@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Rust
+/target
+Cargo.lock
+
+# Editors
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+
+# Environment
+.env
