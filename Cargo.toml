@@ -1,6 +1,12 @@
 [package]
 name = "riddle"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
+lexer = { path = "crates/lexer" }
+ast = { path = "crates/ast" }
+parser = { path = "crates/parser" }
+
+[workspace]
+members = ["crates/ast", "crates/hir","crates/lexer", "crates/parser"]

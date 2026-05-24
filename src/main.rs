@@ -1,13 +1,15 @@
-use frontend::lexer::Lexer;
+use lexer::lexer;
+use parser::parse;
 
-mod frontend;
-mod diagnostic;
 
 fn main() {
-    let source = "//:;\n\"hello\"".to_string();
-    let mut lexer = Lexer::new(source);
-    lexer.scan();
-    let tokens = lexer.tokens;
+    let src = r#"
+        let x = 1 + 2 * 3;
+        let y = (x + 4) * 2;
+    "#;
+    let tokens = lexer(src);
 
-    println!("{:?}", tokens);
+    let ret = parse(tokens);
+
+    println!("{:?}", ret);
 }
