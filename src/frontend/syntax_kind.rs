@@ -9,11 +9,21 @@ pub enum SyntaxKind {
     #[regex(r"//[^\n]*")]
     LineComment,
 
+    // keywords
     #[token("let")]
     Let,
-
     #[token("fun")]
     Fun,
+    #[token("struct")]
+    Struct,
+    #[token("if")]
+    If,
+    #[token("else")]
+    Else,
+    #[token("while")]
+    While,
+    #[token("return")]
+    Return,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*")]
     Ident,
@@ -23,6 +33,18 @@ pub enum SyntaxKind {
 
     #[token("->")]
     Arrow,
+    #[token("==")]
+    EqEq,
+    #[token("!=")]
+    BangEq,
+    #[token("<=")]
+    LessEq,
+    #[token(">=")]
+    GreaterEq,
+    #[token("&&")]
+    AmpAmp,
+    #[token("||")]
+    PipePipe,
 
     #[token("+")]
     Plus,
@@ -32,8 +54,16 @@ pub enum SyntaxKind {
     Star,
     #[token("/")]
     Slash,
+    #[token("%")]
+    Percent,
     #[token("&")]
     Amp,
+    #[token("<")]
+    Less,
+    #[token(">")]
+    Greater,
+    #[token("!")]
+    Bang,
 
     #[token("(")]
     LParen,
@@ -59,6 +89,12 @@ pub enum SyntaxKind {
     FuncDecl,   // fun f(params) -> ty { ... }
     Param,      // name: ty
     ParamList,  // (param, param, ...)
+    StructDecl,
+    StructField,
+    StructFieldList,
+    IfStmt,
+    WhileStmt,
+    ReturnStmt,
     Block,      // { stmt* }
     ExprStmt,   // expr ;
     BinaryExpr, // expr op expr

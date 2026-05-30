@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use super::{lexer::Token, syntax_kind::SyntaxKind};
 
 #[derive(Debug, Clone)]
@@ -20,10 +22,7 @@ impl Marker {
     pub fn complete(mut self, p: &mut Parser, kind: SyntaxKind) -> CompletedMarker {
         self.completed = true;
         match &mut p.events[self.pos] {
-            Event::StartNode {
-                kind: solt,
-                forward_parent: _,
-            } => *solt = kind,
+            Event::StartNode { kind: solt, .. } => *solt = kind,
             _ => unreachable!(),
         }
         p.events.push(Event::FinishNode);
@@ -77,30 +76,60 @@ impl CompletedMarker {
     }
 }
 
-pub struct Parser {
+pub struct Parser<'s> {
+    source: &'s str,
     tokens: Vec<Token>,
     pos: usize, // include trivia
     pub(crate) events: Vec<Event>,
     pub errors: Vec<String>,
+    // cache
+    current_kind: SyntaxKind,
+    current_non_trivia_pos: usize,
 }
 
-impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
-        Self {
+impl<'s> Parser<'s> {
+    pub fn new(source: &'s str, tokens: Vec<Token>) -> Self {
+        let mut p = Self {
+            source,
             tokens,
             pos: 0,
             events: vec![],
             errors: vec![],
+            current_kind: SyntaxKind::Eof,
+            current_non_trivia_pos: 0,
+        };
+        p.recompute_current();
+        p
+    }
+
+    /// Recalculating the current non-trivia token (only called after `pos` changes)
+    fn recompute_current(&mut self) {
+        let mut i = self.pos;
+        while i < self.tokens.len() {
+            if !self.tokens[i].kind.is_trivia() {
+                self.current_kind = self.tokens[i].kind;
+                self.current_non_trivia_pos = i;
+                return;
+            }
+            i += 1;
         }
+        self.current_kind = SyntaxKind::Eof;
+        self.current_non_trivia_pos = self.tokens.len();
     }
 
     // Now non-trivia token.
+    #[inline(always)]
     fn current(&self) -> SyntaxKind {
-        self.nth(0)
+        self.current_kind
     }
 
     // Look ahead to the nth non-trivia token.
+    #[allow(unused)]
     fn nth(&self, n: usize) -> SyntaxKind {
+        if n == 0 {
+            return self.current_kind;
+        }
+
         let mut remaining = n;
         let mut i = self.pos;
         while i < self.tokens.len() {
@@ -119,6 +148,7 @@ impl Parser {
         self.current() == kind
     }
 
+    #[allow(unused)]
     fn at_any(&self, kinds: &[SyntaxKind]) -> bool {
         kinds.contains(&self.current())
     }
@@ -149,6 +179,7 @@ impl Parser {
             self.events.push(Event::AddToken);
             self.pos += 1;
         }
+        self.recompute_current();
     }
 
     fn expect(&mut self, kind: SyntaxKind) -> bool {
@@ -174,7 +205,7 @@ impl Parser {
         self.errors.push(msg);
     }
 
-    pub fn parse(mut self) -> (Vec<Event>, Vec<Token>, Vec<String>) {
+    pub fn parse(mut self) -> (Vec<Event>, Vec<Token>, Vec<String>, &'s str) {
         let m = self.start();
 
         while !self.at(SyntaxKind::Eof) {
@@ -183,7 +214,7 @@ impl Parser {
         self.eat_trivia();
         m.complete(&mut self, SyntaxKind::Root);
 
-        (self.events, self.tokens, self.errors)
+        (self.events, self.tokens, self.errors, self.source)
     }
 
     // == stmt ==
@@ -192,6 +223,10 @@ impl Parser {
         match self.current() {
             SyntaxKind::Let => self.var_decl(),
             SyntaxKind::Fun => self.func_decl(),
+            SyntaxKind::Struct => self.struct_decl(),
+            SyntaxKind::If => self.if_stmt(),
+            SyntaxKind::While => self.while_stmt(),
+            SyntaxKind::Return => self.return_stmt(),
             SyntaxKind::LBrace => {
                 self.block();
             }
@@ -264,6 +299,100 @@ impl Parser {
         m.complete(self, SyntaxKind::Param);
     }
 
+    fn struct_decl(&mut self) {
+        let m = self.start();
+        self.bump();
+        self.expect(SyntaxKind::Ident);
+        self.struct_field_list();
+        m.complete(self, SyntaxKind::StructDecl);
+    }
+
+    fn struct_field_list(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::LBrace);
+
+        if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
+            self.struct_field();
+            while self.at(SyntaxKind::Comma) {
+                self.bump();
+                if self.at(SyntaxKind::RBrace) {
+                    break;
+                }
+                self.struct_field();
+            }
+        }
+
+        self.expect(SyntaxKind::RBrace);
+        m.complete(self, SyntaxKind::StructFieldList);
+    }
+
+    fn struct_field(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::Ident);
+        self.expect(SyntaxKind::Colon);
+        self.ty();
+        m.complete(self, SyntaxKind::StructField);
+    }
+
+    fn if_stmt(&mut self) {
+        let m = self.start();
+        self.bump();
+        self.expression();
+
+        if self.at(SyntaxKind::LBrace) {
+            self.block();
+        } else {
+            self.error(format!(
+                "expected block after if condition, found {:?}",
+                self.current()
+            ));
+        }
+
+        if self.at(SyntaxKind::Else) {
+            self.bump();
+            if self.at(SyntaxKind::If) {
+                self.if_stmt();
+            } else if self.at(SyntaxKind::LBrace) {
+                self.block();
+            } else {
+                self.error(format!(
+                    "expected block after else, found {:?}",
+                    self.current()
+                ));
+            }
+        }
+        m.complete(self, SyntaxKind::IfStmt);
+    }
+
+    fn while_stmt(&mut self) {
+        let m = self.start();
+        self.bump();
+        self.expression();
+
+        if self.at(SyntaxKind::LBrace) {
+            self.block();
+        } else {
+            self.error(format!(
+                "expected block after while condition, found {:?}",
+                self.current()
+            ));
+        }
+
+        m.complete(self, SyntaxKind::WhileStmt);
+    }
+
+    fn return_stmt(&mut self) {
+        let m = self.start();
+        self.bump();
+
+        if !self.at(SyntaxKind::Semi) && !self.at(SyntaxKind::Eof) {
+            self.expression();
+        }
+
+        self.expect(SyntaxKind::Semi);
+        m.complete(self, SyntaxKind::ReturnStmt);
+    }
+
     fn block(&mut self) -> CompletedMarker {
         let m = self.start();
         self.bump();
@@ -307,7 +436,7 @@ impl Parser {
             }
 
             let m = lhs.precede(self);
-            self.bump();
+            self.bump(); // operator
             self.expr_bp(r_bp);
             lhs = m.complete(self, SyntaxKind::BinaryExpr);
         }
@@ -326,6 +455,16 @@ impl Parser {
                 let r_bp = prefix_binding_power(op);
                 self.expr_bp(r_bp);
                 Some(m.complete(self, SyntaxKind::UnaryExpr))
+            }
+
+            SyntaxKind::AmpAmp => {
+                let outer = self.start();
+                let inner = self.start();
+                self.bump();
+                let r_bp = prefix_binding_power(SyntaxKind::Amp);
+                self.expr_bp(r_bp);
+                inner.complete(self, SyntaxKind::UnaryExpr);
+                Some(outer.complete(self, SyntaxKind::UnaryExpr))
             }
 
             SyntaxKind::Number => {
@@ -359,6 +498,14 @@ impl Parser {
                 self.ty();
                 m.complete(self, SyntaxKind::RefType);
             }
+            SyntaxKind::AmpAmp => {
+                let outer = self.start();
+                let inner = self.start();
+                self.bump();
+                self.ty();
+                inner.complete(self, SyntaxKind::RefType);
+                outer.complete(self, SyntaxKind::RefType);
+            }
             SyntaxKind::Ident => {
                 self.bump();
             }
@@ -372,7 +519,7 @@ impl Parser {
 /// prefix binding power for `rhs`
 fn prefix_binding_power(op: SyntaxKind) -> u8 {
     match op {
-        SyntaxKind::Plus | SyntaxKind::Minus | SyntaxKind::Amp | SyntaxKind::Star => 7,
+        SyntaxKind::Plus | SyntaxKind::Minus | SyntaxKind::Amp | SyntaxKind::Star => 13,
         _ => 0,
     }
 }
@@ -382,10 +529,17 @@ fn prefix_binding_power(op: SyntaxKind) -> u8 {
 /// left < right => left combination
 ///
 /// left > right => right combination
+
 fn infix_binding_power(op: SyntaxKind) -> Option<(u8, u8)> {
     match op {
-        SyntaxKind::Plus | SyntaxKind::Minus => Some((1, 2)),
-        SyntaxKind::Star | SyntaxKind::Slash => Some((3, 4)),
+        SyntaxKind::PipePipe => Some((1, 2)),
+        SyntaxKind::AmpAmp => Some((3, 4)),
+        SyntaxKind::EqEq | SyntaxKind::BangEq => Some((5, 6)),
+        SyntaxKind::Less | SyntaxKind::Greater | SyntaxKind::LessEq | SyntaxKind::GreaterEq => {
+            Some((7, 8))
+        }
+        SyntaxKind::Plus | SyntaxKind::Minus => Some((9, 10)),
+        SyntaxKind::Star | SyntaxKind::Slash | SyntaxKind::Percent => Some((11, 12)),
         _ => None,
     }
 }

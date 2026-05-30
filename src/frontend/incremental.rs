@@ -21,9 +21,9 @@ impl IncrementalParser {
     pub fn set_source(&mut self, source: &str) -> &Parse {
         self.source = source.to_string();
         let tokens = lexer::lex(source);
-        let parser = Parser::new(tokens);
-        let (events, tokens, errors) = parser.parse();
-        let parse = tree_builder::build_tree(events, tokens, errors);
+        let parser = Parser::new(source, tokens);
+        let (events, tokens, errors, source) = parser.parse();
+        let parse = tree_builder::build_tree(events, tokens, source, errors);
         self.current = Some(parse);
         self.current.as_ref().unwrap()
     }
