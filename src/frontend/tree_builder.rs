@@ -3,7 +3,7 @@ use rowan::{GreenNodeBuilder, Language};
 use super::{
     lexer::Token,
     parser::Event,
-    syntax_kind::{Lang, SyntaxKind, SyntaxNode},
+    syntax_kind::{RiddleLang, SyntaxKind, SyntaxNode},
 };
 
 pub struct Parse {
@@ -44,7 +44,10 @@ pub fn build_tree(
                 let mut cur = i;
                 loop {
                     match &events[cur] {
-                        Event::StartNode { kind, forward_parent } => {
+                        Event::StartNode {
+                            kind,
+                            forward_parent,
+                        } => {
                             forward_parents.push(*kind);
                             visited[cur] = true;
                             match forward_parent {
@@ -59,7 +62,7 @@ pub fn build_tree(
                 // reverses
                 for &kind in forward_parents.iter().rev() {
                     if kind != SyntaxKind::Tombstone {
-                        builder.start_node(Lang::kind_to_raw(kind));
+                        builder.start_node(RiddleLang::kind_to_raw(kind));
                     }
                 }
             }
@@ -69,10 +72,11 @@ pub fn build_tree(
             Event::AddToken => {
                 if token_idx < tokens.len() {
                     let tok = &tokens[token_idx];
-                    builder.token(Lang::kind_to_raw(tok.kind), tok.text(source));
+                    builder.token(RiddleLang::kind_to_raw(tok.kind), tok.text(source));
                     token_idx += 1;
                 }
             }
+            Event::Placeholder => {}
         }
     }
 

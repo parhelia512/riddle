@@ -84,22 +84,27 @@ pub enum SyntaxKind {
     Eq,
 
     // nodes
-    Root,       // program
-    VarDecl,    // let x: ty = expr;
-    FuncDecl,   // fun f(params) -> ty { ... }
-    Param,      // name: ty
-    ParamList,  // (param, param, ...)
+    // see docs/grammar.md
+    Root,
+    VarDecl,
+    FuncDecl,
+    Param, 
+    ParamList,
     StructDecl,
     StructField,
     StructFieldList,
     IfStmt,
     WhileStmt,
     ReturnStmt,
-    Block,      // { stmt* }
-    ExprStmt,   // expr ;
-    BinaryExpr, // expr op expr
-    UnaryExpr,  // op expr
-    RefType,    // & ty
+    Block,
+    ExprStmt,
+    NameRef,
+    NumberLit,
+    BinaryExpr,
+    UnaryExpr,
+    ParenExpr, 
+    NamedType,
+    RefType,
     ErrorNode,
 
     // special
@@ -114,9 +119,9 @@ impl SyntaxKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lang;
+pub struct RiddleLang;
 
-impl rowan::Language for Lang {
+impl rowan::Language for RiddleLang {
     type Kind = SyntaxKind;
 
     fn kind_from_raw(raw: rowan::SyntaxKind) -> Self::Kind {
@@ -128,6 +133,6 @@ impl rowan::Language for Lang {
     }
 }
 
-pub type SyntaxNode = rowan::SyntaxNode<Lang>;
-pub type SyntaxToken = rowan::SyntaxToken<Lang>;
+pub type SyntaxNode = rowan::SyntaxNode<RiddleLang>;
+pub type SyntaxToken = rowan::SyntaxToken<RiddleLang>;
 pub type SyntaxElement = rowan::NodeOrToken<SyntaxNode, SyntaxToken>;

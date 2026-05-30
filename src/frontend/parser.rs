@@ -1,5 +1,3 @@
-use std::ops::Range;
-
 use super::{lexer::Token, syntax_kind::SyntaxKind};
 
 #[derive(Debug, Clone)]
@@ -10,6 +8,7 @@ pub enum Event {
     },
     FinishNode,
     AddToken,
+    Placeholder,
 }
 
 #[derive(Debug)]
@@ -33,13 +32,9 @@ impl Marker {
     pub fn abandon(mut self, p: &mut Parser) {
         self.completed = true;
         if self.pos == p.events.len() - 1 {
-            match p.events.pop() {
-                Some(Event::StartNode {
-                    kind: SyntaxKind::Tombstone,
-                    ..
-                }) => {}
-                _ => unreachable!(),
-            }
+            p.events.pop();
+        } else {
+            p.events[self.pos] = Event::Placeholder;
         }
     }
 }
@@ -262,8 +257,10 @@ impl<'s> Parser<'s> {
 
         self.param_list();
 
-        self.expect(SyntaxKind::Arrow);
-        self.ty();
+        if self.at(SyntaxKind::Arrow) {
+            self.bump();
+            self.ty();
+        }
 
         if self.at(SyntaxKind::LBrace) {
             self.block();
@@ -448,7 +445,11 @@ impl<'s> Parser<'s> {
     fn lhs(&mut self) -> Option<CompletedMarker> {
         match self.current() {
             // unary
-            SyntaxKind::Plus | SyntaxKind::Minus | SyntaxKind::Amp | SyntaxKind::Star => {
+            SyntaxKind::Plus
+            | SyntaxKind::Minus
+            | SyntaxKind::Amp
+            | SyntaxKind::Star
+            | SyntaxKind::Bang => {
                 let m = self.start();
                 let op = self.current();
                 self.bump(); // operator
@@ -470,16 +471,24 @@ impl<'s> Parser<'s> {
             SyntaxKind::Number => {
                 let m = self.start();
                 self.bump();
-                Some(m.complete(self, SyntaxKind::Number))
+                Some(m.complete(self, SyntaxKind::NumberLit))
             }
 
             SyntaxKind::Ident => {
                 let m = self.start();
                 self.bump();
-                Some(m.complete(self, SyntaxKind::Ident))
+                Some(m.complete(self, SyntaxKind::NameRef))
             }
 
             SyntaxKind::LBrace => Some(self.block()),
+
+            SyntaxKind::LParen => {
+                let m = self.start();
+                self.bump();
+                self.expr_bp(0);
+                self.expect(SyntaxKind::RParen);
+                Some(m.complete(self, SyntaxKind::ParenExpr))
+            }
 
             _ => {
                 self.error_no_bump(format!("expected expression, found {:?}", self.current()));
@@ -507,7 +516,9 @@ impl<'s> Parser<'s> {
                 outer.complete(self, SyntaxKind::RefType);
             }
             SyntaxKind::Ident => {
+                let m = self.start();
                 self.bump();
+                m.complete(self, SyntaxKind::NamedType);
             }
             _ => self.error(format!("expected type, found {:?}", self.current())),
         }
@@ -519,7 +530,11 @@ impl<'s> Parser<'s> {
 /// prefix binding power for `rhs`
 fn prefix_binding_power(op: SyntaxKind) -> u8 {
     match op {
-        SyntaxKind::Plus | SyntaxKind::Minus | SyntaxKind::Amp | SyntaxKind::Star => 13,
+        SyntaxKind::Plus
+        | SyntaxKind::Minus
+        | SyntaxKind::Amp
+        | SyntaxKind::Star
+        | SyntaxKind::Bang => 13,
         _ => 0,
     }
 }

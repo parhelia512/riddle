@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 logos = "0.14"
 rowan = "0.15"
+la-arena = "0.3"
