@@ -28,6 +28,10 @@ expr_stmt = expression ";";
 
 expression = unary (binop unary)* ;
 unary      = prefix_op unary | primary ;
+
+postfix    = primary ( "(" arg_list ")" | "." ident )* ;
+arg_list   = (expression ("," expression)*)? ;
+
 primary    = number | ident | "(" expression ")" | block ;
 
 binop = "||" | "&&" | "==" | "!=" | "<" | ">" | "<=" | ">=" 

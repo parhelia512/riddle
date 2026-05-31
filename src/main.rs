@@ -3,6 +3,7 @@ use frontend::incremental::IncrementalParser;
 
 pub mod frontend;
 pub mod ast;
+pub mod hir;
 
 fn main() {
     let mut parser = IncrementalParser::new();

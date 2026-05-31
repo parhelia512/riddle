@@ -420,9 +420,36 @@ impl<'s> Parser<'s> {
         // prefix
         let mut lhs = self.lhs()?;
 
-        // infix loop
         loop {
             let op = self.current();
+            // postfix
+            // call
+            if op == SyntaxKind::LParen {
+                const CALL_BP: u8 = 15;
+                if CALL_BP < min_bp {
+                    break;
+                }
+                let m = lhs.precede(self);
+                self.arg_list();
+                lhs = m.complete(self, SyntaxKind::CallExpr);
+                continue;
+            }
+
+            // field access
+            if op == SyntaxKind::Dot {
+                const FIELD_BP: u8 = 15;
+                if FIELD_BP < min_bp {
+                    break;
+                }
+                let m = lhs.precede(self);
+                self.bump();
+                self.expect(SyntaxKind::Ident);
+                lhs = m.complete(self, SyntaxKind::FieldExpr);
+                continue;
+            }
+
+            // infix
+            // binary
             let (l_bp, r_bp) = match infix_binding_power(op) {
                 Some(bp) => bp,
                 None => break,
@@ -439,6 +466,25 @@ impl<'s> Parser<'s> {
         }
 
         Some(lhs)
+    }
+
+    fn arg_list(&mut self) {
+        let m = self.start();
+        self.bump();
+
+        if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
+            self.expression();
+            while self.at(SyntaxKind::Comma) {
+                self.bump();
+                if self.at(SyntaxKind::RParen) {
+                    break;
+                }
+                self.expression();
+            }
+        }
+
+        self.expect(SyntaxKind::RParen);
+        m.complete(self, SyntaxKind::ArgList);
     }
 
     // parse prefix, atom, block

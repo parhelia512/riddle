@@ -44,6 +44,9 @@ ast_node!(NumberExpr, NumberLit);
 ast_node!(NameRefExpr, NameRef);
 ast_node!(NamedType, NamedType);
 ast_node!(RefType, RefType);
+ast_node!(CallExpr, CallExpr);
+ast_node!(ArgList, ArgList);
+ast_node!(FieldExpr, FieldExpr);
 
 impl Root {
     pub fn stmts(&self) -> impl Iterator<Item = Stmt> + '_ {
@@ -278,6 +281,32 @@ impl NameRefExpr {
     }
 }
 
+impl CallExpr {
+    pub fn callee(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    pub fn arg_list(&self) -> Option<ArgList> {
+        support::child(&self.syntax)
+    }
+}
+
+impl ArgList {
+    pub fn args(&self) -> impl Iterator<Item = Expr> + '_ {
+        self.syntax.children().filter_map(Expr::cast)
+    }
+}
+
+impl FieldExpr {
+    pub fn base(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    pub fn field_name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     VarDecl(VarDecl),
@@ -310,6 +339,8 @@ pub enum Expr {
     BinaryExpr(BinaryExpr),
     UnaryExpr(UnaryExpr),
     ParenExpr(ParenExpr),
+    CallExpr(CallExpr),
+    FieldExpr(FieldExpr),
     Block(Block),
     IfStmt(IfStmt),
     Number(NumberExpr),
@@ -323,6 +354,8 @@ impl Expr {
             SyntaxKind::BinaryExpr => Some(Expr::BinaryExpr(BinaryExpr { syntax: node })),
             SyntaxKind::UnaryExpr => Some(Expr::UnaryExpr(UnaryExpr { syntax: node })),
             SyntaxKind::ParenExpr => Some(Expr::ParenExpr(ParenExpr { syntax: node })),
+            SyntaxKind::CallExpr => Some(Expr::CallExpr(CallExpr { syntax: node })),
+            SyntaxKind::FieldExpr => Some(Expr::FieldExpr(FieldExpr { syntax: node })),
             SyntaxKind::Block => Some(Expr::Block(Block { syntax: node })),
             SyntaxKind::IfStmt => Some(Expr::IfStmt(IfStmt { syntax: node })),
             SyntaxKind::Number => Some(Expr::Number(NumberExpr { syntax: node })),

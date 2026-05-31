@@ -74,6 +74,8 @@ pub enum SyntaxKind {
     #[token("}")]
     RBrace,
 
+    #[token(".")]
+    Dot,
     #[token(":")]
     Colon,
     #[token(";")]
@@ -88,7 +90,7 @@ pub enum SyntaxKind {
     Root,
     VarDecl,
     FuncDecl,
-    Param, 
+    Param,
     ParamList,
     StructDecl,
     StructField,
@@ -102,7 +104,10 @@ pub enum SyntaxKind {
     NumberLit,
     BinaryExpr,
     UnaryExpr,
-    ParenExpr, 
+    ParenExpr,
+    CallExpr,
+    ArgList,
+    FieldExpr,
     NamedType,
     RefType,
     ErrorNode,
