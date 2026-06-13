@@ -2,13 +2,14 @@ use la_arena::{Arena, Idx};
 
 use super::Name;
 
-pub type FunctionId = Idx<Function>;
-pub type StructId = Idx<Struct>;
+pub type FunctionId = Idx<HirFunction>;
+pub type StructId = Idx<HirStruct>;
 
+// there are only has define without body
 #[derive(Debug)]
 pub struct ItemTree {
-    pub functions: Arena<Function>,
-    pub structs: Arena<Struct>,
+    pub functions: Arena<HirFunction>,
+    pub structs: Arena<HirStruct>,
     pub top_level: Vec<TopLevelItem>,
 }
 
@@ -19,34 +20,35 @@ pub enum TopLevelItem {
 }
 
 #[derive(Debug, Clone)]
-pub struct Function {
+pub struct HirFunction {
     pub name: Name,
-    pub params: Vec<Param>,
-    pub ret_type: Option<TypeRef>,
+    pub params: Vec<HirParam>,
+    pub ret_type: Option<HirTypeRef>,
     pub has_body: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct Param {
+pub struct HirParam {
     pub name: Name,
-    pub ty: TypeRef,
+    pub ty: HirTypeRef,
 }
 
 #[derive(Debug, Clone)]
-pub struct Struct {
+pub struct HirStruct {
     pub name: Name,
-    pub fields: Vec<StructField>,
+    pub fields: Vec<HirStructField>,
 }
 
 #[derive(Debug, Clone)]
-pub struct StructField {
+pub struct HirStructField {
     pub name: Name,
-    pub ty: TypeRef,
+    pub ty: HirTypeRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TypeRef {
+pub enum HirTypeRef {
     Named(Name),
-    Ref(Box<TypeRef>),
+    Ref(Box<HirTypeRef>),
+    Unknown,
     Error,
 }

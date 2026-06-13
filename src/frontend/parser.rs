@@ -212,6 +212,39 @@ impl<'s> Parser<'s> {
         (self.events, self.tokens, self.errors, self.source)
     }
 
+    fn at_stmt_start(&self) -> bool {
+        matches!(
+            self.current(),
+            SyntaxKind::Let | SyntaxKind::Fun | SyntaxKind::Struct | SyntaxKind::Return
+        )
+    }
+
+    fn at_expr_start(&self) -> bool {
+        matches!(
+            self.current(),
+            SyntaxKind::Number
+                | SyntaxKind::Ident
+                | SyntaxKind::LParen
+                | SyntaxKind::LBrace
+                | SyntaxKind::If
+                | SyntaxKind::While
+                | SyntaxKind::Plus
+                | SyntaxKind::Minus
+                | SyntaxKind::Amp
+                | SyntaxKind::AmpAmp
+                | SyntaxKind::Star
+                | SyntaxKind::Bang
+        )
+    }
+    
+
+    fn at_expr_with_block_start(&self) -> bool {
+        matches!(
+            self.current(),
+            SyntaxKind::LBrace | SyntaxKind::If | SyntaxKind::While
+        )
+    }
+
     // == stmt ==
 
     fn statement(&mut self) {
@@ -219,8 +252,6 @@ impl<'s> Parser<'s> {
             SyntaxKind::Let => self.var_decl(),
             SyntaxKind::Fun => self.func_decl(),
             SyntaxKind::Struct => self.struct_decl(),
-            SyntaxKind::If => self.if_stmt(),
-            SyntaxKind::While => self.while_stmt(),
             SyntaxKind::Return => self.return_stmt(),
             SyntaxKind::LBrace => {
                 self.block();
@@ -331,53 +362,6 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::StructField);
     }
 
-    fn if_stmt(&mut self) {
-        let m = self.start();
-        self.bump();
-        self.expression();
-
-        if self.at(SyntaxKind::LBrace) {
-            self.block();
-        } else {
-            self.error(format!(
-                "expected block after if condition, found {:?}",
-                self.current()
-            ));
-        }
-
-        if self.at(SyntaxKind::Else) {
-            self.bump();
-            if self.at(SyntaxKind::If) {
-                self.if_stmt();
-            } else if self.at(SyntaxKind::LBrace) {
-                self.block();
-            } else {
-                self.error(format!(
-                    "expected block after else, found {:?}",
-                    self.current()
-                ));
-            }
-        }
-        m.complete(self, SyntaxKind::IfStmt);
-    }
-
-    fn while_stmt(&mut self) {
-        let m = self.start();
-        self.bump();
-        self.expression();
-
-        if self.at(SyntaxKind::LBrace) {
-            self.block();
-        } else {
-            self.error(format!(
-                "expected block after while condition, found {:?}",
-                self.current()
-            ));
-        }
-
-        m.complete(self, SyntaxKind::WhileStmt);
-    }
-
     fn return_stmt(&mut self) {
         let m = self.start();
         self.bump();
@@ -392,10 +376,59 @@ impl<'s> Parser<'s> {
 
     fn block(&mut self) -> CompletedMarker {
         let m = self.start();
-        self.bump();
+        self.expect(SyntaxKind::LBrace);
 
         while !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
-            self.statement();
+            if self.at_stmt_start() {
+                self.statement();
+                continue;
+            }
+
+            if !self.at_expr_start() {
+                self.error(format!(
+                    "expected statement or expression, found {:?}",
+                    self.current()
+                ));
+                continue;
+            }
+
+            let starts_with_block = self.at_expr_with_block_start();
+
+            let expr = match self.expression() {
+                Some(expr) => expr,
+                None => continue,
+            };
+
+            if self.at(SyntaxKind::Semi) {
+                let stmt = expr.precede(self);
+                self.bump();
+                stmt.complete(self, SyntaxKind::ExprStmt);
+                continue;
+            }
+
+            if self.at(SyntaxKind::RBrace) {
+                break;
+            }
+
+            if starts_with_block {
+                let stmt = expr.precede(self);
+                stmt.complete(self, SyntaxKind::ExprStmt);
+                continue;
+            }
+
+            self.error_no_bump(format!(
+                "expected ';' or '}}' after expression, found {:?}",
+                self.current()
+            ));
+
+            let stmt = expr.precede(self);
+            stmt.complete(self, SyntaxKind::ExprStmt);
+
+            if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
+                let err = self.start();
+                self.bump();
+                err.complete(self, SyntaxKind::ErrorNode);
+            }
         }
 
         self.expect(SyntaxKind::RBrace);
@@ -403,17 +436,85 @@ impl<'s> Parser<'s> {
     }
 
     fn expr_stmt(&mut self) {
-        let m = self.start();
-        self.expression();
-        self.expect(SyntaxKind::Semi);
+        let starts_with_block = self.at_expr_with_block_start();
 
+        let expr = match self.expression() {
+            Some(expr) => expr,
+            None => return,
+        };
+
+        let m = expr.precede(self);
+
+        if self.at(SyntaxKind::Semi) {
+            self.bump();
+            m.complete(self, SyntaxKind::ExprStmt);
+            return;
+        }
+
+        if starts_with_block {
+            m.complete(self, SyntaxKind::ExprStmt);
+            return;
+        }
+
+        self.error(format!(
+            "expected ';' after expression, found {:?}",
+            self.current()
+        ));
         m.complete(self, SyntaxKind::ExprStmt);
     }
 
     // == expr ==
 
-    fn expression(&mut self) {
-        self.expr_bp(0);
+    fn expression(&mut self) -> Option<CompletedMarker> {
+        self.expr_bp(0)
+    }
+
+    fn if_expr(&mut self) -> CompletedMarker {
+        let m = self.start();
+        self.expect(SyntaxKind::If);
+        self.expression();
+
+        if self.at(SyntaxKind::LBrace) {
+            self.block();
+        } else {
+            self.error(format!(
+                "expected block after if condition, found {:?}",
+                self.current()
+            ));
+        }
+
+        if self.at(SyntaxKind::Else) {
+            self.bump();
+            if self.at(SyntaxKind::If) {
+                self.if_expr();
+            } else if self.at(SyntaxKind::LBrace) {
+                self.block();
+            } else {
+                self.error(format!(
+                    "expected block or if after else, found {:?}",
+                    self.current()
+                ));
+            }
+        }
+
+        m.complete(self, SyntaxKind::IfStmt)
+    }
+
+    fn while_expr(&mut self) -> CompletedMarker {
+        let m = self.start();
+        self.expect(SyntaxKind::While);
+        self.expression();
+
+        if self.at(SyntaxKind::LBrace) {
+            self.block();
+        } else {
+            self.error(format!(
+                "expected block after while condition, found {:?}",
+                self.current()
+            ));
+        }
+
+        m.complete(self, SyntaxKind::WhileStmt)
     }
 
     fn expr_bp(&mut self, min_bp: u8) -> Option<CompletedMarker> {
@@ -505,14 +606,14 @@ impl<'s> Parser<'s> {
             }
 
             SyntaxKind::AmpAmp => {
-                let outer = self.start();
-                let inner = self.start();
-                self.bump();
-                let r_bp = prefix_binding_power(SyntaxKind::Amp);
+                let m = self.start();
+                let op = self.current();
+                self.bump(); // &&
+                let r_bp = prefix_binding_power(op);
                 self.expr_bp(r_bp);
-                inner.complete(self, SyntaxKind::UnaryExpr);
-                Some(outer.complete(self, SyntaxKind::UnaryExpr))
+                Some(m.complete(self, SyntaxKind::UnaryExpr))
             }
+            
 
             SyntaxKind::Number => {
                 let m = self.start();
@@ -527,6 +628,10 @@ impl<'s> Parser<'s> {
             }
 
             SyntaxKind::LBrace => Some(self.block()),
+
+            SyntaxKind::If => Some(self.if_expr()),
+
+            SyntaxKind::While => Some(self.while_expr()),
 
             SyntaxKind::LParen => {
                 let m = self.start();
@@ -579,6 +684,7 @@ fn prefix_binding_power(op: SyntaxKind) -> u8 {
         SyntaxKind::Plus
         | SyntaxKind::Minus
         | SyntaxKind::Amp
+        | SyntaxKind::AmpAmp
         | SyntaxKind::Star
         | SyntaxKind::Bang => 13,
         _ => 0,

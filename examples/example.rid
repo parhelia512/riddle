@@ -1,0 +1,18 @@
+struct Foo{
+    x: i32,
+    y: i32,
+}
+
+fun main(){
+    let t: Foo;
+    {
+        let x = Foo{x:1, y:1};
+        t = x
+        print(x) // error
+    }
+    {
+        let y = &Foo{x:1, y:1};
+        t = y.clone()
+        print(y) // yes
+    }
+}

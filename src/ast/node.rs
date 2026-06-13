@@ -132,6 +132,10 @@ impl Block {
     pub fn stmts(&self) -> impl Iterator<Item = Stmt> + '_ {
         self.syntax.children().filter_map(Stmt::cast)
     }
+
+    pub fn tail_expr(&self) -> Option<Expr> {
+        self.syntax.children().filter_map(Expr::cast).last()
+    }
 }
 
 impl IfStmt {
@@ -266,18 +270,14 @@ impl NumberExpr {
 }
 
 impl NamedType {
-    pub fn name_token(&self) -> Option<SyntaxToken> {
+    pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 }
 
 impl NameRefExpr {
-    pub fn name_token(&self) -> Option<SyntaxToken> {
+    pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-
-    pub fn name(&self) -> Option<String> {
-        self.name_token().map(|t| t.text().to_string())
     }
 }
 
@@ -312,8 +312,6 @@ pub enum Stmt {
     VarDecl(VarDecl),
     FuncDecl(FuncDecl),
     StructDecl(StructDecl),
-    IfStmt(IfStmt),
-    WhileStmt(WhileStmt),
     ReturnStmt(ReturnStmt),
     ExprStmt(ExprStmt),
 }
@@ -325,8 +323,6 @@ impl Stmt {
             SyntaxKind::VarDecl => Some(Stmt::VarDecl(VarDecl { syntax: node })),
             SyntaxKind::FuncDecl => Some(Stmt::FuncDecl(FuncDecl { syntax: node })),
             SyntaxKind::StructDecl => Some(Stmt::StructDecl(StructDecl { syntax: node })),
-            SyntaxKind::IfStmt => Some(Stmt::IfStmt(IfStmt { syntax: node })),
-            SyntaxKind::WhileStmt => Some(Stmt::WhileStmt(WhileStmt { syntax: node })),
             SyntaxKind::ReturnStmt => Some(Stmt::ReturnStmt(ReturnStmt { syntax: node })),
             SyntaxKind::ExprStmt => Some(Stmt::ExprStmt(ExprStmt { syntax: node })),
             _ => None,
@@ -343,6 +339,7 @@ pub enum Expr {
     FieldExpr(FieldExpr),
     Block(Block),
     IfStmt(IfStmt),
+    WhileStmt(WhileStmt),
     Number(NumberExpr),
     NameRef(NameRefExpr),
 }
@@ -358,10 +355,11 @@ impl Expr {
             SyntaxKind::FieldExpr => Some(Expr::FieldExpr(FieldExpr { syntax: node })),
             SyntaxKind::Block => Some(Expr::Block(Block { syntax: node })),
             SyntaxKind::IfStmt => Some(Expr::IfStmt(IfStmt { syntax: node })),
-            SyntaxKind::Number => Some(Expr::Number(NumberExpr { syntax: node })),
-            SyntaxKind::Ident => Some(Expr::NameRef(NameRefExpr { syntax: node })),
+            SyntaxKind::WhileStmt => Some(Expr::WhileStmt(WhileStmt { syntax: node })),
+            SyntaxKind::NumberLit => Some(Expr::Number(NumberExpr { syntax: node })),
+            SyntaxKind::NameRef => Some(Expr::NameRef(NameRefExpr { syntax: node })),
             _ => None,
-        }
+        }  
     }
 }
 
