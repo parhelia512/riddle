@@ -180,11 +180,25 @@ impl<'s> Parser<'s> {
     fn expect(&mut self, kind: SyntaxKind) -> bool {
         if self.at(kind) {
             self.bump();
-            true
-        } else {
-            self.error(format!("expected {:?}, found {:?}", kind, self.current()));
-            false
+            return true;
         }
+
+        self.error_no_bump(format!("expected {:?}, found {:?}", kind, self.current()));
+
+        if !matches!(
+            self.current(),
+            SyntaxKind::RParen
+                | SyntaxKind::RBrace
+                | SyntaxKind::Semi
+                | SyntaxKind::Comma
+                | SyntaxKind::Eof
+        ) {
+            let m = self.start();
+            self.bump();
+            m.complete(self, SyntaxKind::ErrorNode);
+        }
+
+        false
     }
 
     fn error(&mut self, msg: String) {
@@ -236,7 +250,6 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Bang
         )
     }
-    
 
     fn at_expr_with_block_start(&self) -> bool {
         matches!(
@@ -440,7 +453,14 @@ impl<'s> Parser<'s> {
 
         let expr = match self.expression() {
             Some(expr) => expr,
-            None => return,
+            None => {
+                if !self.at(SyntaxKind::Eof) {
+                    let m = self.start();
+                    self.bump();
+                    m.complete(self, SyntaxKind::ErrorNode);
+                }
+                return;
+            }
         };
 
         let m = expr.precede(self);
@@ -605,6 +625,12 @@ impl<'s> Parser<'s> {
                 Some(m.complete(self, SyntaxKind::UnaryExpr))
             }
 
+            SyntaxKind::Dot => {
+                self.error_no_bump("expected expression before field access".to_string());
+                let m = self.start();
+                Some(m.complete(self, SyntaxKind::ErrorNode))
+            }            
+
             SyntaxKind::AmpAmp => {
                 let m = self.start();
                 let op = self.current();
@@ -613,7 +639,6 @@ impl<'s> Parser<'s> {
                 self.expr_bp(r_bp);
                 Some(m.complete(self, SyntaxKind::UnaryExpr))
             }
-            
 
             SyntaxKind::Number => {
                 let m = self.start();

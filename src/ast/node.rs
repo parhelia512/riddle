@@ -50,7 +50,7 @@ ast_node!(FieldExpr, FieldExpr);
 
 impl Root {
     pub fn stmts(&self) -> impl Iterator<Item = Stmt> + '_ {
-        self.syntax.children().filter_map(Stmt::cast)
+        support::children(&self.syntax)
     }
 }
 
@@ -60,11 +60,11 @@ impl VarDecl {
     }
 
     pub fn ty(&self) -> Option<Type> {
-        self.syntax.children().find_map(Type::cast)
+        support::child(&self.syntax)
     }
 
     pub fn init(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 }
 
@@ -78,7 +78,7 @@ impl FuncDecl {
     }
 
     pub fn return_type(&self) -> Option<Type> {
-        self.syntax.children().find_map(Type::cast)
+        support::child(&self.syntax)
     }
 
     pub fn body(&self) -> Option<Block> {
@@ -98,7 +98,7 @@ impl Param {
     }
 
     pub fn ty(&self) -> Option<Type> {
-        self.syntax.children().find_map(Type::cast)
+        support::child(&self.syntax)
     }
 }
 
@@ -124,23 +124,23 @@ impl StructField {
     }
 
     pub fn ty(&self) -> Option<Type> {
-        self.syntax.children().find_map(Type::cast)
+        support::child(&self.syntax)
     }
 }
 
 impl Block {
     pub fn stmts(&self) -> impl Iterator<Item = Stmt> + '_ {
-        self.syntax.children().filter_map(Stmt::cast)
+        support::children(&self.syntax)
     }
 
     pub fn tail_expr(&self) -> Option<Expr> {
-        self.syntax.children().filter_map(Expr::cast).last()
+        support::last_child(&self.syntax)
     }
 }
 
 impl IfStmt {
     pub fn condition(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 
     pub fn then_branch(&self) -> Option<Block> {
@@ -148,9 +148,7 @@ impl IfStmt {
     }
 
     pub fn else_branch(&self) -> Option<ElseBranch> {
-        let mut blocks = self.syntax.children().filter_map(Block::cast);
-        let _then = blocks.next(); // skip then
-        if let Some(else_block) = blocks.next() {
+        if let Some(else_block) = support::nth_child::<Block>(&self.syntax, 1) {
             return Some(ElseBranch::Block(else_block));
         }
         let if_stmt: Option<IfStmt> = support::child(&self.syntax);
@@ -166,7 +164,7 @@ pub enum ElseBranch {
 
 impl WhileStmt {
     pub fn condition(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 
     pub fn body(&self) -> Option<Block> {
@@ -176,86 +174,76 @@ impl WhileStmt {
 
 impl ReturnStmt {
     pub fn value(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 }
 
 impl ExprStmt {
     pub fn expr(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 }
 
 impl BinaryExpr {
     pub fn lhs(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 
     pub fn rhs(&self) -> Option<Expr> {
-        let mut exprs = self.syntax.children().filter_map(Expr::cast);
-        exprs.next(); // skip lhs
-        exprs.next()
+        support::nth_child(&self.syntax, 1)
     }
 
     pub fn op_token(&self) -> Option<SyntaxToken> {
-        self.syntax
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|t| {
-                let kind = t.kind();
-                matches!(
-                    kind,
-                    SyntaxKind::Plus
-                        | SyntaxKind::Minus
-                        | SyntaxKind::Star
-                        | SyntaxKind::Slash
-                        | SyntaxKind::Percent
-                        | SyntaxKind::EqEq
-                        | SyntaxKind::BangEq
-                        | SyntaxKind::Less
-                        | SyntaxKind::Greater
-                        | SyntaxKind::LessEq
-                        | SyntaxKind::GreaterEq
-                        | SyntaxKind::AmpAmp
-                        | SyntaxKind::PipePipe
-                )
-            })
+        support::token(&self.syntax, |kind| {
+            matches!(
+                kind,
+                SyntaxKind::Plus
+                    | SyntaxKind::Minus
+                    | SyntaxKind::Star
+                    | SyntaxKind::Slash
+                    | SyntaxKind::Percent
+                    | SyntaxKind::EqEq
+                    | SyntaxKind::BangEq
+                    | SyntaxKind::Less
+                    | SyntaxKind::Greater
+                    | SyntaxKind::LessEq
+                    | SyntaxKind::GreaterEq
+                    | SyntaxKind::AmpAmp
+                    | SyntaxKind::PipePipe
+            )
+        })
     }
 }
 
 impl UnaryExpr {
     pub fn operand(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 
     pub fn op_token(&self) -> Option<SyntaxToken> {
-        self.syntax
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|t| {
-                let kind = t.kind();
-                matches!(
-                    kind,
-                    SyntaxKind::Plus
-                        | SyntaxKind::Minus
-                        | SyntaxKind::Amp
-                        | SyntaxKind::AmpAmp
-                        | SyntaxKind::Star
-                        | SyntaxKind::Bang
-                )
-            })
+        support::token(&self.syntax, |kind| {
+            matches!(
+                kind,
+                SyntaxKind::Plus
+                    | SyntaxKind::Minus
+                    | SyntaxKind::Amp
+                    | SyntaxKind::AmpAmp
+                    | SyntaxKind::Star
+                    | SyntaxKind::Bang
+            )
+        })
     }
 }
 
 impl ParenExpr {
     pub fn inner(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 }
 
 impl RefType {
     pub fn inner(&self) -> Option<Type> {
-        self.syntax.children().find_map(Type::cast)
+        support::child(&self.syntax)
     }
 }
 
@@ -283,7 +271,7 @@ impl NameRefExpr {
 
 impl CallExpr {
     pub fn callee(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 
     pub fn arg_list(&self) -> Option<ArgList> {
@@ -293,13 +281,13 @@ impl CallExpr {
 
 impl ArgList {
     pub fn args(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.syntax.children().filter_map(Expr::cast)
+        support::children(&self.syntax)
     }
 }
 
 impl FieldExpr {
     pub fn base(&self) -> Option<Expr> {
-        self.syntax.children().find_map(Expr::cast)
+        support::child(&self.syntax)
     }
 
     pub fn field_name(&self) -> Option<SyntaxToken> {
@@ -316,8 +304,8 @@ pub enum Stmt {
     ExprStmt(ExprStmt),
 }
 
-impl Stmt {
-    pub fn cast(node: SyntaxNode) -> Option<Self> {
+impl AstNode for Stmt {
+    fn cast(node: SyntaxNode) -> Option<Self> {
         let kind = node.kind();
         match kind {
             SyntaxKind::VarDecl => Some(Stmt::VarDecl(VarDecl { syntax: node })),
@@ -327,6 +315,22 @@ impl Stmt {
             SyntaxKind::ExprStmt => Some(Stmt::ExprStmt(ExprStmt { syntax: node })),
             _ => None,
         }
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            Stmt::VarDecl(it) => it.syntax(),
+            Stmt::FuncDecl(it) => it.syntax(),
+            Stmt::StructDecl(it) => it.syntax(),
+            Stmt::ReturnStmt(it) => it.syntax(),
+            Stmt::ExprStmt(it) => it.syntax(),
+        }
+    }
+}
+
+impl Stmt {
+    pub fn cast(node: SyntaxNode) -> Option<Self> {
+        <Self as AstNode>::cast(node)
     }
 }
 
@@ -344,8 +348,8 @@ pub enum Expr {
     NameRef(NameRefExpr),
 }
 
-impl Expr {
-    pub fn cast(node: SyntaxNode) -> Option<Self> {
+impl AstNode for Expr {
+    fn cast(node: SyntaxNode) -> Option<Self> {
         let kind = node.kind();
         match kind {
             SyntaxKind::BinaryExpr => Some(Expr::BinaryExpr(BinaryExpr { syntax: node })),
@@ -359,7 +363,28 @@ impl Expr {
             SyntaxKind::NumberLit => Some(Expr::Number(NumberExpr { syntax: node })),
             SyntaxKind::NameRef => Some(Expr::NameRef(NameRefExpr { syntax: node })),
             _ => None,
-        }  
+        }
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            Expr::BinaryExpr(it) => it.syntax(),
+            Expr::UnaryExpr(it) => it.syntax(),
+            Expr::ParenExpr(it) => it.syntax(),
+            Expr::CallExpr(it) => it.syntax(),
+            Expr::FieldExpr(it) => it.syntax(),
+            Expr::Block(it) => it.syntax(),
+            Expr::IfStmt(it) => it.syntax(),
+            Expr::WhileStmt(it) => it.syntax(),
+            Expr::Number(it) => it.syntax(),
+            Expr::NameRef(it) => it.syntax(),
+        }
+    }
+}
+
+impl Expr {
+    pub fn cast(node: SyntaxNode) -> Option<Self> {
+        <Self as AstNode>::cast(node)
     }
 }
 
@@ -369,13 +394,26 @@ pub enum Type {
     Ref(RefType),
 }
 
-impl Type {
-    pub fn cast(node: SyntaxNode) -> Option<Self> {
+impl AstNode for Type {
+    fn cast(node: SyntaxNode) -> Option<Self> {
         let kind = node.kind();
         match kind {
             SyntaxKind::RefType => Some(Type::Ref(RefType { syntax: node })),
             SyntaxKind::NamedType => Some(Type::Named(NamedType { syntax: node })),
             _ => None,
         }
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            Type::Named(it) => it.syntax(),
+            Type::Ref(it) => it.syntax(),
+        }
+    }
+}
+
+impl Type {
+    pub fn cast(node: SyntaxNode) -> Option<Self> {
+        <Self as AstNode>::cast(node)
     }
 }

@@ -278,7 +278,6 @@ fn lower_unary_op(token: Option<SyntaxToken>) -> Option<UnaryOp> {
         Some(SyntaxKind::Plus) => Some(UnaryOp::Pos),
         Some(SyntaxKind::Minus) => Some(UnaryOp::Neg),
         Some(SyntaxKind::Amp) => Some(UnaryOp::Ref),
-        // Some(SyntaxKind::AmpAmp) => Some(UnaryOp::Ref),
         Some(SyntaxKind::Star) => Some(UnaryOp::Deref),
         Some(SyntaxKind::Bang) => Some(UnaryOp::Not),
 

@@ -82,10 +82,13 @@ impl Lower for Option<StructFieldList> {
     type Output = Vec<HirStructField>;
 
     fn lower(self) -> Self::Output {
-        let s = self.unwrap(); // todo throw a error
-        s.fields().map(|f| f.lower()).collect()
+        match self {
+            Some(list) => list.fields().map(|f| f.lower()).collect(),
+            None => Vec::new(),
+        }
     }
 }
+
 
 impl Lower for StructField {
     type Output = HirStructField;

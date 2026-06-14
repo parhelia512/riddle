@@ -14,11 +14,11 @@ fn main() {
         x:int
     }
     fun main()->int{
-        let a: &&T;
-        let b = &&x;
-        let c = a && b;
-        let d = &&x && y;
-        let e = f(&&x);
+        let a: &&.T.;
+        let b = &&.x;
+        let c = a. && b.;
+        let d = &&x && .y;
+        let e = f(x.);
         e.xxxxx;
         1
     }

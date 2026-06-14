@@ -12,6 +12,7 @@ pub mod body;
 pub mod body_lower;
 pub mod item_tree;
 pub mod lower;
+pub mod source_graph;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Name(pub String);

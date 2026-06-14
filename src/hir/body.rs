@@ -213,14 +213,14 @@ impl BodyPrinter<'_> {
 
             Expr::Unary { operand, op } => {
                 let operand = self.print_expr(*operand, current_prec, indent);
-                format!("{}{}", Self::unary_op_text(op), operand)
+                format!("({}{})", Self::unary_op_text(op), operand)
             }
 
             Expr::Binary { lhs, rhs, op } => {
                 let lhs = self.print_expr(*lhs, current_prec, indent);
                 let rhs = self.print_expr(*rhs, current_prec + 1, indent);
 
-                format!("{} {} {}", lhs, Self::binary_op_text(op), rhs)
+                format!("({} {} {})", lhs, Self::binary_op_text(op), rhs)
             }
 
             Expr::Call { callee, args } => {
@@ -237,7 +237,7 @@ impl BodyPrinter<'_> {
 
             Expr::FieldAccess { base, field } => {
                 let base = self.print_expr(*base, current_prec, indent);
-                format!("{}.{}", base, Self::name_text(field))
+                format!("({}.{})", base, Self::name_text(field))
             }
 
             Expr::Block { stmts, tail } => self.print_block(stmts, *tail, indent),

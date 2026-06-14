@@ -3,6 +3,20 @@ struct Foo{
     y: i32,
 }
 
+trait Bar{
+    fn bar();
+}
+
+impl Self, Bar for Foo{
+    fn bar(){
+        
+    }
+
+    fn help()->str{
+        "HELP"
+    }
+}
+
 fun main(){
     let t: Foo;
     {
