@@ -4,29 +4,31 @@ struct Foo{
 }
 
 trait Bar{
-    fn bar();
+    fun bar();
 }
 
-impl Self, Bar for Foo{
-    fn bar(){
+impl Bar for Foo{
+    fun bar(){
         
     }
 
-    fn help()->str{
+    fun help()->str{
         "HELP"
     }
 }
 
 fun main(){
     let t: Foo;
-    {
+    {    
         let x = Foo{x:1, y:1};
-        t = x
-        print(x) // error
+        t = x;
+        print(x); // error
     }
+    let t: &Foo;
     {
         let y = &Foo{x:1, y:1};
-        t = y.clone()
-        print(y) // yes
+        t = y;
+        print(y); // yes
     }
+    print(t); // yes
 }

@@ -1,0 +1,8 @@
+[package]
+name = "frontend"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+logos.workspace = true
+rowan.workspace = true

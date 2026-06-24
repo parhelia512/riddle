@@ -1,9 +1,48 @@
-[package]
-name = "riddle"
+[workspace]
+resolver = "2"
+members = [
+    "app/info-viz",
+    "app/riddlec",
+    "crates/ast",
+    "crates/frontend",
+    "crates/hir",
+    "crates/scope-graph",
+    "crates/type-checker",
+]
+default-members = [
+    ".",
+    "app/info-viz",
+    "app/riddlec",
+    "crates/ast",
+    "crates/frontend",
+    "crates/hir",
+    "crates/scope-graph",
+    "crates/type-checker",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-logos = "0.14"
-rowan = "0.15"
+[workspace.dependencies]
+ast = { path = "crates/ast" }
+frontend = { path = "crates/frontend" }
+hir = { path = "crates/hir" }
 la-arena = "0.3"
+logos = "0.16"
+rowan = "0.15"
+scope-graph = { path = "crates/scope-graph" }
+type-checker = { path = "crates/type-checker" }
+
+[package]
+name = "riddle"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dev-dependencies]
+ast.workspace = true
+frontend.workspace = true
+hir.workspace = true
+scope-graph.workspace = true
+type-checker.workspace = true

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Riddle Message Viz</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="toolbar">
+  <span class="brand">riddle-message-viz</span>
+  <div class="view-controls" aria-label="View controls">
+    <button type="button" id="toggleCode" class="toggle-button active" aria-pressed="true">Code</button>
+    <button type="button" id="toggleData" class="toggle-button active" aria-pressed="true">Data</button>
+  </div>
+  <span id="status">ready</span>
+</div>
+<main class="app">
+  <section class="editor-pane">
+    <textarea id="source" spellcheck="false">{{SOURCE}}</textarea>
+  </section>
+  <section class="result-pane" id="result">
+    <div class="summary"><span class="badge neutral">loading</span></div>
+  </section>
+</main>
+<script src="/assets/app.js"></script>
+</body>
+</html>

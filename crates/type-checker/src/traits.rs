@@ -1,0 +1,231 @@
+use std::collections::{HashMap, HashSet};
+
+use hir::item_tree::{HirFunction, HirImpl, HirTrait, HirTypeRef, TypeAliasId};
+
+use crate::{checker::TypeChecker, types::Type};
+
+impl TypeChecker<'_> {
+    pub(crate) fn check_traits(&mut self) {
+        let traits = self
+            .hir
+            .item_tree
+            .traits
+            .iter()
+            .map(|(_, tr)| tr.clone())
+            .collect::<Vec<_>>();
+
+        for tr in traits {
+            self.check_trait_decl(&tr);
+        }
+    }
+
+    pub(crate) fn check_impls(&mut self) {
+        let impls = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .map(|(_, imp)| imp.clone())
+            .collect::<Vec<_>>();
+
+        for imp in impls {
+            self.check_impl_decl(&imp);
+        }
+    }
+
+    fn check_trait_decl(&mut self, tr: &HirTrait) {
+        let mut methods = HashSet::new();
+        for method in &tr.methods {
+            if !methods.insert(method.name.0.clone()) {
+                self.diagnostic(format!(
+                    "trait `{}` has duplicate method `{}`",
+                    tr.name.0, method.name.0
+                ));
+            }
+
+            if method.has_body {
+                self.diagnostic(format!(
+                    "trait method `{}::{}` must not have a body",
+                    tr.name.0, method.name.0
+                ));
+            }
+        }
+
+        let mut type_aliases = HashSet::new();
+        for assoc in &tr.type_aliases {
+            if !type_aliases.insert(assoc.name.0.clone()) {
+                self.diagnostic(format!(
+                    "trait `{}` has duplicate associated type `{}`",
+                    tr.name.0, assoc.name.0
+                ));
+            }
+        }
+    }
+
+    fn check_impl_decl(&mut self, imp: &HirImpl) {
+        self.check_impl_duplicates(imp);
+
+        let Some(trait_ty) = imp.trait_ty.as_ref() else {
+            return;
+        };
+
+        let self_ty_text = self.display_type_ref(&imp.self_ty);
+        let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+            self.diagnostic(format!(
+                "impl for `{}` references unknown trait `{}`",
+                self_ty_text,
+                self.type_ref_source_text(trait_ty)
+            ));
+            return;
+        };
+
+        let tr = self.hir.item_tree.traits[trait_id].clone();
+        self.check_trait_impl(&self_ty_text, &tr, imp);
+    }
+
+    fn check_impl_duplicates(&mut self, imp: &HirImpl) {
+        let impl_name = self.display_type_ref(&imp.self_ty);
+
+        let mut methods = HashSet::new();
+        for fid in &imp.methods {
+            let method = &self.hir.item_tree.functions[*fid];
+            if !methods.insert(method.name.0.clone()) {
+                self.diagnostic(format!(
+                    "impl for `{}` has duplicate method `{}`",
+                    impl_name, method.name.0
+                ));
+            }
+        }
+
+        let mut type_aliases = HashSet::new();
+        for alias in &imp.type_aliases {
+            let assoc = &self.hir.item_tree.type_aliases[*alias];
+            if !type_aliases.insert(assoc.name.0.clone()) {
+                self.diagnostic(format!(
+                    "impl for `{}` has duplicate associated type `{}`",
+                    impl_name, assoc.name.0
+                ));
+            }
+        }
+    }
+
+    fn check_trait_impl(&mut self, self_ty_text: &str, tr: &HirTrait, imp: &HirImpl) {
+        let mut methods = HashMap::new();
+        for fid in &imp.methods {
+            let method = self.hir.item_tree.functions[*fid].clone();
+            methods.entry(method.name.0.clone()).or_insert(method);
+        }
+
+        for required in &tr.methods {
+            let Some(actual) = methods.get(&required.name.0) else {
+                self.diagnostic(format!(
+                    "impl for `{}` of trait `{}` missing method `{}`",
+                    self_ty_text, tr.name.0, required.name.0
+                ));
+                continue;
+            };
+
+            self.expect_method_signature(&tr.name.0, required, actual);
+        }
+
+        let provided_types = imp
+            .type_aliases
+            .iter()
+            .map(|id| (*id, self.hir.item_tree.type_aliases[*id].name.0.clone()))
+            .collect::<Vec<(TypeAliasId, String)>>();
+
+        for required in &tr.type_aliases {
+            let provided = provided_types
+                .iter()
+                .any(|(_, name)| *name == required.name.0);
+
+            if required.ty.is_none() && !provided {
+                self.diagnostic(format!(
+                    "impl for `{}` of trait `{}` missing associated type `{}`",
+                    self_ty_text, tr.name.0, required.name.0
+                ));
+            }
+        }
+    }
+
+    fn expect_method_signature(
+        &mut self,
+        trait_name: &str,
+        expected: &HirFunction,
+        actual: &HirFunction,
+    ) {
+        if expected.params.len() != actual.params.len() {
+            self.diagnostic(format!(
+                "impl method `{}` for trait `{}` parameter count mismatch: expected {}, got {}",
+                expected.name.0,
+                trait_name,
+                expected.params.len(),
+                actual.params.len()
+            ));
+        }
+
+        for (index, expected_param) in expected.params.iter().enumerate() {
+            let Some(actual_param) = actual.params.get(index) else {
+                continue;
+            };
+
+            let expected_ty = self.lower_type_ref(&expected_param.ty);
+            let actual_ty = self.lower_type_ref(&actual_param.ty);
+            if !self.signature_types_match(&expected_ty, &actual_ty) {
+                self.diagnostic(format!(
+                    "impl method `{}` for trait `{}` parameter {} type mismatch: expected {}, got {}",
+                    expected.name.0,
+                    trait_name,
+                    index + 1,
+                    expected_ty.display(self.hir),
+                    actual_ty.display(self.hir)
+                ));
+            }
+        }
+
+        let expected_ret = expected
+            .ret_type
+            .as_ref()
+            .map(|ty| self.lower_type_ref(ty))
+            .unwrap_or(Type::Unit);
+        let actual_ret = actual
+            .ret_type
+            .as_ref()
+            .map(|ty| self.lower_type_ref(ty))
+            .unwrap_or(Type::Unit);
+        if !self.signature_types_match(&expected_ret, &actual_ret) {
+            self.diagnostic(format!(
+                "impl method `{}` for trait `{}` return type mismatch: expected {}, got {}",
+                expected.name.0,
+                trait_name,
+                expected_ret.display(self.hir),
+                actual_ret.display(self.hir)
+            ));
+        }
+    }
+
+    fn signature_types_match(&self, expected: &Type, actual: &Type) -> bool {
+        expected.is_unknown_like()
+            || actual.is_unknown_like()
+            || expected == actual
+            || self.numeric_assignable(expected, actual)
+    }
+
+    fn type_ref_source_text(&self, ty: &HirTypeRef) -> String {
+        match ty {
+            HirTypeRef::Named(path) => path.display(),
+            HirTypeRef::Ref(inner) => format!("&{}", self.type_ref_source_text(inner)),
+            HirTypeRef::Tuple(elements) => {
+                let inner = elements
+                    .iter()
+                    .map(|ty| self.type_ref_source_text(ty))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({inner})")
+            }
+            HirTypeRef::Array(inner) => format!("[{}]", self.type_ref_source_text(inner)),
+            HirTypeRef::Unknown => "_".to_string(),
+            HirTypeRef::Error => "<error>".to_string(),
+        }
+    }
+}
