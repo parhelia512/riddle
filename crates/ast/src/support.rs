@@ -1,4 +1,4 @@
-use crate::frontend::syntax_kind::{SyntaxKind, SyntaxNode, SyntaxToken};
+use frontend::syntax_kind::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 pub fn token(parent: &SyntaxNode, predicate: impl Fn(SyntaxKind) -> bool) -> Option<SyntaxToken> {
     parent

@@ -1,9 +1,37 @@
 [package]
-name = "riddle"
+name = "workspace-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[workspace]
+resolver = "2"
+members = ["app/*", "crates/*"]
+default-members = [
+    ".",
+    "app/riddlec",
+    "app/scope-graph-viz",
+    "crates/ast",
+    "crates/frontend",
+    "crates/hir",
+    "crates/scope-graph",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-logos = "0.14"
+[workspace.dependencies]
+frontend = { path = "crates/frontend" }
+ast = { path = "crates/ast" }
+hir = { path = "crates/hir" }
+scope-graph = { path = "crates/scope-graph" }
+logos = "0.16"
 rowan = "0.15"
 la-arena = "0.3"
+
+[dev-dependencies]
+ast.workspace = true
+frontend.workspace = true
+hir.workspace = true
+scope-graph.workspace = true

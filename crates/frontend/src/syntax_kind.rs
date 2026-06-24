@@ -6,7 +6,7 @@ pub enum SyntaxKind {
     #[regex(r"[ \t\r\n]+")]
     Whitespace = 0,
 
-    #[regex(r"//[^\n]*")]
+    #[regex(r"//[^\n]*", allow_greedy = true)]
     LineComment,
 
     // keywords
@@ -24,11 +24,60 @@ pub enum SyntaxKind {
     While,
     #[token("return")]
     Return,
+    #[token("as")]
+    As,
+    #[token("self")]
+    SelfKw,
+    #[token("mod")]
+    Mod,
+    #[token("use")]
+    Use,
+    #[token("mut")]
+    Mut,
+    #[token("pub")]
+    Pub,
+    #[token("super")]
+    SuperKw,
+    #[token("crate")]
+    CrateKw,
+    #[token("enum")]
+    Enum,
+    #[token("trait")]
+    Trait,
+    #[token("impl")]
+    Impl,
+    #[token("match")]
+    Match,
+    #[token("const")]
+    Const,
+    #[token("type")]
+    TypeKw,
+    #[token("for")]
+    For,
+    #[token("where")]
+    Where,
+    #[token("true")]
+    True,
+    #[token("false")]
+    False,
+    #[regex(r#""([^"\\]|\\.)*""#)]
+    #[regex(r##"r#*"[^"]*"#*"##)]
+    String,
+    #[regex(r#"'([^'\\]|\\.)'"#)]
+    Char,
+    #[token("_")]
+    Underscore,
 
-    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*")]
+    #[regex(r"[0-9]+\.[0-9]+(?:[eE][+-]?[0-9]+)?(?:f32|f64)?")]
+    #[regex(r"[0-9]+(?:[eE][+-]?[0-9]+)(?:f32|f64)?")]
+    #[regex(r"[0-9]+\.[0-9]*(?:f32|f64)?")]
+    Float,
+
+    #[regex(r"[a-zA-Z][a-zA-Z0-9_]*")]
+    #[regex(r"_[a-zA-Z0-9_]+")]
     Ident,
 
-    #[regex(r"[1-9][0-9]*|0")]
+    #[regex(r"[0-9]+(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)?")]
     Number,
 
     #[token("->")]
@@ -45,6 +94,8 @@ pub enum SyntaxKind {
     AmpAmp,
     #[token("||")]
     PipePipe,
+    #[token("=>")]
+    FatArrow,
 
     #[token("+")]
     Plus,
@@ -73,11 +124,17 @@ pub enum SyntaxKind {
     LBrace,
     #[token("}")]
     RBrace,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
 
     #[token(".")]
     Dot,
     #[token(":")]
     Colon,
+    #[token("::")]
+    ColonColon,
     #[token(";")]
     Semi,
     #[token(",")]
@@ -95,6 +152,12 @@ pub enum SyntaxKind {
     StructDecl,
     StructField,
     StructFieldList,
+    ModDecl,
+    UseDecl,
+    UseTree,
+    UseTreeList,
+    Path,
+    PathSegment,
     IfStmt,
     WhileStmt,
     ReturnStmt,
@@ -108,8 +171,31 @@ pub enum SyntaxKind {
     CallExpr,
     ArgList,
     FieldExpr,
+    StructExpr,
+    StructExprField,
     NamedType,
     RefType,
+    TupleType,
+    ArrayType,
+    ArrayExpr,
+    MatchExpr,
+    MatchArm,
+    EnumDecl,
+    EnumVariant,
+    TraitDecl,
+    ImplDecl,
+    GenericParams,
+    TypeAliasDecl,
+    ConstDecl,
+    TuplePattern,
+    StructPattern,
+    EnumPattern,
+    WildcardPattern,
+    LiteralPattern,
+    FloatLit,
+    StringLit,
+    CharLit,
+    BoolLit,
     ErrorNode,
 
     // special

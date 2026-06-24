@@ -1,0 +1,8 @@
+[package]
+name = "ast"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+frontend.workspace = true
+rowan.workspace = true

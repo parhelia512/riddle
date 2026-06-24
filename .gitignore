@@ -8,7 +8,6 @@
 
 # Rust
 /target
-Cargo.lock
 
 # Editors
 .vscode/
@@ -20,3 +19,6 @@ Cargo.lock
 
 # Environment
 .env
+
+# AI
+.junie/
