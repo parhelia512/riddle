@@ -287,16 +287,12 @@ impl NumberExpr {
     }
 
     pub fn value(&self) -> Option<i64> {
-<<<<<<< HEAD
         let text = self.value_token()?;
         let text = text.text();
         let suffix_start = text
             .find(|ch: char| !ch.is_ascii_digit())
             .unwrap_or(text.len());
         text[..suffix_start].parse().ok()
-=======
-        self.value_token()?.text().parse().ok()
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     }
 }
 
@@ -567,14 +563,10 @@ impl FloatLitExpr {
     pub fn value(&self) -> Option<f64> {
         let text = self.value_token()?;
         let text = text.text();
-<<<<<<< HEAD
         let trimmed = ["f16", "f32", "f64", "f128"]
             .iter()
             .find_map(|suffix| text.strip_suffix(suffix))
             .unwrap_or(text);
-=======
-        let trimmed = text.trim_end_matches("f32").trim_end_matches("f64");
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
         trimmed.parse().ok()
     }
 }

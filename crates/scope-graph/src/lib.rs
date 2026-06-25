@@ -33,13 +33,10 @@ pub struct ScopeGraph {
 
     /// Partial path cache indexed by start node.
     pub partial_index: HashMap<NodeId, Vec<PartialPath>>,
-<<<<<<< HEAD
 
     /// Associated item scopes for struct types. `Point::new` resolves by first matching
     /// `Point`, then continuing in this scope with the remaining path.
     pub impl_scopes_by_struct: HashMap<StructId, NodeId>,
-=======
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 }
 
 #[derive(Debug, Clone)]
@@ -82,11 +79,8 @@ pub enum ScopeKind {
     ModExported,
     /// Shared scope for function parameters and the body root.
     FunctionScope,
-<<<<<<< HEAD
     /// Associated item scope for a concrete type.
     ImplScope,
-=======
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 }
 
 #[derive(Debug, Clone)]
@@ -178,10 +172,7 @@ impl ScopeGraph {
             by_ptr: HashMap::new(),
             out_edges,
             partial_index: HashMap::new(),
-<<<<<<< HEAD
             impl_scopes_by_struct: HashMap::new(),
-=======
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
         }
     }
 
@@ -230,12 +221,9 @@ impl ScopeGraph {
             self.partial_index.remove(nid);
             self.out_edges.remove(nid);
         }
-<<<<<<< HEAD
         let dead_nodes: std::collections::HashSet<NodeId> = frag.nodes.iter().copied().collect();
         self.impl_scopes_by_struct
             .retain(|_, scope| !dead_nodes.contains(scope));
-=======
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 
         // 2. Remove edges from `out_edges`. The source node may already be a tombstone.
         for eid in &frag.edges {

@@ -555,7 +555,6 @@ fn assignment_and_struct_literal_parse_and_lower() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn impl_method_body_references_are_encoded() {
     let sg = build(
         r#"
@@ -630,8 +629,6 @@ fn incremental_impl_method_body_rebuilds_resolution() {
 }
 
 #[test]
-=======
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 fn incremental_multi_edit_local_shadowing_rebuilds_statement_chain() {
     let mut parser = IncrementalParser::new();
     parser.set_source(

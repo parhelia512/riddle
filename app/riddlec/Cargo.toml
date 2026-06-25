@@ -8,7 +8,4 @@ ast.workspace = true
 frontend.workspace = true
 hir.workspace = true
 scope-graph.workspace = true
-<<<<<<< HEAD
 type-checker.workspace = true
-=======
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c

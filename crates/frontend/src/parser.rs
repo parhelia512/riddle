@@ -1064,15 +1064,10 @@ impl<'s> Parser<'s> {
         let m = self.start();
 
         self.expect(SyntaxKind::Ident);
-<<<<<<< HEAD
         if self.at(SyntaxKind::Colon) {
             self.bump();
             self.expression();
         }
-=======
-        self.expect(SyntaxKind::Colon);
-        self.expression();
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 
         m.complete(self, SyntaxKind::StructExprField);
     }

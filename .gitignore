@@ -5,9 +5,11 @@
 ._*
 .Spotlight-V100
 .Trashes
+.tmp/
 
 # Rust
 /target
+Cargo.lock
 
 # Editors
 .vscode/
