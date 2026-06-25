@@ -183,6 +183,7 @@ fn resolve_pop(
                 resolve_from(sg, *enter, remaining, visited, fuel - 1)
             }
         }
+<<<<<<< HEAD
         DefRef::Struct(sid) => {
             if remaining.is_empty() {
                 vec![define.clone()]
@@ -192,6 +193,8 @@ fn resolve_pop(
                 vec![]
             }
         }
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
         _ => {
             if remaining.is_empty() {
                 vec![define.clone()]

@@ -134,6 +134,7 @@ pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: ast::ModDecl) -> ModuleId {
 pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree::ImplId {
     use item_tree::{HirImpl, HirTypeRef};
 
+<<<<<<< HEAD
     let impl_path = i.path().map(|p| p.lower());
     let for_ty = i.trait_type().map(|t| t.lower());
     let (self_ty, trait_ty) = match for_ty {
@@ -145,6 +146,13 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
             None,
         ),
     };
+=======
+    let self_ty = i
+        .path()
+        .map(|p| HirTypeRef::Named(p.lower()))
+        .unwrap_or(HirTypeRef::Error);
+    let trait_ty = i.trait_type().map(|t| t.lower());
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     let generics = i
         .generic_params()
         .map(|g| g.names().map(|t| Name(t.text().to_string())).collect())

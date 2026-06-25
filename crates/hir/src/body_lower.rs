@@ -11,7 +11,10 @@ use super::{
         Stmt, StmtId, StructExprField, UnaryOp,
     },
     item_tree::HirTypeRef,
+<<<<<<< HEAD
     item_tree::{HirPath, PathAnchor},
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     lower::{Lower, lower_name},
 };
 
@@ -207,6 +210,7 @@ impl<'a> BodyLower<'a> {
     fn lower_expr(&mut self, expr: ast::Expr) -> ExprId {
         match expr {
             ast::Expr::Number(n) => {
+<<<<<<< HEAD
                 let text = n
                     .value_token()
                     .map(|token| token.text().to_string())
@@ -230,6 +234,21 @@ impl<'a> BodyLower<'a> {
                     0.0
                 });
                 self.alloc_expr(Expr::FloatLiteral { value, suffix })
+=======
+                let value = n.value().unwrap_or_else(|| {
+                    self.diagnostic("invalid integer literal");
+                    0
+                });
+                self.alloc_expr(Expr::IntLiteral { value })
+            }
+
+            ast::Expr::Float(f) => {
+                let value = f.value().unwrap_or_else(|| {
+                    self.diagnostic("invalid float literal");
+                    0.0
+                });
+                self.alloc_expr(Expr::FloatLiteral { value })
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
             }
 
             ast::Expr::StringLit(s) => {
@@ -348,6 +367,7 @@ impl<'a> BodyLower<'a> {
                     .fields()
                     .map(|field| {
                         let name = lower_name(field.name());
+<<<<<<< HEAD
                         let value = field
                             .value()
                             .map(|value| self.lower_expr(value))
@@ -361,6 +381,10 @@ impl<'a> BodyLower<'a> {
                                     resolved: None,
                                 })
                             });
+=======
+                        let value =
+                            self.lower_required_expr(field.value(), "missing struct field value");
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
                         StructExprField { name, value }
                     })
                     .collect();
@@ -472,6 +496,7 @@ fn lower_unary_op(token: Option<SyntaxToken>) -> Option<UnaryOp> {
         _ => None,
     }
 }
+<<<<<<< HEAD
 
 fn split_int_literal(text: &str) -> (&str, Option<String>) {
     let suffix_start = text
@@ -490,3 +515,5 @@ fn split_float_literal(text: &str) -> (&str, Option<String>) {
     }
     (text, None)
 }
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c

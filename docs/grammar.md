@@ -85,7 +85,11 @@ array_expr = "[" (expression ("," expression)* ","?)? "]";
 
 struct_expr = path struct_expr_fields;
 struct_expr_fields = "{" (struct_expr_field ("," struct_expr_field)* ","?)? "}";
+<<<<<<< HEAD
 struct_expr_field = ident (":" expression)?;
+=======
+struct_expr_field = ident ":" expression;
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 
 pattern = "_" | ident | literal | path | tuple_pattern | struct_pattern | enum_pattern;
 
@@ -135,7 +139,11 @@ literal = int_lit | float_lit | string_lit | char_lit | bool_lit;
 
 int_lit = [0-9]+ ("i8" | "i16" | "i32" | "i64" | "i128" | "isize"
                 | "u8" | "u16" | "u32" | "u64" | "u128" | "usize")?;
+<<<<<<< HEAD
 float_lit = [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)? ("f16" | "f32" | "f64" | "f128")?;
+=======
+float_lit = [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)? ("f32" | "f64")?;
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 string_lit = "\"" ... "\"" | raw_string_lit;
 char_lit = "'" ... "'";
 bool_lit = "true" | "false";

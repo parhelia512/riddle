@@ -7,8 +7,12 @@ use hir::{
     HirFile, Name,
     body::{Body, BodyId, BodyItem, Expr, ExprId, MatchArm, PatId, Pattern, Stmt, StmtId},
     item_tree::{
+<<<<<<< HEAD
         FunctionId, HirPath, HirTypeRef, HirUseTree, HirUseTreeKind, ModuleId, PathAnchor,
         StructId, TopLevelItem,
+=======
+        FunctionId, HirPath, HirUseTree, HirUseTreeKind, ModuleId, PathAnchor, TopLevelItem,
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     },
 };
 
@@ -53,7 +57,10 @@ impl<'a> ScopeGraphBuilder<'a> {
         // Pre-allocate module scopes because imports may refer to modules that have not
         // been encoded yet.
         self.pre_alloc_module_scopes();
+<<<<<<< HEAD
         self.pre_alloc_impl_scopes();
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 
         let mut frag_nodes = vec![];
         let mut frag_edges = vec![];
@@ -85,6 +92,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         }
     }
 
+<<<<<<< HEAD
     fn pre_alloc_impl_scopes(&mut self) {
         for (sid, _) in self.hir.item_tree.structs.iter() {
             let scope = self.sg.alloc_node(Node::Scope(ScopeKind::ImplScope));
@@ -92,6 +100,8 @@ impl<'a> ScopeGraphBuilder<'a> {
         }
     }
 
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     fn encode_items(
         &mut self,
         items: &[TopLevelItem],
@@ -107,7 +117,10 @@ impl<'a> ScopeGraphBuilder<'a> {
                     self.encode_function(*fid, parent_scope, frag_nodes, frag_edges);
                 }
                 TopLevelItem::Struct(sid) => {
+<<<<<<< HEAD
                     self.encode_struct_impl_scope(*sid, parent_scope, frag_nodes, frag_edges);
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
                     let name = self.hir.item_tree.structs[*sid].name.clone();
                     let pop = self.sg.alloc_node(Node::PopSymbol {
                         name,
@@ -164,8 +177,16 @@ impl<'a> ScopeGraphBuilder<'a> {
                     let u = self.hir.item_tree.uses[*uid].clone();
                     self.encode_use_tree(&u.tree, parent_scope, frag_nodes, frag_edges);
                 }
+<<<<<<< HEAD
                 TopLevelItem::Impl(iid) => {
                     self.encode_impl(*iid, parent_scope, frag_nodes, frag_edges);
+=======
+                TopLevelItem::Impl(_iid) => {
+                    // Impl blocks add their members to the parent scope's definition set.
+                    // Methods/consts/type-aliases were already encoded via the item-tree
+                    // dispatch in encode_items, so we simply recurse into the impl's items.
+                    // For now, impl items are not separately scoped.
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
                 }
             }
         }
@@ -201,6 +222,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_nodes: &mut Vec<NodeId>,
         frag_edges: &mut Vec<EdgeId>,
     ) {
+<<<<<<< HEAD
         self.encode_function_def(fid, parent_scope, frag_nodes, frag_edges);
         self.encode_function_body(fid, parent_scope, frag_nodes, frag_edges);
     }
@@ -212,6 +234,8 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_nodes: &mut Vec<NodeId>,
         frag_edges: &mut Vec<EdgeId>,
     ) {
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
         let func = self.hir.item_tree.functions[fid].clone();
 
         // Register the function name in its parent scope.
@@ -222,6 +246,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_nodes.push(pop);
         let e = self.sg.add_edge(parent_scope, pop, EdgeKind::Def, 0);
         frag_edges.push(e);
+<<<<<<< HEAD
     }
 
     fn encode_function_body(
@@ -232,6 +257,8 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_edges: &mut Vec<EdgeId>,
     ) {
         let func = self.hir.item_tree.functions[fid].clone();
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 
         // Create the function scope shared by parameters and the body root.
         let fn_scope = self.sg.alloc_node(Node::Scope(ScopeKind::FunctionScope));
@@ -260,6 +287,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         }
     }
 
+<<<<<<< HEAD
     fn encode_struct_impl_scope(
         &mut self,
         sid: StructId,
@@ -343,6 +371,8 @@ impl<'a> ScopeGraphBuilder<'a> {
         self.sg.impl_scopes_by_struct.get(&sid).copied()
     }
 
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     fn encode_module(
         &mut self,
         mid: ModuleId,

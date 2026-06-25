@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 [workspace]
 resolver = "2"
 members = [
@@ -13,11 +14,29 @@ default-members = [
     ".",
     "app/info-viz",
     "app/riddlec",
+=======
+[package]
+name = "workspace-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[workspace]
+resolver = "2"
+members = ["app/*", "crates/*"]
+default-members = [
+    ".",
+    "app/riddlec",
+    "app/scope-graph-viz",
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     "crates/ast",
     "crates/frontend",
     "crates/hir",
     "crates/scope-graph",
+<<<<<<< HEAD
     "crates/type-checker",
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 ]
 
 [workspace.package]
@@ -25,6 +44,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+<<<<<<< HEAD
 ast = { path = "crates/ast" }
 frontend = { path = "crates/frontend" }
 hir = { path = "crates/hir" }
@@ -39,10 +59,22 @@ name = "riddle"
 version.workspace = true
 edition.workspace = true
 publish = false
+=======
+frontend = { path = "crates/frontend" }
+ast = { path = "crates/ast" }
+hir = { path = "crates/hir" }
+scope-graph = { path = "crates/scope-graph" }
+logos = "0.16"
+rowan = "0.15"
+la-arena = "0.3"
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
 
 [dev-dependencies]
 ast.workspace = true
 frontend.workspace = true
 hir.workspace = true
 scope-graph.workspace = true
+<<<<<<< HEAD
 type-checker.workspace = true
+=======
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c

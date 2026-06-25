@@ -62,11 +62,17 @@ pub enum Expr {
     Missing,
     IntLiteral {
         value: i64,
+<<<<<<< HEAD
         suffix: Option<String>,
     },
     FloatLiteral {
         value: f64,
         suffix: Option<String>,
+=======
+    },
+    FloatLiteral {
+        value: f64,
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     },
     StringLiteral {
         value: String,
@@ -331,12 +337,17 @@ impl BodyPrinter<'_> {
         let current_prec = self.expr_prec(expr);
         let out = match &self.body.exprs[expr] {
             Expr::Missing => "<missing>".to_string(),
+<<<<<<< HEAD
             Expr::IntLiteral { value, suffix } => {
                 format!("{}{}", value, suffix.as_deref().unwrap_or(""))
             }
             Expr::FloatLiteral { value, suffix } => {
                 format!("{}{}", value, suffix.as_deref().unwrap_or(""))
             }
+=======
+            Expr::IntLiteral { value } => value.to_string(),
+            Expr::FloatLiteral { value } => value.to_string(),
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
             Expr::StringLiteral { value } => format!("\"{}\"", value),
             Expr::CharLiteral { value } => format!("'{}'", value),
             Expr::BoolLiteral { value } => value.to_string(),

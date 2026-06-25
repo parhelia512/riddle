@@ -22,13 +22,22 @@ fun main(){
     {    
         let x = Foo{x:1, y:1};
         t = x;
+<<<<<<< HEAD
         print(x); // error
+=======
+        print(x) // error
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     }
     let t: &Foo;
     {
         let y = &Foo{x:1, y:1};
+<<<<<<< HEAD
         t = y;
         print(y); // yes
+=======
+        t = y.clone();
+        print(y) // yes
+>>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
     }
     print(t); // yes
 }
