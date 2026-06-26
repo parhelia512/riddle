@@ -8,6 +8,8 @@ use hir::{
 use crate::{checker::TypeChecker, context::BodyCtx, types::Type};
 
 impl TypeChecker<'_> {
+    // ── Statements ──────────────────────────────────────────────────
+
     pub(crate) fn check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
         match &ctx.body.stmts[stmt_id] {
             Stmt::Let { ty, init, .. } => {
@@ -42,6 +44,8 @@ impl TypeChecker<'_> {
             Stmt::Item { .. } => {}
         }
     }
+
+    // ── Expressions ─────────────────────────────────────────────────
 
     pub(crate) fn check_expr(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) -> Type {
         self.check_expr_inner(ctx, expr_id, None)
@@ -138,6 +142,8 @@ impl TypeChecker<'_> {
             .insert((ctx.body_id, expr_id), ty.clone());
         ty
     }
+
+    // ── Binary / Unary ──────────────────────────────────────────────
 
     fn check_binary(
         &mut self,
@@ -257,6 +263,8 @@ impl TypeChecker<'_> {
         }
     }
 
+    // ── Struct / Match / Array ──────────────────────────────────────
+
     fn check_struct_expr(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -367,6 +375,8 @@ impl TypeChecker<'_> {
         Type::Array(Box::new(element_ty.unwrap_or(Type::Unknown)))
     }
 
+    // ── Call / Field ────────────────────────────────────────────────
+
     fn check_call(&mut self, ctx: &mut BodyCtx<'_>, callee: ExprId, args: &[ExprId]) -> Type {
         let callee_ty = self.check_expr(ctx, callee);
         let Type::Function(fid) = callee_ty else {
@@ -448,6 +458,8 @@ impl TypeChecker<'_> {
         field_ty
     }
 
+    // ── Patterns ────────────────────────────────────────────────────
+
     fn bind_pattern(&mut self, ctx: &mut BodyCtx<'_>, pat: PatId, expected: &Type) {
         match &ctx.body.pats[pat] {
             Pattern::Wildcard | Pattern::Literal | Pattern::Path { .. } => {}
@@ -496,6 +508,8 @@ impl TypeChecker<'_> {
             }
         }
     }
+
+    // ── Name resolution ─────────────────────────────────────────────
 
     fn type_of_resolved_name(
         &mut self,

@@ -6,6 +6,7 @@ members = [
     "crates/ast",
     "crates/frontend",
     "crates/hir",
+    "crates/move-checker",
     "crates/scope-graph",
     "crates/type-checker",
 ]
@@ -16,6 +17,7 @@ default-members = [
     "crates/ast",
     "crates/frontend",
     "crates/hir",
+    "crates/move-checker",
     "crates/scope-graph",
     "crates/type-checker",
 ]
@@ -30,6 +32,7 @@ frontend = { path = "crates/frontend" }
 hir = { path = "crates/hir" }
 la-arena = "0.3"
 logos = "0.16"
+move-checker = { path = "crates/move-checker" }
 rowan = "0.15"
 scope-graph = { path = "crates/scope-graph" }
 type-checker = { path = "crates/type-checker" }
@@ -44,5 +47,6 @@ publish = false
 ast.workspace = true
 frontend.workspace = true
 hir.workspace = true
+move-checker.workspace = true
 scope-graph.workspace = true
 type-checker.workspace = true

@@ -4,6 +4,7 @@ mod context;
 pub mod incremental;
 mod lowering;
 mod result;
+mod trait_env;
 mod traits;
 mod types;
 
@@ -12,4 +13,5 @@ pub use incremental::{
     IncrementalStats, IncrementalTypeCheckResult, IncrementalTypeChecker, check_hir_incremental,
 };
 pub use result::{Diagnostic, TypeCheckResult};
+pub use trait_env::TraitEnv;
 pub use types::{FloatTy, IntTy, Type};

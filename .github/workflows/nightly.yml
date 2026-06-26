@@ -1,0 +1,77 @@
+name: Nightly Build
+
+on:
+  schedule:
+    # 每天 UTC 时间 2:00 运行（北京时间约 10:00）
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      upload-artifacts:
+        description: "上传构建产物"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-${{ matrix.os }}
+
+      - name: Clippy 检查
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 运行测试
+        run: cargo test --workspace
+
+      - name: Release 构建
+        run: cargo build --workspace --release
+
+      # 上传构建产物
+      - name: 上传 riddlec 二进制文件
+        if: ${{ github.event_name == 'schedule' || inputs.upload-artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: riddlec-${{ matrix.os }}
+          path: |
+            target/release/riddlec
+            target/release/riddlec.exe
+
+      - name: 上传 info-viz 二进制文件
+        if: ${{ github.event_name == 'schedule' || inputs.upload-artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: info-viz-${{ matrix.os }}
+          path: |
+            target/release/info-viz
+            target/release/info-viz.exe
+
+  notify:
+    name: 通知结果
+    needs: build-and-test
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 构建失败通知
+        run: |
+          echo "夜间构建失败！请检查日志："
+          echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

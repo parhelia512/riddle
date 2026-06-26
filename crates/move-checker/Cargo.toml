@@ -1,12 +1,10 @@
 [package]
-name = "riddlec"
+name = "move-checker"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
-ast.workspace = true
-frontend.workspace = true
 hir.workspace = true
-move-checker.workspace = true
-scope-graph.workspace = true
 type-checker.workspace = true
+la-arena.workspace = true

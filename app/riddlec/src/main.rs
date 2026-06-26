@@ -1,252 +1,86 @@
-use ast::{self, support::AstNode};
-use frontend::incremental::IncrementalParser;
-use hir::{
-    HirFile,
-    body::{BinaryOp, Body, Expr, ExprId, UnaryOp},
-    item_tree::HirTypeRef,
-    lower_root,
-};
-use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
-use type_checker::{TypeCheckResult, check_hir};
+mod diagnostics;
+mod pipeline;
+
+use std::env;
+use std::fs;
+use std::process;
 
 fn main() {
-    let mut parser = IncrementalParser::new();
-    let parse = parser.set_source(
-        r#"
-struct Point {
-    x: i32,
-    y: i64,
-    label: str,
-}
+    let args: Vec<String> = env::args().collect();
 
-impl Point{
-    fun new(x: i32, y: i64, label: str) -> Point {
-        Point{x, y, label}
-    }
-}
-
-fun add(left: i64, right: i64) -> i64 {
-    left + right
-}
-
-fun weight(value: f32) -> f32 {
-    value + 1.5f32
-}
-
-fun main(flag: bool) -> i64 {
-    let p = Point{x: 1, y: 2, label: "origin"};
-    let px: i64 = 1;
-    let total = add(px, p.y);
-    let w: f32 = weight(0.5);
-    if flag { total } else { 0 };
-    let q = Point::new(1, 2, "q");
-    0
-}
-
-fun broken() -> bool {
-    let value: bool = 1;
-    return add(1, 2);
-}
-"#,
-    );
-
-    if !parse.errors.is_empty() {
-        println!("parse errors:");
-        for error in &parse.errors {
-            println!("  - {error}");
+    let (files, verbose) = match parse_args(&args) {
+        Ok(opts) => opts,
+        Err(msg) => {
+            eprintln!("riddlec: {msg}");
+            eprintln!("usage: riddlec [--verbose] <file>...");
+            process::exit(1);
         }
-        return;
+    };
+
+    if files.is_empty() {
+        eprintln!("riddlec: no input files");
+        eprintln!("usage: riddlec [--verbose] <file>...");
+        process::exit(1);
     }
 
-    let syntax = parse.syntax();
-    let root = ast::Root::cast(syntax.clone()).unwrap();
-    let mut hir = lower_root(root);
-    let sg = build_scope_graph(&hir, &syntax);
-    resolve_hir(&mut hir, &sg);
+    let mut total_errors = 0;
 
-    let result = check_hir(&hir);
-    print_expr_types(&hir, &result);
-    print_type_diagnostics(&result);
-}
-
-fn print_expr_types(hir: &HirFile, result: &TypeCheckResult) {
-    println!("== expression types ==");
-    for (fid, function) in hir.item_tree.functions.iter() {
-        let Some(body_id) = hir.function_bodies.get(&fid).copied() else {
-            continue;
+    for file in &files {
+        let source = match fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("riddlec: cannot read `{file}`: {e}");
+                total_errors += 1;
+                continue;
+            }
         };
 
-        let params = function
-            .params
-            .iter()
-            .map(|param| format!("{}: {}", param.name.0, type_ref_text(&param.ty)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let ret = function
-            .ret_type
-            .as_ref()
-            .map(type_ref_text)
-            .unwrap_or_else(|| "()".to_string());
-        println!("fun {}({params}) -> {ret}", function.name.0);
+        let result = pipeline::compile(&source);
 
-        let body = &hir.bodies[body_id];
-        for (expr_id, _) in body.exprs.iter() {
-            let expr = expr_text(body, expr_id);
-            let ty = result
-                .expr_types
-                .get(&(body_id, expr_id))
-                .map(|ty| ty.display(hir))
-                .unwrap_or_else(|| "<not checked>".to_string());
-            println!("  {expr_id:?}: {expr} : {ty}");
+        if verbose {
+            if files.len() > 1 {
+                println!("== {file} ==");
+            }
+            diagnostics::report_verbose(&result);
+            println!();
         }
-        println!();
+
+        total_errors += diagnostics::report(&result, file);
+    }
+
+    if total_errors > 0 {
+        process::exit(1);
     }
 }
 
-fn print_type_diagnostics(result: &TypeCheckResult) {
-    println!("== type diagnostics ==");
-    if result.diagnostics.is_empty() {
-        println!("  <none>");
-        return;
+fn parse_args(args: &[String]) -> Result<(Vec<String>, bool), &'static str> {
+    let mut files = Vec::new();
+    let mut verbose = false;
+
+    // Skip argv[0] (the binary name).
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--verbose" | "-v" => verbose = true,
+            "--help" | "-h" => {
+                print_help();
+                process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                return Err("unknown flag");
+            }
+            other => files.push(other.to_string()),
+        }
     }
 
-    for diagnostic in &result.diagnostics {
-        println!("  - {}", diagnostic.message);
-    }
+    Ok((files, verbose))
 }
 
-fn expr_text(body: &Body, expr: ExprId) -> String {
-    match &body.exprs[expr] {
-        Expr::Missing => "<missing>".to_string(),
-        Expr::IntLiteral { value, suffix } => {
-            format!("{}{}", value, suffix.as_deref().unwrap_or(""))
-        }
-        Expr::FloatLiteral { value, suffix } => {
-            format!("{}{}", value, suffix.as_deref().unwrap_or(""))
-        }
-        Expr::StringLiteral { value } => value.clone(),
-        Expr::CharLiteral { value } => value.clone(),
-        Expr::BoolLiteral { value } => value.to_string(),
-        Expr::Path { path, .. } => path.display(),
-        Expr::Binary { lhs, rhs, op } => {
-            format!(
-                "({} {} {})",
-                expr_text(body, *lhs),
-                binary_op_text(*op),
-                expr_text(body, *rhs)
-            )
-        }
-        Expr::Unary { operand, op } => {
-            format!("({}{})", unary_op_text(*op), expr_text(body, *operand))
-        }
-        Expr::Block { stmts, tail } => {
-            let tail = tail
-                .map(|tail| format!("; {}", expr_text(body, tail)))
-                .unwrap_or_default();
-            format!("{{ {} stmt(s){tail} }}", stmts.len())
-        }
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            let else_text = else_branch
-                .map(|expr| format!(" else {}", expr_text(body, expr)))
-                .unwrap_or_default();
-            format!(
-                "if {} {}{}",
-                expr_text(body, *cond),
-                expr_text(body, *then_branch),
-                else_text
-            )
-        }
-        Expr::While { condition, body: b } => {
-            format!(
-                "while {} {}",
-                expr_text(body, *condition),
-                expr_text(body, *b)
-            )
-        }
-        Expr::Match { scrutinee, arms } => {
-            format!(
-                "match {} {{ {} arm(s) }}",
-                expr_text(body, *scrutinee),
-                arms.len()
-            )
-        }
-        Expr::Array { elements } => {
-            let elements = elements
-                .iter()
-                .map(|element| expr_text(body, *element))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("[{elements}]")
-        }
-        Expr::Struct { path, fields, .. } => {
-            let fields = fields
-                .iter()
-                .map(|field| format!("{}: {}", field.name.0, expr_text(body, field.value)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{}{{{fields}}}", path.display())
-        }
-        Expr::Call { callee, args } => {
-            let args = args
-                .iter()
-                .map(|arg| expr_text(body, *arg))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{}({args})", expr_text(body, *callee))
-        }
-        Expr::FieldAccess { base, field } => {
-            format!("{}.{}", expr_text(body, *base), field.0)
-        }
-    }
-}
-
-fn type_ref_text(ty: &HirTypeRef) -> String {
-    match ty {
-        HirTypeRef::Named(path) => path.display(),
-        HirTypeRef::Ref(inner) => format!("&{}", type_ref_text(inner)),
-        HirTypeRef::Tuple(elements) => {
-            let elements = elements
-                .iter()
-                .map(type_ref_text)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({elements})")
-        }
-        HirTypeRef::Array(inner) => format!("[{}]", type_ref_text(inner)),
-        HirTypeRef::Unknown => "_".to_string(),
-        HirTypeRef::Error => "<error>".to_string(),
-    }
-}
-
-fn binary_op_text(op: BinaryOp) -> &'static str {
-    match op {
-        BinaryOp::Assign => "=",
-        BinaryOp::Add => "+",
-        BinaryOp::Sub => "-",
-        BinaryOp::Mul => "*",
-        BinaryOp::Div => "/",
-        BinaryOp::Mod => "%",
-        BinaryOp::Eq => "==",
-        BinaryOp::Neq => "!=",
-        BinaryOp::Lt => "<",
-        BinaryOp::Gt => ">",
-        BinaryOp::LtEq => "<=",
-        BinaryOp::GtEq => ">=",
-        BinaryOp::And => "&&",
-        BinaryOp::Or => "||",
-    }
-}
-
-fn unary_op_text(op: UnaryOp) -> &'static str {
-    match op {
-        UnaryOp::Neg => "-",
-        UnaryOp::Pos => "+",
-        UnaryOp::Ref => "&",
-        UnaryOp::Deref => "*",
-        UnaryOp::Not => "!",
-    }
+fn print_help() {
+    println!("riddlec — the Riddle compiler (frontend)");
+    println!();
+    println!("usage: riddlec [flags] <file>...");
+    println!();
+    println!("flags:");
+    println!("  --verbose, -v    print pass status for each file");
+    println!("  --help, -h       show this help");
 }

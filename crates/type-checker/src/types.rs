@@ -97,6 +97,26 @@ impl Type {
         matches!(self, Type::Never)
     }
 
+    /// Compiler-intrinsic `Copy` candidates – types that are `Copy`
+    /// regardless of whether a `Copy` trait is defined.
+    pub fn is_fundamentally_copy(&self) -> bool {
+        matches!(
+            self,
+            Type::Int(_)
+                | Type::Float(_)
+                | Type::InferInt
+                | Type::InferFloat
+                | Type::Bool
+                | Type::Char
+                | Type::Unit
+                | Type::Never
+                | Type::Ref(_)
+                | Type::Function(_)
+                | Type::Unknown
+                | Type::Error
+        )
+    }
+
     pub(crate) fn or(self, fallback: Type) -> Type {
         if self.is_unknown_like() {
             fallback

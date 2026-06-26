@@ -30,9 +30,33 @@ impl<'a> TypeChecker<'a> {
     pub fn check(mut self) -> TypeCheckResult {
         self.check_traits();
         self.check_impls();
+        self.build_trait_env();
         self.check_function_bodies();
         self.result
     }
+
+    // ── Trait environment construction ──────────────────────────────
+
+    pub(crate) fn build_trait_env(&mut self) {
+        for (tid, tr) in self.hir.item_tree.traits.iter() {
+            if tr.name.0 == "Copy" {
+                self.result.trait_env.set_copy_trait(tid);
+                break;
+            }
+        }
+        for (_, imp) in self.hir.item_tree.impls.iter() {
+            let Some(trait_ty) = &imp.trait_ty else {
+                continue;
+            };
+            let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+                continue;
+            };
+            let self_ty = self.lower_type_ref(&imp.self_ty);
+            self.result.trait_env.insert_impl(trait_id, self_ty);
+        }
+    }
+
+    // ── Function body checking ──────────────────────────────────────
 
     pub(crate) fn check_function_bodies(&mut self) {
         for (fid, function) in self.hir.item_tree.functions.iter() {
@@ -141,7 +165,6 @@ impl<'a> TypeChecker<'a> {
                 Type::Error
             });
         }
-
         match expected {
             Some(Type::Int(ty)) => Type::Int(*ty),
             Some(Type::InferInt) => Type::InferInt,
@@ -160,7 +183,6 @@ impl<'a> TypeChecker<'a> {
                 Type::Error
             });
         }
-
         match expected {
             Some(Type::Float(ty)) => Type::Float(*ty),
             Some(Type::InferFloat) => Type::InferFloat,

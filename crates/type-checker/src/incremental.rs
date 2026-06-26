@@ -58,6 +58,7 @@ impl IncrementalTypeChecker {
 
         checker.check_traits();
         checker.check_impls();
+        checker.build_trait_env();
 
         for (fid, function) in hir.item_tree.functions.iter() {
             let Some(body_id) = hir.function_bodies.get(&fid).copied() else {

@@ -43,6 +43,7 @@ impl<'a> BodyCtx<'a> {
     }
 }
 
+/// Scoped name → type bindings (from `match` patterns, `if let`, etc.).
 #[derive(Debug, Default)]
 pub(crate) struct ScopedBindings {
     scopes: Vec<HashMap<String, Type>>,
