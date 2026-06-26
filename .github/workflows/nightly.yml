@@ -107,10 +107,13 @@ jobs:
             fi
           done
           # 打包为平台专属 zip
-          cd dist
-          zip "../riddle-${HASH}-nightly-${SUFFIX}.zip" *
-          cd ..
-          ls -lh riddle-*.zip
+          ZIPNAME="riddle-${HASH}-nightly-${SUFFIX}.zip"
+          if [ "$SUFFIX" = "windows" ]; then
+            powershell -Command "Compress-Archive -Path dist\* -DestinationPath ${ZIPNAME}"
+          else
+            cd dist && zip "../${ZIPNAME}" * && cd ..
+          fi
+          ls -lh "${ZIPNAME}"
 
       - name: 上传 zip
         uses: actions/upload-artifact@v4
