@@ -58,13 +58,59 @@ jobs:
 
   # ── 矩阵构建 + 测试 ──────────────────────────────────────────
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.platform }}-${{ matrix.arch }})
     needs: check-changes
     if: needs.check-changes.outputs.should-build == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # ── Linux ──────────────────────────────────────────
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            platform: linux
+
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            platform: linux
+
+          - os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            arch: i686
+            platform: linux
+            cross: true
+
+          # ── Windows ────────────────────────────────────────
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+            platform: windows
+
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            arch: i686
+            platform: windows
+            cross: true
+
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            arch: aarch64
+            platform: windows
+            cross: true
+
+          # ── macOS ──────────────────────────────────────────
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            arch: aarch64
+            platform: macos
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            arch: x86_64
+            platform: macos
+
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -73,42 +119,47 @@ jobs:
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 安装交叉编译依赖（Linux i686）
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib
 
       - name: 缓存 Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: nightly-${{ matrix.os }}
+          shared-key: nightly-${{ matrix.target }}
 
-      - name: 运行测试
-        run: cargo test --workspace
+      - name: 运行测试（仅原生目标）
+        if: matrix.cross != true
+        run: cargo test --workspace --target ${{ matrix.target }}
 
       - name: Release 构建
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --target ${{ matrix.target }}
 
       - name: 打包平台构建产物
         shell: bash
         run: |
           HASH=$(git rev-parse --short HEAD)
-          case "${{ matrix.os }}" in
-            ubuntu-latest)  SUFFIX="linux"   ;;
-            windows-latest) SUFFIX="windows" ;;
-            macos-latest)   SUFFIX="macos"   ;;
-          esac
+          SUFFIX="${{ matrix.platform }}-${{ matrix.arch }}"
+          BIN_DIR="target/${{ matrix.target }}/release"
+
           mkdir -p dist
-          # 复制并重命名二进制文件
-          for bin in target/release/riddlec target/release/info-viz; do
-            if [ -f "$bin" ]; then
-              cp "$bin" "dist/$(basename "$bin")-${SUFFIX}"
+
+          for name in riddlec info-viz; do
+            if [ -f "$BIN_DIR/$name" ]; then
+              cp "$BIN_DIR/$name" "dist/${name}-${SUFFIX}"
+            fi
+            if [ -f "$BIN_DIR/$name.exe" ]; then
+              cp "$BIN_DIR/$name.exe" "dist/${name}-${SUFFIX}.exe"
             fi
           done
-          for exe in target/release/riddlec.exe target/release/info-viz.exe; do
-            if [ -f "$exe" ]; then
-              cp "$exe" "dist/$(basename "$exe" .exe)-${SUFFIX}.exe"
-            fi
-          done
-          # 打包为平台专属 zip
+
           ZIPNAME="riddle-${HASH}-nightly-${SUFFIX}.zip"
-          if [ "$SUFFIX" = "windows" ]; then
+          if [ "${{ matrix.platform }}" = "windows" ]; then
             powershell -Command "Compress-Archive -Path dist\* -DestinationPath ${ZIPNAME}"
           else
             cd dist && zip "../${ZIPNAME}" * && cd ..
@@ -118,7 +169,7 @@ jobs:
       - name: 上传 zip
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-zip-${{ matrix.os }}
+          name: nightly-zip-${{ matrix.platform }}-${{ matrix.arch }}
           path: riddle-*.zip
 
   # ── 发布 Nightly Release ─────────────────────────────────────
@@ -158,22 +209,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           HASH=$(git rev-parse --short HEAD)
+          URL="${{ github.server_url }}/${{ github.repository }}/releases/download/nightly"
           gh release create nightly riddle-*.zip \
             --title "Nightly Build $(date +'%Y-%m-%d')" \
             --prerelease \
             --notes "$(cat <<EOF
-          ### 夜间构建
+          ### 自动化夜间构建
 
           - **提交**: [$(git rev-parse --short HEAD)](${{ github.server_url }}/${{ github.repository }}/commit/$(git rev-parse HEAD))
           - **运行日志**: [Actions #${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
           #### 下载
 
-          | 平台 | 文件 |
-          |------|------|
-          | Linux   | [riddle-${HASH}-nightly-linux.zip](${{ github.server_url }}/${{ github.repository }}/releases/download/nightly/riddle-${HASH}-nightly-linux.zip) |
-          | Windows | [riddle-${HASH}-nightly-windows.zip](${{ github.server_url }}/${{ github.repository }}/releases/download/nightly/riddle-${HASH}-nightly-windows.zip) |
-          | macOS   | [riddle-${HASH}-nightly-macos.zip](${{ github.server_url }}/${{ github.repository }}/releases/download/nightly/riddle-${HASH}-nightly-macos.zip) |
+          | 平台 | 架构 | 文件 |
+          |------|------|------|
+          | Linux   | x86_64   | [riddle-${HASH}-nightly-linux-x86_64.zip]($URL/riddle-${HASH}-nightly-linux-x86_64.zip) |
+          | Linux   | aarch64  | [riddle-${HASH}-nightly-linux-aarch64.zip]($URL/riddle-${HASH}-nightly-linux-aarch64.zip) |
+          | Linux   | i686     | [riddle-${HASH}-nightly-linux-i686.zip]($URL/riddle-${HASH}-nightly-linux-i686.zip) |
+          | Windows | x86_64   | [riddle-${HASH}-nightly-windows-x86_64.zip]($URL/riddle-${HASH}-nightly-windows-x86_64.zip) |
+          | Windows | i686     | [riddle-${HASH}-nightly-windows-i686.zip]($URL/riddle-${HASH}-nightly-windows-i686.zip) |
+          | Windows | aarch64  | [riddle-${HASH}-nightly-windows-aarch64.zip]($URL/riddle-${HASH}-nightly-windows-aarch64.zip) |
+          | macOS   | aarch64  | [riddle-${HASH}-nightly-macos-aarch64.zip]($URL/riddle-${HASH}-nightly-macos-aarch64.zip) |
+          | macOS   | x86_64   | [riddle-${HASH}-nightly-macos-x86_64.zip]($URL/riddle-${HASH}-nightly-macos-x86_64.zip) |
           EOF
           )"
 
