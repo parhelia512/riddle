@@ -85,15 +85,17 @@ jobs:
       - name: Release 构建
         run: cargo build --workspace --release
 
-      - name: 重命名二进制文件（加平台后缀）
+      - name: 打包平台构建产物
         shell: bash
         run: |
-          mkdir -p dist
+          HASH=$(git rev-parse --short HEAD)
           case "${{ matrix.os }}" in
             ubuntu-latest)  SUFFIX="linux"   ;;
             windows-latest) SUFFIX="windows" ;;
             macos-latest)   SUFFIX="macos"   ;;
           esac
+          mkdir -p dist
+          # 复制并重命名二进制文件
           for bin in target/release/riddlec target/release/info-viz; do
             if [ -f "$bin" ]; then
               cp "$bin" "dist/$(basename "$bin")-${SUFFIX}"
@@ -104,13 +106,17 @@ jobs:
               cp "$exe" "dist/$(basename "$exe" .exe)-${SUFFIX}.exe"
             fi
           done
-          ls -lh dist/
+          # 打包为平台专属 zip
+          cd dist
+          zip "../riddle-${HASH}-nightly-${SUFFIX}.zip" *
+          cd ..
+          ls -lh riddle-*.zip
 
-      - name: 上传构建产物
+      - name: 上传 zip
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.os }}
-          path: dist/*
+          name: nightly-zip-${{ matrix.os }}
+          path: riddle-*.zip
 
   # ── 发布 Nightly Release ─────────────────────────────────────
   release:
@@ -124,11 +130,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 下载全部构建产物
+      - name: 下载全部平台 zip
         uses: actions/download-artifact@v4
         with:
-          pattern: binaries-*
-          path: dist
+          pattern: nightly-zip-*
+          path: .
           merge-multiple: true
 
       - name: 更新 nightly tag 并推送
@@ -144,41 +150,27 @@ jobs:
         run: |
           gh release delete nightly --yes 2>/dev/null || true
 
-      - name: 打包为 zip
-        run: |
-          HASH=$(git rev-parse --short HEAD)
-          cd dist
-          zip "../riddle-${HASH}-nightly.zip" *
-          cd ..
-          ls -lh riddle-*.zip
-
       - name: 创建新的 Nightly Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           HASH=$(git rev-parse --short HEAD)
-          gh release create nightly "riddle-${HASH}-nightly.zip" \
+          gh release create nightly riddle-*.zip \
             --title "Nightly Build $(date +'%Y-%m-%d')" \
             --prerelease \
             --notes "$(cat <<EOF
-          ### 自动化夜间构建
+          ### 夜间构建
 
           - **提交**: [$(git rev-parse --short HEAD)](${{ github.server_url }}/${{ github.repository }}/commit/$(git rev-parse HEAD))
           - **运行日志**: [Actions #${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
           #### 下载
 
-          | 文件 |
-          |------|
-          | [riddle-${HASH}-nightly.zip](${{ github.server_url }}/${{ github.repository }}/releases/download/nightly/riddle-${HASH}-nightly.zip) |
-
-          #### 包含的二进制文件
-
-          | 平台 | 文件名 |
-          |------|--------|
-          | Linux   | \`riddlec-linux\`  \`info-viz-linux\` |
-          | Windows | \`riddlec-windows.exe\`  \`info-viz-windows.exe\` |
-          | macOS   | \`riddlec-macos\`  \`info-viz-macos\` |
+          | 平台 | 文件 |
+          |------|------|
+          | Linux   | [riddle-${HASH}-nightly-linux.zip](${{ github.server_url }}/${{ github.repository }}/releases/download/nightly/riddle-${HASH}-nightly-linux.zip) |
+          | Windows | [riddle-${HASH}-nightly-windows.zip](${{ github.server_url }}/${{ github.repository }}/releases/download/nightly/riddle-${HASH}-nightly-windows.zip) |
+          | macOS   | [riddle-${HASH}-nightly-macos.zip](${{ github.server_url }}/${{ github.repository }}/releases/download/nightly/riddle-${HASH}-nightly-macos.zip) |
           EOF
           )"
 
