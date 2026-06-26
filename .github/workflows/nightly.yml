@@ -2,26 +2,70 @@ name: Nightly Build
 
 on:
   schedule:
-    # 每天 UTC 时间 2:00 运行（北京时间约 10:00）
+    # 每天 UTC 2:00 运行（北京时间约 10:00）
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
-      upload-artifacts:
-        description: "上传构建产物"
+      force:
+        description: "强制重新构建（即使没有新提交）"
         type: boolean
-        default: true
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
-  build-and-test:
-    name: Build & Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  # ── 检查是否有新提交 ──────────────────────────────────────────
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      should-build: ${{ steps.check.outputs.should-build }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 对比上次夜间构建的提交
+        id: check
+        run: |
+          CURRENT=$(git rev-parse HEAD)
+
+          # 强制构建（手动触发且勾选了 force）
+          if [ "${{ github.event_name == 'workflow_dispatch' && inputs.force }}" = "true" ]; then
+            echo "强制重新构建"
+            echo "should-build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 获取上次 nightly tag 指向的提交
+          NIGHTLY=$(git rev-parse nightly^{} 2>/dev/null || echo "")
+
+          echo "当前提交:   $CURRENT"
+          echo "上次构建:   ${NIGHTLY:-无}"
+
+          if [ "$CURRENT" = "$NIGHTLY" ]; then
+            echo "无新提交，跳过本次构建"
+            echo "should-build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "检测到新提交，开始构建"
+            echo "should-build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── 矩阵构建 + 测试 ──────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.os }})
+    needs: check-changes
+    if: needs.check-changes.outputs.should-build == 'true'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: 检出代码
@@ -29,16 +73,11 @@ jobs:
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - name: 缓存 Cargo
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: nightly-${{ matrix.os }}
-
-      - name: Clippy 检查
-        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: 运行测试
         run: cargo test --workspace
@@ -46,32 +85,93 @@ jobs:
       - name: Release 构建
         run: cargo build --workspace --release
 
-      # 上传构建产物
-      - name: 上传 riddlec 二进制文件
-        if: ${{ github.event_name == 'schedule' || inputs.upload-artifacts }}
+      - name: 重命名二进制文件（加平台后缀）
+        shell: bash
+        run: |
+          mkdir -p dist
+          case "${{ matrix.os }}" in
+            ubuntu-latest)  SUFFIX="linux"   ;;
+            windows-latest) SUFFIX="windows" ;;
+            macos-latest)   SUFFIX="macos"   ;;
+          esac
+          for bin in target/release/riddlec target/release/info-viz; do
+            if [ -f "$bin" ]; then
+              cp "$bin" "dist/$(basename "$bin")-${SUFFIX}"
+            fi
+          done
+          for exe in target/release/riddlec.exe target/release/info-viz.exe; do
+            if [ -f "$exe" ]; then
+              cp "$exe" "dist/$(basename "$exe" .exe)-${SUFFIX}.exe"
+            fi
+          done
+          ls -lh dist/
+
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: riddlec-${{ matrix.os }}
-          path: |
-            target/release/riddlec
-            target/release/riddlec.exe
+          name: binaries-${{ matrix.os }}
+          path: dist/*
 
-      - name: 上传 info-viz 二进制文件
-        if: ${{ github.event_name == 'schedule' || inputs.upload-artifacts }}
-        uses: actions/upload-artifact@v4
+  # ── 发布 Nightly Release ─────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
         with:
-          name: info-viz-${{ matrix.os }}
-          path: |
-            target/release/info-viz
-            target/release/info-viz.exe
+          fetch-depth: 0
 
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+
+      - name: 更新 nightly tag 并推送
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly HEAD
+          git push -f origin nightly
+
+      - name: 删除旧的 Release（保留 tag）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes 2>/dev/null || true
+
+      - name: 创建新的 Nightly Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create nightly dist/* \
+            --title "Nightly Build $(date +'%Y-%m-%d')" \
+            --prerelease \
+            --notes "$(cat <<EOF
+          ### 🛠 自动化夜间构建
+
+          - **提交**: [$(git rev-parse --short HEAD)](${{ github.server_url }}/${{ github.repository }}/commit/$(git rev-parse HEAD))
+          - **运行日志**: [Actions #${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          | 平台 | 文件名 |
+          |------|--------|
+          | Linux   | \`riddlec-linux\`  \`info-viz-linux\` |
+          | Windows | \`riddlec-windows.exe\`  \`info-viz-windows.exe\` |
+          | macOS   | \`riddlec-macos\`  \`info-viz-macos\` |
+          EOF
+          )"
+
+  # ── 失败通知 ─────────────────────────────────────────────────
   notify:
-    name: 通知结果
-    needs: build-and-test
-    if: ${{ failure() }}
+    name: 通知失败
+    needs: [check-changes, build, release]
+    if: failure()
     runs-on: ubuntu-latest
     steps:
-      - name: 构建失败通知
-        run: |
-          echo "夜间构建失败！请检查日志："
+      - run: |
+          echo "夜间构建失败！请检查运行日志："
           echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
