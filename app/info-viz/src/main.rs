@@ -75,6 +75,10 @@ impl Config {
                     help = true;
                     i += 1;
                 }
+                "-V" | "--version" => {
+                    println!("info-viz {}", env!("GIT_HASH"));
+                    std::process::exit(0);
+                }
                 "--addr" => {
                     let Some(value) = args.get(i + 1) else {
                         return Err("--addr requires a value".into());
@@ -104,8 +108,9 @@ impl Config {
 
     fn print_help() {
         println!(
-            "Usage: scope-graph-viz [--addr 127.0.0.1:7878] [source.rid]\n\
-             Starts a local web UI with a live editor and Riddle semantic message visualization."
+            "Usage: info-viz [--addr 127.0.0.1:7878] [source.rid]\n\
+             Starts a local web UI with a live editor and Riddle semantic message visualization.\n\
+             Flags:\n               --addr <addr>   bind address (default 127.0.0.1:7878)\n               --version, -V   print version (git commit hash)\n               --help, -h      show this help"
         );
     }
 }

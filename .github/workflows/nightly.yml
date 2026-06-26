@@ -144,18 +144,35 @@ jobs:
         run: |
           gh release delete nightly --yes 2>/dev/null || true
 
+      - name: 打包为 zip
+        run: |
+          HASH=$(git rev-parse --short HEAD)
+          cd dist
+          zip "../riddle-${HASH}-nightly.zip" *
+          cd ..
+          ls -lh riddle-*.zip
+
       - name: 创建新的 Nightly Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create nightly dist/* \
+          HASH=$(git rev-parse --short HEAD)
+          gh release create nightly "riddle-${HASH}-nightly.zip" \
             --title "Nightly Build $(date +'%Y-%m-%d')" \
             --prerelease \
             --notes "$(cat <<EOF
-          ### 🛠 自动化夜间构建
+          ### 自动化夜间构建
 
           - **提交**: [$(git rev-parse --short HEAD)](${{ github.server_url }}/${{ github.repository }}/commit/$(git rev-parse HEAD))
           - **运行日志**: [Actions #${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          #### 下载
+
+          | 文件 |
+          |------|
+          | [riddle-${HASH}-nightly.zip](${{ github.server_url }}/${{ github.repository }}/releases/download/nightly/riddle-${HASH}-nightly.zip) |
+
+          #### 包含的二进制文件
 
           | 平台 | 文件名 |
           |------|--------|

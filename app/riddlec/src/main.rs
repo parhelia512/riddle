@@ -65,6 +65,10 @@ fn parse_args(args: &[String]) -> Result<(Vec<String>, bool), &'static str> {
                 print_help();
                 process::exit(0);
             }
+            "--version" | "-V" => {
+                println!("riddlec {}", env!("GIT_HASH"));
+                process::exit(0);
+            }
             other if other.starts_with('-') => {
                 return Err("unknown flag");
             }
@@ -82,5 +86,6 @@ fn print_help() {
     println!();
     println!("flags:");
     println!("  --verbose, -v    print pass status for each file");
+    println!("  --version, -V    print version (git commit hash)");
     println!("  --help, -h       show this help");
 }
