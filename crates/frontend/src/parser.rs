@@ -1,4 +1,12 @@
+use rowan::TextRange;
+
 use super::{lexer::Token, syntax_kind::SyntaxKind};
+
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    pub message: String,
+    pub span: TextRange,
+}
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -117,7 +125,7 @@ pub struct Parser<'s> {
     tokens: Vec<Token>,
     pos: usize, // include trivia
     pub(crate) events: Vec<Event>,
-    pub errors: Vec<String>,
+    pub errors: Vec<ParseError>,
     // cache
     current_kind: SyntaxKind,
     current_non_trivia_pos: usize,
@@ -184,11 +192,6 @@ impl<'s> Parser<'s> {
         self.current() == kind
     }
 
-    #[allow(unused)]
-    fn at_any(&self, kinds: &[SyntaxKind]) -> bool {
-        kinds.contains(&self.current())
-    }
-
     /// make a Marker
     fn start(&mut self) -> Marker {
         let pos = self.events.len();
@@ -242,8 +245,21 @@ impl<'s> Parser<'s> {
         false
     }
 
+    fn current_span(&self) -> TextRange {
+        if self.current_non_trivia_pos < self.tokens.len() {
+            let span = &self.tokens[self.current_non_trivia_pos].span;
+            TextRange::new(
+                rowan::TextSize::from(span.start as u32),
+                rowan::TextSize::from(span.end as u32),
+            )
+        } else {
+            TextRange::new(0.into(), 0.into())
+        }
+    }
+
     fn error(&mut self, msg: String) {
-        self.errors.push(msg);
+        let span = self.current_span();
+        self.errors.push(ParseError { message: msg, span });
         if !self.at(SyntaxKind::Eof) {
             let m = self.start();
             self.bump();
@@ -252,10 +268,11 @@ impl<'s> Parser<'s> {
     }
 
     fn error_no_bump(&mut self, msg: String) {
-        self.errors.push(msg);
+        let span = self.current_span();
+        self.errors.push(ParseError { message: msg, span });
     }
 
-    pub fn parse(mut self) -> (Vec<Event>, Vec<Token>, Vec<String>, &'s str) {
+    pub fn parse(mut self) -> (Vec<Event>, Vec<Token>, Vec<ParseError>, &'s str) {
         let m = self.start();
 
         while !self.at(SyntaxKind::Eof) {
@@ -270,7 +287,7 @@ impl<'s> Parser<'s> {
     pub fn reparse(
         mut self,
         entry: ReparseEntry,
-    ) -> Option<(Vec<Event>, Vec<Token>, Vec<String>, &'s str)> {
+    ) -> Option<(Vec<Event>, Vec<Token>, Vec<ParseError>, &'s str)> {
         use ReparseEntry::*;
         match entry {
             Statement => {
@@ -340,6 +357,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Impl
                 | SyntaxKind::Const
                 | SyntaxKind::TypeKw
+                | SyntaxKind::Extern
         )
     }
 
@@ -363,6 +381,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::If
                 | SyntaxKind::While
                 | SyntaxKind::Match
+                | SyntaxKind::Unsafe
                 | SyntaxKind::Plus
                 | SyntaxKind::Minus
                 | SyntaxKind::Amp
@@ -375,7 +394,7 @@ impl<'s> Parser<'s> {
     fn at_expr_with_block_start(&self) -> bool {
         matches!(
             self.current(),
-            SyntaxKind::LBrace | SyntaxKind::If | SyntaxKind::While | SyntaxKind::Match
+            SyntaxKind::LBrace | SyntaxKind::If | SyntaxKind::While | SyntaxKind::Match | SyntaxKind::Unsafe
         )
     }
 
@@ -394,6 +413,7 @@ impl<'s> Parser<'s> {
             SyntaxKind::Const => self.const_decl(),
             SyntaxKind::TypeKw => self.type_alias_decl(),
             SyntaxKind::Return => self.return_stmt(),
+            SyntaxKind::Extern => self.extern_decl(),
             SyntaxKind::Eof => return,
             _ => self.expr_stmt(),
         }
@@ -533,7 +553,10 @@ impl<'s> Parser<'s> {
 
     fn var_decl(&mut self) {
         let m = self.start();
-        self.bump();
+        self.bump(); // 'let'
+        if self.at(SyntaxKind::Mut) {
+            self.bump(); // 'mut'
+        }
         self.expect(SyntaxKind::Ident);
 
         if self.at(SyntaxKind::Colon) {
@@ -659,6 +682,8 @@ impl<'s> Parser<'s> {
                     "expected statement or expression, found {:?}",
                     self.current()
                 ));
+                // Consume the unexpected token to avoid infinite loop
+                self.bump();
                 continue;
             }
 
@@ -819,6 +844,14 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::MatchExpr)
     }
 
+    fn unsafe_expr(&mut self) -> CompletedMarker {
+        let m = self.start();
+        self.expect(SyntaxKind::Unsafe);
+        // ponytail: unsafe only supports blocks for now
+        self.block();
+        m.complete(self, SyntaxKind::UnsafeExpr)
+    }
+
     fn match_arm(&mut self) {
         let m = self.start();
 
@@ -875,6 +908,20 @@ impl<'s> Parser<'s> {
                 continue;
             }
 
+            // index access
+            if op == SyntaxKind::LBracket {
+                const INDEX_BP: u8 = 15;
+                if INDEX_BP < min_bp {
+                    break;
+                }
+                let m = lhs.precede(self);
+                self.bump();
+                self.expression();
+                self.expect(SyntaxKind::RBracket);
+                lhs = m.complete(self, SyntaxKind::IndexExpr);
+                continue;
+            }
+
             // struct literal
             if op == SyntaxKind::LBrace
                 && restrictions.allow_struct_expr
@@ -887,6 +934,19 @@ impl<'s> Parser<'s> {
                 let m = lhs.precede(self);
                 self.struct_expr_field_list();
                 lhs = m.complete(self, SyntaxKind::StructExpr);
+                continue;
+            }
+
+            // cast
+            if op == SyntaxKind::As {
+                const CAST_BP: u8 = 13;
+                if CAST_BP < min_bp {
+                    break;
+                }
+                let m = lhs.precede(self);
+                self.bump(); // 'as'
+                self.ty();
+                lhs = m.complete(self, SyntaxKind::CastExpr);
                 continue;
             }
 
@@ -933,9 +993,18 @@ impl<'s> Parser<'s> {
     fn lhs(&mut self, restrictions: ExprRestrictions) -> Option<CompletedMarker> {
         match self.current() {
             // unary
+            SyntaxKind::Amp => {
+                let m = self.start();
+                self.bump(); // &
+                if self.at(SyntaxKind::Mut) {
+                    self.bump(); // mut
+                }
+                let r_bp = prefix_binding_power(SyntaxKind::Amp);
+                self.expr_bp_restricted(r_bp, restrictions);
+                Some(m.complete(self, SyntaxKind::UnaryExpr))
+            }
             SyntaxKind::Plus
             | SyntaxKind::Minus
-            | SyntaxKind::Amp
             | SyntaxKind::Star
             | SyntaxKind::Bang => {
                 let m = self.start();
@@ -1009,6 +1078,8 @@ impl<'s> Parser<'s> {
 
             SyntaxKind::Match => Some(self.match_expr()),
 
+            SyntaxKind::Unsafe => Some(self.unsafe_expr()),
+
             SyntaxKind::LBracket => {
                 let m = self.start();
                 self.bump();
@@ -1078,7 +1149,10 @@ impl<'s> Parser<'s> {
         match self.current() {
             SyntaxKind::Amp => {
                 let m = self.start();
-                self.bump();
+                self.bump(); // &
+                if self.at(SyntaxKind::Mut) {
+                    self.bump(); // mut
+                }
                 self.ty();
                 m.complete(self, SyntaxKind::RefType);
             }
@@ -1089,6 +1163,21 @@ impl<'s> Parser<'s> {
                 self.ty();
                 inner.complete(self, SyntaxKind::RefType);
                 outer.complete(self, SyntaxKind::RefType);
+            }
+            SyntaxKind::Star => {
+                let m = self.start();
+                self.bump(); // *
+                let is_mut = self.at(SyntaxKind::Mut);
+                if is_mut || self.at(SyntaxKind::Const) {
+                    self.bump(); // const or mut
+                } else {
+                    self.error(format!(
+                        "expected 'const' or 'mut' after '*' in pointer type, found {:?}",
+                        self.current()
+                    ));
+                }
+                self.ty();
+                m.complete(self, SyntaxKind::PtrType);
             }
             SyntaxKind::LParen => {
                 let m = self.start();
@@ -1182,7 +1271,7 @@ impl<'s> Parser<'s> {
         }
 
         // struct variant: ident { field: ty, ... }
-        if self.at(SyntaxKind::LBrace) {
+        else if self.at(SyntaxKind::LBrace) {
             self.struct_field_list();
         }
 
@@ -1326,6 +1415,40 @@ impl<'s> Parser<'s> {
         }
     }
 
+    fn extern_decl(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::Extern);
+        let _abi = self.expect(SyntaxKind::String); // "C"
+
+        if self.at(SyntaxKind::Fun) {
+            // extern "C" fun name(...) -> T { body }
+            self.func_decl();
+            m.complete(self, SyntaxKind::ExternFnDecl);
+        } else if self.at(SyntaxKind::LBrace) {
+            // extern "C" { fun ...; fun ...; }
+            self.expect(SyntaxKind::LBrace);
+            while !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
+                if self.at(SyntaxKind::Fun) {
+                    self.func_sig();
+                } else {
+                    self.error(format!(
+                        "expected 'fun' in extern block, found {:?}",
+                        self.current()
+                    ));
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::RBrace);
+            m.complete(self, SyntaxKind::ExternBlock);
+        } else {
+            self.error(format!(
+                "expected 'fun' or '{{' after extern \"C\", found {:?}",
+                self.current()
+            ));
+            m.complete(self, SyntaxKind::ErrorNode);
+        }
+    }
+
     fn at_type_start(&self) -> bool {
         matches!(
             self.current(),
@@ -1336,6 +1459,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::ColonColon
                 | SyntaxKind::Amp
                 | SyntaxKind::AmpAmp
+                | SyntaxKind::Star
                 | SyntaxKind::LParen
                 | SyntaxKind::LBracket
         )
@@ -1459,7 +1583,7 @@ fn prefix_binding_power(op: SyntaxKind) -> u8 {
         | SyntaxKind::Amp
         | SyntaxKind::AmpAmp
         | SyntaxKind::Star
-        | SyntaxKind::Bang => 13,
+        | SyntaxKind::Bang => 14,
         _ => 0,
     }
 }

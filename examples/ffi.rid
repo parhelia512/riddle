@@ -1,0 +1,22 @@
+// FFI test — extern functions, unsafe blocks, and raw pointers
+
+extern "C" {
+    // Import: C function declarations
+    fun abs(x: i32) -> i32;
+    fun my_alloc(size: usize) -> *const i32;
+}
+
+// Export: a function others can call from C
+extern "C" fun add(x: i32, y: i32) -> i32 {
+    return x + y;
+}
+
+fun main() {
+    // Call extern function
+    let r = abs(-42);
+
+    // unsafe block (raw pointer operations go here)
+    unsafe {
+        let p = my_alloc(16);
+    }
+}

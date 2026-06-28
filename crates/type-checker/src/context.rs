@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use hir::{
-    body::{Body, BodyId, StmtId},
-    item_tree::{FunctionId, HirFunction},
+    body::{Body, BodyId, SourceMap, StmtId},
+    item_tree::{HirFunction},
 };
+use rowan::TextRange;
 
 use crate::types::Type;
 
@@ -14,13 +15,13 @@ pub(crate) struct BodyCtx<'a> {
     pub(crate) return_ty: Type,
     pub(crate) locals: HashMap<StmtId, Type>,
     pub(crate) bindings: ScopedBindings,
+    source_map: &'a SourceMap,
 }
 
 impl<'a> BodyCtx<'a> {
     pub(crate) fn new(
         body_id: BodyId,
         body: &'a Body,
-        _fid: FunctionId,
         function: &'a HirFunction,
         return_ty: Type,
     ) -> Self {
@@ -31,6 +32,7 @@ impl<'a> BodyCtx<'a> {
             return_ty,
             locals: HashMap::new(),
             bindings: ScopedBindings::default(),
+            source_map: &body.source_map,
         }
     }
 
@@ -40,6 +42,18 @@ impl<'a> BodyCtx<'a> {
 
     pub(crate) fn pop_scope(&mut self) {
         self.bindings.pop_scope();
+    }
+
+    pub(crate) fn expr_range(&self, id: hir::body::ExprId) -> Option<TextRange> {
+        self.source_map.expr_ranges.get(&id).copied()
+    }
+
+    pub(crate) fn stmt_range(&self, id: hir::body::StmtId) -> Option<TextRange> {
+        self.source_map.stmt_ranges.get(&id).copied()
+    }
+
+    pub(crate) fn pat_range(&self, id: hir::body::PatId) -> Option<TextRange> {
+        self.source_map.pat_ranges.get(&id).copied()
     }
 }
 

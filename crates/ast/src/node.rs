@@ -1,6 +1,8 @@
 use super::support::{self, AstNode};
 use frontend::syntax_kind::{SyntaxKind, SyntaxNode, SyntaxToken};
 
+// ── ast_node! macro ────────────────────────────────────────────────────
+
 macro_rules! ast_node {
     ($name:ident, $kind:ident) => {
         #[derive(Debug, Clone)]
@@ -24,56 +26,68 @@ macro_rules! ast_node {
     };
 }
 
+// ── AST node type definitions ──────────────────────────────────────────
+//
+// Sorted roughly by category: top-level → statements → expressions →
+// types → patterns → paths → extern / unsafe.
+
+// top-level
 ast_node!(Root, Root);
-ast_node!(VarDecl, VarDecl);
-ast_node!(FuncDecl, FuncDecl);
-ast_node!(ParamList, ParamList);
-ast_node!(Param, Param);
-ast_node!(StructDecl, StructDecl);
-ast_node!(StructFieldList, StructFieldList);
-ast_node!(StructField, StructField);
-ast_node!(IfStmt, IfStmt);
-ast_node!(WhileStmt, WhileStmt);
-ast_node!(ReturnStmt, ReturnStmt);
-ast_node!(Block, Block);
-ast_node!(ExprStmt, ExprStmt);
-ast_node!(BinaryExpr, BinaryExpr);
-ast_node!(UnaryExpr, UnaryExpr);
-ast_node!(ParenExpr, ParenExpr);
-ast_node!(NumberExpr, NumberLit);
-ast_node!(NameRefExpr, NameRef);
-ast_node!(NamedType, NamedType);
-ast_node!(RefType, RefType);
-ast_node!(CallExpr, CallExpr);
-ast_node!(ArgList, ArgList);
-ast_node!(FieldExpr, FieldExpr);
-ast_node!(StructExpr, StructExpr);
-ast_node!(StructExprField, StructExprField);
-ast_node!(Path, Path);
-ast_node!(PathSegment, PathSegment);
 ast_node!(ModDecl, ModDecl);
 ast_node!(UseDecl, UseDecl);
 ast_node!(UseTree, UseTree);
 ast_node!(UseTreeList, UseTreeList);
-// new items
+
+// statements / declarations
+ast_node!(VarDecl, VarDecl);
+ast_node!(FuncDecl, FuncDecl);
+ast_node!(ReturnStmt, ReturnStmt);
+ast_node!(ExprStmt, ExprStmt);
+ast_node!(StructDecl, StructDecl);
 ast_node!(EnumDecl, EnumDecl);
 ast_node!(EnumVariant, EnumVariant);
 ast_node!(TraitDecl, TraitDecl);
 ast_node!(ImplDecl, ImplDecl);
-ast_node!(GenericParams, GenericParams);
 ast_node!(ConstDecl, ConstDecl);
 ast_node!(TypeAliasDecl, TypeAliasDecl);
-// new expressions
+ast_node!(GenericParams, GenericParams);
+
+// expressions
+ast_node!(Block, Block);
+ast_node!(BinaryExpr, BinaryExpr);
+ast_node!(UnaryExpr, UnaryExpr);
+ast_node!(ParenExpr, ParenExpr);
+ast_node!(CallExpr, CallExpr);
+ast_node!(ArgList, ArgList);
+ast_node!(FieldExpr, FieldExpr);
+ast_node!(IndexExpr, IndexExpr);
+ast_node!(StructExpr, StructExpr);
+ast_node!(StructExprField, StructExprField);
+ast_node!(IfStmt, IfStmt);
+ast_node!(WhileStmt, WhileStmt);
+ast_node!(MatchExpr, MatchExpr);
+ast_node!(MatchArm, MatchArm);
+ast_node!(ArrayExpr, ArrayExpr);
+ast_node!(NumberExpr, NumberLit);
 ast_node!(FloatLitExpr, FloatLit);
 ast_node!(StringLitExpr, StringLit);
 ast_node!(CharLitExpr, CharLit);
 ast_node!(BoolLitExpr, BoolLit);
-ast_node!(MatchExpr, MatchExpr);
-ast_node!(MatchArm, MatchArm);
-ast_node!(ArrayExpr, ArrayExpr);
-// new types
+ast_node!(NameRefExpr, NameRef);
+ast_node!(UnsafeExpr, UnsafeExpr);
+ast_node!(CastExpr, CastExpr);
+
+// paths
+ast_node!(Path, Path);
+ast_node!(PathSegment, PathSegment);
+
+// types
+ast_node!(NamedType, NamedType);
+ast_node!(RefType, RefType);
+ast_node!(PtrType, PtrType);
 ast_node!(TupleType, TupleType);
 ast_node!(ArrayType, ArrayType);
+
 // patterns
 ast_node!(WildcardPat, WildcardPattern);
 ast_node!(LiteralPat, LiteralPattern);
@@ -81,309 +95,25 @@ ast_node!(TuplePat, TuplePattern);
 ast_node!(StructPattern, StructPattern);
 ast_node!(EnumPattern, EnumPattern);
 
+// params
+ast_node!(ParamList, ParamList);
+ast_node!(Param, Param);
+ast_node!(StructFieldList, StructFieldList);
+ast_node!(StructField, StructField);
+
+// extern
+ast_node!(ExternBlock, ExternBlock);
+ast_node!(ExternFnDecl, ExternFnDecl);
+
+// ── Top-level ──────────────────────────────────────────────────────────
+
 impl Root {
     pub fn stmts(&self) -> impl Iterator<Item = Stmt> + '_ {
         support::children(&self.syntax)
     }
 }
 
-impl VarDecl {
-    pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-
-    pub fn ty(&self) -> Option<Type> {
-        support::child(&self.syntax)
-    }
-
-    pub fn init(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-}
-
-impl FuncDecl {
-    pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-
-    pub fn param_list(&self) -> Option<ParamList> {
-        support::child(&self.syntax)
-    }
-
-    pub fn return_type(&self) -> Option<Type> {
-        support::child(&self.syntax)
-    }
-
-    pub fn body(&self) -> Option<Block> {
-        support::child(&self.syntax)
-    }
-}
-
-impl ParamList {
-    pub fn params(&self) -> impl Iterator<Item = Param> + '_ {
-        support::children(&self.syntax)
-    }
-}
-
-impl Param {
-    pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-
-    pub fn ty(&self) -> Option<Type> {
-        support::child(&self.syntax)
-    }
-}
-
-impl StructDecl {
-    pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-
-    pub fn field_list(&self) -> Option<StructFieldList> {
-        support::child(&self.syntax)
-    }
-}
-
-impl StructFieldList {
-    pub fn fields(&self) -> impl Iterator<Item = StructField> + '_ {
-        support::children(&self.syntax)
-    }
-}
-
-impl StructField {
-    pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-
-    pub fn ty(&self) -> Option<Type> {
-        support::child(&self.syntax)
-    }
-}
-
-impl Block {
-    pub fn stmts(&self) -> impl Iterator<Item = Stmt> + '_ {
-        support::children(&self.syntax)
-    }
-
-    pub fn tail_expr(&self) -> Option<Expr> {
-        support::last_child(&self.syntax)
-    }
-}
-
-impl IfStmt {
-    pub fn condition(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-
-    pub fn then_branch(&self) -> Option<Block> {
-        support::child(&self.syntax)
-    }
-
-    pub fn else_branch(&self) -> Option<ElseBranch> {
-        if let Some(else_block) = support::nth_child::<Block>(&self.syntax, 1) {
-            return Some(ElseBranch::Block(else_block));
-        }
-        let if_stmt: Option<IfStmt> = support::child(&self.syntax);
-        if_stmt.map(ElseBranch::IfStmt)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ElseBranch {
-    Block(Block),
-    IfStmt(IfStmt),
-}
-
-impl WhileStmt {
-    pub fn condition(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-
-    pub fn body(&self) -> Option<Block> {
-        support::child(&self.syntax)
-    }
-}
-
-impl ReturnStmt {
-    pub fn value(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-}
-
-impl ExprStmt {
-    pub fn expr(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-}
-
-impl BinaryExpr {
-    pub fn lhs(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-
-    pub fn rhs(&self) -> Option<Expr> {
-        support::nth_child(&self.syntax, 1)
-    }
-
-    pub fn op_token(&self) -> Option<SyntaxToken> {
-        support::token(&self.syntax, |kind| {
-            matches!(
-                kind,
-                SyntaxKind::Eq
-                    | SyntaxKind::Plus
-                    | SyntaxKind::Minus
-                    | SyntaxKind::Star
-                    | SyntaxKind::Slash
-                    | SyntaxKind::Percent
-                    | SyntaxKind::EqEq
-                    | SyntaxKind::BangEq
-                    | SyntaxKind::Less
-                    | SyntaxKind::Greater
-                    | SyntaxKind::LessEq
-                    | SyntaxKind::GreaterEq
-                    | SyntaxKind::AmpAmp
-                    | SyntaxKind::PipePipe
-            )
-        })
-    }
-}
-
-impl UnaryExpr {
-    pub fn operand(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-
-    pub fn op_token(&self) -> Option<SyntaxToken> {
-        support::token(&self.syntax, |kind| {
-            matches!(
-                kind,
-                SyntaxKind::Plus
-                    | SyntaxKind::Minus
-                    | SyntaxKind::Amp
-                    | SyntaxKind::AmpAmp
-                    | SyntaxKind::Star
-                    | SyntaxKind::Bang
-            )
-        })
-    }
-}
-
-impl ParenExpr {
-    pub fn inner(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-}
-
-impl RefType {
-    pub fn inner(&self) -> Option<Type> {
-        support::child(&self.syntax)
-    }
-}
-
-impl NumberExpr {
-    pub fn value_token(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Number)
-    }
-
-    pub fn value(&self) -> Option<i64> {
-        let text = self.value_token()?;
-        let text = text.text();
-        let suffix_start = text
-            .find(|ch: char| !ch.is_ascii_digit())
-            .unwrap_or(text.len());
-        text[..suffix_start].parse().ok()
-    }
-}
-
-impl NamedType {
-    pub fn path(&self) -> Option<Path> {
-        support::child(&self.syntax)
-    }
-}
-
-impl NameRefExpr {
-    pub fn path(&self) -> Option<Path> {
-        support::child(&self.syntax)
-    }
-}
-
-impl CallExpr {
-    pub fn callee(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-
-    pub fn arg_list(&self) -> Option<ArgList> {
-        support::child(&self.syntax)
-    }
-}
-
-impl ArgList {
-    pub fn args(&self) -> impl Iterator<Item = Expr> + '_ {
-        support::children(&self.syntax)
-    }
-}
-
-impl FieldExpr {
-    pub fn base(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-
-    pub fn field_name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-}
-
-impl StructExpr {
-    pub fn path(&self) -> Option<Path> {
-        support::child::<NameRefExpr>(&self.syntax)?.path()
-    }
-
-    pub fn fields(&self) -> impl Iterator<Item = StructExprField> + '_ {
-        support::children(&self.syntax)
-    }
-}
-
-impl StructExprField {
-    pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-
-    pub fn value(&self) -> Option<Expr> {
-        support::child(&self.syntax)
-    }
-}
-
-impl Path {
-    pub fn segments(&self) -> impl Iterator<Item = PathSegment> + '_ {
-        support::children(&self.syntax)
-    }
-
-    /// Returns whether this path starts with `::` and is therefore absolute.
-    pub fn is_absolute(&self) -> bool {
-        self.syntax
-            .children_with_tokens()
-            .find(|it| match it {
-                rowan::NodeOrToken::Node(_) => true,
-                rowan::NodeOrToken::Token(t) => !t.kind().is_trivia(),
-            })
-            .and_then(|it| it.into_token())
-            .map(|t| t.kind() == SyntaxKind::ColonColon)
-            .unwrap_or(false)
-    }
-}
-
-impl PathSegment {
-    /// Returns the token for this path segment: identifier, `self`, `super`, or `crate`.
-    pub fn name_token(&self) -> Option<SyntaxToken> {
-        support::token(&self.syntax, |k| {
-            matches!(
-                k,
-                SyntaxKind::Ident | SyntaxKind::SelfKw | SyntaxKind::SuperKw | SyntaxKind::CrateKw
-            )
-        })
-    }
-}
+// ── Statements ─────────────────────────────────────────────────────────
 
 impl ModDecl {
     pub fn name(&self) -> Option<SyntaxToken> {
@@ -392,13 +122,11 @@ impl ModDecl {
 
     /// Returns `None` for `mod foo;` and the nested items for `mod foo { ... }`.
     pub fn items(&self) -> Option<impl Iterator<Item = Stmt> + '_> {
-        // Use the presence of `{` to decide whether the module has a body.
         let has_brace = self
             .syntax
             .children_with_tokens()
             .filter_map(|it| it.into_token())
             .any(|t| t.kind() == SyntaxKind::LBrace);
-
         if has_brace {
             Some(support::children::<Stmt>(&self.syntax))
         } else {
@@ -449,7 +177,66 @@ impl UseTreeList {
     }
 }
 
-// == new item accessors ==
+impl VarDecl {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn is_mut(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == SyntaxKind::Mut)
+    }
+
+    pub fn ty(&self) -> Option<Type> {
+        support::child(&self.syntax)
+    }
+
+    pub fn init(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
+impl FuncDecl {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn param_list(&self) -> Option<ParamList> {
+        support::child(&self.syntax)
+    }
+
+    pub fn return_type(&self) -> Option<Type> {
+        support::child(&self.syntax)
+    }
+
+    pub fn body(&self) -> Option<Block> {
+        support::child(&self.syntax)
+    }
+}
+
+impl ReturnStmt {
+    pub fn value(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
+impl ExprStmt {
+    pub fn expr(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
+impl StructDecl {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn field_list(&self) -> Option<StructFieldList> {
+        support::child(&self.syntax)
+    }
+}
 
 impl EnumDecl {
     pub fn name(&self) -> Option<SyntaxToken> {
@@ -466,12 +253,10 @@ impl EnumVariant {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
-    /// Tuple-variant payload types, e.g. `Foo(A, B)`.
     pub fn tuple_types(&self) -> impl Iterator<Item = Type> + '_ {
         support::children(&self.syntax)
     }
 
-    /// Struct-variant fields, e.g. `Foo { x: T }`.
     pub fn field_list(&self) -> Option<StructFieldList> {
         support::child(&self.syntax)
     }
@@ -482,7 +267,6 @@ impl TraitDecl {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
-    /// Trait method signatures (parsed as `FuncDecl` without a body).
     pub fn methods(&self) -> impl Iterator<Item = FuncDecl> + '_ {
         support::children(&self.syntax)
     }
@@ -497,12 +281,10 @@ impl ImplDecl {
         support::child(&self.syntax)
     }
 
-    /// The implementing type's path (the `T` in `impl T` or `impl Trait for T`).
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
 
-    /// The trait type when this is a trait impl (`impl Trait for T`).
     pub fn trait_type(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
@@ -517,15 +299,6 @@ impl ImplDecl {
 
     pub fn type_aliases(&self) -> impl Iterator<Item = TypeAliasDecl> + '_ {
         support::children(&self.syntax)
-    }
-}
-
-impl GenericParams {
-    pub fn names(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
-        self.syntax
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .filter(|t| t.kind() == SyntaxKind::Ident)
     }
 }
 
@@ -553,7 +326,229 @@ impl TypeAliasDecl {
     }
 }
 
-// == new expression accessors ==
+impl GenericParams {
+    pub fn names(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|t| t.kind() == SyntaxKind::Ident)
+    }
+}
+
+// ── Expressions ────────────────────────────────────���───────────────────
+
+impl Block {
+    pub fn stmts(&self) -> impl Iterator<Item = Stmt> + '_ {
+        support::children(&self.syntax)
+    }
+
+    pub fn tail_expr(&self) -> Option<Expr> {
+        support::last_child(&self.syntax)
+    }
+}
+
+impl IfStmt {
+    pub fn condition(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn then_branch(&self) -> Option<Block> {
+        support::child(&self.syntax)
+    }
+
+    pub fn else_branch(&self) -> Option<ElseBranch> {
+        if let Some(else_block) = support::nth_child::<Block>(&self.syntax, 1) {
+            return Some(ElseBranch::Block(else_block));
+        }
+        let if_stmt: Option<IfStmt> = support::child(&self.syntax);
+        if_stmt.map(ElseBranch::IfStmt)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ElseBranch {
+    Block(Block),
+    IfStmt(IfStmt),
+}
+
+impl WhileStmt {
+    pub fn condition(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn body(&self) -> Option<Block> {
+        support::child(&self.syntax)
+    }
+}
+
+impl BinaryExpr {
+    pub fn lhs(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn rhs(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 1)
+    }
+
+    pub fn op_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, |kind| {
+            matches!(
+                kind,
+                SyntaxKind::Eq | SyntaxKind::Plus | SyntaxKind::Minus
+                    | SyntaxKind::Star | SyntaxKind::Slash | SyntaxKind::Percent
+                    | SyntaxKind::EqEq | SyntaxKind::BangEq
+                    | SyntaxKind::Less | SyntaxKind::Greater
+                    | SyntaxKind::LessEq | SyntaxKind::GreaterEq
+                    | SyntaxKind::AmpAmp | SyntaxKind::PipePipe
+            )
+        })
+    }
+}
+
+impl UnaryExpr {
+    pub fn operand(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn op_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, |kind| {
+            matches!(
+                kind,
+                SyntaxKind::Plus | SyntaxKind::Minus | SyntaxKind::Amp
+                    | SyntaxKind::AmpAmp | SyntaxKind::Star | SyntaxKind::Bang
+            )
+        })
+    }
+
+    pub fn is_mut(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == SyntaxKind::Mut)
+    }
+}
+
+impl ParenExpr {
+    pub fn inner(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
+impl CallExpr {
+    pub fn callee(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn arg_list(&self) -> Option<ArgList> {
+        support::child(&self.syntax)
+    }
+}
+
+impl ArgList {
+    pub fn args(&self) -> impl Iterator<Item = Expr> + '_ {
+        support::children(&self.syntax)
+    }
+}
+
+impl FieldExpr {
+    pub fn base(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn field_name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+}
+
+impl IndexExpr {
+    pub fn base(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn index(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 1)
+    }
+}
+
+impl StructExpr {
+    pub fn path(&self) -> Option<Path> {
+        support::child::<NameRefExpr>(&self.syntax)?.path()
+    }
+
+    pub fn fields(&self) -> impl Iterator<Item = StructExprField> + '_ {
+        support::children(&self.syntax)
+    }
+}
+
+impl StructExprField {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn value(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
+impl MatchExpr {
+    pub fn scrutinee(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn arms(&self) -> impl Iterator<Item = MatchArm> + '_ {
+        support::children(&self.syntax)
+    }
+}
+
+impl MatchArm {
+    pub fn pattern(&self) -> Option<Pattern> {
+        support::child(&self.syntax)
+    }
+
+    pub fn guard(&self) -> Option<Expr> {
+        let mut exprs = support::children::<Expr>(&self.syntax);
+        let first = exprs.next();
+        if exprs.next().is_some() { first } else { None }
+    }
+
+    pub fn body(&self) -> Option<Expr> {
+        support::last_child(&self.syntax)
+    }
+}
+
+impl ArrayExpr {
+    pub fn elements(&self) -> impl Iterator<Item = Expr> + '_ {
+        support::children(&self.syntax)
+    }
+}
+
+impl NumberExpr {
+    pub fn value_token(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Number)
+    }
+
+    pub fn value(&self) -> Option<i64> {
+        let text = self.value_token()?;
+        let text = text.text();
+        let text_no_underscores: String = text.chars().filter(|&c| c != '_').collect();
+        let text = &text_no_underscores;
+        let (radix, digits) = if let Some(rest) = text.strip_prefix("0x") {
+            (16, rest)
+        } else if let Some(rest) = text.strip_prefix("0o") {
+            (8, rest)
+        } else if let Some(rest) = text.strip_prefix("0b") {
+            (2, rest)
+        } else {
+            (10, text.as_str())
+        };
+        let is_digit = |ch: char| match radix {
+            16 => ch.is_ascii_hexdigit(),
+            _ => ch.is_ascii_digit(),
+        };
+        let suffix_start = digits.find(|ch: char| !is_digit(ch)).unwrap_or(digits.len());
+        i64::from_str_radix(&digits[..suffix_start], radix).ok()
+    }
+}
 
 impl FloatLitExpr {
     pub fn value_token(&self) -> Option<SyntaxToken> {
@@ -592,41 +587,92 @@ impl BoolLitExpr {
     }
 }
 
-impl MatchExpr {
-    pub fn scrutinee(&self) -> Option<Expr> {
+impl NameRefExpr {
+    pub fn path(&self) -> Option<Path> {
+        support::child(&self.syntax)
+    }
+}
+
+impl UnsafeExpr {
+    pub fn body(&self) -> Option<Block> {
+        support::child(&self.syntax)
+    }
+}
+
+impl CastExpr {
+    pub fn base(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
-    pub fn arms(&self) -> impl Iterator<Item = MatchArm> + '_ {
-        support::children(&self.syntax)
+    pub fn ty(&self) -> Option<Type> {
+        support::child(&self.syntax)
     }
 }
 
-impl MatchArm {
-    pub fn pattern(&self) -> Option<Pattern> {
+// ── Paths ──────────────────────────────────────────────────────────────
+
+impl Path {
+    pub fn segments(&self) -> impl Iterator<Item = PathSegment> + '_ {
+        support::children(&self.syntax)
+    }
+
+    pub fn is_absolute(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .find(|it| match it {
+                rowan::NodeOrToken::Node(_) => true,
+                rowan::NodeOrToken::Token(t) => !t.kind().is_trivia(),
+            })
+            .and_then(|it| it.into_token())
+            .map(|t| t.kind() == SyntaxKind::ColonColon)
+            .unwrap_or(false)
+    }
+}
+
+impl PathSegment {
+    pub fn name_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, |k| {
+            matches!(
+                k,
+                SyntaxKind::Ident | SyntaxKind::SelfKw | SyntaxKind::SuperKw | SyntaxKind::CrateKw
+            )
+        })
+    }
+}
+
+// ── Types ──────────────────────────────────────────────────────────────
+
+impl NamedType {
+    pub fn path(&self) -> Option<Path> {
+        support::child(&self.syntax)
+    }
+}
+
+impl RefType {
+    pub fn inner(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
-    pub fn guard(&self) -> Option<Expr> {
-        // The guard is the first expression child; the body is the last.
-        let mut exprs = support::children::<Expr>(&self.syntax);
-        let first = exprs.next();
-        // If there are two expressions, the first is the guard.
-        if exprs.next().is_some() { first } else { None }
-    }
-
-    pub fn body(&self) -> Option<Expr> {
-        support::last_child(&self.syntax)
+    pub fn is_mut(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == SyntaxKind::Mut)
     }
 }
 
-impl ArrayExpr {
-    pub fn elements(&self) -> impl Iterator<Item = Expr> + '_ {
-        support::children(&self.syntax)
+impl PtrType {
+    pub fn inner(&self) -> Option<Type> {
+        support::child(&self.syntax)
+    }
+
+    pub fn is_mut(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == SyntaxKind::Mut)
     }
 }
-
-// == new type accessors ==
 
 impl TupleType {
     pub fn elements(&self) -> impl Iterator<Item = Type> + '_ {
@@ -644,19 +690,15 @@ impl ArrayType {
     }
 }
 
-// == pattern accessors ==
+// ── Patterns ───────────────────────────────────────────────────────────
 
 impl LiteralPat {
     pub fn literal_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, |k| {
             matches!(
                 k,
-                SyntaxKind::Number
-                    | SyntaxKind::Float
-                    | SyntaxKind::String
-                    | SyntaxKind::Char
-                    | SyntaxKind::True
-                    | SyntaxKind::False
+                SyntaxKind::Number | SyntaxKind::Float | SyntaxKind::String
+                    | SyntaxKind::Char | SyntaxKind::True | SyntaxKind::False
             )
         })
     }
@@ -673,7 +715,6 @@ impl StructPattern {
         support::child(&self.syntax)
     }
 
-    /// The field name token for `field` or `field: pat`.
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
@@ -688,16 +729,68 @@ impl EnumPattern {
         support::child(&self.syntax)
     }
 
-    /// Sub-patterns for tuple-style `Variant(a, b)`.
     pub fn elements(&self) -> impl Iterator<Item = Pattern> + '_ {
         support::children(&self.syntax)
     }
 
-    /// Field sub-patterns for struct-style `Variant { a, b }`.
     pub fn fields(&self) -> impl Iterator<Item = StructPattern> + '_ {
         support::children(&self.syntax)
     }
 }
+
+// ── Params / Struct fields ─────────────────────────────────────────────
+
+impl ParamList {
+    pub fn params(&self) -> impl Iterator<Item = Param> + '_ {
+        support::children(&self.syntax)
+    }
+}
+
+impl Param {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn ty(&self) -> Option<Type> {
+        support::child(&self.syntax)
+    }
+}
+
+impl StructFieldList {
+    pub fn fields(&self) -> impl Iterator<Item = StructField> + '_ {
+        support::children(&self.syntax)
+    }
+}
+
+impl StructField {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn ty(&self) -> Option<Type> {
+        support::child(&self.syntax)
+    }
+}
+
+// ── Extern ─────────────────────────────────────────────────────────────
+
+impl ExternBlock {
+    pub fn functions(&self) -> impl Iterator<Item = ExternFnDecl> + '_ {
+        support::children(&self.syntax)
+    }
+}
+
+impl ExternFnDecl {
+    pub fn func_decl(&self) -> Option<FuncDecl> {
+        support::child(&self.syntax)
+    }
+}
+
+// ── Sum-type enums ─────────────────────────────────────────────────────
+//
+// Each variant enum: definition → AstNode impl → inherent cast().
+
+// ── Pattern ──
 
 #[derive(Debug, Clone)]
 pub enum Pattern {
@@ -737,6 +830,8 @@ impl Pattern {
     }
 }
 
+// ── Stmt ──
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     VarDecl(VarDecl),
@@ -751,6 +846,8 @@ pub enum Stmt {
     ExprStmt(ExprStmt),
     ModDecl(ModDecl),
     UseDecl(UseDecl),
+    ExternBlock(ExternBlock),
+    ExternFnDecl(ExternFnDecl),
 }
 
 impl AstNode for Stmt {
@@ -768,6 +865,8 @@ impl AstNode for Stmt {
             SyntaxKind::ExprStmt => Some(Stmt::ExprStmt(ExprStmt { syntax: node })),
             SyntaxKind::ModDecl => Some(Stmt::ModDecl(ModDecl { syntax: node })),
             SyntaxKind::UseDecl => Some(Stmt::UseDecl(UseDecl { syntax: node })),
+            SyntaxKind::ExternBlock => Some(Stmt::ExternBlock(ExternBlock { syntax: node })),
+            SyntaxKind::ExternFnDecl => Some(Stmt::ExternFnDecl(ExternFnDecl { syntax: node })),
             _ => None,
         }
     }
@@ -786,6 +885,8 @@ impl AstNode for Stmt {
             Stmt::ExprStmt(it) => it.syntax(),
             Stmt::ModDecl(it) => it.syntax(),
             Stmt::UseDecl(it) => it.syntax(),
+            Stmt::ExternBlock(it) => it.syntax(),
+            Stmt::ExternFnDecl(it) => it.syntax(),
         }
     }
 }
@@ -796,6 +897,8 @@ impl Stmt {
     }
 }
 
+// ── Expr ──
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     BinaryExpr(BinaryExpr),
@@ -803,6 +906,7 @@ pub enum Expr {
     ParenExpr(ParenExpr),
     CallExpr(CallExpr),
     FieldExpr(FieldExpr),
+    IndexExpr(IndexExpr),
     StructExpr(StructExpr),
     Block(Block),
     IfStmt(IfStmt),
@@ -815,17 +919,19 @@ pub enum Expr {
     CharLit(CharLitExpr),
     BoolLit(BoolLitExpr),
     NameRef(NameRefExpr),
+    UnsafeExpr(UnsafeExpr),
+    CastExpr(CastExpr),
 }
 
 impl AstNode for Expr {
     fn cast(node: SyntaxNode) -> Option<Self> {
-        let kind = node.kind();
-        match kind {
+        match node.kind() {
             SyntaxKind::BinaryExpr => Some(Expr::BinaryExpr(BinaryExpr { syntax: node })),
             SyntaxKind::UnaryExpr => Some(Expr::UnaryExpr(UnaryExpr { syntax: node })),
             SyntaxKind::ParenExpr => Some(Expr::ParenExpr(ParenExpr { syntax: node })),
             SyntaxKind::CallExpr => Some(Expr::CallExpr(CallExpr { syntax: node })),
             SyntaxKind::FieldExpr => Some(Expr::FieldExpr(FieldExpr { syntax: node })),
+            SyntaxKind::IndexExpr => Some(Expr::IndexExpr(IndexExpr { syntax: node })),
             SyntaxKind::StructExpr => Some(Expr::StructExpr(StructExpr { syntax: node })),
             SyntaxKind::Block => Some(Expr::Block(Block { syntax: node })),
             SyntaxKind::IfStmt => Some(Expr::IfStmt(IfStmt { syntax: node })),
@@ -837,6 +943,8 @@ impl AstNode for Expr {
             SyntaxKind::StringLit => Some(Expr::StringLit(StringLitExpr { syntax: node })),
             SyntaxKind::CharLit => Some(Expr::CharLit(CharLitExpr { syntax: node })),
             SyntaxKind::BoolLit => Some(Expr::BoolLit(BoolLitExpr { syntax: node })),
+            SyntaxKind::UnsafeExpr => Some(Expr::UnsafeExpr(UnsafeExpr { syntax: node })),
+            SyntaxKind::CastExpr => Some(Expr::CastExpr(CastExpr { syntax: node })),
             SyntaxKind::NameRef => Some(Expr::NameRef(NameRefExpr { syntax: node })),
             _ => None,
         }
@@ -849,6 +957,7 @@ impl AstNode for Expr {
             Expr::ParenExpr(it) => it.syntax(),
             Expr::CallExpr(it) => it.syntax(),
             Expr::FieldExpr(it) => it.syntax(),
+            Expr::IndexExpr(it) => it.syntax(),
             Expr::StructExpr(it) => it.syntax(),
             Expr::Block(it) => it.syntax(),
             Expr::IfStmt(it) => it.syntax(),
@@ -861,6 +970,8 @@ impl AstNode for Expr {
             Expr::CharLit(it) => it.syntax(),
             Expr::BoolLit(it) => it.syntax(),
             Expr::NameRef(it) => it.syntax(),
+            Expr::UnsafeExpr(it) => it.syntax(),
+            Expr::CastExpr(it) => it.syntax(),
         }
     }
 }
@@ -871,20 +982,23 @@ impl Expr {
     }
 }
 
+// ── Type ──
+
 #[derive(Debug, Clone)]
 pub enum Type {
     Named(NamedType),
     Ref(RefType),
+    Ptr(PtrType),
     Tuple(TupleType),
     Array(ArrayType),
 }
 
 impl AstNode for Type {
     fn cast(node: SyntaxNode) -> Option<Self> {
-        let kind = node.kind();
-        match kind {
+        match node.kind() {
             SyntaxKind::RefType => Some(Type::Ref(RefType { syntax: node })),
             SyntaxKind::NamedType => Some(Type::Named(NamedType { syntax: node })),
+            SyntaxKind::PtrType => Some(Type::Ptr(PtrType { syntax: node })),
             SyntaxKind::TupleType => Some(Type::Tuple(TupleType { syntax: node })),
             SyntaxKind::ArrayType => Some(Type::Array(ArrayType { syntax: node })),
             _ => None,
@@ -895,6 +1009,7 @@ impl AstNode for Type {
         match self {
             Type::Named(it) => it.syntax(),
             Type::Ref(it) => it.syntax(),
+            Type::Ptr(it) => it.syntax(),
             Type::Tuple(it) => it.syntax(),
             Type::Array(it) => it.syntax(),
         }

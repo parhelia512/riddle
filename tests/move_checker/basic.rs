@@ -1,10 +1,10 @@
-use crate::{check_moves, messages};
+use crate::{analyze, messages};
 
 // == Copy types: no errors ==
 
 #[test]
 fn ints_are_copy_no_move_errors() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         fun f() {
             let a: i32 = 1;
@@ -18,7 +18,7 @@ fn ints_are_copy_no_move_errors() {
 
 #[test]
 fn bools_are_copy_no_move_errors() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         fun f() {
             let a: bool = true;
@@ -32,7 +32,7 @@ fn bools_are_copy_no_move_errors() {
 
 #[test]
 fn floats_are_copy_no_move_errors() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         fun f() {
             let a: f64 = 3.14;
@@ -46,7 +46,7 @@ fn floats_are_copy_no_move_errors() {
 
 #[test]
 fn references_are_copy() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         fun f() {
             let x: i32 = 42;
@@ -61,7 +61,7 @@ fn references_are_copy() {
 
 #[test]
 fn assignment_does_not_move_copy_types() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         fun f() {
             let a: i32 = 1;
@@ -78,7 +78,7 @@ fn assignment_does_not_move_copy_types() {
 
 #[test]
 fn struct_let_binding_moves_source() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -98,7 +98,7 @@ fn struct_let_binding_moves_source() {
 
 #[test]
 fn struct_let_binding_first_use_is_ok() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -113,7 +113,7 @@ fn struct_let_binding_first_use_is_ok() {
 
 #[test]
 fn struct_move_in_function_call() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -135,7 +135,7 @@ fn struct_move_in_function_call() {
 
 #[test]
 fn struct_move_in_return_then_use_is_error() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -157,7 +157,7 @@ fn struct_move_in_return_then_use_is_error() {
 
 #[test]
 fn struct_move_in_return_no_reuse_is_ok() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -174,7 +174,7 @@ fn struct_move_in_return_no_reuse_is_ok() {
 
 #[test]
 fn assignment_moves_rhs_struct() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -197,7 +197,7 @@ fn assignment_moves_rhs_struct() {
 
 #[test]
 fn match_scrutinee_is_moved() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32, y: i32 }
 
@@ -219,7 +219,7 @@ fn match_scrutinee_is_moved() {
 
 #[test]
 fn match_int_scrutinee_is_not_moved() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         fun f() {
             let v: i32 = 42;
@@ -237,7 +237,7 @@ fn match_int_scrutinee_is_not_moved() {
 
 #[test]
 fn struct_literal_moves_fields() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Inner { value: i32 }
         struct Outer { inner: Inner }
@@ -260,7 +260,7 @@ fn struct_literal_moves_fields() {
 
 #[test]
 fn array_moves_elements() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -282,7 +282,7 @@ fn array_moves_elements() {
 
 #[test]
 fn field_access_does_not_move() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32, y: i32 }
 
@@ -300,7 +300,25 @@ fn field_access_does_not_move() {
 
 #[test]
 fn taking_reference_does_not_move() {
-    let result = check_moves(
+    // &p does not move p — reading a field through the reference is fine.
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun f() {
+            let p = Point{x: 1};
+            let r = &p;
+            let a = p.x;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn move_while_borrowed_is_error() {
+    // Moving p while a shared borrow exists is E0304.
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -311,14 +329,19 @@ fn taking_reference_does_not_move() {
         }
         "#,
     );
-    assert!(result.diagnostics.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0304" && d.message.contains("p"))
+    );
 }
 
 // == Explicit Copy impl ==
 
 #[test]
 fn explicit_copy_impl_makes_struct_copyable() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         trait Copy {}
 
@@ -338,7 +361,7 @@ fn explicit_copy_impl_makes_struct_copyable() {
 
 #[test]
 fn without_copy_impl_struct_is_not_copyable() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         trait Copy {}
 
@@ -363,7 +386,7 @@ fn without_copy_impl_struct_is_not_copyable() {
 
 #[test]
 fn match_binding_whole_scrutinee_is_consumed() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 
@@ -388,7 +411,7 @@ fn match_binding_whole_scrutinee_is_consumed() {
 
 #[test]
 fn block_tail_moves_value() {
-    let result = check_moves(
+    let result = analyze(
         r#"
         struct Point { x: i32 }
 

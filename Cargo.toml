@@ -1,22 +1,24 @@
 [workspace]
 resolver = "2"
 members = [
-    "app/info-viz",
     "app/riddlec",
     "crates/ast",
+    "crates/escape-analysis",
     "crates/frontend",
     "crates/hir",
+    "crates/mir",
     "crates/move-checker",
     "crates/scope-graph",
     "crates/type-checker",
 ]
 default-members = [
     ".",
-    "app/info-viz",
     "app/riddlec",
     "crates/ast",
+    "crates/escape-analysis",
     "crates/frontend",
     "crates/hir",
+    "crates/mir",
     "crates/move-checker",
     "crates/scope-graph",
     "crates/type-checker",
@@ -28,6 +30,7 @@ edition = "2024"
 
 [workspace.dependencies]
 ast = { path = "crates/ast" }
+escape-analysis = { path = "crates/escape-analysis" }
 frontend = { path = "crates/frontend" }
 hir = { path = "crates/hir" }
 la-arena = "0.3"
@@ -36,6 +39,7 @@ move-checker = { path = "crates/move-checker" }
 rowan = "0.15"
 scope-graph = { path = "crates/scope-graph" }
 type-checker = { path = "crates/type-checker" }
+mir = { path = "crates/mir" }
 
 [package]
 name = "riddle"
@@ -45,8 +49,10 @@ publish = false
 
 [dev-dependencies]
 ast.workspace = true
+escape-analysis.workspace = true
 frontend.workspace = true
 hir.workspace = true
+mir.workspace = true
 move-checker.workspace = true
 scope-graph.workspace = true
 type-checker.workspace = true

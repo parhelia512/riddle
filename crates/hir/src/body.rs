@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use la_arena::{Arena, Idx};
-use rowan::ast::SyntaxNodePtr;
+use rowan::{TextRange, ast::SyntaxNodePtr};
 
 use frontend::syntax_kind::RiddleLang;
 
@@ -23,11 +25,47 @@ pub struct Body {
     /// invalidation of this body's scope-graph fragment.
     pub root_ptr: SyntaxNodePtr<RiddleLang>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Maps HIR ids to their source text ranges, populated during lowering.
+    pub source_map: SourceMap,
+}
+
+#[derive(Debug, Default)]
+pub struct SourceMap {
+    pub expr_ranges: HashMap<ExprId, TextRange>,
+    pub stmt_ranges: HashMap<StmtId, TextRange>,
+    pub pat_ranges: HashMap<PatId, TextRange>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
+    pub code: &'static str,
+    pub severity: Severity,
     pub message: String,
+    pub labels: Vec<SourceLabel>,
+    pub help: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceLabel {
+    pub range: TextRange,
+    pub message: String,
+    pub style: LabelStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelStyle {
+    Primary,
+    Secondary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    // PartialEq + Eq added for cross-crate diagnostic bridging
+    Error,
+    Warning,
+    Note,
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +74,7 @@ pub enum Stmt {
         name: Name,
         ty: HirTypeRef,
         init: Option<ExprId>,
+        is_mut: bool,
     },
     Expr {
         expr: ExprId,
@@ -123,6 +162,17 @@ pub enum Expr {
         base: ExprId,
         field: Name,
     },
+    IndexAccess {
+        base: ExprId,
+        index: ExprId,
+    },
+    Unsafe {
+        body: ExprId,
+    },
+    Cast {
+        base: ExprId,
+        target: HirTypeRef,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +230,7 @@ pub enum ResolvedName {
     Function(FunctionId),
     Struct(StructId),
     Enum(item_tree::EnumId),
+    EnumVariant(item_tree::EnumId, usize),
     Trait(item_tree::TraitId),
     Const(item_tree::ConstId),
     TypeAlias(item_tree::TypeAliasId),
@@ -210,6 +261,7 @@ pub enum UnaryOp {
     Neg,
     Pos,
     Ref,
+    MutRef,
     Deref,
     Not,
 }
@@ -256,7 +308,7 @@ impl BodyPrinter<'_> {
 
     fn print_stmt(&self, stmt: StmtId, indent: usize) -> String {
         match &self.body.stmts[stmt] {
-            Stmt::Let { name, ty, init } => {
+            Stmt::Let { name, ty, init, .. } => {
                 let mut out = format!("let {}", name.0);
                 if !matches!(ty, HirTypeRef::Unknown) {
                     out.push_str(": ");
@@ -367,6 +419,11 @@ impl BodyPrinter<'_> {
                 let base = self.print_expr(*base, current_prec, indent);
                 format!("({}.{})", base, field.0)
             }
+            Expr::IndexAccess { base, index } => {
+                let base = self.print_expr(*base, current_prec, indent);
+                let index = self.print_expr(*index, 0, indent);
+                format!("({}[{}])", base, index)
+            }
             Expr::Block { stmts, tail } => self.print_block(stmts, *tail, indent),
             Expr::If {
                 cond,
@@ -419,6 +476,13 @@ impl BodyPrinter<'_> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("[{}]", items)
+            }
+            Expr::Unsafe { body } => {
+                format!("unsafe {}", self.print_block_like(*body, indent))
+            }
+            Expr::Cast { base, target } => {
+                let base = self.print_expr(*base, current_prec, indent);
+                format!("({} as {})", base, Self::type_text(target))
             }
             Expr::Struct { path, fields, .. } => {
                 let fields = fields
@@ -477,10 +541,11 @@ impl BodyPrinter<'_> {
             | Expr::Path { .. }
             | Expr::Struct { .. }
             | Expr::Array { .. } => 100,
-            Expr::Call { .. } | Expr::FieldAccess { .. } => 90,
+            Expr::Call { .. } | Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => 90,
+            Expr::Cast { .. } => 85,
             Expr::Unary { .. } => 80,
             Expr::Binary { op, .. } => Self::binary_prec(op),
-            Expr::Block { .. } | Expr::If { .. } | Expr::While { .. } | Expr::Match { .. } => 0,
+            Expr::Block { .. } | Expr::If { .. } | Expr::While { .. } | Expr::Match { .. } | Expr::Unsafe { .. } => 0,
         }
     }
 
@@ -520,6 +585,7 @@ impl BodyPrinter<'_> {
             UnaryOp::Pos => "+",
             UnaryOp::Neg => "-",
             UnaryOp::Ref => "&",
+            UnaryOp::MutRef => "&mut ",
             UnaryOp::Deref => "*",
             UnaryOp::Not => "!",
         }
@@ -530,7 +596,14 @@ impl BodyPrinter<'_> {
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
             HirTypeRef::Named(p) => p.display(),
-            HirTypeRef::Ref(inner) => format!("&{}", Self::type_text(inner)),
+            HirTypeRef::Ref(inner, mutable) => {
+                let kw = if *mutable { "&mut " } else { "&" };
+                format!("{}{}", kw, Self::type_text(inner))
+            }
+            HirTypeRef::Ptr { mutable, inner } => {
+                let kind = if *mutable { "*mut" } else { "*const" };
+                format!("{kind} {}", Self::type_text(inner))
+            }
             HirTypeRef::Tuple(elements) => {
                 let inner = elements
                     .iter()

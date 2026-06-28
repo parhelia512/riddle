@@ -37,6 +37,10 @@ pub struct ScopeGraph {
     /// Associated item scopes for struct types. `Point::new` resolves by first matching
     /// `Point`, then continuing in this scope with the remaining path.
     pub impl_scopes_by_struct: HashMap<StructId, NodeId>,
+
+    /// Variant scopes for enums. `Foo::A` resolves by first matching `Foo`, then
+    /// continuing in this scope to find variant `A`.
+    pub variant_scopes_by_enum: HashMap<EnumId, NodeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,11 @@ pub enum DefRef {
         rewrite_to: Vec<Name>,
         anchor: NodeId,
     },
+    /// Enum variant, e.g. `A` in `Foo::A`.
+    EnumVariant {
+        enum_id: EnumId,
+        index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +182,7 @@ impl ScopeGraph {
             out_edges,
             partial_index: HashMap::new(),
             impl_scopes_by_struct: HashMap::new(),
+            variant_scopes_by_enum: HashMap::new(),
         }
     }
 
@@ -223,6 +233,8 @@ impl ScopeGraph {
         }
         let dead_nodes: std::collections::HashSet<NodeId> = frag.nodes.iter().copied().collect();
         self.impl_scopes_by_struct
+            .retain(|_, scope| !dead_nodes.contains(scope));
+        self.variant_scopes_by_enum
             .retain(|_, scope| !dead_nodes.contains(scope));
 
         // 2. Remove edges from `out_edges`. The source node may already be a tombstone.

@@ -12,6 +12,7 @@ pub mod body;
 pub mod body_lower;
 pub mod item_tree;
 pub mod lower;
+pub mod place;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Name(pub String);
@@ -36,6 +37,7 @@ pub fn lower_root(root: Root) -> HirFile {
             consts: Arena::new(),
             type_aliases: Arena::new(),
             top_level: vec![],
+            extern_function_ids: vec![],
         },
         bodies: Arena::new(),
         function_bodies: HashMap::new(),
@@ -78,6 +80,27 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
                 let tree = tree_ast.lower();
                 let uid = hir.item_tree.uses.alloc(HirUse { tree });
                 items.push(TopLevelItem::Use(uid));
+            }
+
+            ast::Stmt::ExternBlock(block) => {
+                for func in block.functions() {
+                    let fid = func.lower(&mut hir.item_tree.functions);
+                    items.push(TopLevelItem::Function(fid));
+                    hir.item_tree.extern_function_ids.push(fid);
+                }
+            }
+
+            ast::Stmt::ExternFnDecl(decl) => {
+                if let Some(func) = decl.func_decl() {
+                    let body_ast = func.body();
+                    let fid = func.lower(&mut hir.item_tree.functions);
+                    items.push(TopLevelItem::Function(fid));
+                    if let Some(block) = body_ast {
+                        let body = BodyLower::lower(hir, block);
+                        let bid = hir.bodies.alloc(body);
+                        hir.function_bodies.insert(fid, bid);
+                    }
+                }
             }
 
             ast::Stmt::EnumDecl(e) => {

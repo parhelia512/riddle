@@ -25,17 +25,48 @@ pub fn resolve_reference(sg: &ScopeGraph, reference: NodeId) -> Vec<DefRef> {
 /// Resolves all expression references in `sg` and writes the selected result back to HIR.
 ///
 /// If resolution returns multiple candidates, the first candidate in resolver traversal order is
-/// selected. If no candidate is found, the expression is marked as unresolved.
+/// selected. If no candidate is found, the expression is marked as unresolved and an E0050
+/// diagnostic is emitted.
 pub fn resolve_hir(hir: &mut HirFile, sg: &ScopeGraph) {
     for (nid, node) in sg.nodes.iter() {
         let Node::Reference { origin, .. } = node else {
             continue;
         };
 
-        let resolved = resolve_reference(sg, nid)
+        let candidates = resolve_reference(sg, nid);
+        let resolved = candidates
             .first()
             .map(def_to_resolved_name)
             .unwrap_or(ResolvedName::Unresolved);
+
+        // Only emit E0050 when genuinely unresolved (no candidates).
+        // `def_to_resolved_name` may map some DefRef variants (PatternBinding,
+        // UseAlias) to Unresolved internally; those are not user-visible errors.
+        if candidates.is_empty() {
+            let RefOrigin::Expr { body, expr } = origin;
+            let path_text = match &hir.bodies[*body].exprs[*expr] {
+                Expr::Path { path, .. } | Expr::Struct { path, .. } => path.display(),
+                _ => String::new(),
+            };
+            let range = hir.bodies[*body]
+                .source_map
+                .expr_ranges
+                .get(expr)
+                .copied();
+            hir.bodies[*body].diagnostics.push(hir::body::Diagnostic {
+                code: "E0050",
+                severity: hir::body::Severity::Error,
+                message: format!("unresolved name: `{}`", path_text),
+                labels: range.map(|r| vec![hir::body::SourceLabel {
+                    range: r,
+                    message: String::new(),
+                    style: hir::body::LabelStyle::Primary,
+                }]).unwrap_or_default(),
+                help: None,
+                notes: Vec::new(),
+            });
+        }
+
         write_resolution(hir, *origin, resolved);
     }
 }
@@ -64,6 +95,7 @@ fn def_to_resolved_name(def: &DefRef) -> ResolvedName {
         DefRef::PatternBinding { .. } => ResolvedName::Unresolved,
         DefRef::Param { index, .. } => ResolvedName::Param(*index),
         DefRef::UseAlias { .. } => ResolvedName::Unresolved,
+        DefRef::EnumVariant { enum_id, index } => ResolvedName::EnumVariant(*enum_id, *index),
     }
 }
 
@@ -187,6 +219,15 @@ fn resolve_pop(
             if remaining.is_empty() {
                 vec![define.clone()]
             } else if let Some(scope) = sg.impl_scopes_by_struct.get(sid) {
+                resolve_from(sg, *scope, remaining, visited, fuel - 1)
+            } else {
+                vec![]
+            }
+        }
+        DefRef::Enum(eid) => {
+            if remaining.is_empty() {
+                vec![define.clone()]
+            } else if let Some(scope) = sg.variant_scopes_by_enum.get(eid) {
                 resolve_from(sg, *scope, remaining, visited, fuel - 1)
             } else {
                 vec![]

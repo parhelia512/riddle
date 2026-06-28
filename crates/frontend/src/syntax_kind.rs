@@ -52,6 +52,10 @@ pub enum SyntaxKind {
     Const,
     #[token("type")]
     TypeKw,
+    #[token("extern")]
+    Extern,
+    #[token("unsafe")]
+    Unsafe,
     #[token("for")]
     For,
     #[token("where")]
@@ -61,7 +65,7 @@ pub enum SyntaxKind {
     #[token("false")]
     False,
     #[regex(r#""([^"\\]|\\.)*""#)]
-    #[regex(r##"r#*"[^"]*"#*"##)]
+    // ponytail: raw string r#"..."# needs Logos callback, regex can't count # delimiters
     String,
     #[regex(r#"'([^'\\]|\\.)'"#)]
     Char,
@@ -171,6 +175,7 @@ pub enum SyntaxKind {
     CallExpr,
     ArgList,
     FieldExpr,
+    IndexExpr,
     StructExpr,
     StructExprField,
     NamedType,
@@ -196,6 +201,11 @@ pub enum SyntaxKind {
     StringLit,
     CharLit,
     BoolLit,
+    ExternBlock,
+    ExternFnDecl,
+    UnsafeExpr,
+    CastExpr,
+    PtrType,
     ErrorNode,
 
     // special
@@ -216,7 +226,13 @@ impl rowan::Language for RiddleLang {
     type Kind = SyntaxKind;
 
     fn kind_from_raw(raw: rowan::SyntaxKind) -> Self::Kind {
-        unsafe { std::mem::transmute(raw.0) }
+        // Safe: #[repr(u16)] with sequential discriminants 0..=Eof are all valid
+        if raw.0 <= SyntaxKind::Eof as u16 {
+            // Safety: raw.0 is within the valid discriminant range
+            unsafe { std::mem::transmute(raw.0) }
+        } else {
+            SyntaxKind::ErrorNode
+        }
     }
 
     fn kind_to_raw(kind: Self::Kind) -> rowan::SyntaxKind {

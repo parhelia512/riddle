@@ -1,0 +1,12 @@
+[package]
+name = "mir"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+ast.workspace = true
+escape-analysis.workspace = true
+hir.workspace = true
+type-checker.workspace = true
+la-arena.workspace = true

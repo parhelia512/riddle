@@ -11,6 +11,9 @@
 /target
 Cargo.lock
 
+# C
+*.c
+
 # Editors
 .vscode/
 .idea/
@@ -22,6 +25,9 @@ Cargo.lock
 
 # Environment
 .env
+
+# Binaries
+*.exe
 
 # AI
 .junie/

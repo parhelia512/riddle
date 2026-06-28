@@ -5,6 +5,8 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+escape-analysis.workspace = true
 hir.workspace = true
 type-checker.workspace = true
 la-arena.workspace = true
+rowan.workspace = true

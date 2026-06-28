@@ -1,43 +1,18 @@
-struct Foo{
-    x: i32,
-    y: i32,
-}
-
-trait Bar{
-    fun bar();
-}
-
-impl Bar for Foo{
-    fun bar(){
-        
-    }
-
-    fun help()->str{
-        "HELP"
-    }
+enum Foo{
+    A,
+    B
 }
 
 fun main(){
-    let t: Foo;
-    {    
-        let x = Foo{x:1, y:1};
-        t = x;
-<<<<<<< HEAD
-        print(x); // error
-=======
-        print(x) // error
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
+    let x = Foo::A;
+    x = Foo::B;
+    test(&x);
+}
+
+fun test(x: &Foo) -> bool{
+    if *x == Foo::A {
+        true
+    }else{
+        false
     }
-    let t: &Foo;
-    {
-        let y = &Foo{x:1, y:1};
-<<<<<<< HEAD
-        t = y;
-        print(y); // yes
-=======
-        t = y.clone();
-        print(y) // yes
->>>>>>> 0d7abe0350871a575608ce4fc1d8aae9223abb1c
-    }
-    print(t); // yes
 }

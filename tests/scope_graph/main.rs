@@ -40,7 +40,7 @@ fn build_hir_and_graph_from_parse(parse: &Parse) -> (HirFile, ScopeGraph) {
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
     let hir = lower_root(root);
-    let sg = build_scope_graph(&hir, &syntax);
+    let (sg, _) = build_scope_graph(&hir, &syntax);
     (hir, sg)
 }
 
@@ -178,6 +178,7 @@ fn def_kind(def: &DefRef) -> DefKind {
         DefRef::Param { .. } => DefKind::Param,
         DefRef::PatternBinding { .. } => DefKind::Local,
         DefRef::UseAlias { .. } => DefKind::UseAlias,
+        DefRef::EnumVariant { .. } => DefKind::Struct,
     }
 }
 

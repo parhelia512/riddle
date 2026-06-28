@@ -71,7 +71,7 @@ fn assignment_and_struct_literal_parse_and_lower() {
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
     let mut hir = lower_root(root);
-    let sg = build_scope_graph(&hir, &syntax);
+    let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
 
     let body_id = *hir.function_bodies.values().next().unwrap();
@@ -93,4 +93,44 @@ fn assignment_and_struct_literal_parse_and_lower() {
             resolved: Some(ResolvedName::Struct(_)),
         } if path.display() == "Foo" && fields.len() == 2
     )));
+}
+
+#[test]
+fn resolves_enum_variant_in_path() {
+    let (mut hir, sg) = build_hir_and_graph(
+        "enum Foo{\n    A,\n    B\n}\n\nfun main(){\n    let x = Foo::A;\n    x = Foo::B;\n    test(x);\n}\n\nfun test(x: &Foo) -> bool{\n    if x == Foo::A {\n        true\n    }else{\n        false\n    }\n}",
+    );
+
+    resolve_hir(&mut hir, &sg);
+
+    let all_resolved: Vec<_> = hir
+        .bodies
+        .iter()
+        .flat_map(|(_, body)| {
+            body.exprs.iter().filter_map(|(_, expr)| match expr {
+                Expr::Path { path, resolved } => Some((path.display(), resolved.clone())),
+                _ => None,
+            })
+        })
+        .collect();
+
+    assert!(
+        all_resolved.iter().any(|(path, r)| {
+            path == "Foo::A" && matches!(r, Some(ResolvedName::EnumVariant(_, _)))
+        }),
+        "Expected EnumVariant for Foo::A"
+    );
+    assert!(
+        all_resolved.iter().any(|(path, r)| {
+            path == "Foo::B" && matches!(r, Some(ResolvedName::EnumVariant(_, _)))
+        }),
+        "Expected EnumVariant for Foo::B"
+    );
+
+    // No unresolved paths
+    let unresolved: Vec<_> = all_resolved
+        .iter()
+        .filter(|(_, r)| matches!(r, Some(ResolvedName::Unresolved) | None))
+        .collect();
+    assert!(unresolved.is_empty(), "Unexpected unresolved paths: {:?}", unresolved);
 }

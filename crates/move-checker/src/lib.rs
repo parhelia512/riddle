@@ -1,56 +1,85 @@
 use std::collections::{HashMap, HashSet};
 
+use rowan::TextRange;
+
+use escape_analysis::EscapeResult;
 use hir::{
     HirFile,
-    body::{Body, BodyId, Expr, ExprId, ResolvedName, Stmt, StmtId},
+    body::{BinaryOp, Body, BodyId, Expr, ExprId, ResolvedName, SourceMap, Stmt, StmtId, UnaryOp},
+    place::Place,
 };
-use type_checker::{Diagnostic, TraitEnv, Type, TypeCheckResult};
+use type_checker::{Diagnostic, LabelStyle, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult};
 
 #[derive(Debug, Default)]
-pub struct MoveResult {
+pub struct AnalysisResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub fn check_moves(hir: &HirFile, type_result: &TypeCheckResult) -> MoveResult {
-    let mut checker = MoveChecker {
+/// Run move/borrow checking. Escape analysis results are consumed read-only
+/// to skip borrow checks for heap-allocated (escaping) locals.
+pub fn analyze(
+    hir: &HirFile,
+    type_result: &TypeCheckResult,
+    escape_result: &EscapeResult,
+) -> AnalysisResult {
+    let mut a = Analyzer {
         hir,
         type_result,
         trait_env: &type_result.trait_env,
-        result: MoveResult::default(),
+        escape_result,
+        result: AnalysisResult::default(),
     };
-    checker.check_all_bodies();
-    checker.result
+    a.analyze_all_bodies();
+    a.result
 }
 
-struct MoveChecker<'a> {
+struct Analyzer<'a> {
     hir: &'a HirFile,
     type_result: &'a TypeCheckResult,
     trait_env: &'a TraitEnv,
-    result: MoveResult,
+    escape_result: &'a EscapeResult,
+    result: AnalysisResult,
 }
 
-impl<'a> MoveChecker<'a> {
-    fn check_all_bodies(&mut self) {
+impl<'a> Analyzer<'a> {
+    fn analyze_all_bodies(&mut self) {
         for (fid, _) in self.hir.item_tree.functions.iter() {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
-                self.check_body(body_id);
+                self.analyze_body(body_id);
             }
         }
     }
 
-    fn check_body(&mut self, body_id: BodyId) {
+    fn analyze_body(&mut self, body_id: BodyId) {
         let body = &self.hir.bodies[body_id];
-        let mut ctx = BodyMoveCtx::new(body_id, body);
-        self.check_expr(&mut ctx, body.root_block);
+        // Build per-body escaping set from global escape result
+        let escaping_locals: HashSet<StmtId> = self
+            .escape_result
+            .escaping_locals
+            .iter()
+            .filter(|(bid, _)| *bid == body_id)
+            .map(|(_, stmt)| *stmt)
+            .collect();
+        let mut ctx = BodyCtx::new(body_id, body, escaping_locals);
+        self.move_check_body(&mut ctx);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Move checking
+    // ═══════════════════════════════════════════════════════════
+
+    fn move_check_body(&mut self, ctx: &mut BodyCtx<'_>) {
+        self.move_check_expr(ctx, ctx.body.root_block);
         if let Expr::Block {
             tail: Some(tail), ..
-        } = &body.exprs[body.root_block]
+        } = &ctx.body.exprs[ctx.body.root_block]
         {
-            self.consume_if_local(&mut ctx, *tail);
+            self.consume_if_local(ctx, *tail);
         }
     }
 
-    fn check_expr(&mut self, ctx: &mut BodyMoveCtx<'_>, expr_id: ExprId) {
+    fn move_check_expr(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let span = ctx.expr_range(expr_id);
         match &ctx.body.exprs[expr_id] {
             Expr::Missing
             | Expr::IntLiteral { .. }
@@ -63,46 +92,103 @@ impl<'a> MoveChecker<'a> {
                 if let Some(name) = path.as_single_name() {
                     if let Some(moved) = ctx.bindings.get(&name.0) {
                         if *moved {
-                            self.diagnostic(format!("use of moved value: `{}`", name.0));
+                            self.diag(format!("use of moved value: `{}`", name.0), span, "E0100");
                         }
                         return;
                     }
                 }
                 if let Some(ResolvedName::Local(stmt)) = resolved {
-                    if ctx.moved_locals.contains(stmt) {
+                    let place = Place::root(*stmt);
+                    if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
                         let label = path.as_single_name().map(|n| n.0.as_str()).unwrap_or("_");
-                        self.diagnostic(format!("use of moved value: `{}`", label));
+                        self.diag(format!("use of moved value: `{}`", label), span, "E0100");
                     }
                 }
             }
 
             Expr::Struct { fields, .. } => {
                 for field in fields {
-                    self.check_expr(ctx, field.value);
+                    self.move_check_expr(ctx, field.value);
                     self.consume_if_local(ctx, field.value);
                 }
             }
 
             Expr::Binary { lhs, rhs, op } => {
-                use hir::body::BinaryOp;
-                self.check_expr(ctx, *lhs);
-                self.check_expr(ctx, *rhs);
+                self.move_check_expr(ctx, *lhs);
+                self.move_check_expr(ctx, *rhs);
                 if *op == BinaryOp::Assign {
+                    if let Some(lhs_place) = self.place_from_expr(ctx, *lhs) {
+                        if !ctx.escaping_locals.contains(&lhs_place.local) {
+                            if self.has_any_borrow(ctx, &lhs_place) {
+                                let name = self.expr_name(ctx, *lhs);
+                                self.diag(
+                                    format!("cannot assign to `{}` while borrowed", name),
+                                    span,
+                                    "E0303",
+                                );
+                            }
+                        }
+                    }
                     self.consume_if_local(ctx, *rhs);
                 }
             }
 
-            Expr::Unary { operand, .. } => {
-                self.check_expr(ctx, *operand);
+            Expr::Unary { operand, op } => {
+                self.move_check_expr(ctx, *operand);
+                match op {
+                    UnaryOp::Ref | UnaryOp::MutRef => {
+                        if let Some(place) = self.place_from_expr(ctx, *operand) {
+                            if !ctx.escaping_locals.contains(&place.local) {
+                                if *op == UnaryOp::Ref {
+                                    if self.has_mut_borrow(ctx, &place) {
+                                        let name = self.expr_name(ctx, *operand);
+                                        self.diag(
+                                            format!("cannot borrow `{}` as immutable because it is also borrowed as mutable", name),
+                                            span,
+                                            "E0301",
+                                        );
+                                    } else {
+                                        ctx.shared_borrows
+                                            .entry(place)
+                                            .or_default()
+                                            .push(BorrowRecord { expr_id, scope_depth: ctx.scope_depth });
+                                    }
+                                } else {
+                                    if self.has_shared_borrow(ctx, &place) {
+                                        let name = self.expr_name(ctx, *operand);
+                                        self.diag(
+                                            format!("cannot borrow `{}` as mutable because it is also borrowed as immutable", name),
+                                            span,
+                                            "E0300",
+                                        );
+                                    } else if self.has_mut_borrow(ctx, &place) {
+                                        let name = self.expr_name(ctx, *operand);
+                                        self.diag(
+                                            format!("cannot borrow `{}` as mutable more than once at a time", name),
+                                            span,
+                                            "E0302",
+                                        );
+                                    } else {
+                                        ctx.mutable_borrows
+                                            .entry(place)
+                                            .or_default()
+                                            .push(BorrowRecord { expr_id, scope_depth: ctx.scope_depth });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             Expr::Block { stmts, tail } => {
                 ctx.push_scope();
                 for stmt in stmts {
-                    self.check_stmt(ctx, *stmt);
+                    self.move_check_stmt(ctx, *stmt);
                 }
                 if let Some(tail) = tail {
-                    self.check_expr(ctx, *tail);
+                    self.move_check_expr(ctx, *tail);
                     self.consume_if_local(ctx, *tail);
                 }
                 ctx.pop_scope();
@@ -113,66 +199,93 @@ impl<'a> MoveChecker<'a> {
                 then_branch,
                 else_branch,
             } => {
-                self.check_expr(ctx, *cond);
-                self.check_expr(ctx, *then_branch);
+                self.move_check_expr(ctx, *cond);
+                self.move_check_expr(ctx, *then_branch);
                 if let Some(e) = else_branch {
-                    self.check_expr(ctx, *e);
+                    self.move_check_expr(ctx, *e);
                 }
             }
 
             Expr::While { condition, body } => {
-                self.check_expr(ctx, *condition);
-                self.check_expr(ctx, *body);
+                self.move_check_expr(ctx, *condition);
+                self.move_check_expr(ctx, *body);
             }
 
             Expr::Match { scrutinee, arms } => {
-                self.check_expr(ctx, *scrutinee);
+                self.move_check_expr(ctx, *scrutinee);
                 self.consume_if_local(ctx, *scrutinee);
                 for arm in arms {
                     ctx.push_scope();
                     self.bind_pattern_names(ctx, arm.pat);
                     if let Some(g) = arm.guard {
-                        self.check_expr(ctx, g);
+                        self.move_check_expr(ctx, g);
                     }
-                    self.check_expr(ctx, arm.body);
+                    self.move_check_expr(ctx, arm.body);
                     ctx.pop_scope();
                 }
             }
 
             Expr::Array { elements } => {
                 for el in elements {
-                    self.check_expr(ctx, *el);
+                    self.move_check_expr(ctx, *el);
                     self.consume_if_local(ctx, *el);
                 }
             }
 
             Expr::Call { callee, args } => {
-                self.check_expr(ctx, *callee);
+                self.move_check_expr(ctx, *callee);
                 for arg in args {
-                    self.check_expr(ctx, *arg);
+                    self.move_check_expr(ctx, *arg);
                     self.consume_if_local(ctx, *arg);
                 }
             }
 
-            Expr::FieldAccess { base, .. } => {
-                self.check_expr(ctx, *base);
+            Expr::Unsafe { body } => {
+                self.move_check_expr(ctx, *body);
+            }
+
+            Expr::Cast { base, .. } => {
+                self.move_check_expr(ctx, *base);
+            }
+
+            Expr::FieldAccess { base, field } => {
+                self.move_check_expr(ctx, *base);
+                if let Some(place) = self.place_from_expr(ctx, expr_id) {
+                    if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
+                        self.diag(
+                            format!("use of moved field: `{}`", field.0),
+                            span,
+                            "E0100",
+                        );
+                    }
+                }
+            }
+
+            Expr::IndexAccess { base, index } => {
+                self.move_check_expr(ctx, *base);
+                self.move_check_expr(ctx, *index);
+                if let Some(place) = self.place_from_expr(ctx, expr_id) {
+                    if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
+                        self.diag("use of moved value from array".into(), span, "E0100");
+                    }
+                }
             }
         }
     }
 
-    fn check_stmt(&mut self, ctx: &mut BodyMoveCtx<'_>, stmt_id: StmtId) {
+    fn move_check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
         let s = &ctx.body.stmts[stmt_id];
         match s {
             Stmt::Let { init, .. } => {
                 if let Some(init) = init {
-                    self.check_expr(ctx, *init);
+                    self.move_check_expr(ctx, *init);
                     self.consume_if_local(ctx, *init);
                 }
             }
-            Stmt::Expr { expr } => self.check_expr(ctx, *expr),
+            Stmt::Expr { expr } => self.move_check_expr(ctx, *expr),
             Stmt::Return { value } => {
                 if let Some(v) = value {
-                    self.check_expr(ctx, *v);
+                    self.move_check_expr(ctx, *v);
                     self.consume_if_local(ctx, *v);
                 }
             }
@@ -180,8 +293,25 @@ impl<'a> MoveChecker<'a> {
         }
     }
 
-    fn consume_if_local(&mut self, ctx: &mut BodyMoveCtx<'_>, expr_id: ExprId) {
-        let Expr::Path { path, resolved, .. } = &ctx.body.exprs[expr_id] else {
+    fn consume_if_local(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        if let Expr::Path { path, .. } = &ctx.body.exprs[expr_id] {
+            if let Some(name) = path.as_single_name() {
+                if ctx.bindings.contains(&name.0) {
+                    let ty = self
+                        .type_result
+                        .expr_types
+                        .get(&(ctx.body_id, expr_id))
+                        .cloned()
+                        .unwrap_or(Type::Unknown);
+                    if !self.trait_env.type_is_copy(&ty) {
+                        ctx.bindings.mark_moved(&name.0);
+                    }
+                    return;
+                }
+            }
+        }
+
+        let Some(place) = self.place_from_expr(ctx, expr_id) else {
             return;
         };
         let ty = self
@@ -193,18 +323,90 @@ impl<'a> MoveChecker<'a> {
         if self.trait_env.type_is_copy(&ty) {
             return;
         }
-        if let Some(name) = path.as_single_name() {
-            if ctx.bindings.contains(&name.0) {
-                ctx.bindings.mark_moved(&name.0);
+        if !ctx.escaping_locals.contains(&place.local) {
+            if self.has_any_borrow(ctx, &place) {
+                let name = self.expr_name(ctx, expr_id);
+                self.diag(
+                    format!("cannot move `{}` while borrowed", name),
+                    ctx.expr_range(expr_id),
+                    "E0304",
+                );
                 return;
             }
         }
-        if let Some(ResolvedName::Local(stmt)) = resolved {
-            ctx.moved_locals.insert(*stmt);
+        ctx.moved_places.insert(place);
+    }
+
+    fn place_from_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<Place> {
+        match &ctx.body.exprs[expr_id] {
+            Expr::Path {
+                resolved: Some(ResolvedName::Local(stmt)),
+                ..
+            } => Some(Place::root(*stmt)),
+            Expr::FieldAccess { base, field } => {
+                let base_place = self.place_from_expr(ctx, *base)?;
+                let idx = self.resolve_field_index(ctx.body_id, *base, field)?;
+                Some(base_place.field(idx))
+            }
+            Expr::IndexAccess { base, index } => {
+                let base_place = self.place_from_expr(ctx, *base)?;
+                let idx = match &ctx.body.exprs[*index] {
+                    Expr::IntLiteral { value, .. } => *value as usize,
+                    _ => return None,
+                };
+                Some(base_place.index(idx))
+            }
+            _ => None,
         }
     }
 
-    fn bind_pattern_names(&self, ctx: &mut BodyMoveCtx<'_>, pat: hir::body::PatId) {
+    fn resolve_field_index(
+        &self,
+        body_id: BodyId,
+        base: ExprId,
+        field: &hir::Name,
+    ) -> Option<usize> {
+        let ty = self.type_result.expr_types.get(&(body_id, base))?;
+        let struct_id = match ty {
+            Type::Ref(inner, _) => match inner.as_ref() {
+                Type::Struct(sid) => Some(*sid),
+                _ => None,
+            },
+            Type::Struct(sid) => Some(*sid),
+            _ => None,
+        }?;
+        let strukt = &self.hir.item_tree.structs[struct_id];
+        strukt.fields.iter().position(|f| f.name == *field)
+    }
+
+    fn has_any_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
+        self.has_shared_borrow(ctx, place) || self.has_mut_borrow(ctx, place)
+    }
+
+    fn has_shared_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
+        ctx.shared_borrows
+            .keys()
+            .any(|b| b.is_prefix_of(place) || place.is_prefix_of(b))
+    }
+
+    fn has_mut_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
+        ctx.mutable_borrows
+            .keys()
+            .any(|b| b.is_prefix_of(place) || place.is_prefix_of(b))
+    }
+
+    fn expr_name(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> String {
+        match &ctx.body.exprs[expr_id] {
+            Expr::Path { path, .. } => path
+                .as_single_name()
+                .map(|n| n.0.as_str().to_string())
+                .unwrap_or_else(|| "_".into()),
+            Expr::FieldAccess { field, .. } => field.0.clone(),
+            _ => String::from("_"),
+        }
+    }
+
+    fn bind_pattern_names(&self, ctx: &mut BodyCtx<'_>, pat: hir::body::PatId) {
         match &ctx.body.pats[pat] {
             hir::body::Pattern::Binding { name } => {
                 ctx.bindings.insert_available(name.0.clone());
@@ -232,32 +434,109 @@ impl<'a> MoveChecker<'a> {
         }
     }
 
-    fn diagnostic(&mut self, message: String) {
-        self.result.diagnostics.push(Diagnostic { message });
+    fn diag(&mut self, message: String, span: Option<TextRange>, code: &'static str) {
+        let help = match code {
+            "E0100" => Some("consider borrowing with `&`".into()),
+            "E0300" => {
+                Some("cannot borrow as mutable while already borrowed as immutable".into())
+            }
+            "E0301" => {
+                Some("cannot borrow as immutable while already borrowed as mutable".into())
+            }
+            "E0302" => {
+                Some("cannot borrow as mutable more than once at a time".into())
+            }
+            "E0303" => Some(
+                "cannot assign while the value is borrowed — the borrow must end first".into(),
+            ),
+            "E0304" => Some(
+                "cannot move while the value is borrowed — the borrow must end first".into(),
+            ),
+            _ => None,
+        };
+        self.result.diagnostics.push(Diagnostic {
+            code,
+            severity: Severity::Error,
+            message,
+            labels: span
+                .map(|r| vec![SourceLabel {
+                    range: r,
+                    message: String::new(),
+                    style: LabelStyle::Primary,
+                }])
+                .unwrap_or_default(),
+            help,
+            notes: Vec::new(),
+        });
     }
 }
 
-struct BodyMoveCtx<'a> {
-    body_id: BodyId,
-    body: &'a Body,
-    moved_locals: HashSet<StmtId>,
-    bindings: MoveBindings,
+// ═══════════════════════════════════════════════════════════
+// Context types
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+struct BorrowRecord {
+    /// The expression that created this borrow.
+    expr_id: ExprId,
+    /// The block scope depth at which this borrow was created.
+    scope_depth: usize,
 }
 
-impl<'a> BodyMoveCtx<'a> {
-    fn new(body_id: BodyId, body: &'a Body) -> Self {
+struct BodyCtx<'a> {
+    body_id: BodyId,
+    body: &'a Body,
+    source_map: &'a SourceMap,
+
+    // Move tracking
+    bindings: MoveBindings,
+    moved_places: HashSet<Place>,
+
+    // Borrow tracking
+    shared_borrows: HashMap<Place, Vec<BorrowRecord>>,
+    mutable_borrows: HashMap<Place, Vec<BorrowRecord>>,
+    scope_depth: usize,
+
+    // Escape results from escape-analysis pass (read-only)
+    escaping_locals: HashSet<StmtId>,
+}
+
+impl<'a> BodyCtx<'a> {
+    fn new(body_id: BodyId, body: &'a Body, escaping_locals: HashSet<StmtId>) -> Self {
         Self {
             body_id,
             body,
-            moved_locals: HashSet::new(),
+            source_map: &body.source_map,
             bindings: MoveBindings::default(),
+            moved_places: HashSet::new(),
+            shared_borrows: HashMap::new(),
+            mutable_borrows: HashMap::new(),
+            scope_depth: 0,
+            escaping_locals,
         }
     }
+
     fn push_scope(&mut self) {
         self.bindings.push_scope();
+        self.scope_depth += 1;
     }
     fn pop_scope(&mut self) {
         self.bindings.pop_scope();
+        if self.scope_depth > 0 {
+            self.scope_depth -= 1;
+        }
+        let current = self.scope_depth;
+        self.shared_borrows.retain(|_, records| {
+            records.retain(|r| r.scope_depth <= current);
+            !records.is_empty()
+        });
+        self.mutable_borrows.retain(|_, records| {
+            records.retain(|r| r.scope_depth <= current);
+            !records.is_empty()
+        });
+    }
+    fn expr_range(&self, id: ExprId) -> Option<TextRange> {
+        self.source_map.expr_ranges.get(&id).copied()
     }
 }
 

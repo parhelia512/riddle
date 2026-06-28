@@ -7,8 +7,8 @@ use hir::{
     HirFile, Name,
     body::{Body, BodyId, BodyItem, Expr, ExprId, MatchArm, PatId, Pattern, Stmt, StmtId},
     item_tree::{
-        FunctionId, HirPath, HirTypeRef, HirUseTree, HirUseTreeKind, ModuleId, PathAnchor,
-        StructId, TopLevelItem,
+        EnumId, FunctionId, HirPath, HirTypeRef, HirUseTree, HirUseTreeKind, ModuleId,
+        PathAnchor, StructId, TopLevelItem,
     },
 };
 
@@ -18,7 +18,7 @@ use super::{DefRef, EdgeId, EdgeKind, Fragment, Node, NodeId, RefOrigin, ScopeGr
 ///
 /// The builder starts from `ItemTree::top_level` and recursively encodes modules,
 /// imports, functions, and structs. Function bodies are encoded as separate fragments.
-pub fn build_scope_graph(hir: &HirFile, root_syntax: &SyntaxNode) -> ScopeGraph {
+pub fn build_scope_graph(hir: &HirFile, root_syntax: &SyntaxNode) -> (ScopeGraph, Vec<hir::body::Diagnostic>) {
     ScopeGraphBuilder::new(hir, root_syntax).build()
 }
 
@@ -34,6 +34,7 @@ pub struct ScopeGraphBuilder<'a> {
     root_ptr: SyntaxNodePtr<RiddleLang>,
     mod_scopes: HashMap<ModuleId, ModuleScopes>,
     modules_by_scope: HashMap<NodeId, Vec<ModuleId>>,
+    diagnostics: Vec<hir::body::Diagnostic>,
 }
 
 impl<'a> ScopeGraphBuilder<'a> {
@@ -42,18 +43,20 @@ impl<'a> ScopeGraphBuilder<'a> {
             sg: ScopeGraph::new(),
             hir,
             root_ptr: SyntaxNodePtr::new(root_syntax),
+            diagnostics: Vec::new(),
             mod_scopes: HashMap::new(),
             modules_by_scope: HashMap::new(),
         }
     }
 
-    pub fn build(mut self) -> ScopeGraph {
+    pub fn build(mut self) -> (ScopeGraph, Vec<hir::body::Diagnostic>) {
         let root_scope = self.sg.root;
 
         // Pre-allocate module scopes because imports may refer to modules that have not
         // been encoded yet.
         self.pre_alloc_module_scopes();
         self.pre_alloc_impl_scopes();
+        self.pre_alloc_enum_scopes();
 
         let mut frag_nodes = vec![];
         let mut frag_edges = vec![];
@@ -73,7 +76,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         let fid = self.sg.fragments.alloc(frag);
         self.sg.by_ptr.insert(root_ptr, fid);
 
-        self.sg
+        (self.sg, self.diagnostics)
     }
 
     fn pre_alloc_module_scopes(&mut self) {
@@ -89,6 +92,13 @@ impl<'a> ScopeGraphBuilder<'a> {
         for (sid, _) in self.hir.item_tree.structs.iter() {
             let scope = self.sg.alloc_node(Node::Scope(ScopeKind::ImplScope));
             self.sg.impl_scopes_by_struct.insert(sid, scope);
+        }
+    }
+
+    fn pre_alloc_enum_scopes(&mut self) {
+        for (eid, _) in self.hir.item_tree.enums.iter() {
+            let scope = self.sg.alloc_node(Node::Scope(ScopeKind::Block));
+            self.sg.variant_scopes_by_enum.insert(eid, scope);
         }
     }
 
@@ -109,53 +119,24 @@ impl<'a> ScopeGraphBuilder<'a> {
                 TopLevelItem::Struct(sid) => {
                     self.encode_struct_impl_scope(*sid, parent_scope, frag_nodes, frag_edges);
                     let name = self.hir.item_tree.structs[*sid].name.clone();
-                    let pop = self.sg.alloc_node(Node::PopSymbol {
-                        name,
-                        define: DefRef::Struct(*sid),
-                    });
-                    frag_nodes.push(pop);
-                    let e = self.sg.add_edge(parent_scope, pop, EdgeKind::Def, 0);
-                    frag_edges.push(e);
+                    self.emit_named_def(parent_scope, name, DefRef::Struct(*sid), frag_nodes, frag_edges);
                 }
                 TopLevelItem::Enum(eid) => {
                     let name = self.hir.item_tree.enums[*eid].name.clone();
-                    let pop = self.sg.alloc_node(Node::PopSymbol {
-                        name,
-                        define: DefRef::Enum(*eid),
-                    });
-                    frag_nodes.push(pop);
-                    let e = self.sg.add_edge(parent_scope, pop, EdgeKind::Def, 0);
-                    frag_edges.push(e);
+                    self.emit_named_def(parent_scope, name, DefRef::Enum(*eid), frag_nodes, frag_edges);
+                    self.encode_enum_variant_scope(*eid, parent_scope, frag_nodes, frag_edges);
                 }
                 TopLevelItem::Trait(tid) => {
                     let name = self.hir.item_tree.traits[*tid].name.clone();
-                    let pop = self.sg.alloc_node(Node::PopSymbol {
-                        name,
-                        define: DefRef::Trait(*tid),
-                    });
-                    frag_nodes.push(pop);
-                    let e = self.sg.add_edge(parent_scope, pop, EdgeKind::Def, 0);
-                    frag_edges.push(e);
+                    self.emit_named_def(parent_scope, name, DefRef::Trait(*tid), frag_nodes, frag_edges);
                 }
                 TopLevelItem::Const(cid) => {
                     let name = self.hir.item_tree.consts[*cid].name.clone();
-                    let pop = self.sg.alloc_node(Node::PopSymbol {
-                        name,
-                        define: DefRef::Const(*cid),
-                    });
-                    frag_nodes.push(pop);
-                    let e = self.sg.add_edge(parent_scope, pop, EdgeKind::Def, 0);
-                    frag_edges.push(e);
+                    self.emit_named_def(parent_scope, name, DefRef::Const(*cid), frag_nodes, frag_edges);
                 }
                 TopLevelItem::TypeAlias(tid) => {
                     let name = self.hir.item_tree.type_aliases[*tid].name.clone();
-                    let pop = self.sg.alloc_node(Node::PopSymbol {
-                        name,
-                        define: DefRef::TypeAlias(*tid),
-                    });
-                    frag_nodes.push(pop);
-                    let e = self.sg.add_edge(parent_scope, pop, EdgeKind::Def, 0);
-                    frag_edges.push(e);
+                    self.emit_named_def(parent_scope, name, DefRef::TypeAlias(*tid), frag_nodes, frag_edges);
                 }
                 TopLevelItem::Module(mid) => {
                     self.encode_module(*mid, parent_scope, frag_nodes, frag_edges);
@@ -187,6 +168,20 @@ impl<'a> ScopeGraphBuilder<'a> {
         }
     }
 
+    fn emit_named_def(
+        &mut self,
+        parent_scope: NodeId,
+        name: hir::Name,
+        def: DefRef,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        let pop = self.sg.alloc_node(Node::PopSymbol { name, define: def });
+        frag_nodes.push(pop);
+        let e = self.sg.add_edge(parent_scope, pop, EdgeKind::Def, 0);
+        frag_edges.push(e);
+    }
+
     fn register_module_child(&mut self, parent_scope: NodeId, module_id: ModuleId) {
         let siblings = self.modules_by_scope.entry(parent_scope).or_default();
         if !siblings.contains(&module_id) {
@@ -212,7 +207,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_nodes: &mut Vec<NodeId>,
         frag_edges: &mut Vec<EdgeId>,
     ) {
-        let func = self.hir.item_tree.functions[fid].clone();
+        let func = &self.hir.item_tree.functions[fid];
 
         // Register the function name in its parent scope.
         let pop = self.sg.alloc_node(Node::PopSymbol {
@@ -231,7 +226,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_nodes: &mut Vec<NodeId>,
         frag_edges: &mut Vec<EdgeId>,
     ) {
-        let func = self.hir.item_tree.functions[fid].clone();
+        let func = &self.hir.item_tree.functions[fid];
 
         // Create the function scope shared by parameters and the body root.
         let fn_scope = self.sg.alloc_node(Node::Scope(ScopeKind::FunctionScope));
@@ -276,6 +271,36 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_edges.push(e);
     }
 
+    fn encode_enum_variant_scope(
+        &mut self,
+        eid: EnumId,
+        parent_scope: NodeId,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        let Some(scope) = self.sg.variant_scopes_by_enum.get(&eid).copied() else {
+            return;
+        };
+
+        frag_nodes.push(scope);
+        let e = self.sg.add_edge(scope, parent_scope, EdgeKind::Lex, 0);
+        frag_edges.push(e);
+
+        let enum_data = &self.hir.item_tree.enums[eid];
+        for (idx, variant) in enum_data.variants.iter().enumerate() {
+            self.emit_named_def(
+                scope,
+                variant.name.clone(),
+                DefRef::EnumVariant {
+                    enum_id: eid,
+                    index: idx,
+                },
+                frag_nodes,
+                frag_edges,
+            );
+        }
+    }
+
     fn encode_impl(
         &mut self,
         iid: hir::item_tree::ImplId,
@@ -283,10 +308,10 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_nodes: &mut Vec<NodeId>,
         frag_edges: &mut Vec<EdgeId>,
     ) {
-        let imp = self.hir.item_tree.impls[iid].clone();
+        let imp = &self.hir.item_tree.impls[iid];
         let associated_scope = self.impl_scope_for_self_ty(&imp.self_ty);
 
-        for fid in imp.methods {
+        for &fid in &imp.methods {
             let body_parent = associated_scope.unwrap_or(parent_scope);
             if let Some(scope) = associated_scope {
                 self.encode_function_def(fid, scope, frag_nodes, frag_edges);
@@ -296,7 +321,7 @@ impl<'a> ScopeGraphBuilder<'a> {
             }
         }
 
-        for cid in imp.consts {
+        for &cid in &imp.consts {
             let name = self.hir.item_tree.consts[cid].name.clone();
             let pop = self.sg.alloc_node(Node::PopSymbol {
                 name,
@@ -312,7 +337,7 @@ impl<'a> ScopeGraphBuilder<'a> {
             frag_edges.push(e);
         }
 
-        for tid in imp.type_aliases {
+        for &tid in &imp.type_aliases {
             let name = self.hir.item_tree.type_aliases[tid].name.clone();
             let pop = self.sg.alloc_node(Node::PopSymbol {
                 name,
@@ -398,7 +423,17 @@ impl<'a> ScopeGraphBuilder<'a> {
                 let exposed = alias
                     .clone()
                     .or_else(|| tree.prefix.segments.last().cloned());
-                let Some(exposed) = exposed else { return };
+                let Some(exposed) = exposed else {
+                    self.diagnostics.push(hir::body::Diagnostic {
+                        code: "E0051",
+                        severity: hir::body::Severity::Error,
+                        message: "empty use declaration".into(),
+                        labels: Vec::new(),
+                        help: None,
+                        notes: Vec::new(),
+                    });
+                    return;
+                };
 
                 // `rewrite_to` stores the path segments only; the anchor is stored separately.
                 let rewrite_to = tree.prefix.segments.clone();
@@ -428,6 +463,18 @@ impl<'a> ScopeGraphBuilder<'a> {
                         .sg
                         .add_edge(current_scope, target, EdgeKind::Export, -1);
                     frag_edges.push(e);
+                } else {
+                    self.diagnostics.push(hir::body::Diagnostic {
+                        code: "E0052",
+                        severity: hir::body::Severity::Error,
+                        message: format!(
+                            "glob import target not found: `{}`",
+                            tree.prefix.display()
+                        ),
+                        labels: Vec::new(),
+                        help: None,
+                        notes: Vec::new(),
+                    });
                 }
             }
         }
@@ -680,6 +727,11 @@ impl<'a> ScopeGraphBuilder<'a> {
             Expr::FieldAccess { base, .. } => {
                 self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
             }
+
+            Expr::IndexAccess { base, index } => {
+                self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
+                self.walk_expr_for_refs(body_id, body, *index, current_scope, nodes, edges);
+            }
             Expr::Block { stmts, tail } => {
                 let inner = self.sg.alloc_node(Node::Scope(ScopeKind::Block));
                 nodes.push(inner);
@@ -722,6 +774,12 @@ impl<'a> ScopeGraphBuilder<'a> {
                     }
                     self.walk_expr_for_refs(body_id, body, arm.body, arm_scope, nodes, edges);
                 }
+            }
+            Expr::Unsafe { body: b } => {
+                self.walk_expr_for_refs(body_id, body, *b, current_scope, nodes, edges);
+            }
+            Expr::Cast { base, .. } => {
+                self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
             }
             Expr::Array { elements } => {
                 for e in elements {

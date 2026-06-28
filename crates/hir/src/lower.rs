@@ -1,6 +1,6 @@
 use la_arena::Arena;
 
-use ast::{self, FuncDecl, Param, StructDecl, StructField, StructFieldList, Type};
+use ast::{self, ExternFnDecl, FuncDecl, Param, StructDecl, StructField, StructFieldList, Type};
 use frontend::syntax_kind::{SyntaxKind, SyntaxToken};
 
 use super::{
@@ -54,6 +54,16 @@ impl AstLower for FuncDecl {
             ret_type,
             has_body,
         })
+    }
+}
+
+impl AstLower for ExternFnDecl {
+    type Id = FunctionId;
+    type Item = HirFunction;
+    fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
+        self.func_decl()
+            .expect("ExternFnDecl must contain FuncDecl")
+            .lower(arena)
     }
 }
 
@@ -180,7 +190,14 @@ impl Lower for Type {
         match self {
             Type::Named(node) => HirTypeRef::Named(node.path().lower()),
             Type::Ref(ref_ty) => match ref_ty.inner() {
-                Some(inner) => HirTypeRef::Ref(Box::new(inner.lower())),
+                Some(inner) => HirTypeRef::Ref(Box::new(inner.lower()), ref_ty.is_mut()),
+                None => HirTypeRef::Error,
+            },
+            Type::Ptr(ptr_ty) => match ptr_ty.inner() {
+                Some(inner) => HirTypeRef::Ptr {
+                    mutable: ptr_ty.is_mut(),
+                    inner: Box::new(inner.lower()),
+                },
                 None => HirTypeRef::Error,
             },
             Type::Tuple(tuple) => HirTypeRef::Tuple(tuple.elements().map(|t| t.lower()).collect()),

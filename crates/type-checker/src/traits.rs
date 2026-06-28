@@ -37,27 +37,39 @@ impl TypeChecker<'_> {
         let mut methods = HashSet::new();
         for method in &tr.methods {
             if !methods.insert(method.name.0.clone()) {
-                self.diagnostic(format!(
-                    "trait `{}` has duplicate method `{}`",
-                    tr.name.0, method.name.0
-                ));
+                self.diagnostic(
+                    "E0020",
+                    format!(
+                        "trait `{}` has duplicate method `{}`",
+                        tr.name.0, method.name.0
+                    ),
+                    None,
+                );
             }
 
             if method.has_body {
-                self.diagnostic(format!(
-                    "trait method `{}::{}` must not have a body",
-                    tr.name.0, method.name.0
-                ));
+                self.diagnostic(
+                    "E0021",
+                    format!(
+                        "trait method `{}::{}` must not have a body",
+                        tr.name.0, method.name.0
+                    ),
+                    None,
+                );
             }
         }
 
         let mut type_aliases = HashSet::new();
         for assoc in &tr.type_aliases {
             if !type_aliases.insert(assoc.name.0.clone()) {
-                self.diagnostic(format!(
-                    "trait `{}` has duplicate associated type `{}`",
-                    tr.name.0, assoc.name.0
-                ));
+                self.diagnostic(
+                    "E0022",
+                    format!(
+                        "trait `{}` has duplicate associated type `{}`",
+                        tr.name.0, assoc.name.0
+                    ),
+                    None,
+                );
             }
         }
     }
@@ -71,11 +83,15 @@ impl TypeChecker<'_> {
 
         let self_ty_text = self.display_type_ref(&imp.self_ty);
         let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
-            self.diagnostic(format!(
-                "impl for `{}` references unknown trait `{}`",
-                self_ty_text,
-                self.type_ref_source_text(trait_ty)
-            ));
+            self.diagnostic(
+                "E0023",
+                format!(
+                    "impl for `{}` references unknown trait `{}`",
+                    self_ty_text,
+                    self.type_ref_source_text(trait_ty)
+                ),
+                None,
+            );
             return;
         };
 
@@ -90,10 +106,14 @@ impl TypeChecker<'_> {
         for fid in &imp.methods {
             let method = &self.hir.item_tree.functions[*fid];
             if !methods.insert(method.name.0.clone()) {
-                self.diagnostic(format!(
-                    "impl for `{}` has duplicate method `{}`",
-                    impl_name, method.name.0
-                ));
+                self.diagnostic(
+                    "E0024",
+                    format!(
+                        "impl for `{}` has duplicate method `{}`",
+                        impl_name, method.name.0
+                    ),
+                    None,
+                );
             }
         }
 
@@ -101,10 +121,14 @@ impl TypeChecker<'_> {
         for alias in &imp.type_aliases {
             let assoc = &self.hir.item_tree.type_aliases[*alias];
             if !type_aliases.insert(assoc.name.0.clone()) {
-                self.diagnostic(format!(
-                    "impl for `{}` has duplicate associated type `{}`",
-                    impl_name, assoc.name.0
-                ));
+                self.diagnostic(
+                    "E0025",
+                    format!(
+                        "impl for `{}` has duplicate associated type `{}`",
+                        impl_name, assoc.name.0
+                    ),
+                    None,
+                );
             }
         }
     }
@@ -118,10 +142,14 @@ impl TypeChecker<'_> {
 
         for required in &tr.methods {
             let Some(actual) = methods.get(&required.name.0) else {
-                self.diagnostic(format!(
-                    "impl for `{}` of trait `{}` missing method `{}`",
-                    self_ty_text, tr.name.0, required.name.0
-                ));
+                self.diagnostic(
+                    "E0026",
+                    format!(
+                        "impl for `{}` of trait `{}` missing method `{}`",
+                        self_ty_text, tr.name.0, required.name.0
+                    ),
+                    None,
+                );
                 continue;
             };
 
@@ -140,10 +168,14 @@ impl TypeChecker<'_> {
                 .any(|(_, name)| *name == required.name.0);
 
             if required.ty.is_none() && !provided {
-                self.diagnostic(format!(
-                    "impl for `{}` of trait `{}` missing associated type `{}`",
-                    self_ty_text, tr.name.0, required.name.0
-                ));
+                self.diagnostic(
+                    "E0027",
+                    format!(
+                        "impl for `{}` of trait `{}` missing associated type `{}`",
+                        self_ty_text, tr.name.0, required.name.0
+                    ),
+                    None,
+                );
             }
         }
     }
@@ -155,13 +187,17 @@ impl TypeChecker<'_> {
         actual: &HirFunction,
     ) {
         if expected.params.len() != actual.params.len() {
-            self.diagnostic(format!(
-                "impl method `{}` for trait `{}` parameter count mismatch: expected {}, got {}",
-                expected.name.0,
-                trait_name,
-                expected.params.len(),
-                actual.params.len()
-            ));
+            self.diagnostic(
+                "E0028",
+                format!(
+                    "impl method `{}` for trait `{}` parameter count mismatch: expected {}, got {}",
+                    expected.name.0,
+                    trait_name,
+                    expected.params.len(),
+                    actual.params.len()
+                ),
+                None,
+            );
         }
 
         for (index, expected_param) in expected.params.iter().enumerate() {
@@ -172,14 +208,18 @@ impl TypeChecker<'_> {
             let expected_ty = self.lower_type_ref(&expected_param.ty);
             let actual_ty = self.lower_type_ref(&actual_param.ty);
             if !self.signature_types_match(&expected_ty, &actual_ty) {
-                self.diagnostic(format!(
-                    "impl method `{}` for trait `{}` parameter {} type mismatch: expected {}, got {}",
-                    expected.name.0,
-                    trait_name,
-                    index + 1,
-                    expected_ty.display(self.hir),
-                    actual_ty.display(self.hir)
-                ));
+                self.diagnostic(
+                    "E0029",
+                    format!(
+                        "impl method `{}` for trait `{}` parameter {} type mismatch: expected {}, got {}",
+                        expected.name.0,
+                        trait_name,
+                        index + 1,
+                        expected_ty.display(self.hir),
+                        actual_ty.display(self.hir)
+                    ),
+                    None,
+                );
             }
         }
 
@@ -194,13 +234,17 @@ impl TypeChecker<'_> {
             .map(|ty| self.lower_type_ref(ty))
             .unwrap_or(Type::Unit);
         if !self.signature_types_match(&expected_ret, &actual_ret) {
-            self.diagnostic(format!(
-                "impl method `{}` for trait `{}` return type mismatch: expected {}, got {}",
-                expected.name.0,
-                trait_name,
-                expected_ret.display(self.hir),
-                actual_ret.display(self.hir)
-            ));
+            self.diagnostic(
+                "E0030",
+                format!(
+                    "impl method `{}` for trait `{}` return type mismatch: expected {}, got {}",
+                    expected.name.0,
+                    trait_name,
+                    expected_ret.display(self.hir),
+                    actual_ret.display(self.hir)
+                ),
+                None,
+            );
         }
     }
 
@@ -214,7 +258,10 @@ impl TypeChecker<'_> {
     fn type_ref_source_text(&self, ty: &HirTypeRef) -> String {
         match ty {
             HirTypeRef::Named(path) => path.display(),
-            HirTypeRef::Ref(inner) => format!("&{}", self.type_ref_source_text(inner)),
+            HirTypeRef::Ref(inner, mutable) => {
+                let kw = if *mutable { "&mut " } else { "&" };
+                format!("{}{}", kw, self.type_ref_source_text(inner))
+            }
             HirTypeRef::Tuple(elements) => {
                 let inner = elements
                     .iter()
@@ -224,6 +271,10 @@ impl TypeChecker<'_> {
                 format!("({inner})")
             }
             HirTypeRef::Array(inner) => format!("[{}]", self.type_ref_source_text(inner)),
+            HirTypeRef::Ptr { mutable, inner } => {
+                let kind = if *mutable { "*mut" } else { "*const" };
+                format!("{kind} {}", self.type_ref_source_text(inner))
+            }
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
         }

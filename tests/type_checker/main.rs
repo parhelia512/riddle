@@ -23,7 +23,7 @@ fn lower_and_resolve(parse: &Parse) -> HirFile {
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
     let mut hir = lower_root(root);
-    let sg = build_scope_graph(&hir, &syntax);
+    let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
     hir
 }
@@ -32,6 +32,6 @@ fn messages(result: &TypeCheckResult) -> Vec<&str> {
     result
         .diagnostics
         .iter()
-        .map(|Diagnostic { message }| message.as_str())
+        .map(|Diagnostic { message, .. }| message.as_str())
         .collect()
 }

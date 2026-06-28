@@ -1,4 +1,4 @@
-use hir::item_tree::{HirPath, HirTypeRef, StructId, TraitId, TypeAliasId};
+use hir::item_tree::{EnumId, HirPath, HirTypeRef, StructId, TraitId, TypeAliasId};
 
 use crate::{
     checker::TypeChecker,
@@ -9,7 +9,6 @@ impl TypeChecker<'_> {
     pub(crate) fn lower_type_alias(&mut self, type_alias: TypeAliasId) -> Type {
         self.hir.item_tree.type_aliases[type_alias]
             .ty
-            .clone()
             .as_ref()
             .map(|ty| self.lower_type_ref(ty))
             .unwrap_or(Type::Unknown)
@@ -18,7 +17,11 @@ impl TypeChecker<'_> {
     pub(crate) fn lower_type_ref(&mut self, ty: &HirTypeRef) -> Type {
         match ty {
             HirTypeRef::Named(path) => self.lower_named_type(path),
-            HirTypeRef::Ref(inner) => Type::Ref(Box::new(self.lower_type_ref(inner))),
+            HirTypeRef::Ref(inner, mutable) => Type::Ref(Box::new(self.lower_type_ref(inner)), *mutable),
+            HirTypeRef::Ptr { mutable, inner } => Type::Ptr {
+                mutable: *mutable,
+                inner: Box::new(self.lower_type_ref(inner)),
+            },
             HirTypeRef::Tuple(elements) => {
                 Type::Tuple(elements.iter().map(|ty| self.lower_type_ref(ty)).collect())
             }
@@ -36,7 +39,32 @@ impl TypeChecker<'_> {
 
         match ty {
             HirTypeRef::Named(path) => path.display(),
+            HirTypeRef::Ptr { mutable, inner } => {
+                let kind = if *mutable { "*mut" } else { "*const" };
+                format!("{kind} {}", Self::type_text(inner))
+            }
             _ => lowered.display(self.hir),
+        }
+    }
+
+    fn type_text(ty: &HirTypeRef) -> String {
+        match ty {
+            HirTypeRef::Unknown => "_".to_string(),
+            HirTypeRef::Error => "<error>".to_string(),
+            HirTypeRef::Named(p) => p.display(),
+            HirTypeRef::Ref(inner, mutable) => {
+                let kw = if *mutable { "&mut " } else { "&" };
+                format!("{}{}", kw, Self::type_text(inner))
+            }
+            HirTypeRef::Ptr { mutable, inner } => {
+                let kind = if *mutable { "*mut" } else { "*const" };
+                format!("{kind} {}", Self::type_text(inner))
+            }
+            HirTypeRef::Tuple(elements) => {
+                let inner = elements.iter().map(|t| Self::type_text(t)).collect::<Vec<_>>().join(", ");
+                format!("({})", inner)
+            }
+            HirTypeRef::Array(elem) => format!("[{}]", Self::type_text(elem)),
         }
     }
 
@@ -77,6 +105,8 @@ impl TypeChecker<'_> {
             _ => {
                 if let Some(struct_id) = self.find_struct_by_name(name) {
                     Type::Struct(struct_id)
+                } else if let Some(enum_id) = self.find_enum_by_name(name) {
+                    Type::Enum(enum_id)
                 } else {
                     Type::Unknown
                 }
@@ -90,6 +120,14 @@ impl TypeChecker<'_> {
             .structs
             .iter()
             .find_map(|(id, strukt)| (strukt.name.0 == name).then_some(id))
+    }
+
+    fn find_enum_by_name(&self, name: &str) -> Option<EnumId> {
+        self.hir
+            .item_tree
+            .enums
+            .iter()
+            .find_map(|(id, e)| (e.name.0 == name).then_some(id))
     }
 
     fn find_trait_by_name(&self, name: &str) -> Option<TraitId> {

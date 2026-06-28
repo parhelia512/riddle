@@ -21,8 +21,6 @@ pub struct TraitEnv {
 }
 
 impl TraitEnv {
-    // ── public queries ──────────────────────────────────────────────
-
     /// Whether `ty` implements the trait identified by `trait_id`.
     pub fn type_implements(&self, ty: &Type, trait_id: TraitId) -> bool {
         if self.has_builtin_impl(ty, trait_id) {
@@ -44,8 +42,6 @@ impl TraitEnv {
         }
     }
 
-    // ── builders ───────────────────────────────────────────────────
-
     pub(crate) fn insert_impl(&mut self, trait_id: TraitId, self_ty: Type) {
         self.trait_impls
             .entry(trait_id)
@@ -56,8 +52,6 @@ impl TraitEnv {
     pub(crate) fn set_copy_trait(&mut self, id: TraitId) {
         self.copy_trait_id = Some(id);
     }
-
-    // ── internal ────────────────────────────────────────────────────
 
     fn has_builtin_impl(&self, ty: &Type, trait_id: TraitId) -> bool {
         if Some(trait_id) == self.copy_trait_id {

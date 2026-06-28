@@ -24,6 +24,8 @@ pub struct ItemTree {
     pub consts: Arena<HirConst>,
     pub type_aliases: Arena<HirTypeAlias>,
     pub top_level: Vec<TopLevelItem>,
+    /// Functions declared in `extern "C"` blocks (no body).
+    pub extern_function_ids: Vec<FunctionId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,7 +124,7 @@ pub struct HirTypeAlias {
 #[derive(Debug, Clone)]
 pub struct HirModule {
     pub name: Name,
-    /// `mod foo;`  → None；`mod foo { ... }` → Some(items)
+    /// `mod foo;` → None; `mod foo { ... }` → Some(items)
     pub items: Option<Vec<TopLevelItem>>,
 }
 
@@ -166,7 +168,12 @@ pub enum PathAnchor {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HirTypeRef {
     Named(HirPath),
-    Ref(Box<HirTypeRef>),
+    Ref(Box<HirTypeRef>, bool), // (inner, mutable)
+    /// Raw pointer type: `*const T` or `*mut T`.
+    Ptr {
+        mutable: bool,
+        inner: Box<HirTypeRef>,
+    },
     Tuple(Vec<HirTypeRef>),
     Array(Box<HirTypeRef>),
     Unknown,

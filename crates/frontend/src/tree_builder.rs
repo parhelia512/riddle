@@ -2,13 +2,13 @@ use rowan::{GreenNodeBuilder, Language};
 
 use super::{
     lexer::Token,
-    parser::Event,
+    parser::{Event, ParseError},
     syntax_kind::{RiddleLang, SyntaxKind, SyntaxNode},
 };
 
 pub struct Parse {
     pub green: rowan::GreenNode,
-    pub errors: Vec<String>,
+    pub errors: Vec<ParseError>,
 }
 
 impl Parse {
@@ -25,7 +25,7 @@ pub fn build_tree(
     events: Vec<Event>,
     tokens: Vec<Token>,
     source: &str,
-    errors: Vec<String>,
+    errors: Vec<ParseError>,
 ) -> Parse {
     let mut builder = GreenNodeBuilder::new();
     let mut token_idx: usize = 0;

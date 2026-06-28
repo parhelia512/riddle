@@ -1,6 +1,6 @@
 use hir::{
     HirFile,
-    item_tree::{FunctionId, HirStruct, StructId},
+    item_tree::{EnumId, FunctionId, HirStruct, StructId},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -14,10 +14,16 @@ pub enum Type {
     Char,
     Unit,
     Never,
-    Ref(Box<Type>),
+    Ref(Box<Type>, bool), // (inner, mutable)
+    /// Raw pointer type: `*const T` or `*mut T`.
+    Ptr {
+        mutable: bool,
+        inner: Box<Type>,
+    },
     Tuple(Vec<Type>),
     Array(Box<Type>),
     Struct(StructId),
+    Enum(EnumId),
     Function(FunctionId),
     Unknown,
     Error,
@@ -59,7 +65,14 @@ impl Type {
             Type::Char => "char".to_string(),
             Type::Unit => "()".to_string(),
             Type::Never => "!".to_string(),
-            Type::Ref(inner) => format!("&{}", inner.display(hir)),
+            Type::Ref(inner, mutable) => {
+                let kw = if *mutable { "&mut " } else { "&" };
+                format!("{}{}", kw, inner.display(hir))
+            }
+            Type::Ptr { mutable, inner } => {
+                let kind = if *mutable { "*mut" } else { "*const" };
+                format!("{kind} {}", inner.display(hir))
+            }
             Type::Tuple(elements) => {
                 let inner = elements
                     .iter()
@@ -72,6 +85,10 @@ impl Type {
             Type::Struct(id) => {
                 let HirStruct { name, .. } = &hir.item_tree.structs[*id];
                 name.0.clone()
+            }
+            Type::Enum(id) => {
+                let enum_data = &hir.item_tree.enums[*id];
+                enum_data.name.0.clone()
             }
             Type::Function(id) => {
                 let function = &hir.item_tree.functions[*id];
@@ -110,8 +127,10 @@ impl Type {
                 | Type::Char
                 | Type::Unit
                 | Type::Never
-                | Type::Ref(_)
+                | Type::Ref(_, _)
+                | Type::Ptr { .. }
                 | Type::Function(_)
+                | Type::Enum(_)
                 | Type::Unknown
                 | Type::Error
         )

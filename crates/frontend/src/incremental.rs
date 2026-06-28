@@ -2,7 +2,7 @@ use rowan::{NodeOrToken, TextRange, TextSize};
 
 use super::{
     lexer,
-    parser::{Parser, ReparseEntry},
+    parser::{ParseError, Parser, ReparseEntry},
     syntax_kind::{SyntaxKind, SyntaxNode, SyntaxToken},
     tree_builder::{self, Parse},
 };
@@ -179,19 +179,47 @@ impl IncrementalParser {
 
 fn parse_full(source: &str) -> Parse {
     let tokens = lexer::lex(source);
+    let mut lex_errors = lexer_error_diagnostics(source, &tokens);
     let parser = Parser::new(source, tokens);
-    let (events, tokens, errors, source) = parser.parse();
-    tree_builder::build_tree(events, tokens, source, errors)
+    let (events, tokens, mut errors, source) = parser.parse();
+    lex_errors.append(&mut errors);
+    tree_builder::build_tree(events, tokens, source, lex_errors)
 }
 
 fn parse_fragment(source: &str, entry: ReparseEntry) -> Option<Parse> {
     let tokens = lexer::lex(source);
+    let mut lex_errors = lexer_error_diagnostics(source, &tokens);
     let parser = Parser::new(source, tokens);
-    let (event, tokens, errors, source) = parser.reparse(entry)?;
-    if !errors.is_empty() {
+    let (event, tokens, mut errors, source) = parser.reparse(entry)?;
+    lex_errors.append(&mut errors);
+    if !lex_errors.is_empty() {
         return None;
     }
-    Some(tree_builder::build_tree(event, tokens, source, errors))
+    Some(tree_builder::build_tree(event, tokens, source, lex_errors))
+}
+
+/// Emit diagnostics for tokens the lexer couldn't recognise.
+fn lexer_error_diagnostics(source: &str, tokens: &[lexer::Token]) -> Vec<ParseError> {
+    use crate::syntax_kind::SyntaxKind;
+    tokens
+        .iter()
+        .filter(|t| t.kind == SyntaxKind::ErrorNode)
+        .map(|t| {
+            let text = &source[t.span.start..t.span.end];
+            let msg = if text.is_empty() {
+                "unrecognized token".into()
+            } else {
+                format!("unrecognized character: `{}`", text)
+            };
+            ParseError {
+                message: msg,
+                span: TextRange::new(
+                    TextSize::from(t.span.start as u32),
+                    TextSize::from(t.span.end as u32),
+                ),
+            }
+        })
+        .collect()
 }
 
 fn try_incremental_reparse(
@@ -202,8 +230,8 @@ fn try_incremental_reparse(
     delete_len: usize,
     insert: &str,
 ) -> Option<(Parse, SyntaxKind)> {
-    // Existing diagnostics are unpositioned strings. A full parse is required
-    // to preserve correct diagnostics until ParseError carries a TextRange.
+    // Fall back to full reparse when the previous parse has errors —
+    // avoids compounding stale diagnostic spans across incremental edits.
     if !old_parse.errors.is_empty() {
         return None;
     }

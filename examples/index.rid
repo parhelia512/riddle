@@ -1,0 +1,5 @@
+fun main() {
+    let arr = [10, 20, 30];
+    let x = arr[1];
+    let y = arr[0] + arr[2];
+}
