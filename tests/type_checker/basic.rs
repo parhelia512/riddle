@@ -43,7 +43,7 @@ fn supports_rust_style_scalar_numeric_types() {
             o: f64,
             p: f128,
             q: char,
-            r: str
+            r: &str
         ) -> f128 {
             let a2: i8 = 1i8;
             let b2: i16 = 1i16;
@@ -62,7 +62,7 @@ fn supports_rust_style_scalar_numeric_types() {
             let o2: f64 = 1.0f64;
             let p2: f128 = 1.0f128;
             let q2: char = 'x';
-            let r2: str = "text";
+            let r2: &str = "text";
             p2
         }
         "#,
@@ -75,4 +75,32 @@ fn supports_rust_style_scalar_numeric_types() {
             .values()
             .any(|ty| matches!(ty, Type::Float(FloatTy::F128)))
     );
+}
+
+#[test]
+fn accepts_compound_assignment_ops() {
+    let result = check(
+        r#"
+        fun main() {
+            let mut n: i32 = 1;
+            n += 2;
+            n -= 1;
+            n *= 3;
+            n /= 2;
+            n %= 2;
+            n &= 1;
+            n |= 2;
+            n ^= 3;
+            n <<= 1;
+            n >>= 1;
+
+            let mut flag = true;
+            flag &= false;
+            flag |= true;
+            flag ^= false;
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
 }

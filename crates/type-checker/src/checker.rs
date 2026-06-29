@@ -1,10 +1,6 @@
 use rowan::TextRange;
 
-use hir::{
-    HirFile,
-    body::{BodyId},
-    item_tree::{HirFunction},
-};
+use hir::{HirFile, body::BodyId, item_tree::HirFunction};
 
 use crate::{
     context::BodyCtx,
@@ -39,7 +35,11 @@ impl<'a> TypeChecker<'a> {
 
     pub(crate) fn build_trait_env(&mut self) {
         for (tid, tr) in self.hir.item_tree.traits.iter() {
-            if tr.name.0 == "Copy" {
+            if tr
+                .attrs
+                .iter()
+                .any(|attr| attr.name.0 == "lang" && attr.value.as_deref() == Some("copy"))
+            {
                 self.result.trait_env.set_copy_trait(tid);
                 break;
             }
@@ -51,7 +51,9 @@ impl<'a> TypeChecker<'a> {
             let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
                 continue;
             };
-            let self_ty = self.lower_type_ref(&imp.self_ty);
+            let params =
+                crate::lowering::generic_param_map(imp.generics.iter().map(|name| name.0.as_str()));
+            let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
             self.result.trait_env.insert_impl(trait_id, self_ty);
         }
     }
@@ -64,11 +66,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    pub(crate) fn check_function(
-        &mut self,
-        function: &HirFunction,
-        body_id: BodyId,
-    ) {
+    pub(crate) fn check_function(&mut self, function: &HirFunction, body_id: BodyId) {
         let body = &self.hir.bodies[body_id];
         let return_ty = function
             .ret_type
@@ -82,15 +80,29 @@ impl<'a> TypeChecker<'a> {
         // are validated inside check_stmt when the return is encountered.
         // ponytail: full return-path analysis needed to catch missing returns
         if self.has_tail(body, body.root_block) && !actual.is_never() {
-            self.expect_assignable(&return_ty, &actual, "function return type", ctx.expr_range(body.root_block));
+            self.expect_assignable(
+                &return_ty,
+                &actual,
+                "function return type",
+                ctx.expr_range(body.root_block),
+            );
         }
     }
 
     fn has_tail(&self, body: &hir::body::Body, expr: hir::body::ExprId) -> bool {
-        matches!(&body.exprs[expr], hir::body::Expr::Block { tail: Some(_), .. })
+        matches!(
+            &body.exprs[expr],
+            hir::body::Expr::Block { tail: Some(_), .. }
+        )
     }
 
-    pub(crate) fn join_branch_types(&mut self, lhs: Type, rhs: Type, context: &str, span: Option<TextRange>) -> Type {
+    pub(crate) fn join_branch_types(
+        &mut self,
+        lhs: Type,
+        rhs: Type,
+        context: &str,
+        span: Option<TextRange>,
+    ) -> Type {
         if lhs.is_never() {
             return rhs;
         }
@@ -128,16 +140,18 @@ impl<'a> TypeChecker<'a> {
         }
         self.diagnostic(
             "E0003",
-            format!(
-                "{} must be numeric, got {}",
-                context,
-                ty.display(self.hir)
-            ),
+            format!("{} must be numeric, got {}", context, ty.display(self.hir)),
             span,
         );
     }
 
-    pub(crate) fn expect_assignable(&mut self, expected: &Type, actual: &Type, context: &str, span: Option<TextRange>) {
+    pub(crate) fn expect_assignable(
+        &mut self,
+        expected: &Type,
+        actual: &Type,
+        context: &str,
+        span: Option<TextRange>,
+    ) {
         if expected.is_unknown_like()
             || actual.is_unknown_like()
             || expected == actual
@@ -146,6 +160,12 @@ impl<'a> TypeChecker<'a> {
             return;
         }
         if actual.is_never() {
+            return;
+        }
+        // str → &str coercion (unsized coercion for string literals)
+        if matches!(actual, Type::Str)
+            && matches!(expected, Type::Ref(inner, _) if matches!(**inner, Type::Str))
+        {
             return;
         }
         self.diagnostic(
@@ -160,7 +180,12 @@ impl<'a> TypeChecker<'a> {
         );
     }
 
-    pub(crate) fn diagnostic(&mut self, code: &'static str, message: impl Into<String>, span: Option<TextRange>) {
+    pub(crate) fn diagnostic(
+        &mut self,
+        code: &'static str,
+        message: impl Into<String>,
+        span: Option<TextRange>,
+    ) {
         let help: Option<String> = match code {
             "E0001" => Some("expected one type but found another — consider an explicit type annotation or cast".into()),
             "E0002" => Some("all branches must produce values of the same type — consider ensuring both branches return compatible types".into()),
@@ -174,7 +199,9 @@ impl<'a> TypeChecker<'a> {
             "E0010" => Some("the pattern does not match the expected type — ensure tuple element counts match".into()),
             "E0011" => Some("this numeric suffix is not recognized — valid suffixes are i8, i16, i32, i64, u8, u16, u32, u64, f32, f64".into()),
             "E0012" => Some("this type cast is not supported between the source and target types".into()),
+            "E0013" => Some("this method does not exist for the receiver type — check the impl block and receiver type".into()),
             "E0020" | "E0024" => Some("duplicate definition — remove the duplicate".into()),
+            "E0031" => Some("cannot assign twice to an immutable variable — add `mut` to the `let` binding".into()),
             "E0021" => Some("trait method declarations should not have a body".into()),
             "E0022" | "E0025" => Some("duplicate associated type — remove the duplicate".into()),
             "E0023" => Some("this trait is not defined or not in scope".into()),
@@ -188,11 +215,13 @@ impl<'a> TypeChecker<'a> {
             severity: Severity::Error,
             message: message.into(),
             labels: span
-                .map(|r| vec![SourceLabel {
-                    range: r,
-                    message: String::new(),
-                    style: LabelStyle::Primary,
-                }])
+                .map(|r| {
+                    vec![SourceLabel {
+                        range: r,
+                        message: String::new(),
+                        style: LabelStyle::Primary,
+                    }]
+                })
                 .unwrap_or_default(),
             help,
             notes: Vec::new(),
@@ -206,7 +235,11 @@ impl<'a> TypeChecker<'a> {
     ) -> Type {
         if let Some(suffix) = suffix {
             return IntTy::parse(suffix).map(Type::Int).unwrap_or_else(|| {
-                self.diagnostic("E0011", format!("unknown integer literal suffix `{suffix}`"), None);
+                self.diagnostic(
+                    "E0011",
+                    format!("unknown integer literal suffix `{suffix}`"),
+                    None,
+                );
                 Type::Error
             });
         }
@@ -224,7 +257,11 @@ impl<'a> TypeChecker<'a> {
     ) -> Type {
         if let Some(suffix) = suffix {
             return FloatTy::parse(suffix).map(Type::Float).unwrap_or_else(|| {
-                self.diagnostic("E0011", format!("unknown float literal suffix `{suffix}`"), None);
+                self.diagnostic(
+                    "E0011",
+                    format!("unknown float literal suffix `{suffix}`"),
+                    None,
+                );
                 Type::Error
             });
         }

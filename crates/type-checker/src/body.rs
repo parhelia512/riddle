@@ -3,14 +3,22 @@ use std::collections::HashMap;
 use hir::{
     Name,
     body::{BinaryOp, Expr, ExprId, MatchArm, PatId, Pattern, ResolvedName, Stmt, StmtId, UnaryOp},
+    item_tree::FunctionId,
 };
 
-use crate::{checker::TypeChecker, context::BodyCtx, types::{IntTy, Type}};
+use crate::{
+    checker::TypeChecker,
+    context::BodyCtx,
+    lowering::collect_subst,
+    types::{IntTy, Type},
+};
 
 impl TypeChecker<'_> {
     pub(crate) fn check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
         match &ctx.body.stmts[stmt_id] {
-            Stmt::Let { ty, init, .. } => {
+            Stmt::Let {
+                ty, init, is_mut, ..
+            } => {
                 let declared = self.lower_type_ref(ty);
                 let init_ty = init.map(|expr| {
                     if declared.is_unknown_like() {
@@ -22,11 +30,16 @@ impl TypeChecker<'_> {
 
                 if let Some(init_ty) = init_ty {
                     if !declared.is_unknown_like() {
-                        self.expect_assignable(&declared, &init_ty, "let initializer", ctx.stmt_range(stmt_id));
+                        self.expect_assignable(
+                            &declared,
+                            &init_ty,
+                            "let initializer",
+                            ctx.stmt_range(stmt_id),
+                        );
                     }
-                    ctx.locals.insert(stmt_id, declared.or(init_ty));
+                    ctx.locals.insert(stmt_id, (declared.or(init_ty), *is_mut));
                 } else {
-                    ctx.locals.insert(stmt_id, declared);
+                    ctx.locals.insert(stmt_id, (declared, *is_mut));
                 }
             }
             Stmt::Expr { expr } => {
@@ -85,8 +98,10 @@ impl TypeChecker<'_> {
             }
             Expr::Struct {
                 resolved, fields, ..
-            } => self.check_struct_expr(ctx, resolved.as_ref(), fields, span),
-            Expr::Binary { lhs, rhs, op } => self.check_binary(ctx, *lhs, *rhs, *op, expected, span),
+            } => self.check_struct_expr(ctx, resolved.as_ref(), fields, expected, span),
+            Expr::Binary { lhs, rhs, op } => {
+                self.check_binary(ctx, *lhs, *rhs, *op, expected, span)
+            }
             Expr::Unary { operand, op } => self.check_unary(ctx, *operand, *op, expected, span),
             Expr::Block { stmts, tail } => {
                 ctx.push_scope();
@@ -108,7 +123,12 @@ impl TypeChecker<'_> {
                 else_branch,
             } => {
                 let cond_ty = self.check_expr(ctx, *cond);
-                self.expect_assignable(&Type::Bool, &cond_ty, "if condition", ctx.expr_range(*cond));
+                self.expect_assignable(
+                    &Type::Bool,
+                    &cond_ty,
+                    "if condition",
+                    ctx.expr_range(*cond),
+                );
 
                 let then_ty = match expected {
                     Some(expected) => self.check_expr_expected(ctx, *then_branch, expected),
@@ -124,11 +144,18 @@ impl TypeChecker<'_> {
             }
             Expr::While { condition, body } => {
                 let condition_ty = self.check_expr(ctx, *condition);
-                self.expect_assignable(&Type::Bool, &condition_ty, "while condition", ctx.expr_range(*condition));
+                self.expect_assignable(
+                    &Type::Bool,
+                    &condition_ty,
+                    "while condition",
+                    ctx.expr_range(*condition),
+                );
                 self.check_expr(ctx, *body);
                 Type::Unit
             }
-            Expr::Match { scrutinee, arms } => self.check_match(ctx, *scrutinee, arms, expected, span),
+            Expr::Match { scrutinee, arms } => {
+                self.check_match(ctx, *scrutinee, arms, expected, span)
+            }
             Expr::Array { elements } => self.check_array(ctx, elements, expected, span),
             Expr::Call { callee, args } => self.check_call(ctx, *callee, args, span),
             Expr::FieldAccess { base, field } => self.check_field_access(ctx, *base, field, span),
@@ -140,11 +167,19 @@ impl TypeChecker<'_> {
                 ty
             }
             Expr::IndexAccess { base, index } => {
-                let _base_ty = self.check_expr(ctx, *base);
-                let _index_ty = self.check_expr(ctx, *index);
-                self.expect_assignable(&Type::Int(IntTy::I32), &_index_ty, "index", ctx.expr_range(*index));
-                // ponytail: return array element type when array type info is available
-                Type::Unknown
+                let base_ty = self.check_expr(ctx, *base);
+                let index_ty = self.check_expr(ctx, *index);
+                self.expect_assignable(
+                    &Type::Int(IntTy::I32),
+                    &index_ty,
+                    "index",
+                    ctx.expr_range(*index),
+                );
+                // Extract element type from array / pointer base.
+                match &base_ty {
+                    Type::Array(inner, _) | Type::Ptr { inner, .. } => *inner.clone(),
+                    _ => Type::Unknown,
+                }
             }
             Expr::Cast { base, target } => {
                 self.check_expr(ctx, *base);
@@ -171,7 +206,30 @@ impl TypeChecker<'_> {
             let lhs_ty = self.check_expr(ctx, lhs);
             let rhs_ty = self.check_expr_expected(ctx, rhs, &lhs_ty);
             self.expect_assignable(&lhs_ty, &rhs_ty, "assignment", span);
-            // ponytail: mutability check deferred — needs MIR/borrowck integration
+            self.check_assign_mut(ctx, lhs, span);
+            return Type::Unit;
+        }
+
+        if let Some(base_op) = op.compound_base() {
+            let lhs_ty = self.check_expr(ctx, lhs);
+            let rhs_ty = match base_op {
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                    if lhs_ty.is_numeric() || lhs_ty.is_bitwise_scalar() =>
+                {
+                    self.check_expr_expected(ctx, rhs, &lhs_ty)
+                }
+                _ => self.check_expr(ctx, rhs),
+            };
+            let result_ty = self.check_binary_types(ctx, lhs, rhs, base_op, &lhs_ty, &rhs_ty, span);
+            self.expect_assignable(&lhs_ty, &result_ty, "assignment", span);
+            self.check_assign_mut(ctx, lhs, span);
             return Type::Unit;
         }
 
@@ -201,16 +259,29 @@ impl TypeChecker<'_> {
             _ => self.check_expr(ctx, rhs),
         };
 
+        self.check_binary_types(ctx, lhs, rhs, op, &lhs_ty, &rhs_ty, span)
+    }
+
+    fn check_binary_types(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        lhs: ExprId,
+        rhs: ExprId,
+        op: BinaryOp,
+        lhs_ty: &Type,
+        rhs_ty: &Type,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
         match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                self.expect_numeric(&lhs_ty, "left operand", ctx.expr_range(lhs));
-                self.expect_numeric(&rhs_ty, "right operand", ctx.expr_range(rhs));
+                self.expect_numeric(lhs_ty, "left operand", ctx.expr_range(lhs));
+                self.expect_numeric(rhs_ty, "right operand", ctx.expr_range(rhs));
                 if !lhs_ty.is_numeric() || !rhs_ty.is_numeric() {
                     return Type::Error;
                 }
                 if lhs_ty.is_unknown_like() || rhs_ty.is_unknown_like() {
                     Type::Unknown
-                } else if let Some(result) = self.join_numeric_types(&lhs_ty, &rhs_ty) {
+                } else if let Some(result) = self.join_numeric_types(lhs_ty, rhs_ty) {
                     result
                 } else {
                     self.diagnostic(
@@ -225,26 +296,102 @@ impl TypeChecker<'_> {
                     Type::Error
                 }
             }
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                if !lhs_ty.is_unknown_like()
+                    && !rhs_ty.is_unknown_like()
+                    && (!lhs_ty.is_bitwise_scalar() || !rhs_ty.is_bitwise_scalar())
+                {
+                    self.diagnostic(
+                        "E0003",
+                        format!(
+                            "bitwise operation requires integer or bool operands, got {} and {}",
+                            lhs_ty.display(self.hir),
+                            rhs_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                    return Type::Error;
+                }
+                if lhs_ty == &Type::Bool && rhs_ty == &Type::Bool {
+                    Type::Bool
+                } else if let Some(result) = self.join_numeric_types(lhs_ty, rhs_ty) {
+                    result
+                } else {
+                    self.diagnostic(
+                        "E0001",
+                        format!(
+                            "bitwise operands have different types: {} and {}",
+                            lhs_ty.display(self.hir),
+                            rhs_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                    Type::Error
+                }
+            }
+            BinaryOp::Shl | BinaryOp::Shr => {
+                if !lhs_ty.is_unknown_like()
+                    && !rhs_ty.is_unknown_like()
+                    && (!lhs_ty.is_integer() || !rhs_ty.is_integer())
+                {
+                    self.diagnostic(
+                        "E0003",
+                        format!(
+                            "shift operation requires integer operands, got {} and {}",
+                            lhs_ty.display(self.hir),
+                            rhs_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                    return Type::Error;
+                }
+                lhs_ty.clone()
+            }
             BinaryOp::Eq | BinaryOp::Neq => {
-                if self.join_numeric_types(&lhs_ty, &rhs_ty).is_none() {
-                    self.expect_assignable(&lhs_ty, &rhs_ty, "comparison", span);
+                if self.join_numeric_types(lhs_ty, rhs_ty).is_none() {
+                    self.expect_assignable(lhs_ty, rhs_ty, "comparison", span);
                 }
                 Type::Bool
             }
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
-                self.expect_numeric(&lhs_ty, "left operand", ctx.expr_range(lhs));
-                self.expect_numeric(&rhs_ty, "right operand", ctx.expr_range(rhs));
-                if self.join_numeric_types(&lhs_ty, &rhs_ty).is_none() {
-                    self.expect_assignable(&lhs_ty, &rhs_ty, "comparison", span);
+                if !lhs_ty.is_unknown_like()
+                    && !rhs_ty.is_unknown_like()
+                    && (!lhs_ty.is_ordered_scalar()
+                        || !rhs_ty.is_ordered_scalar()
+                        || (*lhs_ty == Type::Char) != (*rhs_ty == Type::Char))
+                {
+                    self.diagnostic(
+                        "E0003",
+                        format!(
+                            "ordered comparison requires compatible numeric or char operands, got {} and {}",
+                            lhs_ty.display(self.hir),
+                            rhs_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                    return Type::Error;
+                }
+                if *lhs_ty != Type::Char && self.join_numeric_types(lhs_ty, rhs_ty).is_none() {
+                    self.expect_assignable(lhs_ty, rhs_ty, "comparison", span);
                 }
                 Type::Bool
             }
             BinaryOp::And | BinaryOp::Or => {
-                self.expect_assignable(&Type::Bool, &lhs_ty, "left operand", ctx.expr_range(lhs));
-                self.expect_assignable(&Type::Bool, &rhs_ty, "right operand", ctx.expr_range(rhs));
+                self.expect_assignable(&Type::Bool, lhs_ty, "left operand", ctx.expr_range(lhs));
+                self.expect_assignable(&Type::Bool, rhs_ty, "right operand", ctx.expr_range(rhs));
                 Type::Bool
             }
-            BinaryOp::Assign => unreachable!(),
+            BinaryOp::Assign
+            | BinaryOp::AddAssign
+            | BinaryOp::SubAssign
+            | BinaryOp::MulAssign
+            | BinaryOp::DivAssign
+            | BinaryOp::ModAssign
+            | BinaryOp::BitAndAssign
+            | BinaryOp::BitOrAssign
+            | BinaryOp::BitXorAssign
+            | BinaryOp::ShlAssign
+            | BinaryOp::ShrAssign => unreachable!(),
         }
     }
 
@@ -268,7 +415,12 @@ impl TypeChecker<'_> {
                 operand_ty
             }
             UnaryOp::Not => {
-                self.expect_assignable(&Type::Bool, &operand_ty, "unary operand", ctx.expr_range(operand));
+                self.expect_assignable(
+                    &Type::Bool,
+                    &operand_ty,
+                    "unary operand",
+                    ctx.expr_range(operand),
+                );
                 Type::Bool
             }
             UnaryOp::Ref => Type::Ref(Box::new(operand_ty), false),
@@ -297,6 +449,7 @@ impl TypeChecker<'_> {
         ctx: &mut BodyCtx<'_>,
         resolved: Option<&ResolvedName>,
         fields: &[hir::body::StructExprField],
+        expected: Option<&Type>,
         span: Option<rowan::TextRange>,
     ) -> Type {
         let Some(ResolvedName::Struct(struct_id)) = resolved else {
@@ -307,7 +460,13 @@ impl TypeChecker<'_> {
             return Type::Error;
         };
 
-        let strukt = &self.hir.item_tree.structs[*struct_id];
+        let strukt = self.hir.item_tree.structs[*struct_id].clone();
+        let mut subst = match expected {
+            Some(Type::Struct(expected_id, args)) if expected_id == struct_id => {
+                self.struct_subst(*struct_id, args)
+            }
+            _ => HashMap::new(),
+        };
         let expected_fields = strukt
             .fields
             .iter()
@@ -330,8 +489,20 @@ impl TypeChecker<'_> {
             };
 
             seen.push(field.name.0.as_str());
-            let expected = self.lower_type_ref(&expected_field.ty);
-            let actual = self.check_expr_expected(ctx, field.value, &expected);
+            let pattern = self.lower_type_ref_with_params(
+                &expected_field.ty,
+                &crate::lowering::generic_param_map(
+                    strukt.generics.iter().map(|name| name.0.as_str()),
+                ),
+            );
+            let expected = self.lower_type_ref_with_params(&expected_field.ty, &subst);
+            let actual = if expected.is_unknown_like() || matches!(expected, Type::Param(_)) {
+                self.check_expr(ctx, field.value)
+            } else {
+                self.check_expr_expected(ctx, field.value, &expected)
+            };
+            collect_subst(&pattern, &actual, &mut subst);
+            let expected = self.lower_type_ref_with_params(&expected_field.ty, &subst);
             self.expect_assignable(&expected, &actual, "struct field", span);
         }
 
@@ -348,7 +519,12 @@ impl TypeChecker<'_> {
             }
         }
 
-        Type::Struct(*struct_id)
+        let args = strukt
+            .generics
+            .iter()
+            .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+            .collect();
+        Type::Struct(*struct_id, args)
     }
 
     fn check_match(
@@ -367,7 +543,12 @@ impl TypeChecker<'_> {
             self.bind_pattern(ctx, arm.pat, &scrutinee_ty);
             if let Some(guard) = arm.guard {
                 let guard_ty = self.check_expr(ctx, guard);
-                self.expect_assignable(&Type::Bool, &guard_ty, "match guard", ctx.expr_range(guard));
+                self.expect_assignable(
+                    &Type::Bool,
+                    &guard_ty,
+                    "match guard",
+                    ctx.expr_range(guard),
+                );
             }
             let arm_ty = match expected {
                 Some(expected) => self.check_expr_expected(ctx, arm.body, expected),
@@ -392,7 +573,7 @@ impl TypeChecker<'_> {
         _span: Option<rowan::TextRange>,
     ) -> Type {
         let expected_element = match expected {
-            Some(Type::Array(inner)) => Some(inner.as_ref()),
+            Some(Type::Array(inner, _)) => Some(inner.as_ref()),
             _ => None,
         };
         let mut element_ty = None;
@@ -411,10 +592,23 @@ impl TypeChecker<'_> {
             });
         }
 
-        Type::Array(Box::new(element_ty.unwrap_or(Type::Unknown)))
+        Type::Array(
+            Box::new(element_ty.unwrap_or(Type::Unknown)),
+            elements.len(),
+        )
     }
 
-    fn check_call(&mut self, ctx: &mut BodyCtx<'_>, callee: ExprId, args: &[ExprId], span: Option<rowan::TextRange>) -> Type {
+    fn check_call(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        callee: ExprId,
+        args: &[ExprId],
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        if let Expr::FieldAccess { base, field } = &ctx.body.exprs[callee] {
+            return self.check_method_call(ctx, callee, *base, field.clone(), args, span);
+        }
+
         let callee_ty = self.check_expr(ctx, callee);
         let Type::Function(fid) = callee_ty else {
             for arg in args {
@@ -423,10 +617,7 @@ impl TypeChecker<'_> {
             if !callee_ty.is_unknown_like() {
                 self.diagnostic(
                     "E0004",
-                    format!(
-                        "cannot call value of type {}",
-                        callee_ty.display(self.hir)
-                    ),
+                    format!("cannot call value of type {}", callee_ty.display(self.hir)),
                     ctx.expr_range(callee),
                 );
             }
@@ -451,7 +642,12 @@ impl TypeChecker<'_> {
             if let Some(param) = function.params.get(index) {
                 let expected = self.lower_type_ref(&param.ty);
                 let actual = self.check_expr_expected(ctx, *arg, &expected);
-                self.expect_assignable(&expected, &actual, "function argument", ctx.expr_range(*arg));
+                self.expect_assignable(
+                    &expected,
+                    &actual,
+                    "function argument",
+                    ctx.expr_range(*arg),
+                );
             } else {
                 self.check_expr(ctx, *arg);
             }
@@ -464,18 +660,135 @@ impl TypeChecker<'_> {
             .unwrap_or(Type::Unit)
     }
 
-    fn check_field_access(&mut self, ctx: &mut BodyCtx<'_>, base: ExprId, field: &Name, span: Option<rowan::TextRange>) -> Type {
+    fn check_method_call(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        callee: ExprId,
+        base: ExprId,
+        method_name: Name,
+        args: &[ExprId],
+        span: Option<rowan::TextRange>,
+    ) -> Type {
         let base_ty = self.check_expr(ctx, base);
-        let struct_id = match &base_ty {
-            Type::Struct(id) => Some(*id),
+        let Some((fid, subst)) = self.find_inherent_method(&base_ty, &method_name) else {
+            for arg in args {
+                self.check_expr(ctx, *arg);
+            }
+            if !base_ty.is_unknown_like() {
+                self.diagnostic(
+                    "E0013",
+                    format!(
+                        "unknown method `{}` on type {}",
+                        method_name.0,
+                        base_ty.display(self.hir)
+                    ),
+                    span,
+                );
+            }
+            return Type::Error;
+        };
+
+        self.result
+            .expr_types
+            .insert((ctx.body_id, callee), Type::Function(fid));
+
+        let function = self.hir.item_tree.functions[fid].clone();
+        let receiver_count = usize::from(!function.params.is_empty());
+        let expected_arg_count = function.params.len().saturating_sub(receiver_count);
+        if args.len() != expected_arg_count {
+            self.diagnostic(
+                "E0005",
+                format!(
+                    "method `{}` expects {} argument(s), got {}",
+                    function.name.0,
+                    expected_arg_count,
+                    args.len()
+                ),
+                span,
+            );
+        }
+
+        if let Some(receiver) = function.params.first() {
+            let expected = self.lower_type_ref_with_params(&receiver.ty, &subst);
+            let actual = self.receiver_argument_type(&base_ty, &expected);
+            self.expect_assignable(&expected, &actual, "method receiver", ctx.expr_range(base));
+        }
+
+        for (index, arg) in args.iter().enumerate() {
+            if let Some(param) = function.params.get(index + receiver_count) {
+                let expected = self.lower_type_ref_with_params(&param.ty, &subst);
+                let actual = self.check_expr_expected(ctx, *arg, &expected);
+                self.expect_assignable(&expected, &actual, "method argument", ctx.expr_range(*arg));
+            } else {
+                self.check_expr(ctx, *arg);
+            }
+        }
+
+        function
+            .ret_type
+            .as_ref()
+            .map(|ty| self.lower_type_ref_with_params(ty, &subst))
+            .unwrap_or(Type::Unit)
+    }
+
+    fn find_inherent_method(
+        &mut self,
+        receiver_ty: &Type,
+        method_name: &Name,
+    ) -> Option<(FunctionId, HashMap<String, Type>)> {
+        let receiver_self_ty = match receiver_ty {
+            Type::Ref(inner, _) => inner.as_ref(),
+            other => other,
+        };
+        let impls = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .map(|(_, imp)| imp.clone())
+            .collect::<Vec<_>>();
+
+        for imp in impls {
+            let Some(subst) = self.impl_subst_from_self_ty(&imp, receiver_self_ty) else {
+                continue;
+            };
+            for fid in imp.methods {
+                if self.hir.item_tree.functions[fid].name == *method_name {
+                    return Some((fid, subst));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn receiver_argument_type(&self, base_ty: &Type, expected: &Type) -> Type {
+        match expected {
+            Type::Ref(inner, mutable) if inner.as_ref() == base_ty => {
+                Type::Ref(Box::new(base_ty.clone()), *mutable)
+            }
+            _ => base_ty.clone(),
+        }
+    }
+
+    fn check_field_access(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        base: ExprId,
+        field: &Name,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let base_ty = self.check_expr(ctx, base);
+        let struct_ref = match &base_ty {
+            Type::Struct(id, args) => Some((*id, args.as_slice())),
             Type::Ref(inner, _) => match inner.as_ref() {
-                Type::Struct(id) => Some(*id),
+                Type::Struct(id, args) => Some((*id, args.as_slice())),
                 _ => None,
             },
             _ => None,
         };
 
-        let Some(struct_id) = struct_id else {
+        let Some((struct_id, args)) = struct_ref else {
             if !base_ty.is_unknown_like() {
                 self.diagnostic(
                     "E0006",
@@ -490,25 +803,61 @@ impl TypeChecker<'_> {
             return Type::Error;
         };
 
-        let strukt = &self.hir.item_tree.structs[struct_id];
+        let strukt = self.hir.item_tree.structs[struct_id].clone();
+        let subst = self.struct_subst(struct_id, args);
         let Some(field_ty) = strukt
             .fields
             .iter()
             .find(|candidate| candidate.name == *field)
-            .map(|candidate| self.lower_type_ref(&candidate.ty))
+            .map(|candidate| self.lower_type_ref_with_params(&candidate.ty, &subst))
         else {
             self.diagnostic(
                 "E0006",
-                format!(
-                    "unknown field `{}` on struct `{}`",
-                    field.0, strukt.name.0
-                ),
+                format!("unknown field `{}` on struct `{}`", field.0, strukt.name.0),
                 span,
             );
             return Type::Error;
         };
 
         field_ty
+    }
+
+    /// Check that the LHS of an assignment targets a mutable binding.
+    fn check_assign_mut(&mut self, ctx: &BodyCtx<'_>, lhs: ExprId, span: Option<rowan::TextRange>) {
+        if let Some(stmt_id) = self.root_local_of_expr(ctx, lhs) {
+            if let Some((_, false)) = ctx.locals.get(&stmt_id) {
+                let name = self.local_name(ctx, stmt_id);
+                self.diagnostic(
+                    "E0031",
+                    format!(
+                        "cannot assign to `{}`, as it is not declared as mutable",
+                        name
+                    ),
+                    span,
+                );
+            }
+        }
+    }
+
+    /// Walk the expression to find the root local StmtId (ignoring dereferences).
+    fn root_local_of_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<StmtId> {
+        match &ctx.body.exprs[expr_id] {
+            Expr::Path {
+                resolved: Some(ResolvedName::Local(stmt)),
+                ..
+            } => Some(*stmt),
+            Expr::FieldAccess { base, .. } => self.root_local_of_expr(ctx, *base),
+            Expr::IndexAccess { base, .. } => self.root_local_of_expr(ctx, *base),
+            _ => None,
+        }
+    }
+
+    /// Get the name of a local binding for error messages.
+    fn local_name(&self, ctx: &BodyCtx<'_>, stmt_id: StmtId) -> String {
+        match &ctx.body.stmts[stmt_id] {
+            Stmt::Let { name, .. } => name.0.clone(),
+            _ => String::from("_"),
+        }
     }
 
     fn bind_pattern(&mut self, ctx: &mut BodyCtx<'_>, pat: PatId, expected: &Type) {
@@ -575,9 +924,11 @@ impl TypeChecker<'_> {
         resolved: Option<&ResolvedName>,
     ) -> Type {
         match resolved {
-            Some(ResolvedName::Local(stmt)) => {
-                ctx.locals.get(stmt).cloned().unwrap_or(Type::Unknown)
-            }
+            Some(ResolvedName::Local(stmt)) => ctx
+                .locals
+                .get(stmt)
+                .map(|(ty, _)| ty.clone())
+                .unwrap_or(Type::Unknown),
             Some(ResolvedName::Param(index)) => ctx
                 .function
                 .params
@@ -585,17 +936,16 @@ impl TypeChecker<'_> {
                 .map(|param| self.lower_type_ref(&param.ty))
                 .unwrap_or(Type::Unknown),
             Some(ResolvedName::Function(fid)) => Type::Function(*fid),
-            Some(ResolvedName::Struct(sid)) => Type::Struct(*sid),
+            Some(ResolvedName::Struct(sid)) => Type::Struct(*sid, Vec::new()),
             Some(ResolvedName::Const(cid)) => {
                 let konst = &self.hir.item_tree.consts[*cid];
                 self.lower_type_ref(&konst.ty)
             }
             Some(ResolvedName::TypeAlias(tid)) => self.lower_type_alias(*tid),
             Some(ResolvedName::Unresolved) | None => Type::Unknown,
-            Some(ResolvedName::Enum(eid)) => Type::Enum(*eid),
-            Some(ResolvedName::EnumVariant(eid, _)) => Type::Enum(*eid),
-            Some(ResolvedName::Trait(_))
-            | Some(ResolvedName::Module(_)) => Type::Unknown,
+            Some(ResolvedName::Enum(eid)) => Type::Enum(*eid, Vec::new()),
+            Some(ResolvedName::EnumVariant(eid, _)) => Type::Enum(*eid, Vec::new()),
+            Some(ResolvedName::Trait(_)) | Some(ResolvedName::Module(_)) => Type::Unknown,
         }
     }
 }

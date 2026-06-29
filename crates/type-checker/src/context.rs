@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use hir::{
     body::{Body, BodyId, SourceMap, StmtId},
-    item_tree::{HirFunction},
+    item_tree::HirFunction,
 };
 use rowan::TextRange;
 
@@ -13,7 +13,7 @@ pub(crate) struct BodyCtx<'a> {
     pub(crate) body: &'a Body,
     pub(crate) function: &'a HirFunction,
     pub(crate) return_ty: Type,
-    pub(crate) locals: HashMap<StmtId, Type>,
+    pub(crate) locals: HashMap<StmtId, (Type, bool)>,
     pub(crate) bindings: ScopedBindings,
     source_map: &'a SourceMap,
 }

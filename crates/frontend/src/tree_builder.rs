@@ -76,6 +76,16 @@ pub fn build_tree(
                     token_idx += 1;
                 }
             }
+            Event::AddSyntheticToken {
+                kind,
+                text,
+                consume,
+            } => {
+                builder.token(RiddleLang::kind_to_raw(*kind), text);
+                if *consume {
+                    token_idx += 1;
+                }
+            }
             Event::Placeholder => {}
         }
     }

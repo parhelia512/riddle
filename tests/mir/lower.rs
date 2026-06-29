@@ -125,6 +125,37 @@ fn arithmetic_operations() {
 }
 
 #[test]
+fn compound_assignment_lowers_to_load_binop_store() {
+    let module = lower(
+        r#"
+        fun main() {
+            let mut n: i32 = 1;
+            n += 2;
+        }
+        "#,
+    );
+    let func = &module.functions[module.function_order[0]];
+    let entry = &func.blocks[func.entry];
+
+    assert!(
+        entry
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, mir::instr::InstKind::Load(_)))
+    );
+    assert!(entry.insts.iter().any(|i| matches!(
+        i.kind,
+        mir::instr::InstKind::BinOp(mir::instr::BinOp::Add, _, _)
+    )));
+    assert!(
+        entry
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, mir::instr::InstKind::Store(_, _)))
+    );
+}
+
+#[test]
 fn struct_literal() {
     let module = lower(
         r#"
@@ -333,7 +364,10 @@ fn two_params_both_used() {
     assert_eq!(func.params.len(), 2);
     let entry = &func.blocks[func.entry];
     assert!(
-        entry.insts.iter().any(|i| matches!(i.kind, mir::instr::InstKind::BinOp(..))),
+        entry
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, mir::instr::InstKind::BinOp(..))),
         "expected a BinOp instruction for a + b, got {:?}",
         entry.insts.iter().map(|i| &i.kind).collect::<Vec<_>>()
     );

@@ -36,12 +36,21 @@ pub fn lower_hir(
         current_body: None,
         scope_map: HashMap::new(),
         mut_bindings: HashSet::new(),
+        generic_subst: HashMap::new(),
+        mono_methods: HashMap::new(),
     };
 
     // 遍历所有有函数体的函数
     for (fid, func) in hir.item_tree.functions.iter() {
+        if ctx
+            .impl_for_method(fid)
+            .map(|imp| !imp.generics.is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if let Some(body_id) = hir.function_bodies.get(&fid).copied() {
-            let mir_func = ctx.lower_function(func.name.0.clone(), body_id);
+            let mir_func = ctx.lower_function(fid, func.name.0.clone(), body_id);
             ctx.module.add_function(mir_func);
         }
     }
@@ -86,39 +95,38 @@ struct LowerCtx<'a> {
     /// StmtIds of `mut` bindings — their Value is a storage location (Alloca),
     /// so Path resolution must emit a Load to read the current value.
     mut_bindings: HashSet<StmtId>,
+    generic_subst: HashMap<String, Type>,
+    mono_methods: HashMap<(hir::item_tree::FunctionId, String), String>,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn lower_function(&mut self, name: String, body_id: BodyId) -> Function {
+    fn lower_function(
+        &mut self,
+        fid: hir::item_tree::FunctionId,
+        name: String,
+        body_id: BodyId,
+    ) -> Function {
         let body = &self.hir.bodies[body_id];
         self.expr_cache.clear();
         self.scope_map.clear();
         self.mut_bindings.clear();
         self.current_body = Some(body_id);
 
-        // 查找函数签名（一次扫描）
-        let func_item = self
-            .hir
-            .item_tree
-            .functions
-            .iter()
-            .find(|(_, f)| f.name.0 == name)
-            .map(|(_, f)| f);
+        let func_item = &self.hir.item_tree.functions[fid];
 
         let ret_type = func_item
-            .and_then(|f| f.ret_type.as_ref())
+            .ret_type
+            .as_ref()
             .map(|rt| self.convert_hir_type(rt))
             .unwrap_or(Type::Unit);
 
         let mut func = Function::new(name.clone(), ret_type);
         let mut param_values: Vec<Value> = Vec::new();
 
-        if let Some(fi) = func_item {
-            for param in &fi.params {
-                let pty = self.convert_hir_type(&param.ty);
-                let v = func.add_param(param.name.0.clone(), pty);
-                param_values.push(v);
-            }
+        for param in &func_item.params {
+            let pty = self.convert_hir_type(&param.ty);
+            let v = func.add_param(param.name.0.clone(), pty);
+            param_values.push(v);
         }
 
         // Fix entry block start_value: params were allocated after the entry block
@@ -190,7 +198,11 @@ impl<'a> LowerCtx<'a> {
 
             Expr::Path { resolved, .. } => match resolved {
                 Some(ResolvedName::Local(stmt)) => {
-                    let storage = self.scope_map.get(stmt).copied().unwrap_or_else(|| builder.unit_const());
+                    let storage = self
+                        .scope_map
+                        .get(stmt)
+                        .copied()
+                        .unwrap_or_else(|| builder.unit_const());
                     if self.mut_bindings.contains(stmt) {
                         // mut binding: need to Load from storage to get current value
                         builder.load(storage, mir_type.clone())
@@ -198,18 +210,17 @@ impl<'a> LowerCtx<'a> {
                         storage
                     }
                 }
-                Some(ResolvedName::Param(idx)) => {
-                    param_values.get(*idx).copied().unwrap_or_else(|| builder.unit_const())
-                }
+                Some(ResolvedName::Param(idx)) => param_values
+                    .get(*idx)
+                    .copied()
+                    .unwrap_or_else(|| builder.unit_const()),
                 Some(ResolvedName::Function(_)) => builder.unit_const(),
-                Some(ResolvedName::EnumVariant(_, idx)) => {
-                    builder.iconst(*idx as i128, IntTy::U32)
-                }
+                Some(ResolvedName::EnumVariant(_, idx)) => builder.iconst(*idx as i128, IntTy::U32),
                 _ => builder.unit_const(),
             },
 
             Expr::Binary { lhs, rhs, op } => {
-                let lv = if matches!(op, HirBinOp::Assign) {
+                let lv = if op.is_assignment() {
                     self.lower_lvalue(builder, param_values, body, *lhs)
                 } else {
                     self.lower_expr(builder, param_values, body, *lhs)
@@ -221,6 +232,18 @@ impl<'a> LowerCtx<'a> {
                         // 赋值 = store rv -> lv 的地址
                         builder.store(rv, lv);
                         rv
+                    }
+                    _ if let Some(base_op) = op.compound_base() => {
+                        let value_ty = self
+                            .current_body
+                            .and_then(|bid| self.type_result.expr_types.get(&(bid, *lhs)))
+                            .map(|t| self.convert_type(t))
+                            .unwrap_or(mir_type);
+                        let current = builder.load(lv, value_ty.clone());
+                        let updated =
+                            builder.binop(convert_binop(&base_op), current, rv, value_ty.clone());
+                        builder.store(updated, lv);
+                        updated
                     }
                     HirBinOp::Eq
                     | HirBinOp::Neq
@@ -254,7 +277,7 @@ impl<'a> LowerCtx<'a> {
                     self.lower_stmt(builder, param_values, body, stmt);
                 }
                 match tail {
-                    Some(tail_expr) => self.lower_expr(builder, param_values, body,*tail_expr),
+                    Some(tail_expr) => self.lower_expr(builder, param_values, body, *tail_expr),
                     None => builder.unit_const(),
                 }
             }
@@ -264,7 +287,7 @@ impl<'a> LowerCtx<'a> {
                 then_branch,
                 else_branch,
             } => {
-                let cv = self.lower_expr(builder, param_values, body,*cond);
+                let cv = self.lower_expr(builder, param_values, body, *cond);
                 let then_block = builder.func.new_block_labeled("then");
                 let else_block = builder.func.new_block_labeled("else");
                 let merge_block = builder.func.new_block_labeled("merge");
@@ -273,16 +296,20 @@ impl<'a> LowerCtx<'a> {
 
                 // then 分支
                 builder.switch_to_block(then_block);
-                let tv = self.lower_expr(builder, param_values, body,*then_branch);
-                builder.set_branch(merge_block);
+                let tv = self.lower_expr(builder, param_values, body, *then_branch);
+                if builder.needs_return() {
+                    builder.set_branch(merge_block);
+                }
 
                 // else 分支
                 builder.switch_to_block(else_block);
                 let ev = match else_branch {
-                    Some(eb) => self.lower_expr(builder, param_values, body,*eb),
+                    Some(eb) => self.lower_expr(builder, param_values, body, *eb),
                     None => builder.unit_const(),
                 };
-                builder.set_branch(merge_block);
+                if builder.needs_return() {
+                    builder.set_branch(merge_block);
+                }
 
                 // merge 块：用 phi 节点合并两条路径的值
                 builder.switch_to_block(merge_block);
@@ -306,13 +333,15 @@ impl<'a> LowerCtx<'a> {
 
                 // 条件块：计算条件，条件分支
                 builder.switch_to_block(cond_block);
-                let cv = self.lower_expr(builder, param_values, body,*condition);
+                let cv = self.lower_expr(builder, param_values, body, *condition);
                 builder.set_cond_branch(cv, body_block, exit_block);
 
                 // 循环体：执行后跳回条件块
                 builder.switch_to_block(body_block);
-                self.lower_expr(builder, param_values, body,*while_body);
-                builder.set_branch(cond_block);
+                self.lower_expr(builder, param_values, body, *while_body);
+                if builder.needs_return() {
+                    builder.set_branch(cond_block);
+                }
 
                 // 出口块
                 builder.switch_to_block(exit_block);
@@ -320,15 +349,17 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::Match { scrutinee, arms } => {
-                let _sv = self.lower_expr(builder, param_values, body,*scrutinee);
+                let _sv = self.lower_expr(builder, param_values, body, *scrutinee);
                 let merge_block = builder.func.new_block_labeled("match_merge");
                 let mut phi_args: Vec<(Value, BlockId)> = Vec::new();
 
                 // 简化处理：每个 arm 生成一个独立块，最后用 phi 合并
                 for arm in arms {
-                    self.lower_expr(builder, param_values, body,arm.body);
+                    self.lower_expr(builder, param_values, body, arm.body);
                     let current = builder.current_block;
-                    builder.set_branch(merge_block);
+                    if builder.needs_return() {
+                        builder.set_branch(merge_block);
+                    }
                     // 实际需要跟踪 arm body 的值
                     phi_args.push((builder.unit_const(), current));
                 }
@@ -345,7 +376,7 @@ impl<'a> LowerCtx<'a> {
             Expr::Array { elements } => {
                 let vals: Vec<Value> = elements
                     .iter()
-                    .map(|e| self.lower_expr(builder, param_values, body,*e))
+                    .map(|e| self.lower_expr(builder, param_values, body, *e))
                     .collect();
                 builder.array_value(vals, mir_type)
             }
@@ -353,30 +384,47 @@ impl<'a> LowerCtx<'a> {
             Expr::Struct { fields, .. } => {
                 let vals: Vec<Value> = fields
                     .iter()
-                    .map(|f| self.lower_expr(builder, param_values, body,f.value))
+                    .map(|f| self.lower_expr(builder, param_values, body, f.value))
                     .collect();
                 builder.struct_value(vals, mir_type)
             }
 
             Expr::Call { callee, args } => {
-                // 从 callee 路径提取函数名
-                let name = callee_name(body, *callee);
-                let arg_vals: Vec<Value> = args
-                    .iter()
-                    .map(|a| self.lower_expr(builder, param_values, body,*a))
-                    .collect();
-                // 检查是否是 extern 函数调用
-                let is_extern = match &body.exprs[*callee] {
-                    Expr::Path { resolved, .. } => resolved
-                        .as_ref()
-                        .and_then(|r| match r {
-                            ResolvedName::Function(fid) => Some(*fid),
-                            _ => None,
-                        })
-                        .map(|fid| self.hir.item_tree.extern_function_ids.contains(&fid))
-                        .unwrap_or(false),
-                    _ => false,
+                let target_fid = self.callee_function_id(*callee);
+                let name = if let (
+                    Some(fid),
+                    Expr::FieldAccess { base, .. },
+                ) = (target_fid, &body.exprs[*callee])
+                {
+                    self.mono_method_name(fid, *base)
+                        .unwrap_or_else(|| self.hir.item_tree.functions[fid].name.0.clone())
+                } else {
+                    target_fid
+                        .map(|fid| self.hir.item_tree.functions[fid].name.0.clone())
+                        .unwrap_or_else(|| callee_name(body, *callee))
                 };
+                let mut arg_vals: Vec<Value> = Vec::new();
+                if let Expr::FieldAccess { base, .. } = &body.exprs[*callee] {
+                    if let Some(fid) = target_fid {
+                        if let Some(receiver) = self.hir.item_tree.functions[fid].params.first() {
+                            arg_vals.push(self.lower_receiver_arg(
+                                builder,
+                                param_values,
+                                body,
+                                *base,
+                                &receiver.ty,
+                            ));
+                        }
+                    }
+                }
+                arg_vals.extend(
+                    args.iter()
+                        .map(|a| self.lower_expr(builder, param_values, body, *a)),
+                );
+                // 检查是否是 extern 函数调用
+                let is_extern = target_fid
+                    .map(|fid| self.hir.item_tree.extern_function_ids.contains(&fid))
+                    .unwrap_or(false);
                 let func_ref = if is_extern {
                     FuncRef::Extern(name)
                 } else {
@@ -386,7 +434,7 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::FieldAccess { base, field } => {
-                let bv = self.lower_expr(builder, param_values, body,*base);
+                let bv = self.lower_expr(builder, param_values, body, *base);
                 let field_idx = self.resolve_field_index(*base, field);
                 builder.extract_value(bv, field_idx, mir_type)
             }
@@ -429,6 +477,44 @@ impl<'a> LowerCtx<'a> {
         value
     }
 
+    fn callee_function_id(&self, callee: ExprId) -> Option<hir::item_tree::FunctionId> {
+        self.current_body
+            .and_then(|bid| self.type_result.expr_types.get(&(bid, callee)))
+            .and_then(|ty| match ty {
+                type_checker::Type::Function(fid) => Some(*fid),
+                _ => None,
+            })
+    }
+
+    fn lower_receiver_arg(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        base: ExprId,
+        expected: &hir::item_tree::HirTypeRef,
+    ) -> Value {
+        let base_val = self.lower_expr(builder, param_values, body, base);
+        let expected_ty = self.convert_hir_type(expected);
+        let base_ty = self
+            .current_body
+            .and_then(|bid| self.type_result.expr_types.get(&(bid, base)))
+            .map(|t| self.convert_type(t))
+            .unwrap_or(Type::Unit);
+
+        match &expected_ty {
+            Type::Ref(inner, mutable) if inner.as_ref() == &base_ty => {
+                let op = if *mutable {
+                    HirUnOp::MutRef
+                } else {
+                    HirUnOp::Ref
+                };
+                builder.unop(convert_unop(&op), base_val, expected_ty)
+            }
+            _ => base_val,
+        }
+    }
+
     fn resolve_field_index(&self, base: ExprId, field_name: &hir::Name) -> usize {
         let Some(body_id) = self.current_body else {
             return 0;
@@ -450,14 +536,37 @@ impl<'a> LowerCtx<'a> {
         let expr = &body.exprs[expr_id];
         match expr {
             Expr::Path { resolved, .. } => match resolved {
-                Some(ResolvedName::Local(stmt)) => {
-                    *self.scope_map.get(stmt).unwrap_or(&builder.unit_const())
-                }
-                Some(ResolvedName::Param(idx)) => {
-                    param_values.get(*idx).copied().unwrap_or_else(|| builder.unit_const())
-                }
+                Some(ResolvedName::Local(stmt)) => self
+                    .scope_map
+                    .get(stmt)
+                    .copied()
+                    .unwrap_or_else(|| builder.unit_const()),
+                Some(ResolvedName::Param(idx)) => param_values
+                    .get(*idx)
+                    .copied()
+                    .unwrap_or_else(|| builder.unit_const()),
                 _ => builder.unit_const(),
             },
+            Expr::IndexAccess { base, index } => {
+                let base_val = self.lower_expr(builder, param_values, body, *base);
+                let index_val = self.lower_expr(builder, param_values, body, *index);
+                let mir_type = self
+                    .current_body
+                    .and_then(|bid| self.type_result.expr_types.get(&(bid, expr_id)))
+                    .map(|t| self.convert_type(t))
+                    .unwrap_or(Type::Unit);
+                builder.index_ptr(base_val, index_val, mir_type)
+            }
+            Expr::FieldAccess { base, field } => {
+                let base_val = self.lower_lvalue(builder, param_values, body, *base);
+                let field_idx = self.resolve_field_index(*base, field);
+                let field_ty = self
+                    .current_body
+                    .and_then(|bid| self.type_result.expr_types.get(&(bid, expr_id)))
+                    .map(|t| self.convert_type(t))
+                    .unwrap_or(Type::Unit);
+                builder.field_ptr(base_val, field_idx, field_ty)
+            }
             _ => self.lower_expr(builder, param_values, body, expr_id),
         }
     }
@@ -473,7 +582,9 @@ impl<'a> LowerCtx<'a> {
     ) {
         let stmt = &body.stmts[stmt_id];
         match stmt {
-            Stmt::Let { init, ty, is_mut, .. } => {
+            Stmt::Let {
+                init, ty, is_mut, ..
+            } => {
                 let escapes = self
                     .current_body
                     .map(|bid| self.analysis.escapes(bid, stmt_id))
@@ -484,9 +595,8 @@ impl<'a> LowerCtx<'a> {
                     // falling back to HIR type annotation if no init.
                     let alloc_ty = init
                         .and_then(|init_expr| {
-                            self.current_body.and_then(|bid| {
-                                self.type_result.expr_types.get(&(bid, init_expr))
-                            })
+                            self.current_body
+                                .and_then(|bid| self.type_result.expr_types.get(&(bid, init_expr)))
                         })
                         .map(|t| self.convert_type(t))
                         .unwrap_or_else(|| self.convert_hir_type(ty));
@@ -500,9 +610,8 @@ impl<'a> LowerCtx<'a> {
                     // mut bindings: always use Alloca for reassignable storage
                     let alloc_ty = init
                         .and_then(|init_expr| {
-                            self.current_body.and_then(|bid| {
-                                self.type_result.expr_types.get(&(bid, init_expr))
-                            })
+                            self.current_body
+                                .and_then(|bid| self.type_result.expr_types.get(&(bid, init_expr)))
                         })
                         .map(|t| self.convert_type(t))
                         .unwrap_or_else(|| self.convert_hir_type(ty));
@@ -571,19 +680,8 @@ impl<'a> LowerCtx<'a> {
             TcType::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_type(e)).collect())
             }
-            TcType::Array(inner) => Type::Array(Box::new(self.convert_type(inner))),
-            TcType::Struct(sid) => {
-                let s = &self.hir.item_tree.structs[*sid];
-                let fields = s
-                    .fields
-                    .iter()
-                    .map(|f| (f.name.0.clone(), self.convert_hir_type(&f.ty)))
-                    .collect();
-                Type::Struct(StructType {
-                    name: s.name.0.clone(),
-                    fields,
-                })
-            }
+            TcType::Array(inner, len) => Type::Array(Box::new(self.convert_type(inner)), *len),
+            TcType::Struct(sid, args) => self.convert_struct_type(*sid, args),
             TcType::Function(fid) => {
                 let f = &self.hir.item_tree.functions[*fid];
                 let params = f
@@ -601,14 +699,19 @@ impl<'a> LowerCtx<'a> {
                     ret: Box::new(ret),
                 })
             }
-            TcType::Enum(_) => Type::Int(IntTy::U32),
-            TcType::Unknown | TcType::Error => Type::Unit,
+            TcType::Enum(_, _) => Type::Int(IntTy::U32),
+            TcType::Param(_) | TcType::Unknown | TcType::Error => Type::Unit,
         }
     }
 
     fn convert_hir_type(&self, t: &hir::item_tree::HirTypeRef) -> Type {
         match t {
             hir::item_tree::HirTypeRef::Named(path) => {
+                if let Some(name) = path.as_single_name().map(|name| name.0.as_str()) {
+                    if let Some(ty) = self.generic_subst.get(name) {
+                        return ty.clone();
+                    }
+                }
                 match path.segments.last().map(|n| n.0.as_str()) {
                     Some("bool") => Type::Bool,
                     Some("i8") => Type::Int(IntTy::I8),
@@ -630,18 +733,25 @@ impl<'a> LowerCtx<'a> {
                     Some("str") => Type::Str,
                     Some("char") => Type::Char,
                     Some(name) => {
+                        if let Some(type_alias) = self.find_associated_type_alias(path) {
+                            if let Some(ty) = &self.hir.item_tree.type_aliases[type_alias].ty {
+                                return self.convert_hir_type(ty);
+                            }
+                        }
                         // Look up user-defined struct by name
-                        for (_sid, s) in self.hir.item_tree.structs.iter() {
+                        for (sid, s) in self.hir.item_tree.structs.iter() {
                             if s.name.0 == name {
-                                let fields = s
-                                    .fields
+                                let args = path
+                                    .type_args
                                     .iter()
-                                    .map(|f| (f.name.0.clone(), self.convert_hir_type(&f.ty)))
-                                    .collect();
-                                return Type::Struct(StructType {
-                                    name: s.name.0.clone(),
-                                    fields,
-                                });
+                                    .map(|arg| self.convert_hir_type(arg))
+                                    .collect::<Vec<_>>();
+                                return self.convert_struct_type_from_mir_args(sid, &args);
+                            }
+                        }
+                        for (_eid, e) in self.hir.item_tree.enums.iter() {
+                            if e.name.0 == name {
+                                return Type::Int(IntTy::U32);
                             }
                         }
                         Type::Int(IntTy::I32)
@@ -658,11 +768,211 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_hir_type(e)).collect())
             }
-            hir::item_tree::HirTypeRef::Array(inner) => {
-                Type::Array(Box::new(self.convert_hir_type(inner)))
+            hir::item_tree::HirTypeRef::Array(inner, len) => {
+                Type::Array(Box::new(self.convert_hir_type(inner)), *len)
             }
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
+    }
+
+    fn find_associated_type_alias(
+        &self,
+        path: &hir::item_tree::HirPath,
+    ) -> Option<hir::item_tree::TypeAliasId> {
+        if !matches!(path.anchor, hir::item_tree::PathAnchor::Plain) || path.segments.len() != 2 {
+            return None;
+        }
+        let self_ty_name = path.segments[0].0.as_str();
+        let alias_name = path.segments[1].0.as_str();
+
+        self.hir.item_tree.impls.iter().find_map(|(_, imp)| {
+            let hir::item_tree::HirTypeRef::Named(self_ty_path) = &imp.self_ty else {
+                return None;
+            };
+            if self_ty_path.as_single_name().map(|name| name.0.as_str()) != Some(self_ty_name) {
+                return None;
+            }
+            imp.type_aliases.iter().find_map(|alias_id| {
+                (self.hir.item_tree.type_aliases[*alias_id].name.0 == alias_name)
+                    .then_some(*alias_id)
+            })
+        })
+    }
+
+    fn convert_struct_type(
+        &self,
+        sid: hir::item_tree::StructId,
+        args: &[type_checker::Type],
+    ) -> Type {
+        let mir_args = args
+            .iter()
+            .map(|arg| self.convert_type(arg))
+            .collect::<Vec<_>>();
+        self.convert_struct_type_from_mir_args(sid, &mir_args)
+    }
+
+    fn convert_struct_type_from_mir_args(
+        &self,
+        sid: hir::item_tree::StructId,
+        args: &[Type],
+    ) -> Type {
+        let s = &self.hir.item_tree.structs[sid];
+        let subst = s
+            .generics
+            .iter()
+            .zip(args.iter())
+            .map(|(name, ty)| (name.0.as_str(), ty))
+            .collect::<HashMap<_, _>>();
+        let fields = s
+            .fields
+            .iter()
+            .map(|f| {
+                (
+                    f.name.0.clone(),
+                    self.convert_hir_type_with_subst(&f.ty, &subst),
+                )
+            })
+            .collect();
+        Type::Struct(StructType {
+            name: mono_struct_name(&s.name.0, args),
+            fields,
+        })
+    }
+
+    fn mono_method_name(
+        &mut self,
+        fid: hir::item_tree::FunctionId,
+        base: ExprId,
+    ) -> Option<String> {
+        let imp = self.impl_for_method(fid)?.clone();
+        if imp.generics.is_empty() {
+            return None;
+        }
+        let body_id = self.current_body?;
+        let receiver_ty = self.type_result.expr_types.get(&(body_id, base))?;
+        let receiver_mir_ty = self.convert_type(receiver_ty);
+        let suffix = mono_type_name(&receiver_mir_ty);
+        let key = (fid, suffix.clone());
+        if let Some(name) = self.mono_methods.get(&key) {
+            return Some(name.clone());
+        }
+
+        let subst = self.impl_mir_subst(&imp, receiver_ty)?;
+        let original_name = self.hir.item_tree.functions[fid].name.0.clone();
+        let mono_name = format!("{}__{}", original_name, suffix);
+        let old_subst = std::mem::replace(&mut self.generic_subst, subst);
+        let old_expr_cache = std::mem::take(&mut self.expr_cache);
+        let old_scope_map = std::mem::take(&mut self.scope_map);
+        let old_mut_bindings = std::mem::take(&mut self.mut_bindings);
+        let old_current_body = self.current_body;
+        let body_id = *self.hir.function_bodies.get(&fid)?;
+        let func = self.lower_function(fid, mono_name.clone(), body_id);
+        self.expr_cache = old_expr_cache;
+        self.scope_map = old_scope_map;
+        self.mut_bindings = old_mut_bindings;
+        self.current_body = old_current_body;
+        self.generic_subst = old_subst;
+        self.module.add_function(func);
+        self.mono_methods.insert(key, mono_name.clone());
+        Some(mono_name)
+    }
+
+    fn impl_for_method(&self, fid: hir::item_tree::FunctionId) -> Option<&hir::item_tree::HirImpl> {
+        self.hir
+            .item_tree
+            .impls
+            .iter()
+            .find_map(|(_, imp)| imp.methods.contains(&fid).then_some(imp))
+    }
+
+    fn impl_mir_subst(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+    ) -> Option<HashMap<String, Type>> {
+        let type_checker::Type::Struct(_, args) = receiver_ty else {
+            return None;
+        };
+        Some(
+            imp.generics
+                .iter()
+                .zip(args.iter())
+                .map(|(name, ty)| (name.0.clone(), self.convert_type(ty)))
+                .collect(),
+        )
+    }
+
+    fn convert_hir_type_with_subst(
+        &self,
+        t: &hir::item_tree::HirTypeRef,
+        subst: &HashMap<&str, &Type>,
+    ) -> Type {
+        match t {
+            hir::item_tree::HirTypeRef::Named(path) => {
+                if let Some(name) = path.as_single_name().map(|name| name.0.as_str()) {
+                    if let Some(ty) = subst.get(name) {
+                        return (*ty).clone();
+                    }
+                }
+                self.convert_hir_type(t)
+            }
+            hir::item_tree::HirTypeRef::Ref(inner, mutable) => Type::Ref(
+                Box::new(self.convert_hir_type_with_subst(inner, subst)),
+                *mutable,
+            ),
+            hir::item_tree::HirTypeRef::Ptr { inner, .. } => {
+                Type::Ptr(Box::new(self.convert_hir_type_with_subst(inner, subst)))
+            }
+            hir::item_tree::HirTypeRef::Tuple(elems) => Type::Tuple(
+                elems
+                    .iter()
+                    .map(|elem| self.convert_hir_type_with_subst(elem, subst))
+                    .collect(),
+            ),
+            hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
+                Box::new(self.convert_hir_type_with_subst(inner, subst)),
+                *len,
+            ),
+            hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
+        }
+    }
+}
+
+fn mono_struct_name(base: &str, args: &[Type]) -> String {
+    if args.is_empty() {
+        return base.to_string();
+    }
+    let suffix = args
+        .iter()
+        .map(mono_type_name)
+        .collect::<Vec<_>>()
+        .join("_");
+    format!("{base}_{suffix}")
+}
+
+fn mono_type_name(ty: &Type) -> String {
+    match ty {
+        Type::Int(i) => format!("{:?}", i).to_ascii_lowercase(),
+        Type::Float(f) => format!("{:?}", f).to_ascii_lowercase(),
+        Type::Bool => "bool".into(),
+        Type::Str => "str".into(),
+        Type::Char => "char".into(),
+        Type::Unit => "unit".into(),
+        Type::Never => "never".into(),
+        Type::Ref(inner, _) | Type::Ptr(inner) => format!("ptr_{}", mono_type_name(inner)),
+        Type::Tuple(elems) => format!(
+            "tuple_{}",
+            elems
+                .iter()
+                .map(mono_type_name)
+                .collect::<Vec<_>>()
+                .join("_")
+        ),
+        Type::Array(inner, len) => format!("arr{len}_{}", mono_type_name(inner)),
+        Type::Struct(st) => st.name.clone(),
+        Type::Enum(e) => e.name.clone(),
+        Type::FnPtr(_) => "fn".into(),
+        Type::Void => "void".into(),
     }
 }
 
@@ -675,6 +985,11 @@ fn convert_binop(op: &HirBinOp) -> BinOp {
         HirBinOp::Mul => BinOp::Mul,
         HirBinOp::Div => BinOp::Div,
         HirBinOp::Mod => BinOp::Mod,
+        HirBinOp::BitAnd => BinOp::BitAnd,
+        HirBinOp::BitOr => BinOp::BitOr,
+        HirBinOp::BitXor => BinOp::BitXor,
+        HirBinOp::Shl => BinOp::Shl,
+        HirBinOp::Shr => BinOp::Shr,
         HirBinOp::And => BinOp::BitAnd,
         HirBinOp::Or => BinOp::BitOr,
         // comparison/assign should be handled before reaching here
@@ -684,7 +999,17 @@ fn convert_binop(op: &HirBinOp) -> BinOp {
         | HirBinOp::Gt
         | HirBinOp::LtEq
         | HirBinOp::GtEq
-        | HirBinOp::Assign => unreachable!("cmp/assign handled before convert_binop"),
+        | HirBinOp::Assign
+        | HirBinOp::AddAssign
+        | HirBinOp::SubAssign
+        | HirBinOp::MulAssign
+        | HirBinOp::DivAssign
+        | HirBinOp::ModAssign
+        | HirBinOp::BitAndAssign
+        | HirBinOp::BitOrAssign
+        | HirBinOp::BitXorAssign
+        | HirBinOp::ShlAssign
+        | HirBinOp::ShrAssign => unreachable!("cmp/assign handled before convert_binop"),
     }
 }
 
@@ -703,8 +1028,25 @@ fn convert_cmp_op(op: &HirBinOp) -> CmpOp {
         | HirBinOp::Mul
         | HirBinOp::Div
         | HirBinOp::Mod
+        | HirBinOp::BitAnd
+        | HirBinOp::BitOr
+        | HirBinOp::BitXor
+        | HirBinOp::Shl
+        | HirBinOp::Shr
         | HirBinOp::And
-        | HirBinOp::Or => unreachable!("convert_cmp_op called with non-comparison op: {op:?}"),
+        | HirBinOp::Or
+        | HirBinOp::AddAssign
+        | HirBinOp::SubAssign
+        | HirBinOp::MulAssign
+        | HirBinOp::DivAssign
+        | HirBinOp::ModAssign
+        | HirBinOp::BitAndAssign
+        | HirBinOp::BitOrAssign
+        | HirBinOp::BitXorAssign
+        | HirBinOp::ShlAssign
+        | HirBinOp::ShrAssign => {
+            unreachable!("convert_cmp_op called with non-comparison op: {op:?}")
+        }
     }
 }
 
@@ -775,7 +1117,7 @@ fn resolve_field_index(
         .expr_types
         .get(&(body_id, base))
         .and_then(|ty| match ty {
-            type_checker::Type::Struct(sid) => Some(*sid),
+            type_checker::Type::Struct(sid, _) => Some(*sid),
             _ => None,
         });
 

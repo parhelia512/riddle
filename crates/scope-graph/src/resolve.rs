@@ -48,20 +48,20 @@ pub fn resolve_hir(hir: &mut HirFile, sg: &ScopeGraph) {
                 Expr::Path { path, .. } | Expr::Struct { path, .. } => path.display(),
                 _ => String::new(),
             };
-            let range = hir.bodies[*body]
-                .source_map
-                .expr_ranges
-                .get(expr)
-                .copied();
+            let range = hir.bodies[*body].source_map.expr_ranges.get(expr).copied();
             hir.bodies[*body].diagnostics.push(hir::body::Diagnostic {
                 code: "E0050",
                 severity: hir::body::Severity::Error,
                 message: format!("unresolved name: `{}`", path_text),
-                labels: range.map(|r| vec![hir::body::SourceLabel {
-                    range: r,
-                    message: String::new(),
-                    style: hir::body::LabelStyle::Primary,
-                }]).unwrap_or_default(),
+                labels: range
+                    .map(|r| {
+                        vec![hir::body::SourceLabel {
+                            range: r,
+                            message: String::new(),
+                            style: hir::body::LabelStyle::Primary,
+                        }]
+                    })
+                    .unwrap_or_default(),
                 help: None,
                 notes: Vec::new(),
             });

@@ -207,7 +207,9 @@ impl<'a> EscapeAnalyzer<'a> {
                     || args.iter().any(|arg| ctx.ref_to_place.contains_key(arg))
                     || args.iter().any(|arg| ctx.expr_ref_source.contains_key(arg))
                     || args.iter().any(|arg| ctx.ref_to_param.contains_key(arg))
-                    || args.iter().any(|arg| ctx.expr_param_source.contains_key(arg))
+                    || args
+                        .iter()
+                        .any(|arg| ctx.expr_param_source.contains_key(arg))
             }
 
             Expr::If {
@@ -297,12 +299,7 @@ impl<'a> EscapeAnalyzer<'a> {
 
     /// Handle call arguments for escape: a ref passed to a local function
     /// only forces heap allocation when the callee's param actually escapes.
-    fn handle_call_args(
-        &mut self,
-        ctx: &mut EscapeCtx<'_>,
-        callee: ExprId,
-        args: &[ExprId],
-    ) {
+    fn handle_call_args(&mut self, ctx: &mut EscapeCtx<'_>, callee: ExprId, args: &[ExprId]) {
         // Resolve the callee to a FunctionId.
         let callee_fid = self.resolve_callee(ctx, callee);
 
@@ -449,12 +446,7 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    fn record_stmt_ref_chain(
-        &mut self,
-        ctx: &mut EscapeCtx<'_>,
-        stmt_id: StmtId,
-        init: ExprId,
-    ) {
+    fn record_stmt_ref_chain(&mut self, ctx: &mut EscapeCtx<'_>, stmt_id: StmtId, init: ExprId) {
         if let Some(target) = ctx.ref_to_place.get(&init).cloned() {
             ctx.stmt_ref_source.insert(stmt_id, target);
             return;

@@ -96,3 +96,62 @@ fn let_bindings_are_distinct_across_statement_chain() {
             .any(|(path, defs)| path == "y" && local_stmt(defs).is_some())
     );
 }
+
+#[test]
+fn local_declared_before_nested_while_body_is_visible() {
+    let sg = build(
+        r#"
+        fun f(flag: bool) {
+            if flag {
+                let mut go: bool = true;
+                while go {
+                    go = false;
+                }
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(
+        resolve_paths(&sg, "go"),
+        vec![vec![DefKind::Local], vec![DefKind::Local]]
+    );
+}
+
+#[test]
+fn same_named_locals_in_sibling_blocks_do_not_cross_resolve() {
+    let sg = build(
+        r#"
+        fun f(flag: bool) {
+            if flag {
+                let mut go: bool = true;
+                while go { go = false; }
+            } else {
+                let mut go: bool = true;
+                while go { go = false; }
+            }
+        }
+        "#,
+    );
+
+    let go_defs: Vec<_> = sg
+        .nodes
+        .iter()
+        .filter_map(|(nid, node)| {
+            let Node::Reference { segments, .. } = node else {
+                return None;
+            };
+            (segments
+                .iter()
+                .map(|name| name.0.as_str())
+                .collect::<Vec<_>>()
+                == ["go"])
+            .then(|| local_stmt(&resolve_reference(&sg, nid)).unwrap())
+        })
+        .collect();
+
+    assert_eq!(go_defs.len(), 4, "expected two refs per block");
+    assert_eq!(go_defs[0], go_defs[1]);
+    assert_eq!(go_defs[2], go_defs[3]);
+    assert_ne!(go_defs[0], go_defs[2]);
+}

@@ -1,4 +1,5 @@
 mod basic;
+mod dst;
 mod errors;
 mod incremental;
 mod structs;

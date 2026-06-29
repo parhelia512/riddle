@@ -5,10 +5,12 @@ use rowan::TextRange;
 use escape_analysis::EscapeResult;
 use hir::{
     HirFile,
-    body::{BinaryOp, Body, BodyId, Expr, ExprId, ResolvedName, SourceMap, Stmt, StmtId, UnaryOp},
+    body::{Body, BodyId, Expr, ExprId, ResolvedName, SourceMap, Stmt, StmtId, UnaryOp},
     place::Place,
 };
-use type_checker::{Diagnostic, LabelStyle, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult};
+use type_checker::{
+    Diagnostic, LabelStyle, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult,
+};
 
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
@@ -92,7 +94,23 @@ impl<'a> Analyzer<'a> {
                 if let Some(name) = path.as_single_name() {
                     if let Some(moved) = ctx.bindings.get(&name.0) {
                         if *moved {
-                            self.diag(format!("use of moved value: `{}`", name.0), span, "E0100");
+                            let extra = resolved
+                                .as_ref()
+                                .and_then(|resolved| {
+                                    if let ResolvedName::Local(stmt) = resolved {
+                                        let p = Place::root(*stmt);
+                                        Some(self.move_site_labels(ctx, &p))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_default();
+                            self.diag_with_labels(
+                                format!("use of moved value: `{}`", name.0),
+                                span,
+                                "E0100",
+                                &extra,
+                            );
                         }
                         return;
                     }
@@ -101,7 +119,13 @@ impl<'a> Analyzer<'a> {
                     let place = Place::root(*stmt);
                     if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
                         let label = path.as_single_name().map(|n| n.0.as_str()).unwrap_or("_");
-                        self.diag(format!("use of moved value: `{}`", label), span, "E0100");
+                        let extra = self.move_site_labels(ctx, &place);
+                        self.diag_with_labels(
+                            format!("use of moved value: `{}`", label),
+                            span,
+                            "E0100",
+                            &extra,
+                        );
                     }
                 }
             }
@@ -116,7 +140,7 @@ impl<'a> Analyzer<'a> {
             Expr::Binary { lhs, rhs, op } => {
                 self.move_check_expr(ctx, *lhs);
                 self.move_check_expr(ctx, *rhs);
-                if *op == BinaryOp::Assign {
+                if op.is_assignment() {
                     if let Some(lhs_place) = self.place_from_expr(ctx, *lhs) {
                         if !ctx.escaping_locals.contains(&lhs_place.local) {
                             if self.has_any_borrow(ctx, &lhs_place) {
@@ -148,10 +172,12 @@ impl<'a> Analyzer<'a> {
                                             "E0301",
                                         );
                                     } else {
-                                        ctx.shared_borrows
-                                            .entry(place)
-                                            .or_default()
-                                            .push(BorrowRecord { expr_id, scope_depth: ctx.scope_depth });
+                                        ctx.shared_borrows.entry(place).or_default().push(
+                                            BorrowRecord {
+                                                expr_id,
+                                                scope_depth: ctx.scope_depth,
+                                            },
+                                        );
                                     }
                                 } else {
                                     if self.has_shared_borrow(ctx, &place) {
@@ -169,10 +195,12 @@ impl<'a> Analyzer<'a> {
                                             "E0302",
                                         );
                                     } else {
-                                        ctx.mutable_borrows
-                                            .entry(place)
-                                            .or_default()
-                                            .push(BorrowRecord { expr_id, scope_depth: ctx.scope_depth });
+                                        ctx.mutable_borrows.entry(place).or_default().push(
+                                            BorrowRecord {
+                                                expr_id,
+                                                scope_depth: ctx.scope_depth,
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -249,13 +277,23 @@ impl<'a> Analyzer<'a> {
             }
 
             Expr::FieldAccess { base, field } => {
-                self.move_check_expr(ctx, *base);
+                // Check if base is already moved before recursing — if so,
+                // skip inner error and emit only this outer one.
+                let base_moved = self
+                    .place_from_expr(ctx, *base)
+                    .map(|p| ctx.moved_places.iter().any(|m| m.is_prefix_of(&p)))
+                    .unwrap_or(false);
+                if !base_moved {
+                    self.move_check_expr(ctx, *base);
+                }
                 if let Some(place) = self.place_from_expr(ctx, expr_id) {
                     if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
-                        self.diag(
+                        let extra = self.move_site_labels(ctx, &place);
+                        self.diag_with_labels(
                             format!("use of moved field: `{}`", field.0),
                             span,
                             "E0100",
+                            &extra,
                         );
                     }
                 }
@@ -266,7 +304,13 @@ impl<'a> Analyzer<'a> {
                 self.move_check_expr(ctx, *index);
                 if let Some(place) = self.place_from_expr(ctx, expr_id) {
                     if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
-                        self.diag("use of moved value from array".into(), span, "E0100");
+                        let extra = self.move_site_labels(ctx, &place);
+                        self.diag_with_labels(
+                            "use of moved value from array".into(),
+                            span,
+                            "E0100",
+                            &extra,
+                        );
                     }
                 }
             }
@@ -294,7 +338,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn consume_if_local(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
-        if let Expr::Path { path, .. } = &ctx.body.exprs[expr_id] {
+        if let Expr::Path { path, resolved } = &ctx.body.exprs[expr_id] {
             if let Some(name) = path.as_single_name() {
                 if ctx.bindings.contains(&name.0) {
                     let ty = self
@@ -305,6 +349,12 @@ impl<'a> Analyzer<'a> {
                         .unwrap_or(Type::Unknown);
                     if !self.trait_env.type_is_copy(&ty) {
                         ctx.bindings.mark_moved(&name.0);
+                        // Record move site for secondary label.
+                        let span = ctx.expr_range(expr_id);
+                        if let Some(ResolvedName::Local(stmt)) = resolved {
+                            let p = Place::root(*stmt);
+                            ctx.moved_sites.insert(p, (span, "value moved here".into()));
+                        }
                     }
                     return;
                 }
@@ -334,7 +384,10 @@ impl<'a> Analyzer<'a> {
                 return;
             }
         }
-        ctx.moved_places.insert(place);
+        ctx.moved_places.insert(place.clone());
+        let span = ctx.expr_range(expr_id);
+        let desc = "value moved here".to_string();
+        ctx.moved_sites.insert(place, (span, desc));
     }
 
     fn place_from_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<Place> {
@@ -369,10 +422,10 @@ impl<'a> Analyzer<'a> {
         let ty = self.type_result.expr_types.get(&(body_id, base))?;
         let struct_id = match ty {
             Type::Ref(inner, _) => match inner.as_ref() {
-                Type::Struct(sid) => Some(*sid),
+                Type::Struct(sid, _) => Some(*sid),
                 _ => None,
             },
-            Type::Struct(sid) => Some(*sid),
+            Type::Struct(sid, _) => Some(*sid),
             _ => None,
         }?;
         let strukt = &self.hir.item_tree.structs[struct_id];
@@ -435,36 +488,80 @@ impl<'a> Analyzer<'a> {
     }
 
     fn diag(&mut self, message: String, span: Option<TextRange>, code: &'static str) {
+        self.diag_with_labels(message, span, code, &[])
+    }
+
+    /// Build secondary labels for the move site that caused this E0100 error.
+    fn move_site_labels(
+        &self,
+        ctx: &BodyCtx<'_>,
+        place: &Place,
+    ) -> Vec<(TextRange, String, LabelStyle)> {
+        // Find the most specific moved site — scan for a prefix match.
+        let mut best: Option<(&Place, &(Option<TextRange>, String))> = None;
+        for (moved_place, site) in &ctx.moved_sites {
+            if moved_place.is_prefix_of(place) {
+                match best {
+                    None => best = Some((moved_place, site)),
+                    Some((existing, _))
+                        if moved_place.projections.len() > existing.projections.len() =>
+                    {
+                        best = Some((moved_place, site));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        match best {
+            Some((_, &(ref span, ref desc))) => match span {
+                Some(range) => vec![(*range, desc.clone(), LabelStyle::Secondary)],
+                None => vec![],
+            },
+            None => vec![],
+        }
+    }
+
+    fn diag_with_labels(
+        &mut self,
+        message: String,
+        span: Option<TextRange>,
+        code: &'static str,
+        extra_labels: &[(TextRange, String, LabelStyle)],
+    ) {
         let help = match code {
             "E0100" => Some("consider borrowing with `&`".into()),
-            "E0300" => {
-                Some("cannot borrow as mutable while already borrowed as immutable".into())
+            "E0300" => Some("cannot borrow as mutable while already borrowed as immutable".into()),
+            "E0301" => Some("cannot borrow as immutable while already borrowed as mutable".into()),
+            "E0302" => Some("cannot borrow as mutable more than once at a time".into()),
+            "E0303" => {
+                Some("cannot assign while the value is borrowed — the borrow must end first".into())
             }
-            "E0301" => {
-                Some("cannot borrow as immutable while already borrowed as mutable".into())
+            "E0304" => {
+                Some("cannot move while the value is borrowed — the borrow must end first".into())
             }
-            "E0302" => {
-                Some("cannot borrow as mutable more than once at a time".into())
-            }
-            "E0303" => Some(
-                "cannot assign while the value is borrowed — the borrow must end first".into(),
-            ),
-            "E0304" => Some(
-                "cannot move while the value is borrowed — the borrow must end first".into(),
-            ),
             _ => None,
         };
+        let mut labels: Vec<SourceLabel> = span
+            .map(|r| {
+                vec![SourceLabel {
+                    range: r,
+                    message: String::new(),
+                    style: LabelStyle::Primary,
+                }]
+            })
+            .unwrap_or_default();
+        for (range, msg, style) in extra_labels {
+            labels.push(SourceLabel {
+                range: *range,
+                message: msg.clone(),
+                style: *style,
+            });
+        }
         self.result.diagnostics.push(Diagnostic {
             code,
             severity: Severity::Error,
             message,
-            labels: span
-                .map(|r| vec![SourceLabel {
-                    range: r,
-                    message: String::new(),
-                    style: LabelStyle::Primary,
-                }])
-                .unwrap_or_default(),
+            labels,
             help,
             notes: Vec::new(),
         });
@@ -491,6 +588,8 @@ struct BodyCtx<'a> {
     // Move tracking
     bindings: MoveBindings,
     moved_places: HashSet<Place>,
+    /// Where each place was moved — (span, description) for secondary labels.
+    moved_sites: HashMap<Place, (Option<TextRange>, String)>,
 
     // Borrow tracking
     shared_borrows: HashMap<Place, Vec<BorrowRecord>>,
@@ -509,6 +608,7 @@ impl<'a> BodyCtx<'a> {
             source_map: &body.source_map,
             bindings: MoveBindings::default(),
             moved_places: HashSet::new(),
+            moved_sites: HashMap::new(),
             shared_borrows: HashMap::new(),
             mutable_borrows: HashMap::new(),
             scope_depth: 0,

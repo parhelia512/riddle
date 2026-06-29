@@ -146,7 +146,7 @@ impl fmt::Display for TypeFmt<'_> {
                 let inner: Vec<String> = elems.iter().map(|t| format!("{}", TypeFmt(t))).collect();
                 write!(f, "({})", inner.join(", "))
             }
-            Type::Array(inner) => write!(f, "[{}]", TypeFmt(inner)),
+            Type::Array(inner, len) => write!(f, "[{}; {}]", TypeFmt(inner), len),
             Type::Struct(s) => write!(f, "{}", s.name),
             Type::Enum(e) => write!(f, "{}", e.name),
             Type::FnPtr(fp) => {

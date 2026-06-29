@@ -1,10 +1,12 @@
 use ast::{self, support::AstNode};
-use frontend::incremental::IncrementalParser;
 use frontend::ParseError;
+use frontend::incremental::IncrementalParser;
 use hir::lower_root;
 use mir::{self, Module};
 use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
 use type_checker::{self, TypeCheckResult, check_hir};
+
+const STD_PRELUDE: &str = include_str!("../../../std/prelude.rid");
 
 pub struct CompileResult {
     pub type_result: TypeCheckResult,
@@ -64,6 +66,10 @@ impl IntoDiagnosticExt for ParseError {
 
 /// Run the full frontend pipeline on `source`.
 pub fn compile(source: &str) -> CompileResult {
+    let owned_source;
+    owned_source = format!("{source}\n\n{STD_PRELUDE}");
+    let source = owned_source.as_str();
+
     // 1. Parse
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
@@ -101,14 +107,18 @@ pub fn compile(source: &str) -> CompileResult {
                 hir::body::Severity::Help => type_checker::Severity::Help,
             },
             message: d.message.clone(),
-            labels: d.labels.iter().map(|l| type_checker::SourceLabel {
-                range: l.range,
-                message: l.message.clone(),
-                style: match l.style {
-                    hir::body::LabelStyle::Primary => type_checker::LabelStyle::Primary,
-                    hir::body::LabelStyle::Secondary => type_checker::LabelStyle::Secondary,
-                },
-            }).collect(),
+            labels: d
+                .labels
+                .iter()
+                .map(|l| type_checker::SourceLabel {
+                    range: l.range,
+                    message: l.message.clone(),
+                    style: match l.style {
+                        hir::body::LabelStyle::Primary => type_checker::LabelStyle::Primary,
+                        hir::body::LabelStyle::Secondary => type_checker::LabelStyle::Secondary,
+                    },
+                })
+                .collect(),
             help: d.help.clone(),
             notes: d.notes.clone(),
         }
@@ -139,9 +149,16 @@ pub fn compile(source: &str) -> CompileResult {
     // Only Error-severity diagnostics block compilation.
     // Notes (like E0200 heap promotion) and warnings are informational.
     let success = parse_errors.is_empty()
-        && !hir_diagnostics.iter().any(|d| d.severity == type_checker::Severity::Error)
-        && !type_result.diagnostics.iter().any(|d| d.severity == type_checker::Severity::Error)
-        && !analysis_diagnostics.iter().any(|d| d.severity == type_checker::Severity::Error);
+        && !hir_diagnostics
+            .iter()
+            .any(|d| d.severity == type_checker::Severity::Error)
+        && !type_result
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == type_checker::Severity::Error)
+        && !analysis_diagnostics
+            .iter()
+            .any(|d| d.severity == type_checker::Severity::Error);
 
     CompileResult {
         type_result,
@@ -156,8 +173,18 @@ pub fn compile(source: &str) -> CompileResult {
 impl CompileResult {
     pub fn success(&self) -> bool {
         self.parse_errors.is_empty()
-            && !self.hir_diagnostics.iter().any(|d| d.severity == type_checker::Severity::Error)
-            && !self.type_result.diagnostics.iter().any(|d| d.severity == type_checker::Severity::Error)
-            && !self.analysis_diagnostics.iter().any(|d| d.severity == type_checker::Severity::Error)
+            && !self
+                .hir_diagnostics
+                .iter()
+                .any(|d| d.severity == type_checker::Severity::Error)
+            && !self
+                .type_result
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == type_checker::Severity::Error)
+            && !self
+                .analysis_diagnostics
+                .iter()
+                .any(|d| d.severity == type_checker::Severity::Error)
     }
 }

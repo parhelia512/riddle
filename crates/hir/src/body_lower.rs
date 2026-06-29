@@ -85,7 +85,10 @@ impl<'a> BodyLower<'a> {
                 message: String::new(),
                 style: LabelStyle::Primary,
             }],
-            help: Some("the source code could not be lowered — check for syntax or structural errors".into()),
+            help: Some(
+                "the source code could not be lowered — check for syntax or structural errors"
+                    .into(),
+            ),
             notes: Vec::new(),
         });
     }
@@ -148,7 +151,15 @@ impl<'a> BodyLower<'a> {
                 let ty = self.lower_optional_type(var.ty());
                 let init = self.lower_optional_expr(var.init());
                 let is_mut = var.is_mut();
-                Some(self.alloc_stmt(Stmt::Let { name, ty, init, is_mut }, range))
+                Some(self.alloc_stmt(
+                    Stmt::Let {
+                        name,
+                        ty,
+                        init,
+                        is_mut,
+                    },
+                    range,
+                ))
             }
 
             ast::Stmt::ReturnStmt(ret) => {
@@ -163,9 +174,12 @@ impl<'a> BodyLower<'a> {
 
             ast::Stmt::ModDecl(m) => {
                 let mid = crate::lower_mod_decl(self.hir, m);
-                Some(self.alloc_stmt(Stmt::Item {
-                    item: BodyItem::Module(mid),
-                }, range))
+                Some(self.alloc_stmt(
+                    Stmt::Item {
+                        item: BodyItem::Module(mid),
+                    },
+                    range,
+                ))
             }
 
             ast::Stmt::UseDecl(u) => {
@@ -174,14 +188,18 @@ impl<'a> BodyLower<'a> {
                     return None;
                 };
                 let tree = tree_ast.lower();
+                let attrs = crate::lower::lower_attrs(u.syntax());
                 let uid = self
                     .hir
                     .item_tree
                     .uses
-                    .alloc(crate::item_tree::HirUse { tree });
-                Some(self.alloc_stmt(Stmt::Item {
-                    item: BodyItem::Use(uid),
-                }, range))
+                    .alloc(crate::item_tree::HirUse { tree, attrs });
+                Some(self.alloc_stmt(
+                    Stmt::Item {
+                        item: BodyItem::Use(uid),
+                    },
+                    range,
+                ))
             }
 
             // Top-level declarations inside bodies are allowed and are promoted to the global item tree.
@@ -248,6 +266,7 @@ impl<'a> BodyLower<'a> {
                     use crate::lower::AstLower;
                     let body_ast = func.body();
                     let fid = func.lower(&mut self.hir.item_tree.functions);
+                    self.hir.item_tree.extern_function_ids.push(fid);
                     if let Some(block) = body_ast {
                         let nested_body = BodyLower::lower(self.hir, block);
                         let body_id = self.hir.bodies.alloc(nested_body);
@@ -301,7 +320,12 @@ impl<'a> BodyLower<'a> {
                     .value_token()
                     .map(|t| t.text().to_string())
                     .unwrap_or_default();
-                self.alloc_expr(Expr::CharLiteral { value: text }, range)
+                self.alloc_expr(
+                    Expr::CharLiteral {
+                        value: lower_char_literal(&text),
+                    },
+                    range,
+                )
             }
 
             ast::Expr::BoolLit(b) => {
@@ -311,10 +335,13 @@ impl<'a> BodyLower<'a> {
 
             ast::Expr::NameRef(name_ref) => {
                 let path = name_ref.path().lower();
-                self.alloc_expr(Expr::Path {
-                    path,
-                    resolved: None,
-                }, range)
+                self.alloc_expr(
+                    Expr::Path {
+                        path,
+                        resolved: None,
+                    },
+                    range,
+                )
             }
 
             ast::Expr::ParenExpr(p) => {
@@ -337,15 +364,25 @@ impl<'a> BodyLower<'a> {
                 let operand = self.lower_required_expr(u.operand(), "missing unary operand");
                 let is_mut = u.is_mut();
                 if token.kind() == SyntaxKind::AmpAmp {
-                    let inner_op = if is_mut { UnaryOp::MutRef } else { UnaryOp::Ref };
-                    let inner = self.alloc_expr(Expr::Unary {
-                        operand,
-                        op: inner_op,
-                    }, range);
-                    return self.alloc_expr(Expr::Unary {
-                        operand: inner,
-                        op: UnaryOp::Ref,
-                    }, range);
+                    let inner_op = if is_mut {
+                        UnaryOp::MutRef
+                    } else {
+                        UnaryOp::Ref
+                    };
+                    let inner = self.alloc_expr(
+                        Expr::Unary {
+                            operand,
+                            op: inner_op,
+                        },
+                        range,
+                    );
+                    return self.alloc_expr(
+                        Expr::Unary {
+                            operand: inner,
+                            op: UnaryOp::Ref,
+                        },
+                        range,
+                    );
                 }
                 let Some(base_op) = lower_unary_op(Some(token)) else {
                     return self.missing_expr("unknown unary operator");
@@ -361,7 +398,8 @@ impl<'a> BodyLower<'a> {
             ast::Expr::Block(b) => self.lower_block(b),
 
             ast::Expr::UnsafeExpr(u) => {
-                let body = u.body()
+                let body = u
+                    .body()
                     .map(|b| self.lower_block(b))
                     .unwrap_or_else(|| self.missing_expr("missing unsafe block body"));
                 self.alloc_expr(Expr::Unsafe { body }, range)
@@ -381,11 +419,14 @@ impl<'a> BodyLower<'a> {
                     Some(ElseBranch::IfStmt(i)) => Some(self.lower_expr(ast::Expr::IfStmt(i))),
                     None => None,
                 };
-                self.alloc_expr(Expr::If {
-                    cond,
-                    then_branch,
-                    else_branch,
-                }, range)
+                self.alloc_expr(
+                    Expr::If {
+                        cond,
+                        then_branch,
+                        else_branch,
+                    },
+                    range,
+                )
             }
 
             ast::Expr::WhileStmt(w) => {
@@ -431,22 +472,29 @@ impl<'a> BodyLower<'a> {
                                 let path = HirPath {
                                     anchor: PathAnchor::Plain,
                                     segments: vec![name.clone()],
+                                    type_args: Vec::new(),
                                 };
                                 let r = field.name().map(|t| t.text_range()).unwrap_or(range);
-                                self.alloc_expr(Expr::Path {
-                                    path,
-                                    resolved: None,
-                                }, r)
+                                self.alloc_expr(
+                                    Expr::Path {
+                                        path,
+                                        resolved: None,
+                                    },
+                                    r,
+                                )
                             });
                         StructExprField { name, value }
                     })
                     .collect();
                 let path = s.path().lower();
-                self.alloc_expr(Expr::Struct {
-                    path,
-                    fields,
-                    resolved: None,
-                }, range)
+                self.alloc_expr(
+                    Expr::Struct {
+                        path,
+                        fields,
+                        resolved: None,
+                    },
+                    range,
+                )
             }
 
             ast::Expr::FieldExpr(f) => {
@@ -485,20 +533,26 @@ impl<'a> BodyLower<'a> {
                 let path = sp.path().lower();
                 let name = lower_name(sp.name());
                 let sub = sp.sub_pattern().map(|p| self.lower_pattern(p));
-                self.alloc_pat(Pattern::Struct {
-                    path,
-                    fields: vec![FieldPat { name, pat: sub }],
-                }, range)
+                self.alloc_pat(
+                    Pattern::Struct {
+                        path,
+                        fields: vec![FieldPat { name, pat: sub }],
+                    },
+                    range,
+                )
             }
             ast::Pattern::Enum(ep) => {
                 let path = ep.path().lower();
                 let tuple_elems: Vec<PatId> =
                     ep.elements().map(|p| self.lower_pattern(p)).collect();
                 if !tuple_elems.is_empty() {
-                    self.alloc_pat(Pattern::TupleStruct {
-                        path,
-                        elements: tuple_elems,
-                    }, range)
+                    self.alloc_pat(
+                        Pattern::TupleStruct {
+                            path,
+                            elements: tuple_elems,
+                        },
+                        range,
+                    )
                 } else {
                     let fields: Vec<FieldPat> = ep
                         .fields()
@@ -510,7 +564,9 @@ impl<'a> BodyLower<'a> {
                         .collect();
                     if fields.is_empty() {
                         match path.as_single_name() {
-                            Some(name) => self.alloc_pat(Pattern::Binding { name: name.clone() }, range),
+                            Some(name) => {
+                                self.alloc_pat(Pattern::Binding { name: name.clone() }, range)
+                            }
                             None => self.alloc_pat(Pattern::Path { path }, range),
                         }
                     } else {
@@ -525,11 +581,26 @@ impl<'a> BodyLower<'a> {
 fn lower_binary_op(token: SyntaxToken) -> Option<BinaryOp> {
     match token.kind() {
         SyntaxKind::Eq => Some(BinaryOp::Assign),
+        SyntaxKind::PlusEq => Some(BinaryOp::AddAssign),
+        SyntaxKind::MinusEq => Some(BinaryOp::SubAssign),
+        SyntaxKind::StarEq => Some(BinaryOp::MulAssign),
+        SyntaxKind::SlashEq => Some(BinaryOp::DivAssign),
+        SyntaxKind::PercentEq => Some(BinaryOp::ModAssign),
+        SyntaxKind::AmpEq => Some(BinaryOp::BitAndAssign),
+        SyntaxKind::PipeEq => Some(BinaryOp::BitOrAssign),
+        SyntaxKind::CaretEq => Some(BinaryOp::BitXorAssign),
+        SyntaxKind::ShlEq => Some(BinaryOp::ShlAssign),
+        SyntaxKind::ShrEq => Some(BinaryOp::ShrAssign),
         SyntaxKind::Plus => Some(BinaryOp::Add),
         SyntaxKind::Minus => Some(BinaryOp::Sub),
         SyntaxKind::Star => Some(BinaryOp::Mul),
         SyntaxKind::Slash => Some(BinaryOp::Div),
         SyntaxKind::Percent => Some(BinaryOp::Mod),
+        SyntaxKind::Amp => Some(BinaryOp::BitAnd),
+        SyntaxKind::Pipe => Some(BinaryOp::BitOr),
+        SyntaxKind::Caret => Some(BinaryOp::BitXor),
+        SyntaxKind::Shl => Some(BinaryOp::Shl),
+        SyntaxKind::Shr => Some(BinaryOp::Shr),
         SyntaxKind::EqEq => Some(BinaryOp::Eq),
         SyntaxKind::BangEq => Some(BinaryOp::Neq),
         SyntaxKind::Less => Some(BinaryOp::Lt),
@@ -553,6 +624,25 @@ fn lower_unary_op(token: Option<SyntaxToken>) -> Option<UnaryOp> {
     }
 }
 
+fn lower_char_literal(text: &str) -> String {
+    let inner = text
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(text);
+    let ch = match inner.strip_prefix('\\') {
+        Some("n") => '\n',
+        Some("r") => '\r',
+        Some("t") => '\t',
+        Some("0") => '\0',
+        Some("\\") => '\\',
+        Some("'") => '\'',
+        Some("\"") => '"',
+        Some(rest) => rest.chars().next().unwrap_or('\0'),
+        None => inner.chars().next().unwrap_or('\0'),
+    };
+    ch.to_string()
+}
+
 fn split_int_literal(text: &str) -> (String, u32, Option<String>) {
     // Strip underscores
     let filtered: String = text.chars().filter(|&c| c != '_').collect();
@@ -570,7 +660,9 @@ fn split_int_literal(text: &str) -> (String, u32, Option<String>) {
         16 => ch.is_ascii_hexdigit(),
         _ => ch.is_ascii_digit(),
     };
-    let suffix_start = digits.find(|ch: char| !is_digit(ch)).unwrap_or(digits.len());
+    let suffix_start = digits
+        .find(|ch: char| !is_digit(ch))
+        .unwrap_or(digits.len());
     let (digits, suffix) = digits.split_at(suffix_start);
     let suffix = (!suffix.is_empty()).then(|| suffix.to_string());
     (digits.to_string(), radix, suffix)

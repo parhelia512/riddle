@@ -241,11 +241,26 @@ pub enum ResolvedName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Assign,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    ModAssign,
+    BitAndAssign,
+    BitOrAssign,
+    BitXorAssign,
+    ShlAssign,
+    ShrAssign,
     Add,
     Sub,
     Mul,
     Div,
     Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     Eq,
     Neq,
     Lt,
@@ -254,6 +269,41 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
+}
+
+impl BinaryOp {
+    pub fn is_assignment(self) -> bool {
+        matches!(
+            self,
+            BinaryOp::Assign
+                | BinaryOp::AddAssign
+                | BinaryOp::SubAssign
+                | BinaryOp::MulAssign
+                | BinaryOp::DivAssign
+                | BinaryOp::ModAssign
+                | BinaryOp::BitAndAssign
+                | BinaryOp::BitOrAssign
+                | BinaryOp::BitXorAssign
+                | BinaryOp::ShlAssign
+                | BinaryOp::ShrAssign
+        )
+    }
+
+    pub fn compound_base(self) -> Option<BinaryOp> {
+        match self {
+            BinaryOp::AddAssign => Some(BinaryOp::Add),
+            BinaryOp::SubAssign => Some(BinaryOp::Sub),
+            BinaryOp::MulAssign => Some(BinaryOp::Mul),
+            BinaryOp::DivAssign => Some(BinaryOp::Div),
+            BinaryOp::ModAssign => Some(BinaryOp::Mod),
+            BinaryOp::BitAndAssign => Some(BinaryOp::BitAnd),
+            BinaryOp::BitOrAssign => Some(BinaryOp::BitOr),
+            BinaryOp::BitXorAssign => Some(BinaryOp::BitXor),
+            BinaryOp::ShlAssign => Some(BinaryOp::Shl),
+            BinaryOp::ShrAssign => Some(BinaryOp::Shr),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -545,17 +595,36 @@ impl BodyPrinter<'_> {
             Expr::Cast { .. } => 85,
             Expr::Unary { .. } => 80,
             Expr::Binary { op, .. } => Self::binary_prec(op),
-            Expr::Block { .. } | Expr::If { .. } | Expr::While { .. } | Expr::Match { .. } | Expr::Unsafe { .. } => 0,
+            Expr::Block { .. }
+            | Expr::If { .. }
+            | Expr::While { .. }
+            | Expr::Match { .. }
+            | Expr::Unsafe { .. } => 0,
         }
     }
 
     fn binary_prec(op: &BinaryOp) -> u8 {
         match op {
-            BinaryOp::Assign => 5,
+            BinaryOp::Assign
+            | BinaryOp::AddAssign
+            | BinaryOp::SubAssign
+            | BinaryOp::MulAssign
+            | BinaryOp::DivAssign
+            | BinaryOp::ModAssign
+            | BinaryOp::BitAndAssign
+            | BinaryOp::BitOrAssign
+            | BinaryOp::BitXorAssign
+            | BinaryOp::ShlAssign
+            | BinaryOp::ShrAssign => 5,
             BinaryOp::Or => 10,
             BinaryOp::And => 20,
             BinaryOp::Eq | BinaryOp::Neq => 30,
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => 40,
+            BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::BitAnd
+            | BinaryOp::Shl
+            | BinaryOp::Shr => 45,
             BinaryOp::Add | BinaryOp::Sub => 50,
             BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => 60,
         }
@@ -564,11 +633,26 @@ impl BodyPrinter<'_> {
     fn binary_op_text(op: &BinaryOp) -> &'static str {
         match op {
             BinaryOp::Assign => "=",
+            BinaryOp::AddAssign => "+=",
+            BinaryOp::SubAssign => "-=",
+            BinaryOp::MulAssign => "*=",
+            BinaryOp::DivAssign => "/=",
+            BinaryOp::ModAssign => "%=",
+            BinaryOp::BitAndAssign => "&=",
+            BinaryOp::BitOrAssign => "|=",
+            BinaryOp::BitXorAssign => "^=",
+            BinaryOp::ShlAssign => "<<=",
+            BinaryOp::ShrAssign => ">>=",
             BinaryOp::Add => "+",
             BinaryOp::Sub => "-",
             BinaryOp::Mul => "*",
             BinaryOp::Div => "/",
             BinaryOp::Mod => "%",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::BitXor => "^",
+            BinaryOp::Shl => "<<",
+            BinaryOp::Shr => ">>",
             BinaryOp::Eq => "==",
             BinaryOp::Neq => "!=",
             BinaryOp::Lt => "<",
@@ -612,7 +696,7 @@ impl BodyPrinter<'_> {
                     .join(", ");
                 format!("({})", inner)
             }
-            HirTypeRef::Array(elem) => format!("[{}]", Self::type_text(elem)),
+            HirTypeRef::Array(elem, len) => format!("[{}; {}]", Self::type_text(elem), len),
         }
     }
 

@@ -42,30 +42,42 @@ pub fn report(result: &CompileResult, source: Option<&str>, source_name: &str) -
     count
 }
 
-pub fn report_verbose(result: &CompileResult, source: Option<&str>, source_name: &str) {
+pub fn report_verbose(result: &CompileResult, _source: Option<&str>, _source_name: &str) {
     if result.parse_errors.is_empty() {
         println!("parse: ok");
+    } else {
+        println!("parse: failed");
+        println!("hir lower: skipped");
+        println!("type check: skipped");
+        println!("move + escape analysis: skipped");
+        println!("MIR lowering: skipped");
+        return;
     }
 
     if result.hir_diagnostics.is_empty() {
         println!("hir lower: ok");
+    } else {
+        println!("hir lower: failed");
     }
 
     if result.type_result.diagnostics.is_empty() {
         println!("type check: ok");
+    } else {
+        println!("type check: failed");
     }
 
     if result.analysis_diagnostics.is_empty() {
         println!("move + escape analysis: ok");
+    } else {
+        println!("move + escape analysis: failed");
     }
 
     if result.success() && result.mir_module.is_some() {
         println!("MIR lowering: ok");
-    }
-
-    if !result.success() {
-        println!();
-        report(result, source, source_name);
+    } else if result.success() {
+        println!("MIR lowering: skipped");
+    } else {
+        println!("MIR lowering: failed");
     }
 }
 
@@ -91,15 +103,25 @@ fn print_rust_style(
         type_checker::Severity::Help => format!("{BLUE}help{RESET}"),
     };
 
-    let code = if d.code.is_empty() { stage.to_string() } else { d.code.to_string() };
+    let code = if d.code.is_empty() {
+        stage.to_string()
+    } else {
+        d.code.to_string()
+    };
 
     // Header
     let _ = write!(out, "{severity_str}[{code}]: {}\n", d.message);
 
     // Primary label — show source context
     if let (Some(source), Some(primary)) = (source, d.labels.first()) {
-        let line_col = offset_to_line_col(source, primary.range.start());
-        let _ = writeln!(out, " {BLUE}-->{RESET} {source_name}:{}:{}", line_col.line, line_col.col);
+        // Skip leading whitespace in range (CST ranges include leading trivia)
+        let trim_start = trim_leading_trivia(source, primary.range.start(), primary.range.end());
+        let line_col = offset_to_line_col(source, trim_start);
+        let _ = writeln!(
+            out,
+            " {BLUE}-->{RESET} {source_name}:{}:{}",
+            line_col.line, line_col.col
+        );
 
         let annotated = annotate_source(source, &d.labels);
         let _ = write!(out, "{}", annotated);
@@ -135,20 +157,52 @@ fn annotate_source(source: &str, labels: &[type_checker::SourceLabel]) -> String
         std::collections::BTreeMap::new();
 
     for label in labels {
-        let start_lc = offset_to_line_col(source, label.range.start());
-        let end_lc = offset_to_line_col(source, label.range.end());
+        // Trim leading/trailing whitespace from the source range — CST ranges
+        // include trivia that shouldn't be highlighted.
+        let (trim_start, trim_end) = trim_range(source, label.range.start(), label.range.end());
+        if trim_start >= trim_end {
+            continue;
+        }
+        let start_lc = offset_to_line_col(source, trim_start);
+        let end_lc = offset_to_line_col(source, trim_end);
         let is_primary = matches!(label.style, type_checker::LabelStyle::Primary);
 
         if start_lc.line == end_lc.line {
-            line_labels
-                .entry(start_lc.line)
-                .or_default()
-                .push((start_lc.col - 1, end_lc.col - 1, label.message.as_str(), is_primary));
+            let s = (start_lc.col - 1).min(end_lc.col - 1);
+            let e = (start_lc.col - 1).max(end_lc.col - 1);
+            // Ponytail: only add if there's at least one visible span on this line.
+            if s < e {
+                line_labels.entry(start_lc.line).or_default().push((
+                    s,
+                    e,
+                    label.message.as_str(),
+                    is_primary,
+                ));
+            }
         } else {
-            line_labels
-                .entry(start_lc.line)
-                .or_default()
-                .push((start_lc.col - 1, 0, label.message.as_str(), is_primary));
+            // Start line: from start_byte to end of line
+            line_labels.entry(start_lc.line).or_default().push((
+                start_lc.col - 1,
+                0,
+                label.message.as_str(),
+                is_primary,
+            ));
+            // Intermediate lines: highlight full line
+            for line in (start_lc.line + 1)..end_lc.line {
+                line_labels.entry(line).or_default().push((
+                    0,
+                    0,
+                    label.message.as_str(),
+                    is_primary,
+                ));
+            }
+            // End line: from beginning to end_byte
+            line_labels.entry(end_lc.line).or_default().push((
+                0,
+                end_lc.col - 1,
+                label.message.as_str(),
+                is_primary,
+            ));
         }
     }
 
@@ -157,7 +211,10 @@ fn annotate_source(source: &str, labels: &[type_checker::SourceLabel]) -> String
     }
 
     // Collect lines and strip \r (Windows CRLF)
-    let raw_lines: Vec<String> = source.lines().map(|s| s.trim_end_matches('\r').to_string()).collect();
+    let raw_lines: Vec<String> = source
+        .lines()
+        .map(|s| s.trim_end_matches('\r').to_string())
+        .collect();
     let max_line = line_labels.keys().last().copied().unwrap_or(1);
     let min_line = line_labels.keys().next().copied().unwrap_or(1);
     let gutter_w = max_line.to_string().len().max(1);
@@ -173,7 +230,11 @@ fn annotate_source(source: &str, labels: &[type_checker::SourceLabel]) -> String
         let source_line = raw_lines.get(line_no - 1).map(|s| s.as_str()).unwrap_or("");
 
         // Source line with gutter
-        out.push_str(&format!("{}{}\n", gutter(Some(line_no), gutter_w), source_line));
+        out.push_str(&format!(
+            "{}{}\n",
+            gutter(Some(line_no), gutter_w),
+            source_line
+        ));
 
         // Marker line
         if let Some(labels_for_line) = line_labels.get(&line_no) {
@@ -182,7 +243,9 @@ fn annotate_source(source: &str, labels: &[type_checker::SourceLabel]) -> String
 
             for &(start_byte, end_byte, _msg, is_primary) in labels_for_line {
                 let end = if end_byte == 0 { line_len } else { end_byte };
-                for i in start_byte..end.min(line_len) {
+                // Clamp start to line bounds — CST ranges can include leading trivia
+                let start = start_byte.min(line_len);
+                for i in start..end.min(line_len) {
                     markers[i] = if is_primary { b'^' } else { b'-' };
                 }
             }
@@ -194,16 +257,23 @@ fn annotate_source(source: &str, labels: &[type_checker::SourceLabel]) -> String
             let underline: String = markers.iter().map(|&b| b as char).collect();
 
             if !underline.is_empty() {
-                out.push_str(&format!("{}{RED}{}{RESET}", gutter(None, gutter_w), underline));
+                out.push_str(&format!(
+                    "{}{RED}{}{RESET}",
+                    gutter(None, gutter_w),
+                    underline
+                ));
 
-                // Show label message for primary labels
+                // Show label message (primary first, then secondary)
                 for &(_, _, msg, is_primary) in labels_for_line {
-                    if is_primary && !msg.is_empty() {
+                    if !msg.is_empty() {
                         out.push_str(&format!(" {msg}"));
+                        if is_primary {
+                            break; // only first message per line
+                        }
                     }
                 }
+                out.push('\n');
             }
-            out.push('\n');
         }
     }
 
@@ -212,8 +282,53 @@ fn annotate_source(source: &str, labels: &[type_checker::SourceLabel]) -> String
 
 #[derive(Debug, Clone, Copy)]
 struct LineCol {
-    line: usize,  // 1-based
-    col: usize,   // 1-based
+    line: usize, // 1-based
+    col: usize,  // 1-based
+}
+
+/// Trim leading and trailing whitespace from source range — CST ranges
+/// include leading trivia (newlines, indentation) that inflate the span.
+fn trim_range(
+    source: &str,
+    start: rowan::TextSize,
+    end: rowan::TextSize,
+) -> (rowan::TextSize, rowan::TextSize) {
+    let s: usize = start.into();
+    let e: usize = end.into();
+    if s >= e || e > source.len() {
+        return (start, end);
+    }
+    let slice = &source[s..e];
+    let lead = slice.len() - slice.trim_start_matches(|c: char| c.is_whitespace()).len();
+    let trimmed_tail = slice.trim_end_matches(|c: char| c.is_whitespace()).len();
+    let tail = slice.len() - trimmed_tail;
+    let new_s = s + lead;
+    let content_len = slice.len().saturating_sub(lead).saturating_sub(tail);
+    let new_e = (new_s + content_len).min(e);
+    if new_s >= new_e {
+        return (start, end);
+    }
+    (
+        rowan::TextSize::from(new_s as u32),
+        rowan::TextSize::from(new_e as u32),
+    )
+}
+
+/// Skip leading whitespace/newlines in source range — CST ranges include
+/// leading trivia that shouldn't be used for the `--> file:line:col` header.
+fn trim_leading_trivia(
+    source: &str,
+    start: rowan::TextSize,
+    end: rowan::TextSize,
+) -> rowan::TextSize {
+    let s: usize = start.into();
+    let e: usize = end.into();
+    if s >= e {
+        return start;
+    }
+    let slice = &source[s..e];
+    let trimmed = slice.len() - slice.trim_start_matches(|c: char| c.is_whitespace()).len();
+    rowan::TextSize::from((s + trimmed) as u32)
 }
 
 fn offset_to_line_col(source: &str, offset: rowan::TextSize) -> LineCol {

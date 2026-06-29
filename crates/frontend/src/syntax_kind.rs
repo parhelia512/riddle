@@ -100,6 +100,30 @@ pub enum SyntaxKind {
     PipePipe,
     #[token("=>")]
     FatArrow,
+    #[token("+=")]
+    PlusEq,
+    #[token("-=")]
+    MinusEq,
+    #[token("*=")]
+    StarEq,
+    #[token("/=")]
+    SlashEq,
+    #[token("%=")]
+    PercentEq,
+    #[token("&=")]
+    AmpEq,
+    #[token("|=")]
+    PipeEq,
+    #[token("^=")]
+    CaretEq,
+    #[token("<<=")]
+    ShlEq,
+    #[token(">>=")]
+    ShrEq,
+    #[token("<<")]
+    Shl,
+    #[token(">>")]
+    Shr,
 
     #[token("+")]
     Plus,
@@ -113,12 +137,18 @@ pub enum SyntaxKind {
     Percent,
     #[token("&")]
     Amp,
+    #[token("|")]
+    Pipe,
+    #[token("^")]
+    Caret,
     #[token("<")]
     Less,
     #[token(">")]
     Greater,
     #[token("!")]
     Bang,
+    #[token("#")]
+    Hash,
 
     #[token("(")]
     LParen,
@@ -179,6 +209,7 @@ pub enum SyntaxKind {
     StructExpr,
     StructExprField,
     NamedType,
+    TypeArgList,
     RefType,
     TupleType,
     ArrayType,
@@ -203,6 +234,7 @@ pub enum SyntaxKind {
     BoolLit,
     ExternBlock,
     ExternFnDecl,
+    Attribute,
     UnsafeExpr,
     CastExpr,
     PtrType,

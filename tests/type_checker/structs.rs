@@ -46,6 +46,66 @@ fn checks_struct_literal_shorthand_and_associated_function_call() {
 }
 
 #[test]
+fn checks_generic_struct_literals_and_field_access() {
+    let result = check(
+        r#"
+        struct Box<T> {
+            value: T,
+        }
+
+        fun main() -> i32 {
+            let b: Box<i32> = Box { value: 1 };
+            b.value
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn checks_generic_impl_receiver_substitution() {
+    let result = check(
+        r#"
+        struct Box<T> {
+            value: T,
+        }
+
+        impl<T> Box<T> {
+            fun get(&self) -> T {
+                self.value
+            }
+        }
+
+        fun main() -> i32 {
+            let b: Box<i32> = Box { value: 1 };
+            b.get()
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn checks_nested_generic_type_args_without_spaces() {
+    let result = check(
+        r#"
+        struct Box<T> {
+            value: T,
+        }
+
+        fun main() -> i32 {
+            let b: Box<Box<Box<i32>>> = Box { value: Box { value: Box { value: 1 } } };
+            b.value.value.value
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn reports_struct_literal_field_errors() {
     let result = check(
         r#"
@@ -90,5 +150,26 @@ fn reports_invalid_field_access() {
     assert!(
         msgs.iter()
             .any(|msg| msg.contains("cannot access field `x` on type i32"))
+    );
+}
+
+#[test]
+fn reports_generic_type_arg_count_mismatch() {
+    let result = check(
+        r#"
+        struct Box<T> {
+            value: T,
+        }
+
+        fun main() {
+            let b: Box<i32, bool> = Box { value: 1 };
+        }
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("expects 1 type argument(s), got 2"))
     );
 }

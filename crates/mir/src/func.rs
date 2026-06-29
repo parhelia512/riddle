@@ -72,6 +72,9 @@ impl Function {
     /// Append an instruction to a block and return its Value.
     pub fn push_inst(&mut self, block: BlockId, inst: Inst) -> Value {
         let b = &mut self.blocks[block];
+        if b.insts.is_empty() && b.start_value < self.next_value {
+            b.start_value = self.next_value;
+        }
         let v = Value(b.next_value());
         b.insts.push(inst);
         if v.0 >= self.next_value {

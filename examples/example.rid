@@ -3,10 +3,26 @@ enum Foo{
     B
 }
 
+impl Foo{
+    fun get(&self) -> &str {
+        if *self == Foo::A {
+            "A"
+        } else {
+            "B"
+        }
+    }
+}
+
 fun main(){
-    let x = Foo::A;
+    let mut x = Foo::A;
     x = Foo::B;
-    test(&x);
+    let mut a = 1;
+    let t = x.get();
+    if test(&x) == true{
+        a+=2;
+    }else{
+        a = 0;
+    }
 }
 
 fun test(x: &Foo) -> bool{

@@ -11,7 +11,14 @@ use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
 use type_checker::TypeCheckResult;
 
 /// Parse source, run the full frontend pipeline, and return the lowered MIR module.
-fn compile(source: &str) -> (HirFile, TypeCheckResult, move_checker::AnalysisResult, Module) {
+fn compile(
+    source: &str,
+) -> (
+    HirFile,
+    TypeCheckResult,
+    move_checker::AnalysisResult,
+    Module,
+) {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
 

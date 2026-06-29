@@ -17,7 +17,6 @@ enum BackendKind {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-
     let opts = match parse_args(&args) {
         Ok(opts) => opts,
         Err(msg) => {
@@ -208,7 +207,12 @@ fn compile_c(c_code: &str, output: Option<&str>, input_files: &[String]) -> usiz
                 None => {
                     let base = input_files
                         .first()
-                        .map(|f| Path::new(f).file_stem().unwrap_or_default().to_string_lossy())
+                        .map(|f| {
+                            Path::new(f)
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        })
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "riddle_out".into());
                     format!("{base}.c")

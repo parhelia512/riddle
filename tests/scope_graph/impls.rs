@@ -40,3 +40,20 @@ fn associated_function_path_resolves_through_impl_scope() {
         vec![vec![DefKind::Function]]
     );
 }
+
+#[test]
+fn self_receiver_resolves_as_param() {
+    let sg = build(
+        r#"
+        struct Point {}
+
+        impl Point {
+            fun get(&self) {
+                self;
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(resolve_paths(&sg, "self"), vec![vec![DefKind::Param]]);
+}

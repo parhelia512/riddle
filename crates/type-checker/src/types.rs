@@ -21,9 +21,10 @@ pub enum Type {
         inner: Box<Type>,
     },
     Tuple(Vec<Type>),
-    Array(Box<Type>),
-    Struct(StructId),
-    Enum(EnumId),
+    Array(Box<Type>, usize),
+    Struct(StructId, Vec<Type>),
+    Enum(EnumId, Vec<Type>),
+    Param(String),
     Function(FunctionId),
     Unknown,
     Error,
@@ -81,19 +82,38 @@ impl Type {
                     .join(", ");
                 format!("({inner})")
             }
-            Type::Array(inner) => format!("[{}]", inner.display(hir)),
-            Type::Struct(id) => {
+            Type::Array(inner, len) => format!("[{}; {}]", inner.display(hir), len),
+            Type::Struct(id, args) => {
                 let HirStruct { name, .. } = &hir.item_tree.structs[*id];
-                name.0.clone()
+                if args.is_empty() {
+                    name.0.clone()
+                } else {
+                    let args = args
+                        .iter()
+                        .map(|arg| arg.display(hir))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{}<{}>", name.0, args)
+                }
             }
-            Type::Enum(id) => {
+            Type::Enum(id, args) => {
                 let enum_data = &hir.item_tree.enums[*id];
-                enum_data.name.0.clone()
+                if args.is_empty() {
+                    enum_data.name.0.clone()
+                } else {
+                    let args = args
+                        .iter()
+                        .map(|arg| arg.display(hir))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{}<{}>", enum_data.name.0, args)
+                }
             }
             Type::Function(id) => {
                 let function = &hir.item_tree.functions[*id];
                 format!("fun {}", function.name.0)
             }
+            Type::Param(name) => name.clone(),
             Type::Unknown => "_".to_string(),
             Type::Error => "<error>".to_string(),
         }
@@ -110,8 +130,27 @@ impl Type {
         )
     }
 
+    pub(crate) fn is_integer(&self) -> bool {
+        matches!(self, Type::Int(_) | Type::InferInt)
+    }
+
+    pub(crate) fn is_bitwise_scalar(&self) -> bool {
+        self.is_integer() || matches!(self, Type::Bool)
+    }
+
+    pub(crate) fn is_ordered_scalar(&self) -> bool {
+        self.is_numeric() || matches!(self, Type::Char)
+    }
+
     pub(crate) fn is_never(&self) -> bool {
         matches!(self, Type::Never)
+    }
+
+    /// Returns `true` if this type has a known size at compile time.
+    /// Unsized types (like `str`) can only exist behind a pointer/reference.
+    pub fn is_sized(&self) -> bool {
+        !matches!(self, Type::Str)
+        // ponytail: only str is unsized for now; [T] slices would also be unsized
     }
 
     /// Compiler-intrinsic `Copy` candidates – types that are `Copy`
@@ -125,12 +164,13 @@ impl Type {
                 | Type::InferFloat
                 | Type::Bool
                 | Type::Char
+                | Type::Str // fat pointer {ptr, len} — plain data, trivially Copy
                 | Type::Unit
                 | Type::Never
                 | Type::Ref(_, _)
                 | Type::Ptr { .. }
                 | Type::Function(_)
-                | Type::Enum(_)
+                | Type::Enum(_, _)
                 | Type::Unknown
                 | Type::Error
         )

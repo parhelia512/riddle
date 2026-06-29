@@ -132,5 +132,9 @@ fn resolves_enum_variant_in_path() {
         .iter()
         .filter(|(_, r)| matches!(r, Some(ResolvedName::Unresolved) | None))
         .collect();
-    assert!(unresolved.is_empty(), "Unexpected unresolved paths: {:?}", unresolved);
+    assert!(
+        unresolved.is_empty(),
+        "Unexpected unresolved paths: {:?}",
+        unresolved
+    );
 }

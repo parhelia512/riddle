@@ -65,7 +65,7 @@ fn assignment_does_not_move_copy_types() {
         r#"
         fun f() {
             let a: i32 = 1;
-            let b: i32 = 2;
+            let mut b: i32 = 2;
             b = a;
             let c = a;
         }
@@ -180,7 +180,7 @@ fn assignment_moves_rhs_struct() {
 
         fun f() {
             let a = Point{x: 1};
-            let b = Point{x: 2};
+            let mut b = Point{x: 2};
             b = a;
             let c = a;
         }
@@ -343,6 +343,7 @@ fn move_while_borrowed_is_error() {
 fn explicit_copy_impl_makes_struct_copyable() {
     let result = analyze(
         r#"
+        #[lang = "copy"]
         trait Copy {}
 
         struct Vec2 { x: i32, y: i32 }
@@ -360,12 +361,83 @@ fn explicit_copy_impl_makes_struct_copyable() {
 }
 
 #[test]
+fn namespaced_copy_impl_makes_struct_copyable() {
+    let result = analyze(
+        r#"
+        mod std {
+            mod marker {
+                #[lang = "copy"]
+                trait Copy {}
+            }
+        }
+
+        struct Vec2 { x: i32, y: i32 }
+
+        impl std::marker::Copy for Vec2 {}
+
+        fun f() {
+            let a = Vec2{x: 1, y: 2};
+            let b = a;
+            let c = a;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn generic_copy_impl_makes_instantiations_copyable() {
+    let result = analyze(
+        r#"
+        #[lang = "copy"]
+        trait Copy {}
+
+        struct Box<T> { value: T }
+
+        impl<T> Copy for Box<T> {}
+
+        fun f() {
+            let a: Box<i32> = Box{value: 1};
+            let b = a;
+            let c = a;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
 fn without_copy_impl_struct_is_not_copyable() {
     let result = analyze(
         r#"
         trait Copy {}
 
         struct Vec2 { x: i32 }
+
+        fun f() {
+            let a = Vec2{x: 1};
+            let b = a;
+            let c = a;
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("use of moved value"))
+    );
+}
+
+#[test]
+fn unannotated_copy_trait_does_not_enable_copy_hook() {
+    let result = analyze(
+        r#"
+        trait Copy {}
+
+        struct Vec2 { x: i32 }
+
+        impl Copy for Vec2 {}
 
         fun f() {
             let a = Vec2{x: 1};

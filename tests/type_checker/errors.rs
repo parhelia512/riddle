@@ -59,3 +59,51 @@ fn checks_function_call_arguments() {
             .any(|msg| msg.contains("expects 1 argument(s), got 2"))
     );
 }
+
+#[test]
+fn ordered_comparison_reports_one_error_for_bad_operand_pair() {
+    let result = check(
+        r#"
+        fun main() {
+            let c = 'a';
+            if c >= 1 { }
+        }
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert_eq!(
+        msgs.iter()
+            .filter(|msg| msg.contains("ordered comparison requires compatible"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn accepts_char_ordered_comparison() {
+    let result = check(
+        r#"
+        fun main() {
+            let c = 'a';
+            if c >= '0' && c <= '9' { }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn compound_assignment_requires_mutable_lhs() {
+    let result = check(
+        r#"
+        fun main() {
+            let n = 1;
+            n += 2;
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diag| diag.code == "E0031"));
+}

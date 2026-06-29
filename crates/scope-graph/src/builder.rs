@@ -7,8 +7,8 @@ use hir::{
     HirFile, Name,
     body::{Body, BodyId, BodyItem, Expr, ExprId, MatchArm, PatId, Pattern, Stmt, StmtId},
     item_tree::{
-        EnumId, FunctionId, HirPath, HirTypeRef, HirUseTree, HirUseTreeKind, ModuleId,
-        PathAnchor, StructId, TopLevelItem,
+        EnumId, FunctionId, HirPath, HirTypeRef, HirUseTree, HirUseTreeKind, ModuleId, PathAnchor,
+        StructId, TopLevelItem,
     },
 };
 
@@ -18,7 +18,10 @@ use super::{DefRef, EdgeId, EdgeKind, Fragment, Node, NodeId, RefOrigin, ScopeGr
 ///
 /// The builder starts from `ItemTree::top_level` and recursively encodes modules,
 /// imports, functions, and structs. Function bodies are encoded as separate fragments.
-pub fn build_scope_graph(hir: &HirFile, root_syntax: &SyntaxNode) -> (ScopeGraph, Vec<hir::body::Diagnostic>) {
+pub fn build_scope_graph(
+    hir: &HirFile,
+    root_syntax: &SyntaxNode,
+) -> (ScopeGraph, Vec<hir::body::Diagnostic>) {
     ScopeGraphBuilder::new(hir, root_syntax).build()
 }
 
@@ -119,24 +122,54 @@ impl<'a> ScopeGraphBuilder<'a> {
                 TopLevelItem::Struct(sid) => {
                     self.encode_struct_impl_scope(*sid, parent_scope, frag_nodes, frag_edges);
                     let name = self.hir.item_tree.structs[*sid].name.clone();
-                    self.emit_named_def(parent_scope, name, DefRef::Struct(*sid), frag_nodes, frag_edges);
+                    self.emit_named_def(
+                        parent_scope,
+                        name,
+                        DefRef::Struct(*sid),
+                        frag_nodes,
+                        frag_edges,
+                    );
                 }
                 TopLevelItem::Enum(eid) => {
                     let name = self.hir.item_tree.enums[*eid].name.clone();
-                    self.emit_named_def(parent_scope, name, DefRef::Enum(*eid), frag_nodes, frag_edges);
+                    self.emit_named_def(
+                        parent_scope,
+                        name,
+                        DefRef::Enum(*eid),
+                        frag_nodes,
+                        frag_edges,
+                    );
                     self.encode_enum_variant_scope(*eid, parent_scope, frag_nodes, frag_edges);
                 }
                 TopLevelItem::Trait(tid) => {
                     let name = self.hir.item_tree.traits[*tid].name.clone();
-                    self.emit_named_def(parent_scope, name, DefRef::Trait(*tid), frag_nodes, frag_edges);
+                    self.emit_named_def(
+                        parent_scope,
+                        name,
+                        DefRef::Trait(*tid),
+                        frag_nodes,
+                        frag_edges,
+                    );
                 }
                 TopLevelItem::Const(cid) => {
                     let name = self.hir.item_tree.consts[*cid].name.clone();
-                    self.emit_named_def(parent_scope, name, DefRef::Const(*cid), frag_nodes, frag_edges);
+                    self.emit_named_def(
+                        parent_scope,
+                        name,
+                        DefRef::Const(*cid),
+                        frag_nodes,
+                        frag_edges,
+                    );
                 }
                 TopLevelItem::TypeAlias(tid) => {
                     let name = self.hir.item_tree.type_aliases[*tid].name.clone();
-                    self.emit_named_def(parent_scope, name, DefRef::TypeAlias(*tid), frag_nodes, frag_edges);
+                    self.emit_named_def(
+                        parent_scope,
+                        name,
+                        DefRef::TypeAlias(*tid),
+                        frag_nodes,
+                        frag_edges,
+                    );
                 }
                 TopLevelItem::Module(mid) => {
                     self.encode_module(*mid, parent_scope, frag_nodes, frag_edges);
@@ -552,6 +585,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         HirPath {
             anchor: prefix.anchor,
             segments: segs,
+            type_args: Vec::new(),
         }
     }
 

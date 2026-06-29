@@ -16,6 +16,11 @@ pub enum Event {
     },
     FinishNode,
     AddToken,
+    AddSyntheticToken {
+        kind: SyntaxKind,
+        text: &'static str,
+        consume: bool,
+    },
     Placeholder,
 }
 
@@ -129,6 +134,7 @@ pub struct Parser<'s> {
     // cache
     current_kind: SyntaxKind,
     current_non_trivia_pos: usize,
+    pending_split_greater: usize,
 }
 
 impl<'s> Parser<'s> {
@@ -141,6 +147,7 @@ impl<'s> Parser<'s> {
             errors: vec![],
             current_kind: SyntaxKind::Eof,
             current_non_trivia_pos: 0,
+            pending_split_greater: 0,
         };
         p.recompute_current();
         p
@@ -148,6 +155,10 @@ impl<'s> Parser<'s> {
 
     /// Recalculating the current non-trivia token (only called after `pos` changes)
     fn recompute_current(&mut self) {
+        if self.pending_split_greater > 0 {
+            self.current_kind = SyntaxKind::Greater;
+            return;
+        }
         let mut i = self.pos;
         while i < self.tokens.len() {
             if !self.tokens[i].kind.is_trivia() {
@@ -206,6 +217,9 @@ impl<'s> Parser<'s> {
     }
 
     fn eat_trivia(&mut self) {
+        if self.pending_split_greater > 0 {
+            return;
+        }
         while self.pos < self.tokens.len() && self.tokens[self.pos].kind.is_trivia() {
             self.events.push(Event::AddToken);
             self.pos += 1;
@@ -213,10 +227,34 @@ impl<'s> Parser<'s> {
     }
 
     fn bump(&mut self) {
+        if self.pending_split_greater > 0 {
+            self.events.push(Event::AddSyntheticToken {
+                kind: SyntaxKind::Greater,
+                text: ">",
+                consume: false,
+            });
+            self.pending_split_greater -= 1;
+            self.recompute_current();
+            return;
+        }
         self.eat_trivia();
         if self.pos < self.tokens.len() {
             self.events.push(Event::AddToken);
             self.pos += 1;
+        }
+        self.recompute_current();
+    }
+
+    fn split_shr_as_greater(&mut self) {
+        self.eat_trivia();
+        if self.at(SyntaxKind::Shr) {
+            self.events.push(Event::AddSyntheticToken {
+                kind: SyntaxKind::Greater,
+                text: ">",
+                consume: true,
+            });
+            self.pos += 1;
+            self.pending_split_greater += 1;
         }
         self.recompute_current();
     }
@@ -346,7 +384,8 @@ impl<'s> Parser<'s> {
     fn at_stmt_start(&self) -> bool {
         matches!(
             self.current(),
-            SyntaxKind::Let
+            SyntaxKind::Hash
+                | SyntaxKind::Let
                 | SyntaxKind::Fun
                 | SyntaxKind::Struct
                 | SyntaxKind::Mod
@@ -364,7 +403,8 @@ impl<'s> Parser<'s> {
     fn at_expr_start(&self) -> bool {
         matches!(
             self.current(),
-            SyntaxKind::Number
+            SyntaxKind::Hash
+                | SyntaxKind::Number
                 | SyntaxKind::Float
                 | SyntaxKind::String
                 | SyntaxKind::Char
@@ -394,13 +434,18 @@ impl<'s> Parser<'s> {
     fn at_expr_with_block_start(&self) -> bool {
         matches!(
             self.current(),
-            SyntaxKind::LBrace | SyntaxKind::If | SyntaxKind::While | SyntaxKind::Match | SyntaxKind::Unsafe
+            SyntaxKind::LBrace
+                | SyntaxKind::If
+                | SyntaxKind::While
+                | SyntaxKind::Match
+                | SyntaxKind::Unsafe
         )
     }
 
     // == stmt ==
 
     fn statement(&mut self) {
+        self.attrs();
         match self.current() {
             SyntaxKind::Let => self.var_decl(),
             SyntaxKind::Fun => self.func_decl(),
@@ -417,6 +462,40 @@ impl<'s> Parser<'s> {
             SyntaxKind::Eof => return,
             _ => self.expr_stmt(),
         }
+    }
+
+    fn attrs(&mut self) {
+        while self.at(SyntaxKind::Hash) && self.nth(1) == SyntaxKind::LBracket {
+            self.attr();
+        }
+    }
+
+    fn attr(&mut self) {
+        let m = self.start();
+        self.bump(); // #
+        self.expect(SyntaxKind::LBracket);
+        self.balanced_tokens_until(SyntaxKind::RBracket);
+        self.expect(SyntaxKind::RBracket);
+        m.complete(self, SyntaxKind::Attribute);
+    }
+
+    fn balanced_tokens_until(&mut self, close: SyntaxKind) {
+        while !self.at(close) && !self.at(SyntaxKind::Eof) {
+            match self.current() {
+                SyntaxKind::LParen => self.balanced_group(SyntaxKind::LParen, SyntaxKind::RParen),
+                SyntaxKind::LBracket => {
+                    self.balanced_group(SyntaxKind::LBracket, SyntaxKind::RBracket)
+                }
+                SyntaxKind::LBrace => self.balanced_group(SyntaxKind::LBrace, SyntaxKind::RBrace),
+                _ => self.bump(),
+            }
+        }
+    }
+
+    fn balanced_group(&mut self, open: SyntaxKind, close: SyntaxKind) {
+        self.expect(open);
+        self.balanced_tokens_until(close);
+        self.expect(close);
     }
 
     fn mod_decl(&mut self) {
@@ -613,10 +692,21 @@ impl<'s> Parser<'s> {
     }
 
     fn param(&mut self) {
+        self.attrs();
         let m = self.start();
-        self.expect(SyntaxKind::Ident);
-        self.expect(SyntaxKind::Colon);
-        self.ty();
+        if self.at(SyntaxKind::Amp) || self.at(SyntaxKind::SelfKw) {
+            if self.at(SyntaxKind::Amp) {
+                self.bump();
+                if self.at(SyntaxKind::Mut) {
+                    self.bump();
+                }
+            }
+            self.expect(SyntaxKind::SelfKw);
+        } else {
+            self.expect(SyntaxKind::Ident);
+            self.expect(SyntaxKind::Colon);
+            self.ty();
+        }
         m.complete(self, SyntaxKind::Param);
     }
 
@@ -624,6 +714,9 @@ impl<'s> Parser<'s> {
         let m = self.start();
         self.bump();
         self.expect(SyntaxKind::Ident);
+        if self.at(SyntaxKind::Less) {
+            self.generic_params();
+        }
         self.struct_field_list();
         m.complete(self, SyntaxKind::StructDecl);
     }
@@ -648,6 +741,7 @@ impl<'s> Parser<'s> {
     }
 
     fn struct_field(&mut self) {
+        self.attrs();
         let m = self.start();
         self.expect(SyntaxKind::Ident);
         self.expect(SyntaxKind::Colon);
@@ -853,6 +947,7 @@ impl<'s> Parser<'s> {
     }
 
     fn match_arm(&mut self) {
+        self.attrs();
         let m = self.start();
 
         self.pattern();
@@ -877,6 +972,7 @@ impl<'s> Parser<'s> {
         min_bp: u8,
         restrictions: ExprRestrictions,
     ) -> Option<CompletedMarker> {
+        self.attrs();
         // prefix
         let mut lhs = self.lhs(restrictions)?;
 
@@ -991,6 +1087,7 @@ impl<'s> Parser<'s> {
 
     // parse prefix, atom, block
     fn lhs(&mut self, restrictions: ExprRestrictions) -> Option<CompletedMarker> {
+        self.attrs();
         match self.current() {
             // unary
             SyntaxKind::Amp => {
@@ -1003,10 +1100,7 @@ impl<'s> Parser<'s> {
                 self.expr_bp_restricted(r_bp, restrictions);
                 Some(m.complete(self, SyntaxKind::UnaryExpr))
             }
-            SyntaxKind::Plus
-            | SyntaxKind::Minus
-            | SyntaxKind::Star
-            | SyntaxKind::Bang => {
+            SyntaxKind::Plus | SyntaxKind::Minus | SyntaxKind::Star | SyntaxKind::Bang => {
                 let m = self.start();
                 let op = self.current();
                 self.bump(); // operator
@@ -1146,6 +1240,7 @@ impl<'s> Parser<'s> {
     // == type ==
 
     fn ty(&mut self) {
+        self.attrs();
         match self.current() {
             SyntaxKind::Amp => {
                 let m = self.start();
@@ -1219,6 +1314,9 @@ impl<'s> Parser<'s> {
             | SyntaxKind::ColonColon => {
                 let m = self.start();
                 self.path();
+                if self.at(SyntaxKind::Less) {
+                    self.type_arg_list();
+                }
                 m.complete(self, SyntaxKind::NamedType);
             }
             _ => self.error(format!("expected type, found {:?}", self.current())),
@@ -1232,6 +1330,9 @@ impl<'s> Parser<'s> {
 
         self.expect(SyntaxKind::Enum);
         self.expect(SyntaxKind::Ident);
+        if self.at(SyntaxKind::Less) {
+            self.generic_params();
+        }
         self.expect(SyntaxKind::LBrace);
 
         if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
@@ -1250,6 +1351,7 @@ impl<'s> Parser<'s> {
     }
 
     fn enum_variant(&mut self) {
+        self.attrs();
         let m = self.start();
 
         self.expect(SyntaxKind::Ident);
@@ -1269,7 +1371,6 @@ impl<'s> Parser<'s> {
             }
             self.expect(SyntaxKind::RParen);
         }
-
         // struct variant: ident { field: ty, ... }
         else if self.at(SyntaxKind::LBrace) {
             self.struct_field_list();
@@ -1294,6 +1395,7 @@ impl<'s> Parser<'s> {
     }
 
     fn trait_item(&mut self) {
+        self.attrs();
         match self.current() {
             SyntaxKind::Fun => self.func_sig(),
             SyntaxKind::TypeKw => self.type_alias_decl(),
@@ -1329,7 +1431,7 @@ impl<'s> Parser<'s> {
             self.generic_params();
         }
 
-        self.path();
+        self.ty();
 
         // optional "for" ty
         if self.at(SyntaxKind::For) {
@@ -1348,6 +1450,7 @@ impl<'s> Parser<'s> {
     }
 
     fn impl_item(&mut self) {
+        self.attrs();
         match self.current() {
             SyntaxKind::Fun => self.func_decl(),
             SyntaxKind::TypeKw => self.type_alias_decl(),
@@ -1415,7 +1518,22 @@ impl<'s> Parser<'s> {
         }
     }
 
+    fn type_arg_list(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::Less);
+        if !self.at(SyntaxKind::Greater) && !self.at(SyntaxKind::Eof) {
+            self.type_list();
+        }
+        if self.at(SyntaxKind::Shr) {
+            self.split_shr_as_greater();
+        } else {
+            self.expect(SyntaxKind::Greater);
+        }
+        m.complete(self, SyntaxKind::TypeArgList);
+    }
+
     fn extern_decl(&mut self) {
+        self.attrs();
         let m = self.start();
         self.expect(SyntaxKind::Extern);
         let _abi = self.expect(SyntaxKind::String); // "C"
@@ -1428,6 +1546,7 @@ impl<'s> Parser<'s> {
             // extern "C" { fun ...; fun ...; }
             self.expect(SyntaxKind::LBrace);
             while !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
+                self.attrs();
                 if self.at(SyntaxKind::Fun) {
                     self.func_sig();
                 } else {
@@ -1473,6 +1592,7 @@ impl<'s> Parser<'s> {
 
     /// When `top_level` is true, we are at the start of a pattern and can see `&`.
     fn pattern_inner(&mut self, _top_level: bool) {
+        self.attrs();
         match self.current() {
             SyntaxKind::Underscore => {
                 let m = self.start();
@@ -1561,6 +1681,7 @@ impl<'s> Parser<'s> {
     }
 
     fn field_pattern(&mut self) {
+        self.attrs();
         let m = self.start();
         self.expect(SyntaxKind::Ident);
 
@@ -1596,13 +1717,28 @@ fn prefix_binding_power(op: SyntaxKind) -> u8 {
 
 fn infix_binding_power(op: SyntaxKind) -> Option<(u8, u8)> {
     match op {
-        SyntaxKind::Eq => Some((1, 1)),
+        SyntaxKind::Eq
+        | SyntaxKind::PlusEq
+        | SyntaxKind::MinusEq
+        | SyntaxKind::StarEq
+        | SyntaxKind::SlashEq
+        | SyntaxKind::PercentEq
+        | SyntaxKind::AmpEq
+        | SyntaxKind::PipeEq
+        | SyntaxKind::CaretEq
+        | SyntaxKind::ShlEq
+        | SyntaxKind::ShrEq => Some((1, 1)),
         SyntaxKind::PipePipe => Some((2, 3)),
         SyntaxKind::AmpAmp => Some((4, 5)),
         SyntaxKind::EqEq | SyntaxKind::BangEq => Some((6, 7)),
         SyntaxKind::Less | SyntaxKind::Greater | SyntaxKind::LessEq | SyntaxKind::GreaterEq => {
             Some((8, 9))
         }
+        SyntaxKind::Pipe
+        | SyntaxKind::Caret
+        | SyntaxKind::Amp
+        | SyntaxKind::Shl
+        | SyntaxKind::Shr => Some((9, 10)),
         SyntaxKind::Plus | SyntaxKind::Minus => Some((10, 11)),
         SyntaxKind::Star | SyntaxKind::Slash | SyntaxKind::Percent => Some((12, 13)),
         _ => None,

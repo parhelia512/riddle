@@ -15,7 +15,7 @@ pub enum Type {
     Ref(Box<Type>, bool), // (inner, mutable)
     Ptr(Box<Type>),
     Tuple(Vec<Type>),
-    Array(Box<Type>),
+    Array(Box<Type>, usize),
     Struct(StructType),
     Enum(EnumType),
 
@@ -44,7 +44,10 @@ pub enum IntTy {
 
 impl IntTy {
     pub fn is_signed(self) -> bool {
-        matches!(self, IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128 | IntTy::Isize)
+        matches!(
+            self,
+            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128 | IntTy::Isize
+        )
     }
 }
 
@@ -103,6 +106,13 @@ impl Type {
         )
     }
 
+    /// Returns `true` if this type has a known size at compile time.
+    /// Unsized types (like `str`) can only exist behind a pointer/reference.
+    pub fn is_sized(&self) -> bool {
+        !matches!(self, Type::Str)
+        // ponytail: only str is unsized for now; [T] slices would also be unsized
+    }
+
     /// Rough size estimate in bytes (used for alloca sizing).
     /// Backends may override this with target-specific layouts.
     pub fn size_bytes(&self) -> usize {
@@ -123,7 +133,14 @@ impl Type {
             },
             Type::Bool => 1,
             Type::Char => 4,
-            Type::Ref(_, _) | Type::Ptr(_) | Type::FnPtr(_) => 8,
+            Type::Ref(inner, _) | Type::Ptr(inner) => {
+                if !inner.is_sized() {
+                    16
+                } else {
+                    8
+                }
+            }
+            Type::FnPtr(_) => 8,
             Type::Str => 16, // ptr + len
             Type::Unit => 0,
             Type::Never => 0,

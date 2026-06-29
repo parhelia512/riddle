@@ -37,6 +37,7 @@ ast_node!(ModDecl, ModDecl);
 ast_node!(UseDecl, UseDecl);
 ast_node!(UseTree, UseTree);
 ast_node!(UseTreeList, UseTreeList);
+ast_node!(Attribute, Attribute);
 
 // statements / declarations
 ast_node!(VarDecl, VarDecl);
@@ -83,6 +84,7 @@ ast_node!(PathSegment, PathSegment);
 
 // types
 ast_node!(NamedType, NamedType);
+ast_node!(TypeArgList, TypeArgList);
 ast_node!(RefType, RefType);
 ast_node!(PtrType, PtrType);
 ast_node!(TupleType, TupleType);
@@ -177,6 +179,62 @@ impl UseTreeList {
     }
 }
 
+impl Attribute {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn string_value(&self) -> Option<String> {
+        let mut after_eq = false;
+        for token in self
+            .syntax
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+        {
+            if token.kind() == SyntaxKind::Eq {
+                after_eq = true;
+                continue;
+            }
+            if after_eq && token.kind() == SyntaxKind::String {
+                return Some(unquote_string(token.text()));
+            }
+        }
+        None
+    }
+
+    pub fn raw_text(&self) -> String {
+        self.syntax.text().to_string()
+    }
+}
+
+pub fn attrs_for_node(node: &SyntaxNode) -> Vec<Attribute> {
+    let Some(parent) = node.parent() else {
+        return Vec::new();
+    };
+
+    let mut pending = Vec::new();
+    for element in parent.children_with_tokens() {
+        match element {
+            rowan::NodeOrToken::Node(candidate) if candidate == *node => return pending,
+            rowan::NodeOrToken::Node(candidate) if candidate.kind() == SyntaxKind::Attribute => {
+                pending.push(Attribute { syntax: candidate });
+            }
+            rowan::NodeOrToken::Node(_) => pending.clear(),
+            rowan::NodeOrToken::Token(token) if token.kind().is_trivia() => {}
+            rowan::NodeOrToken::Token(_) => pending.clear(),
+        }
+    }
+
+    Vec::new()
+}
+
+fn unquote_string(text: &str) -> String {
+    text.strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))
+        .unwrap_or(text)
+        .to_string()
+}
+
 impl VarDecl {
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
@@ -233,6 +291,10 @@ impl StructDecl {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    pub fn generic_params(&self) -> Option<GenericParams> {
+        support::child(&self.syntax)
+    }
+
     pub fn field_list(&self) -> Option<StructFieldList> {
         support::child(&self.syntax)
     }
@@ -241,6 +303,10 @@ impl StructDecl {
 impl EnumDecl {
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn generic_params(&self) -> Option<GenericParams> {
+        support::child(&self.syntax)
     }
 
     pub fn variants(&self) -> impl Iterator<Item = EnumVariant> + '_ {
@@ -285,8 +351,19 @@ impl ImplDecl {
         support::child(&self.syntax)
     }
 
-    pub fn trait_type(&self) -> Option<Type> {
+    pub fn self_type(&self) -> Option<Type> {
         support::child(&self.syntax)
+    }
+
+    pub fn trait_type(&self) -> Option<Type> {
+        support::nth_child(&self.syntax, 1)
+    }
+
+    pub fn has_for(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .any(|token| token.kind() == SyntaxKind::For)
     }
 
     pub fn methods(&self) -> impl Iterator<Item = FuncDecl> + '_ {
@@ -394,12 +471,35 @@ impl BinaryExpr {
         support::token(&self.syntax, |kind| {
             matches!(
                 kind,
-                SyntaxKind::Eq | SyntaxKind::Plus | SyntaxKind::Minus
-                    | SyntaxKind::Star | SyntaxKind::Slash | SyntaxKind::Percent
-                    | SyntaxKind::EqEq | SyntaxKind::BangEq
-                    | SyntaxKind::Less | SyntaxKind::Greater
-                    | SyntaxKind::LessEq | SyntaxKind::GreaterEq
-                    | SyntaxKind::AmpAmp | SyntaxKind::PipePipe
+                SyntaxKind::Eq
+                    | SyntaxKind::PlusEq
+                    | SyntaxKind::MinusEq
+                    | SyntaxKind::StarEq
+                    | SyntaxKind::SlashEq
+                    | SyntaxKind::PercentEq
+                    | SyntaxKind::AmpEq
+                    | SyntaxKind::PipeEq
+                    | SyntaxKind::CaretEq
+                    | SyntaxKind::ShlEq
+                    | SyntaxKind::ShrEq
+                    | SyntaxKind::Plus
+                    | SyntaxKind::Minus
+                    | SyntaxKind::Star
+                    | SyntaxKind::Slash
+                    | SyntaxKind::Percent
+                    | SyntaxKind::Amp
+                    | SyntaxKind::Pipe
+                    | SyntaxKind::Caret
+                    | SyntaxKind::Shl
+                    | SyntaxKind::Shr
+                    | SyntaxKind::EqEq
+                    | SyntaxKind::BangEq
+                    | SyntaxKind::Less
+                    | SyntaxKind::Greater
+                    | SyntaxKind::LessEq
+                    | SyntaxKind::GreaterEq
+                    | SyntaxKind::AmpAmp
+                    | SyntaxKind::PipePipe
             )
         })
     }
@@ -414,8 +514,12 @@ impl UnaryExpr {
         support::token(&self.syntax, |kind| {
             matches!(
                 kind,
-                SyntaxKind::Plus | SyntaxKind::Minus | SyntaxKind::Amp
-                    | SyntaxKind::AmpAmp | SyntaxKind::Star | SyntaxKind::Bang
+                SyntaxKind::Plus
+                    | SyntaxKind::Minus
+                    | SyntaxKind::Amp
+                    | SyntaxKind::AmpAmp
+                    | SyntaxKind::Star
+                    | SyntaxKind::Bang
             )
         })
     }
@@ -545,7 +649,9 @@ impl NumberExpr {
             16 => ch.is_ascii_hexdigit(),
             _ => ch.is_ascii_digit(),
         };
-        let suffix_start = digits.find(|ch: char| !is_digit(ch)).unwrap_or(digits.len());
+        let suffix_start = digits
+            .find(|ch: char| !is_digit(ch))
+            .unwrap_or(digits.len());
         i64::from_str_radix(&digits[..suffix_start], radix).ok()
     }
 }
@@ -646,6 +752,20 @@ impl NamedType {
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
+
+    pub fn type_args(&self) -> Vec<Type> {
+        self.syntax
+            .children()
+            .find_map(TypeArgList::cast)
+            .map(|list| list.types().collect())
+            .unwrap_or_default()
+    }
+}
+
+impl TypeArgList {
+    pub fn types(&self) -> impl Iterator<Item = Type> + '_ {
+        support::children(&self.syntax)
+    }
 }
 
 impl RefType {
@@ -697,8 +817,12 @@ impl LiteralPat {
         support::token(&self.syntax, |k| {
             matches!(
                 k,
-                SyntaxKind::Number | SyntaxKind::Float | SyntaxKind::String
-                    | SyntaxKind::Char | SyntaxKind::True | SyntaxKind::False
+                SyntaxKind::Number
+                    | SyntaxKind::Float
+                    | SyntaxKind::String
+                    | SyntaxKind::Char
+                    | SyntaxKind::True
+                    | SyntaxKind::False
             )
         })
     }
@@ -748,11 +872,25 @@ impl ParamList {
 
 impl Param {
     pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
+        support::token(&self.syntax, |k| {
+            matches!(k, SyntaxKind::Ident | SyntaxKind::SelfKw)
+        })
     }
 
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
+    }
+
+    pub fn is_self_receiver(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::SelfKw).is_some()
+    }
+
+    pub fn is_ref(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Amp).is_some()
+    }
+
+    pub fn is_mut(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Mut).is_some()
     }
 }
 
@@ -775,7 +913,7 @@ impl StructField {
 // ── Extern ─────────────────────────────────────────────────────────────
 
 impl ExternBlock {
-    pub fn functions(&self) -> impl Iterator<Item = ExternFnDecl> + '_ {
+    pub fn functions(&self) -> impl Iterator<Item = FuncDecl> + '_ {
         support::children(&self.syntax)
     }
 }

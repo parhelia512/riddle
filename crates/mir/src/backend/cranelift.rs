@@ -301,7 +301,7 @@ impl CraneliftBackend {
             ConstValue::Char(ch) => builder.ins().iconst(types::I32, *ch as i64),
             ConstValue::String(_s) => {
                 // ponytail: string constants not yet supported
-                builder.ins().iconst(types::I64, 0)
+                builder.ins().iconst(types::I128, 0)
             }
             ConstValue::Unit => builder.ins().iconst(types::I8, 0),
         };
@@ -634,7 +634,7 @@ impl CraneliftBackend {
         v: Value,
     ) {
         let elem_size = match ty {
-            Type::Array(inner) => type_size_bytes(inner),
+            Type::Array(inner, _) => type_size_bytes(inner),
             _ => 8,
         };
         let total_size = elem_size * elements.len();
@@ -776,7 +776,7 @@ fn mir_type_to_clif(ty: &Type) -> types::Type {
         },
         Type::Bool => types::I8,
         Type::Char => types::I32,
-        Type::Str => types::I64,
+        Type::Str => types::I128,
         Type::Ptr(_) | Type::Ref(_) | Type::FnPtr(_) => types::I64,
         Type::Array(_) | Type::Struct(_) | Type::Tuple(_) | Type::Enum(_) => types::I64,
         Type::Unit | Type::Never | Type::Void => types::I8,
@@ -801,7 +801,10 @@ fn type_size_bytes(ty: &Type) -> usize {
         },
         Type::Bool => 1,
         Type::Char => 4,
-        Type::Ref(_) | Type::Ptr(_) | Type::FnPtr(_) => 8,
+        Type::Ref(inner, _) => {
+            if !inner.is_sized() { 16 } else { 8 }
+        }
+        Type::Ptr(_) | Type::FnPtr(_) => 8,
         Type::Str => 16,
         Type::Unit => 0,
         Type::Never => 0,
@@ -884,7 +887,7 @@ fn collect_types(ty: &Type, seen: &mut std::collections::BTreeMap<String, Struct
             }
         }
         Type::Ptr(inner) | Type::Ref(inner) => collect_types(inner, seen),
-        Type::Array(inner) => collect_types(inner, seen),
+        Type::Array(inner, _) => collect_types(inner, seen),
         Type::Tuple(types) => {
             for t in types {
                 collect_types(t, seen);

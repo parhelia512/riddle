@@ -1,6 +1,6 @@
 fun main() {
     let c = 'a';
-    let ok = 0;
+    let mut ok = 0;
     if c >= '0' && c <= '9' { ok = 1; }
 
     let a: usize = 42usize;

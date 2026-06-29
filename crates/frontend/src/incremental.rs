@@ -454,7 +454,19 @@ fn lexical_state_may_escape(
     fn sensitive_byte(byte: u8) -> bool {
         matches!(
             byte,
-            b'/' | b'\n' | b'\r' | b':' | b'-' | b'=' | b'!' | b'<' | b'>' | b'&' | b'|'
+            b'/' | b'\n'
+                | b'\r'
+                | b':'
+                | b'-'
+                | b'='
+                | b'!'
+                | b'<'
+                | b'>'
+                | b'&'
+                | b'|'
+                | b'#'
+                | b'['
+                | b']'
         )
     }
 

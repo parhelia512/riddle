@@ -79,6 +79,21 @@ fn build_multiple_blocks() {
 }
 
 #[test]
+fn values_are_unique_across_precreated_blocks() {
+    let mut func = Function::new("test".into(), Type::Unit);
+    let left = func.new_block_labeled("left");
+    let right = func.new_block_labeled("right");
+
+    let mut builder = Builder::new(&mut func);
+    builder.switch_to_block(left);
+    let a = builder.bconst(true);
+    builder.switch_to_block(right);
+    let b = builder.bconst(false);
+
+    assert_ne!(a, b);
+}
+
+#[test]
 fn build_call() {
     let mut func = Function::new("test".into(), Type::Int(IntTy::I32));
     let mut builder = Builder::new(&mut func);

@@ -6,7 +6,7 @@ use item_tree::{FunctionId, HirModule, HirUse, ItemTree, ModuleId, TopLevelItem}
 use la_arena::Arena;
 use lower::{AstLower, Lower};
 
-use ast::{self, Root};
+use ast::{self, Root, support::AstNode};
 
 pub mod body;
 pub mod body_lower;
@@ -78,7 +78,8 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
                     continue;
                 };
                 let tree = tree_ast.lower();
-                let uid = hir.item_tree.uses.alloc(HirUse { tree });
+                let attrs = lower::lower_attrs(u.syntax());
+                let uid = hir.item_tree.uses.alloc(HirUse { tree, attrs });
                 items.push(TopLevelItem::Use(uid));
             }
 
@@ -95,6 +96,7 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
                     let body_ast = func.body();
                     let fid = func.lower(&mut hir.item_tree.functions);
                     items.push(TopLevelItem::Function(fid));
+                    hir.item_tree.extern_function_ids.push(fid);
                     if let Some(block) = body_ast {
                         let body = BodyLower::lower(hir, block);
                         let bid = hir.bodies.alloc(body);
@@ -142,7 +144,12 @@ pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: ast::ModDecl) -> ModuleId {
     let name = lower::lower_name(m.name());
 
     // Allocate a placeholder first so the module has a stable id while lowering children.
-    let mid = hir.item_tree.modules.alloc(HirModule { name, items: None });
+    let attrs = lower::lower_attrs(m.syntax());
+    let mid = hir.item_tree.modules.alloc(HirModule {
+        name,
+        items: None,
+        attrs,
+    });
 
     if let Some(items_iter) = m.items() {
         let stmts: Vec<ast::Stmt> = items_iter.collect();
@@ -157,26 +164,28 @@ pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: ast::ModDecl) -> ModuleId {
 pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree::ImplId {
     use item_tree::{HirImpl, HirTypeRef};
 
-    let impl_path = i.path().map(|p| p.lower());
-    let for_ty = i.trait_type().map(|t| t.lower());
-    let (self_ty, trait_ty) = match for_ty {
-        Some(self_ty) => (self_ty, impl_path.map(HirTypeRef::Named)),
-        None => (
-            impl_path
-                .map(HirTypeRef::Named)
-                .unwrap_or(HirTypeRef::Error),
-            None,
-        ),
+    let first_ty = i.self_type().map(|t| t.lower());
+    let second_ty = i.trait_type().map(|t| t.lower());
+    let (self_ty, trait_ty) = if i.has_for() {
+        (second_ty.unwrap_or(HirTypeRef::Error), first_ty)
+    } else {
+        (first_ty.unwrap_or(HirTypeRef::Error), None)
     };
-    let generics = i
-        .generic_params()
-        .map(|g| g.names().map(|t| Name(t.text().to_string())).collect())
-        .unwrap_or_default();
+    let generics = lower::lower_generic_params(i.generic_params());
 
     let mut methods = Vec::new();
     for func in i.methods() {
         let body_ast = func.body();
+        let receivers: Vec<_> = func
+            .param_list()
+            .map(|pl| {
+                pl.params()
+                    .map(|p| (p.is_self_receiver(), p.is_ref(), p.is_mut()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let fid = func.lower(&mut hir.item_tree.functions);
+        apply_self_receiver_types(&mut hir.item_tree.functions[fid], &receivers, &self_ty);
         methods.push(fid);
         if let Some(block) = body_ast {
             let body = BodyLower::lower(hir, block);
@@ -201,5 +210,24 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
         methods,
         consts,
         type_aliases,
+        attrs: lower::lower_attrs(i.syntax()),
     })
+}
+
+fn apply_self_receiver_types(
+    func: &mut item_tree::HirFunction,
+    receivers: &[(bool, bool, bool)],
+    self_ty: &item_tree::HirTypeRef,
+) {
+    for (param, (is_self, is_ref, is_mut)) in func.params.iter_mut().zip(receivers) {
+        if !*is_self {
+            continue;
+        }
+
+        param.ty = if *is_ref {
+            item_tree::HirTypeRef::Ref(Box::new(self_ty.clone()), *is_mut)
+        } else {
+            self_ty.clone()
+        };
+    }
 }

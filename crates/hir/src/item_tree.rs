@@ -42,41 +42,56 @@ pub enum TopLevelItem {
 }
 
 #[derive(Debug, Clone)]
+pub struct HirAttr {
+    pub name: Name,
+    pub value: Option<String>,
+    pub raw: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct HirFunction {
     pub name: Name,
     pub params: Vec<HirParam>,
     pub ret_type: Option<HirTypeRef>,
     pub has_body: bool,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HirParam {
     pub name: Name,
     pub ty: HirTypeRef,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HirStruct {
     pub name: Name,
+    pub generics: Vec<Name>,
     pub fields: Vec<HirStructField>,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HirStructField {
     pub name: Name,
     pub ty: HirTypeRef,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HirEnum {
     pub name: Name,
+    pub generics: Vec<Name>,
     pub variants: Vec<HirEnumVariant>,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HirEnumVariant {
     pub name: Name,
     pub kind: HirVariantKind,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +109,7 @@ pub struct HirTrait {
     pub name: Name,
     pub methods: Vec<HirFunction>,
     pub type_aliases: Vec<HirTypeAlias>,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +122,7 @@ pub struct HirImpl {
     pub methods: Vec<FunctionId>,
     pub consts: Vec<ConstId>,
     pub type_aliases: Vec<TypeAliasId>,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,12 +130,14 @@ pub struct HirConst {
     pub name: Name,
     pub ty: HirTypeRef,
     pub has_value: bool,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HirTypeAlias {
     pub name: Name,
     pub ty: Option<HirTypeRef>,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,11 +145,13 @@ pub struct HirModule {
     pub name: Name,
     /// `mod foo;` → None; `mod foo { ... }` → Some(items)
     pub items: Option<Vec<TopLevelItem>>,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HirUse {
     pub tree: HirUseTree,
+    pub attrs: Vec<HirAttr>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +175,7 @@ pub enum HirUseTreeKind {
 pub struct HirPath {
     pub anchor: PathAnchor,
     pub segments: Vec<Name>,
+    pub type_args: Vec<HirTypeRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -175,7 +197,7 @@ pub enum HirTypeRef {
         inner: Box<HirTypeRef>,
     },
     Tuple(Vec<HirTypeRef>),
-    Array(Box<HirTypeRef>),
+    Array(Box<HirTypeRef>, usize),
     Unknown,
     Error,
 }
@@ -201,6 +223,17 @@ impl HirPath {
             }
             s.push_str(&seg.0);
         }
+        if !self.type_args.is_empty() {
+            let args = self
+                .type_args
+                .iter()
+                .map(HirTypeRef::display)
+                .collect::<Vec<_>>()
+                .join(", ");
+            s.push('<');
+            s.push_str(&args);
+            s.push('>');
+        }
         s
     }
 
@@ -210,6 +243,33 @@ impl HirPath {
             Some(&self.segments[0])
         } else {
             None
+        }
+    }
+}
+
+impl HirTypeRef {
+    pub fn display(&self) -> String {
+        match self {
+            HirTypeRef::Named(path) => path.display(),
+            HirTypeRef::Ref(inner, mutable) => {
+                let kw = if *mutable { "&mut " } else { "&" };
+                format!("{}{}", kw, inner.display())
+            }
+            HirTypeRef::Ptr { mutable, inner } => {
+                let kind = if *mutable { "*mut" } else { "*const" };
+                format!("{kind} {}", inner.display())
+            }
+            HirTypeRef::Tuple(elements) => {
+                let inner = elements
+                    .iter()
+                    .map(HirTypeRef::display)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({inner})")
+            }
+            HirTypeRef::Array(inner, len) => format!("[{}; {}]", inner.display(), len),
+            HirTypeRef::Unknown => "_".to_string(),
+            HirTypeRef::Error => "<error>".to_string(),
         }
     }
 }
