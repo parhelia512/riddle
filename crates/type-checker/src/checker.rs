@@ -1,6 +1,10 @@
 use rowan::TextRange;
 
-use hir::{HirFile, body::BodyId, item_tree::HirFunction};
+use hir::{
+    HirFile,
+    body::BodyId,
+    item_tree::{FunctionId, HirFunction},
+};
 
 use crate::{
     context::BodyCtx,
@@ -11,6 +15,14 @@ use crate::{
 pub struct TypeChecker<'a> {
     pub(crate) hir: &'a HirFile,
     pub(crate) result: TypeCheckResult,
+    pub(crate) generic_edges: Vec<GenericEdge>,
+}
+
+pub(crate) struct GenericEdge {
+    pub(crate) caller: FunctionId,
+    pub(crate) callee: FunctionId,
+    pub(crate) grows: bool,
+    pub(crate) span: Option<TextRange>,
 }
 
 pub fn check_hir(hir: &HirFile) -> TypeCheckResult {
@@ -22,6 +34,7 @@ impl<'a> TypeChecker<'a> {
         Self {
             hir,
             result: TypeCheckResult::default(),
+            generic_edges: Vec::new(),
         }
     }
 
@@ -30,6 +43,7 @@ impl<'a> TypeChecker<'a> {
         self.check_impls();
         self.build_trait_env();
         self.check_function_bodies();
+        self.check_generic_recursion();
         self.result
     }
 
@@ -61,19 +75,34 @@ impl<'a> TypeChecker<'a> {
     pub(crate) fn check_function_bodies(&mut self) {
         for (fid, function) in self.hir.item_tree.functions.iter() {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
-                self.check_function(function, body_id);
+                self.check_function(fid, function, body_id);
             }
         }
     }
 
-    pub(crate) fn check_function(&mut self, function: &HirFunction, body_id: BodyId) {
+    pub(crate) fn check_function(
+        &mut self,
+        function_id: FunctionId,
+        function: &HirFunction,
+        body_id: BodyId,
+    ) {
         let body = &self.hir.bodies[body_id];
+        let params = crate::lowering::generic_param_map(
+            function.generics.iter().map(|name| name.0.as_str()),
+        );
         let return_ty = function
             .ret_type
             .as_ref()
-            .map(|ty| self.lower_type_ref(ty))
+            .map(|ty| self.lower_type_ref_with_params(ty, &params))
             .unwrap_or(Type::Unit);
-        let mut ctx = BodyCtx::new(body_id, body, function, return_ty.clone());
+        let mut ctx = BodyCtx::new(
+            body_id,
+            body,
+            function_id,
+            function,
+            return_ty.clone(),
+            params,
+        );
         let actual = self.check_expr_expected(&mut ctx, body.root_block, &return_ty);
 
         // Only check tail-type compatibility; return-statement-only functions
@@ -94,6 +123,48 @@ impl<'a> TypeChecker<'a> {
             &body.exprs[expr],
             hir::body::Expr::Block { tail: Some(_), .. }
         )
+    }
+
+    fn check_generic_recursion(&mut self) {
+        for i in 0..self.generic_edges.len() {
+            if !self.generic_edges[i].grows {
+                continue;
+            }
+            let caller = self.generic_edges[i].caller;
+            let callee = self.generic_edges[i].callee;
+            if !self.reaches(callee, caller) {
+                continue;
+            }
+
+            let callee_name = self.hir.item_tree.functions[callee].name.0.clone();
+            self.diagnostic(
+                "E0033",
+                format!("generic recursion grows type arguments while calling `{callee_name}`"),
+                self.generic_edges[i].span,
+            );
+        }
+    }
+
+    fn reaches(&self, from: FunctionId, target: FunctionId) -> bool {
+        let mut seen = Vec::new();
+        let mut stack = vec![from];
+
+        while let Some(next) = stack.pop() {
+            if next == target {
+                return true;
+            }
+            if seen.contains(&next) {
+                continue;
+            }
+            seen.push(next);
+            stack.extend(
+                self.generic_edges
+                    .iter()
+                    .filter_map(|edge| (edge.caller == next).then_some(edge.callee)),
+            );
+        }
+
+        false
     }
 
     pub(crate) fn join_branch_types(
@@ -202,6 +273,7 @@ impl<'a> TypeChecker<'a> {
             "E0013" => Some("this method does not exist for the receiver type — check the impl block and receiver type".into()),
             "E0020" | "E0024" => Some("duplicate definition — remove the duplicate".into()),
             "E0031" => Some("cannot assign twice to an immutable variable — add `mut` to the `let` binding".into()),
+            "E0033" => Some("recursive generic calls must reuse the same type arguments; wrapping them requires infinitely many instantiations".into()),
             "E0021" => Some("trait method declarations should not have a body".into()),
             "E0022" | "E0025" => Some("duplicate associated type — remove the duplicate".into()),
             "E0023" => Some("this trait is not defined or not in scope".into()),

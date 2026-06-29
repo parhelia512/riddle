@@ -7,9 +7,9 @@ use hir::{
 };
 
 use crate::{
-    checker::TypeChecker,
+    checker::{GenericEdge, TypeChecker},
     context::BodyCtx,
-    lowering::collect_subst,
+    lowering::{collect_subst, substitute_type},
     types::{IntTy, Type},
 };
 
@@ -19,7 +19,7 @@ impl TypeChecker<'_> {
             Stmt::Let {
                 ty, init, is_mut, ..
             } => {
-                let declared = self.lower_type_ref(ty);
+                let declared = self.lower_type_ref_with_params(ty, &ctx.generic_params);
                 let init_ty = init.map(|expr| {
                     if declared.is_unknown_like() {
                         self.check_expr(ctx, expr)
@@ -424,7 +424,10 @@ impl TypeChecker<'_> {
                 Type::Bool
             }
             UnaryOp::Ref => Type::Ref(Box::new(operand_ty), false),
-            UnaryOp::MutRef => Type::Ref(Box::new(operand_ty), true),
+            UnaryOp::MutRef => {
+                self.check_assign_mut(ctx, operand, ctx.expr_range(operand));
+                Type::Ref(Box::new(operand_ty), true)
+            }
             UnaryOp::Deref => match &operand_ty {
                 Type::Ref(inner, _) => *inner.clone(),
                 Type::Ptr { inner, .. } => *inner.clone(),
@@ -625,6 +628,10 @@ impl TypeChecker<'_> {
         };
 
         let function = &self.hir.item_tree.functions[fid];
+        let params = crate::lowering::generic_param_map(
+            function.generics.iter().map(|name| name.0.as_str()),
+        );
+        let mut subst = HashMap::new();
         if args.len() != function.params.len() {
             self.diagnostic(
                 "E0005",
@@ -640,8 +647,15 @@ impl TypeChecker<'_> {
 
         for (index, arg) in args.iter().enumerate() {
             if let Some(param) = function.params.get(index) {
-                let expected = self.lower_type_ref(&param.ty);
-                let actual = self.check_expr_expected(ctx, *arg, &expected);
+                let pattern = self.lower_type_ref_with_params(&param.ty, &params);
+                let expected = substitute_type(&pattern, &subst);
+                let actual = if expected_has_param(&expected) {
+                    self.check_expr(ctx, *arg)
+                } else {
+                    self.check_expr_expected(ctx, *arg, &expected)
+                };
+                collect_subst(&pattern, &actual, &mut subst);
+                let expected = substitute_type(&pattern, &subst);
                 self.expect_assignable(
                     &expected,
                     &actual,
@@ -653,10 +667,43 @@ impl TypeChecker<'_> {
             }
         }
 
+        if !function.generics.is_empty() {
+            if function
+                .generics
+                .iter()
+                .any(|name| matches!(subst.get(&name.0), None | Some(Type::Unknown)))
+            {
+                self.diagnostic(
+                    "E0005",
+                    format!(
+                        "cannot infer type argument(s) for function `{}`",
+                        function.name.0
+                    ),
+                    span,
+                );
+            }
+            let args = function
+                .generics
+                .iter()
+                .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+                .collect::<Vec<_>>();
+            self.generic_edges.push(GenericEdge {
+                caller: ctx.function_id,
+                callee: fid,
+                grows: args
+                    .iter()
+                    .any(|arg| grows_generic_arg(arg, &ctx.generic_params)),
+                span,
+            });
+            self.result
+                .generic_calls
+                .insert((ctx.body_id, callee), crate::result::GenericCall { args });
+        }
+
         function
             .ret_type
             .as_ref()
-            .map(|ty| self.lower_type_ref(ty))
+            .map(|ty| substitute_type(&self.lower_type_ref_with_params(ty, &params), &subst))
             .unwrap_or(Type::Unit)
     }
 
@@ -711,6 +758,9 @@ impl TypeChecker<'_> {
         if let Some(receiver) = function.params.first() {
             let expected = self.lower_type_ref_with_params(&receiver.ty, &subst);
             let actual = self.receiver_argument_type(&base_ty, &expected);
+            if matches!(expected, Type::Ref(_, true)) {
+                self.check_assign_mut(ctx, base, ctx.expr_range(base));
+            }
             self.expect_assignable(&expected, &actual, "method receiver", ctx.expr_range(base));
         }
 
@@ -933,7 +983,7 @@ impl TypeChecker<'_> {
                 .function
                 .params
                 .get(*index)
-                .map(|param| self.lower_type_ref(&param.ty))
+                .map(|param| self.lower_type_ref_with_params(&param.ty, &ctx.generic_params))
                 .unwrap_or(Type::Unknown),
             Some(ResolvedName::Function(fid)) => Type::Function(*fid),
             Some(ResolvedName::Struct(sid)) => Type::Struct(*sid, Vec::new()),
@@ -947,5 +997,49 @@ impl TypeChecker<'_> {
             Some(ResolvedName::EnumVariant(eid, _)) => Type::Enum(*eid, Vec::new()),
             Some(ResolvedName::Trait(_)) | Some(ResolvedName::Module(_)) => Type::Unknown,
         }
+    }
+}
+
+fn expected_has_param(ty: &Type) -> bool {
+    match ty {
+        Type::Param(_) => true,
+        Type::Ref(inner, _) => expected_has_param(inner),
+        Type::Ptr { inner, .. } => expected_has_param(inner),
+        Type::Tuple(elements) => elements.iter().any(expected_has_param),
+        Type::Array(inner, _) => expected_has_param(inner),
+        Type::Struct(_, args) | Type::Enum(_, args) => args.iter().any(expected_has_param),
+        _ => false,
+    }
+}
+
+fn grows_generic_arg(ty: &Type, params: &HashMap<String, Type>) -> bool {
+    match ty {
+        Type::Param(name) => !params.contains_key(name),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
+            contains_current_param(inner, params)
+        }
+        Type::Tuple(elements) => elements
+            .iter()
+            .any(|element| contains_current_param(element, params)),
+        Type::Struct(_, args) | Type::Enum(_, args) => {
+            args.iter().any(|arg| contains_current_param(arg, params))
+        }
+        _ => false,
+    }
+}
+
+fn contains_current_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
+    match ty {
+        Type::Param(name) => params.contains_key(name),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
+            contains_current_param(inner, params)
+        }
+        Type::Tuple(elements) => elements
+            .iter()
+            .any(|element| contains_current_param(element, params)),
+        Type::Struct(_, args) | Type::Enum(_, args) => {
+            args.iter().any(|arg| contains_current_param(arg, params))
+        }
+        _ => false,
     }
 }

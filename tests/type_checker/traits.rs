@@ -90,6 +90,48 @@ fn accepts_inherent_method_call_with_self_receiver() {
 }
 
 #[test]
+fn mutable_self_method_requires_mutable_receiver_binding() {
+    let result = check(
+        r#"
+        struct Cell {
+            value: i32,
+        }
+
+        impl Cell {
+            fun set(&mut self, value: i32) {
+                self.value = value;
+            }
+        }
+
+        fun main() {
+            let cell = Cell { value: 1 };
+            cell.set(42);
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diag| diag.code == "E0031"));
+}
+
+#[test]
+fn mutable_reference_requires_mutable_binding() {
+    let result = check(
+        r#"
+        struct Cell {
+            value: i32,
+        }
+
+        fun main() {
+            let cell = Cell { value: 1 };
+            let ref_cell = &mut cell;
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diag| diag.code == "E0031"));
+}
+
+#[test]
 fn resolves_impl_associated_type_path() {
     let result = check(
         r#"

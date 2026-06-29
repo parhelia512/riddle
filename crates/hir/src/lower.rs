@@ -63,6 +63,7 @@ impl AstLower for FuncDecl {
     type Item = HirFunction;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
         let name = lower_name(self.name());
+        let generics = lower_generic_params(self.generic_params());
         let params = self
             .param_list()
             .map(|pl| pl.params().map(|p| p.lower()).collect())
@@ -72,6 +73,7 @@ impl AstLower for FuncDecl {
         let attrs = lower_attrs(self.syntax());
         arena.alloc(HirFunction {
             name,
+            generics,
             params,
             ret_type,
             has_body,
@@ -157,6 +159,7 @@ impl AstLower for ast::TraitDecl {
                 let ret_type = m.return_type().map(|ty| ty.lower());
                 HirFunction {
                     name: mname,
+                    generics: lower_generic_params(m.generic_params()),
                     params,
                     ret_type,
                     has_body: m.body().is_some(),

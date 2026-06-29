@@ -96,6 +96,36 @@ fn assignment_and_struct_literal_parse_and_lower() {
 }
 
 #[test]
+fn reports_unsupported_explicit_generic_exprs_without_cascading() {
+    let source = r#"
+        struct Wrap<T> {
+            inner: T,
+        }
+
+        fun f<T>(x: T) {
+            g<Wrap<T>>(x);
+            Wrap::<T> { inner: x };
+        }
+        "#;
+
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(source);
+    let messages = parse
+        .errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        messages,
+        vec![
+            "explicit generic function calls are not supported; omit the type arguments",
+            "explicit generic struct literals are not supported; omit the type arguments",
+        ]
+    );
+}
+
+#[test]
 fn resolves_enum_variant_in_path() {
     let (mut hir, sg) = build_hir_and_graph(
         "enum Foo{\n    A,\n    B\n}\n\nfun main(){\n    let x = Foo::A;\n    x = Foo::B;\n    test(x);\n}\n\nfun test(x: &Foo) -> bool{\n    if x == Foo::A {\n        true\n    }else{\n        false\n    }\n}",

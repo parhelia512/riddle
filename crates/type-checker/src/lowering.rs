@@ -321,3 +321,30 @@ pub(crate) fn collect_subst(
         _ => expected.is_unknown_like() || actual.is_unknown_like() || expected == actual,
     }
 }
+
+pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Param(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Ref(inner, mutable) => Type::Ref(Box::new(substitute_type(inner, subst)), *mutable),
+        Type::Ptr { mutable, inner } => Type::Ptr {
+            mutable: *mutable,
+            inner: Box::new(substitute_type(inner, subst)),
+        },
+        Type::Tuple(elements) => Type::Tuple(
+            elements
+                .iter()
+                .map(|ty| substitute_type(ty, subst))
+                .collect(),
+        ),
+        Type::Array(inner, len) => Type::Array(Box::new(substitute_type(inner, subst)), *len),
+        Type::Struct(id, args) => Type::Struct(
+            *id,
+            args.iter().map(|ty| substitute_type(ty, subst)).collect(),
+        ),
+        Type::Enum(id, args) => Type::Enum(
+            *id,
+            args.iter().map(|ty| substitute_type(ty, subst)).collect(),
+        ),
+        _ => ty.clone(),
+    }
+}

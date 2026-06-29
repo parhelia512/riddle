@@ -261,6 +261,10 @@ impl FuncDecl {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    pub fn generic_params(&self) -> Option<GenericParams> {
+        support::child(&self.syntax)
+    }
+
     pub fn param_list(&self) -> Option<ParamList> {
         support::child(&self.syntax)
     }

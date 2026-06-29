@@ -657,6 +657,9 @@ impl<'s> Parser<'s> {
 
         self.bump();
         self.expect(SyntaxKind::Ident);
+        if self.at(SyntaxKind::Less) {
+            self.generic_params();
+        }
 
         self.param_list();
 
@@ -978,6 +981,43 @@ impl<'s> Parser<'s> {
 
         loop {
             let op = self.current();
+
+            if lhs.kind(self) == SyntaxKind::NameRef
+                && op == SyntaxKind::Less
+                && self.type_arg_list_followed_by(0, SyntaxKind::LParen)
+            {
+                let m = lhs.precede(self);
+                self.error_no_bump(
+                    "explicit generic function calls are not supported; omit the type arguments"
+                        .to_string(),
+                );
+                self.type_arg_list();
+                if self.at(SyntaxKind::LParen) {
+                    self.balanced_group(SyntaxKind::LParen, SyntaxKind::RParen);
+                }
+                lhs = m.complete(self, SyntaxKind::ErrorNode);
+                continue;
+            }
+
+            if lhs.kind(self) == SyntaxKind::NameRef
+                && op == SyntaxKind::ColonColon
+                && self.nth(1) == SyntaxKind::Less
+                && self.type_arg_list_followed_by(1, SyntaxKind::LBrace)
+            {
+                let m = lhs.precede(self);
+                self.error_no_bump(
+                    "explicit generic struct literals are not supported; omit the type arguments"
+                        .to_string(),
+                );
+                self.bump(); // ::
+                self.type_arg_list();
+                if self.at(SyntaxKind::LBrace) {
+                    self.balanced_group(SyntaxKind::LBrace, SyntaxKind::RBrace);
+                }
+                lhs = m.complete(self, SyntaxKind::ErrorNode);
+                continue;
+            }
+
             // postfix
             // call
             if op == SyntaxKind::LParen {
@@ -1064,6 +1104,76 @@ impl<'s> Parser<'s> {
         }
 
         Some(lhs)
+    }
+
+    fn nth_non_trivia_index(&self, n: usize) -> Option<usize> {
+        let mut remaining = n;
+        let mut i = self.pos;
+        while i < self.tokens.len() {
+            if !self.tokens[i].kind.is_trivia() {
+                if remaining == 0 {
+                    return Some(i);
+                }
+                remaining -= 1;
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn next_non_trivia_kind_after(&self, mut i: usize) -> SyntaxKind {
+        i += 1;
+        while i < self.tokens.len() {
+            if !self.tokens[i].kind.is_trivia() {
+                return self.tokens[i].kind;
+            }
+            i += 1;
+        }
+        SyntaxKind::Eof
+    }
+
+    fn type_arg_list_followed_by(&self, start: usize, follow: SyntaxKind) -> bool {
+        if self.pending_split_greater > 0 {
+            return false;
+        }
+
+        let Some(mut i) = self.nth_non_trivia_index(start) else {
+            return false;
+        };
+        if self.tokens[i].kind != SyntaxKind::Less {
+            return false;
+        }
+
+        let mut depth = 0usize;
+        while i < self.tokens.len() {
+            match self.tokens[i].kind {
+                kind if kind.is_trivia() => {}
+                SyntaxKind::Less => depth += 1,
+                SyntaxKind::Greater => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.next_non_trivia_kind_after(i) == follow;
+                    }
+                }
+                SyntaxKind::Shr => {
+                    if depth < 2 {
+                        return false;
+                    }
+                    depth -= 2;
+                    if depth == 0 {
+                        return self.next_non_trivia_kind_after(i) == follow;
+                    }
+                }
+                SyntaxKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+
+        false
     }
 
     fn arg_list(&mut self) {
@@ -1410,6 +1520,9 @@ impl<'s> Parser<'s> {
 
         self.expect(SyntaxKind::Fun);
         self.expect(SyntaxKind::Ident);
+        if self.at(SyntaxKind::Less) {
+            self.generic_params();
+        }
         self.param_list();
 
         if self.at(SyntaxKind::Arrow) {

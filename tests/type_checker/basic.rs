@@ -104,3 +104,54 @@ fn accepts_compound_assignment_ops() {
 
     assert_eq!(result.diagnostics, vec![]);
 }
+
+#[test]
+fn checks_generic_function_calls() {
+    let result = check(
+        r#"
+        fun id<T>(value: T) -> T {
+            value
+        }
+
+        fun main() -> i32 {
+            let a = id(1);
+            let b = id(true);
+            a
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn reports_uninferred_generic_function_type_arg() {
+    let result = check(
+        r#"
+        fun make<T>() -> T {
+            1
+        }
+
+        fun main() {
+            let x = make();
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message.contains("cannot infer type argument"))
+    );
+}
+
+#[test]
+fn reports_growing_generic_recursion() {
+    let result = check(include_str!("../../examples/generic_wrap_recursion.rid"));
+
+    assert!(result.diagnostics.iter().any(|diag| {
+        diag.message
+            .contains("generic recursion grows type arguments")
+    }));
+}

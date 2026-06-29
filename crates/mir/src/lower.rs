@@ -37,15 +37,17 @@ pub fn lower_hir(
         scope_map: HashMap::new(),
         mut_bindings: HashSet::new(),
         generic_subst: HashMap::new(),
+        mono_functions: HashMap::new(),
         mono_methods: HashMap::new(),
     };
 
     // 遍历所有有函数体的函数
     for (fid, func) in hir.item_tree.functions.iter() {
-        if ctx
-            .impl_for_method(fid)
-            .map(|imp| !imp.generics.is_empty())
-            .unwrap_or(false)
+        if !func.generics.is_empty()
+            || ctx
+                .impl_for_method(fid)
+                .map(|imp| !imp.generics.is_empty())
+                .unwrap_or(false)
         {
             continue;
         }
@@ -96,6 +98,7 @@ struct LowerCtx<'a> {
     /// so Path resolution must emit a Load to read the current value.
     mut_bindings: HashSet<StmtId>,
     generic_subst: HashMap<String, Type>,
+    mono_functions: HashMap<(hir::item_tree::FunctionId, String), String>,
     mono_methods: HashMap<(hir::item_tree::FunctionId, String), String>,
 }
 
@@ -391,16 +394,17 @@ impl<'a> LowerCtx<'a> {
 
             Expr::Call { callee, args } => {
                 let target_fid = self.callee_function_id(*callee);
-                let name = if let (
-                    Some(fid),
-                    Expr::FieldAccess { base, .. },
-                ) = (target_fid, &body.exprs[*callee])
+                let name = if let (Some(fid), Expr::FieldAccess { base, .. }) =
+                    (target_fid, &body.exprs[*callee])
                 {
                     self.mono_method_name(fid, *base)
                         .unwrap_or_else(|| self.hir.item_tree.functions[fid].name.0.clone())
                 } else {
                     target_fid
-                        .map(|fid| self.hir.item_tree.functions[fid].name.0.clone())
+                        .map(|fid| {
+                            self.mono_function_name(fid, *callee)
+                                .unwrap_or_else(|| self.hir.item_tree.functions[fid].name.0.clone())
+                        })
                         .unwrap_or_else(|| callee_name(body, *callee))
                 };
                 let mut arg_vals: Vec<Value> = Vec::new();
@@ -700,7 +704,8 @@ impl<'a> LowerCtx<'a> {
                 })
             }
             TcType::Enum(_, _) => Type::Int(IntTy::U32),
-            TcType::Param(_) | TcType::Unknown | TcType::Error => Type::Unit,
+            TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
+            TcType::Unknown | TcType::Error => Type::Unit,
         }
     }
 
@@ -860,6 +865,7 @@ impl<'a> LowerCtx<'a> {
         let subst = self.impl_mir_subst(&imp, receiver_ty)?;
         let original_name = self.hir.item_tree.functions[fid].name.0.clone();
         let mono_name = format!("{}__{}", original_name, suffix);
+        self.mono_methods.insert(key, mono_name.clone());
         let old_subst = std::mem::replace(&mut self.generic_subst, subst);
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
@@ -873,7 +879,56 @@ impl<'a> LowerCtx<'a> {
         self.current_body = old_current_body;
         self.generic_subst = old_subst;
         self.module.add_function(func);
-        self.mono_methods.insert(key, mono_name.clone());
+        Some(mono_name)
+    }
+
+    fn mono_function_name(
+        &mut self,
+        fid: hir::item_tree::FunctionId,
+        callee: ExprId,
+    ) -> Option<String> {
+        let function = &self.hir.item_tree.functions[fid];
+        if function.generics.is_empty() {
+            return None;
+        }
+        let body_id = self.current_body?;
+        let call = self.type_result.generic_calls.get(&(body_id, callee))?;
+        let args = call
+            .args
+            .iter()
+            .map(|arg| self.convert_type(arg))
+            .collect::<Vec<_>>();
+        let suffix = args
+            .iter()
+            .map(mono_type_name)
+            .collect::<Vec<_>>()
+            .join("_");
+        let key = (fid, suffix.clone());
+        if let Some(name) = self.mono_functions.get(&key) {
+            return Some(name.clone());
+        }
+
+        let subst = function
+            .generics
+            .iter()
+            .zip(args.iter())
+            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .collect();
+        let mono_name = format!("{}__{}", function.name.0, suffix);
+        self.mono_functions.insert(key, mono_name.clone());
+        let old_subst = std::mem::replace(&mut self.generic_subst, subst);
+        let old_expr_cache = std::mem::take(&mut self.expr_cache);
+        let old_scope_map = std::mem::take(&mut self.scope_map);
+        let old_mut_bindings = std::mem::take(&mut self.mut_bindings);
+        let old_current_body = self.current_body;
+        let body_id = *self.hir.function_bodies.get(&fid)?;
+        let func = self.lower_function(fid, mono_name.clone(), body_id);
+        self.expr_cache = old_expr_cache;
+        self.scope_map = old_scope_map;
+        self.mut_bindings = old_mut_bindings;
+        self.current_body = old_current_body;
+        self.generic_subst = old_subst;
+        self.module.add_function(func);
         Some(mono_name)
     }
 

@@ -40,7 +40,13 @@ pub enum Severity {
 pub struct TypeCheckResult {
     pub diagnostics: Vec<Diagnostic>,
     pub expr_types: HashMap<(BodyId, ExprId), Type>,
+    pub generic_calls: HashMap<(BodyId, ExprId), GenericCall>,
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericCall {
+    pub args: Vec<Type>,
 }

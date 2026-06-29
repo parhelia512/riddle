@@ -143,9 +143,6 @@ pub fn compile(source: &str) -> CompileResult {
     let analysis = move_checker::analyze(&hir, &type_result, &escape_result);
     let analysis_diagnostics = analysis.diagnostics.clone();
 
-    // 7. Lower HIR → MIR
-    let mir_module = mir::lower_hir(&hir, &type_result, &escape_result);
-
     // Only Error-severity diagnostics block compilation.
     // Notes (like E0200 heap promotion) and warnings are informational.
     let success = parse_errors.is_empty()
@@ -160,12 +157,15 @@ pub fn compile(source: &str) -> CompileResult {
             .iter()
             .any(|d| d.severity == type_checker::Severity::Error);
 
+    // 7. Lower HIR → MIR
+    let mir_module = success.then(|| mir::lower_hir(&hir, &type_result, &escape_result));
+
     CompileResult {
         type_result,
         hir_diagnostics,
         analysis_diagnostics,
         analysis,
-        mir_module: success.then_some(mir_module),
+        mir_module,
         parse_errors,
     }
 }

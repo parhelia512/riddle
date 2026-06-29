@@ -11,7 +11,12 @@ use hir::{
 };
 use rowan::ast::SyntaxNodePtr;
 
-use crate::{TypeCheckResult, checker::TypeChecker, result::Diagnostic, types::Type};
+use crate::{
+    TypeCheckResult,
+    checker::TypeChecker,
+    result::{Diagnostic, GenericCall},
+    types::Type,
+};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct IncrementalStats {
@@ -36,6 +41,7 @@ struct CachedBody {
     body_hash: u64,
     diagnostics: Vec<Diagnostic>,
     expr_types: Vec<(ExprId, Type)>,
+    generic_calls: Vec<(ExprId, GenericCall)>,
 }
 
 pub fn check_hir_incremental(
@@ -80,7 +86,7 @@ impl IncrementalTypeChecker {
 
             stats.checked_bodies += 1;
             let diagnostic_start = checker.result.diagnostics.len();
-            checker.check_function(function, body_id);
+            checker.check_function(fid, function, body_id);
             let diagnostics = checker.result.diagnostics[diagnostic_start..].to_vec();
             let expr_types = checker
                 .result
@@ -88,6 +94,14 @@ impl IncrementalTypeChecker {
                 .iter()
                 .filter_map(|((checked_body, expr), ty)| {
                     (*checked_body == body_id).then(|| (*expr, ty.clone()))
+                })
+                .collect();
+            let generic_calls = checker
+                .result
+                .generic_calls
+                .iter()
+                .filter_map(|((checked_body, expr), call)| {
+                    (*checked_body == body_id).then(|| (*expr, call.clone()))
                 })
                 .collect();
 
@@ -98,6 +112,7 @@ impl IncrementalTypeChecker {
                     body_hash,
                     diagnostics,
                     expr_types,
+                    generic_calls,
                 },
             );
         }
@@ -117,6 +132,9 @@ fn replay_cached_body(result: &mut TypeCheckResult, body_id: BodyId, cached: &Ca
         .extend(cached.diagnostics.iter().cloned());
     for (expr, ty) in &cached.expr_types {
         result.expr_types.insert((body_id, *expr), ty.clone());
+    }
+    for (expr, call) in &cached.generic_calls {
+        result.generic_calls.insert((body_id, *expr), call.clone());
     }
 }
 

@@ -51,6 +51,7 @@ pub struct HirAttr {
 #[derive(Debug, Clone)]
 pub struct HirFunction {
     pub name: Name,
+    pub generics: Vec<Name>,
     pub params: Vec<HirParam>,
     pub ret_type: Option<HirTypeRef>,
     pub has_body: bool,

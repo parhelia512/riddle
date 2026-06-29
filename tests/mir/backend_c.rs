@@ -461,3 +461,37 @@ fn c_backend_accepts_nested_generic_type_args_without_spaces() {
         result
     );
 }
+
+#[test]
+fn c_backend_monomorphizes_generic_functions() {
+    let module = lower(
+        r#"
+        fun id<T>(value: T) -> T {
+            value
+        }
+
+        fun main() -> i32 {
+            let a = id(1);
+            let b = id(true);
+            return a;
+        }
+        "#,
+    );
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+    assert!(
+        result.contains("id__i32"),
+        "missing i32 instance:\n{}",
+        result
+    );
+    assert!(
+        result.contains("id__bool"),
+        "missing bool instance:\n{}",
+        result
+    );
+    assert!(
+        !result.contains(" id ("),
+        "generic template should not be emitted directly:\n{}",
+        result
+    );
+}
