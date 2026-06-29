@@ -134,6 +134,276 @@ fn struct_move_in_function_call() {
 }
 
 #[test]
+fn method_call_after_move_is_error() {
+    let result = analyze(
+        r#"
+        struct Box<T> { value: T }
+
+        impl<T> Box<T> {
+            fun get(&self) -> &T {
+                &self.value
+            }
+        }
+
+        fun f() {
+            let x = Box { value: 1 };
+            let y = x;
+            x.get();
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value") && m.contains("x"))
+    );
+}
+
+#[test]
+fn moved_local_is_error_on_plain_use() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun f() {
+            let p = Point{x: 1};
+            let q = p;
+            let r = p;
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value") && m.contains("p"))
+    );
+}
+
+#[test]
+fn moved_local_is_error_on_method_receiver() {
+    let result = analyze(
+        r#"
+        struct Box<T> { value: T }
+
+        impl<T> Box<T> {
+            fun get(&self) -> &T {
+                &self.value
+            }
+        }
+
+        fun f() {
+            let x = Box { value: 1 };
+            let y = x;
+            x.get();
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value") && m.contains("x"))
+    );
+}
+
+#[test]
+fn moved_field_blocks_parent_use() {
+    let result = analyze(
+        r#"
+        struct Inner { value: i32 }
+        struct Outer { inner: Inner, tag: i32 }
+
+        fun f() {
+            let outer = Outer{inner: Inner{value: 1}, tag: 2};
+            let inner = outer.inner;
+            let again = outer;
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value") && m.contains("outer"))
+    );
+}
+
+#[test]
+fn moved_array_element_blocks_array_use() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun f() {
+            let p = Point{x: 1};
+            let arr = [p];
+            let again = p;
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value") && m.contains("p"))
+    );
+}
+
+#[test]
+fn copy_types_remain_usable_after_assignment() {
+    let result = analyze(
+        r#"
+        fun f() {
+            let x: i32 = 1;
+            let y = x;
+            let z = x;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn moved_parameter_is_error_on_second_plain_use() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun f(p: Point) {
+            let q = p;
+            let r = p;
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value") && m.contains("p"))
+    );
+}
+
+#[test]
+fn moved_parameter_is_error_on_method_receiver() {
+    let result = analyze(
+        r#"
+        struct Box<T> { value: T }
+
+        impl<T> Box<T> {
+            fun get(&self) -> &T {
+                &self.value
+            }
+        }
+
+        fun f(x: Box<i32>) {
+            let y = x;
+            x.get();
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value") && m.contains("x"))
+    );
+}
+
+#[test]
+fn copy_parameter_remains_usable_after_assignment() {
+    let result = analyze(
+        r#"
+        fun f(x: i32) {
+            let y = x;
+            let z = x;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn moved_whole_value_blocks_field_use() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun f() {
+            let p = Point{x: 1};
+            let q = p;
+            let x = p.x;
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved field") && m.contains("x"))
+    );
+}
+
+#[test]
+fn moved_field_blocks_method_on_parent() {
+    let result = analyze(
+        r#"
+        struct Inner { value: i32 }
+        struct Outer { inner: Inner, tag: i32 }
+
+        impl Outer {
+            fun tag(&self) -> i32 {
+                self.tag
+            }
+        }
+
+        fun f() {
+            let outer = Outer{inner: Inner{value: 1}, tag: 2};
+            let inner = outer.inner;
+            outer.tag();
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value") && m.contains("outer"))
+    );
+}
+
+#[test]
+fn moving_one_field_allows_sibling_field_use() {
+    let result = analyze(
+        r#"
+        struct Inner { value: i32 }
+        struct Outer { inner: Inner, tag: i32 }
+
+        fun f() {
+            let outer = Outer{inner: Inner{value: 1}, tag: 2};
+            let inner = outer.inner;
+            let tag = outer.tag;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn moved_array_blocks_index_use() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun f() {
+            let a = Point{x: 1};
+            let b = Point{x: 2};
+            let arr = [a, b];
+            let moved = arr;
+            let first = arr[0];
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|m| m.contains("use of moved value from array"))
+    );
+}
+
+#[test]
 fn struct_move_in_return_then_use_is_error() {
     let result = analyze(
         r#"
@@ -276,6 +546,20 @@ fn array_moves_elements() {
             .iter()
             .any(|m| m.contains("use of moved value") && m.contains("p"))
     );
+}
+
+#[test]
+fn array_repeat_copy_value_remains_usable() {
+    let result = analyze(
+        r#"
+        fun f() {
+            let x = 1;
+            let arr = [x; 3];
+            let y = x;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty());
 }
 
 // == Field access (borrow, not move) ==

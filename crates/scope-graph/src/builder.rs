@@ -820,6 +820,10 @@ impl<'a> ScopeGraphBuilder<'a> {
                     self.walk_expr_for_refs(body_id, body, *e, current_scope, nodes, edges);
                 }
             }
+            Expr::ArrayRepeat { value, len } => {
+                self.walk_expr_for_refs(body_id, body, *value, current_scope, nodes, edges);
+                self.walk_expr_for_refs(body_id, body, *len, current_scope, nodes, edges);
+            }
         }
     }
 

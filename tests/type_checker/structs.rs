@@ -173,3 +173,63 @@ fn reports_generic_type_arg_count_mismatch() {
             .any(|msg| msg.contains("expects 1 type argument(s), got 2"))
     );
 }
+
+#[test]
+fn reports_direct_recursive_struct_with_infinite_size() {
+    let result = check(
+        r#"
+        struct KSK {
+            x: KSK,
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diag| {
+        diag.code == "E0072"
+            && diag
+                .message
+                .contains("recursive type `KSK` has infinite size")
+    }));
+}
+
+#[test]
+fn reports_indirect_recursive_struct_with_infinite_size() {
+    let result = check(
+        r#"
+        struct A {
+            b: B,
+        }
+
+        struct B {
+            a: A,
+        }
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("recursive type `A` has infinite size"))
+    );
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("recursive type `B` has infinite size"))
+    );
+}
+
+#[test]
+fn accepts_recursive_struct_behind_indirection() {
+    let result = check(
+        r#"
+        struct Node {
+            next: &Node,
+        }
+
+        struct RawNode {
+            next: *const RawNode,
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}

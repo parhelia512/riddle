@@ -1,6 +1,4 @@
-mod diagnostics;
-mod pipeline;
-
+use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -8,6 +6,7 @@ use std::path::Path;
 use std::process::{self, Command};
 
 use mir::backend::{Backend, c::CBackend};
+use riddlec::{diagnostics, pipeline};
 
 const USAGE: &str = "usage: riddlec [--verbose] [--backend c] [--output <file>] <file>...";
 
@@ -16,6 +15,8 @@ enum BackendKind {
 }
 
 fn main() {
+    let x = RefCell::new(1);
+    
     let args: Vec<String> = env::args().collect();
     let opts = match parse_args(&args) {
         Ok(opts) => opts,

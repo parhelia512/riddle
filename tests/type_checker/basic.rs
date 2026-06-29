@@ -106,6 +106,44 @@ fn accepts_compound_assignment_ops() {
 }
 
 #[test]
+fn accepts_rust_style_array_forms() {
+    let result = check(
+        r#"
+        fun main() {
+            let empty: [i32; 0] = [];
+            let one: [i32; 1] = [1];
+            let many: [i32; 3] = [1, 2, 3];
+            let repeated: [i32; 3] = [7; 3];
+            let nested: [[i32; 2]; 3] = [[1, 2]; 3];
+            let trailing: [i32; 2] = [1, 2,];
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_array_repeat_for_explicit_copy_type() {
+    let result = check(
+        r#"
+        #[lang = "copy"]
+        trait Copy {}
+
+        struct Point { x: i32 }
+        impl Copy for Point {}
+
+        fun main() {
+            let point = Point { x: 1 };
+            let points: [Point; 3] = [point; 3];
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn checks_generic_function_calls() {
     let result = check(
         r#"

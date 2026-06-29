@@ -63,6 +63,29 @@ fn string_literal() {
 }
 
 #[test]
+fn array_repeat_lowers_to_array_value() {
+    let module = lower(
+        r#"
+        fun main() {
+            let xs: [i32; 4] = [5; 4];
+        }
+        "#,
+    );
+    let func = &module.functions[module.function_order[0]];
+    let entry = &func.blocks[func.entry];
+    let repeated = entry.insts.iter().find_map(|inst| match &inst.kind {
+        mir::instr::InstKind::ArrayValue(values) => Some(values),
+        _ => None,
+    });
+
+    assert!(
+        matches!(repeated, Some(values) if values.len() == 4 && values.iter().all(|v| *v == values[0])),
+        "expected repeated ArrayValue, got {:?}",
+        entry.insts.iter().map(|i| &i.kind).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn if_expression_creates_blocks() {
     let module = lower(
         r#"

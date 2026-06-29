@@ -384,6 +384,15 @@ impl<'a> LowerCtx<'a> {
                 builder.array_value(vals, mir_type)
             }
 
+            Expr::ArrayRepeat { value, .. } => {
+                let len = match tc_type {
+                    Some(type_checker::Type::Array(_, len)) => *len,
+                    _ => 0,
+                };
+                let val = self.lower_expr(builder, param_values, body, *value);
+                builder.array_value(vec![val; len], mir_type)
+            }
+
             Expr::Struct { fields, .. } => {
                 let vals: Vec<Value> = fields
                     .iter()

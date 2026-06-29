@@ -96,6 +96,66 @@ fn assignment_and_struct_literal_parse_and_lower() {
 }
 
 #[test]
+fn rust_style_array_repeat_parses_and_lowers() {
+    let source = r#"
+        fun f() {
+            let value = 1;
+            let repeated: [i32; 3] = [value; 3];
+        }
+        "#;
+
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(source);
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let syntax = parse.syntax();
+    let root = ast::Root::cast(syntax.clone()).unwrap();
+    let mut hir = lower_root(root);
+    let (sg, _) = build_scope_graph(&hir, &syntax);
+    resolve_hir(&mut hir, &sg);
+
+    let body_id = *hir.function_bodies.values().next().unwrap();
+    let body = &hir.bodies[body_id];
+
+    assert!(body.exprs.iter().any(|(_, expr)| matches!(
+        expr,
+        Expr::ArrayRepeat { value, len }
+            if matches!(
+                body.exprs[*value],
+                Expr::Path {
+                    resolved: Some(ResolvedName::Local(_)),
+                    ..
+                }
+            ) && matches!(body.exprs[*len], Expr::IntLiteral { value: 3, .. })
+    )));
+}
+
+#[test]
+fn array_type_requires_rust_style_length() {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(
+        r#"
+        fun f() {
+            let xs: [i32] = [];
+            let ys: [i32;] = [];
+        }
+        "#,
+    );
+    let messages = parse
+        .errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(messages.iter().any(|msg| msg.contains("expected Semi")));
+    assert!(
+        messages
+            .iter()
+            .any(|msg| msg.contains("expected expression"))
+    );
+}
+
+#[test]
 fn reports_unsupported_explicit_generic_exprs_without_cascading() {
     let source = r#"
         struct Wrap<T> {

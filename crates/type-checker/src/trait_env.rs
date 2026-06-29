@@ -41,7 +41,7 @@ impl TraitEnv {
     pub fn type_is_copy(&self, ty: &Type) -> bool {
         match self.copy_trait_id {
             Some(tid) => self.type_implements(ty, tid),
-            None => ty.is_fundamentally_copy(),
+            None => self.builtin_copy_fallback(ty),
         }
     }
 
@@ -70,6 +70,14 @@ impl TraitEnv {
                 .all(|elem| self.type_implements(elem, trait_id)),
             Type::Array(inner, _) => self.type_implements(inner, trait_id),
             _ => false,
+        }
+    }
+
+    fn builtin_copy_fallback(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Tuple(elements) => elements.iter().all(|elem| self.builtin_copy_fallback(elem)),
+            Type::Array(inner, _) => self.builtin_copy_fallback(inner),
+            _ => ty.is_fundamentally_copy(),
         }
     }
 }

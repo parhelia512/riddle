@@ -1,20 +1,24 @@
-trait Base {
-    fun set(&mut self, value: i32);
-    fun get(&self) -> i32;
+mod A {
+    trait Base {
+        fun set(&mut self, value: i32);
+        fun get(&self) -> i32;
+    }
+
+    impl Base for Cell {
+        fun set(&mut self, value: i32) {
+            self.value = value;
+        }
+    
+        fun get(&self) -> i32 {
+            self.value
+        }
+    }
 }
+
+use A::*;
 
 struct Cell {
     value: i32,
-}
-
-impl Base for Cell {
-    fun set(&mut self, value: i32) {
-        self.value = value;
-    }
-
-    fun get(&self) -> i32 {
-        self.value
-    }
 }
 
 fun main() -> i32 {

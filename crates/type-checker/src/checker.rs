@@ -3,7 +3,7 @@ use rowan::TextRange;
 use hir::{
     HirFile,
     body::BodyId,
-    item_tree::{FunctionId, HirFunction},
+    item_tree::{FunctionId, HirFunction, HirTypeRef, StructId},
 };
 
 use crate::{
@@ -39,6 +39,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub fn check(mut self) -> TypeCheckResult {
+        self.check_struct_layouts();
         self.check_traits();
         self.check_impls();
         self.build_trait_env();
@@ -123,6 +124,86 @@ impl<'a> TypeChecker<'a> {
             &body.exprs[expr],
             hir::body::Expr::Block { tail: Some(_), .. }
         )
+    }
+
+    fn check_struct_layouts(&mut self) {
+        let structs = self
+            .hir
+            .item_tree
+            .structs
+            .iter()
+            .map(|(id, strukt)| {
+                (
+                    id,
+                    strukt.name.0.clone(),
+                    strukt.name_range,
+                    strukt.fields.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (id, name, name_range, fields) in structs {
+            if let Some(field_range) = fields.iter().find_map(|field| {
+                self.type_ref_contains_inline_struct(&field.ty, id, &mut Vec::new())
+                    .then_some(field.ty_range)
+            }) {
+                self.diagnostic(
+                    "E0072",
+                    format!("recursive type `{name}` has infinite size"),
+                    Some(name_range),
+                );
+                self.result.diagnostics.last_mut().unwrap().labels.push(
+                    crate::result::SourceLabel {
+                        range: field_range,
+                        message: "recursive field".into(),
+                        style: crate::result::LabelStyle::Secondary,
+                    },
+                );
+            }
+        }
+    }
+
+    fn type_ref_contains_inline_struct(
+        &self,
+        ty: &HirTypeRef,
+        target: StructId,
+        seen: &mut Vec<StructId>,
+    ) -> bool {
+        match ty {
+            HirTypeRef::Named(path) => {
+                let Some(name) = path.as_single_name().map(|name| name.0.as_str()) else {
+                    return false;
+                };
+                let Some((sid, strukt)) = self
+                    .hir
+                    .item_tree
+                    .structs
+                    .iter()
+                    .find(|(_, strukt)| strukt.name.0 == name)
+                else {
+                    return false;
+                };
+                if sid == target {
+                    return true;
+                }
+                if seen.contains(&sid) {
+                    return false;
+                }
+                seen.push(sid);
+                let found = strukt
+                    .fields
+                    .iter()
+                    .any(|field| self.type_ref_contains_inline_struct(&field.ty, target, seen));
+                seen.pop();
+                found
+            }
+            HirTypeRef::Tuple(elements) => elements
+                .iter()
+                .any(|ty| self.type_ref_contains_inline_struct(ty, target, seen)),
+            HirTypeRef::Array(inner, _) => self.type_ref_contains_inline_struct(inner, target, seen),
+            HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
+            HirTypeRef::Unknown | HirTypeRef::Error => false,
+        }
     }
 
     fn check_generic_recursion(&mut self) {
@@ -274,6 +355,7 @@ impl<'a> TypeChecker<'a> {
             "E0020" | "E0024" => Some("duplicate definition — remove the duplicate".into()),
             "E0031" => Some("cannot assign twice to an immutable variable — add `mut` to the `let` binding".into()),
             "E0033" => Some("recursive generic calls must reuse the same type arguments; wrapping them requires infinitely many instantiations".into()),
+            "E0072" => Some("insert some indirection, such as `&`, `*const`, or `*mut`, to break the cycle".into()),
             "E0021" => Some("trait method declarations should not have a body".into()),
             "E0022" | "E0025" => Some("duplicate associated type — remove the duplicate".into()),
             "E0023" => Some("this trait is not defined or not in scope".into()),

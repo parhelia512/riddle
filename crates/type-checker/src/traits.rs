@@ -270,7 +270,9 @@ impl TypeChecker<'_> {
                     .join(", ");
                 format!("({inner})")
             }
-            HirTypeRef::Array(inner, _) => format!("[{}]", self.type_ref_source_text(inner)),
+            HirTypeRef::Array(inner, len) => {
+                format!("[{}; {}]", self.type_ref_source_text(inner), len)
+            }
             HirTypeRef::Ptr { mutable, inner } => {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", self.type_ref_source_text(inner))

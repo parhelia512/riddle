@@ -18,6 +18,7 @@ Cargo.lock
 .vscode/
 .idea/
 .zed/
+.helix/
 *.iml
 
 # Logs

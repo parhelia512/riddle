@@ -178,6 +178,13 @@ impl<'a> EscapeAnalyzer<'a> {
                 elements.iter().any(|e| ctx.escaping_exprs.contains(e))
             }
 
+            Expr::ArrayRepeat { value, len } => {
+                self.mark_escaping_exprs(ctx, *value);
+                self.mark_escaping_exprs(ctx, *len);
+                self.record_ref_chain(ctx, expr_id, *value);
+                ctx.escaping_exprs.contains(value)
+            }
+
             Expr::Path { resolved, .. } => match resolved {
                 Some(ResolvedName::Local(stmt)) => ctx.escaping_locals.contains(stmt),
                 Some(ResolvedName::Param(idx)) => ctx.escaping_params.contains(idx),

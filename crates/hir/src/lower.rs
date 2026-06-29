@@ -97,11 +97,16 @@ impl AstLower for StructDecl {
     type Item = HirStruct;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
         let name = lower_name(self.name());
+        let name_range = self
+            .name()
+            .map(|name| name.text_range())
+            .unwrap_or_else(|| self.syntax().text_range());
         let generics = lower_generic_params(self.generic_params());
         let fields = self.field_list().lower();
         let attrs = lower_attrs(self.syntax());
         arena.alloc(HirStruct {
             name,
+            name_range,
             generics,
             fields,
             attrs,
@@ -228,8 +233,17 @@ impl Lower for StructField {
     fn lower(self) -> Self::Output {
         let name = lower_name(self.name());
         let ty = self.ty().lower();
+        let ty_range = self
+            .ty()
+            .map(|ty| ty.syntax().text_range())
+            .unwrap_or_else(|| self.syntax().text_range());
         let attrs = lower_attrs(self.syntax());
-        HirStructField { name, ty, attrs }
+        HirStructField {
+            name,
+            ty,
+            ty_range,
+            attrs,
+        }
     }
 }
 
@@ -254,19 +268,21 @@ impl Lower for Type {
                 None => HirTypeRef::Error,
             },
             Type::Tuple(tuple) => HirTypeRef::Tuple(tuple.elements().map(|t| t.lower()).collect()),
-            Type::Array(arr) => match arr.element() {
-                Some(inner) => {
-                    let len = arr
-                        .len_expr()
-                        .and_then(|e| match e {
-                            ast::Expr::Number(n) => n.value().map(|v| v as usize),
-                            _ => None,
-                        })
-                        .unwrap_or(0);
-                    HirTypeRef::Array(Box::new(inner.lower()), len)
-                }
-                None => HirTypeRef::Error,
-            },
+            Type::Array(arr) => {
+                let Some(inner) = arr.element() else {
+                    return HirTypeRef::Error;
+                };
+                let Some(len_expr) = arr.len_expr() else {
+                    return HirTypeRef::Error;
+                };
+                let Some(len) = (match len_expr {
+                    ast::Expr::Number(n) => n.value().map(|v| v as usize),
+                    _ => None,
+                }) else {
+                    return HirTypeRef::Error;
+                };
+                HirTypeRef::Array(Box::new(inner.lower()), len)
+            }
         }
     }
 }

@@ -628,6 +628,18 @@ impl ArrayExpr {
     pub fn elements(&self) -> impl Iterator<Item = Expr> + '_ {
         support::children(&self.syntax)
     }
+
+    pub fn is_repeat(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Semi).is_some()
+    }
+
+    pub fn repeat_value(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 0)
+    }
+
+    pub fn repeat_len(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 1)
+    }
 }
 
 impl NumberExpr {

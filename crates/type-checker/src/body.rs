@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use hir::{
     Name,
     body::{BinaryOp, Expr, ExprId, MatchArm, PatId, Pattern, ResolvedName, Stmt, StmtId, UnaryOp},
-    item_tree::FunctionId,
+    item_tree::{FunctionId, HirTypeRef},
 };
 
 use crate::{
@@ -20,8 +20,16 @@ impl TypeChecker<'_> {
                 ty, init, is_mut, ..
             } => {
                 let declared = self.lower_type_ref_with_params(ty, &ctx.generic_params);
+                let explicit_error = type_ref_contains_error(ty);
+                if explicit_error {
+                    self.diagnostic(
+                        "E0034",
+                        "invalid type annotation",
+                        ctx.stmt_range(stmt_id),
+                    );
+                }
                 let init_ty = init.map(|expr| {
-                    if declared.is_unknown_like() {
+                    if explicit_error || declared.is_unknown_like() {
                         self.check_expr(ctx, expr)
                     } else {
                         self.check_expr_expected(ctx, expr, &declared)
@@ -29,7 +37,7 @@ impl TypeChecker<'_> {
                 });
 
                 if let Some(init_ty) = init_ty {
-                    if !declared.is_unknown_like() {
+                    if !explicit_error && !declared.is_unknown_like() {
                         self.expect_assignable(
                             &declared,
                             &init_ty,
@@ -37,7 +45,12 @@ impl TypeChecker<'_> {
                             ctx.stmt_range(stmt_id),
                         );
                     }
-                    ctx.locals.insert(stmt_id, (declared.or(init_ty), *is_mut));
+                    let local_ty = if explicit_error {
+                        declared
+                    } else {
+                        declared.or(init_ty)
+                    };
+                    ctx.locals.insert(stmt_id, (local_ty, *is_mut));
                 } else {
                     ctx.locals.insert(stmt_id, (declared, *is_mut));
                 }
@@ -157,6 +170,9 @@ impl TypeChecker<'_> {
                 self.check_match(ctx, *scrutinee, arms, expected, span)
             }
             Expr::Array { elements } => self.check_array(ctx, elements, expected, span),
+            Expr::ArrayRepeat { value, len } => {
+                self.check_array_repeat(ctx, *value, *len, expected, span)
+            }
             Expr::Call { callee, args } => self.check_call(ctx, *callee, args, span),
             Expr::FieldAccess { base, field } => self.check_field_access(ctx, *base, field, span),
             Expr::Unsafe { body } => {
@@ -573,11 +589,11 @@ impl TypeChecker<'_> {
         ctx: &mut BodyCtx<'_>,
         elements: &[ExprId],
         expected: Option<&Type>,
-        _span: Option<rowan::TextRange>,
+        span: Option<rowan::TextRange>,
     ) -> Type {
-        let expected_element = match expected {
-            Some(Type::Array(inner, _)) => Some(inner.as_ref()),
-            _ => None,
+        let (expected_element, expected_len) = match expected {
+            Some(Type::Array(inner, len)) => (Some(inner.as_ref()), Some(*len)),
+            _ => (None, None),
         };
         let mut element_ty = None;
         for element in elements {
@@ -594,11 +610,98 @@ impl TypeChecker<'_> {
                 }
             });
         }
+        if let Some(expected_len) = expected_len {
+            if expected_len != elements.len() {
+                self.diagnostic(
+                    "E0001",
+                    format!(
+                        "array length mismatch: expected {}, got {}",
+                        expected_len,
+                        elements.len()
+                    ),
+                    span,
+                );
+            }
+        }
 
         Type::Array(
-            Box::new(element_ty.unwrap_or(Type::Unknown)),
+            Box::new(
+                element_ty
+                    .or_else(|| expected_element.cloned())
+                    .unwrap_or(Type::Unknown),
+            ),
             elements.len(),
         )
+    }
+
+    fn check_array_repeat(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        value: ExprId,
+        len: ExprId,
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let (expected_element, expected_len) = match expected {
+            Some(Type::Array(inner, len)) => (Some(inner.as_ref()), Some(*len)),
+            _ => (None, None),
+        };
+        let value_ty = match expected_element {
+            Some(expected) => self.check_expr_expected(ctx, value, expected),
+            None => self.check_expr(ctx, value),
+        };
+        if !self.repeat_value_is_copy(&value_ty) {
+            self.diagnostic(
+                "E0031",
+                format!(
+                    "array repeat value must be Copy, got {}",
+                    value_ty.display(self.hir)
+                ),
+                ctx.expr_range(value),
+            );
+        }
+        let len_ty = self.check_expr(ctx, len);
+        if !matches!(len_ty, Type::Int(_)) {
+            self.expect_assignable(
+                &Type::Int(IntTy::I32),
+                &len_ty,
+                "array length",
+                ctx.expr_range(len),
+            );
+        }
+        let len_value = match &ctx.body.exprs[len] {
+            Expr::IntLiteral { value, .. } if *value >= 0 => *value as usize,
+            _ => {
+                self.diagnostic(
+                    "E0002",
+                    "array repeat length must be a non-negative integer literal",
+                    ctx.expr_range(len),
+                );
+                0
+            }
+        };
+        if let Some(expected_len) = expected_len {
+            if expected_len != len_value {
+                self.diagnostic(
+                    "E0001",
+                    format!(
+                        "array length mismatch: expected {}, got {}",
+                        expected_len, len_value
+                    ),
+                    span,
+                );
+            }
+        }
+
+        Type::Array(Box::new(value_ty), len_value)
+    }
+
+    fn repeat_value_is_copy(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Array(inner, _) => self.repeat_value_is_copy(inner),
+            Type::Tuple(elements) => elements.iter().all(|elem| self.repeat_value_is_copy(elem)),
+            _ => self.result.trait_env.type_is_copy(ty),
+        }
     }
 
     fn check_call(
@@ -1009,6 +1112,17 @@ fn expected_has_param(ty: &Type) -> bool {
         Type::Array(inner, _) => expected_has_param(inner),
         Type::Struct(_, args) | Type::Enum(_, args) => args.iter().any(expected_has_param),
         _ => false,
+    }
+}
+
+fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
+    match ty {
+        HirTypeRef::Error => true,
+        HirTypeRef::Ref(inner, _) | HirTypeRef::Array(inner, _) => type_ref_contains_error(inner),
+        HirTypeRef::Ptr { inner, .. } => type_ref_contains_error(inner),
+        HirTypeRef::Tuple(elements) => elements.iter().any(type_ref_contains_error),
+        HirTypeRef::Named(path) => path.type_args.iter().any(type_ref_contains_error),
+        HirTypeRef::Unknown => false,
     }
 }
 

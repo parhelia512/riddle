@@ -1290,12 +1290,17 @@ impl<'s> Parser<'s> {
 
                 if !self.at(SyntaxKind::RBracket) && !self.at(SyntaxKind::Eof) {
                     self.expression();
-                    while self.at(SyntaxKind::Comma) {
+                    if self.at(SyntaxKind::Semi) {
                         self.bump();
-                        if self.at(SyntaxKind::RBracket) {
-                            break;
-                        }
                         self.expression();
+                    } else {
+                        while self.at(SyntaxKind::Comma) {
+                            self.bump();
+                            if self.at(SyntaxKind::RBracket) {
+                                break;
+                            }
+                            self.expression();
+                        }
                     }
                 }
 
@@ -1407,11 +1412,8 @@ impl<'s> Parser<'s> {
                 self.bump();
                 self.ty();
 
-                if self.at(SyntaxKind::Semi) {
-                    self.bump();
-                    if !self.at(SyntaxKind::RBracket) && !self.at(SyntaxKind::Eof) {
-                        self.expression();
-                    }
+                if self.expect(SyntaxKind::Semi) {
+                    self.expression();
                 }
 
                 self.expect(SyntaxKind::RBracket);

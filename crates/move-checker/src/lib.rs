@@ -6,6 +6,7 @@ use escape_analysis::EscapeResult;
 use hir::{
     HirFile,
     body::{Body, BodyId, Expr, ExprId, ResolvedName, SourceMap, Stmt, StmtId, UnaryOp},
+    item_tree::FunctionId,
     place::Place,
 };
 use type_checker::{
@@ -47,12 +48,12 @@ impl<'a> Analyzer<'a> {
     fn analyze_all_bodies(&mut self) {
         for (fid, _) in self.hir.item_tree.functions.iter() {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
-                self.analyze_body(body_id);
+                self.analyze_body(fid, body_id);
             }
         }
     }
 
-    fn analyze_body(&mut self, body_id: BodyId) {
+    fn analyze_body(&mut self, function_id: FunctionId, body_id: BodyId) {
         let body = &self.hir.bodies[body_id];
         // Build per-body escaping set from global escape result
         let escaping_locals: HashSet<StmtId> = self
@@ -63,6 +64,12 @@ impl<'a> Analyzer<'a> {
             .map(|(_, stmt)| *stmt)
             .collect();
         let mut ctx = BodyCtx::new(body_id, body, escaping_locals);
+        ctx.seed_params(
+            self.hir.item_tree.functions[function_id]
+                .params
+                .iter()
+                .map(|param| param.name.0.as_str()),
+        );
         self.move_check_body(&mut ctx);
     }
 
@@ -117,7 +124,7 @@ impl<'a> Analyzer<'a> {
                 }
                 if let Some(ResolvedName::Local(stmt)) = resolved {
                     let place = Place::root(*stmt);
-                    if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
+                    if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
                         let label = path.as_single_name().map(|n| n.0.as_str()).unwrap_or("_");
                         let extra = self.move_site_labels(ctx, &place);
                         self.diag_with_labels(
@@ -260,7 +267,27 @@ impl<'a> Analyzer<'a> {
                 }
             }
 
+            Expr::ArrayRepeat { value, len } => {
+                self.move_check_expr(ctx, *value);
+                self.consume_if_local(ctx, *value);
+                self.move_check_expr(ctx, *len);
+            }
+
             Expr::Call { callee, args } => {
+                if let Expr::FieldAccess { base, .. } = &ctx.body.exprs[*callee] {
+                    if let Some(place) = self.place_from_expr(ctx, *base) {
+                        if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
+                            let extra = self.move_site_labels(ctx, &place);
+                            let label = self.expr_name(ctx, *base);
+                            self.diag_with_labels(
+                                format!("use of moved value: `{}`", label),
+                                span,
+                                "E0100",
+                                &extra,
+                            );
+                        }
+                    }
+                }
                 self.move_check_expr(ctx, *callee);
                 for arg in args {
                     self.move_check_expr(ctx, *arg);
@@ -281,13 +308,13 @@ impl<'a> Analyzer<'a> {
                 // skip inner error and emit only this outer one.
                 let base_moved = self
                     .place_from_expr(ctx, *base)
-                    .map(|p| ctx.moved_places.iter().any(|m| m.is_prefix_of(&p)))
+                    .map(|p| ctx.moved_places.iter().any(|m| place_overlaps(m, &p)))
                     .unwrap_or(false);
                 if !base_moved {
                     self.move_check_expr(ctx, *base);
                 }
                 if let Some(place) = self.place_from_expr(ctx, expr_id) {
-                    if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
+                    if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
                         let extra = self.move_site_labels(ctx, &place);
                         self.diag_with_labels(
                             format!("use of moved field: `{}`", field.0),
@@ -303,7 +330,7 @@ impl<'a> Analyzer<'a> {
                 self.move_check_expr(ctx, *base);
                 self.move_check_expr(ctx, *index);
                 if let Some(place) = self.place_from_expr(ctx, expr_id) {
-                    if ctx.moved_places.iter().any(|m| m.is_prefix_of(&place)) {
+                    if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
                         let extra = self.move_site_labels(ctx, &place);
                         self.diag_with_labels(
                             "use of moved value from array".into(),
@@ -500,7 +527,7 @@ impl<'a> Analyzer<'a> {
         // Find the most specific moved site — scan for a prefix match.
         let mut best: Option<(&Place, &(Option<TextRange>, String))> = None;
         for (moved_place, site) in &ctx.moved_sites {
-            if moved_place.is_prefix_of(place) {
+            if place_overlaps(moved_place, place) {
                 match best {
                     None => best = Some((moved_place, site)),
                     Some((existing, _))
@@ -616,6 +643,12 @@ impl<'a> BodyCtx<'a> {
         }
     }
 
+    fn seed_params<'b>(&mut self, params: impl IntoIterator<Item = &'b str>) {
+        for name in params {
+            self.bindings.insert_available(name.to_string());
+        }
+    }
+
     fn push_scope(&mut self) {
         self.bindings.push_scope();
         self.scope_depth += 1;
@@ -672,4 +705,8 @@ impl MoveBindings {
             }
         }
     }
+}
+
+fn place_overlaps(a: &Place, b: &Place) -> bool {
+    a.is_prefix_of(b) || b.is_prefix_of(a)
 }

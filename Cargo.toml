@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "app/riddle-lsp",
     "app/riddlec",
     "crates/ast",
     "crates/escape-analysis",
@@ -13,6 +14,7 @@ members = [
 ]
 default-members = [
     ".",
+    "app/riddle-lsp",
     "app/riddlec",
     "crates/ast",
     "crates/escape-analysis",
@@ -40,6 +42,7 @@ rowan = "0.15"
 scope-graph = { path = "crates/scope-graph" }
 type-checker = { path = "crates/type-checker" }
 mir = { path = "crates/mir" }
+riddlec = { path = "app/riddlec" }
 
 [package]
 name = "riddle"

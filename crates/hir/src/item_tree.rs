@@ -1,4 +1,5 @@
 use la_arena::{Arena, Idx};
+use rowan::TextRange;
 
 use super::Name;
 
@@ -68,6 +69,7 @@ pub struct HirParam {
 #[derive(Debug, Clone)]
 pub struct HirStruct {
     pub name: Name,
+    pub name_range: TextRange,
     pub generics: Vec<Name>,
     pub fields: Vec<HirStructField>,
     pub attrs: Vec<HirAttr>,
@@ -77,6 +79,7 @@ pub struct HirStruct {
 pub struct HirStructField {
     pub name: Name,
     pub ty: HirTypeRef,
+    pub ty_range: TextRange,
     pub attrs: Vec<HirAttr>,
 }
 

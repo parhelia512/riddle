@@ -456,8 +456,14 @@ impl<'a> BodyLower<'a> {
             }
 
             ast::Expr::ArrayExpr(a) => {
-                let elements = a.elements().map(|e| self.lower_expr(e)).collect();
-                self.alloc_expr(Expr::Array { elements }, range)
+                if a.is_repeat() {
+                    let value = self.lower_required_expr(a.repeat_value(), "missing array value");
+                    let len = self.lower_required_expr(a.repeat_len(), "missing array length");
+                    self.alloc_expr(Expr::ArrayRepeat { value, len }, range)
+                } else {
+                    let elements = a.elements().map(|e| self.lower_expr(e)).collect();
+                    self.alloc_expr(Expr::Array { elements }, range)
+                }
             }
 
             ast::Expr::StructExpr(s) => {

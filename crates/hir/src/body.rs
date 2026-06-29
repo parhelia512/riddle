@@ -149,6 +149,10 @@ pub enum Expr {
     Array {
         elements: Vec<ExprId>,
     },
+    ArrayRepeat {
+        value: ExprId,
+        len: ExprId,
+    },
     Struct {
         path: HirPath,
         fields: Vec<StructExprField>,
@@ -527,6 +531,13 @@ impl BodyPrinter<'_> {
                     .join(", ");
                 format!("[{}]", items)
             }
+            Expr::ArrayRepeat { value, len } => {
+                format!(
+                    "[{}; {}]",
+                    self.print_expr(*value, 0, indent),
+                    self.print_expr(*len, 0, indent)
+                )
+            }
             Expr::Unsafe { body } => {
                 format!("unsafe {}", self.print_block_like(*body, indent))
             }
@@ -590,7 +601,8 @@ impl BodyPrinter<'_> {
             | Expr::BoolLiteral { .. }
             | Expr::Path { .. }
             | Expr::Struct { .. }
-            | Expr::Array { .. } => 100,
+            | Expr::Array { .. }
+            | Expr::ArrayRepeat { .. } => 100,
             Expr::Call { .. } | Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => 90,
             Expr::Cast { .. } => 85,
             Expr::Unary { .. } => 80,

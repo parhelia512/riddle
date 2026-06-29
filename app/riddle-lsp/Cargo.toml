@@ -1,0 +1,12 @@
+[package]
+name = "riddle-lsp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lsp-types = "0.94.1"
+riddlec.workspace = true
+rowan.workspace = true
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+tower-lsp = "0.20.0"
+type-checker.workspace = true

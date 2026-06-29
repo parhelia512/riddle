@@ -3,7 +3,7 @@
 extern "C" {
     // Import: C function declarations
     fun abs(x: i32) -> i32;
-    fun my_alloc(size: usize) -> *const i32;
+    fun malloc(size: usize) -> *const i32;
 }
 
 // Export: a function others can call from C
@@ -17,6 +17,6 @@ fun main() {
 
     // unsafe block (raw pointer operations go here)
     unsafe {
-        let p = my_alloc(16);
+        let p = malloc(16);
     }
 }
