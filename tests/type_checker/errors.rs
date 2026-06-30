@@ -204,6 +204,26 @@ fn nested_array_type_length_must_be_literal() {
 }
 
 #[test]
+fn unknown_type_annotation_is_reported() {
+    let source = r#"
+        fun main() {
+            let value: KSK;
+        }
+        "#;
+    let result = check(source);
+
+    let diag = result
+        .diagnostics
+        .iter()
+        .find(|diag| diag.message == "unknown type `KSK`")
+        .expect("missing unknown type diagnostic");
+    let label = diag.labels.first().expect("unknown type diagnostic label");
+    let start = u32::from(label.range.start()) as usize;
+    let end = u32::from(label.range.end()) as usize;
+    assert_eq!(&source[start..end], "KSK");
+}
+
+#[test]
 fn array_repeat_requires_copy_value() {
     let result = check(
         r#"

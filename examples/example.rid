@@ -3,10 +3,6 @@ enum Foo{
     B
 }
 
-struct KSK{
-    x: KSK
-}
-
 impl Foo{
     fun get(&self) -> &str {
         if *self == Foo::A {
@@ -31,7 +27,6 @@ fun x(){
     let mut x = Box {value: 1};
     let y = &mut x;
     x.get();
-    let t : KSK;
 }
 
 fun main(){

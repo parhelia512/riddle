@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use la_arena::Arena;
 
-use ast::{self, ElseBranch, support::AstNode};
+use ast::{
+    self, ElseBranch,
+    support::{AstNode, trimmed_range},
+};
 use frontend::syntax_kind::{SyntaxKind, SyntaxToken};
 use rowan::{TextRange, ast::SyntaxNodePtr};
 
@@ -148,13 +151,16 @@ impl<'a> BodyLower<'a> {
         match stmt {
             ast::Stmt::VarDecl(var) => {
                 let name = lower_name(var.name());
-                let ty = self.lower_optional_type(var.ty());
+                let ty_ast = var.ty();
+                let ty_range = ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
+                let ty = self.lower_optional_type(ty_ast);
                 let init = self.lower_optional_expr(var.init());
                 let is_mut = var.is_mut();
                 Some(self.alloc_stmt(
                     Stmt::Let {
                         name,
                         ty,
+                        ty_range,
                         init,
                         is_mut,
                     },

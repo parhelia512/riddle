@@ -1,11 +1,9 @@
-use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{self, Command};
 
-use mir::backend::{Backend, c::CBackend};
 use riddlec::{diagnostics, pipeline};
 
 const USAGE: &str = "usage: riddlec [--verbose] [--backend c] [--output <file>] <file>...";
@@ -15,8 +13,6 @@ enum BackendKind {
 }
 
 fn main() {
-    let x = RefCell::new(1);
-    
     let args: Vec<String> = env::args().collect();
     let opts = match parse_args(&args) {
         Ok(opts) => opts,
@@ -37,14 +33,15 @@ fn main() {
     let mut generated_code = String::new();
 
     for file in &opts.files {
-        let source = match fs::read_to_string(file) {
-            Ok(s) => s,
+        let loaded = match pipeline::load_source_file(file) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 eprintln!("riddlec: cannot read `{file}`: {e}");
                 total_errors += 1;
                 continue;
             }
         };
+        let source = loaded.source;
 
         let result = pipeline::compile(&source);
 
@@ -102,9 +99,7 @@ fn generate(
 ) -> Result<String, Box<dyn std::fmt::Debug>> {
     match backend {
         BackendKind::C => {
-            let mut b = CBackend::new();
-            b.compile(module)
-                .map_err(|e| Box::new(e) as Box<dyn std::fmt::Debug>)
+            pipeline::generate_c(module).map_err(|e| Box::new(e) as Box<dyn std::fmt::Debug>)
         }
     }
 }

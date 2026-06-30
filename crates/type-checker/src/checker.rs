@@ -76,7 +76,8 @@ impl<'a> TypeChecker<'a> {
     pub(crate) fn check_function_bodies(&mut self) {
         for (fid, function) in self.hir.item_tree.functions.iter() {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
-                self.check_function(fid, function, body_id);
+                let outer_generics = self.impl_generic_names(fid);
+                self.check_function(fid, function, body_id, outer_generics);
             }
         }
     }
@@ -86,10 +87,14 @@ impl<'a> TypeChecker<'a> {
         function_id: FunctionId,
         function: &HirFunction,
         body_id: BodyId,
+        outer_generics: Vec<String>,
     ) {
         let body = &self.hir.bodies[body_id];
         let params = crate::lowering::generic_param_map(
-            function.generics.iter().map(|name| name.0.as_str()),
+            outer_generics
+                .iter()
+                .map(String::as_str)
+                .chain(function.generics.iter().map(|name| name.0.as_str())),
         );
         let return_ty = function
             .ret_type
@@ -117,6 +122,19 @@ impl<'a> TypeChecker<'a> {
                 ctx.expr_range(body.root_block),
             );
         }
+    }
+
+    pub(crate) fn impl_generic_names(&self, function_id: FunctionId) -> Vec<String> {
+        self.hir
+            .item_tree
+            .impls
+            .iter()
+            .find_map(|(_, imp)| {
+                imp.methods
+                    .contains(&function_id)
+                    .then(|| imp.generics.iter().map(|name| name.0.clone()).collect())
+            })
+            .unwrap_or_default()
     }
 
     fn has_tail(&self, body: &hir::body::Body, expr: hir::body::ExprId) -> bool {
@@ -200,7 +218,9 @@ impl<'a> TypeChecker<'a> {
             HirTypeRef::Tuple(elements) => elements
                 .iter()
                 .any(|ty| self.type_ref_contains_inline_struct(ty, target, seen)),
-            HirTypeRef::Array(inner, _) => self.type_ref_contains_inline_struct(inner, target, seen),
+            HirTypeRef::Array(inner, _) => {
+                self.type_ref_contains_inline_struct(inner, target, seen)
+            }
             HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
             HirTypeRef::Unknown | HirTypeRef::Error => false,
         }
