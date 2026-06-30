@@ -58,7 +58,7 @@ type FnSummary = HashSet<usize>;
 struct EscapeAnalyzer<'a> {
     hir: &'a HirFile,
     result: EscapeResult,
-    /// Summaries from the previous fixpoint iteration.
+    /// Summaries from the previous Fixpoint iteration.
     /// Initially empty (= conservative: assume all params escape).
     fn_param_escapes: HashMap<FunctionId, FnSummary>,
     /// Cache the EscapeCtx after analysis so we can read escaping_params.
@@ -67,7 +67,7 @@ struct EscapeAnalyzer<'a> {
 
 impl<'a> EscapeAnalyzer<'a> {
     /// Run one pass over all bodies. Returns true if any function's param
-    /// summary changed (meaning another fixpoint iteration is needed).
+    /// summary changed (meaning another Fixpoint iteration is needed).
     fn analyze_all_bodies(&mut self) -> bool {
         let mut changed = false;
         let mut new_summaries: HashMap<FunctionId, FnSummary> = HashMap::new();

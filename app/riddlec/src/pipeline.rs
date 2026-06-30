@@ -1,7 +1,15 @@
+use std::{
+    collections::HashSet,
+    fs, io,
+    path::{Path, PathBuf},
+};
+
 use ast::{self, support::AstNode};
 use frontend::ParseError;
 use frontend::incremental::IncrementalParser;
+use frontend::syntax_kind::SyntaxNode;
 use hir::lower_root;
+use mir::backend::{Backend, c::CBackend};
 use mir::{self, Module};
 use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
 use type_checker::{self, TypeCheckResult, check_hir};
@@ -15,6 +23,12 @@ pub struct CompileResult {
     pub analysis: move_checker::AnalysisResult,
     pub mir_module: Option<Module>,
     pub parse_errors: Vec<ParseError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedSource {
+    pub source: String,
+    pub files: Vec<PathBuf>,
 }
 
 /// An adapter that lets the diagnostics printer handle diagnostics from
@@ -64,10 +78,120 @@ impl IntoDiagnosticExt for ParseError {
     }
 }
 
+pub fn load_source_file(path: impl AsRef<Path>) -> io::Result<LoadedSource> {
+    let mut files = Vec::new();
+    let mut stack = HashSet::new();
+    let source = load_source_file_inner(path.as_ref(), &mut stack, &mut files)?;
+    Ok(LoadedSource { source, files })
+}
+
+fn load_source_file_inner(
+    path: &Path,
+    stack: &mut HashSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<String> {
+    let path = fs::canonicalize(path)?;
+    if !stack.insert(path.clone()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cyclic module import involving `{}`", path.display()),
+        ));
+    }
+
+    let source = fs::read_to_string(&path)?;
+    files.push(path.clone());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let expanded = expand_external_mods(&source, dir, stack, files)?;
+    stack.remove(&path);
+    Ok(expanded)
+}
+
+fn expand_external_mods(
+    source: &str,
+    dir: &Path,
+    stack: &mut HashSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<String> {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(source);
+    if !parse.errors.is_empty() {
+        return Ok(source.to_string());
+    }
+
+    let mut mods = Vec::new();
+    collect_external_mods(&parse.syntax(), &mut mods);
+    if mods.is_empty() {
+        return Ok(source.to_string());
+    }
+
+    let mut replacements = Vec::new();
+    for module in mods {
+        let Some(name) = module.name().map(|token| token.text().to_string()) else {
+            continue;
+        };
+        let child = find_module_file(dir, &name)?;
+        let child_source = load_source_file_inner(&child, stack, files)?;
+        let range = module.syntax().text_range();
+        replacements.push((
+            usize::from(range.start()),
+            usize::from(range.end()),
+            format!("mod {name} {{\n{child_source}\n}}"),
+        ));
+    }
+
+    replacements.sort_by_key(|(start, _, _)| *start);
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0;
+    for (start, end, replacement) in replacements {
+        out.push_str(&source[cursor..start]);
+        out.push_str(&replacement);
+        cursor = end;
+    }
+    out.push_str(&source[cursor..]);
+    Ok(out)
+}
+
+fn collect_external_mods(node: &SyntaxNode, out: &mut Vec<ast::ModDecl>) {
+    for child in node.children() {
+        if let Some(module) = ast::ModDecl::cast(child.clone()) {
+            if module.items().is_none() {
+                out.push(module);
+                continue;
+            }
+        }
+        collect_external_mods(&child, out);
+    }
+}
+
+fn find_module_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let flat = dir.join(format!("{name}.rid"));
+    if flat.is_file() {
+        return Ok(flat);
+    }
+
+    let nested = dir.join(name).join("mod.rid");
+    if nested.is_file() {
+        return Ok(nested);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "module `{name}` not found; expected `{}` or `{}`",
+            flat.display(),
+            nested.display()
+        ),
+    ))
+}
+
+pub fn generate_c(module: &Module) -> Result<String, String> {
+    let mut backend = CBackend::new();
+    backend.compile(module)
+}
+
 /// Run the full frontend pipeline on `source`.
 pub fn compile(source: &str) -> CompileResult {
-    let owned_source;
-    owned_source = format!("{source}\n\n{STD_PRELUDE}");
+    let owned_source = format!("{source}\n\n{STD_PRELUDE}");
     let source = owned_source.as_str();
 
     // 1. Parse
@@ -186,5 +310,37 @@ impl CompileResult {
                 .analysis_diagnostics
                 .iter()
                 .any(|d| d.severity == type_checker::Severity::Error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn load_source_file_expands_external_mods() {
+        let root = std::env::temp_dir().join(format!(
+            "riddle-load-source-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("main.rid"),
+            "mod util;\nfun main() -> i32 { util::one() }\n",
+        )
+        .unwrap();
+        fs::write(root.join("util.rid"), "fun one() -> i32 { 1 }\n").unwrap();
+
+        let loaded = load_source_file(root.join("main.rid")).unwrap();
+        assert!(loaded.source.contains("mod util {"));
+        assert!(loaded.source.contains("fun one() -> i32 { 1 }"));
+        assert_eq!(loaded.files.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

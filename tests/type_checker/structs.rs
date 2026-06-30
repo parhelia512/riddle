@@ -88,6 +88,30 @@ fn checks_generic_impl_receiver_substitution() {
 }
 
 #[test]
+fn checks_generic_impl_ref_return_substitution() {
+    let result = check(
+        r#"
+        struct Box<T> {
+            value: T,
+        }
+
+        impl<T> Box<T> {
+            fun get(&self) -> &T {
+                &self.value
+            }
+        }
+
+        fun main() {
+            let b: Box<i32> = Box { value: 1 };
+            let value = b.get();
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn checks_nested_generic_type_args_without_spaces() {
     let result = check(
         r#"

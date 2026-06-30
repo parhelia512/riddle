@@ -86,7 +86,7 @@ impl IncrementalTypeChecker {
 
             stats.checked_bodies += 1;
             let diagnostic_start = checker.result.diagnostics.len();
-            checker.check_function(fid, function, body_id);
+            checker.check_function(fid, function, body_id, checker.impl_generic_names(fid));
             let diagnostics = checker.result.diagnostics[diagnostic_start..].to_vec();
             let expr_types = checker
                 .result

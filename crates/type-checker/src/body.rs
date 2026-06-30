@@ -17,16 +17,17 @@ impl TypeChecker<'_> {
     pub(crate) fn check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
         match &ctx.body.stmts[stmt_id] {
             Stmt::Let {
-                ty, init, is_mut, ..
+                ty,
+                ty_range,
+                init,
+                is_mut,
+                ..
             } => {
-                let declared = self.lower_type_ref_with_params(ty, &ctx.generic_params);
+                let declared =
+                    self.lower_type_ref_with_params_at(ty, &ctx.generic_params, *ty_range);
                 let explicit_error = type_ref_contains_error(ty);
                 if explicit_error {
-                    self.diagnostic(
-                        "E0034",
-                        "invalid type annotation",
-                        ctx.stmt_range(stmt_id),
-                    );
+                    self.diagnostic("E0034", "invalid type annotation", ctx.stmt_range(stmt_id));
                 }
                 let init_ty = init.map(|expr| {
                     if explicit_error || declared.is_unknown_like() {
@@ -514,14 +515,14 @@ impl TypeChecker<'_> {
                     strukt.generics.iter().map(|name| name.0.as_str()),
                 ),
             );
-            let expected = self.lower_type_ref_with_params(&expected_field.ty, &subst);
+            let expected = substitute_type(&pattern, &subst);
             let actual = if expected.is_unknown_like() || matches!(expected, Type::Param(_)) {
                 self.check_expr(ctx, field.value)
             } else {
                 self.check_expr_expected(ctx, field.value, &expected)
             };
             collect_subst(&pattern, &actual, &mut subst);
-            let expected = self.lower_type_ref_with_params(&expected_field.ty, &subst);
+            let expected = substitute_type(&pattern, &subst);
             self.expect_assignable(&expected, &actual, "struct field", span);
         }
 

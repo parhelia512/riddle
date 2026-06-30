@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use hir::item_tree::{EnumId, HirPath, HirTypeRef, StructId, TraitId, TypeAliasId};
+use rowan::TextRange;
 
 use crate::{
     checker::TypeChecker,
@@ -25,24 +26,33 @@ impl TypeChecker<'_> {
         ty: &HirTypeRef,
         params: &HashMap<String, Type>,
     ) -> Type {
+        self.lower_type_ref_with_params_at(ty, params, None)
+    }
+
+    pub(crate) fn lower_type_ref_with_params_at(
+        &mut self,
+        ty: &HirTypeRef,
+        params: &HashMap<String, Type>,
+        span: Option<TextRange>,
+    ) -> Type {
         match ty {
-            HirTypeRef::Named(path) => self.lower_named_type(path, params),
+            HirTypeRef::Named(path) => self.lower_named_type(path, params, span),
             HirTypeRef::Ref(inner, mutable) => Type::Ref(
-                Box::new(self.lower_type_ref_with_params(inner, params)),
+                Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
                 *mutable,
             ),
             HirTypeRef::Ptr { mutable, inner } => Type::Ptr {
                 mutable: *mutable,
-                inner: Box::new(self.lower_type_ref_with_params(inner, params)),
+                inner: Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
             },
             HirTypeRef::Tuple(elements) => Type::Tuple(
                 elements
                     .iter()
-                    .map(|ty| self.lower_type_ref_with_params(ty, params))
+                    .map(|ty| self.lower_type_ref_with_params_at(ty, params, span))
                     .collect(),
             ),
             HirTypeRef::Array(inner, len) => Type::Array(
-                Box::new(self.lower_type_ref_with_params(inner, params)),
+                Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
                 *len,
             ),
             HirTypeRef::Unknown => Type::Unknown,
@@ -51,19 +61,7 @@ impl TypeChecker<'_> {
     }
 
     pub(crate) fn display_type_ref(&mut self, ty: &HirTypeRef) -> String {
-        let lowered = self.lower_type_ref(ty);
-        if !lowered.is_unknown_like() {
-            return lowered.display(self.hir);
-        }
-
-        match ty {
-            HirTypeRef::Named(path) => path.display(),
-            HirTypeRef::Ptr { mutable, inner } => {
-                let kind = if *mutable { "*mut" } else { "*const" };
-                format!("{kind} {}", Self::type_text(inner))
-            }
-            _ => lowered.display(self.hir),
-        }
+        Self::type_text(ty)
     }
 
     fn type_text(ty: &HirTypeRef) -> String {
@@ -99,12 +97,18 @@ impl TypeChecker<'_> {
         self.find_trait_by_name(name)
     }
 
-    fn lower_named_type(&mut self, path: &HirPath, params: &HashMap<String, Type>) -> Type {
+    fn lower_named_type(
+        &mut self,
+        path: &HirPath,
+        params: &HashMap<String, Type>,
+        span: Option<TextRange>,
+    ) -> Type {
         if let Some(type_alias) = self.find_associated_type_alias(path) {
             return self.lower_type_alias(type_alias);
         }
 
         let Some(name) = path.as_single_name().map(|name| name.0.as_str()) else {
+            self.diagnostic("E0034", format!("unknown type `{}`", path.display()), span);
             return Type::Unknown;
         };
 
@@ -149,6 +153,7 @@ impl TypeChecker<'_> {
                     );
                     Type::Enum(enum_id, args)
                 } else {
+                    self.diagnostic("E0034", format!("unknown type `{name}`"), span);
                     Type::Unknown
                 }
             }
@@ -194,6 +199,11 @@ impl TypeChecker<'_> {
         let expected = self.lower_type_ref_with_params(&imp.self_ty, &params);
         let mut subst = HashMap::new();
         if collect_subst(&expected, actual, &mut subst) {
+            for name in &imp.generics {
+                subst
+                    .entry(name.0.clone())
+                    .or_insert_with(|| Type::Param(name.0.clone()));
+            }
             Some(subst)
         } else {
             None

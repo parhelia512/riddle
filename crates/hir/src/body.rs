@@ -73,6 +73,7 @@ pub enum Stmt {
     Let {
         name: Name,
         ty: HirTypeRef,
+        ty_range: Option<TextRange>,
         init: Option<ExprId>,
         is_mut: bool,
     },

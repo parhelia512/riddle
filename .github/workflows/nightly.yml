@@ -144,7 +144,7 @@ jobs:
 
           mkdir -p dist
 
-          for name in riddlec; do
+          for name in clue riddle-lsp riddlec; do
             if [ -f "$BIN_DIR/$name" ]; then
               cp "$BIN_DIR/$name" "dist/${name}-${SUFFIX}"
             fi

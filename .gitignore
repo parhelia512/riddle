@@ -10,6 +10,7 @@
 # Rust
 /target
 Cargo.lock
+**/.clue/
 
 # C
 *.c
@@ -34,4 +35,4 @@ Cargo.lock
 # AI
 .junie/
 .claude/
-.agent/
+.agents/
