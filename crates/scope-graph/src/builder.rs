@@ -215,6 +215,100 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_edges.push(e);
     }
 
+    fn export_item(
+        &mut self,
+        item: TopLevelItem,
+        export_scope: NodeId,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        match item {
+            TopLevelItem::Function(fid)
+                if self.hir.item_tree.functions[fid].visibility.is_public() =>
+            {
+                let name = self.hir.item_tree.functions[fid].name.clone();
+                self.emit_named_def(
+                    export_scope,
+                    name,
+                    DefRef::Function(fid),
+                    frag_nodes,
+                    frag_edges,
+                );
+            }
+            TopLevelItem::Struct(sid) if self.hir.item_tree.structs[sid].visibility.is_public() => {
+                let name = self.hir.item_tree.structs[sid].name.clone();
+                self.emit_named_def(
+                    export_scope,
+                    name,
+                    DefRef::Struct(sid),
+                    frag_nodes,
+                    frag_edges,
+                );
+            }
+            TopLevelItem::Enum(eid) if self.hir.item_tree.enums[eid].visibility.is_public() => {
+                let name = self.hir.item_tree.enums[eid].name.clone();
+                self.emit_named_def(
+                    export_scope,
+                    name,
+                    DefRef::Enum(eid),
+                    frag_nodes,
+                    frag_edges,
+                );
+            }
+            TopLevelItem::Trait(tid) if self.hir.item_tree.traits[tid].visibility.is_public() => {
+                let name = self.hir.item_tree.traits[tid].name.clone();
+                self.emit_named_def(
+                    export_scope,
+                    name,
+                    DefRef::Trait(tid),
+                    frag_nodes,
+                    frag_edges,
+                );
+            }
+            TopLevelItem::Const(cid) if self.hir.item_tree.consts[cid].visibility.is_public() => {
+                let name = self.hir.item_tree.consts[cid].name.clone();
+                self.emit_named_def(
+                    export_scope,
+                    name,
+                    DefRef::Const(cid),
+                    frag_nodes,
+                    frag_edges,
+                );
+            }
+            TopLevelItem::TypeAlias(tid)
+                if self.hir.item_tree.type_aliases[tid].visibility.is_public() =>
+            {
+                let name = self.hir.item_tree.type_aliases[tid].name.clone();
+                self.emit_named_def(
+                    export_scope,
+                    name,
+                    DefRef::TypeAlias(tid),
+                    frag_nodes,
+                    frag_edges,
+                );
+            }
+            TopLevelItem::Module(mid) if self.hir.item_tree.modules[mid].visibility.is_public() => {
+                let scopes = self.mod_scopes[&mid];
+                let name = self.hir.item_tree.modules[mid].name.clone();
+                self.emit_named_def(
+                    export_scope,
+                    name,
+                    DefRef::Module {
+                        id: mid,
+                        enter: scopes.exported,
+                    },
+                    frag_nodes,
+                    frag_edges,
+                );
+            }
+            TopLevelItem::Use(uid) if self.hir.item_tree.uses[uid].visibility.is_public() => {
+                let u = self.hir.item_tree.uses[uid].clone();
+                self.encode_use_tree(&u.tree, export_scope, frag_nodes, frag_edges);
+            }
+            _ => {}
+        }
+    }
+
     fn register_module_child(&mut self, parent_scope: NodeId, module_id: ModuleId) {
         let siblings = self.modules_by_scope.entry(parent_scope).or_default();
         if !siblings.contains(&module_id) {
@@ -414,12 +508,6 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_nodes.push(scopes.internal);
         frag_nodes.push(scopes.exported);
 
-        // External lookups enter the module through `exported` and then walk into `internal`.
-        let e = self
-            .sg
-            .add_edge(scopes.exported, scopes.internal, EdgeKind::Export, 0);
-        frag_edges.push(e);
-
         // Nested modules can see names from their lexical parent scope.
         let e = self
             .sg
@@ -441,6 +529,9 @@ impl<'a> ScopeGraphBuilder<'a> {
         // Encode child items inside the module's internal scope.
         if let Some(children) = &m.items {
             self.encode_items(children, scopes.internal, frag_nodes, frag_edges);
+            for child in children {
+                self.export_item(*child, scopes.exported, frag_nodes, frag_edges);
+            }
         }
     }
 

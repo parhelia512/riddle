@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+frontend.workspace = true
+hir.workspace = true
 lsp-types = "0.94.1"
 riddlec.workspace = true
 rowan.workspace = true

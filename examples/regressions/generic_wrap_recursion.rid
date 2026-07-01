@@ -1,0 +1,15 @@
+struct Wrap<T> {
+    inner: T,
+}
+
+fun f<T>(x: T) -> T {
+    return g(Wrap { inner: x });
+}
+
+fun g<T>(x: T) -> T {
+    return f(Wrap { inner: x });
+}
+
+fun main() -> i32 {
+    return f(0i32);
+}

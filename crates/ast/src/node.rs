@@ -1,5 +1,5 @@
 use super::support::{self, AstNode};
-use frontend::syntax_kind::{SyntaxKind, SyntaxNode, SyntaxToken};
+use frontend::syntax_kind::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 
 // ── ast_node! macro ────────────────────────────────────────────────────
 
@@ -122,6 +122,10 @@ impl ModDecl {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
+    }
+
     /// Returns `None` for `mod foo;` and the nested items for `mod foo { ... }`.
     pub fn items(&self) -> Option<impl Iterator<Item = Stmt> + '_> {
         let has_brace = self
@@ -140,6 +144,10 @@ impl ModDecl {
 impl UseDecl {
     pub fn use_tree(&self) -> Option<UseTree> {
         support::child(&self.syntax)
+    }
+
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 }
 
@@ -261,6 +269,10 @@ impl FuncDecl {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
+    }
+
     pub fn generic_params(&self) -> Option<GenericParams> {
         support::child(&self.syntax)
     }
@@ -295,6 +307,10 @@ impl StructDecl {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
+    }
+
     pub fn generic_params(&self) -> Option<GenericParams> {
         support::child(&self.syntax)
     }
@@ -307,6 +323,10 @@ impl StructDecl {
 impl EnumDecl {
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
     pub fn generic_params(&self) -> Option<GenericParams> {
@@ -335,6 +355,10 @@ impl EnumVariant {
 impl TraitDecl {
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
     pub fn methods(&self) -> impl Iterator<Item = FuncDecl> + '_ {
@@ -388,6 +412,10 @@ impl ConstDecl {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
+    }
+
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
@@ -402,18 +430,185 @@ impl TypeAliasDecl {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
+    }
+
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 }
 
 impl GenericParams {
-    pub fn names(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
-        self.syntax
-            .children_with_tokens()
-            .filter_map(|it| it.into_token())
-            .filter(|t| t.kind() == SyntaxKind::Ident)
+    pub fn params(&self) -> impl Iterator<Item = GenericParam> + '_ {
+        let mut current: Vec<SyntaxElement> = Vec::new();
+        let mut params = Vec::new();
+        let mut depth = 0usize;
+        let mut seen_outer_less = false;
+
+        for element in self.syntax.children_with_tokens() {
+            match element.as_token().map(|token| token.kind()) {
+                Some(SyntaxKind::Less) if !seen_outer_less => {
+                    seen_outer_less = true;
+                }
+                Some(SyntaxKind::Less) => {
+                    depth += 1;
+                    current.push(element);
+                }
+                Some(SyntaxKind::Greater) if depth == 0 => {}
+                Some(SyntaxKind::Greater) => {
+                    depth -= 1;
+                    current.push(element);
+                }
+                Some(SyntaxKind::Comma) if depth == 0 => {
+                    if let Some(param) = GenericParam::from_tokens(&current) {
+                        params.push(param);
+                    }
+                    current.clear();
+                }
+                _ => current.push(element),
+            }
+        }
+        if let Some(param) = GenericParam::from_tokens(&current) {
+            params.push(param);
+        }
+
+        params.into_iter()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenericParam {
+    pub name: String,
+    pub bounds: Vec<GenericBound>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenericBound {
+    pub trait_path: Path,
+    pub assoc_constraints: Vec<GenericAssocConstraint>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenericAssocConstraint {
+    pub name: String,
+    pub ty: Type,
+}
+
+impl GenericParam {
+    fn from_tokens(elements: &[SyntaxElement]) -> Option<Self> {
+        let name = elements
+            .iter()
+            .filter_map(|element| element.as_token())
+            .find(|token| token.kind() == SyntaxKind::Ident)
+            .map(|token| token.text().to_string())?;
+        let colon = elements
+            .iter()
+            .position(|element| matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::Colon));
+        let bounds = colon
+            .map(|index| parse_generic_bounds(&elements[index + 1..]))
+            .unwrap_or_default();
+        Some(Self { name, bounds })
+    }
+}
+
+fn parse_generic_bounds(elements: &[SyntaxElement]) -> Vec<GenericBound> {
+    split_elements(elements, SyntaxKind::Plus)
+        .into_iter()
+        .filter_map(|bound| {
+            let trait_path = bound
+                .iter()
+                .find_map(|element| element.as_node().and_then(|node| Path::cast(node.clone())))?;
+            let assoc_constraints = parse_assoc_constraints(&bound);
+            Some(GenericBound {
+                trait_path,
+                assoc_constraints,
+            })
+        })
+        .collect()
+}
+
+fn parse_assoc_constraints(elements: &[SyntaxElement]) -> Vec<GenericAssocConstraint> {
+    let mut constraints = Vec::new();
+    let mut i = 0;
+    while i < elements.len() {
+        let Some(token) = elements[i].as_token() else {
+            i += 1;
+            continue;
+        };
+        if token.kind() != SyntaxKind::Ident {
+            i += 1;
+            continue;
+        }
+        let Some(eq_index) = next_non_trivia(elements, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if !matches!(elements[eq_index].as_token(), Some(eq) if eq.kind() == SyntaxKind::Eq) {
+            i += 1;
+            continue;
+        }
+        let Some(type_index) = next_non_trivia(elements, eq_index + 1) else {
+            i += 1;
+            continue;
+        };
+        if let Some(ty) = elements[type_index]
+            .as_node()
+            .and_then(|node| Type::cast(node.clone()))
+        {
+            constraints.push(GenericAssocConstraint {
+                name: token.text().to_string(),
+                ty,
+            });
+            i = type_index + 1;
+        } else {
+            i += 1;
+        }
+    }
+    constraints
+}
+
+fn split_elements(elements: &[SyntaxElement], separator: SyntaxKind) -> Vec<Vec<SyntaxElement>> {
+    let mut result = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0usize;
+    for element in elements {
+        match element.as_token().map(|token| token.kind()) {
+            Some(SyntaxKind::Less) => {
+                depth += 1;
+                current.push(element.clone());
+            }
+            Some(SyntaxKind::Greater) => {
+                depth = depth.saturating_sub(1);
+                current.push(element.clone());
+            }
+            Some(kind) if kind == separator && depth == 0 => {
+                if !current.is_empty() {
+                    result.push(current);
+                    current = Vec::new();
+                }
+            }
+            _ => current.push(element.clone()),
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
+fn next_non_trivia(elements: &[SyntaxElement], start: usize) -> Option<usize> {
+    elements
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, element)| {
+            let is_trivia = element
+                .as_token()
+                .map(|token| token.kind().is_trivia())
+                .unwrap_or(false);
+            (!is_trivia).then_some(index)
+        })
 }
 
 // ── Expressions ────────────────────────────────────���───────────────────

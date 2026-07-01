@@ -4,6 +4,14 @@
 
 关于语言的教程请查看 [The Riddle Book](https://riddle-lang.github.io/docs/)
 
+## Install
+
+```powershell
+cargo install --path . --features install-bins --force --target-dir "$env:TEMP\riddle-install"
+```
+
+会安装 `clue`、`riddle-lsp` 和 `riddlec`。
+
 ## Todo
 
 - [ ] 实现宏 `#[...]`

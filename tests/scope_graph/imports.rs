@@ -8,7 +8,7 @@ fn use_alias_rewrites_to_target_path() {
     let sg = build(
         r#"
         mod m {
-            struct S {}
+            pub struct S {}
         }
 
         use crate::m::S as T;
@@ -27,14 +27,14 @@ fn glob_import_resolves_modules_step_by_step() {
     let sg = build(
         r#"
         mod b {
-            mod target {
-                struct B {}
+            pub mod target {
+                pub struct B {}
             }
         }
 
         mod a {
-            mod target {
-                struct A {}
+            pub mod target {
+                pub struct A {}
             }
         }
 
@@ -76,10 +76,10 @@ fn self_super_and_crate_aliases_bind_to_the_right_structs() {
         r#"
         struct S {}
 
-        mod outer {
+        pub mod outer {
             struct S {}
 
-            mod inner {
+            pub mod inner {
                 struct S {}
 
                 use self::S as LocalS;

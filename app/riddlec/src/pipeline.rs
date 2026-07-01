@@ -14,9 +14,10 @@ use mir::{self, Module};
 use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
 use type_checker::{self, TypeCheckResult, check_hir};
 
-const STD_PRELUDE: &str = include_str!("../../../std/prelude.rid");
+const STD_PRELUDE: &str = include_str!("../../../std/lib.rid");
 
 pub struct CompileResult {
+    pub hir: Option<hir::HirFile>,
     pub type_result: TypeCheckResult,
     pub hir_diagnostics: Vec<type_checker::Diagnostic>,
     pub analysis_diagnostics: Vec<type_checker::Diagnostic>,
@@ -132,10 +133,11 @@ fn expand_external_mods(
         let child = find_module_file(dir, &name)?;
         let child_source = load_source_file_inner(&child, stack, files)?;
         let range = module.syntax().text_range();
+        let visibility = if module.is_pub() { "pub " } else { "" };
         replacements.push((
             usize::from(range.start()),
             usize::from(range.end()),
-            format!("mod {name} {{\n{child_source}\n}}"),
+            format!("{visibility}mod {name} {{\n{child_source}\n}}"),
         ));
     }
 
@@ -202,6 +204,7 @@ pub fn compile(source: &str) -> CompileResult {
 
     if !parse_errors.is_empty() {
         return CompileResult {
+            hir: None,
             type_result: TypeCheckResult::default(),
             hir_diagnostics: Vec::new(),
             analysis_diagnostics: Vec::new(),
@@ -285,6 +288,7 @@ pub fn compile(source: &str) -> CompileResult {
     let mir_module = success.then(|| mir::lower_hir(&hir, &type_result, &escape_result));
 
     CompileResult {
+        hir: Some(hir),
         type_result,
         hir_diagnostics,
         analysis_diagnostics,

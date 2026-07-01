@@ -34,6 +34,7 @@ pub fn lower_hir(
         module: Module::new("main"),
         expr_cache: HashMap::new(),
         current_body: None,
+        current_function: None,
         scope_map: HashMap::new(),
         mut_bindings: HashSet::new(),
         generic_subst: HashMap::new(),
@@ -52,7 +53,7 @@ pub fn lower_hir(
             continue;
         }
         if let Some(body_id) = hir.function_bodies.get(&fid).copied() {
-            let mir_func = ctx.lower_function(fid, func.name.0.clone(), body_id);
+            let mir_func = ctx.lower_function(fid, ctx.function_name(fid), body_id);
             ctx.module.add_function(mir_func);
         }
     }
@@ -92,6 +93,7 @@ struct LowerCtx<'a> {
     expr_cache: HashMap<ExprId, Value>,
     /// The BodyId currently being lowered, used to look up expr_types.
     current_body: Option<BodyId>,
+    current_function: Option<hir::item_tree::FunctionId>,
     /// Maps let-bound StmtId → Value for local variable resolution.
     scope_map: HashMap<StmtId, Value>,
     /// StmtIds of `mut` bindings — their Value is a storage location (Alloca),
@@ -114,6 +116,12 @@ impl<'a> LowerCtx<'a> {
         self.scope_map.clear();
         self.mut_bindings.clear();
         self.current_body = Some(body_id);
+        let old_current_function = self.current_function;
+        let old_generic_subst = self.generic_subst.clone();
+        self.current_function = Some(fid);
+        if let Some(self_ty) = self.impl_self_mir_type(fid) {
+            self.generic_subst.insert("Self".into(), self_ty);
+        }
 
         let func_item = &self.hir.item_tree.functions[fid];
 
@@ -153,6 +161,8 @@ impl<'a> LowerCtx<'a> {
             }
         }
 
+        self.current_function = old_current_function;
+        self.generic_subst = old_generic_subst;
         func
     }
 
@@ -223,6 +233,22 @@ impl<'a> LowerCtx<'a> {
             },
 
             Expr::Binary { lhs, rhs, op } => {
+                if let Some(call) = self
+                    .current_body
+                    .and_then(|bid| self.type_result.operator_calls.get(&(bid, expr_id)))
+                    .cloned()
+                {
+                    let lv = self.lower_expr(builder, param_values, body, *lhs);
+                    let rv = self.lower_expr(builder, param_values, body, *rhs);
+                    return self.lower_operator_call(
+                        builder,
+                        *lhs,
+                        call.function,
+                        vec![lv, rv],
+                        mir_type,
+                    );
+                }
+
                 let lv = if op.is_assignment() {
                     self.lower_lvalue(builder, param_values, body, *lhs)
                 } else {
@@ -406,8 +432,9 @@ impl<'a> LowerCtx<'a> {
                 let name = if let (Some(fid), Expr::FieldAccess { base, .. }) =
                     (target_fid, &body.exprs[*callee])
                 {
-                    self.mono_method_name(fid, *base)
-                        .unwrap_or_else(|| self.hir.item_tree.functions[fid].name.0.clone())
+                    let actual_fid = self.actual_method_fid(*callee, fid, *base);
+                    self.mono_method_name(actual_fid, *base)
+                        .unwrap_or_else(|| self.function_name(actual_fid))
                 } else {
                     target_fid
                         .map(|fid| {
@@ -419,7 +446,10 @@ impl<'a> LowerCtx<'a> {
                 let mut arg_vals: Vec<Value> = Vec::new();
                 if let Expr::FieldAccess { base, .. } = &body.exprs[*callee] {
                     if let Some(fid) = target_fid {
-                        if let Some(receiver) = self.hir.item_tree.functions[fid].params.first() {
+                        let receiver_fid = self.actual_method_fid(*callee, fid, *base);
+                        if let Some(receiver) =
+                            self.hir.item_tree.functions[receiver_fid].params.first()
+                        {
                             arg_vals.push(self.lower_receiver_arg(
                                 builder,
                                 param_values,
@@ -497,6 +527,71 @@ impl<'a> LowerCtx<'a> {
                 type_checker::Type::Function(fid) => Some(*fid),
                 _ => None,
             })
+    }
+
+    fn lower_operator_call(
+        &mut self,
+        builder: &mut Builder,
+        lhs: ExprId,
+        fid: hir::item_tree::FunctionId,
+        args: Vec<Value>,
+        ret_ty: Type,
+    ) -> Value {
+        let name = self
+            .mono_method_name(fid, lhs)
+            .unwrap_or_else(|| self.function_name(fid));
+        builder.call(FuncRef::Local(name), args, ret_ty)
+    }
+
+    fn actual_method_fid(
+        &mut self,
+        callee: ExprId,
+        fid: hir::item_tree::FunctionId,
+        base: ExprId,
+    ) -> hir::item_tree::FunctionId {
+        let Some(body_id) = self.current_body else {
+            return fid;
+        };
+        let Some(receiver_ty) = self.type_result.expr_types.get(&(body_id, base)) else {
+            return fid;
+        };
+        if let Some(call) = self.type_result.trait_method_calls.get(&(body_id, callee)) {
+            return self
+                .find_trait_impl_method(call.trait_id, &call.method, receiver_ty)
+                .unwrap_or(fid);
+        }
+        let Some(imp) = self.impl_for_method(fid) else {
+            return fid;
+        };
+        if self.impl_type_matches(imp, receiver_ty) {
+            return fid;
+        }
+        let Some(trait_ty) = &imp.trait_ty else {
+            return fid;
+        };
+        let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+            return fid;
+        };
+        let method_name = &self.hir.item_tree.functions[fid].name;
+        self.find_trait_impl_method(trait_id, &method_name.0, receiver_ty)
+            .unwrap_or(fid)
+    }
+
+    fn find_trait_impl_method(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        method_name: &str,
+        receiver_ty: &type_checker::Type,
+    ) -> Option<hir::item_tree::FunctionId> {
+        self.hir.item_tree.impls.iter().find_map(|(_, candidate)| {
+            let candidate_trait = candidate.trait_ty.as_ref()?;
+            (self.resolve_trait_ref(candidate_trait) == Some(trait_id)).then_some(())?;
+            self.impl_type_matches(candidate, receiver_ty)
+                .then_some(())?;
+            candidate.methods.iter().copied().find(|candidate_fid| {
+                self.hir.item_tree.functions[*candidate_fid].name.0 == method_name
+            })
+        })
     }
 
     fn lower_receiver_arg(
@@ -721,6 +816,12 @@ impl<'a> LowerCtx<'a> {
     fn convert_hir_type(&self, t: &hir::item_tree::HirTypeRef) -> Type {
         match t {
             hir::item_tree::HirTypeRef::Named(path) => {
+                if let Some(ty) = self.convert_self_associated_type(path) {
+                    return ty;
+                }
+                if is_self_associated_path(path) {
+                    return Type::Unit;
+                }
                 if let Some(name) = path.as_single_name().map(|name| name.0.as_str()) {
                     if let Some(ty) = self.generic_subst.get(name) {
                         return ty.clone();
@@ -811,6 +912,25 @@ impl<'a> LowerCtx<'a> {
                     .then_some(*alias_id)
             })
         })
+    }
+
+    fn convert_self_associated_type(&self, path: &hir::item_tree::HirPath) -> Option<Type> {
+        if !is_self_associated_path(path) {
+            return None;
+        }
+        let alias_name = path.segments[1].0.as_str();
+        let imp = self.impl_for_method(self.current_function?)?;
+        let alias_id = imp
+            .type_aliases
+            .iter()
+            .find(|alias_id| self.hir.item_tree.type_aliases[**alias_id].name.0 == alias_name)?;
+        Some(
+            self.hir.item_tree.type_aliases[*alias_id]
+                .ty
+                .as_ref()
+                .map(|ty| self.convert_hir_type(ty))
+                .unwrap_or(Type::Unit),
+        )
     }
 
     fn convert_struct_type(
@@ -949,6 +1069,64 @@ impl<'a> LowerCtx<'a> {
             .find_map(|(_, imp)| imp.methods.contains(&fid).then_some(imp))
     }
 
+    fn function_name(&self, fid: hir::item_tree::FunctionId) -> String {
+        self.static_method_name(fid)
+            .unwrap_or_else(|| self.hir.item_tree.functions[fid].name.0.clone())
+    }
+
+    fn static_method_name(&self, fid: hir::item_tree::FunctionId) -> Option<String> {
+        let imp = self.impl_for_method(fid)?;
+        if !imp.generics.is_empty() {
+            return None;
+        }
+        let self_ty = self.convert_hir_type(&imp.self_ty);
+        Some(format!(
+            "{}__{}",
+            self.hir.item_tree.functions[fid].name.0,
+            mono_type_name(&self_ty)
+        ))
+    }
+
+    fn impl_self_mir_type(&self, fid: hir::item_tree::FunctionId) -> Option<Type> {
+        self.impl_for_method(fid)
+            .map(|imp| self.convert_hir_type(&imp.self_ty))
+    }
+
+    fn impl_type_matches(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+    ) -> bool {
+        let receiver_mir_ty = self.convert_type(receiver_ty);
+        if imp.generics.is_empty() {
+            return self.convert_hir_type(&imp.self_ty) == receiver_mir_ty;
+        }
+        self.impl_mir_subst(imp, receiver_ty)
+            .map(|subst| {
+                let subst = subst
+                    .iter()
+                    .map(|(name, ty)| (name.as_str(), ty))
+                    .collect::<HashMap<_, _>>();
+                self.convert_hir_type_with_subst(&imp.self_ty, &subst) == receiver_mir_ty
+            })
+            .unwrap_or(false)
+    }
+
+    fn resolve_trait_ref(
+        &self,
+        ty: &hir::item_tree::HirTypeRef,
+    ) -> Option<hir::item_tree::TraitId> {
+        let hir::item_tree::HirTypeRef::Named(path) = ty else {
+            return None;
+        };
+        let name = path.segments.last()?.0.as_str();
+        self.hir
+            .item_tree
+            .traits
+            .iter()
+            .find_map(|(id, tr)| (tr.name.0 == name).then_some(id))
+    }
+
     fn impl_mir_subst(
         &self,
         imp: &hir::item_tree::HirImpl,
@@ -1000,6 +1178,12 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
+}
+
+fn is_self_associated_path(path: &hir::item_tree::HirPath) -> bool {
+    matches!(path.anchor, hir::item_tree::PathAnchor::Plain)
+        && path.segments.len() == 2
+        && path.segments[0].0 == "Self"
 }
 
 fn mono_struct_name(base: &str, args: &[Type]) -> String {

@@ -3,6 +3,9 @@ enum Foo{
     B
 }
 
+impl PartialEq for Foo {}
+impl Eq for Foo {}
+
 impl Foo{
     fun get(&self) -> &str {
         if *self == Foo::A {
@@ -15,6 +18,14 @@ impl Foo{
 
 struct Box<T> {
     value: T,
+}
+
+impl<T: Add<Output = T>> Add for Box<T> {
+    type Output = T;
+
+    fun add(self, rhs: Self) -> Self::Output {
+        self.value + rhs.value
+    }
 }
 
 impl<T> Box<T>{
@@ -31,6 +42,7 @@ fun x(){
 
 fun main(){
     let mut x = Foo::A;
+    let v = 1;
     x = Foo::B;
     let mut a = 1;
     let t = x.get();
@@ -40,7 +52,8 @@ fun main(){
         a = 0;
     }
     let b: Box<i32> = Box { value: 1 };
-    let v = b.get();
+    let bb: Box<i32> = Box {value: 1};
+    let t =   bb +  b;
 }
 
 fun test(x: &Foo) -> bool{

@@ -14,7 +14,7 @@ fn resolve_hir_updates_expr_path_resolutions() {
     let (mut hir, sg) = build_hir_and_graph(
         r#"
         mod m {
-            struct S {}
+            pub struct S {}
         }
 
         use crate::m::S as T;

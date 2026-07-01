@@ -97,6 +97,7 @@ impl TypeChecker<'_> {
 
         let tr = self.hir.item_tree.traits[trait_id].clone();
         self.check_trait_impl(&self_ty_text, &tr, imp);
+        self.check_lang_trait_dependencies(&self_ty_text, trait_id);
     }
 
     fn check_impl_duplicates(&mut self, imp: &HirImpl) {
@@ -153,7 +154,7 @@ impl TypeChecker<'_> {
                 continue;
             };
 
-            self.expect_method_signature(&tr.name.0, required, actual);
+            self.expect_method_signature(&tr.name.0, imp, required, actual);
         }
 
         let provided_types = imp
@@ -180,12 +181,67 @@ impl TypeChecker<'_> {
         }
     }
 
+    fn check_lang_trait_dependencies(
+        &mut self,
+        self_ty_text: &str,
+        trait_id: hir::item_tree::TraitId,
+    ) {
+        let Some(lang) = self.trait_lang(trait_id).map(str::to_string) else {
+            return;
+        };
+        let deps: &[(&str, &str)] = match lang.as_str() {
+            "eq" => &[("partial_eq", "PartialEq")],
+            "partial_ord" => &[("partial_eq", "PartialEq")],
+            "ord" => &[("eq", "Eq"), ("partial_ord", "PartialOrd")],
+            _ => &[],
+        };
+
+        for (required_lang, required_name) in deps {
+            if !self.impl_exists_for_lang_trait(required_lang, self_ty_text) {
+                self.diagnostic(
+                    "E0036",
+                    format!(
+                        "impl `{}` for `{}` requires `{}`",
+                        self.hir.item_tree.traits[trait_id].name.0, self_ty_text, required_name
+                    ),
+                    None,
+                );
+            }
+        }
+    }
+
+    fn impl_exists_for_lang_trait(&mut self, lang: &str, self_ty_text: &str) -> bool {
+        let Some(required_trait) = self.find_lang_trait(lang) else {
+            return false;
+        };
+        let impls = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .map(|(_, imp)| imp.clone())
+            .collect::<Vec<_>>();
+        impls.into_iter().any(|imp| {
+            imp.trait_ty
+                .as_ref()
+                .and_then(|trait_ty| self.resolve_trait_ref(trait_ty))
+                == Some(required_trait)
+                && self.display_type_ref(&imp.self_ty) == self_ty_text
+        })
+    }
+
     fn expect_method_signature(
         &mut self,
         trait_name: &str,
+        imp: &HirImpl,
         expected: &HirFunction,
         actual: &HirFunction,
     ) {
+        let mut params =
+            crate::lowering::generic_param_map(imp.generics.iter().map(|name| name.0.as_str()));
+        let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
+        params.insert("Self".into(), self_ty);
+
         if expected.params.len() != actual.params.len() {
             self.diagnostic(
                 "E0028",
@@ -205,8 +261,8 @@ impl TypeChecker<'_> {
                 continue;
             };
 
-            let expected_ty = self.lower_type_ref(&expected_param.ty);
-            let actual_ty = self.lower_type_ref(&actual_param.ty);
+            let expected_ty = self.lower_type_ref_with_params(&expected_param.ty, &params);
+            let actual_ty = self.lower_type_ref_with_params(&actual_param.ty, &params);
             if !self.signature_types_match(&expected_ty, &actual_ty) {
                 self.diagnostic(
                     "E0029",
@@ -226,12 +282,12 @@ impl TypeChecker<'_> {
         let expected_ret = expected
             .ret_type
             .as_ref()
-            .map(|ty| self.lower_type_ref(ty))
+            .map(|ty| self.lower_type_ref_with_params(ty, &params))
             .unwrap_or(Type::Unit);
         let actual_ret = actual
             .ret_type
             .as_ref()
-            .map(|ty| self.lower_type_ref(ty))
+            .map(|ty| self.lower_type_ref_with_params(ty, &params))
             .unwrap_or(Type::Unit);
         if !self.signature_types_match(&expected_ret, &actual_ret) {
             self.diagnostic(

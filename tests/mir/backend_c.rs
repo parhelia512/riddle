@@ -495,3 +495,61 @@ fn c_backend_monomorphizes_generic_functions() {
         result
     );
 }
+
+#[test]
+fn c_backend_dispatches_trait_bound_method_in_generic_function() {
+    let module = lower(
+        r#"
+        trait Named {
+            fun name(&self) -> i32;
+        }
+
+        trait Tagged {
+            fun tag(&self) -> i32;
+        }
+
+        struct User {
+            id: i32,
+            tag_value: i32,
+        }
+
+        impl Named for User {
+            fun name(&self) -> i32 {
+                self.id
+            }
+        }
+
+        impl Tagged for User {
+            fun tag(&self) -> i32 {
+                self.tag_value
+            }
+        }
+
+        fun read<T: Named + Tagged>(value: T) -> i32 {
+            value.name() + value.tag()
+        }
+
+        fun main() -> i32 {
+            let user = User { id: 7, tag_value: 2 };
+            return read(user);
+        }
+        "#,
+    );
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+    assert!(
+        result.contains("read__User"),
+        "missing generic function monomorph:\n{}",
+        result
+    );
+    assert!(
+        result.contains("name__User("),
+        "generic body should call concrete Named impl method:\n{}",
+        result
+    );
+    assert!(
+        result.contains("tag__User("),
+        "generic body should call concrete Tagged impl method:\n{}",
+        result
+    );
+}

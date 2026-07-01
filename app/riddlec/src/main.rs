@@ -147,7 +147,7 @@ fn parse_args(args: &[String]) -> Result<Opts, &'static str> {
                 process::exit(0);
             }
             "--version" | "-V" => {
-                println!("riddlec {}", env!("GIT_HASH"));
+                println!("riddlec {}", riddlec::GIT_HASH);
                 process::exit(0);
             }
             other if other.starts_with('-') => {

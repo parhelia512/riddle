@@ -79,7 +79,12 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
                 };
                 let tree = tree_ast.lower();
                 let attrs = lower::lower_attrs(u.syntax());
-                let uid = hir.item_tree.uses.alloc(HirUse { tree, attrs });
+                let visibility = lower::lower_visibility(u.is_pub());
+                let uid = hir.item_tree.uses.alloc(HirUse {
+                    tree,
+                    visibility,
+                    attrs,
+                });
                 items.push(TopLevelItem::Use(uid));
             }
 
@@ -145,8 +150,10 @@ pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: ast::ModDecl) -> ModuleId {
 
     // Allocate a placeholder first so the module has a stable id while lowering children.
     let attrs = lower::lower_attrs(m.syntax());
+    let visibility = lower::lower_visibility(m.is_pub());
     let mid = hir.item_tree.modules.alloc(HirModule {
         name,
+        visibility,
         items: None,
         attrs,
     });
@@ -171,7 +178,9 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
     } else {
         (first_ty.unwrap_or(HirTypeRef::Error), None)
     };
-    let generics = lower::lower_generic_params(i.generic_params());
+    let generic_params = i.generic_params();
+    let generics = lower::lower_generic_params(generic_params.clone());
+    let generic_bounds = lower::lower_generic_bounds(generic_params);
 
     let mut methods = Vec::new();
     for func in i.methods() {
@@ -207,6 +216,7 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
         self_ty,
         trait_ty,
         generics,
+        generic_bounds,
         methods,
         consts,
         type_aliases,

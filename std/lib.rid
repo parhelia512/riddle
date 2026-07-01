@@ -1,7 +1,7 @@
-mod std {
-    mod marker {
+pub mod std {
+    pub mod marker {
         #[lang = "copy"]
-        trait Copy {}
+        pub trait Copy {}
 
         impl Copy for bool {}
         impl Copy for char {}
@@ -23,9 +23,9 @@ mod std {
         impl Copy for f128 {}
     }
 
-    mod clone {
+    pub mod clone {
         #[lang = "clone"]
-        trait Clone {}
+        pub trait Clone {}
 
         impl Clone for bool {}
         impl Clone for char {}
@@ -48,9 +48,9 @@ mod std {
         impl Clone for f128 {}
     }
 
-    mod default {
+    pub mod default {
         #[lang = "default"]
-        trait Default {}
+        pub trait Default {}
 
         impl Default for bool {}
         impl Default for char {}
@@ -72,15 +72,15 @@ mod std {
         impl Default for f128 {}
     }
 
-    mod cmp {
+    pub mod cmp {
         #[lang = "partial_eq"]
-        trait PartialEq {}
+        pub trait PartialEq {}
         #[lang = "eq"]
-        trait Eq {}
+        pub trait Eq {}
         #[lang = "partial_ord"]
-        trait PartialOrd {}
+        pub trait PartialOrd {}
         #[lang = "ord"]
-        trait Ord {}
+        pub trait Ord {}
 
         impl PartialEq for bool {}
         impl PartialEq for char {}
@@ -155,23 +155,23 @@ mod std {
         impl Ord for usize {}
     }
 
-    mod fmt {
+    pub mod fmt {
         #[lang = "debug"]
-        trait Debug {}
+        pub trait Debug {}
         #[lang = "display"]
-        trait Display {}
+        pub trait Display {}
         #[lang = "binary"]
-        trait Binary {}
+        pub trait Binary {}
         #[lang = "octal"]
-        trait Octal {}
+        pub trait Octal {}
         #[lang = "lower_hex"]
-        trait LowerHex {}
+        pub trait LowerHex {}
         #[lang = "upper_hex"]
-        trait UpperHex {}
+        pub trait UpperHex {}
         #[lang = "lower_exp"]
-        trait LowerExp {}
+        pub trait LowerExp {}
         #[lang = "upper_exp"]
-        trait UpperExp {}
+        pub trait UpperExp {}
 
         impl Debug for bool {}
         impl Debug for char {}
@@ -275,9 +275,9 @@ mod std {
         impl UpperExp for f128 {}
     }
 
-    mod hash {
+    pub mod hash {
         #[lang = "hash"]
-        trait Hash {}
+        pub trait Hash {}
 
         impl Hash for bool {}
         impl Hash for char {}
@@ -296,69 +296,71 @@ mod std {
         impl Hash for usize {}
     }
 
-    mod ops {
-        // ponytail: lang markers exist; operators stay compiler-builtins until trait dispatch exists.
+    pub mod ops {
         #[lang = "add"]
-        trait Add { type Output; }
+        pub trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
         #[lang = "sub"]
-        trait Sub { type Output; }
+        pub trait Sub { type Output; }
         #[lang = "mul"]
-        trait Mul { type Output; }
+        pub trait Mul { type Output; }
         #[lang = "div"]
-        trait Div { type Output; }
+        pub trait Div { type Output; }
         #[lang = "rem"]
-        trait Rem { type Output; }
+        pub trait Rem { type Output; }
         #[lang = "neg"]
-        trait Neg { type Output; }
+        pub trait Neg { type Output; }
         #[lang = "not"]
-        trait Not { type Output; }
+        pub trait Not { type Output; }
         #[lang = "bitand"]
-        trait BitAnd { type Output; }
+        pub trait BitAnd { type Output; }
         #[lang = "bitor"]
-        trait BitOr { type Output; }
+        pub trait BitOr { type Output; }
         #[lang = "bitxor"]
-        trait BitXor { type Output; }
+        pub trait BitXor { type Output; }
         #[lang = "shl"]
-        trait Shl { type Output; }
+        pub trait Shl { type Output; }
         #[lang = "shr"]
-        trait Shr { type Output; }
+        pub trait Shr { type Output; }
         #[lang = "add_assign"]
-        trait AddAssign {}
+        pub trait AddAssign {}
         #[lang = "sub_assign"]
-        trait SubAssign {}
+        pub trait SubAssign {}
         #[lang = "mul_assign"]
-        trait MulAssign {}
+        pub trait MulAssign {}
         #[lang = "div_assign"]
-        trait DivAssign {}
+        pub trait DivAssign {}
         #[lang = "rem_assign"]
-        trait RemAssign {}
+        pub trait RemAssign {}
         #[lang = "bitand_assign"]
-        trait BitAndAssign {}
+        pub trait BitAndAssign {}
         #[lang = "bitor_assign"]
-        trait BitOrAssign {}
+        pub trait BitOrAssign {}
         #[lang = "bitxor_assign"]
-        trait BitXorAssign {}
+        pub trait BitXorAssign {}
         #[lang = "shl_assign"]
-        trait ShlAssign {}
+        pub trait ShlAssign {}
         #[lang = "shr_assign"]
-        trait ShrAssign {}
+        pub trait ShrAssign {}
 
-        impl Add for i8 { type Output = i8; }
-        impl Add for i16 { type Output = i16; }
-        impl Add for i32 { type Output = i32; }
-        impl Add for i64 { type Output = i64; }
-        impl Add for i128 { type Output = i128; }
-        impl Add for isize { type Output = isize; }
-        impl Add for u8 { type Output = u8; }
-        impl Add for u16 { type Output = u16; }
-        impl Add for u32 { type Output = u32; }
-        impl Add for u64 { type Output = u64; }
-        impl Add for u128 { type Output = u128; }
-        impl Add for usize { type Output = usize; }
-        impl Add for f16 { type Output = f16; }
-        impl Add for f32 { type Output = f32; }
-        impl Add for f64 { type Output = f64; }
-        impl Add for f128 { type Output = f128; }
+        impl Add for i8 { type Output = i8; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for i16 { type Output = i16; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for i32 { type Output = i32; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for i64 { type Output = i64; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for i128 { type Output = i128; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for isize { type Output = isize; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for u8 { type Output = u8; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for u16 { type Output = u16; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for u32 { type Output = u32; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for u64 { type Output = u64; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for u128 { type Output = u128; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for usize { type Output = usize; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for f16 { type Output = f16; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for f32 { type Output = f32; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for f64 { type Output = f64; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
+        impl Add for f128 { type Output = f128; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
 
         impl Sub for i8 { type Output = i8; }
         impl Sub for i16 { type Output = i16; }

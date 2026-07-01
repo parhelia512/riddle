@@ -148,6 +148,89 @@ fn arithmetic_operations() {
 }
 
 #[test]
+fn i32_add_lowers_to_builtin_binop() {
+    let module = lower(
+        r#"
+        fun main() {
+            let a: i32 = 1;
+            let b: i32 = 2;
+            let sum = a + b;
+        }
+        "#,
+    );
+    let func = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|func| func.name == "main")
+        .unwrap();
+    let entry = &func.blocks[func.entry];
+
+    assert!(entry.insts.iter().any(|i| matches!(
+        i.kind,
+        mir::instr::InstKind::BinOp(mir::instr::BinOp::Add, _, _)
+    )));
+}
+
+#[test]
+fn overloaded_add_lowers_to_method_call() {
+    let module = lower(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+
+        impl Add for i32 {
+            type Output = i32;
+            fun add(self, rhs: Self) -> Self::Output {
+                self + rhs
+            }
+        }
+
+        struct Box<T> {
+            value: T,
+        }
+
+        impl<T: Add<Output = T>> Add for Box<T> {
+            type Output = T;
+
+            fun add(self, rhs: Self) -> Self::Output {
+                self.value + rhs.value
+            }
+        }
+
+        fun main() {
+            let a: Box<i32> = Box { value: 1 };
+            let b: Box<i32> = Box { value: 2 };
+            let sum = a + b;
+        }
+        "#,
+    );
+    let func = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|func| func.name == "main")
+        .unwrap();
+    let entry = &func.blocks[func.entry];
+
+    assert!(entry.insts.iter().any(|i| matches!(
+        &i.kind,
+        mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name.starts_with("add")
+    )));
+    assert!(
+        !entry.insts.iter().any(|i| matches!(
+            i.kind,
+            mir::instr::InstKind::BinOp(mir::instr::BinOp::Add, _, _)
+        )),
+        "overloaded add should call Add::add, got {:?}",
+        entry.insts.iter().map(|i| &i.kind).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn compound_assignment_lowers_to_load_binop_store() {
     let module = lower(
         r#"

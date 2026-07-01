@@ -9,6 +9,7 @@ use hir::{
 use crate::{
     context::BodyCtx,
     result::{Diagnostic, LabelStyle, Severity, SourceLabel, TypeCheckResult},
+    trait_env::{TraitAssocConstraint, TraitBound},
     types::{FloatTy, IntTy, Type},
 };
 
@@ -69,8 +70,49 @@ impl<'a> TypeChecker<'a> {
             let params =
                 crate::lowering::generic_param_map(imp.generics.iter().map(|name| name.0.as_str()));
             let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
-            self.result.trait_env.insert_impl(trait_id, self_ty);
+            let bounds = self.lower_trait_env_bounds(&imp.generic_bounds, &params);
+            let assoc_types = imp
+                .type_aliases
+                .iter()
+                .filter_map(|alias_id| {
+                    let alias = &self.hir.item_tree.type_aliases[*alias_id];
+                    alias.ty.as_ref().map(|ty| {
+                        (
+                            alias.name.0.clone(),
+                            self.lower_type_ref_with_params(ty, &params),
+                        )
+                    })
+                })
+                .collect();
+            self.result
+                .trait_env
+                .insert_impl(trait_id, self_ty, bounds, assoc_types);
         }
+    }
+
+    fn lower_trait_env_bounds(
+        &mut self,
+        bounds: &[hir::item_tree::HirGenericBound],
+        params: &std::collections::HashMap<String, Type>,
+    ) -> Vec<TraitBound> {
+        bounds
+            .iter()
+            .filter_map(|bound| {
+                let trait_id = self.resolve_trait_ref(&bound.trait_ty)?;
+                Some(TraitBound {
+                    param: bound.param.0.clone(),
+                    trait_id,
+                    assoc_constraints: bound
+                        .assoc_constraints
+                        .iter()
+                        .map(|constraint| TraitAssocConstraint {
+                            name: constraint.name.0.clone(),
+                            ty: self.lower_type_ref_with_params(&constraint.ty, params),
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn check_function_bodies(&mut self) {
@@ -90,12 +132,16 @@ impl<'a> TypeChecker<'a> {
         outer_generics: Vec<String>,
     ) {
         let body = &self.hir.bodies[body_id];
-        let params = crate::lowering::generic_param_map(
+        let mut params = crate::lowering::generic_param_map(
             outer_generics
                 .iter()
                 .map(String::as_str)
                 .chain(function.generics.iter().map(|name| name.0.as_str())),
         );
+        if let Some(self_ty_ref) = self.impl_self_ty_ref(function_id).cloned() {
+            let self_ty = self.lower_type_ref_with_params(&self_ty_ref, &params);
+            params.insert("Self".into(), self_ty);
+        }
         let return_ty = function
             .ret_type
             .as_ref()
@@ -135,6 +181,34 @@ impl<'a> TypeChecker<'a> {
                     .then(|| imp.generics.iter().map(|name| name.0.clone()).collect())
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn impl_self_ty_ref(&self, function_id: FunctionId) -> Option<&HirTypeRef> {
+        self.hir
+            .item_tree
+            .impls
+            .iter()
+            .find_map(|(_, imp)| imp.methods.contains(&function_id).then_some(&imp.self_ty))
+    }
+
+    pub(crate) fn find_lang_trait(&self, lang: &str) -> Option<hir::item_tree::TraitId> {
+        self.hir.item_tree.traits.iter().find_map(|(id, tr)| {
+            tr.attrs
+                .iter()
+                .any(|attr| attr.name.0 == "lang" && attr.value.as_deref() == Some(lang))
+                .then_some(id)
+        })
+    }
+
+    pub(crate) fn trait_lang(&self, trait_id: hir::item_tree::TraitId) -> Option<&str> {
+        self.hir.item_tree.traits[trait_id]
+            .attrs
+            .iter()
+            .find_map(|attr| {
+                (attr.name.0 == "lang")
+                    .then(|| attr.value.as_deref())
+                    .flatten()
+            })
     }
 
     fn has_tail(&self, body: &hir::body::Body, expr: hir::body::ExprId) -> bool {
@@ -375,6 +449,8 @@ impl<'a> TypeChecker<'a> {
             "E0020" | "E0024" => Some("duplicate definition — remove the duplicate".into()),
             "E0031" => Some("cannot assign twice to an immutable variable — add `mut` to the `let` binding".into()),
             "E0033" => Some("recursive generic calls must reuse the same type arguments; wrapping them requires infinitely many instantiations".into()),
+            "E0035" => Some("the inferred type must implement every trait bound on the generic parameter".into()),
+            "E0036" => Some("add the required comparison trait impl for this type".into()),
             "E0072" => Some("insert some indirection, such as `&`, `*const`, or `*mut`, to break the cycle".into()),
             "E0021" => Some("trait method declarations should not have a body".into()),
             "E0022" | "E0025" => Some("duplicate associated type — remove the duplicate".into()),

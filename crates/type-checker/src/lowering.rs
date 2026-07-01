@@ -103,6 +103,13 @@ impl TypeChecker<'_> {
         params: &HashMap<String, Type>,
         span: Option<TextRange>,
     ) -> Type {
+        if let Some(ty) = self.lower_self_associated_type(path, params) {
+            return ty;
+        }
+        if is_self_associated_path(path) && params.contains_key("Self") {
+            return Type::Unknown;
+        }
+
         if let Some(type_alias) = self.find_associated_type_alias(path) {
             return self.lower_type_alias(type_alias);
         }
@@ -254,6 +261,48 @@ impl TypeChecker<'_> {
             })
         })
     }
+
+    fn lower_self_associated_type(
+        &mut self,
+        path: &HirPath,
+        params: &HashMap<String, Type>,
+    ) -> Option<Type> {
+        if !is_self_associated_path(path) {
+            return None;
+        }
+        let self_ty = params.get("Self")?.clone();
+        let alias_name = path.segments[1].0.as_str();
+        let impls = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .map(|(_, imp)| imp.clone())
+            .collect::<Vec<_>>();
+
+        for imp in impls {
+            let Some(mut subst) = self.impl_subst_from_self_ty(&imp, &self_ty) else {
+                continue;
+            };
+            subst.insert("Self".into(), self_ty.clone());
+            let Some(alias_id) = imp
+                .type_aliases
+                .iter()
+                .find(|alias_id| self.hir.item_tree.type_aliases[**alias_id].name.0 == alias_name)
+            else {
+                continue;
+            };
+            return Some(
+                self.hir.item_tree.type_aliases[*alias_id]
+                    .ty
+                    .clone()
+                    .map(|ty| self.lower_type_ref_with_params(&ty, &subst))
+                    .unwrap_or(Type::Unknown),
+            );
+        }
+
+        None
+    }
 }
 
 pub(crate) fn generic_param_map<'a>(names: impl Iterator<Item = &'a str>) -> HashMap<String, Type> {
@@ -357,4 +406,10 @@ pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type 
         ),
         _ => ty.clone(),
     }
+}
+
+fn is_self_associated_path(path: &HirPath) -> bool {
+    matches!(path.anchor, hir::item_tree::PathAnchor::Plain)
+        && path.segments.len() == 2
+        && path.segments[0].0 == "Self"
 }

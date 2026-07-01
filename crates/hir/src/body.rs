@@ -72,6 +72,7 @@ pub enum Severity {
 pub enum Stmt {
     Let {
         name: Name,
+        name_range: Option<TextRange>,
         ty: HirTypeRef,
         ty_range: Option<TextRange>,
         init: Option<ExprId>,

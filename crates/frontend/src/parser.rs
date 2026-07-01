@@ -386,6 +386,7 @@ impl<'s> Parser<'s> {
             self.current(),
             SyntaxKind::Hash
                 | SyntaxKind::Let
+                | SyntaxKind::Pub
                 | SyntaxKind::Fun
                 | SyntaxKind::Struct
                 | SyntaxKind::Mod
@@ -447,6 +448,7 @@ impl<'s> Parser<'s> {
     fn statement(&mut self) {
         self.attrs();
         match self.current() {
+            SyntaxKind::Pub => self.pub_item(),
             SyntaxKind::Let => self.var_decl(),
             SyntaxKind::Fun => self.func_decl(),
             SyntaxKind::Struct => self.struct_decl(),
@@ -461,6 +463,30 @@ impl<'s> Parser<'s> {
             SyntaxKind::Extern => self.extern_decl(),
             SyntaxKind::Eof => return,
             _ => self.expr_stmt(),
+        }
+    }
+
+    fn pub_item(&mut self) {
+        match self.nth(1) {
+            SyntaxKind::Fun => self.func_decl(),
+            SyntaxKind::Struct => self.struct_decl(),
+            SyntaxKind::Mod => self.mod_decl(),
+            SyntaxKind::Use => self.use_decl(),
+            SyntaxKind::Enum => self.enum_decl(),
+            SyntaxKind::Trait => self.trait_decl(),
+            SyntaxKind::Const => self.const_decl(),
+            SyntaxKind::TypeKw => self.type_alias_decl(),
+            SyntaxKind::Extern => self.extern_decl(),
+            _ => self.error(format!(
+                "expected item after 'pub', found {:?}",
+                self.nth(1)
+            )),
+        }
+    }
+
+    fn optional_pub(&mut self) {
+        if self.at(SyntaxKind::Pub) {
+            self.bump();
         }
     }
 
@@ -501,6 +527,7 @@ impl<'s> Parser<'s> {
     fn mod_decl(&mut self) {
         let m = self.start();
 
+        self.optional_pub();
         self.expect(SyntaxKind::Mod);
         self.expect(SyntaxKind::Ident);
 
@@ -527,6 +554,7 @@ impl<'s> Parser<'s> {
     fn use_decl(&mut self) {
         let m = self.start();
 
+        self.optional_pub();
         self.expect(SyntaxKind::Use);
         self.use_tree();
         self.expect(SyntaxKind::Semi);
@@ -655,10 +683,11 @@ impl<'s> Parser<'s> {
     fn func_decl(&mut self) {
         let m = self.start();
 
-        self.bump();
+        self.optional_pub();
+        self.expect(SyntaxKind::Fun);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params();
+            self.generic_params(true);
         }
 
         self.param_list();
@@ -715,10 +744,11 @@ impl<'s> Parser<'s> {
 
     fn struct_decl(&mut self) {
         let m = self.start();
-        self.bump();
+        self.optional_pub();
+        self.expect(SyntaxKind::Struct);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params();
+            self.generic_params(false);
         }
         self.struct_field_list();
         m.complete(self, SyntaxKind::StructDecl);
@@ -746,6 +776,7 @@ impl<'s> Parser<'s> {
     fn struct_field(&mut self) {
         self.attrs();
         let m = self.start();
+        self.optional_pub();
         self.expect(SyntaxKind::Ident);
         self.expect(SyntaxKind::Colon);
         self.ty();
@@ -1440,10 +1471,11 @@ impl<'s> Parser<'s> {
     fn enum_decl(&mut self) {
         let m = self.start();
 
+        self.optional_pub();
         self.expect(SyntaxKind::Enum);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params();
+            self.generic_params(false);
         }
         self.expect(SyntaxKind::LBrace);
 
@@ -1494,6 +1526,7 @@ impl<'s> Parser<'s> {
     fn trait_decl(&mut self) {
         let m = self.start();
 
+        self.optional_pub();
         self.expect(SyntaxKind::Trait);
         self.expect(SyntaxKind::Ident);
         self.expect(SyntaxKind::LBrace);
@@ -1509,6 +1542,11 @@ impl<'s> Parser<'s> {
     fn trait_item(&mut self) {
         self.attrs();
         match self.current() {
+            SyntaxKind::Pub => match self.nth(1) {
+                SyntaxKind::Fun => self.func_sig(),
+                SyntaxKind::TypeKw => self.type_alias_decl(),
+                _ => self.error(format!("expected trait item, found {:?}", self.current())),
+            },
             SyntaxKind::Fun => self.func_sig(),
             SyntaxKind::TypeKw => self.type_alias_decl(),
             _ => {
@@ -1520,10 +1558,11 @@ impl<'s> Parser<'s> {
     fn func_sig(&mut self) {
         let m = self.start();
 
+        self.optional_pub();
         self.expect(SyntaxKind::Fun);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params();
+            self.generic_params(true);
         }
         self.param_list();
 
@@ -1543,7 +1582,7 @@ impl<'s> Parser<'s> {
 
         // optional generic_params
         if self.at(SyntaxKind::Less) {
-            self.generic_params();
+            self.generic_params(true);
         }
 
         self.ty();
@@ -1567,6 +1606,12 @@ impl<'s> Parser<'s> {
     fn impl_item(&mut self) {
         self.attrs();
         match self.current() {
+            SyntaxKind::Pub => match self.nth(1) {
+                SyntaxKind::Fun => self.func_decl(),
+                SyntaxKind::TypeKw => self.type_alias_decl(),
+                SyntaxKind::Const => self.const_decl(),
+                _ => self.error(format!("expected impl item, found {:?}", self.current())),
+            },
             SyntaxKind::Fun => self.func_decl(),
             SyntaxKind::TypeKw => self.type_alias_decl(),
             SyntaxKind::Const => self.const_decl(),
@@ -1579,6 +1624,7 @@ impl<'s> Parser<'s> {
     fn const_decl(&mut self) {
         let m = self.start();
 
+        self.optional_pub();
         self.expect(SyntaxKind::Const);
         self.expect(SyntaxKind::Ident);
         self.expect(SyntaxKind::Colon);
@@ -1596,6 +1642,7 @@ impl<'s> Parser<'s> {
     fn type_alias_decl(&mut self) {
         let m = self.start();
 
+        self.optional_pub();
         self.expect(SyntaxKind::TypeKw);
         self.expect(SyntaxKind::Ident);
 
@@ -1608,18 +1655,62 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::TypeAliasDecl);
     }
 
-    fn generic_params(&mut self) {
+    fn generic_params(&mut self, allow_bounds: bool) {
         let m = self.start();
 
         self.expect(SyntaxKind::Less);
-        self.expect(SyntaxKind::Ident);
+        self.generic_param(allow_bounds);
         while self.at(SyntaxKind::Comma) {
             self.bump();
-            self.expect(SyntaxKind::Ident);
+            self.generic_param(allow_bounds);
         }
         self.expect(SyntaxKind::Greater);
 
         m.complete(self, SyntaxKind::GenericParams);
+    }
+
+    fn generic_param(&mut self, allow_bounds: bool) {
+        self.expect(SyntaxKind::Ident);
+        if allow_bounds && self.at(SyntaxKind::Colon) {
+            self.bump();
+            self.generic_bound();
+            while self.at(SyntaxKind::Plus) {
+                self.bump();
+                self.generic_bound();
+            }
+        }
+    }
+
+    fn generic_bound(&mut self) {
+        self.path();
+        if self.at(SyntaxKind::Less) {
+            self.bump();
+            if !self.at(SyntaxKind::Greater) && !self.at(SyntaxKind::Eof) {
+                self.generic_bound_arg();
+                while self.at(SyntaxKind::Comma) {
+                    self.bump();
+                    if self.at(SyntaxKind::Greater) {
+                        break;
+                    }
+                    self.generic_bound_arg();
+                }
+            }
+            if self.at(SyntaxKind::Shr) {
+                self.split_shr_as_greater();
+            } else {
+                self.expect(SyntaxKind::Greater);
+            }
+        }
+    }
+
+    fn generic_bound_arg(&mut self) {
+        if self.at(SyntaxKind::Ident) && self.nth(1) == SyntaxKind::Eq {
+            self.bump();
+            self.bump();
+            self.ty();
+        } else {
+            self.ty();
+        }
     }
 
     fn type_list(&mut self) {
@@ -1650,6 +1741,7 @@ impl<'s> Parser<'s> {
     fn extern_decl(&mut self) {
         self.attrs();
         let m = self.start();
+        self.optional_pub();
         self.expect(SyntaxKind::Extern);
         let _abi = self.expect(SyntaxKind::String); // "C"
 

@@ -14,7 +14,7 @@ use rowan::ast::SyntaxNodePtr;
 use crate::{
     TypeCheckResult,
     checker::TypeChecker,
-    result::{Diagnostic, GenericCall},
+    result::{Diagnostic, GenericCall, OperatorCall, TraitMethodCall},
     types::Type,
 };
 
@@ -42,6 +42,8 @@ struct CachedBody {
     diagnostics: Vec<Diagnostic>,
     expr_types: Vec<(ExprId, Type)>,
     generic_calls: Vec<(ExprId, GenericCall)>,
+    trait_method_calls: Vec<(ExprId, TraitMethodCall)>,
+    operator_calls: Vec<(ExprId, OperatorCall)>,
 }
 
 pub fn check_hir_incremental(
@@ -104,6 +106,22 @@ impl IncrementalTypeChecker {
                     (*checked_body == body_id).then(|| (*expr, call.clone()))
                 })
                 .collect();
+            let trait_method_calls = checker
+                .result
+                .trait_method_calls
+                .iter()
+                .filter_map(|((checked_body, expr), call)| {
+                    (*checked_body == body_id).then(|| (*expr, call.clone()))
+                })
+                .collect();
+            let operator_calls = checker
+                .result
+                .operator_calls
+                .iter()
+                .filter_map(|((checked_body, expr), call)| {
+                    (*checked_body == body_id).then(|| (*expr, call.clone()))
+                })
+                .collect();
 
             self.bodies.insert(
                 ptr,
@@ -113,6 +131,8 @@ impl IncrementalTypeChecker {
                     diagnostics,
                     expr_types,
                     generic_calls,
+                    trait_method_calls,
+                    operator_calls,
                 },
             );
         }
@@ -135,6 +155,14 @@ fn replay_cached_body(result: &mut TypeCheckResult, body_id: BodyId, cached: &Ca
     }
     for (expr, call) in &cached.generic_calls {
         result.generic_calls.insert((body_id, *expr), call.clone());
+    }
+    for (expr, call) in &cached.trait_method_calls {
+        result
+            .trait_method_calls
+            .insert((body_id, *expr), call.clone());
+    }
+    for (expr, call) in &cached.operator_calls {
+        result.operator_calls.insert((body_id, *expr), call.clone());
     }
 }
 

@@ -43,6 +43,18 @@ pub enum TopLevelItem {
 }
 
 #[derive(Debug, Clone)]
+pub enum Visibility {
+    Private,
+    Public,
+}
+
+impl Visibility {
+    pub fn is_public(&self) -> bool {
+        matches!(self, Visibility::Public)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct HirAttr {
     pub name: Name,
     pub value: Option<String>,
@@ -52,11 +64,26 @@ pub struct HirAttr {
 #[derive(Debug, Clone)]
 pub struct HirFunction {
     pub name: Name,
+    pub visibility: Visibility,
     pub generics: Vec<Name>,
+    pub generic_bounds: Vec<HirGenericBound>,
     pub params: Vec<HirParam>,
     pub ret_type: Option<HirTypeRef>,
     pub has_body: bool,
     pub attrs: Vec<HirAttr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HirGenericBound {
+    pub param: Name,
+    pub trait_ty: HirTypeRef,
+    pub assoc_constraints: Vec<HirAssocTypeConstraint>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HirAssocTypeConstraint {
+    pub name: Name,
+    pub ty: HirTypeRef,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +96,7 @@ pub struct HirParam {
 #[derive(Debug, Clone)]
 pub struct HirStruct {
     pub name: Name,
+    pub visibility: Visibility,
     pub name_range: TextRange,
     pub generics: Vec<Name>,
     pub fields: Vec<HirStructField>,
@@ -86,6 +114,7 @@ pub struct HirStructField {
 #[derive(Debug, Clone)]
 pub struct HirEnum {
     pub name: Name,
+    pub visibility: Visibility,
     pub generics: Vec<Name>,
     pub variants: Vec<HirEnumVariant>,
     pub attrs: Vec<HirAttr>,
@@ -111,6 +140,7 @@ pub enum HirVariantKind {
 #[derive(Debug, Clone)]
 pub struct HirTrait {
     pub name: Name,
+    pub visibility: Visibility,
     pub methods: Vec<HirFunction>,
     pub type_aliases: Vec<HirTypeAlias>,
     pub attrs: Vec<HirAttr>,
@@ -123,6 +153,7 @@ pub struct HirImpl {
     /// The trait being implemented, if any (`Trait` in `impl Trait for T`).
     pub trait_ty: Option<HirTypeRef>,
     pub generics: Vec<Name>,
+    pub generic_bounds: Vec<HirGenericBound>,
     pub methods: Vec<FunctionId>,
     pub consts: Vec<ConstId>,
     pub type_aliases: Vec<TypeAliasId>,
@@ -132,6 +163,7 @@ pub struct HirImpl {
 #[derive(Debug, Clone)]
 pub struct HirConst {
     pub name: Name,
+    pub visibility: Visibility,
     pub ty: HirTypeRef,
     pub has_value: bool,
     pub attrs: Vec<HirAttr>,
@@ -140,6 +172,7 @@ pub struct HirConst {
 #[derive(Debug, Clone)]
 pub struct HirTypeAlias {
     pub name: Name,
+    pub visibility: Visibility,
     pub ty: Option<HirTypeRef>,
     pub attrs: Vec<HirAttr>,
 }
@@ -147,6 +180,7 @@ pub struct HirTypeAlias {
 #[derive(Debug, Clone)]
 pub struct HirModule {
     pub name: Name,
+    pub visibility: Visibility,
     /// `mod foo;` → None; `mod foo { ... }` → Some(items)
     pub items: Option<Vec<TopLevelItem>>,
     pub attrs: Vec<HirAttr>,
@@ -155,6 +189,7 @@ pub struct HirModule {
 #[derive(Debug, Clone)]
 pub struct HirUse {
     pub tree: HirUseTree,
+    pub visibility: Visibility,
     pub attrs: Vec<HirAttr>,
 }
 

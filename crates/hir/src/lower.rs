@@ -9,9 +9,10 @@ use frontend::syntax_kind::{SyntaxKind, SyntaxToken};
 use super::{
     Name,
     item_tree::{
-        ConstId, EnumId, FunctionId, HirAttr, HirConst, HirEnum, HirEnumVariant, HirFunction,
-        HirParam, HirPath, HirStruct, HirStructField, HirTrait, HirTypeAlias, HirTypeRef,
-        HirUseTree, HirUseTreeKind, HirVariantKind, PathAnchor, StructId, TraitId, TypeAliasId,
+        ConstId, EnumId, FunctionId, HirAssocTypeConstraint, HirAttr, HirConst, HirEnum,
+        HirEnumVariant, HirFunction, HirGenericBound, HirParam, HirPath, HirStruct, HirStructField,
+        HirTrait, HirTypeAlias, HirTypeRef, HirUseTree, HirUseTreeKind, HirVariantKind, PathAnchor,
+        StructId, TraitId, TypeAliasId, Visibility,
     },
 };
 
@@ -33,7 +34,31 @@ pub fn lower_name(name: Option<SyntaxToken>) -> Name {
 
 pub fn lower_generic_params(params: Option<ast::GenericParams>) -> Vec<Name> {
     params
-        .map(|g| g.names().map(|t| Name(t.text().to_string())).collect())
+        .map(|g| g.params().map(|param| Name(param.name)).collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+pub fn lower_generic_bounds(params: Option<ast::GenericParams>) -> Vec<HirGenericBound> {
+    params
+        .map(|g| {
+            g.params()
+                .flat_map(|param| {
+                    let name = Name(param.name);
+                    param.bounds.into_iter().map(move |bound| HirGenericBound {
+                        param: name.clone(),
+                        trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                        assoc_constraints: bound
+                            .assoc_constraints
+                            .into_iter()
+                            .map(|constraint| HirAssocTypeConstraint {
+                                name: Name(constraint.name),
+                                ty: constraint.ty.lower(),
+                            })
+                            .collect(),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -46,6 +71,14 @@ pub fn lower_attrs(node: &frontend::syntax_kind::SyntaxNode) -> Vec<HirAttr> {
             raw: attr.raw_text(),
         })
         .collect()
+}
+
+pub fn lower_visibility(is_pub: bool) -> Visibility {
+    if is_pub {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
 }
 
 impl Lower for Param {
@@ -63,7 +96,9 @@ impl AstLower for FuncDecl {
     type Item = HirFunction;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
         let name = lower_name(self.name());
-        let generics = lower_generic_params(self.generic_params());
+        let generic_params = self.generic_params();
+        let generics = lower_generic_params(generic_params.clone());
+        let generic_bounds = lower_generic_bounds(generic_params);
         let params = self
             .param_list()
             .map(|pl| pl.params().map(|p| p.lower()).collect())
@@ -71,9 +106,12 @@ impl AstLower for FuncDecl {
         let ret_type = self.return_type().map(|ty| ty.lower());
         let has_body = self.body().is_some();
         let attrs = lower_attrs(self.syntax());
+        let visibility = lower_visibility(self.is_pub());
         arena.alloc(HirFunction {
             name,
+            visibility,
             generics,
+            generic_bounds,
             params,
             ret_type,
             has_body,
@@ -104,8 +142,10 @@ impl AstLower for StructDecl {
         let generics = lower_generic_params(self.generic_params());
         let fields = self.field_list().lower();
         let attrs = lower_attrs(self.syntax());
+        let visibility = lower_visibility(self.is_pub());
         arena.alloc(HirStruct {
             name,
+            visibility,
             name_range,
             generics,
             fields,
@@ -122,8 +162,10 @@ impl AstLower for ast::EnumDecl {
         let generics = lower_generic_params(self.generic_params());
         let variants = self.variants().map(|v| v.lower()).collect();
         let attrs = lower_attrs(self.syntax());
+        let visibility = lower_visibility(self.is_pub());
         arena.alloc(HirEnum {
             name,
+            visibility,
             generics,
             variants,
             attrs,
@@ -153,18 +195,35 @@ impl AstLower for ast::TraitDecl {
     type Item = HirTrait;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
         let name = lower_name(self.name());
+        let visibility = lower_visibility(self.is_pub());
         let methods = self
             .methods()
             .map(|m| {
                 let mname = lower_name(m.name());
                 let params = m
                     .param_list()
-                    .map(|pl| pl.params().map(|p| p.lower()).collect())
+                    .map(|pl| {
+                        pl.params()
+                            .map(|p| {
+                                let is_self = p.is_self_receiver();
+                                let is_ref = p.is_ref();
+                                let is_mut = p.is_mut();
+                                let mut param = p.lower();
+                                if is_self {
+                                    param.ty = self_receiver_type(is_ref, is_mut);
+                                }
+                                param
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let ret_type = m.return_type().map(|ty| ty.lower());
+                let generic_params = m.generic_params();
                 HirFunction {
                     name: mname,
-                    generics: lower_generic_params(m.generic_params()),
+                    visibility: lower_visibility(m.is_pub()),
+                    generics: lower_generic_params(generic_params.clone()),
+                    generic_bounds: lower_generic_bounds(generic_params),
                     params,
                     ret_type,
                     has_body: m.body().is_some(),
@@ -176,6 +235,7 @@ impl AstLower for ast::TraitDecl {
             .type_aliases()
             .map(|t| HirTypeAlias {
                 name: lower_name(t.name()),
+                visibility: lower_visibility(t.is_pub()),
                 ty: t.ty().map(|ty| ty.lower()),
                 attrs: lower_attrs(t.syntax()),
             })
@@ -183,10 +243,24 @@ impl AstLower for ast::TraitDecl {
         let attrs = lower_attrs(self.syntax());
         arena.alloc(HirTrait {
             name,
+            visibility,
             methods,
             type_aliases,
             attrs,
         })
+    }
+}
+
+fn self_receiver_type(is_ref: bool, is_mut: bool) -> HirTypeRef {
+    let self_ty = HirTypeRef::Named(HirPath {
+        anchor: PathAnchor::Plain,
+        segments: vec![Name("Self".into())],
+        type_args: Vec::new(),
+    });
+    if is_ref {
+        HirTypeRef::Ref(Box::new(self_ty), is_mut)
+    } else {
+        self_ty
     }
 }
 
@@ -198,8 +272,10 @@ impl AstLower for ast::ConstDecl {
         let ty = self.ty().lower();
         let has_value = self.value().is_some();
         let attrs = lower_attrs(self.syntax());
+        let visibility = lower_visibility(self.is_pub());
         arena.alloc(HirConst {
             name,
+            visibility,
             ty,
             has_value,
             attrs,
@@ -214,7 +290,13 @@ impl AstLower for ast::TypeAliasDecl {
         let name = lower_name(self.name());
         let ty = self.ty().map(|t| t.lower());
         let attrs = lower_attrs(self.syntax());
-        arena.alloc(HirTypeAlias { name, ty, attrs })
+        let visibility = lower_visibility(self.is_pub());
+        arena.alloc(HirTypeAlias {
+            name,
+            visibility,
+            ty,
+            attrs,
+        })
     }
 }
 

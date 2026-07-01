@@ -83,7 +83,7 @@ fn incremental_multi_edit_inline_module_definition_updates_path_resolution() {
         r#"
         fun f() {
             mod local {
-                struct Hidden {}
+                pub struct Hidden {}
             }
 
             local::Thing;
@@ -117,8 +117,8 @@ fn incremental_multi_edit_use_alias_retargets_resolution() {
     parser.set_source(
         r#"
         mod a {
-            struct Left {}
-            struct Right {}
+            pub struct Left {}
+            pub struct Right {}
         }
 
         use crate::a::Left as Pick;

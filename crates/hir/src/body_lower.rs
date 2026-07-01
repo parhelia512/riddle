@@ -150,7 +150,9 @@ impl<'a> BodyLower<'a> {
         let range = stmt.syntax().text_range();
         match stmt {
             ast::Stmt::VarDecl(var) => {
-                let name = lower_name(var.name());
+                let name_token = var.name();
+                let name_range = name_token.as_ref().map(|token| token.text_range());
+                let name = lower_name(name_token);
                 let ty_ast = var.ty();
                 let ty_range = ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
                 let ty = self.lower_optional_type(ty_ast);
@@ -159,6 +161,7 @@ impl<'a> BodyLower<'a> {
                 Some(self.alloc_stmt(
                     Stmt::Let {
                         name,
+                        name_range,
                         ty,
                         ty_range,
                         init,
@@ -195,11 +198,11 @@ impl<'a> BodyLower<'a> {
                 };
                 let tree = tree_ast.lower();
                 let attrs = crate::lower::lower_attrs(u.syntax());
-                let uid = self
-                    .hir
-                    .item_tree
-                    .uses
-                    .alloc(crate::item_tree::HirUse { tree, attrs });
+                let uid = self.hir.item_tree.uses.alloc(crate::item_tree::HirUse {
+                    tree,
+                    visibility: crate::item_tree::Visibility::Private,
+                    attrs,
+                });
                 Some(self.alloc_stmt(
                     Stmt::Item {
                         item: BodyItem::Use(uid),

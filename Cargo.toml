@@ -13,7 +13,7 @@ members = ["app/clue",
     "crates/type-checker",
 ]
 default-members = [
-    ".",
+    "app/clue",
     "app/riddle-lsp",
     "app/riddlec",
     "crates/ast",
@@ -44,12 +44,44 @@ scope-graph = { path = "crates/scope-graph" }
 type-checker = { path = "crates/type-checker" }
 mir = { path = "crates/mir" }
 riddlec = { path = "app/riddlec" }
+toml = "0.8"
 
 [package]
 name = "riddle"
 version.workspace = true
 edition.workspace = true
 publish = false
+
+[dependencies]
+clap.workspace = true
+frontend.workspace = true
+hir.workspace = true
+lsp-types = "0.94.1"
+mir.workspace = true
+riddlec.workspace = true
+rowan.workspace = true
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+toml.workspace = true
+tower-lsp = "0.20.0"
+type-checker.workspace = true
+
+[features]
+install-bins = []
+
+[[bin]]
+name = "clue"
+path = "app/clue/src/main.rs"
+required-features = ["install-bins"]
+
+[[bin]]
+name = "riddle-lsp"
+path = "app/riddle-lsp/src/main.rs"
+required-features = ["install-bins"]
+
+[[bin]]
+name = "riddlec"
+path = "app/riddlec/src/main.rs"
+required-features = ["install-bins"]
 
 [dev-dependencies]
 ast.workspace = true

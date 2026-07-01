@@ -1,4 +1,8 @@
+mod manifest;
+mod package;
+
 use clap::{Args, Parser, Subcommand};
+use manifest::{CLUE_PROJECT_FILE_NAME, CLUE_PROJECT_FILE_TEMPLATE};
 use riddlec::pipeline;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
@@ -10,13 +14,6 @@ use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process;
 
-const CLUE_PROJECT_FILE_NAME: &str = "Clue.toml";
-const CLUE_PROJECT_FILE_TEMPLATE: &str = r#"[package]
-name = "{package_name}"
-version = "0.1.0"
-
-[dependencies]
-"#;
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 
 #[derive(Parser, Debug)]
@@ -75,28 +72,22 @@ fn package_name_from_path(path: &Path) -> io::Result<String> {
 
 fn build(arg: BuildArg) -> io::Result<()> {
     let root = arg.path.unwrap_or_else(|| PathBuf::from("."));
-    let manifest = root.join(CLUE_PROJECT_FILE_NAME);
-    let manifest_text = fs::read_to_string(&manifest)?;
-    let package_name = package_name(&manifest_text).ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!("missing package name in `{}`", manifest.display()),
-        )
-    })?;
-    let entry = entry_file(&root, &package_name)?;
-    let loaded = pipeline::load_source_file(&entry)?;
-    let result = pipeline::compile(&loaded.source);
-    let errors =
-        riddlec::diagnostics::report(&result, Some(&loaded.source), &entry.display().to_string());
+    let package = package::load(&root)?;
+    let result = pipeline::compile(&package.source.source);
+    let errors = riddlec::diagnostics::report(
+        &result,
+        Some(&package.source.source),
+        &package.entry.display().to_string(),
+    );
     if errors > 0 || !result.success() {
         return Err(Error::new(ErrorKind::InvalidData, "build failed"));
     }
 
     let build_dir = root.join(".clue").join("build");
     create_dir_all(&build_dir)?;
-    let c_path = build_dir.join(format!("{package_name}.c"));
-    let hash_path = build_dir.join(format!("{package_name}.hash"));
-    let hash = fingerprint(&manifest_text, &loaded.source);
+    let c_path = build_dir.join(format!("{}.c", package.name));
+    let hash_path = build_dir.join(format!("{}.hash", package.name));
+    let hash = fingerprint(&package.manifest_fingerprint, &package.source.source);
     if fs::read_to_string(&hash_path).unwrap_or_default() == hash && c_path.is_file() {
         println!("clue: fresh {}", c_path.display());
         return Ok(());
@@ -111,39 +102,6 @@ fn build(arg: BuildArg) -> io::Result<()> {
     fs::write(&hash_path, hash)?;
     println!("clue: built {}", c_path.display());
     Ok(())
-}
-
-fn package_name(manifest: &str) -> Option<String> {
-    for line in manifest.lines().map(str::trim) {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "name" {
-            continue;
-        }
-        let value = value.trim().trim_matches('"');
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn entry_file(root: &Path, package_name: &str) -> io::Result<PathBuf> {
-    for path in [
-        root.join("src").join("main.rid"),
-        root.join(format!("{package_name}.rid")),
-        root.join("main.rid"),
-    ] {
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-
-    Err(Error::new(
-        ErrorKind::NotFound,
-        "missing entry file; expected src/main.rid, <package>.rid, or main.rid",
-    ))
 }
 
 fn fingerprint(manifest: &str, source: &str) -> String {

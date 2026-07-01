@@ -42,9 +42,9 @@ fn plain_paths_climb_out_of_inner_modules() {
 fn multi_segment_reference_uses_reverse_push_chain() {
     let sg = build(
         r#"
-        mod a {
-            mod b {
-                struct C {}
+        pub mod a {
+            pub mod b {
+                pub struct C {}
             }
         }
 
@@ -80,4 +80,45 @@ fn multi_segment_reference_uses_reverse_push_chain() {
     assert_eq!(chain, vec!["C", "b", "a"]);
     assert_eq!(current, sg.root);
     assert_eq!(resolve_paths(&sg, "a::b::C"), vec![vec![DefKind::Struct]]);
+}
+
+#[test]
+fn module_paths_only_export_pub_items() {
+    let sg = build(
+        r#"
+        mod m {
+            pub fun open() -> i32 { 1 }
+            fun hidden() -> i32 { 2 }
+        }
+
+        fun f() {
+            m::open();
+            m::hidden()
+        }
+        "#,
+    );
+
+    assert_eq!(resolve_paths(&sg, "m::open"), vec![vec![DefKind::Function]]);
+    assert_eq!(resolve_paths(&sg, "m::hidden"), vec![vec![]]);
+}
+
+#[test]
+fn pub_use_re_exports_item_from_module() {
+    let sg = build(
+        r#"
+        mod inner {
+            pub struct S {}
+        }
+
+        mod outer {
+            pub use crate::inner::S;
+        }
+
+        fun f() {
+            outer::S
+        }
+        "#,
+    );
+
+    assert_eq!(resolve_paths(&sg, "outer::S"), vec![vec![DefKind::Struct]]);
 }

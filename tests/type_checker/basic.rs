@@ -186,7 +186,9 @@ fn reports_uninferred_generic_function_type_arg() {
 
 #[test]
 fn reports_growing_generic_recursion() {
-    let result = check(include_str!("../../examples/generic_wrap_recursion.rid"));
+    let result = check(include_str!(
+        "../../examples/regressions/generic_wrap_recursion.rid"
+    ));
 
     assert!(result.diagnostics.iter().any(|diag| {
         diag.message
