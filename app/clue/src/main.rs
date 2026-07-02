@@ -2,7 +2,7 @@ mod manifest;
 mod package;
 
 use clap::{Args, Parser, Subcommand};
-use manifest::{CLUE_PROJECT_FILE_NAME, CLUE_PROJECT_FILE_TEMPLATE};
+use manifest::{CLUE_PROJECT_FILE_NAME, PackageKind};
 use riddlec::pipeline;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
@@ -32,7 +32,21 @@ enum Commands {
 
 #[derive(Args, Debug, Clone)]
 struct InitArg {
+    #[arg(long, conflicts_with = "lib")]
+    bin: bool,
+    #[arg(long, conflicts_with = "bin")]
+    lib: bool,
     path: PathBuf,
+}
+
+impl InitArg {
+    fn package_kind(&self) -> PackageKind {
+        if self.lib {
+            PackageKind::Library
+        } else {
+            PackageKind::Binary
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -40,7 +54,7 @@ struct BuildArg {
     path: Option<PathBuf>,
 }
 
-fn try_create_package(path: impl AsRef<Path>) -> Result<(), Error> {
+fn try_create_package(path: impl AsRef<Path>, kind: PackageKind) -> Result<(), Error> {
     let path = path.as_ref();
     match create_dir(path) {
         Err(error) => {
@@ -53,7 +67,7 @@ fn try_create_package(path: impl AsRef<Path>) -> Result<(), Error> {
     let package_name = package_name_from_path(path)?;
     write(
         path.join(CLUE_PROJECT_FILE_NAME),
-        CLUE_PROJECT_FILE_TEMPLATE.replace("{package_name}", &package_name),
+        manifest::new_manifest(&package_name, kind),
     )?;
     write(path.join(GITIGNORE_FILE_NAME), "/.clue")?;
     Ok(())
@@ -115,11 +129,34 @@ fn fingerprint(manifest: &str, source: &str) -> String {
 fn main() {
     let args = Arg::parse();
     let result = match args.command {
-        Commands::Init(arg) => try_create_package(arg.path),
+        Commands::Init(arg) => {
+            let kind = arg.package_kind();
+            try_create_package(arg.path, kind)
+        }
         Commands::Build(arg) => build(arg),
     };
     if let Err(error) = result {
         eprintln!("clue: {error}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_lib_selects_library_kind() {
+        let args = Arg::try_parse_from(["clue", "init", "--lib", "hello"]).unwrap();
+        let Commands::Init(arg) = args.command else {
+            panic!("expected init command");
+        };
+
+        assert_eq!(arg.package_kind(), PackageKind::Library);
+    }
+
+    #[test]
+    fn init_bin_and_lib_conflict() {
+        assert!(Arg::try_parse_from(["clue", "init", "--bin", "--lib", "hello"]).is_err());
     }
 }

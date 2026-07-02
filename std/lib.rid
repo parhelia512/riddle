@@ -1,3 +1,90 @@
+pub enum Option<T> {
+    Some(T),
+    None,
+}
+
+pub trait Iterator {
+    type Item;
+
+    fun next(&mut self) -> Option<Self::Item>;
+}
+
+pub trait IntoIterator {
+    type Item;
+    type IntoIter;
+
+    fun into_iter(self) -> Self::IntoIter;
+}
+
+pub struct ArrayIter<T, const N: usize> {
+    values: [T; N],
+    index: usize,
+}
+
+impl<T: std::marker::Copy, const N: usize> Iterator for ArrayIter<T, N> {
+    type Item = T;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.index < N {
+            let value = self.values[self.index];
+            self.index += 1usize;
+            Option::Some(value)
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl<T: std::marker::Copy, const N: usize> IntoIterator for [T; N] {
+    type Item = T;
+    type IntoIter = ArrayIter<T, N>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        ArrayIter {
+            values: self,
+            index: 0usize,
+        }
+    }
+}
+
+pub struct Range {
+    start: i32,
+    end: i32,
+}
+
+impl Range {
+    pub fun new(start: i32, end: i32) -> Range {
+        Range { start, end }
+    }
+}
+
+pub fun range(start: i32, end: i32) -> Range {
+    Range::new(start, end)
+}
+
+impl Iterator for Range {
+    type Item = i32;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.start < self.end {
+            let value = self.start;
+            self.start += 1;
+            Option::Some(value)
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl IntoIterator for Range {
+    type Item = i32;
+    type IntoIter = Range;
+
+    fun into_iter(self) -> Self::IntoIter {
+        self
+    }
+}
+
 pub mod std {
     pub mod marker {
         #[lang = "copy"]

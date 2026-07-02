@@ -21,11 +21,20 @@ pub enum Type {
         inner: Box<Type>,
     },
     Tuple(Vec<Type>),
-    Array(Box<Type>, usize),
+    Array(Box<Type>, ConstArg),
     Struct(StructId, Vec<Type>),
     Enum(EnumId, Vec<Type>),
     Param(String),
+    Const(ConstArg),
     Function(FunctionId),
+    Unknown,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConstArg {
+    Value(usize),
+    Param(String),
     Unknown,
     Error,
 }
@@ -82,7 +91,7 @@ impl Type {
                     .join(", ");
                 format!("({inner})")
             }
-            Type::Array(inner, len) => format!("[{}; {}]", inner.display(hir), len),
+            Type::Array(inner, len) => format!("[{}; {}]", inner.display(hir), len.display()),
             Type::Struct(id, args) => {
                 let HirStruct { name, .. } = &hir.item_tree.structs[*id];
                 if args.is_empty() {
@@ -114,6 +123,7 @@ impl Type {
                 format!("fun {}", function.name.0)
             }
             Type::Param(name) => name.clone(),
+            Type::Const(value) => value.display(),
             Type::Unknown => "_".to_string(),
             Type::Error => "<error>".to_string(),
         }
@@ -182,6 +192,28 @@ impl Type {
         } else {
             self
         }
+    }
+}
+
+impl ConstArg {
+    pub fn display(&self) -> String {
+        match self {
+            ConstArg::Value(value) => value.to_string(),
+            ConstArg::Param(name) => name.clone(),
+            ConstArg::Unknown => "_".to_string(),
+            ConstArg::Error => "<error>".to_string(),
+        }
+    }
+
+    pub fn as_usize(&self) -> Option<usize> {
+        match self {
+            ConstArg::Value(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_unknown_like(&self) -> bool {
+        matches!(self, ConstArg::Unknown | ConstArg::Error)
     }
 }
 

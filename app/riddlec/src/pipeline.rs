@@ -347,4 +347,54 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn std_range_iterator_type_checks() {
+        let result = compile(
+            r#"
+            fun main() {
+                let mut iter = range(0, 3);
+                let first = iter.next();
+            }
+            "#,
+        );
+
+        assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    }
+
+    #[test]
+    fn std_range_for_loop_lowers_to_mir_loop() {
+        let result = compile(
+            r#"
+            fun main() {
+                let mut sum = 0;
+                for item in range(0, 3) {
+                    sum += item;
+                }
+            }
+            "#,
+        );
+
+        assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+        let module = result
+            .mir_module
+            .expect("successful compile should lower MIR");
+        let main_id = module
+            .function_order
+            .iter()
+            .copied()
+            .find(|id| module.functions[*id].name == "main")
+            .expect("main function should be lowered");
+        let main = &module.functions[main_id];
+        let has_loop_branch = main
+            .blocks
+            .iter()
+            .any(|(_, block)| matches!(block.terminator, mir::instr::Terminator::CondBranch(..)));
+        assert!(has_loop_branch, "{main:#?}");
+        assert!(
+            !generate_c(&module)
+                .expect("C backend should lower for loop")
+                .is_empty()
+        );
+    }
 }

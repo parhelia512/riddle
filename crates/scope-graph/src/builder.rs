@@ -5,7 +5,7 @@ use rowan::ast::SyntaxNodePtr;
 use frontend::syntax_kind::{RiddleLang, SyntaxNode};
 use hir::{
     HirFile, Name,
-    body::{Body, BodyId, BodyItem, Expr, ExprId, MatchArm, PatId, Pattern, Stmt, StmtId},
+    body::{Body, BodyId, BodyItem, Expr, ExprId, PatId, Pattern, Stmt, StmtId},
     item_tree::{
         EnumId, FunctionId, HirPath, HirTypeRef, HirUseTree, HirUseTreeKind, ModuleId, PathAnchor,
         StructId, TopLevelItem,
@@ -375,11 +375,38 @@ impl<'a> ScopeGraphBuilder<'a> {
             frag_edges.push(e);
         }
 
+        for name in self
+            .impl_const_generics_for_method(fid)
+            .into_iter()
+            .chain(func.const_generics.clone())
+        {
+            let pop = self.sg.alloc_node(Node::PopSymbol {
+                name: name.clone(),
+                define: DefRef::ConstParam { name },
+            });
+            frag_nodes.push(pop);
+            let e = self.sg.add_edge(fn_scope, pop, EdgeKind::Def, 0);
+            frag_edges.push(e);
+        }
+
         // Encode the body as a separate fragment.
         if let Some(bid) = self.hir.function_bodies.get(&fid).copied() {
             let body = &self.hir.bodies[bid];
             self.encode_body_as_fragment(bid, body, fn_scope);
         }
+    }
+
+    fn impl_const_generics_for_method(&self, fid: FunctionId) -> Vec<hir::Name> {
+        self.hir
+            .item_tree
+            .impls
+            .iter()
+            .find_map(|(_, imp)| {
+                imp.methods
+                    .contains(&fid)
+                    .then(|| imp.const_generics.clone())
+            })
+            .unwrap_or_default()
     }
 
     fn encode_struct_impl_scope(
@@ -889,11 +916,21 @@ impl<'a> ScopeGraphBuilder<'a> {
                 self.walk_expr_for_refs(body_id, body, *condition, current_scope, nodes, edges);
                 self.walk_expr_for_refs(body_id, body, *b, current_scope, nodes, edges);
             }
+            Expr::For {
+                pat,
+                iterable,
+                body: b,
+            } => {
+                self.walk_expr_for_refs(body_id, body, *iterable, current_scope, nodes, edges);
+                let body_scope =
+                    self.walk_pat_for_bindings(body, *pat, current_scope, nodes, edges);
+                self.walk_expr_for_refs(body_id, body, *b, body_scope, nodes, edges);
+            }
             Expr::Match { scrutinee, arms } => {
                 self.walk_expr_for_refs(body_id, body, *scrutinee, current_scope, nodes, edges);
                 for arm in arms {
                     let arm_scope =
-                        self.walk_pat_for_bindings(body_id, body, arm, current_scope, nodes, edges);
+                        self.walk_pat_for_bindings(body, arm.pat, current_scope, nodes, edges);
                     if let Some(g) = arm.guard {
                         self.walk_expr_for_refs(body_id, body, g, arm_scope, nodes, edges);
                     }
@@ -983,15 +1020,14 @@ impl<'a> ScopeGraphBuilder<'a> {
     /// each introduced binding.
     fn walk_pat_for_bindings(
         &mut self,
-        _body_id: BodyId,
         body: &Body,
-        arm: &MatchArm,
+        pat: PatId,
         parent_scope: NodeId,
         nodes: &mut Vec<NodeId>,
         edges: &mut Vec<EdgeId>,
     ) -> NodeId {
         let mut scope = parent_scope;
-        self.emit_pat_bindings(body, arm.pat, &mut scope, nodes, edges);
+        self.emit_pat_bindings(body, pat, &mut scope, nodes, edges);
         scope
     }
 

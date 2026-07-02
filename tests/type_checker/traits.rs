@@ -497,6 +497,208 @@ fn allows_trait_bound_method_call_in_generic_body() {
 }
 
 #[test]
+fn accepts_iterator_next_protocol() {
+    let result = check(
+        r#"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        struct Counter {
+            current: i32,
+        }
+
+        impl Iterator for Counter {
+            type Item = i32;
+
+            fun next(&mut self) -> Option<Self::Item> {
+                if self.current < 10 {
+                    Option::Some(self.current)
+                } else {
+                    Option::None
+                }
+            }
+        }
+
+        fun main() {
+            let mut counter = Counter { current: 0 };
+            let value = counter.next();
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_for_loop_over_into_iterator() {
+    let result = check(
+        r#"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct Counter {
+            current: i32,
+        }
+
+        impl Iterator for Counter {
+            type Item = i32;
+
+            fun next(&mut self) -> Option<Self::Item> {
+                if self.current < 10 {
+                    Option::Some(self.current)
+                } else {
+                    Option::None
+                }
+            }
+        }
+
+        impl IntoIterator for Counter {
+            type Item = i32;
+            type IntoIter = Counter;
+
+            fun into_iter(self) -> Self::IntoIter {
+                self
+            }
+        }
+
+        fun main() {
+            let counter = Counter { current: 0 };
+            for item in counter {
+                let next = item + 1;
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_for_loop_over_array() {
+    let result = check(
+        r#"
+        fun main() {
+            let values = [1, 2, 3];
+            for item in values {
+                let next = item + 1;
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn matches_const_generic_trait_impl_for_arrays() {
+    let result = check(
+        r#"
+        trait Marker {}
+
+        impl<T, const N: usize> Marker for [T; N] {}
+
+        fun takes_marker<T: Marker>(value: T) {}
+
+        fun main() {
+            takes_marker([1, 2, 3]);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn array_into_iterator_impl_type_checks_with_const_generics() {
+    let result = check(
+        r#"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        #[lang = "copy"]
+        trait Copy {}
+        impl Copy for i32 {}
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct ArrayIter<T, const N: usize> {
+            values: [T; N],
+            index: usize,
+        }
+
+        impl<T: Copy, const N: usize> Iterator for ArrayIter<T, N> {
+            type Item = T;
+
+            fun next(&mut self) -> Option<Self::Item> {
+                if self.index < N {
+                    let value = self.values[self.index];
+                    self.index += 1usize;
+                    Option::Some(value)
+                } else {
+                    Option::None
+                }
+            }
+        }
+
+        impl<T: Copy, const N: usize> IntoIterator for [T; N] {
+            type Item = T;
+            type IntoIter = ArrayIter<T, N>;
+
+            fun into_iter(self) -> Self::IntoIter {
+                ArrayIter {
+                    values: self,
+                    index: 0usize,
+                }
+            }
+        }
+
+        fun main() {
+            let values = [1, 2, 3];
+            let mut iter = values.into_iter();
+            let first = iter.next();
+
+            for item in [1, 2, 3] {
+                let next = item + 1;
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn checks_multiple_generic_trait_bounds() {
     let result = check(
         r#"
@@ -588,7 +790,7 @@ fn accepts_outer_attributes_on_common_ast_nodes() {
         }
 
         #[item]
-        enum Maybe {
+        enum Option {
             #[variant]
             Some(#[variant_ty] i32),
             None,

@@ -66,6 +66,7 @@ pub struct HirFunction {
     pub name: Name,
     pub visibility: Visibility,
     pub generics: Vec<Name>,
+    pub const_generics: Vec<Name>,
     pub generic_bounds: Vec<HirGenericBound>,
     pub params: Vec<HirParam>,
     pub ret_type: Option<HirTypeRef>,
@@ -99,6 +100,7 @@ pub struct HirStruct {
     pub visibility: Visibility,
     pub name_range: TextRange,
     pub generics: Vec<Name>,
+    pub const_generics: Vec<Name>,
     pub fields: Vec<HirStructField>,
     pub attrs: Vec<HirAttr>,
 }
@@ -116,6 +118,7 @@ pub struct HirEnum {
     pub name: Name,
     pub visibility: Visibility,
     pub generics: Vec<Name>,
+    pub const_generics: Vec<Name>,
     pub variants: Vec<HirEnumVariant>,
     pub attrs: Vec<HirAttr>,
 }
@@ -153,6 +156,7 @@ pub struct HirImpl {
     /// The trait being implemented, if any (`Trait` in `impl Trait for T`).
     pub trait_ty: Option<HirTypeRef>,
     pub generics: Vec<Name>,
+    pub const_generics: Vec<Name>,
     pub generic_bounds: Vec<HirGenericBound>,
     pub methods: Vec<FunctionId>,
     pub consts: Vec<ConstId>,
@@ -236,7 +240,16 @@ pub enum HirTypeRef {
         inner: Box<HirTypeRef>,
     },
     Tuple(Vec<HirTypeRef>),
-    Array(Box<HirTypeRef>, usize),
+    Array(Box<HirTypeRef>, HirConstArg),
+    Const(HirConstArg),
+    Unknown,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HirConstArg {
+    Value(usize),
+    Param(Name),
     Unknown,
     Error,
 }
@@ -306,9 +319,21 @@ impl HirTypeRef {
                     .join(", ");
                 format!("({inner})")
             }
-            HirTypeRef::Array(inner, len) => format!("[{}; {}]", inner.display(), len),
+            HirTypeRef::Array(inner, len) => format!("[{}; {}]", inner.display(), len.display()),
+            HirTypeRef::Const(value) => value.display(),
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
+        }
+    }
+}
+
+impl HirConstArg {
+    pub fn display(&self) -> String {
+        match self {
+            HirConstArg::Value(value) => value.to_string(),
+            HirConstArg::Param(name) => name.0.clone(),
+            HirConstArg::Unknown => "_".to_string(),
+            HirConstArg::Error => "<error>".to_string(),
         }
     }
 }

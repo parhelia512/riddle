@@ -94,6 +94,7 @@ fn def_to_resolved_name(def: &DefRef) -> ResolvedName {
         DefRef::Local { stmt } => ResolvedName::Local(*stmt),
         DefRef::PatternBinding { .. } => ResolvedName::Unresolved,
         DefRef::Param { index, .. } => ResolvedName::Param(*index),
+        DefRef::ConstParam { .. } => ResolvedName::Unresolved,
         DefRef::UseAlias { .. } => ResolvedName::Unresolved,
         DefRef::EnumVariant { enum_id, index } => ResolvedName::EnumVariant(*enum_id, *index),
     }

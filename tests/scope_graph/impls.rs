@@ -57,3 +57,22 @@ fn self_receiver_resolves_as_param() {
 
     assert_eq!(resolve_paths(&sg, "self"), vec![vec![DefKind::Param]]);
 }
+
+#[test]
+fn impl_const_generic_resolves_in_method_body() {
+    let sg = build(
+        r#"
+        struct ArrayIter<T, const N: usize> {
+            index: usize,
+        }
+
+        impl<T, const N: usize> ArrayIter<T, N> {
+            fun next(&self) -> usize {
+                N
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(resolve_paths(&sg, "N"), vec![vec![DefKind::Param]]);
+}

@@ -176,6 +176,7 @@ fn def_kind(def: &DefRef) -> DefKind {
         DefRef::Module { .. } => DefKind::Module,
         DefRef::Local { .. } => DefKind::Local,
         DefRef::Param { .. } => DefKind::Param,
+        DefRef::ConstParam { .. } => DefKind::Param,
         DefRef::PatternBinding { .. } => DefKind::Local,
         DefRef::UseAlias { .. } => DefKind::UseAlias,
         DefRef::EnumVariant { .. } => DefKind::Struct,

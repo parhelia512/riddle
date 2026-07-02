@@ -4,8 +4,8 @@ use escape_analysis::EscapeResult;
 use hir::{
     HirFile,
     body::{
-        BinaryOp as HirBinOp, Body, BodyId, Expr, ExprId, ResolvedName, Stmt, StmtId,
-        UnaryOp as HirUnOp,
+        BinaryOp as HirBinOp, Body, BodyId, Expr, ExprId, PatId, Pattern, ResolvedName, Stmt,
+        StmtId, UnaryOp as HirUnOp,
     },
 };
 use type_checker::TypeCheckResult;
@@ -37,6 +37,7 @@ pub fn lower_hir(
         current_function: None,
         scope_map: HashMap::new(),
         mut_bindings: HashSet::new(),
+        pattern_bindings: Vec::new(),
         generic_subst: HashMap::new(),
         mono_functions: HashMap::new(),
         mono_methods: HashMap::new(),
@@ -99,6 +100,7 @@ struct LowerCtx<'a> {
     /// StmtIds of `mut` bindings — their Value is a storage location (Alloca),
     /// so Path resolution must emit a Load to read the current value.
     mut_bindings: HashSet<StmtId>,
+    pattern_bindings: Vec<HashMap<String, Value>>,
     generic_subst: HashMap<String, Type>,
     mono_functions: HashMap<(hir::item_tree::FunctionId, String), String>,
     mono_methods: HashMap<(hir::item_tree::FunctionId, String), String>,
@@ -115,6 +117,7 @@ impl<'a> LowerCtx<'a> {
         self.expr_cache.clear();
         self.scope_map.clear();
         self.mut_bindings.clear();
+        self.pattern_bindings.clear();
         self.current_body = Some(body_id);
         let old_current_function = self.current_function;
         let old_generic_subst = self.generic_subst.clone();
@@ -209,7 +212,7 @@ impl<'a> LowerCtx<'a> {
 
             Expr::BoolLiteral { value } => builder.bconst(*value),
 
-            Expr::Path { resolved, .. } => match resolved {
+            Expr::Path { path, resolved } => match resolved {
                 Some(ResolvedName::Local(stmt)) => {
                     let storage = self
                         .scope_map
@@ -229,7 +232,10 @@ impl<'a> LowerCtx<'a> {
                     .unwrap_or_else(|| builder.unit_const()),
                 Some(ResolvedName::Function(_)) => builder.unit_const(),
                 Some(ResolvedName::EnumVariant(_, idx)) => builder.iconst(*idx as i128, IntTy::U32),
-                _ => builder.unit_const(),
+                _ => path
+                    .as_single_name()
+                    .and_then(|name| self.pattern_binding(&name.0))
+                    .unwrap_or_else(|| builder.unit_const()),
             },
 
             Expr::Binary { lhs, rhs, op } => {
@@ -377,6 +383,12 @@ impl<'a> LowerCtx<'a> {
                 builder.unit_const()
             }
 
+            Expr::For {
+                pat,
+                iterable,
+                body: for_body,
+            } => self.lower_for_expr(builder, param_values, body, *pat, *iterable, *for_body),
+
             Expr::Match { scrutinee, arms } => {
                 let _sv = self.lower_expr(builder, param_values, body, *scrutinee);
                 let merge_block = builder.func.new_block_labeled("match_merge");
@@ -412,7 +424,7 @@ impl<'a> LowerCtx<'a> {
 
             Expr::ArrayRepeat { value, .. } => {
                 let len = match tc_type {
-                    Some(type_checker::Type::Array(_, len)) => *len,
+                    Some(type_checker::Type::Array(_, len)) => len.as_usize().unwrap_or(0),
                     _ => 0,
                 };
                 let val = self.lower_expr(builder, param_values, body, *value);
@@ -428,52 +440,63 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::Call { callee, args } => {
-                let target_fid = self.callee_function_id(*callee);
-                let name = if let (Some(fid), Expr::FieldAccess { base, .. }) =
-                    (target_fid, &body.exprs[*callee])
+                if let Expr::Path {
+                    resolved: Some(ResolvedName::EnumVariant(_, variant_index)),
+                    ..
+                } = &body.exprs[*callee]
                 {
-                    let actual_fid = self.actual_method_fid(*callee, fid, *base);
-                    self.mono_method_name(actual_fid, *base)
-                        .unwrap_or_else(|| self.function_name(actual_fid))
+                    for arg in args {
+                        self.lower_expr(builder, param_values, body, *arg);
+                    }
+                    builder.iconst(*variant_index as i128, IntTy::U32)
                 } else {
-                    target_fid
-                        .map(|fid| {
-                            self.mono_function_name(fid, *callee)
-                                .unwrap_or_else(|| self.hir.item_tree.functions[fid].name.0.clone())
-                        })
-                        .unwrap_or_else(|| callee_name(body, *callee))
-                };
-                let mut arg_vals: Vec<Value> = Vec::new();
-                if let Expr::FieldAccess { base, .. } = &body.exprs[*callee] {
-                    if let Some(fid) = target_fid {
-                        let receiver_fid = self.actual_method_fid(*callee, fid, *base);
-                        if let Some(receiver) =
-                            self.hir.item_tree.functions[receiver_fid].params.first()
-                        {
-                            arg_vals.push(self.lower_receiver_arg(
-                                builder,
-                                param_values,
-                                body,
-                                *base,
-                                &receiver.ty,
-                            ));
+                    let target_fid = self.callee_function_id(*callee);
+                    let name = if let (Some(fid), Expr::FieldAccess { base, .. }) =
+                        (target_fid, &body.exprs[*callee])
+                    {
+                        let actual_fid = self.actual_method_fid(*callee, fid, *base);
+                        self.mono_method_name(actual_fid, *base)
+                            .unwrap_or_else(|| self.function_name(actual_fid))
+                    } else {
+                        target_fid
+                            .map(|fid| {
+                                self.mono_function_name(fid, *callee)
+                                    .unwrap_or_else(|| self.function_name(fid))
+                            })
+                            .unwrap_or_else(|| callee_name(body, *callee))
+                    };
+                    let mut arg_vals: Vec<Value> = Vec::new();
+                    if let Expr::FieldAccess { base, .. } = &body.exprs[*callee] {
+                        if let Some(fid) = target_fid {
+                            let receiver_fid = self.actual_method_fid(*callee, fid, *base);
+                            if let Some(receiver) =
+                                self.hir.item_tree.functions[receiver_fid].params.first()
+                            {
+                                arg_vals.push(self.lower_receiver_arg(
+                                    builder,
+                                    param_values,
+                                    body,
+                                    *base,
+                                    &receiver.ty,
+                                ));
+                            }
                         }
                     }
+                    arg_vals.extend(
+                        args.iter()
+                            .map(|a| self.lower_expr(builder, param_values, body, *a)),
+                    );
+                    // 检查是否是 extern 函数调用
+                    let is_extern = target_fid
+                        .map(|fid| self.hir.item_tree.extern_function_ids.contains(&fid))
+                        .unwrap_or(false);
+                    let func_ref = if is_extern {
+                        FuncRef::Extern(name)
+                    } else {
+                        FuncRef::Local(name)
+                    };
+                    builder.call(func_ref, arg_vals, mir_type)
                 }
-                arg_vals.extend(
-                    args.iter()
-                        .map(|a| self.lower_expr(builder, param_values, body, *a)),
-                );
-                // 检查是否是 extern 函数调用
-                let is_extern = target_fid
-                    .map(|fid| self.hir.item_tree.extern_function_ids.contains(&fid))
-                    .unwrap_or(false);
-                let func_ref = if is_extern {
-                    FuncRef::Extern(name)
-                } else {
-                    FuncRef::Local(name)
-                };
-                builder.call(func_ref, arg_vals, mir_type)
             }
 
             Expr::FieldAccess { base, field } => {
@@ -518,6 +541,125 @@ impl<'a> LowerCtx<'a> {
 
         self.expr_cache.insert(expr_id, value);
         value
+    }
+
+    fn lower_for_expr(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        pat: PatId,
+        iterable: ExprId,
+        for_body: ExprId,
+    ) -> Value {
+        let iterable_value = self.lower_expr(builder, param_values, body, iterable);
+        if let Some((item_ty, len)) = self.array_iter_info(iterable) {
+            let index_ty = Type::Int(IntTy::I32);
+            let zero = builder.iconst(0, IntTy::I32);
+            let end = builder.iconst(len as i128, IntTy::I32);
+            let cursor = builder.alloca(index_ty.clone());
+            builder.store(zero, cursor);
+
+            let cond_block = builder.func.new_block_labeled("for_array_cond");
+            let body_block = builder.func.new_block_labeled("for_array_body");
+            let exit_block = builder.func.new_block_labeled("for_array_exit");
+
+            builder.set_branch(cond_block);
+
+            builder.switch_to_block(cond_block);
+            let current = builder.load(cursor, index_ty.clone());
+            let keep_going = builder.cmp(CmpOp::Lt, current, end);
+            builder.set_cond_branch(keep_going, body_block, exit_block);
+
+            builder.switch_to_block(body_block);
+            let item_ptr = builder.index_ptr(iterable_value, current, item_ty.clone());
+            let item = builder.load(item_ptr, item_ty);
+            self.push_pattern_binding(body, pat, item);
+            self.lower_expr(builder, param_values, body, for_body);
+            self.pattern_bindings.pop();
+            if builder.needs_return() {
+                let one = builder.iconst(1, IntTy::I32);
+                let next = builder.binop(BinOp::Add, current, one, index_ty);
+                builder.store(next, cursor);
+                builder.set_branch(cond_block);
+            }
+
+            builder.switch_to_block(exit_block);
+            return builder.unit_const();
+        }
+
+        if !self.is_std_range_expr(iterable) {
+            // ponytail: generic Iterator lowering needs enum payload matching for Option::Some.
+            return builder.unit_const();
+        }
+
+        let i32_ty = Type::Int(IntTy::I32);
+        let start = builder.extract_value(iterable_value, 0, i32_ty.clone());
+        let end = builder.extract_value(iterable_value, 1, i32_ty.clone());
+        let cursor = builder.alloca(i32_ty.clone());
+        builder.store(start, cursor);
+
+        let cond_block = builder.func.new_block_labeled("for_cond");
+        let body_block = builder.func.new_block_labeled("for_body");
+        let exit_block = builder.func.new_block_labeled("for_exit");
+
+        builder.set_branch(cond_block);
+
+        builder.switch_to_block(cond_block);
+        let current = builder.load(cursor, i32_ty.clone());
+        let keep_going = builder.cmp(CmpOp::Lt, current, end);
+        builder.set_cond_branch(keep_going, body_block, exit_block);
+
+        builder.switch_to_block(body_block);
+        self.push_pattern_binding(body, pat, current);
+        self.lower_expr(builder, param_values, body, for_body);
+        self.pattern_bindings.pop();
+        if builder.needs_return() {
+            let one = builder.iconst(1, IntTy::I32);
+            let next = builder.binop(BinOp::Add, current, one, i32_ty);
+            builder.store(next, cursor);
+            builder.set_branch(cond_block);
+        }
+
+        builder.switch_to_block(exit_block);
+        builder.unit_const()
+    }
+
+    fn pattern_binding(&self, name: &str) -> Option<Value> {
+        self.pattern_bindings
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    fn push_pattern_binding(&mut self, body: &Body, pat: PatId, value: Value) {
+        let mut scope = HashMap::new();
+        if let Pattern::Binding { name } = &body.pats[pat] {
+            scope.insert(name.0.clone(), value);
+        }
+        self.pattern_bindings.push(scope);
+    }
+
+    fn is_std_range_expr(&self, expr: ExprId) -> bool {
+        self.current_body
+            .and_then(|bid| self.type_result.expr_types.get(&(bid, expr)))
+            .and_then(|ty| match ty {
+                type_checker::Type::Struct(sid, _) => Some(*sid),
+                _ => None,
+            })
+            .map(|sid| self.hir.item_tree.structs[sid].name.0 == "Range")
+            .unwrap_or(false)
+    }
+
+    fn array_iter_info(&self, expr: ExprId) -> Option<(Type, usize)> {
+        self.current_body
+            .and_then(|bid| self.type_result.expr_types.get(&(bid, expr)))
+            .and_then(|ty| match ty {
+                type_checker::Type::Array(inner, len) => {
+                    Some((self.convert_type(inner), len.as_usize()?))
+                }
+                _ => None,
+            })
     }
 
     fn callee_function_id(&self, callee: ExprId) -> Option<hir::item_tree::FunctionId> {
@@ -788,7 +930,10 @@ impl<'a> LowerCtx<'a> {
             TcType::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_type(e)).collect())
             }
-            TcType::Array(inner, len) => Type::Array(Box::new(self.convert_type(inner)), *len),
+            TcType::Array(inner, len) => Type::Array(
+                Box::new(self.convert_type(inner)),
+                len.as_usize().unwrap_or(0),
+            ),
             TcType::Struct(sid, args) => self.convert_struct_type(*sid, args),
             TcType::Function(fid) => {
                 let f = &self.hir.item_tree.functions[*fid];
@@ -809,6 +954,7 @@ impl<'a> LowerCtx<'a> {
             }
             TcType::Enum(_, _) => Type::Int(IntTy::U32),
             TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
+            TcType::Const(_) => Type::Unit,
             TcType::Unknown | TcType::Error => Type::Unit,
         }
     }
@@ -883,9 +1029,11 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_hir_type(e)).collect())
             }
-            hir::item_tree::HirTypeRef::Array(inner, len) => {
-                Type::Array(Box::new(self.convert_hir_type(inner)), *len)
-            }
+            hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
+                Box::new(self.convert_hir_type(inner)),
+                hir_const_arg_to_usize(len),
+            ),
+            hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
@@ -999,12 +1147,14 @@ impl<'a> LowerCtx<'a> {
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
         let old_mut_bindings = std::mem::take(&mut self.mut_bindings);
+        let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
         let old_current_body = self.current_body;
         let body_id = *self.hir.function_bodies.get(&fid)?;
         let func = self.lower_function(fid, mono_name.clone(), body_id);
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
         self.mut_bindings = old_mut_bindings;
+        self.pattern_bindings = old_pattern_bindings;
         self.current_body = old_current_body;
         self.generic_subst = old_subst;
         self.module.add_function(func);
@@ -1049,12 +1199,14 @@ impl<'a> LowerCtx<'a> {
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
         let old_mut_bindings = std::mem::take(&mut self.mut_bindings);
+        let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
         let old_current_body = self.current_body;
         let body_id = *self.hir.function_bodies.get(&fid)?;
         let func = self.lower_function(fid, mono_name.clone(), body_id);
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
         self.mut_bindings = old_mut_bindings;
+        self.pattern_bindings = old_pattern_bindings;
         self.current_body = old_current_body;
         self.generic_subst = old_subst;
         self.module.add_function(func);
@@ -1173,8 +1325,9 @@ impl<'a> LowerCtx<'a> {
             ),
             hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
                 Box::new(self.convert_hir_type_with_subst(inner, subst)),
-                *len,
+                hir_const_arg_to_usize(len),
             ),
+            hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
@@ -1184,6 +1337,13 @@ fn is_self_associated_path(path: &hir::item_tree::HirPath) -> bool {
     matches!(path.anchor, hir::item_tree::PathAnchor::Plain)
         && path.segments.len() == 2
         && path.segments[0].0 == "Self"
+}
+
+fn hir_const_arg_to_usize(arg: &hir::item_tree::HirConstArg) -> usize {
+    match arg {
+        hir::item_tree::HirConstArg::Value(value) => *value,
+        _ => 0,
+    }
 }
 
 fn mono_struct_name(base: &str, args: &[Type]) -> String {

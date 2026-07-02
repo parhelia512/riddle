@@ -67,8 +67,10 @@ impl<'a> TypeChecker<'a> {
             let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
                 continue;
             };
-            let params =
-                crate::lowering::generic_param_map(imp.generics.iter().map(|name| name.0.as_str()));
+            let params = crate::lowering::generic_param_map_with_consts(
+                imp.generics.iter().map(|name| name.0.as_str()),
+                imp.const_generics.iter().map(|name| name.0.as_str()),
+            );
             let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
             let bounds = self.lower_trait_env_bounds(&imp.generic_bounds, &params);
             let assoc_types = imp
@@ -119,7 +121,8 @@ impl<'a> TypeChecker<'a> {
         for (fid, function) in self.hir.item_tree.functions.iter() {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
                 let outer_generics = self.impl_generic_names(fid);
-                self.check_function(fid, function, body_id, outer_generics);
+                let outer_const_generics = self.impl_const_generic_names(fid);
+                self.check_function(fid, function, body_id, outer_generics, outer_const_generics);
             }
         }
     }
@@ -130,13 +133,18 @@ impl<'a> TypeChecker<'a> {
         function: &HirFunction,
         body_id: BodyId,
         outer_generics: Vec<String>,
+        outer_const_generics: Vec<String>,
     ) {
         let body = &self.hir.bodies[body_id];
-        let mut params = crate::lowering::generic_param_map(
+        let mut params = crate::lowering::generic_param_map_with_consts(
             outer_generics
                 .iter()
                 .map(String::as_str)
                 .chain(function.generics.iter().map(|name| name.0.as_str())),
+            outer_const_generics
+                .iter()
+                .map(String::as_str)
+                .chain(function.const_generics.iter().map(|name| name.0.as_str())),
         );
         if let Some(self_ty_ref) = self.impl_self_ty_ref(function_id).cloned() {
             let self_ty = self.lower_type_ref_with_params(&self_ty_ref, &params);
@@ -179,6 +187,22 @@ impl<'a> TypeChecker<'a> {
                 imp.methods
                     .contains(&function_id)
                     .then(|| imp.generics.iter().map(|name| name.0.clone()).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn impl_const_generic_names(&self, function_id: FunctionId) -> Vec<String> {
+        self.hir
+            .item_tree
+            .impls
+            .iter()
+            .find_map(|(_, imp)| {
+                imp.methods.contains(&function_id).then(|| {
+                    imp.const_generics
+                        .iter()
+                        .map(|name| name.0.clone())
+                        .collect()
+                })
             })
             .unwrap_or_default()
     }
@@ -295,6 +319,7 @@ impl<'a> TypeChecker<'a> {
             HirTypeRef::Array(inner, _) => {
                 self.type_ref_contains_inline_struct(inner, target, seen)
             }
+            HirTypeRef::Const(_) => false,
             HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
             HirTypeRef::Unknown | HirTypeRef::Error => false,
         }
@@ -402,6 +427,7 @@ impl<'a> TypeChecker<'a> {
             || actual.is_unknown_like()
             || expected == actual
             || self.numeric_assignable(expected, actual)
+            || self.structural_assignable(expected, actual)
         {
             return;
         }
@@ -532,6 +558,18 @@ impl<'a> TypeChecker<'a> {
                 | (Type::InferInt, Type::InferInt)
                 | (Type::InferFloat, Type::InferFloat)
         )
+    }
+
+    fn structural_assignable(&self, expected: &Type, actual: &Type) -> bool {
+        match (expected, actual) {
+            (Type::Array(expected_inner, expected_len), Type::Array(actual_inner, actual_len)) => {
+                expected_len == actual_len
+                    && (expected_inner == actual_inner
+                        || self.numeric_assignable(expected_inner, actual_inner)
+                        || self.structural_assignable(expected_inner, actual_inner))
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn join_numeric_types(&self, lhs: &Type, rhs: &Type) -> Option<Type> {

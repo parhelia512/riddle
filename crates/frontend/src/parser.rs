@@ -421,6 +421,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::LBracket
                 | SyntaxKind::If
                 | SyntaxKind::While
+                | SyntaxKind::For
                 | SyntaxKind::Match
                 | SyntaxKind::Unsafe
                 | SyntaxKind::Plus
@@ -438,6 +439,7 @@ impl<'s> Parser<'s> {
             SyntaxKind::LBrace
                 | SyntaxKind::If
                 | SyntaxKind::While
+                | SyntaxKind::For
                 | SyntaxKind::Match
                 | SyntaxKind::Unsafe
         )
@@ -951,6 +953,25 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::WhileStmt)
     }
 
+    fn for_expr(&mut self) -> CompletedMarker {
+        let m = self.start();
+        self.expect(SyntaxKind::For);
+        self.expect(SyntaxKind::Ident);
+        self.expect(SyntaxKind::In);
+        self.expression_no_struct();
+
+        if self.at(SyntaxKind::LBrace) {
+            self.block();
+        } else {
+            self.error(format!(
+                "expected block after for iterable, found {:?}",
+                self.current()
+            ));
+        }
+
+        m.complete(self, SyntaxKind::ForExpr)
+    }
+
     fn match_expr(&mut self) -> CompletedMarker {
         let m = self.start();
         self.expect(SyntaxKind::Match);
@@ -1311,6 +1332,8 @@ impl<'s> Parser<'s> {
 
             SyntaxKind::While => Some(self.while_expr()),
 
+            SyntaxKind::For => Some(self.for_expr()),
+
             SyntaxKind::Match => Some(self.match_expr()),
 
             SyntaxKind::Unsafe => Some(self.unsafe_expr()),
@@ -1449,6 +1472,11 @@ impl<'s> Parser<'s> {
 
                 self.expect(SyntaxKind::RBracket);
                 m.complete(self, SyntaxKind::ArrayType);
+            }
+            SyntaxKind::Number => {
+                let m = self.start();
+                self.bump();
+                m.complete(self, SyntaxKind::ConstType);
             }
             SyntaxKind::Ident
             | SyntaxKind::SelfKw
@@ -1670,6 +1698,14 @@ impl<'s> Parser<'s> {
     }
 
     fn generic_param(&mut self, allow_bounds: bool) {
+        if self.at(SyntaxKind::Const) {
+            self.bump();
+            self.expect(SyntaxKind::Ident);
+            self.expect(SyntaxKind::Colon);
+            self.ty();
+            return;
+        }
+
         self.expect(SyntaxKind::Ident);
         if allow_bounds && self.at(SyntaxKind::Colon) {
             self.bump();
@@ -1788,6 +1824,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Star
                 | SyntaxKind::LParen
                 | SyntaxKind::LBracket
+                | SyntaxKind::Number
         )
     }
 

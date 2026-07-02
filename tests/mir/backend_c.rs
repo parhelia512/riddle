@@ -140,6 +140,41 @@ fn c_function_call() {
 }
 
 #[test]
+fn c_static_impl_method_call_uses_mangled_name() {
+    let module = lower(
+        r#"
+        struct Point {
+            x: i32,
+        }
+
+        impl Point {
+            fun new(x: i32) -> Point {
+                Point { x }
+            }
+        }
+
+        fun main() -> i32 {
+            let p = Point::new(1);
+            return p.x;
+        }
+        "#,
+    );
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+
+    assert!(
+        result.contains("new__Point"),
+        "static impl method should be mangled:\n{}",
+        result
+    );
+    assert!(
+        !result.contains(" new("),
+        "static impl method call used bare name:\n{}",
+        result
+    );
+}
+
+#[test]
 fn c_heap_alloc() {
     let module = lower(
         r#"

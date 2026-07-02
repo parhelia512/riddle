@@ -66,6 +66,7 @@ ast_node!(StructExpr, StructExpr);
 ast_node!(StructExprField, StructExprField);
 ast_node!(IfStmt, IfStmt);
 ast_node!(WhileStmt, WhileStmt);
+ast_node!(ForExpr, ForExpr);
 ast_node!(MatchExpr, MatchExpr);
 ast_node!(MatchArm, MatchArm);
 ast_node!(ArrayExpr, ArrayExpr);
@@ -89,6 +90,7 @@ ast_node!(RefType, RefType);
 ast_node!(PtrType, PtrType);
 ast_node!(TupleType, TupleType);
 ast_node!(ArrayType, ArrayType);
+ast_node!(ConstType, ConstType);
 
 // patterns
 ast_node!(WildcardPat, WildcardPattern);
@@ -480,6 +482,7 @@ impl GenericParams {
 #[derive(Debug, Clone)]
 pub struct GenericParam {
     pub name: String,
+    pub is_const: bool,
     pub bounds: Vec<GenericBound>,
 }
 
@@ -497,18 +500,32 @@ pub struct GenericAssocConstraint {
 
 impl GenericParam {
     fn from_tokens(elements: &[SyntaxElement]) -> Option<Self> {
+        let is_const = elements
+            .iter()
+            .any(|element| matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::Const));
         let name = elements
             .iter()
             .filter_map(|element| element.as_token())
             .find(|token| token.kind() == SyntaxKind::Ident)
             .map(|token| token.text().to_string())?;
+        if is_const {
+            return Some(Self {
+                name,
+                is_const,
+                bounds: Vec::new(),
+            });
+        }
         let colon = elements
             .iter()
             .position(|element| matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::Colon));
         let bounds = colon
             .map(|index| parse_generic_bounds(&elements[index + 1..]))
             .unwrap_or_default();
-        Some(Self { name, bounds })
+        Some(Self {
+            name,
+            is_const,
+            bounds,
+        })
     }
 }
 
@@ -649,6 +666,20 @@ pub enum ElseBranch {
 
 impl WhileStmt {
     pub fn condition(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    pub fn body(&self) -> Option<Block> {
+        support::child(&self.syntax)
+    }
+}
+
+impl ForExpr {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn iterable(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
@@ -1021,6 +1052,15 @@ impl ArrayType {
     }
 }
 
+impl ConstType {
+    pub fn value(&self) -> Option<usize> {
+        support::token_of(&self.syntax, SyntaxKind::Number)?
+            .text()
+            .parse::<usize>()
+            .ok()
+    }
+}
+
 // ── Patterns ───────────────────────────────────────────────────────────
 
 impl LiteralPat {
@@ -1260,6 +1300,7 @@ pub enum Expr {
     Block(Block),
     IfStmt(IfStmt),
     WhileStmt(WhileStmt),
+    ForExpr(ForExpr),
     MatchExpr(MatchExpr),
     ArrayExpr(ArrayExpr),
     Number(NumberExpr),
@@ -1285,6 +1326,7 @@ impl AstNode for Expr {
             SyntaxKind::Block => Some(Expr::Block(Block { syntax: node })),
             SyntaxKind::IfStmt => Some(Expr::IfStmt(IfStmt { syntax: node })),
             SyntaxKind::WhileStmt => Some(Expr::WhileStmt(WhileStmt { syntax: node })),
+            SyntaxKind::ForExpr => Some(Expr::ForExpr(ForExpr { syntax: node })),
             SyntaxKind::MatchExpr => Some(Expr::MatchExpr(MatchExpr { syntax: node })),
             SyntaxKind::ArrayExpr => Some(Expr::ArrayExpr(ArrayExpr { syntax: node })),
             SyntaxKind::NumberLit => Some(Expr::Number(NumberExpr { syntax: node })),
@@ -1311,6 +1353,7 @@ impl AstNode for Expr {
             Expr::Block(it) => it.syntax(),
             Expr::IfStmt(it) => it.syntax(),
             Expr::WhileStmt(it) => it.syntax(),
+            Expr::ForExpr(it) => it.syntax(),
             Expr::MatchExpr(it) => it.syntax(),
             Expr::ArrayExpr(it) => it.syntax(),
             Expr::Number(it) => it.syntax(),
@@ -1340,6 +1383,7 @@ pub enum Type {
     Ptr(PtrType),
     Tuple(TupleType),
     Array(ArrayType),
+    Const(ConstType),
 }
 
 impl AstNode for Type {
@@ -1350,6 +1394,7 @@ impl AstNode for Type {
             SyntaxKind::PtrType => Some(Type::Ptr(PtrType { syntax: node })),
             SyntaxKind::TupleType => Some(Type::Tuple(TupleType { syntax: node })),
             SyntaxKind::ArrayType => Some(Type::Array(ArrayType { syntax: node })),
+            SyntaxKind::ConstType => Some(Type::Const(ConstType { syntax: node })),
             _ => None,
         }
     }
@@ -1361,6 +1406,7 @@ impl AstNode for Type {
             Type::Ptr(it) => it.syntax(),
             Type::Tuple(it) => it.syntax(),
             Type::Array(it) => it.syntax(),
+            Type::Const(it) => it.syntax(),
         }
     }
 }

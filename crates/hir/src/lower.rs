@@ -9,10 +9,10 @@ use frontend::syntax_kind::{SyntaxKind, SyntaxToken};
 use super::{
     Name,
     item_tree::{
-        ConstId, EnumId, FunctionId, HirAssocTypeConstraint, HirAttr, HirConst, HirEnum,
-        HirEnumVariant, HirFunction, HirGenericBound, HirParam, HirPath, HirStruct, HirStructField,
-        HirTrait, HirTypeAlias, HirTypeRef, HirUseTree, HirUseTreeKind, HirVariantKind, PathAnchor,
-        StructId, TraitId, TypeAliasId, Visibility,
+        ConstId, EnumId, FunctionId, HirAssocTypeConstraint, HirAttr, HirConst, HirConstArg,
+        HirEnum, HirEnumVariant, HirFunction, HirGenericBound, HirParam, HirPath, HirStruct,
+        HirStructField, HirTrait, HirTypeAlias, HirTypeRef, HirUseTree, HirUseTreeKind,
+        HirVariantKind, PathAnchor, StructId, TraitId, TypeAliasId, Visibility,
     },
 };
 
@@ -34,7 +34,23 @@ pub fn lower_name(name: Option<SyntaxToken>) -> Name {
 
 pub fn lower_generic_params(params: Option<ast::GenericParams>) -> Vec<Name> {
     params
-        .map(|g| g.params().map(|param| Name(param.name)).collect::<Vec<_>>())
+        .map(|g| {
+            g.params()
+                .filter(|param| !param.is_const)
+                .map(|param| Name(param.name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+pub fn lower_const_generic_params(params: Option<ast::GenericParams>) -> Vec<Name> {
+    params
+        .map(|g| {
+            g.params()
+                .filter(|param| param.is_const)
+                .map(|param| Name(param.name))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default()
 }
 
@@ -43,19 +59,27 @@ pub fn lower_generic_bounds(params: Option<ast::GenericParams>) -> Vec<HirGeneri
         .map(|g| {
             g.params()
                 .flat_map(|param| {
+                    if param.is_const {
+                        return Vec::new().into_iter();
+                    }
                     let name = Name(param.name);
-                    param.bounds.into_iter().map(move |bound| HirGenericBound {
-                        param: name.clone(),
-                        trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
-                        assoc_constraints: bound
-                            .assoc_constraints
-                            .into_iter()
-                            .map(|constraint| HirAssocTypeConstraint {
-                                name: Name(constraint.name),
-                                ty: constraint.ty.lower(),
-                            })
-                            .collect(),
-                    })
+                    param
+                        .bounds
+                        .into_iter()
+                        .map(move |bound| HirGenericBound {
+                            param: name.clone(),
+                            trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                            assoc_constraints: bound
+                                .assoc_constraints
+                                .into_iter()
+                                .map(|constraint| HirAssocTypeConstraint {
+                                    name: Name(constraint.name),
+                                    ty: constraint.ty.lower(),
+                                })
+                                .collect(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
                 })
                 .collect()
         })
@@ -98,6 +122,7 @@ impl AstLower for FuncDecl {
         let name = lower_name(self.name());
         let generic_params = self.generic_params();
         let generics = lower_generic_params(generic_params.clone());
+        let const_generics = lower_const_generic_params(generic_params.clone());
         let generic_bounds = lower_generic_bounds(generic_params);
         let params = self
             .param_list()
@@ -111,6 +136,7 @@ impl AstLower for FuncDecl {
             name,
             visibility,
             generics,
+            const_generics,
             generic_bounds,
             params,
             ret_type,
@@ -139,7 +165,9 @@ impl AstLower for StructDecl {
             .name()
             .map(|name| name.text_range())
             .unwrap_or_else(|| self.syntax().text_range());
-        let generics = lower_generic_params(self.generic_params());
+        let generic_params = self.generic_params();
+        let generics = lower_generic_params(generic_params.clone());
+        let const_generics = lower_const_generic_params(generic_params);
         let fields = self.field_list().lower();
         let attrs = lower_attrs(self.syntax());
         let visibility = lower_visibility(self.is_pub());
@@ -148,6 +176,7 @@ impl AstLower for StructDecl {
             visibility,
             name_range,
             generics,
+            const_generics,
             fields,
             attrs,
         })
@@ -159,7 +188,9 @@ impl AstLower for ast::EnumDecl {
     type Item = HirEnum;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
         let name = lower_name(self.name());
-        let generics = lower_generic_params(self.generic_params());
+        let generic_params = self.generic_params();
+        let generics = lower_generic_params(generic_params.clone());
+        let const_generics = lower_const_generic_params(generic_params);
         let variants = self.variants().map(|v| v.lower()).collect();
         let attrs = lower_attrs(self.syntax());
         let visibility = lower_visibility(self.is_pub());
@@ -167,6 +198,7 @@ impl AstLower for ast::EnumDecl {
             name,
             visibility,
             generics,
+            const_generics,
             variants,
             attrs,
         })
@@ -223,6 +255,7 @@ impl AstLower for ast::TraitDecl {
                     name: mname,
                     visibility: lower_visibility(m.is_pub()),
                     generics: lower_generic_params(generic_params.clone()),
+                    const_generics: lower_const_generic_params(generic_params.clone()),
                     generic_bounds: lower_generic_bounds(generic_params),
                     params,
                     ret_type,
@@ -357,15 +390,29 @@ impl Lower for Type {
                 let Some(len_expr) = arr.len_expr() else {
                     return HirTypeRef::Error;
                 };
-                let Some(len) = (match len_expr {
-                    ast::Expr::Number(n) => n.value().map(|v| v as usize),
-                    _ => None,
-                }) else {
-                    return HirTypeRef::Error;
-                };
-                HirTypeRef::Array(Box::new(inner.lower()), len)
+                HirTypeRef::Array(Box::new(inner.lower()), lower_const_arg(len_expr))
             }
+            Type::Const(value) => value
+                .value()
+                .map(|value| HirTypeRef::Const(HirConstArg::Value(value)))
+                .unwrap_or(HirTypeRef::Error),
         }
+    }
+}
+
+fn lower_const_arg(expr: ast::Expr) -> HirConstArg {
+    match expr {
+        ast::Expr::Number(n) => n
+            .value()
+            .map(|value| HirConstArg::Value(value as usize))
+            .unwrap_or(HirConstArg::Error),
+        ast::Expr::NameRef(name_ref) => name_ref
+            .path()
+            .and_then(|path| path.segments().next())
+            .and_then(|segment| segment.name_token())
+            .map(|name| HirConstArg::Param(Name(name.text().to_string())))
+            .unwrap_or(HirConstArg::Error),
+        _ => HirConstArg::Error,
     }
 }
 

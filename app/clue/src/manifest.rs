@@ -5,25 +5,41 @@ use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
 pub const CLUE_PROJECT_FILE_NAME: &str = "Clue.toml";
-pub const CLUE_PROJECT_FILE_TEMPLATE: &str = r#"[package]
-name = "{package_name}"
-version = "0.1.0"
 
-[dependencies]
-"#;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageKind {
+    Binary,
+    Library,
+}
+
+pub fn new_manifest(package_name: &str, kind: PackageKind) -> String {
+    let mut package = Table::new();
+    package.insert("name".to_string(), Value::String(package_name.to_string()));
+    package.insert("version".to_string(), Value::String("0.1.0".to_string()));
+    if kind == PackageKind::Library {
+        package.insert(
+            "entry".to_string(),
+            Value::String("src/lib.rid".to_string()),
+        );
+    }
+
+    let package = document_table("package", package);
+    let dependencies = document_table("dependencies", Table::new());
+    format!("{package}\n{dependencies}")
+}
+
+fn document_table(name: &str, table: Table) -> String {
+    let mut document = Table::new();
+    document.insert(name.to_string(), Value::Table(table));
+    toml::to_string(&Value::Table(document)).expect("generated Clue manifest should serialize")
+}
 
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub name: String,
     pub entry: PathBuf,
-    pub text: String,
+    pub fingerprint: String,
     pub dependencies: Vec<Dependency>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PackageKind {
-    Binary,
-    Library,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +79,7 @@ pub fn read(root: &Path, kind: PackageKind) -> io::Result<Manifest> {
     Ok(Manifest {
         name,
         entry,
-        text,
+        fingerprint: value.to_string(),
         dependencies: dependencies(&value)?,
     })
 }
@@ -172,6 +188,30 @@ mod tests {
     }
 
     #[test]
+    fn builds_init_manifest_from_toml_values() {
+        let manifest = new_manifest("hello", PackageKind::Library);
+        let value = manifest.parse::<Value>().unwrap();
+
+        assert_eq!(
+            value
+                .get("package")
+                .and_then(Value::as_table)
+                .and_then(|package| package.get("name"))
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+        assert_eq!(
+            value
+                .get("package")
+                .and_then(Value::as_table)
+                .and_then(|package| package.get("entry"))
+                .and_then(Value::as_str),
+            Some("src/lib.rid")
+        );
+        assert!(table(&value, "dependencies").is_some());
+    }
+
+    #[test]
     fn reads_explicit_entry_and_cargo_style_path_dependency() {
         let root = temp_root("read");
         fs::create_dir_all(root.join("src").join("bin")).unwrap();
@@ -227,6 +267,39 @@ math = "1.0"
         let error = read(&root, PackageKind::Binary).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert!(error.to_string().contains("local path dependency"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fingerprints_parsed_toml_not_formatting() {
+        let root = temp_root("fingerprint");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join(CLUE_PROJECT_FILE_NAME),
+            r#"# comment
+[package]
+name = "app"
+
+[dependencies]
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("src").join("main.rid"), "fun main() -> i32 { 0 }").unwrap();
+
+        let first = read(&root, PackageKind::Binary).unwrap().fingerprint;
+        fs::write(
+            root.join(CLUE_PROJECT_FILE_NAME),
+            r#"[package]
+name = "app" # comment
+
+[dependencies]
+"#,
+        )
+        .unwrap();
+        let second = read(&root, PackageKind::Binary).unwrap().fingerprint;
+
+        assert_eq!(first, second);
 
         let _ = fs::remove_dir_all(root);
     }

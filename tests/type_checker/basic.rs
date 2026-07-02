@@ -163,6 +163,58 @@ fn checks_generic_function_calls() {
 }
 
 #[test]
+fn infers_const_generic_array_length_from_struct_field() {
+    let result = check(
+        r#"
+        struct Buffer<T, const N: usize> {
+            data: [T; N],
+        }
+
+        fun main() {
+            let b = Buffer { data: [1, 2, 3] };
+            let x = b.data[0];
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_explicit_const_generic_argument() {
+    let result = check(
+        r#"
+        struct Buffer<T, const N: usize> {
+            data: [T; N],
+        }
+
+        fun main() {
+            let b: Buffer<i32, 3> = Buffer { data: [1, 2, 3] };
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn infers_const_generic_array_length_for_function_call() {
+    let result = check(
+        r#"
+        fun len<const N: usize>(values: [i32; N]) -> i32 {
+            0
+        }
+
+        fun main() {
+            let n = len([1, 2, 3]);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn reports_uninferred_generic_function_type_arg() {
     let result = check(
         r#"
@@ -186,9 +238,7 @@ fn reports_uninferred_generic_function_type_arg() {
 
 #[test]
 fn reports_growing_generic_recursion() {
-    let result = check(include_str!(
-        "../../examples/regressions/generic_wrap_recursion.rid"
-    ));
+    let result = check(include_str!("../../examples/generic_wrap_recursion.rid"));
 
     assert!(result.diagnostics.iter().any(|diag| {
         diag.message

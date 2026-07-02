@@ -349,6 +349,7 @@ fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
 
         SyntaxKind::IfStmt
         | SyntaxKind::WhileStmt
+        | SyntaxKind::ForExpr
         | SyntaxKind::NameRef
         | SyntaxKind::NumberLit
         | SyntaxKind::FloatLit

@@ -1,3 +1,5 @@
+extern "C" fun putchar(c: i32) -> i32;
+
 enum Foo{
     A,
     B
@@ -40,6 +42,11 @@ fun x(){
     x.get();
 }
 
+fun print_digit(n: i32){
+    putchar(n + 48);
+    putchar(10);
+}
+
 fun main(){
     let mut x = Foo::A;
     let v = 1;
@@ -54,6 +61,11 @@ fun main(){
     let b: Box<i32> = Box { value: 1 };
     let bb: Box<i32> = Box {value: 1};
     let t =   bb +  b;
+
+    let tx = [1, 2, 3];
+    for i in tx{
+        print_digit(i);
+    }
 }
 
 fun test(x: &Foo) -> bool{

@@ -246,6 +246,19 @@ impl<'a> Analyzer<'a> {
                 self.move_check_expr(ctx, *body);
             }
 
+            Expr::For {
+                pat,
+                iterable,
+                body,
+            } => {
+                self.move_check_expr(ctx, *iterable);
+                self.consume_if_local(ctx, *iterable);
+                ctx.push_scope();
+                self.bind_pattern_names(ctx, *pat);
+                self.move_check_expr(ctx, *body);
+                ctx.pop_scope();
+            }
+
             Expr::Match { scrutinee, arms } => {
                 self.move_check_expr(ctx, *scrutinee);
                 self.consume_if_local(ctx, *scrutinee);

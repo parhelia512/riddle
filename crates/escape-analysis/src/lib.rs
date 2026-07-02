@@ -240,6 +240,12 @@ impl<'a> EscapeAnalyzer<'a> {
                 ctx.escaping_exprs.contains(body)
             }
 
+            Expr::For { iterable, body, .. } => {
+                self.mark_escaping_exprs(ctx, *iterable);
+                self.mark_escaping_exprs(ctx, *body);
+                ctx.escaping_exprs.contains(body)
+            }
+
             Expr::Match { scrutinee, arms } => {
                 self.mark_escaping_exprs(ctx, *scrutinee);
                 for arm in arms {

@@ -237,8 +237,10 @@ impl TypeChecker<'_> {
         expected: &HirFunction,
         actual: &HirFunction,
     ) {
-        let mut params =
-            crate::lowering::generic_param_map(imp.generics.iter().map(|name| name.0.as_str()));
+        let mut params = crate::lowering::generic_param_map_with_consts(
+            imp.generics.iter().map(|name| name.0.as_str()),
+            imp.const_generics.iter().map(|name| name.0.as_str()),
+        );
         let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
         params.insert("Self".into(), self_ty);
 
@@ -327,8 +329,9 @@ impl TypeChecker<'_> {
                 format!("({inner})")
             }
             HirTypeRef::Array(inner, len) => {
-                format!("[{}; {}]", self.type_ref_source_text(inner), len)
+                format!("[{}; {}]", self.type_ref_source_text(inner), len.display())
             }
+            HirTypeRef::Const(value) => value.display(),
             HirTypeRef::Ptr { mutable, inner } => {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", self.type_ref_source_text(inner))

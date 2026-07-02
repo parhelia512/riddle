@@ -144,6 +144,11 @@ pub enum Expr {
         condition: ExprId,
         body: ExprId,
     },
+    For {
+        pat: PatId,
+        iterable: ExprId,
+        body: ExprId,
+    },
     Match {
         scrutinee: ExprId,
         arms: Vec<MatchArm>,
@@ -506,6 +511,19 @@ impl BodyPrinter<'_> {
                 out.push_str(&self.print_block_like(*body, indent));
                 out
             }
+            Expr::For {
+                pat,
+                iterable,
+                body,
+            } => {
+                let mut out = String::from("for ");
+                out.push_str(&self.print_pat(*pat));
+                out.push_str(" in ");
+                out.push_str(&self.print_expr(*iterable, 0, indent));
+                out.push(' ');
+                out.push_str(&self.print_block_like(*body, indent));
+                out
+            }
             Expr::Match { scrutinee, arms } => {
                 let mut out = String::from("match ");
                 out.push_str(&self.print_expr(*scrutinee, 0, indent));
@@ -612,6 +630,7 @@ impl BodyPrinter<'_> {
             Expr::Block { .. }
             | Expr::If { .. }
             | Expr::While { .. }
+            | Expr::For { .. }
             | Expr::Match { .. }
             | Expr::Unsafe { .. } => 0,
         }
@@ -710,7 +729,10 @@ impl BodyPrinter<'_> {
                     .join(", ");
                 format!("({})", inner)
             }
-            HirTypeRef::Array(elem, len) => format!("[{}; {}]", Self::type_text(elem), len),
+            HirTypeRef::Array(elem, len) => {
+                format!("[{}; {}]", Self::type_text(elem), len.display())
+            }
+            HirTypeRef::Const(value) => value.display(),
         }
     }
 

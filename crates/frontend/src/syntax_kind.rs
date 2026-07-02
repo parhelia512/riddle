@@ -58,6 +58,8 @@ pub enum SyntaxKind {
     Unsafe,
     #[token("for")]
     For,
+    #[token("in")]
+    In,
     #[token("where")]
     Where,
     #[token("true")]
@@ -194,6 +196,7 @@ pub enum SyntaxKind {
     PathSegment,
     IfStmt,
     WhileStmt,
+    ForExpr,
     ReturnStmt,
     Block,
     ExprStmt,
@@ -213,6 +216,7 @@ pub enum SyntaxKind {
     RefType,
     TupleType,
     ArrayType,
+    ConstType,
     ArrayExpr,
     MatchExpr,
     MatchArm,

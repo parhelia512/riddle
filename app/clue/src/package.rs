@@ -34,7 +34,7 @@ fn load_inner(
     let manifest = manifest::read(&root, kind)?;
     let mut source = String::new();
     let mut files = Vec::new();
-    let mut manifest_fingerprint = manifest.text.clone();
+    let mut manifest_fingerprint = manifest.fingerprint.clone();
     for dependency in &manifest.dependencies {
         if !is_ident(&dependency.alias) {
             return Err(Error::new(

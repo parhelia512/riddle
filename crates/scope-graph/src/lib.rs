@@ -111,6 +111,9 @@ pub enum DefRef {
         fn_id: FunctionId,
         index: usize,
     },
+    ConstParam {
+        name: Name,
+    },
     /// Alias introduced by `use foo::bar as X;`.
     ///
     /// After matching `X`, resolution restarts at `anchor` with the remaining path segments

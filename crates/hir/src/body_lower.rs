@@ -444,6 +444,26 @@ impl<'a> BodyLower<'a> {
                 self.alloc_expr(Expr::While { condition, body }, range)
             }
 
+            ast::Expr::ForExpr(f) => {
+                let name_token = f.name();
+                let pat_range = name_token
+                    .as_ref()
+                    .map(|token| token.text_range())
+                    .unwrap_or(range);
+                let name = lower_name(name_token);
+                let pat = self.alloc_pat(Pattern::Binding { name }, pat_range);
+                let iterable = self.lower_required_expr(f.iterable(), "missing for iterable");
+                let body = self.lower_required_block(f.body(), "missing for body");
+                self.alloc_expr(
+                    Expr::For {
+                        pat,
+                        iterable,
+                        body,
+                    },
+                    range,
+                )
+            }
+
             ast::Expr::CallExpr(c) => {
                 let callee = self.lower_required_expr(c.callee(), "missing call callee");
                 let args = self.lower_arg_list(c.arg_list());

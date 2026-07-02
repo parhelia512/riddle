@@ -5,7 +5,7 @@ use rowan::TextRange;
 
 use crate::{
     checker::TypeChecker,
-    types::{FloatTy, IntTy, Type},
+    types::{ConstArg, FloatTy, IntTy, Type},
 };
 
 impl TypeChecker<'_> {
@@ -53,8 +53,9 @@ impl TypeChecker<'_> {
             ),
             HirTypeRef::Array(inner, len) => Type::Array(
                 Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
-                *len,
+                self.lower_const_arg(len, params),
             ),
+            HirTypeRef::Const(value) => Type::Const(self.lower_const_arg(value, params)),
             HirTypeRef::Unknown => Type::Unknown,
             HirTypeRef::Error => Type::Error,
         }
@@ -85,7 +86,10 @@ impl TypeChecker<'_> {
                     .join(", ");
                 format!("({})", inner)
             }
-            HirTypeRef::Array(elem, len) => format!("[{}; {}]", Self::type_text(elem), len),
+            HirTypeRef::Array(elem, len) => {
+                format!("[{}; {}]", Self::type_text(elem), len.display())
+            }
+            HirTypeRef::Const(value) => value.display(),
         }
     }
 
@@ -147,7 +151,8 @@ impl TypeChecker<'_> {
                     let args = self.lower_type_args(&path.type_args, params);
                     self.check_type_arg_count(
                         name,
-                        self.hir.item_tree.structs[struct_id].generics.len(),
+                        self.hir.item_tree.structs[struct_id].generics.len()
+                            + self.hir.item_tree.structs[struct_id].const_generics.len(),
                         args.len(),
                     );
                     Type::Struct(struct_id, args)
@@ -155,7 +160,8 @@ impl TypeChecker<'_> {
                     let args = self.lower_type_args(&path.type_args, params);
                     self.check_type_arg_count(
                         name,
-                        self.hir.item_tree.enums[enum_id].generics.len(),
+                        self.hir.item_tree.enums[enum_id].generics.len()
+                            + self.hir.item_tree.enums[enum_id].const_generics.len(),
                         args.len(),
                     );
                     Type::Enum(enum_id, args)
@@ -177,6 +183,22 @@ impl TypeChecker<'_> {
             .collect()
     }
 
+    fn lower_const_arg(
+        &self,
+        arg: &hir::item_tree::HirConstArg,
+        params: &HashMap<String, Type>,
+    ) -> ConstArg {
+        match arg {
+            hir::item_tree::HirConstArg::Value(value) => ConstArg::Value(*value),
+            hir::item_tree::HirConstArg::Param(name) => match params.get(&name.0) {
+                Some(Type::Const(value)) => value.clone(),
+                _ => ConstArg::Param(name.0.clone()),
+            },
+            hir::item_tree::HirConstArg::Unknown => ConstArg::Unknown,
+            hir::item_tree::HirConstArg::Error => ConstArg::Error,
+        }
+    }
+
     fn check_type_arg_count(&mut self, name: &str, expected: usize, actual: usize) {
         if expected == actual {
             return;
@@ -189,9 +211,11 @@ impl TypeChecker<'_> {
     }
 
     pub(crate) fn struct_subst(&self, struct_id: StructId, args: &[Type]) -> HashMap<String, Type> {
-        self.hir.item_tree.structs[struct_id]
+        let strukt = &self.hir.item_tree.structs[struct_id];
+        strukt
             .generics
             .iter()
+            .chain(strukt.const_generics.iter())
             .zip(args.iter())
             .map(|(name, ty)| (name.0.clone(), ty.clone()))
             .collect()
@@ -202,14 +226,21 @@ impl TypeChecker<'_> {
         imp: &hir::item_tree::HirImpl,
         actual: &Type,
     ) -> Option<HashMap<String, Type>> {
-        let params = generic_param_map(imp.generics.iter().map(|name| name.0.as_str()));
+        let params = generic_param_map_with_consts(
+            imp.generics.iter().map(|name| name.0.as_str()),
+            imp.const_generics.iter().map(|name| name.0.as_str()),
+        );
         let expected = self.lower_type_ref_with_params(&imp.self_ty, &params);
         let mut subst = HashMap::new();
         if collect_subst(&expected, actual, &mut subst) {
-            for name in &imp.generics {
-                subst
-                    .entry(name.0.clone())
-                    .or_insert_with(|| Type::Param(name.0.clone()));
+            for name in imp.generics.iter().chain(imp.const_generics.iter()) {
+                subst.entry(name.0.clone()).or_insert_with(|| {
+                    if imp.const_generics.contains(name) {
+                        Type::Const(ConstArg::Param(name.0.clone()))
+                    } else {
+                        Type::Param(name.0.clone())
+                    }
+                });
             }
             Some(subst)
         } else {
@@ -233,7 +264,7 @@ impl TypeChecker<'_> {
             .find_map(|(id, e)| (e.name.0 == name).then_some(id))
     }
 
-    fn find_trait_by_name(&self, name: &str) -> Option<TraitId> {
+    pub(crate) fn find_trait_by_name(&self, name: &str) -> Option<TraitId> {
         self.hir
             .item_tree
             .traits
@@ -305,9 +336,18 @@ impl TypeChecker<'_> {
     }
 }
 
-pub(crate) fn generic_param_map<'a>(names: impl Iterator<Item = &'a str>) -> HashMap<String, Type> {
-    names
+pub(crate) fn generic_param_map_with_consts<'a>(
+    type_names: impl Iterator<Item = &'a str>,
+    const_names: impl Iterator<Item = &'a str>,
+) -> HashMap<String, Type> {
+    type_names
         .map(|name| (name.to_string(), Type::Param(name.to_string())))
+        .chain(const_names.map(|name| {
+            (
+                name.to_string(),
+                Type::Const(ConstArg::Param(name.to_string())),
+            )
+        }))
         .collect()
 }
 
@@ -323,6 +363,10 @@ pub(crate) fn collect_subst(
                 subst.insert(name.clone(), actual.clone());
                 true
             }
+        },
+        Type::Const(expected) => match actual {
+            Type::Const(actual) => collect_const_subst(expected, actual, subst),
+            _ => expected.is_unknown_like() || actual.is_unknown_like(),
         },
         Type::Ref(expected_inner, expected_mut) => match actual {
             Type::Ref(actual_inner, actual_mut) => {
@@ -351,7 +395,8 @@ pub(crate) fn collect_subst(
         },
         Type::Array(expected_inner, expected_len) => match actual {
             Type::Array(actual_inner, actual_len) => {
-                expected_len == actual_len && collect_subst(expected_inner, actual_inner, subst)
+                collect_const_subst(expected_len, actual_len, subst)
+                    && collect_subst(expected_inner, actual_inner, subst)
             }
             _ => false,
         },
@@ -381,9 +426,28 @@ pub(crate) fn collect_subst(
     }
 }
 
+fn collect_const_subst(
+    expected: &ConstArg,
+    actual: &ConstArg,
+    subst: &mut HashMap<String, Type>,
+) -> bool {
+    match expected {
+        ConstArg::Param(name) => match subst.get(name) {
+            Some(Type::Const(existing)) => existing == actual,
+            Some(_) => false,
+            None => {
+                subst.insert(name.clone(), Type::Const(actual.clone()));
+                true
+            }
+        },
+        _ => expected.is_unknown_like() || actual.is_unknown_like() || expected == actual,
+    }
+}
+
 pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
     match ty {
         Type::Param(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Const(value) => Type::Const(substitute_const(value, subst)),
         Type::Ref(inner, mutable) => Type::Ref(Box::new(substitute_type(inner, subst)), *mutable),
         Type::Ptr { mutable, inner } => Type::Ptr {
             mutable: *mutable,
@@ -395,7 +459,10 @@ pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type 
                 .map(|ty| substitute_type(ty, subst))
                 .collect(),
         ),
-        Type::Array(inner, len) => Type::Array(Box::new(substitute_type(inner, subst)), *len),
+        Type::Array(inner, len) => Type::Array(
+            Box::new(substitute_type(inner, subst)),
+            substitute_const(len, subst),
+        ),
         Type::Struct(id, args) => Type::Struct(
             *id,
             args.iter().map(|ty| substitute_type(ty, subst)).collect(),
@@ -405,6 +472,16 @@ pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type 
             args.iter().map(|ty| substitute_type(ty, subst)).collect(),
         ),
         _ => ty.clone(),
+    }
+}
+
+fn substitute_const(value: &ConstArg, subst: &HashMap<String, Type>) -> ConstArg {
+    match value {
+        ConstArg::Param(name) => match subst.get(name) {
+            Some(Type::Const(value)) => value.clone(),
+            _ => value.clone(),
+        },
+        _ => value.clone(),
     }
 }
 

@@ -3,15 +3,18 @@ use std::collections::HashMap;
 use hir::{
     Name,
     body::{BinaryOp, Expr, ExprId, MatchArm, PatId, Pattern, ResolvedName, Stmt, StmtId, UnaryOp},
-    item_tree::{FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound, HirTypeRef},
+    item_tree::{
+        FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound, HirTypeRef,
+        HirVariantKind, TraitId,
+    },
 };
 
 use crate::{
     checker::{GenericEdge, TypeChecker},
     context::BodyCtx,
-    lowering::{collect_subst, substitute_type},
+    lowering::{collect_subst, generic_param_map_with_consts, substitute_type},
     result::{OperatorCall, TraitMethodCall},
-    types::{IntTy, Type},
+    types::{ConstArg, IntTy, Type},
 };
 
 impl TypeChecker<'_> {
@@ -26,7 +29,8 @@ impl TypeChecker<'_> {
             } => {
                 let declared =
                     self.lower_type_ref_with_params_at(ty, &ctx.generic_params, *ty_range);
-                let explicit_error = type_ref_contains_error(ty);
+                let explicit_error = type_ref_contains_error(ty)
+                    || type_contains_unresolved_const_param(&declared, &ctx.generic_params);
                 if explicit_error {
                     self.diagnostic("E0034", "invalid type annotation", ctx.stmt_range(stmt_id));
                 }
@@ -107,6 +111,14 @@ impl TypeChecker<'_> {
                     .cloned()
                 {
                     binding_ty
+                } else if path
+                    .as_single_name()
+                    .and_then(|name| ctx.generic_params.get(&name.0))
+                    .is_some_and(|ty| matches!(ty, Type::Const(_)))
+                {
+                    Type::Int(IntTy::Usize)
+                } else if let Some(ResolvedName::EnumVariant(enum_id, _)) = resolved {
+                    self.enum_variant_type(*enum_id, expected)
                 } else {
                     self.type_of_resolved_name(ctx, resolved.as_ref())
                 }
@@ -168,6 +180,11 @@ impl TypeChecker<'_> {
                 self.check_expr(ctx, *body);
                 Type::Unit
             }
+            Expr::For {
+                pat,
+                iterable,
+                body,
+            } => self.check_for(ctx, *pat, *iterable, *body, span),
             Expr::Match { scrutinee, arms } => {
                 self.check_match(ctx, *scrutinee, arms, expected, span)
             }
@@ -175,7 +192,7 @@ impl TypeChecker<'_> {
             Expr::ArrayRepeat { value, len } => {
                 self.check_array_repeat(ctx, *value, *len, expected, span)
             }
-            Expr::Call { callee, args } => self.check_call(ctx, *callee, args, span),
+            Expr::Call { callee, args } => self.check_call(ctx, *callee, args, expected, span),
             Expr::FieldAccess { base, field } => self.check_field_access(ctx, *base, field, span),
             Expr::Unsafe { body } => {
                 let ty = match expected {
@@ -187,12 +204,14 @@ impl TypeChecker<'_> {
             Expr::IndexAccess { base, index } => {
                 let base_ty = self.check_expr(ctx, *base);
                 let index_ty = self.check_expr(ctx, *index);
-                self.expect_assignable(
-                    &Type::Int(IntTy::I32),
-                    &index_ty,
-                    "index",
-                    ctx.expr_range(*index),
-                );
+                if !index_ty.is_unknown_like() && !index_ty.is_integer() {
+                    self.expect_assignable(
+                        &Type::Int(IntTy::I32),
+                        &index_ty,
+                        "index",
+                        ctx.expr_range(*index),
+                    );
+                }
                 // Extract element type from array / pointer base.
                 match &base_ty {
                     Type::Array(inner, _) | Type::Ptr { inner, .. } => *inner.clone(),
@@ -623,12 +642,13 @@ impl TypeChecker<'_> {
             seen.push(field.name.0.as_str());
             let pattern = self.lower_type_ref_with_params(
                 &expected_field.ty,
-                &crate::lowering::generic_param_map(
+                &generic_param_map_with_consts(
                     strukt.generics.iter().map(|name| name.0.as_str()),
+                    strukt.const_generics.iter().map(|name| name.0.as_str()),
                 ),
             );
             let expected = substitute_type(&pattern, &subst);
-            let actual = if expected.is_unknown_like() || matches!(expected, Type::Param(_)) {
+            let actual = if expected.is_unknown_like() || expected_has_param(&expected) {
                 self.check_expr(ctx, field.value)
             } else {
                 self.check_expr_expected(ctx, field.value, &expected)
@@ -654,6 +674,7 @@ impl TypeChecker<'_> {
         let args = strukt
             .generics
             .iter()
+            .chain(strukt.const_generics.iter())
             .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
             .collect();
         Type::Struct(*struct_id, args)
@@ -697,6 +718,78 @@ impl TypeChecker<'_> {
         result.unwrap_or(Type::Unit)
     }
 
+    fn check_for(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        pat: PatId,
+        iterable: ExprId,
+        body: ExprId,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let iterable_ty = self.check_expr(ctx, iterable);
+        let Some(into_iter_trait) = self.find_trait_by_name("IntoIterator") else {
+            if let Type::Array(item_ty, _) = &iterable_ty {
+                ctx.push_scope();
+                self.bind_pattern(ctx, pat, item_ty);
+                self.check_expr(ctx, body);
+                ctx.pop_scope();
+                return Type::Unit;
+            }
+            self.diagnostic("E0035", "missing `IntoIterator` trait", span);
+            return Type::Unit;
+        };
+
+        if !self.type_has_trait_id(ctx, &iterable_ty, into_iter_trait) {
+            self.diagnostic(
+                "E0035",
+                format!(
+                    "type `{}` cannot be used in a for loop because it does not implement `IntoIterator`",
+                    iterable_ty.display(self.hir)
+                ),
+                ctx.expr_range(iterable),
+            );
+        }
+
+        let item_ty = self
+            .associated_type_for(ctx, &iterable_ty, into_iter_trait, "Item")
+            .unwrap_or(Type::Unknown);
+        let into_iter_ty = self
+            .associated_type_for(ctx, &iterable_ty, into_iter_trait, "IntoIter")
+            .unwrap_or(Type::Unknown);
+
+        if let Some(iterator_trait) = self.find_trait_by_name("Iterator") {
+            if !into_iter_ty.is_unknown_like()
+                && !self.type_has_trait_id(ctx, &into_iter_ty, iterator_trait)
+            {
+                self.diagnostic(
+                    "E0035",
+                    format!(
+                        "`IntoIterator::IntoIter` type `{}` does not implement `Iterator`",
+                        into_iter_ty.display(self.hir)
+                    ),
+                    ctx.expr_range(iterable),
+                );
+            }
+            if let Some(iter_item_ty) =
+                self.associated_type_for(ctx, &into_iter_ty, iterator_trait, "Item")
+            {
+                self.expect_assignable(
+                    &item_ty,
+                    &iter_item_ty,
+                    "iterator item",
+                    ctx.expr_range(iterable),
+                );
+            }
+        }
+
+        ctx.push_scope();
+        self.bind_pattern(ctx, pat, &item_ty);
+        self.check_expr(ctx, body);
+        ctx.pop_scope();
+
+        Type::Unit
+    }
+
     fn check_array(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -705,7 +798,7 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) -> Type {
         let (expected_element, expected_len) = match expected {
-            Some(Type::Array(inner, len)) => (Some(inner.as_ref()), Some(*len)),
+            Some(Type::Array(inner, len)) => (Some(inner.as_ref()), len.as_usize()),
             _ => (None, None),
         };
         let mut element_ty = None;
@@ -743,7 +836,7 @@ impl TypeChecker<'_> {
                     .or_else(|| expected_element.cloned())
                     .unwrap_or(Type::Unknown),
             ),
-            elements.len(),
+            ConstArg::Value(elements.len()),
         )
     }
 
@@ -756,7 +849,7 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) -> Type {
         let (expected_element, expected_len) = match expected {
-            Some(Type::Array(inner, len)) => (Some(inner.as_ref()), Some(*len)),
+            Some(Type::Array(inner, len)) => (Some(inner.as_ref()), len.as_usize()),
             _ => (None, None),
         };
         let value_ty = match expected_element {
@@ -806,7 +899,7 @@ impl TypeChecker<'_> {
             }
         }
 
-        Type::Array(Box::new(value_ty), len_value)
+        Type::Array(Box::new(value_ty), ConstArg::Value(len_value))
     }
 
     fn repeat_value_is_copy(&self, ty: &Type) -> bool {
@@ -822,10 +915,26 @@ impl TypeChecker<'_> {
         ctx: &mut BodyCtx<'_>,
         callee: ExprId,
         args: &[ExprId],
+        expected: Option<&Type>,
         span: Option<rowan::TextRange>,
     ) -> Type {
         if let Expr::FieldAccess { base, field } = &ctx.body.exprs[callee] {
             return self.check_method_call(ctx, callee, *base, field.clone(), args, span);
+        }
+
+        if let Expr::Path {
+            resolved: Some(ResolvedName::EnumVariant(enum_id, variant_index)),
+            ..
+        } = &ctx.body.exprs[callee]
+        {
+            return self.check_enum_variant_call(
+                ctx,
+                *enum_id,
+                *variant_index,
+                args,
+                expected,
+                span,
+            );
         }
 
         let callee_ty = self.check_expr(ctx, callee);
@@ -844,8 +953,9 @@ impl TypeChecker<'_> {
         };
 
         let function = &self.hir.item_tree.functions[fid];
-        let params = crate::lowering::generic_param_map(
+        let params = generic_param_map_with_consts(
             function.generics.iter().map(|name| name.0.as_str()),
+            function.const_generics.iter().map(|name| name.0.as_str()),
         );
         let mut subst = HashMap::new();
         if args.len() != function.params.len() {
@@ -883,11 +993,12 @@ impl TypeChecker<'_> {
             }
         }
 
-        if !function.generics.is_empty() {
+        if !function.generics.is_empty() || !function.const_generics.is_empty() {
             if function
                 .generics
                 .iter()
-                .any(|name| matches!(subst.get(&name.0), None | Some(Type::Unknown)))
+                .chain(function.const_generics.iter())
+                .any(|name| subst.get(&name.0).is_none_or(generic_arg_unknown))
             {
                 self.diagnostic(
                     "E0005",
@@ -902,6 +1013,7 @@ impl TypeChecker<'_> {
             let args = function
                 .generics
                 .iter()
+                .chain(function.const_generics.iter())
                 .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
                 .collect::<Vec<_>>();
             self.generic_edges.push(GenericEdge {
@@ -922,6 +1034,115 @@ impl TypeChecker<'_> {
             .as_ref()
             .map(|ty| substitute_type(&self.lower_type_ref_with_params(ty, &params), &subst))
             .unwrap_or(Type::Unit)
+    }
+
+    fn check_enum_variant_call(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        enum_id: hir::item_tree::EnumId,
+        variant_index: usize,
+        args: &[ExprId],
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let enum_data = &self.hir.item_tree.enums[enum_id];
+        let Some(variant) = enum_data.variants.get(variant_index) else {
+            for arg in args {
+                self.check_expr(ctx, *arg);
+            }
+            return Type::Error;
+        };
+
+        let mut subst = match expected {
+            Some(Type::Enum(expected_id, expected_args)) if *expected_id == enum_id => enum_data
+                .generics
+                .iter()
+                .chain(enum_data.const_generics.iter())
+                .zip(expected_args.iter())
+                .map(|(name, ty)| (name.0.clone(), ty.clone()))
+                .collect::<HashMap<_, _>>(),
+            _ => HashMap::new(),
+        };
+        let params = generic_param_map_with_consts(
+            enum_data.generics.iter().map(|name| name.0.as_str()),
+            enum_data.const_generics.iter().map(|name| name.0.as_str()),
+        );
+        let fields = match &variant.kind {
+            HirVariantKind::Tuple(fields) => fields.as_slice(),
+            HirVariantKind::Unit => &[],
+            HirVariantKind::Struct(_) => {
+                for arg in args {
+                    self.check_expr(ctx, *arg);
+                }
+                self.diagnostic(
+                    "E0004",
+                    format!(
+                        "cannot call struct enum variant `{}`; use struct literal syntax",
+                        variant.name.0
+                    ),
+                    span,
+                );
+                return Type::Error;
+            }
+        };
+
+        if args.len() != fields.len() {
+            self.diagnostic(
+                "E0005",
+                format!(
+                    "enum variant `{}` expects {} argument(s), got {}",
+                    variant.name.0,
+                    fields.len(),
+                    args.len()
+                ),
+                span,
+            );
+        }
+
+        for (index, arg) in args.iter().enumerate() {
+            if let Some(field) = fields.get(index) {
+                let pattern = self.lower_type_ref_with_params(field, &params);
+                let expected = substitute_type(&pattern, &subst);
+                let actual = if expected_has_param(&expected) {
+                    self.check_expr(ctx, *arg)
+                } else {
+                    self.check_expr_expected(ctx, *arg, &expected)
+                };
+                collect_subst(&pattern, &actual, &mut subst);
+                let expected = substitute_type(&pattern, &subst);
+                self.expect_assignable(
+                    &expected,
+                    &actual,
+                    "enum variant argument",
+                    ctx.expr_range(*arg),
+                );
+            } else {
+                self.check_expr(ctx, *arg);
+            }
+        }
+
+        let args = enum_data
+            .generics
+            .iter()
+            .chain(enum_data.const_generics.iter())
+            .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+            .collect();
+        Type::Enum(enum_id, args)
+    }
+
+    fn enum_variant_type(&self, enum_id: hir::item_tree::EnumId, expected: Option<&Type>) -> Type {
+        if let Some(Type::Enum(expected_id, args)) = expected {
+            if *expected_id == enum_id {
+                return Type::Enum(enum_id, args.clone());
+            }
+        }
+        let args = self.hir.item_tree.enums[enum_id]
+            .generics
+            .iter()
+            .chain(self.hir.item_tree.enums[enum_id].const_generics.iter())
+            .map(|_| Type::Unknown)
+            .collect();
+        Type::Enum(enum_id, args)
     }
 
     fn check_generic_bounds(
@@ -1003,6 +1224,10 @@ impl TypeChecker<'_> {
         let Some(trait_id) = self.find_lang_trait(lang) else {
             return false;
         };
+        self.type_has_trait_id(ctx, ty, trait_id)
+    }
+
+    fn type_has_trait_id(&mut self, ctx: &BodyCtx<'_>, ty: &Type, trait_id: TraitId) -> bool {
         if ty.is_unknown_like() {
             return true;
         }
@@ -1010,6 +1235,30 @@ impl TypeChecker<'_> {
             return self.param_has_trait_bound(ctx, param, trait_id, &[], &ctx.generic_params);
         }
         self.result.trait_env.type_implements(ty, trait_id)
+    }
+
+    fn associated_type_for(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        ty: &Type,
+        trait_id: TraitId,
+        name: &str,
+    ) -> Option<Type> {
+        if let Type::Param(param) = ty {
+            return self
+                .current_generic_bounds(ctx)
+                .into_iter()
+                .find_map(|bound| {
+                    if bound.param.0 != *param {
+                        return None;
+                    }
+                    let bound_trait = self.resolve_trait_ref(&bound.trait_ty)?;
+                    self.trait_implies(bound_trait, trait_id)
+                        .then(|| self.bound_assoc_type(ctx, &bound, name))
+                        .flatten()
+                });
+        }
+        self.result.trait_env.associated_type(ty, trait_id, name)
     }
 
     fn param_has_trait_bound(
@@ -1216,6 +1465,7 @@ impl TypeChecker<'_> {
         method_name: &Name,
     ) -> Option<ResolvedMethod> {
         self.find_inherent_method(receiver_ty, method_name)
+            .or_else(|| self.find_trait_impl_method_by_name(receiver_ty, method_name))
             .or_else(|| self.find_trait_bound_method(ctx, receiver_ty, method_name))
     }
 
@@ -1254,6 +1504,52 @@ impl TypeChecker<'_> {
                     });
                 }
             }
+        }
+
+        None
+    }
+
+    fn find_trait_impl_method_by_name(
+        &mut self,
+        receiver_ty: &Type,
+        method_name: &Name,
+    ) -> Option<ResolvedMethod> {
+        let impls = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .map(|(_, imp)| imp.clone())
+            .collect::<Vec<_>>();
+
+        for imp in impls {
+            let Some(trait_ty) = imp.trait_ty.as_ref() else {
+                continue;
+            };
+            let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+                continue;
+            };
+            let Some(mut subst) = self.impl_subst_from_self_ty(&imp, receiver_ty) else {
+                continue;
+            };
+            if !self.impl_bounds_satisfied(&imp, &subst) {
+                continue;
+            }
+            subst.insert("Self".into(), receiver_ty.clone());
+            let Some(fid) = imp
+                .methods
+                .iter()
+                .copied()
+                .find(|fid| self.hir.item_tree.functions[*fid].name == *method_name)
+            else {
+                continue;
+            };
+            return Some(ResolvedMethod {
+                fid,
+                function: self.hir.item_tree.functions[fid].clone(),
+                subst,
+                trait_id: Some(trait_id),
+            });
         }
 
         None
@@ -1333,8 +1629,9 @@ impl TypeChecker<'_> {
             else {
                 continue;
             };
-            let mut subst = crate::lowering::generic_param_map(
+            let mut subst = generic_param_map_with_consts(
                 function.generics.iter().map(|name| name.0.as_str()),
+                function.const_generics.iter().map(|name| name.0.as_str()),
             );
             subst.insert("Self".into(), receiver_ty.clone());
             return Some(ResolvedMethod {
@@ -1409,6 +1706,21 @@ impl TypeChecker<'_> {
 
     /// Check that the LHS of an assignment targets a mutable binding.
     fn check_assign_mut(&mut self, ctx: &BodyCtx<'_>, lhs: ExprId, span: Option<rowan::TextRange>) {
+        if let Expr::Path { path, .. } = &ctx.body.exprs[lhs] {
+            if let Some(name) = path.as_single_name() {
+                if ctx.bindings.get(&name.0).is_some() {
+                    self.diagnostic(
+                        "E0031",
+                        format!(
+                            "cannot assign to `{}`, as it is not declared as mutable",
+                            name.0
+                        ),
+                        span,
+                    );
+                    return;
+                }
+            }
+        }
         if let Some(stmt_id) = self.root_local_of_expr(ctx, lhs) {
             if let Some((_, false)) = ctx.locals.get(&stmt_id) {
                 let name = self.local_name(ctx, stmt_id);
@@ -1544,12 +1856,43 @@ struct ResolvedMethod {
 
 fn expected_has_param(ty: &Type) -> bool {
     match ty {
-        Type::Param(_) => true,
+        Type::Param(_) | Type::Const(ConstArg::Param(_)) => true,
         Type::Ref(inner, _) => expected_has_param(inner),
         Type::Ptr { inner, .. } => expected_has_param(inner),
         Type::Tuple(elements) => elements.iter().any(expected_has_param),
-        Type::Array(inner, _) => expected_has_param(inner),
+        Type::Array(inner, len) => expected_has_param(inner) || const_has_param(len),
         Type::Struct(_, args) | Type::Enum(_, args) => args.iter().any(expected_has_param),
+        _ => false,
+    }
+}
+
+fn const_has_param(value: &ConstArg) -> bool {
+    matches!(value, ConstArg::Param(_))
+}
+
+fn generic_arg_unknown(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Unknown | Type::Error | Type::Const(ConstArg::Unknown | ConstArg::Error)
+    )
+}
+
+fn type_contains_unresolved_const_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
+    match ty {
+        Type::Const(ConstArg::Param(name)) => !matches!(params.get(name), Some(Type::Const(_))),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } => {
+            type_contains_unresolved_const_param(inner, params)
+        }
+        Type::Tuple(elements) => elements
+            .iter()
+            .any(|element| type_contains_unresolved_const_param(element, params)),
+        Type::Array(inner, len) => {
+            type_contains_unresolved_const_param(inner, params)
+                || matches!(len, ConstArg::Param(name) if !matches!(params.get(name), Some(Type::Const(_))))
+        }
+        Type::Struct(_, args) | Type::Enum(_, args) => args
+            .iter()
+            .any(|arg| type_contains_unresolved_const_param(arg, params)),
         _ => false,
     }
 }
@@ -1557,10 +1900,14 @@ fn expected_has_param(ty: &Type) -> bool {
 fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
     match ty {
         HirTypeRef::Error => true,
-        HirTypeRef::Ref(inner, _) | HirTypeRef::Array(inner, _) => type_ref_contains_error(inner),
+        HirTypeRef::Ref(inner, _) => type_ref_contains_error(inner),
+        HirTypeRef::Array(inner, len) => {
+            type_ref_contains_error(inner) || matches!(len, hir::item_tree::HirConstArg::Error)
+        }
         HirTypeRef::Ptr { inner, .. } => type_ref_contains_error(inner),
         HirTypeRef::Tuple(elements) => elements.iter().any(type_ref_contains_error),
         HirTypeRef::Named(path) => path.type_args.iter().any(type_ref_contains_error),
+        HirTypeRef::Const(value) => matches!(value, hir::item_tree::HirConstArg::Error),
         HirTypeRef::Unknown => false,
     }
 }
@@ -1568,8 +1915,10 @@ fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
 fn grows_generic_arg(ty: &Type, params: &HashMap<String, Type>) -> bool {
     match ty {
         Type::Param(name) => !params.contains_key(name),
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
-            contains_current_param(inner, params)
+        Type::Const(ConstArg::Param(name)) => !params.contains_key(name),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } => contains_current_param(inner, params),
+        Type::Array(inner, len) => {
+            contains_current_param(inner, params) || const_contains_current_param(len, params)
         }
         Type::Tuple(elements) => elements
             .iter()
@@ -1584,8 +1933,10 @@ fn grows_generic_arg(ty: &Type, params: &HashMap<String, Type>) -> bool {
 fn contains_current_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
     match ty {
         Type::Param(name) => params.contains_key(name),
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
-            contains_current_param(inner, params)
+        Type::Const(ConstArg::Param(name)) => params.contains_key(name),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } => contains_current_param(inner, params),
+        Type::Array(inner, len) => {
+            contains_current_param(inner, params) || const_contains_current_param(len, params)
         }
         Type::Tuple(elements) => elements
             .iter()
@@ -1595,4 +1946,8 @@ fn contains_current_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
         }
         _ => false,
     }
+}
+
+fn const_contains_current_param(value: &ConstArg, params: &HashMap<String, Type>) -> bool {
+    matches!(value, ConstArg::Param(name) if params.contains_key(name))
 }

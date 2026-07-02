@@ -86,6 +86,35 @@ fn array_repeat_lowers_to_array_value() {
 }
 
 #[test]
+fn array_for_loop_lowers_to_indexed_loop() {
+    let module = lower(
+        r#"
+        fun main() {
+            let mut sum = 0;
+            let values = [1, 2, 3];
+            for item in values {
+                sum += item;
+            }
+        }
+        "#,
+    );
+    let func = &module.functions[module.function_order[0]];
+    let has_loop_branch = func
+        .blocks
+        .iter()
+        .any(|(_, block)| matches!(block.terminator, mir::instr::Terminator::CondBranch(..)));
+    let has_index_ptr = func.blocks.iter().any(|(_, block)| {
+        block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::IndexPtr(..)))
+    });
+
+    assert!(has_loop_branch, "{func:#?}");
+    assert!(has_index_ptr, "{func:#?}");
+}
+
+#[test]
 fn if_expression_creates_blocks() {
     let module = lower(
         r#"
@@ -228,6 +257,34 @@ fn overloaded_add_lowers_to_method_call() {
         "overloaded add should call Add::add, got {:?}",
         entry.insts.iter().map(|i| &i.kind).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn enum_variant_constructor_lowers_to_discriminant() {
+    let module = lower(
+        r#"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        fun make() -> Option<i32> {
+            Option::Some(1)
+        }
+        "#,
+    );
+    let func = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|func| func.name == "make")
+        .unwrap();
+    let entry = &func.blocks[func.entry];
+
+    assert!(!entry.insts.iter().any(|i| matches!(
+        &i.kind,
+        mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name == "Option::Some"
+    )));
 }
 
 #[test]
