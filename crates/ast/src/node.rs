@@ -52,6 +52,7 @@ ast_node!(ImplDecl, ImplDecl);
 ast_node!(ConstDecl, ConstDecl);
 ast_node!(TypeAliasDecl, TypeAliasDecl);
 ast_node!(GenericParams, GenericParams);
+ast_node!(WhereClause, WhereClause);
 
 // expressions
 ast_node!(Block, Block);
@@ -239,10 +240,37 @@ pub fn attrs_for_node(node: &SyntaxNode) -> Vec<Attribute> {
 }
 
 fn unquote_string(text: &str) -> String {
+    if let Some(text) = raw_string_body(text) {
+        return text.to_string();
+    }
+
     text.strip_prefix('"')
         .and_then(|text| text.strip_suffix('"'))
         .unwrap_or(text)
         .to_string()
+}
+
+fn raw_string_body(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('r')?;
+    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+    let open_quote = 1 + hashes;
+    if text.as_bytes().get(open_quote) != Some(&b'"') {
+        return None;
+    }
+
+    let suffix_len = 1 + hashes;
+    let suffix_start = text.len().checked_sub(suffix_len)?;
+    if suffix_start <= open_quote || text.as_bytes().get(suffix_start) != Some(&b'"') {
+        return None;
+    }
+    if !text.as_bytes()[suffix_start + 1..]
+        .iter()
+        .all(|&b| b == b'#')
+    {
+        return None;
+    }
+
+    Some(&text[open_quote + 1..suffix_start])
 }
 
 impl VarDecl {
@@ -276,6 +304,10 @@ impl FuncDecl {
     }
 
     pub fn generic_params(&self) -> Option<GenericParams> {
+        support::child(&self.syntax)
+    }
+
+    pub fn where_clause(&self) -> Option<WhereClause> {
         support::child(&self.syntax)
     }
 
@@ -317,6 +349,10 @@ impl StructDecl {
         support::child(&self.syntax)
     }
 
+    pub fn where_clause(&self) -> Option<WhereClause> {
+        support::child(&self.syntax)
+    }
+
     pub fn field_list(&self) -> Option<StructFieldList> {
         support::child(&self.syntax)
     }
@@ -332,6 +368,10 @@ impl EnumDecl {
     }
 
     pub fn generic_params(&self) -> Option<GenericParams> {
+        support::child(&self.syntax)
+    }
+
+    pub fn where_clause(&self) -> Option<WhereClause> {
         support::child(&self.syntax)
     }
 
@@ -374,6 +414,10 @@ impl TraitDecl {
 
 impl ImplDecl {
     pub fn generic_params(&self) -> Option<GenericParams> {
+        support::child(&self.syntax)
+    }
+
+    pub fn where_clause(&self) -> Option<WhereClause> {
         support::child(&self.syntax)
     }
 
@@ -479,10 +523,31 @@ impl GenericParams {
     }
 }
 
+impl WhereClause {
+    pub fn predicates(&self) -> impl Iterator<Item = WherePredicate> + '_ {
+        let elements = self
+            .syntax
+            .children_with_tokens()
+            .filter(|element| {
+                !matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::Where)
+            })
+            .collect::<Vec<_>>();
+        split_elements(&elements, SyntaxKind::Comma)
+            .into_iter()
+            .filter_map(|elements| WherePredicate::from_tokens(&elements))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GenericParam {
     pub name: String,
     pub is_const: bool,
+    pub bounds: Vec<GenericBound>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WherePredicate {
+    pub target_ty: Type,
     pub bounds: Vec<GenericBound>,
 }
 
@@ -496,6 +561,19 @@ pub struct GenericBound {
 pub struct GenericAssocConstraint {
     pub name: String,
     pub ty: Type,
+}
+
+impl WherePredicate {
+    fn from_tokens(elements: &[SyntaxElement]) -> Option<Self> {
+        let target_ty = elements
+            .iter()
+            .find_map(|element| element.as_node().and_then(|node| Type::cast(node.clone())))?;
+        let colon = elements.iter().position(
+            |element| matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::Colon),
+        )?;
+        let bounds = parse_generic_bounds(&elements[colon + 1..]);
+        Some(Self { target_ty, bounds })
+    }
 }
 
 impl GenericParam {
@@ -591,11 +669,11 @@ fn split_elements(elements: &[SyntaxElement], separator: SyntaxKind) -> Vec<Vec<
     let mut depth = 0usize;
     for element in elements {
         match element.as_token().map(|token| token.kind()) {
-            Some(SyntaxKind::Less) => {
+            Some(SyntaxKind::Less | SyntaxKind::LParen | SyntaxKind::LBracket) => {
                 depth += 1;
                 current.push(element.clone());
             }
-            Some(SyntaxKind::Greater) => {
+            Some(SyntaxKind::Greater | SyntaxKind::RParen | SyntaxKind::RBracket) => {
                 depth = depth.saturating_sub(1);
                 current.push(element.clone());
             }

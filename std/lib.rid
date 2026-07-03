@@ -21,7 +21,7 @@ pub struct ArrayIter<T, const N: usize> {
     index: usize,
 }
 
-impl<T: std::marker::Copy, const N: usize> Iterator for ArrayIter<T, N> {
+impl<T, const N: usize> Iterator for ArrayIter<T, N> {
     type Item = T;
 
     fun next(&mut self) -> Option<Self::Item> {
@@ -35,7 +35,7 @@ impl<T: std::marker::Copy, const N: usize> Iterator for ArrayIter<T, N> {
     }
 }
 
-impl<T: std::marker::Copy, const N: usize> IntoIterator for [T; N] {
+impl<T, const N: usize> IntoIterator for [T; N] {
     type Item = T;
     type IntoIter = ArrayIter<T, N>;
 

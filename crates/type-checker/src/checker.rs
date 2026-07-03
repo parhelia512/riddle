@@ -102,7 +102,7 @@ impl<'a> TypeChecker<'a> {
             .filter_map(|bound| {
                 let trait_id = self.resolve_trait_ref(&bound.trait_ty)?;
                 Some(TraitBound {
-                    param: bound.param.0.clone(),
+                    ty: self.lower_type_ref_with_params(&bound.target_ty, params),
                     trait_id,
                     assoc_constraints: bound
                         .assoc_constraints
@@ -163,6 +163,11 @@ impl<'a> TypeChecker<'a> {
             return_ty.clone(),
             params,
         );
+        self.check_type_bounds(&ctx, &return_ty, None);
+        for param in &function.params {
+            let param_ty = self.lower_type_ref_with_params(&param.ty, &ctx.generic_params);
+            self.check_type_bounds(&ctx, &param_ty, None);
+        }
         let actual = self.check_expr_expected(&mut ctx, body.root_block, &return_ty);
 
         // Only check tail-type compatibility; return-statement-only functions
@@ -477,6 +482,7 @@ impl<'a> TypeChecker<'a> {
             "E0033" => Some("recursive generic calls must reuse the same type arguments; wrapping them requires infinitely many instantiations".into()),
             "E0035" => Some("the inferred type must implement every trait bound on the generic parameter".into()),
             "E0036" => Some("add the required comparison trait impl for this type".into()),
+            "E0037" => Some("make impl where-clause bounds structurally smaller than the implemented type".into()),
             "E0072" => Some("insert some indirection, such as `&`, `*const`, or `*mut`, to break the cycle".into()),
             "E0021" => Some("trait method declarations should not have a body".into()),
             "E0022" | "E0025" => Some("duplicate associated type — remove the duplicate".into()),

@@ -467,6 +467,52 @@ fn checks_generic_trait_bounds() {
 }
 
 #[test]
+fn checks_struct_and_enum_where_clause_bounds() {
+    let result = check(
+        r#"
+        trait Marker {}
+
+        struct Good {}
+        struct Bad {}
+
+        impl Marker for Good {}
+
+        struct Box<T> where T: Marker {
+            value: T,
+        }
+
+        enum Slot<T> where T: Marker {
+            Some(T),
+            None,
+        }
+
+        fun takes_marker<T: Marker>(value: T) {
+            let ok: Box<T> = Box { value: value };
+        }
+
+        fun main() {
+            let good_box = Box { value: Good {} };
+            let good_slot = Slot::Some(Good {});
+            let bad_box = Box { value: Bad {} };
+            let bad_slot = Slot::Some(Bad {});
+        }
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("type `Bad` does not satisfy bound `Marker` for `Box`")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("type `Bad` does not satisfy bound `Marker` for `Slot`")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
 fn allows_trait_bound_method_call_in_generic_body() {
     let result = check(
         r#"
@@ -637,10 +683,6 @@ fn array_into_iterator_impl_type_checks_with_const_generics() {
             None,
         }
 
-        #[lang = "copy"]
-        trait Copy {}
-        impl Copy for i32 {}
-
         trait Iterator {
             type Item;
             fun next(&mut self) -> Option<Self::Item>;
@@ -657,7 +699,7 @@ fn array_into_iterator_impl_type_checks_with_const_generics() {
             index: usize,
         }
 
-        impl<T: Copy, const N: usize> Iterator for ArrayIter<T, N> {
+        impl<T, const N: usize> Iterator for ArrayIter<T, N> {
             type Item = T;
 
             fun next(&mut self) -> Option<Self::Item> {
@@ -671,7 +713,7 @@ fn array_into_iterator_impl_type_checks_with_const_generics() {
             }
         }
 
-        impl<T: Copy, const N: usize> IntoIterator for [T; N] {
+        impl<T, const N: usize> IntoIterator for [T; N] {
             type Item = T;
             type IntoIter = ArrayIter<T, N>;
 
@@ -683,13 +725,17 @@ fn array_into_iterator_impl_type_checks_with_const_generics() {
             }
         }
 
+        struct Token {
+            value: i32,
+        }
+
         fun main() {
-            let values = [1, 2, 3];
+            let values = [Token { value: 1 }, Token { value: 2 }, Token { value: 3 }];
             let mut iter = values.into_iter();
             let first = iter.next();
 
-            for item in [1, 2, 3] {
-                let next = item + 1;
+            for item in [Token { value: 4 }, Token { value: 5 }] {
+                let next = item.value + 1;
             }
         }
         "#,
@@ -742,6 +788,93 @@ fn checks_multiple_generic_trait_bounds() {
     assert!(
         msgs.iter()
             .any(|msg| msg.contains("does not satisfy bound `Tagged`")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn accepts_where_clause_on_function_bound() {
+    let result = check(
+        r#"
+        trait Named {
+            fun name(&self) -> i32;
+        }
+
+        struct User { id: i32 }
+
+        impl Named for User {
+            fun name(&self) -> i32 {
+                self.id
+            }
+        }
+
+        fun read<T>(value: T) -> i32
+        where T: Named
+        {
+            value.name()
+        }
+
+        fun main() {
+            let user = User { id: 1 };
+            let id = read(user);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_where_clause_on_impl_bound() {
+    let result = check(
+        r#"
+        trait Marker {}
+        trait Wrap {}
+
+        struct Box<T> { value: T }
+        struct Bad {}
+
+        impl Marker for i32 {}
+
+        impl<T> Wrap for Box<T>
+        where T: Marker
+        {}
+
+        fun takes_wrap<T: Wrap>(value: T) {}
+
+        fun main() {
+            takes_wrap(Box { value: 1 });
+            takes_wrap(Box { value: Bad {} });
+        }
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("does not satisfy bound `Wrap`")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn rejects_impl_where_clause_that_violates_paterson_condition() {
+    let result = check(
+        r#"
+        trait Foo {}
+
+        struct Vec<T> { value: T }
+
+        impl<T> Foo for T
+        where Vec<T>: Foo
+        {}
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("not strictly smaller than implemented type")),
         "{msgs:?}"
     );
 }

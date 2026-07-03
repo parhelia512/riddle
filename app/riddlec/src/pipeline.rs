@@ -363,6 +363,34 @@ mod tests {
     }
 
     #[test]
+    fn std_array_into_iterator_accepts_non_copy_items() {
+        let result = compile(
+            r#"
+            struct Token {
+                value: i32,
+            }
+
+            fun main() {
+                let values = [Token { value: 1 }, Token { value: 2 }];
+                let mut iter = values.into_iter();
+                let first = iter.next();
+
+                for item in [Token { value: 3 }, Token { value: 4 }] {
+                    let next = item.value + 1;
+                }
+            }
+            "#,
+        );
+
+        assert!(
+            result.success(),
+            "type: {:#?}\nanalysis: {:#?}",
+            result.type_result.diagnostics,
+            result.analysis_diagnostics
+        );
+    }
+
+    #[test]
     fn std_range_for_loop_lowers_to_mir_loop() {
         let result = compile(
             r#"

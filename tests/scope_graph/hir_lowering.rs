@@ -131,6 +131,69 @@ fn rust_style_array_repeat_parses_and_lowers() {
 }
 
 #[test]
+fn raw_string_literals_parse_and_lower() {
+    let source = r####"
+        fun f() {
+            let plain = r"hello";
+            let quoted = r#"hello "riddle""#;
+            let hashed = r###"hello "# world"###;
+        }
+        "####;
+
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(source);
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let syntax = parse.syntax();
+    let root = ast::Root::cast(syntax.clone()).unwrap();
+    let mut hir = lower_root(root);
+    let (sg, _) = build_scope_graph(&hir, &syntax);
+    resolve_hir(&mut hir, &sg);
+
+    let body_id = *hir.function_bodies.values().next().unwrap();
+    let body = &hir.bodies[body_id];
+    let values = body
+        .exprs
+        .iter()
+        .filter_map(|(_, expr)| match expr {
+            Expr::StringLiteral { value } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        values,
+        vec![
+            r#"r"hello""#,
+            r##"r#"hello "riddle""#"##,
+            r####"r###"hello "# world"###"####
+        ]
+    );
+}
+
+#[test]
+fn raw_string_attribute_values_unquote() {
+    let source = r##"#[lang = r#"copy"#] trait Copy {}"##;
+
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(source);
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let syntax = parse.syntax();
+    let root = ast::Root::cast(syntax).unwrap();
+    let trait_decl = root
+        .stmts()
+        .find_map(|stmt| match stmt {
+            ast::Stmt::TraitDecl(decl) => Some(decl),
+            _ => None,
+        })
+        .unwrap();
+    let attrs = ast::attrs_for_node(trait_decl.syntax());
+
+    assert_eq!(attrs[0].string_value().as_deref(), Some("copy"));
+}
+
+#[test]
 fn array_type_requires_rust_style_length() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(

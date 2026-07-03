@@ -77,6 +77,7 @@ pub struct HirFunction {
 #[derive(Debug, Clone)]
 pub struct HirGenericBound {
     pub param: Name,
+    pub target_ty: HirTypeRef,
     pub trait_ty: HirTypeRef,
     pub assoc_constraints: Vec<HirAssocTypeConstraint>,
 }
@@ -101,6 +102,7 @@ pub struct HirStruct {
     pub name_range: TextRange,
     pub generics: Vec<Name>,
     pub const_generics: Vec<Name>,
+    pub generic_bounds: Vec<HirGenericBound>,
     pub fields: Vec<HirStructField>,
     pub attrs: Vec<HirAttr>,
 }
@@ -119,6 +121,7 @@ pub struct HirEnum {
     pub visibility: Visibility,
     pub generics: Vec<Name>,
     pub const_generics: Vec<Name>,
+    pub generic_bounds: Vec<HirGenericBound>,
     pub variants: Vec<HirEnumVariant>,
     pub attrs: Vec<HirAttr>,
 }

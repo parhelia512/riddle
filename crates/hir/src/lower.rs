@@ -54,8 +54,11 @@ pub fn lower_const_generic_params(params: Option<ast::GenericParams>) -> Vec<Nam
         .unwrap_or_default()
 }
 
-pub fn lower_generic_bounds(params: Option<ast::GenericParams>) -> Vec<HirGenericBound> {
-    params
+pub fn lower_generic_bounds(
+    params: Option<ast::GenericParams>,
+    where_clause: Option<ast::WhereClause>,
+) -> Vec<HirGenericBound> {
+    let mut bounds: Vec<HirGenericBound> = params
         .map(|g| {
             g.params()
                 .flat_map(|param| {
@@ -68,6 +71,11 @@ pub fn lower_generic_bounds(params: Option<ast::GenericParams>) -> Vec<HirGeneri
                         .into_iter()
                         .map(move |bound| HirGenericBound {
                             param: name.clone(),
+                            target_ty: HirTypeRef::Named(HirPath {
+                                anchor: PathAnchor::Plain,
+                                segments: vec![name.clone()],
+                                type_args: Vec::new(),
+                            }),
                             trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
                             assoc_constraints: bound
                                 .assoc_constraints
@@ -83,7 +91,45 @@ pub fn lower_generic_bounds(params: Option<ast::GenericParams>) -> Vec<HirGeneri
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if let Some(where_clause) = where_clause {
+        bounds.extend(where_clause.predicates().flat_map(|predicate| {
+            let target_ty = predicate.target_ty.lower();
+            let param = generic_bound_param_name(&target_ty);
+            predicate
+                .bounds
+                .into_iter()
+                .map(move |bound| HirGenericBound {
+                    param: param.clone(),
+                    target_ty: target_ty.clone(),
+                    trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                    assoc_constraints: bound
+                        .assoc_constraints
+                        .into_iter()
+                        .map(|constraint| HirAssocTypeConstraint {
+                            name: Name(constraint.name),
+                            ty: constraint.ty.lower(),
+                        })
+                        .collect(),
+                })
+        }));
+    }
+
+    bounds
+}
+
+fn generic_bound_param_name(ty: &HirTypeRef) -> Name {
+    match ty {
+        HirTypeRef::Named(path)
+            if matches!(path.anchor, PathAnchor::Plain)
+                && path.segments.len() == 1
+                && path.type_args.is_empty() =>
+        {
+            path.segments[0].clone()
+        }
+        _ => Name("<where>".into()),
+    }
 }
 
 pub fn lower_attrs(node: &frontend::syntax_kind::SyntaxNode) -> Vec<HirAttr> {
@@ -123,7 +169,7 @@ impl AstLower for FuncDecl {
         let generic_params = self.generic_params();
         let generics = lower_generic_params(generic_params.clone());
         let const_generics = lower_const_generic_params(generic_params.clone());
-        let generic_bounds = lower_generic_bounds(generic_params);
+        let generic_bounds = lower_generic_bounds(generic_params, self.where_clause());
         let params = self
             .param_list()
             .map(|pl| pl.params().map(|p| p.lower()).collect())
@@ -167,7 +213,8 @@ impl AstLower for StructDecl {
             .unwrap_or_else(|| self.syntax().text_range());
         let generic_params = self.generic_params();
         let generics = lower_generic_params(generic_params.clone());
-        let const_generics = lower_const_generic_params(generic_params);
+        let const_generics = lower_const_generic_params(generic_params.clone());
+        let generic_bounds = lower_generic_bounds(generic_params, self.where_clause());
         let fields = self.field_list().lower();
         let attrs = lower_attrs(self.syntax());
         let visibility = lower_visibility(self.is_pub());
@@ -177,6 +224,7 @@ impl AstLower for StructDecl {
             name_range,
             generics,
             const_generics,
+            generic_bounds,
             fields,
             attrs,
         })
@@ -190,7 +238,8 @@ impl AstLower for ast::EnumDecl {
         let name = lower_name(self.name());
         let generic_params = self.generic_params();
         let generics = lower_generic_params(generic_params.clone());
-        let const_generics = lower_const_generic_params(generic_params);
+        let const_generics = lower_const_generic_params(generic_params.clone());
+        let generic_bounds = lower_generic_bounds(generic_params, self.where_clause());
         let variants = self.variants().map(|v| v.lower()).collect();
         let attrs = lower_attrs(self.syntax());
         let visibility = lower_visibility(self.is_pub());
@@ -199,6 +248,7 @@ impl AstLower for ast::EnumDecl {
             visibility,
             generics,
             const_generics,
+            generic_bounds,
             variants,
             attrs,
         })
@@ -256,7 +306,7 @@ impl AstLower for ast::TraitDecl {
                     visibility: lower_visibility(m.is_pub()),
                     generics: lower_generic_params(generic_params.clone()),
                     const_generics: lower_const_generic_params(generic_params.clone()),
-                    generic_bounds: lower_generic_bounds(generic_params),
+                    generic_bounds: lower_generic_bounds(generic_params, m.where_clause()),
                     params,
                     ret_type,
                     has_body: m.body().is_some(),

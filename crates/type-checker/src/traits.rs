@@ -96,8 +96,34 @@ impl TypeChecker<'_> {
         };
 
         let tr = self.hir.item_tree.traits[trait_id].clone();
+        self.check_impl_paterson(imp, &self_ty_text);
         self.check_trait_impl(&self_ty_text, &tr, imp);
         self.check_lang_trait_dependencies(&self_ty_text, trait_id);
+    }
+
+    fn check_impl_paterson(&mut self, imp: &HirImpl, self_ty_text: &str) {
+        let generics = imp
+            .generics
+            .iter()
+            .map(|name| name.0.as_str())
+            .collect::<HashSet<_>>();
+        let self_size = type_ref_size(&imp.self_ty, &generics);
+
+        for bound in &imp.generic_bounds {
+            let bound_size = type_ref_size(&bound.target_ty, &generics);
+            if bound_size < self_size {
+                continue;
+            }
+            self.diagnostic(
+                "E0037",
+                format!(
+                    "impl bound `{}` is not strictly smaller than implemented type `{}`",
+                    self.type_ref_source_text(&bound.target_ty),
+                    self_ty_text
+                ),
+                None,
+            );
+        }
     }
 
     fn check_impl_duplicates(&mut self, imp: &HirImpl) {
@@ -339,5 +365,36 @@ impl TypeChecker<'_> {
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
         }
+    }
+}
+
+fn type_ref_size(ty: &HirTypeRef, generics: &HashSet<&str>) -> usize {
+    match ty {
+        HirTypeRef::Named(path)
+            if matches!(path.anchor, hir::item_tree::PathAnchor::Plain)
+                && path.segments.len() == 1
+                && path.type_args.is_empty()
+                && generics.contains(path.segments[0].0.as_str()) =>
+        {
+            0
+        }
+        HirTypeRef::Named(path) => {
+            1 + path
+                .type_args
+                .iter()
+                .map(|arg| type_ref_size(arg, generics))
+                .sum::<usize>()
+        }
+        HirTypeRef::Ref(inner, _) | HirTypeRef::Ptr { inner, .. } => {
+            1 + type_ref_size(inner, generics)
+        }
+        HirTypeRef::Tuple(elements) => {
+            1 + elements
+                .iter()
+                .map(|element| type_ref_size(element, generics))
+                .sum::<usize>()
+        }
+        HirTypeRef::Array(inner, _) => 1 + type_ref_size(inner, generics),
+        HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => 0,
     }
 }

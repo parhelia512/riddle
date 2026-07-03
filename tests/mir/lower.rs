@@ -115,6 +115,92 @@ fn array_for_loop_lowers_to_indexed_loop() {
 }
 
 #[test]
+fn generic_for_loop_lowers_to_iterator_calls() {
+    let module = lower(
+        r#"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct Counter {
+            current: i32,
+        }
+
+        impl Iterator for Counter {
+            type Item = i32;
+
+            fun next(&mut self) -> Option<Self::Item> {
+                if self.current < 3 {
+                    let value = self.current;
+                    self.current += 1;
+                    Option::Some(value)
+                } else {
+                    Option::None
+                }
+            }
+        }
+
+        impl IntoIterator for Counter {
+            type Item = i32;
+            type IntoIter = Counter;
+
+            fun into_iter(self) -> Self::IntoIter {
+                self
+            }
+        }
+
+        fun main() {
+            let counter = Counter { current: 0 };
+            for item in counter {
+                let next = item + 1;
+            }
+        }
+        "#,
+    );
+    let func = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|func| func.name == "main")
+        .unwrap();
+
+    let calls = func
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| block.insts.iter())
+        .filter_map(|inst| match &inst.kind {
+            mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        calls.iter().any(|name| name.starts_with("into_iter")),
+        "{func:#?}"
+    );
+    assert!(
+        calls.iter().any(|name| name.starts_with("next")),
+        "{func:#?}"
+    );
+    assert!(
+        func.blocks
+            .iter()
+            .any(|(_, block)| matches!(block.terminator, mir::instr::Terminator::CondBranch(..)))
+    );
+}
+
+#[test]
 fn if_expression_creates_blocks() {
     let module = lower(
         r#"

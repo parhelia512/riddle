@@ -699,6 +699,10 @@ impl<'s> Parser<'s> {
             self.ty();
         }
 
+        if self.at(SyntaxKind::Where) {
+            self.where_clause();
+        }
+
         if self.at(SyntaxKind::LBrace) {
             self.block();
         } else {
@@ -751,6 +755,9 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
             self.generic_params(false);
+        }
+        if self.at(SyntaxKind::Where) {
+            self.where_clause();
         }
         self.struct_field_list();
         m.complete(self, SyntaxKind::StructDecl);
@@ -1505,6 +1512,9 @@ impl<'s> Parser<'s> {
         if self.at(SyntaxKind::Less) {
             self.generic_params(false);
         }
+        if self.at(SyntaxKind::Where) {
+            self.where_clause();
+        }
         self.expect(SyntaxKind::LBrace);
 
         if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
@@ -1599,6 +1609,10 @@ impl<'s> Parser<'s> {
             self.ty();
         }
 
+        if self.at(SyntaxKind::Where) {
+            self.where_clause();
+        }
+
         self.expect(SyntaxKind::Semi);
         m.complete(self, SyntaxKind::FuncDecl);
     }
@@ -1619,6 +1633,10 @@ impl<'s> Parser<'s> {
         if self.at(SyntaxKind::For) {
             self.bump();
             self.ty();
+        }
+
+        if self.at(SyntaxKind::Where) {
+            self.where_clause();
         }
 
         self.expect(SyntaxKind::LBrace);
@@ -1746,6 +1764,31 @@ impl<'s> Parser<'s> {
             self.ty();
         } else {
             self.ty();
+        }
+    }
+
+    fn where_clause(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::Where);
+        self.where_predicate();
+        while self.at(SyntaxKind::Comma) {
+            self.bump();
+            if self.at(SyntaxKind::LBrace) || self.at(SyntaxKind::Semi) || self.at(SyntaxKind::Eof)
+            {
+                break;
+            }
+            self.where_predicate();
+        }
+        m.complete(self, SyntaxKind::WhereClause);
+    }
+
+    fn where_predicate(&mut self) {
+        self.ty();
+        self.expect(SyntaxKind::Colon);
+        self.generic_bound();
+        while self.at(SyntaxKind::Plus) {
+            self.bump();
+            self.generic_bound();
         }
     }
 

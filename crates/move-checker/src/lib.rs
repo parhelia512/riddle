@@ -181,7 +181,6 @@ impl<'a> Analyzer<'a> {
                                     } else {
                                         ctx.shared_borrows.entry(place).or_default().push(
                                             BorrowRecord {
-                                                expr_id,
                                                 scope_depth: ctx.scope_depth,
                                             },
                                         );
@@ -204,7 +203,6 @@ impl<'a> Analyzer<'a> {
                                     } else {
                                         ctx.mutable_borrows.entry(place).or_default().push(
                                             BorrowRecord {
-                                                expr_id,
                                                 scope_depth: ctx.scope_depth,
                                             },
                                         );
@@ -614,8 +612,6 @@ impl<'a> Analyzer<'a> {
 
 #[derive(Debug, Clone)]
 struct BorrowRecord {
-    /// The expression that created this borrow.
-    expr_id: ExprId,
     /// The block scope depth at which this borrow was created.
     scope_depth: usize,
 }

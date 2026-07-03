@@ -14,7 +14,7 @@ use rowan::ast::SyntaxNodePtr;
 use crate::{
     TypeCheckResult,
     checker::TypeChecker,
-    result::{Diagnostic, GenericCall, OperatorCall, TraitMethodCall},
+    result::{Diagnostic, ForLoopInfo, GenericCall, OperatorCall, TraitMethodCall},
     types::Type,
 };
 
@@ -44,6 +44,7 @@ struct CachedBody {
     generic_calls: Vec<(ExprId, GenericCall)>,
     trait_method_calls: Vec<(ExprId, TraitMethodCall)>,
     operator_calls: Vec<(ExprId, OperatorCall)>,
+    for_loops: Vec<(ExprId, ForLoopInfo)>,
 }
 
 pub fn check_hir_incremental(
@@ -128,6 +129,14 @@ impl IncrementalTypeChecker {
                     (*checked_body == body_id).then(|| (*expr, call.clone()))
                 })
                 .collect();
+            let for_loops = checker
+                .result
+                .for_loops
+                .iter()
+                .filter_map(|((checked_body, expr), info)| {
+                    (*checked_body == body_id).then(|| (*expr, info.clone()))
+                })
+                .collect();
 
             self.bodies.insert(
                 ptr,
@@ -139,6 +148,7 @@ impl IncrementalTypeChecker {
                     generic_calls,
                     trait_method_calls,
                     operator_calls,
+                    for_loops,
                 },
             );
         }
@@ -169,6 +179,9 @@ fn replay_cached_body(result: &mut TypeCheckResult, body_id: BodyId, cached: &Ca
     }
     for (expr, call) in &cached.operator_calls {
         result.operator_calls.insert((body_id, *expr), call.clone());
+    }
+    for (expr, info) in &cached.for_loops {
+        result.for_loops.insert((body_id, *expr), info.clone());
     }
 }
 

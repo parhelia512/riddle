@@ -100,7 +100,8 @@ impl Backend for CBackend {
         for s in &structs {
             writeln!(out, "typedef struct {{").unwrap();
             for (name, ty) in &s.fields {
-                writeln!(out, "  {} {};", ctype_of(ty), sanitize(name)).unwrap();
+                let (pre, suf) = c_decl_parts(ty);
+                writeln!(out, "  {} {}{};", pre, sanitize(name), suf).unwrap();
             }
             writeln!(out, "}} {};", s.name).unwrap();
             writeln!(out).unwrap();
@@ -132,7 +133,12 @@ impl Backend for CBackend {
         for &fid in &module.function_order {
             let func = &module.functions[fid];
             let ret = c_return_type(func);
-            let params: Vec<String> = func.params.iter().map(|p| ctype_of(&p.ty)).collect();
+            let params: Vec<String> = func
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, p)| c_param_decl(&p.ty, &format!("p{index}")))
+                .collect();
             let sname = sanitize(&func.name);
             writeln!(
                 out,
@@ -202,7 +208,7 @@ impl CBackend {
         let param_strs: Vec<String> = func
             .params
             .iter()
-            .map(|p| format!("{} {}", ctype_of(&p.ty), sanitize(&p.name)))
+            .map(|p| c_param_decl(&p.ty, &sanitize(&p.name)))
             .collect();
 
         let sname = sanitize(&func.name);
@@ -297,15 +303,9 @@ impl CBackend {
                     ConstValue::Float(val, _) => format!("(({}){})", ct, val),
                     ConstValue::Bool(val) => val.to_string(),
                     ConstValue::String(val) => {
-                        // Strip surrounding quotes — val is stored as "content"
-                        let inner = if val.len() >= 2 {
-                            &val[1..val.len() - 1]
-                        } else {
-                            val.as_str()
-                        };
+                        let (inner, len) = c_string_parts(val);
                         if is_fat_repr(&inst.ty) {
-                            // Fat pointer: emit struct initializer with ptr + len
-                            format!("(riddle_str){{ \"{}\", {} }}", inner, inner.len())
+                            format!("(riddle_str){{ \"{}\", {} }}", inner, len)
                         } else {
                             format!("\"{}\"", inner)
                         }
@@ -473,8 +473,40 @@ impl CBackend {
                 let ct = ctype_of(&inst.ty);
                 self.set(v, name.clone(), ct.clone());
 
-                let flds: Vec<String> = fields.iter().map(|f| self.name(*f).to_owned()).collect();
-                writeln!(out, "  {} {} = {{ {} }};", ct, name, flds.join(", ")).unwrap();
+                if let Type::Struct(st) = &inst.ty {
+                    if st
+                        .fields
+                        .iter()
+                        .any(|(_, field_ty)| matches!(field_ty, Type::Array(_, _)))
+                    {
+                        writeln!(out, "  {} {} = {{0}};", ct, name).unwrap();
+                        for (index, value) in fields.iter().enumerate() {
+                            let Some((field_name, field_ty)) = st.fields.get(index) else {
+                                continue;
+                            };
+                            let field = sanitize(field_name);
+                            let value_name = self.name(*value).to_owned();
+                            if matches!(field_ty, Type::Array(_, _)) {
+                                writeln!(
+                                    out,
+                                    "  memcpy({}.{}, {}, sizeof({}.{}));",
+                                    name, field, value_name, name, field
+                                )
+                                .unwrap();
+                            } else {
+                                writeln!(out, "  {}.{} = {};", name, field, value_name).unwrap();
+                            }
+                        }
+                    } else {
+                        let flds: Vec<String> =
+                            fields.iter().map(|f| self.name(*f).to_owned()).collect();
+                        writeln!(out, "  {} {} = {{ {} }};", ct, name, flds.join(", ")).unwrap();
+                    }
+                } else {
+                    let flds: Vec<String> =
+                        fields.iter().map(|f| self.name(*f).to_owned()).collect();
+                    writeln!(out, "  {} {} = {{ {} }};", ct, name, flds.join(", ")).unwrap();
+                }
             }
 
             InstKind::ArrayValue(elements) => {
@@ -823,11 +855,6 @@ fn ctype_of(ty: &Type) -> String {
     }
 }
 
-/// Fat pointer struct type for `&str` — carries both pointer and length.
-fn fat_str_ctype() -> &'static str {
-    "riddle_str"
-}
-
 /// C type for FFI declarations — `str` and `&str` map to plain `const char*`
 /// (C functions expect C strings, not the fat pointer struct).
 fn ctype_of_ffi(ty: &Type) -> String {
@@ -845,6 +872,58 @@ fn is_fat_repr(ty: &Type) -> bool {
         Type::Ref(inner, _) => !inner.is_sized(),
         _ => false,
     }
+}
+
+fn c_string_parts(value: &str) -> (String, usize) {
+    if let Some(body) = raw_string_body(value) {
+        return (escape_c_string(body), body.len());
+    }
+
+    let inner = if value.len() >= 2 {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    (inner.to_string(), inner.len())
+}
+
+fn raw_string_body(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('r')?;
+    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+    let open_quote = 1 + hashes;
+    if text.as_bytes().get(open_quote) != Some(&b'"') {
+        return None;
+    }
+
+    let suffix_len = 1 + hashes;
+    let suffix_start = text.len().checked_sub(suffix_len)?;
+    if suffix_start <= open_quote || text.as_bytes().get(suffix_start) != Some(&b'"') {
+        return None;
+    }
+    if !text.as_bytes()[suffix_start + 1..]
+        .iter()
+        .all(|&b| b == b'#')
+    {
+        return None;
+    }
+
+    Some(&text[open_quote + 1..suffix_start])
+}
+
+fn escape_c_string(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn struct_type_for_field_base(ty: &Type) -> Option<&StructType> {
@@ -883,6 +962,11 @@ fn c_decl_parts(ty: &Type) -> (String, String) {
         }
         _ => (ctype_of(ty), String::new()),
     }
+}
+
+fn c_param_decl(ty: &Type, name: &str) -> String {
+    let (pre, suf) = c_decl_parts(ty);
+    format!("{} {}{}", pre, name, suf)
 }
 
 fn binop_c(op: BinOp) -> &'static str {

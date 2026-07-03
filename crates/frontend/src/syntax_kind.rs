@@ -1,5 +1,13 @@
 use logos::Logos;
 
+fn raw_string(lex: &mut logos::Lexer<'_, SyntaxKind>) -> Option<()> {
+    let hashes = lex.slice().len().checked_sub(2)?;
+    let terminator = format!("\"{}", "#".repeat(hashes));
+    let end = lex.remainder().find(&terminator)?;
+    lex.bump(end + terminator.len());
+    Some(())
+}
+
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 pub enum SyntaxKind {
@@ -66,8 +74,8 @@ pub enum SyntaxKind {
     True,
     #[token("false")]
     False,
+    #[regex(r##"r#*""##, raw_string)]
     #[regex(r#""([^"\\]|\\.)*""#)]
-    // ponytail: raw string r#"..."# needs Logos callback, regex can't count # delimiters
     String,
     #[regex(r#"'([^'\\]|\\.)'"#)]
     Char,
@@ -225,6 +233,7 @@ pub enum SyntaxKind {
     TraitDecl,
     ImplDecl,
     GenericParams,
+    WhereClause,
     TypeAliasDecl,
     ConstDecl,
     TuplePattern,

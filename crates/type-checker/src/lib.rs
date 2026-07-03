@@ -12,6 +12,6 @@ pub use checker::{TypeChecker, check_hir};
 pub use incremental::{
     IncrementalStats, IncrementalTypeCheckResult, IncrementalTypeChecker, check_hir_incremental,
 };
-pub use result::{Diagnostic, LabelStyle, Severity, SourceLabel, TypeCheckResult};
+pub use result::{Diagnostic, ForLoopInfo, LabelStyle, Severity, SourceLabel, TypeCheckResult};
 pub use trait_env::TraitEnv;
 pub use types::{FloatTy, IntTy, Type};

@@ -6,7 +6,7 @@ use crate::{Type, lowering::substitute_type};
 
 #[derive(Debug, Clone)]
 pub struct TraitBound {
-    pub param: String,
+    pub ty: Type,
     pub trait_id: TraitId,
     pub assoc_constraints: Vec<TraitAssocConstraint>,
 }
@@ -129,15 +129,13 @@ impl TraitEnv {
 
     fn bounds_satisfied(&self, bounds: &[TraitBound], subst: &HashMap<String, Type>) -> bool {
         bounds.iter().all(|bound| {
-            let Some(actual) = subst.get(&bound.param) else {
-                return false;
-            };
-            if !self.type_implements(actual, bound.trait_id) {
+            let actual = substitute_type(&bound.ty, subst);
+            if !self.type_implements(&actual, bound.trait_id) {
                 return false;
             }
             bound.assoc_constraints.iter().all(|constraint| {
                 let expected = substitute_type(&constraint.ty, subst);
-                self.associated_type(actual, bound.trait_id, &constraint.name)
+                self.associated_type(&actual, bound.trait_id, &constraint.name)
                     .map(|actual| {
                         actual.is_unknown_like() || expected.is_unknown_like() || actual == expected
                     })

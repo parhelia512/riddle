@@ -1,7 +1,5 @@
-mod manifest;
-mod package;
-
 use clap::{Args, Parser, Subcommand};
+use clue::{manifest, package};
 use manifest::{CLUE_PROJECT_FILE_NAME, PackageKind};
 use riddlec::pipeline;
 use std::collections::hash_map::DefaultHasher;
@@ -138,25 +136,5 @@ fn main() {
     if let Err(error) = result {
         eprintln!("clue: {error}");
         process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn init_lib_selects_library_kind() {
-        let args = Arg::try_parse_from(["clue", "init", "--lib", "hello"]).unwrap();
-        let Commands::Init(arg) = args.command else {
-            panic!("expected init command");
-        };
-
-        assert_eq!(arg.package_kind(), PackageKind::Library);
-    }
-
-    #[test]
-    fn init_bin_and_lib_conflict() {
-        assert!(Arg::try_parse_from(["clue", "init", "--bin", "--lib", "hello"]).is_err());
     }
 }

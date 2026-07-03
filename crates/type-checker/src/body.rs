@@ -13,7 +13,7 @@ use crate::{
     checker::{GenericEdge, TypeChecker},
     context::BodyCtx,
     lowering::{collect_subst, generic_param_map_with_consts, substitute_type},
-    result::{OperatorCall, TraitMethodCall},
+    result::{ForLoopInfo, OperatorCall, TraitMethodCall},
     types::{ConstArg, IntTy, Type},
 };
 
@@ -33,6 +33,8 @@ impl TypeChecker<'_> {
                     || type_contains_unresolved_const_param(&declared, &ctx.generic_params);
                 if explicit_error {
                     self.diagnostic("E0034", "invalid type annotation", ctx.stmt_range(stmt_id));
+                } else {
+                    self.check_type_bounds(ctx, &declared, ctx.stmt_range(stmt_id));
                 }
                 let init_ty = init.map(|expr| {
                     if explicit_error || declared.is_unknown_like() {
@@ -184,7 +186,7 @@ impl TypeChecker<'_> {
                 pat,
                 iterable,
                 body,
-            } => self.check_for(ctx, *pat, *iterable, *body, span),
+            } => self.check_for(ctx, expr_id, *pat, *iterable, *body, span),
             Expr::Match { scrutinee, arms } => {
                 self.check_match(ctx, *scrutinee, arms, expected, span)
             }
@@ -383,7 +385,8 @@ impl TypeChecker<'_> {
         let bound = bounds
             .iter()
             .find(|bound| {
-                bound.param.0 == *param && self.resolve_trait_ref(&bound.trait_ty) == Some(trait_id)
+                bound_target_param(bound).is_some_and(|name| name == *param)
+                    && self.resolve_trait_ref(&bound.trait_ty) == Some(trait_id)
             })?
             .clone();
 
@@ -677,7 +680,9 @@ impl TypeChecker<'_> {
             .chain(strukt.const_generics.iter())
             .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
             .collect();
-        Type::Struct(*struct_id, args)
+        let ty = Type::Struct(*struct_id, args);
+        self.check_type_bounds(ctx, &ty, span);
+        ty
     }
 
     fn check_match(
@@ -721,6 +726,7 @@ impl TypeChecker<'_> {
     fn check_for(
         &mut self,
         ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
         pat: PatId,
         iterable: ExprId,
         body: ExprId,
@@ -778,6 +784,21 @@ impl TypeChecker<'_> {
                     &iter_item_ty,
                     "iterator item",
                     ctx.expr_range(iterable),
+                );
+            }
+
+            if let (Some(into_iter_method), Some(next_method)) = (
+                self.find_trait_impl_method(&iterable_ty, into_iter_trait, "into_iter"),
+                self.find_trait_impl_method(&into_iter_ty, iterator_trait, "next"),
+            ) {
+                self.result.for_loops.insert(
+                    (ctx.body_id, expr_id),
+                    ForLoopInfo {
+                        into_iter: into_iter_method.fid,
+                        next: next_method.fid,
+                        item_ty: item_ty.clone(),
+                        iter_ty: into_iter_ty.clone(),
+                    },
                 );
             }
         }
@@ -1127,7 +1148,9 @@ impl TypeChecker<'_> {
             .chain(enum_data.const_generics.iter())
             .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
             .collect();
-        Type::Enum(enum_id, args)
+        let ty = Type::Enum(enum_id, args);
+        self.check_type_bounds(ctx, &ty, span);
+        ty
     }
 
     fn enum_variant_type(&self, enum_id: hir::item_tree::EnumId, expected: Option<&Type>) -> Type {
@@ -1153,9 +1176,7 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) {
         for bound in &function.generic_bounds {
-            let Some(actual) = subst.get(&bound.param.0) else {
-                continue;
-            };
+            let actual = self.lower_type_ref_with_params(&bound.target_ty, subst);
             if actual.is_unknown_like() {
                 continue;
             }
@@ -1170,7 +1191,7 @@ impl TypeChecker<'_> {
                 );
                 continue;
             };
-            if !self.type_satisfies_bound(ctx, actual, trait_id, &bound.assoc_constraints, subst) {
+            if !self.type_satisfies_bound(ctx, &actual, trait_id, &bound.assoc_constraints, subst) {
                 let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
                 self.diagnostic(
                     "E0035",
@@ -1178,7 +1199,113 @@ impl TypeChecker<'_> {
                         "type `{}` does not satisfy bound `{}` for `{}`",
                         actual.display(self.hir),
                         trait_name,
-                        bound.param.0
+                        bound.target_ty.display()
+                    ),
+                    span,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn check_type_bounds(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        ty: &Type,
+        span: Option<rowan::TextRange>,
+    ) {
+        match ty {
+            Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
+                self.check_type_bounds(ctx, inner, span)
+            }
+            Type::Tuple(elements) => {
+                for element in elements {
+                    self.check_type_bounds(ctx, element, span);
+                }
+            }
+            Type::Struct(struct_id, args) => {
+                for arg in args {
+                    self.check_type_bounds(ctx, arg, span);
+                }
+                let strukt = self.hir.item_tree.structs[*struct_id].clone();
+                let subst = strukt
+                    .generics
+                    .iter()
+                    .chain(strukt.const_generics.iter())
+                    .zip(args.iter())
+                    .map(|(name, ty)| (name.0.clone(), ty.clone()))
+                    .collect::<HashMap<_, _>>();
+                self.check_item_bounds(ctx, &strukt.name.0, &strukt.generic_bounds, &subst, span);
+            }
+            Type::Enum(enum_id, args) => {
+                for arg in args {
+                    self.check_type_bounds(ctx, arg, span);
+                }
+                let enum_data = self.hir.item_tree.enums[*enum_id].clone();
+                let subst = enum_data
+                    .generics
+                    .iter()
+                    .chain(enum_data.const_generics.iter())
+                    .zip(args.iter())
+                    .map(|(name, ty)| (name.0.clone(), ty.clone()))
+                    .collect::<HashMap<_, _>>();
+                self.check_item_bounds(
+                    ctx,
+                    &enum_data.name.0,
+                    &enum_data.generic_bounds,
+                    &subst,
+                    span,
+                );
+            }
+            Type::Function(_)
+            | Type::Param(_)
+            | Type::Const(_)
+            | Type::Unknown
+            | Type::Error
+            | Type::InferInt
+            | Type::InferFloat
+            | Type::Int(_)
+            | Type::Float(_)
+            | Type::Bool
+            | Type::Str
+            | Type::Char
+            | Type::Unit
+            | Type::Never => {}
+        }
+    }
+
+    fn check_item_bounds(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        item_name: &str,
+        bounds: &[HirGenericBound],
+        subst: &HashMap<String, Type>,
+        span: Option<rowan::TextRange>,
+    ) {
+        for bound in bounds {
+            let actual = self.lower_type_ref_with_params(&bound.target_ty, subst);
+            if actual.is_unknown_like() {
+                continue;
+            }
+            let Some(trait_id) = self.resolve_trait_ref(&bound.trait_ty) else {
+                self.diagnostic(
+                    "E0023",
+                    format!(
+                        "generic bound references unknown trait `{}`",
+                        bound.trait_ty.display()
+                    ),
+                    span,
+                );
+                continue;
+            };
+            if !self.type_satisfies_bound(ctx, &actual, trait_id, &bound.assoc_constraints, subst) {
+                let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
+                self.diagnostic(
+                    "E0035",
+                    format!(
+                        "type `{}` does not satisfy bound `{}` for `{}`",
+                        actual.display(self.hir),
+                        trait_name,
+                        item_name
                     ),
                     span,
                 );
@@ -1249,7 +1376,7 @@ impl TypeChecker<'_> {
                 .current_generic_bounds(ctx)
                 .into_iter()
                 .find_map(|bound| {
-                    if bound.param.0 != *param {
+                    if !bound_target_param(&bound).is_some_and(|name| name == *param) {
                         return None;
                     }
                     let bound_trait = self.resolve_trait_ref(&bound.trait_ty)?;
@@ -1270,7 +1397,7 @@ impl TypeChecker<'_> {
         subst: &HashMap<String, Type>,
     ) -> bool {
         self.current_generic_bounds(ctx).into_iter().any(|bound| {
-            if bound.param.0 != param {
+            if !bound_target_param(&bound).is_some_and(|name| name == param) {
                 return false;
             }
             let Some(bound_trait) = self.resolve_trait_ref(&bound.trait_ty) else {
@@ -1311,14 +1438,12 @@ impl TypeChecker<'_> {
         subst: &HashMap<String, Type>,
     ) -> bool {
         imp.generic_bounds.iter().all(|bound| {
-            let Some(actual) = subst.get(&bound.param.0) else {
-                return false;
-            };
+            let actual = self.lower_type_ref_with_params(&bound.target_ty, subst);
             let Some(trait_id) = self.resolve_trait_ref(&bound.trait_ty) else {
                 return false;
             };
-            self.result.trait_env.type_implements(actual, trait_id)
-                && self.assoc_constraints_match(actual, trait_id, &bound.assoc_constraints, subst)
+            self.result.trait_env.type_implements(&actual, trait_id)
+                && self.assoc_constraints_match(&actual, trait_id, &bound.assoc_constraints, subst)
         })
     }
 
@@ -1614,7 +1739,7 @@ impl TypeChecker<'_> {
         let bounds = self
             .current_generic_bounds(ctx)
             .into_iter()
-            .filter(|bound| bound.param.0 == *param)
+            .filter(|bound| bound_target_param(bound).is_some_and(|name| name == *param))
             .collect::<Vec<_>>();
 
         for bound in bounds {
@@ -1863,6 +1988,19 @@ fn expected_has_param(ty: &Type) -> bool {
         Type::Array(inner, len) => expected_has_param(inner) || const_has_param(len),
         Type::Struct(_, args) | Type::Enum(_, args) => args.iter().any(expected_has_param),
         _ => false,
+    }
+}
+
+fn bound_target_param(bound: &HirGenericBound) -> Option<&str> {
+    match &bound.target_ty {
+        HirTypeRef::Named(path)
+            if matches!(path.anchor, hir::item_tree::PathAnchor::Plain)
+                && path.segments.len() == 1
+                && path.type_args.is_empty() =>
+        {
+            Some(path.segments[0].0.as_str())
+        }
+        _ => None,
     }
 }
 

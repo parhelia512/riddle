@@ -46,6 +46,7 @@ pub struct TypeCheckResult {
     pub generic_calls: HashMap<(BodyId, ExprId), GenericCall>,
     pub trait_method_calls: HashMap<(BodyId, ExprId), TraitMethodCall>,
     pub operator_calls: HashMap<(BodyId, ExprId), OperatorCall>,
+    pub for_loops: HashMap<(BodyId, ExprId), ForLoopInfo>,
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,
@@ -65,4 +66,12 @@ pub struct TraitMethodCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorCall {
     pub function: FunctionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForLoopInfo {
+    pub into_iter: FunctionId,
+    pub next: FunctionId,
+    pub item_ty: Type,
+    pub iter_ty: Type,
 }

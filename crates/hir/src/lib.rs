@@ -181,7 +181,7 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
     let generic_params = i.generic_params();
     let generics = lower::lower_generic_params(generic_params.clone());
     let const_generics = lower::lower_const_generic_params(generic_params.clone());
-    let generic_bounds = lower::lower_generic_bounds(generic_params);
+    let generic_bounds = lower::lower_generic_bounds(generic_params, i.where_clause());
 
     let mut methods = Vec::new();
     for func in i.methods() {

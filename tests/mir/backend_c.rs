@@ -272,6 +272,26 @@ fn c_str_slice_return() {
 }
 
 #[test]
+fn c_raw_string_return_escapes_content() {
+    let module = lower(
+        r####"
+        fun hello() -> str {
+            return r###"say "hi"
+"###;
+        }
+        "####,
+    );
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+
+    assert!(
+        result.contains("(riddle_str){ \"say \\\"hi\\\"\\n\", 9 }"),
+        "raw string not escaped as C string:\n{}",
+        result
+    );
+}
+
+#[test]
 fn c_str_slice_let() {
     let module = lower(
         r#"
@@ -585,6 +605,92 @@ fn c_backend_dispatches_trait_bound_method_in_generic_function() {
     assert!(
         result.contains("tag__User("),
         "generic body should call concrete Tagged impl method:\n{}",
+        result
+    );
+}
+
+#[test]
+fn c_backend_lowers_non_copy_array_into_iterator() {
+    let module = lower(
+        r#"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct ArrayIter<T, const N: usize> {
+            values: [T; N],
+            index: usize,
+        }
+
+        impl<T, const N: usize> Iterator for ArrayIter<T, N> {
+            type Item = T;
+
+            fun next(&mut self) -> Option<Self::Item> {
+                if self.index < N {
+                    let value = self.values[self.index];
+                    self.index += 1usize;
+                    Option::Some(value)
+                } else {
+                    Option::None
+                }
+            }
+        }
+
+        impl<T, const N: usize> IntoIterator for [T; N] {
+            type Item = T;
+            type IntoIter = ArrayIter<T, N>;
+
+            fun into_iter(self) -> Self::IntoIter {
+                ArrayIter {
+                    values: self,
+                    index: 0usize,
+                }
+            }
+        }
+
+        struct Token {
+            value: i32,
+        }
+
+        fun main() {
+            for item in [Token { value: 1 }, Token { value: 2 }] {
+                let next = item.value + 1;
+            }
+        }
+        "#,
+    );
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+    assert!(
+        result.contains("into_iter__arr2_Token"),
+        "missing array IntoIterator monomorph:\n{}",
+        result
+    );
+    assert!(
+        result.contains("next__ArrayIter_Token_2"),
+        "missing ArrayIter::next monomorph:\n{}",
+        result
+    );
+    assert!(
+        result.contains("Token values[2];"),
+        "array field should use C array declarator:\n{}",
+        result
+    );
+    assert!(
+        result.contains("memcpy("),
+        "array field initialization should copy array storage:\n{}",
         result
     );
 }

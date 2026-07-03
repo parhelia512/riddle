@@ -39,6 +39,7 @@ pub fn lower_hir(
         mut_bindings: HashSet::new(),
         pattern_bindings: Vec::new(),
         generic_subst: HashMap::new(),
+        generic_const_subst: HashMap::new(),
         mono_functions: HashMap::new(),
         mono_methods: HashMap::new(),
     };
@@ -48,7 +49,7 @@ pub fn lower_hir(
         if !func.generics.is_empty()
             || ctx
                 .impl_for_method(fid)
-                .map(|imp| !imp.generics.is_empty())
+                .map(|imp| !imp.generics.is_empty() || !imp.const_generics.is_empty())
                 .unwrap_or(false)
         {
             continue;
@@ -102,8 +103,15 @@ struct LowerCtx<'a> {
     mut_bindings: HashSet<StmtId>,
     pattern_bindings: Vec<HashMap<String, Value>>,
     generic_subst: HashMap<String, Type>,
+    generic_const_subst: HashMap<String, usize>,
     mono_functions: HashMap<(hir::item_tree::FunctionId, String), String>,
     mono_methods: HashMap<(hir::item_tree::FunctionId, String), String>,
+}
+
+#[derive(Default)]
+struct MirSubst {
+    types: HashMap<String, Type>,
+    consts: HashMap<String, usize>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -121,6 +129,7 @@ impl<'a> LowerCtx<'a> {
         self.current_body = Some(body_id);
         let old_current_function = self.current_function;
         let old_generic_subst = self.generic_subst.clone();
+        let old_generic_const_subst = self.generic_const_subst.clone();
         self.current_function = Some(fid);
         if let Some(self_ty) = self.impl_self_mir_type(fid) {
             self.generic_subst.insert("Self".into(), self_ty);
@@ -166,6 +175,7 @@ impl<'a> LowerCtx<'a> {
 
         self.current_function = old_current_function;
         self.generic_subst = old_generic_subst;
+        self.generic_const_subst = old_generic_const_subst;
         func
     }
 
@@ -231,10 +241,17 @@ impl<'a> LowerCtx<'a> {
                     .copied()
                     .unwrap_or_else(|| builder.unit_const()),
                 Some(ResolvedName::Function(_)) => builder.unit_const(),
-                Some(ResolvedName::EnumVariant(_, idx)) => builder.iconst(*idx as i128, IntTy::U32),
+                Some(ResolvedName::EnumVariant(enum_id, idx)) => {
+                    self.lower_enum_variant_value(builder, *enum_id, *idx, Vec::new(), mir_type)
+                }
                 _ => path
                     .as_single_name()
-                    .and_then(|name| self.pattern_binding(&name.0))
+                    .and_then(|name| {
+                        self.generic_const_subst
+                            .get(&name.0)
+                            .map(|value| builder.iconst(*value as i128, IntTy::Usize))
+                            .or_else(|| self.pattern_binding(&name.0))
+                    })
                     .unwrap_or_else(|| builder.unit_const()),
             },
 
@@ -387,7 +404,15 @@ impl<'a> LowerCtx<'a> {
                 pat,
                 iterable,
                 body: for_body,
-            } => self.lower_for_expr(builder, param_values, body, *pat, *iterable, *for_body),
+            } => self.lower_for_expr(
+                builder,
+                param_values,
+                body,
+                expr_id,
+                *pat,
+                *iterable,
+                *for_body,
+            ),
 
             Expr::Match { scrutinee, arms } => {
                 let _sv = self.lower_expr(builder, param_values, body, *scrutinee);
@@ -441,14 +466,21 @@ impl<'a> LowerCtx<'a> {
 
             Expr::Call { callee, args } => {
                 if let Expr::Path {
-                    resolved: Some(ResolvedName::EnumVariant(_, variant_index)),
+                    resolved: Some(ResolvedName::EnumVariant(enum_id, variant_index)),
                     ..
                 } = &body.exprs[*callee]
                 {
-                    for arg in args {
-                        self.lower_expr(builder, param_values, body, *arg);
-                    }
-                    builder.iconst(*variant_index as i128, IntTy::U32)
+                    let arg_vals = args
+                        .iter()
+                        .map(|arg| self.lower_expr(builder, param_values, body, *arg))
+                        .collect();
+                    self.lower_enum_variant_value(
+                        builder,
+                        *enum_id,
+                        *variant_index,
+                        arg_vals,
+                        mir_type,
+                    )
                 } else {
                     let target_fid = self.callee_function_id(*callee);
                     let name = if let (Some(fid), Expr::FieldAccess { base, .. }) =
@@ -548,10 +580,27 @@ impl<'a> LowerCtx<'a> {
         builder: &mut Builder,
         param_values: &[Value],
         body: &Body,
+        for_expr: ExprId,
         pat: PatId,
         iterable: ExprId,
         for_body: ExprId,
     ) -> Value {
+        if let Some(info) = self
+            .current_body
+            .and_then(|bid| self.type_result.for_loops.get(&(bid, for_expr)))
+            .cloned()
+        {
+            return self.lower_iterator_for_expr(
+                builder,
+                param_values,
+                body,
+                pat,
+                iterable,
+                for_body,
+                &info,
+            );
+        }
+
         let iterable_value = self.lower_expr(builder, param_values, body, iterable);
         if let Some((item_ty, len)) = self.array_iter_info(iterable) {
             let index_ty = Type::Int(IntTy::I32);
@@ -623,6 +672,151 @@ impl<'a> LowerCtx<'a> {
 
         builder.switch_to_block(exit_block);
         builder.unit_const()
+    }
+
+    fn lower_iterator_for_expr(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        pat: PatId,
+        iterable: ExprId,
+        for_body: ExprId,
+        info: &type_checker::ForLoopInfo,
+    ) -> Value {
+        let Some(body_id) = self.current_body else {
+            return builder.unit_const();
+        };
+        let Some(iterable_ty) = self
+            .type_result
+            .expr_types
+            .get(&(body_id, iterable))
+            .cloned()
+        else {
+            return builder.unit_const();
+        };
+
+        let iterable_value = self.lower_expr(builder, param_values, body, iterable);
+        let iter_ty = self.convert_type(&info.iter_ty);
+        let item_ty = self.convert_type(&info.item_ty);
+        let option_ty = self
+            .option_type_for_item(&info.item_ty)
+            .unwrap_or(Type::Unit);
+        let into_iter_name = self
+            .mono_method_name_for_receiver(info.into_iter, &iterable_ty)
+            .unwrap_or_else(|| self.function_name(info.into_iter));
+        let next_name = self
+            .mono_method_name_for_receiver(info.next, &info.iter_ty)
+            .unwrap_or_else(|| self.function_name(info.next));
+
+        let iter_value = builder.call(
+            FuncRef::Local(into_iter_name),
+            vec![iterable_value],
+            iter_ty.clone(),
+        );
+        let iter_slot = builder.alloca(iter_ty);
+        builder.store(iter_value, iter_slot);
+
+        let cond_block = builder.func.new_block_labeled("for_iter_cond");
+        let body_block = builder.func.new_block_labeled("for_iter_body");
+        let exit_block = builder.func.new_block_labeled("for_iter_exit");
+
+        builder.set_branch(cond_block);
+
+        builder.switch_to_block(cond_block);
+        let next_value = builder.call(
+            FuncRef::Local(next_name),
+            vec![iter_slot],
+            option_ty.clone(),
+        );
+        let tag = builder.extract_value(next_value, 0, Type::Int(IntTy::U32));
+        let some_tag = builder.iconst(self.option_some_discriminant() as i128, IntTy::U32);
+        let has_item = builder.cmp(CmpOp::Eq, tag, some_tag);
+        builder.set_cond_branch(has_item, body_block, exit_block);
+
+        builder.switch_to_block(body_block);
+        let payload_index = self.option_some_payload_index().unwrap_or(1);
+        let item = builder.extract_value(next_value, payload_index, item_ty);
+        self.push_pattern_binding(body, pat, item);
+        self.lower_expr(builder, param_values, body, for_body);
+        self.pattern_bindings.pop();
+        if builder.needs_return() {
+            builder.set_branch(cond_block);
+        }
+
+        builder.switch_to_block(exit_block);
+        builder.unit_const()
+    }
+
+    fn lower_enum_variant_value(
+        &mut self,
+        builder: &mut Builder,
+        _enum_id: hir::item_tree::EnumId,
+        variant_index: usize,
+        args: Vec<Value>,
+        ty: Type,
+    ) -> Value {
+        let tag = builder.iconst(variant_index as i128, IntTy::U32);
+        let mut fields = vec![tag];
+        fields.extend(args);
+        builder.struct_value(fields, ty)
+    }
+
+    fn option_some_discriminant(&self) -> u32 {
+        self.hir
+            .item_tree
+            .enums
+            .iter()
+            .find(|(_, enum_data)| enum_data.name.0 == "Option")
+            .and_then(|(_, enum_data)| {
+                enum_data
+                    .variants
+                    .iter()
+                    .position(|variant| variant.name.0 == "Some")
+            })
+            .unwrap_or(0) as u32
+    }
+
+    fn option_type_for_item(&self, item_ty: &type_checker::Type) -> Option<Type> {
+        let enum_id = self
+            .hir
+            .item_tree
+            .enums
+            .iter()
+            .find_map(|(enum_id, enum_data)| (enum_data.name.0 == "Option").then_some(enum_id))?;
+        Some(self.convert_type(&type_checker::Type::Enum(enum_id, vec![item_ty.clone()])))
+    }
+
+    fn option_some_payload_index(&self) -> Option<usize> {
+        self.hir
+            .item_tree
+            .enums
+            .iter()
+            .find(|(_, enum_data)| enum_data.name.0 == "Option")
+            .and_then(|(_, enum_data)| {
+                let some_index = enum_data
+                    .variants
+                    .iter()
+                    .position(|variant| variant.name.0 == "Some")?;
+                Some(1 + self.enum_payload_offset(enum_data, some_index))
+            })
+    }
+
+    fn enum_payload_offset(
+        &self,
+        enum_data: &hir::item_tree::HirEnum,
+        variant_index: usize,
+    ) -> usize {
+        enum_data
+            .variants
+            .iter()
+            .take(variant_index)
+            .map(|variant| match &variant.kind {
+                hir::item_tree::HirVariantKind::Unit => 0,
+                hir::item_tree::HirVariantKind::Tuple(items) => items.len(),
+                hir::item_tree::HirVariantKind::Struct(items) => items.len(),
+            })
+            .sum()
     }
 
     fn pattern_binding(&self, name: &str) -> Option<Value> {
@@ -935,6 +1129,7 @@ impl<'a> LowerCtx<'a> {
                 len.as_usize().unwrap_or(0),
             ),
             TcType::Struct(sid, args) => self.convert_struct_type(*sid, args),
+            TcType::Enum(eid, args) => self.convert_enum_type(*eid, args),
             TcType::Function(fid) => {
                 let f = &self.hir.item_tree.functions[*fid];
                 let params = f
@@ -952,7 +1147,6 @@ impl<'a> LowerCtx<'a> {
                     ret: Box::new(ret),
                 })
             }
-            TcType::Enum(_, _) => Type::Int(IntTy::U32),
             TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
             TcType::Const(_) => Type::Unit,
             TcType::Unknown | TcType::Error => Type::Unit,
@@ -1002,17 +1196,13 @@ impl<'a> LowerCtx<'a> {
                         // Look up user-defined struct by name
                         for (sid, s) in self.hir.item_tree.structs.iter() {
                             if s.name.0 == name {
-                                let args = path
-                                    .type_args
-                                    .iter()
-                                    .map(|arg| self.convert_hir_type(arg))
-                                    .collect::<Vec<_>>();
-                                return self.convert_struct_type_from_mir_args(sid, &args);
+                                return self
+                                    .convert_struct_type_from_hir_args(sid, &path.type_args);
                             }
                         }
-                        for (_eid, e) in self.hir.item_tree.enums.iter() {
+                        for (eid, e) in self.hir.item_tree.enums.iter() {
                             if e.name.0 == name {
-                                return Type::Int(IntTy::U32);
+                                return self.convert_enum_type_from_hir_args(eid, &path.type_args);
                             }
                         }
                         Type::Int(IntTy::I32)
@@ -1031,7 +1221,7 @@ impl<'a> LowerCtx<'a> {
             }
             hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
                 Box::new(self.convert_hir_type(inner)),
-                hir_const_arg_to_usize(len),
+                self.hir_const_arg_to_usize(len, &HashMap::new()),
             ),
             hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
@@ -1086,24 +1276,59 @@ impl<'a> LowerCtx<'a> {
         sid: hir::item_tree::StructId,
         args: &[type_checker::Type],
     ) -> Type {
+        let s = &self.hir.item_tree.structs[sid];
+        let type_count = s.generics.len();
         let mir_args = args
             .iter()
+            .take(type_count)
             .map(|arg| self.convert_type(arg))
             .collect::<Vec<_>>();
-        self.convert_struct_type_from_mir_args(sid, &mir_args)
+        let const_args = args
+            .iter()
+            .skip(type_count)
+            .filter_map(tc_const_arg_to_usize)
+            .collect::<Vec<_>>();
+        self.convert_struct_type_from_parts(sid, &mir_args, &const_args)
     }
 
-    fn convert_struct_type_from_mir_args(
+    fn convert_struct_type_from_hir_args(
         &self,
         sid: hir::item_tree::StructId,
-        args: &[Type],
+        args: &[hir::item_tree::HirTypeRef],
+    ) -> Type {
+        let s = &self.hir.item_tree.structs[sid];
+        let type_count = s.generics.len();
+        let mir_args = args
+            .iter()
+            .take(type_count)
+            .map(|arg| self.convert_hir_type(arg))
+            .collect::<Vec<_>>();
+        let const_args = args
+            .iter()
+            .skip(type_count)
+            .map(|arg| self.hir_type_ref_const_arg_to_usize(arg, &HashMap::new()))
+            .collect::<Vec<_>>();
+        self.convert_struct_type_from_parts(sid, &mir_args, &const_args)
+    }
+
+    fn convert_struct_type_from_parts(
+        &self,
+        sid: hir::item_tree::StructId,
+        type_args: &[Type],
+        const_args: &[usize],
     ) -> Type {
         let s = &self.hir.item_tree.structs[sid];
         let subst = s
             .generics
             .iter()
-            .zip(args.iter())
+            .zip(type_args.iter())
             .map(|(name, ty)| (name.0.as_str(), ty))
+            .collect::<HashMap<_, _>>();
+        let const_subst = s
+            .const_generics
+            .iter()
+            .zip(const_args.iter())
+            .map(|(name, value)| (name.0.as_str(), *value))
             .collect::<HashMap<_, _>>();
         let fields = s
             .fields
@@ -1111,12 +1336,105 @@ impl<'a> LowerCtx<'a> {
             .map(|f| {
                 (
                     f.name.0.clone(),
-                    self.convert_hir_type_with_subst(&f.ty, &subst),
+                    self.convert_hir_type_with_substs(&f.ty, &subst, &const_subst),
                 )
             })
             .collect();
+        let name_args = type_args
+            .iter()
+            .map(mono_type_name)
+            .chain(const_args.iter().map(|value| value.to_string()))
+            .collect::<Vec<_>>();
         Type::Struct(StructType {
-            name: mono_struct_name(&s.name.0, args),
+            name: mono_name_from_parts(&s.name.0, &name_args),
+            fields,
+        })
+    }
+
+    fn convert_enum_type(&self, eid: hir::item_tree::EnumId, args: &[type_checker::Type]) -> Type {
+        let e = &self.hir.item_tree.enums[eid];
+        let type_count = e.generics.len();
+        let mir_args = args
+            .iter()
+            .take(type_count)
+            .map(|arg| self.convert_type(arg))
+            .collect::<Vec<_>>();
+        let const_args = args
+            .iter()
+            .skip(type_count)
+            .filter_map(tc_const_arg_to_usize)
+            .collect::<Vec<_>>();
+        self.convert_enum_type_from_parts(eid, &mir_args, &const_args)
+    }
+
+    fn convert_enum_type_from_hir_args(
+        &self,
+        eid: hir::item_tree::EnumId,
+        args: &[hir::item_tree::HirTypeRef],
+    ) -> Type {
+        let e = &self.hir.item_tree.enums[eid];
+        let type_count = e.generics.len();
+        let mir_args = args
+            .iter()
+            .take(type_count)
+            .map(|arg| self.convert_hir_type(arg))
+            .collect::<Vec<_>>();
+        let const_args = args
+            .iter()
+            .skip(type_count)
+            .map(|arg| self.hir_type_ref_const_arg_to_usize(arg, &HashMap::new()))
+            .collect::<Vec<_>>();
+        self.convert_enum_type_from_parts(eid, &mir_args, &const_args)
+    }
+
+    fn convert_enum_type_from_parts(
+        &self,
+        eid: hir::item_tree::EnumId,
+        type_args: &[Type],
+        const_args: &[usize],
+    ) -> Type {
+        let e = &self.hir.item_tree.enums[eid];
+        let subst = e
+            .generics
+            .iter()
+            .zip(type_args.iter())
+            .map(|(name, ty)| (name.0.as_str(), ty))
+            .collect::<HashMap<_, _>>();
+        let const_subst = e
+            .const_generics
+            .iter()
+            .zip(const_args.iter())
+            .map(|(name, value)| (name.0.as_str(), *value))
+            .collect::<HashMap<_, _>>();
+        let mut fields = vec![("tag".to_string(), Type::Int(IntTy::U32))];
+        for variant in &e.variants {
+            match &variant.kind {
+                hir::item_tree::HirVariantKind::Tuple(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        fields.push((
+                            format!("{}_{}", variant.name.0, index),
+                            self.convert_hir_type_with_substs(item, &subst, &const_subst),
+                        ));
+                    }
+                }
+                hir::item_tree::HirVariantKind::Struct(items) => {
+                    for item in items {
+                        fields.push((
+                            format!("{}_{}", variant.name.0, item.name.0),
+                            self.convert_hir_type_with_substs(&item.ty, &subst, &const_subst),
+                        ));
+                    }
+                }
+                hir::item_tree::HirVariantKind::Unit => {}
+            }
+        }
+        let name_args = type_args
+            .iter()
+            .map(mono_type_name)
+            .chain(const_args.iter().map(|value| value.to_string()))
+            .collect::<Vec<_>>();
+        Type::Struct(StructType {
+            name: mono_name_from_parts(&e.name.0, &name_args),
             fields,
         })
     }
@@ -1126,12 +1444,20 @@ impl<'a> LowerCtx<'a> {
         fid: hir::item_tree::FunctionId,
         base: ExprId,
     ) -> Option<String> {
-        let imp = self.impl_for_method(fid)?.clone();
-        if imp.generics.is_empty() {
-            return None;
-        }
         let body_id = self.current_body?;
         let receiver_ty = self.type_result.expr_types.get(&(body_id, base))?;
+        self.mono_method_name_for_receiver(fid, receiver_ty)
+    }
+
+    fn mono_method_name_for_receiver(
+        &mut self,
+        fid: hir::item_tree::FunctionId,
+        receiver_ty: &type_checker::Type,
+    ) -> Option<String> {
+        let imp = self.impl_for_method(fid)?.clone();
+        if imp.generics.is_empty() && imp.const_generics.is_empty() {
+            return None;
+        }
         let receiver_mir_ty = self.convert_type(receiver_ty);
         let suffix = mono_type_name(&receiver_mir_ty);
         let key = (fid, suffix.clone());
@@ -1143,7 +1469,8 @@ impl<'a> LowerCtx<'a> {
         let original_name = self.hir.item_tree.functions[fid].name.0.clone();
         let mono_name = format!("{}__{}", original_name, suffix);
         self.mono_methods.insert(key, mono_name.clone());
-        let old_subst = std::mem::replace(&mut self.generic_subst, subst);
+        let old_subst = std::mem::replace(&mut self.generic_subst, subst.types);
+        let old_const_subst = std::mem::replace(&mut self.generic_const_subst, subst.consts);
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
         let old_mut_bindings = std::mem::take(&mut self.mut_bindings);
@@ -1157,6 +1484,7 @@ impl<'a> LowerCtx<'a> {
         self.pattern_bindings = old_pattern_bindings;
         self.current_body = old_current_body;
         self.generic_subst = old_subst;
+        self.generic_const_subst = old_const_subst;
         self.module.add_function(func);
         Some(mono_name)
     }
@@ -1228,7 +1556,7 @@ impl<'a> LowerCtx<'a> {
 
     fn static_method_name(&self, fid: hir::item_tree::FunctionId) -> Option<String> {
         let imp = self.impl_for_method(fid)?;
-        if !imp.generics.is_empty() {
+        if !imp.generics.is_empty() || !imp.const_generics.is_empty() {
             return None;
         }
         let self_ty = self.convert_hir_type(&imp.self_ty);
@@ -1250,16 +1578,23 @@ impl<'a> LowerCtx<'a> {
         receiver_ty: &type_checker::Type,
     ) -> bool {
         let receiver_mir_ty = self.convert_type(receiver_ty);
-        if imp.generics.is_empty() {
+        if imp.generics.is_empty() && imp.const_generics.is_empty() {
             return self.convert_hir_type(&imp.self_ty) == receiver_mir_ty;
         }
         self.impl_mir_subst(imp, receiver_ty)
             .map(|subst| {
-                let subst = subst
+                let type_subst = subst
+                    .types
                     .iter()
                     .map(|(name, ty)| (name.as_str(), ty))
                     .collect::<HashMap<_, _>>();
-                self.convert_hir_type_with_subst(&imp.self_ty, &subst) == receiver_mir_ty
+                let const_subst = subst
+                    .consts
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), *value))
+                    .collect::<HashMap<_, _>>();
+                self.convert_hir_type_with_substs(&imp.self_ty, &type_subst, &const_subst)
+                    == receiver_mir_ty
             })
             .unwrap_or(false)
     }
@@ -1283,23 +1618,99 @@ impl<'a> LowerCtx<'a> {
         &self,
         imp: &hir::item_tree::HirImpl,
         receiver_ty: &type_checker::Type,
-    ) -> Option<HashMap<String, Type>> {
-        let type_checker::Type::Struct(_, args) = receiver_ty else {
-            return None;
-        };
-        Some(
-            imp.generics
-                .iter()
-                .zip(args.iter())
-                .map(|(name, ty)| (name.0.clone(), self.convert_type(ty)))
-                .collect(),
-        )
+    ) -> Option<MirSubst> {
+        let mut subst = MirSubst::default();
+        match receiver_ty {
+            type_checker::Type::Struct(_, args) => {
+                for (name, ty) in imp.generics.iter().zip(args.iter()) {
+                    subst.types.insert(name.0.clone(), self.convert_type(ty));
+                }
+                for (name, ty) in imp
+                    .const_generics
+                    .iter()
+                    .zip(args.iter().skip(imp.generics.len()))
+                {
+                    if let Some(value) = tc_const_arg_to_usize(ty) {
+                        subst.consts.insert(name.0.clone(), value);
+                    }
+                }
+                Some(subst)
+            }
+            type_checker::Type::Array(inner, len) => {
+                let hir::item_tree::HirTypeRef::Array(pattern_inner, pattern_len) = &imp.self_ty
+                else {
+                    return None;
+                };
+                let generics = imp
+                    .generics
+                    .iter()
+                    .map(|name| name.0.as_str())
+                    .collect::<HashSet<_>>();
+                if !self.collect_hir_type_subst(pattern_inner, inner, &generics, &mut subst.types) {
+                    return None;
+                }
+                if let hir::item_tree::HirConstArg::Param(name) = pattern_len {
+                    if let Some(value) = len.as_usize() {
+                        subst.consts.insert(name.0.clone(), value);
+                    }
+                }
+                Some(subst)
+            }
+            _ => None,
+        }
     }
 
-    fn convert_hir_type_with_subst(
+    fn collect_hir_type_subst(
+        &self,
+        pattern: &hir::item_tree::HirTypeRef,
+        actual: &type_checker::Type,
+        generics: &HashSet<&str>,
+        subst: &mut HashMap<String, Type>,
+    ) -> bool {
+        match pattern {
+            hir::item_tree::HirTypeRef::Named(path)
+                if path
+                    .as_single_name()
+                    .is_some_and(|name| generics.contains(name.0.as_str())) =>
+            {
+                let name = path.as_single_name().unwrap().0.clone();
+                match subst.get(&name) {
+                    Some(existing) => existing == &self.convert_type(actual),
+                    None => {
+                        subst.insert(name, self.convert_type(actual));
+                        true
+                    }
+                }
+            }
+            hir::item_tree::HirTypeRef::Ref(inner, expected_mut) => match actual {
+                type_checker::Type::Ref(actual_inner, actual_mut) => {
+                    expected_mut == actual_mut
+                        && self.collect_hir_type_subst(inner, actual_inner, generics, subst)
+                }
+                _ => false,
+            },
+            hir::item_tree::HirTypeRef::Ptr { inner, .. } => match actual {
+                type_checker::Type::Ptr {
+                    inner: actual_inner,
+                    ..
+                } => self.collect_hir_type_subst(inner, actual_inner, generics, subst),
+                _ => false,
+            },
+            hir::item_tree::HirTypeRef::Array(inner, _) => match actual {
+                type_checker::Type::Array(actual_inner, _) => {
+                    self.collect_hir_type_subst(inner, actual_inner, generics, subst)
+                }
+                _ => false,
+            },
+            _ => true,
+        }
+    }
+
+    fn convert_hir_type_with_substs(
         &self,
         t: &hir::item_tree::HirTypeRef,
         subst: &HashMap<&str, &Type>,
+        const_subst: &HashMap<&str, usize>,
     ) -> Type {
         match t {
             hir::item_tree::HirTypeRef::Named(path) => {
@@ -1308,27 +1719,133 @@ impl<'a> LowerCtx<'a> {
                         return (*ty).clone();
                     }
                 }
+                match path.segments.last().map(|n| n.0.as_str()) {
+                    Some(name) => {
+                        for (sid, s) in self.hir.item_tree.structs.iter() {
+                            if s.name.0 == name {
+                                return self.convert_struct_type_from_hir_args_with_substs(
+                                    sid,
+                                    &path.type_args,
+                                    subst,
+                                    const_subst,
+                                );
+                            }
+                        }
+                        for (eid, e) in self.hir.item_tree.enums.iter() {
+                            if e.name.0 == name {
+                                return self.convert_enum_type_from_hir_args_with_substs(
+                                    eid,
+                                    &path.type_args,
+                                    subst,
+                                    const_subst,
+                                );
+                            }
+                        }
+                    }
+                    None => {}
+                }
                 self.convert_hir_type(t)
             }
             hir::item_tree::HirTypeRef::Ref(inner, mutable) => Type::Ref(
-                Box::new(self.convert_hir_type_with_subst(inner, subst)),
+                Box::new(self.convert_hir_type_with_substs(inner, subst, const_subst)),
                 *mutable,
             ),
-            hir::item_tree::HirTypeRef::Ptr { inner, .. } => {
-                Type::Ptr(Box::new(self.convert_hir_type_with_subst(inner, subst)))
-            }
+            hir::item_tree::HirTypeRef::Ptr { inner, .. } => Type::Ptr(Box::new(
+                self.convert_hir_type_with_substs(inner, subst, const_subst),
+            )),
             hir::item_tree::HirTypeRef::Tuple(elems) => Type::Tuple(
                 elems
                     .iter()
-                    .map(|elem| self.convert_hir_type_with_subst(elem, subst))
+                    .map(|elem| self.convert_hir_type_with_substs(elem, subst, const_subst))
                     .collect(),
             ),
             hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
-                Box::new(self.convert_hir_type_with_subst(inner, subst)),
-                hir_const_arg_to_usize(len),
+                Box::new(self.convert_hir_type_with_substs(inner, subst, const_subst)),
+                self.hir_const_arg_to_usize(len, const_subst),
             ),
             hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
+        }
+    }
+
+    fn convert_struct_type_from_hir_args_with_substs(
+        &self,
+        sid: hir::item_tree::StructId,
+        args: &[hir::item_tree::HirTypeRef],
+        subst: &HashMap<&str, &Type>,
+        const_subst: &HashMap<&str, usize>,
+    ) -> Type {
+        let s = &self.hir.item_tree.structs[sid];
+        let type_count = s.generics.len();
+        let mir_args = args
+            .iter()
+            .take(type_count)
+            .map(|arg| self.convert_hir_type_with_substs(arg, subst, const_subst))
+            .collect::<Vec<_>>();
+        let const_args = args
+            .iter()
+            .skip(type_count)
+            .map(|arg| self.hir_type_ref_const_arg_to_usize(arg, const_subst))
+            .collect::<Vec<_>>();
+        self.convert_struct_type_from_parts(sid, &mir_args, &const_args)
+    }
+
+    fn convert_enum_type_from_hir_args_with_substs(
+        &self,
+        eid: hir::item_tree::EnumId,
+        args: &[hir::item_tree::HirTypeRef],
+        subst: &HashMap<&str, &Type>,
+        const_subst: &HashMap<&str, usize>,
+    ) -> Type {
+        let e = &self.hir.item_tree.enums[eid];
+        let type_count = e.generics.len();
+        let mir_args = args
+            .iter()
+            .take(type_count)
+            .map(|arg| self.convert_hir_type_with_substs(arg, subst, const_subst))
+            .collect::<Vec<_>>();
+        let const_args = args
+            .iter()
+            .skip(type_count)
+            .map(|arg| self.hir_type_ref_const_arg_to_usize(arg, const_subst))
+            .collect::<Vec<_>>();
+        self.convert_enum_type_from_parts(eid, &mir_args, &const_args)
+    }
+
+    fn hir_type_ref_const_arg_to_usize(
+        &self,
+        ty: &hir::item_tree::HirTypeRef,
+        const_subst: &HashMap<&str, usize>,
+    ) -> usize {
+        match ty {
+            hir::item_tree::HirTypeRef::Const(value) => {
+                self.hir_const_arg_to_usize(value, const_subst)
+            }
+            hir::item_tree::HirTypeRef::Named(path) => path
+                .as_single_name()
+                .and_then(|name| const_subst.get(name.0.as_str()).copied())
+                .or_else(|| {
+                    path.as_single_name()
+                        .and_then(|name| self.generic_const_subst.get(&name.0).copied())
+                })
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    fn hir_const_arg_to_usize(
+        &self,
+        arg: &hir::item_tree::HirConstArg,
+        const_subst: &HashMap<&str, usize>,
+    ) -> usize {
+        match arg {
+            hir::item_tree::HirConstArg::Value(value) => *value,
+            hir::item_tree::HirConstArg::Param(name) => const_subst
+                .get(name.0.as_str())
+                .copied()
+                .or_else(|| self.generic_const_subst.get(&name.0).copied())
+                .unwrap_or(0),
+            hir::item_tree::HirConstArg::Unknown | hir::item_tree::HirConstArg::Error => 0,
         }
     }
 }
@@ -1339,23 +1856,18 @@ fn is_self_associated_path(path: &hir::item_tree::HirPath) -> bool {
         && path.segments[0].0 == "Self"
 }
 
-fn hir_const_arg_to_usize(arg: &hir::item_tree::HirConstArg) -> usize {
-    match arg {
-        hir::item_tree::HirConstArg::Value(value) => *value,
-        _ => 0,
-    }
-}
-
-fn mono_struct_name(base: &str, args: &[Type]) -> String {
+fn mono_name_from_parts(base: &str, args: &[String]) -> String {
     if args.is_empty() {
         return base.to_string();
     }
-    let suffix = args
-        .iter()
-        .map(mono_type_name)
-        .collect::<Vec<_>>()
-        .join("_");
-    format!("{base}_{suffix}")
+    format!("{}_{}", base, args.join("_"))
+}
+
+fn tc_const_arg_to_usize(ty: &type_checker::Type) -> Option<usize> {
+    match ty {
+        type_checker::Type::Const(value) => value.as_usize(),
+        _ => None,
+    }
 }
 
 fn mono_type_name(ty: &Type) -> String {
