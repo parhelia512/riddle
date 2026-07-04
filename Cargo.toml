@@ -33,6 +33,7 @@ edition = "2024"
 [workspace.dependencies]
 ast = { path = "crates/ast" }
 clap = { version = "4.6.1", features = ["derive"] }
+clue = { path = "app/clue" }
 escape-analysis = { path = "crates/escape-analysis" }
 frontend = { path = "crates/frontend" }
 hir = { path = "crates/hir" }
@@ -54,6 +55,7 @@ publish = false
 
 [dependencies]
 clap.workspace = true
+clue.workspace = true
 frontend.workspace = true
 hir.workspace = true
 lsp-types = "0.94.1"
