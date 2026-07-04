@@ -1,3 +1,4 @@
+pub mod c_compiler;
 pub mod diagnostics;
 pub mod pipeline;
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hir::item_tree::{EnumId, HirPath, HirTypeRef, StructId, TraitId, TypeAliasId};
+use hir::item_tree::{EnumId, HirConstArg, HirPath, HirTypeRef, StructId, TraitId, TypeAliasId};
 use rowan::TextRange;
 
 use crate::{
@@ -51,10 +51,21 @@ impl TypeChecker<'_> {
                     .map(|ty| self.lower_type_ref_with_params_at(ty, params, span))
                     .collect(),
             ),
-            HirTypeRef::Array(inner, len) => Type::Array(
-                Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
-                self.lower_const_arg(len, params),
-            ),
+            HirTypeRef::Array(inner, len) => {
+                if let Some(suggestion) = self.swapped_array_type_suggestion(inner, len, params) {
+                    self.diagnostic("E0034", "invalid array type syntax", span);
+                    if let Some(diagnostic) = self.result.diagnostics.last_mut() {
+                        diagnostic.notes.push(format!(
+                            "array types use `[T; N]`; write `{suggestion}` instead"
+                        ));
+                    }
+                    return Type::Unknown;
+                }
+                Type::Array(
+                    Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
+                    self.lower_const_arg(len, params),
+                )
+            }
             HirTypeRef::Const(value) => Type::Const(self.lower_const_arg(value, params)),
             HirTypeRef::Unknown => Type::Unknown,
             HirTypeRef::Error => Type::Error,
@@ -183,20 +194,43 @@ impl TypeChecker<'_> {
             .collect()
     }
 
-    fn lower_const_arg(
-        &self,
-        arg: &hir::item_tree::HirConstArg,
-        params: &HashMap<String, Type>,
-    ) -> ConstArg {
+    fn lower_const_arg(&self, arg: &HirConstArg, params: &HashMap<String, Type>) -> ConstArg {
         match arg {
-            hir::item_tree::HirConstArg::Value(value) => ConstArg::Value(*value),
-            hir::item_tree::HirConstArg::Param(name) => match params.get(&name.0) {
+            HirConstArg::Value(value) => ConstArg::Value(*value),
+            HirConstArg::Param(name) => match params.get(&name.0) {
                 Some(Type::Const(value)) => value.clone(),
                 _ => ConstArg::Param(name.0.clone()),
             },
-            hir::item_tree::HirConstArg::Unknown => ConstArg::Unknown,
-            hir::item_tree::HirConstArg::Error => ConstArg::Error,
+            HirConstArg::Unknown => ConstArg::Unknown,
+            HirConstArg::Error => ConstArg::Error,
         }
+    }
+
+    fn swapped_array_type_suggestion(
+        &self,
+        inner: &HirTypeRef,
+        len: &HirConstArg,
+        params: &HashMap<String, Type>,
+    ) -> Option<String> {
+        let HirTypeRef::Const(HirConstArg::Value(value)) = inner else {
+            return None;
+        };
+        let HirConstArg::Param(name) = len else {
+            return None;
+        };
+        self.is_type_name(&name.0, params)
+            .then(|| format!("[{}; {}]", name.0, value))
+    }
+
+    fn is_type_name(&self, name: &str, params: &HashMap<String, Type>) -> bool {
+        if let Some(ty) = params.get(name) {
+            return !matches!(ty, Type::Const(_));
+        }
+        IntTy::parse(name).is_some()
+            || FloatTy::parse(name).is_some()
+            || matches!(name, "bool" | "str" | "char" | "unit")
+            || self.find_struct_by_name(name).is_some()
+            || self.find_enum_by_name(name).is_some()
     }
 
     fn check_type_arg_count(&mut self, name: &str, expected: usize, actual: usize) {

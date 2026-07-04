@@ -1,0 +1,22 @@
+#[lang = "clone"]
+pub trait Clone {}
+
+impl Clone for bool {}
+impl Clone for char {}
+impl Clone for str {}
+impl Clone for i8 {}
+impl Clone for i16 {}
+impl Clone for i32 {}
+impl Clone for i64 {}
+impl Clone for i128 {}
+impl Clone for isize {}
+impl Clone for u8 {}
+impl Clone for u16 {}
+impl Clone for u32 {}
+impl Clone for u64 {}
+impl Clone for u128 {}
+impl Clone for usize {}
+impl Clone for f16 {}
+impl Clone for f32 {}
+impl Clone for f64 {}
+impl Clone for f128 {}

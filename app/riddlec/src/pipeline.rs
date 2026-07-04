@@ -14,7 +14,7 @@ use mir::{self, Module};
 use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
 use type_checker::{self, TypeCheckResult, check_hir};
 
-const STD_PRELUDE: &str = include_str!("../../../std/lib.rid");
+const STD_PRELUDE: &str = include_str!(concat!(env!("OUT_DIR"), "/std.rid"));
 
 pub struct CompileResult {
     pub hir: Option<hir::HirFile>,
@@ -82,12 +82,18 @@ impl IntoDiagnosticExt for ParseError {
 pub fn load_source_file(path: impl AsRef<Path>) -> io::Result<LoadedSource> {
     let mut files = Vec::new();
     let mut stack = HashSet::new();
-    let source = load_source_file_inner(path.as_ref(), &mut stack, &mut files)?;
+    let path = fs::canonicalize(path)?;
+    let module_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let source = load_source_file_inner(&path, &module_dir, &mut stack, &mut files)?;
     Ok(LoadedSource { source, files })
 }
 
 fn load_source_file_inner(
     path: &Path,
+    module_dir: &Path,
     stack: &mut HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
 ) -> io::Result<String> {
@@ -101,15 +107,14 @@ fn load_source_file_inner(
 
     let source = fs::read_to_string(&path)?;
     files.push(path.clone());
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let expanded = expand_external_mods(&source, dir, stack, files)?;
+    let expanded = expand_external_mods(&source, module_dir, stack, files)?;
     stack.remove(&path);
     Ok(expanded)
 }
 
 fn expand_external_mods(
     source: &str,
-    dir: &Path,
+    module_dir: &Path,
     stack: &mut HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
 ) -> io::Result<String> {
@@ -120,18 +125,19 @@ fn expand_external_mods(
     }
 
     let mut mods = Vec::new();
-    collect_external_mods(&parse.syntax(), &mut mods);
+    collect_external_mods(&parse.syntax(), module_dir, &mut mods);
     if mods.is_empty() {
         return Ok(source.to_string());
     }
 
     let mut replacements = Vec::new();
-    for module in mods {
+    for ExternalMod { module, module_dir } in mods {
         let Some(name) = module.name().map(|token| token.text().to_string()) else {
             continue;
         };
-        let child = find_module_file(dir, &name)?;
-        let child_source = load_source_file_inner(&child, stack, files)?;
+        let child = find_module_file(&module_dir, &name)?;
+        let child_dir = module_dir.join(&name);
+        let child_source = load_source_file_inner(&child, &child_dir, stack, files)?;
         let range = module.syntax().text_range();
         let visibility = if module.is_pub() { "pub " } else { "" };
         replacements.push((
@@ -153,37 +159,55 @@ fn expand_external_mods(
     Ok(out)
 }
 
-fn collect_external_mods(node: &SyntaxNode, out: &mut Vec<ast::ModDecl>) {
+struct ExternalMod {
+    module: ast::ModDecl,
+    module_dir: PathBuf,
+}
+
+fn collect_external_mods(node: &SyntaxNode, module_dir: &Path, out: &mut Vec<ExternalMod>) {
     for child in node.children() {
         if let Some(module) = ast::ModDecl::cast(child.clone()) {
             if module.items().is_none() {
-                out.push(module);
+                out.push(ExternalMod {
+                    module,
+                    module_dir: module_dir.to_path_buf(),
+                });
                 continue;
             }
+            let Some(name) = module.name().map(|token| token.text().to_string()) else {
+                collect_external_mods(&child, module_dir, out);
+                continue;
+            };
+            collect_external_mods(&child, &module_dir.join(name), out);
+            continue;
         }
-        collect_external_mods(&child, out);
+        collect_external_mods(&child, module_dir, out);
     }
 }
 
-fn find_module_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
-    let flat = dir.join(format!("{name}.rid"));
-    if flat.is_file() {
-        return Ok(flat);
+fn find_module_file(module_dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let flat = module_dir.join(format!("{name}.rid"));
+    let nested = module_dir.join(name).join("mod.rid");
+    match (flat.is_file(), nested.is_file()) {
+        (true, false) => Ok(flat),
+        (false, true) => Ok(nested),
+        (true, true) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "module `{name}` is ambiguous; both `{}` and `{}` exist",
+                flat.display(),
+                nested.display()
+            ),
+        )),
+        (false, false) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "module `{name}` not found; expected `{}` or `{}`",
+                flat.display(),
+                nested.display()
+            ),
+        )),
     }
-
-    let nested = dir.join(name).join("mod.rid");
-    if nested.is_file() {
-        return Ok(nested);
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!(
-            "module `{name}` not found; expected `{}` or `{}`",
-            flat.display(),
-            nested.display()
-        ),
-    ))
 }
 
 pub fn generate_c(module: &Module) -> Result<String, String> {
@@ -322,16 +346,20 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn load_source_file_expands_external_mods() {
-        let root = std::env::temp_dir().join(format!(
-            "riddle-load-source-{}-{}",
+    fn temp_source_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "riddle-load-source-{name}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[test]
+    fn load_source_file_expands_external_mods() {
+        let root = temp_source_root("external-mods");
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("main.rid"),
@@ -349,11 +377,168 @@ mod tests {
     }
 
     #[test]
+    fn load_source_file_uses_rust_style_mod_rid_tree() {
+        let root = temp_source_root("mod-rid-tree");
+        fs::create_dir_all(root.join("foo")).unwrap();
+        fs::write(
+            root.join("main.rid"),
+            "mod foo;\nfun main() -> i32 { foo::value() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("foo").join("mod.rid"),
+            "mod bar;\npub fun value() -> i32 { bar::value() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("foo").join("bar.rid"),
+            "pub fun value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+
+        let loaded = load_source_file(root.join("main.rid")).unwrap();
+        assert!(
+            loaded
+                .files
+                .contains(&fs::canonicalize(root.join("foo").join("mod.rid")).unwrap())
+        );
+        assert!(
+            loaded
+                .files
+                .contains(&fs::canonicalize(root.join("foo").join("bar.rid")).unwrap())
+        );
+        assert!(compile(&loaded.source).success());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn flat_modules_resolve_children_from_module_directory() {
+        let root = temp_source_root("flat-module-children");
+        fs::create_dir_all(root.join("foo")).unwrap();
+        fs::write(
+            root.join("main.rid"),
+            "mod foo;\nfun main() -> i32 { foo::value() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("foo.rid"),
+            "mod bar;\npub fun value() -> i32 { bar::value() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("foo").join("bar.rid"),
+            "pub fun value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        fs::write(root.join("bar.rid"), "pub fun value() -> i32 { 99 }\n").unwrap();
+
+        let loaded = load_source_file(root.join("main.rid")).unwrap();
+        assert!(loaded.source.contains("pub fun value() -> i32 { 1 }"));
+        assert!(!loaded.source.contains("pub fun value() -> i32 { 99 }"));
+        assert!(compile(&loaded.source).success());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inline_modules_resolve_children_from_module_directory() {
+        let root = temp_source_root("inline-module-children");
+        fs::create_dir_all(root.join("foo")).unwrap();
+        fs::write(
+            root.join("main.rid"),
+            "mod foo { mod bar; pub fun value() -> i32 { bar::value() } }\nfun main() -> i32 { foo::value() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("foo").join("bar.rid"),
+            "pub fun value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+
+        let loaded = load_source_file(root.join("main.rid")).unwrap();
+        assert!(
+            loaded
+                .files
+                .contains(&fs::canonicalize(root.join("foo").join("bar.rid")).unwrap())
+        );
+        assert!(compile(&loaded.source).success());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_flat_and_mod_rid_modules_are_rejected() {
+        let root = temp_source_root("duplicate-module-files");
+        fs::create_dir_all(root.join("foo")).unwrap();
+        fs::write(root.join("main.rid"), "mod foo;\n").unwrap();
+        fs::write(root.join("foo.rid"), "pub fun value() -> i32 { 1 }\n").unwrap();
+        fs::write(
+            root.join("foo").join("mod.rid"),
+            "pub fun value() -> i32 { 2 }\n",
+        )
+        .unwrap();
+
+        let error = load_source_file(root.join("main.rid")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("ambiguous"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn undeclared_directory_modules_are_not_loaded() {
+        let root = temp_source_root("undeclared-module");
+        fs::create_dir_all(root.join("foo")).unwrap();
+        fs::write(root.join("main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+        fs::write(root.join("foo").join("mod.rid"), "this is not parsed\n").unwrap();
+
+        let loaded = load_source_file(root.join("main.rid")).unwrap();
+        assert_eq!(
+            loaded.files,
+            vec![fs::canonicalize(root.join("main.rid")).unwrap()]
+        );
+        assert!(compile(&loaded.source).success());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn std_range_iterator_type_checks() {
         let result = compile(
             r#"
             fun main() {
                 let mut iter = range(0, 3);
+                let first = iter.next();
+            }
+            "#,
+        );
+
+        assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    }
+
+    #[test]
+    fn std_prelude_reexports_core_items() {
+        let result = compile(
+            r#"
+            fun main() {
+                let value: Option<i32> = Option::Some(1);
+                let mut iter = range(0, 3);
+                let first = iter.next();
+            }
+            "#,
+        );
+
+        assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    }
+
+    #[test]
+    fn std_modules_expose_core_items() {
+        let result = compile(
+            r#"
+            fun main() {
+                let value = std::option::Option::Some(1);
+                let mut iter: Range = std::ops::range(0, 3);
                 let first = iter.next();
             }
             "#,

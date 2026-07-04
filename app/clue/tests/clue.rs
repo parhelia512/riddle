@@ -283,3 +283,57 @@ name = "math"
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn package_loads_rust_style_module_trees() {
+    let root = temp_root("rust-style-modules");
+    let app = root.join("app");
+    let math = root.join("math");
+    fs::create_dir_all(app.join("src").join("app")).unwrap();
+    fs::create_dir_all(math.join("src").join("ops")).unwrap();
+    fs::write(
+        app.join(CLUE_PROJECT_FILE_NAME),
+        r#"[package]
+name = "app"
+
+[dependencies]
+math = { path = "../math" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        math.join(CLUE_PROJECT_FILE_NAME),
+        r#"[package]
+name = "math"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        app.join("src").join("main.rid"),
+        "mod app;\nfun main() -> i32 { app::run() + math::ops::one() }\n",
+    )
+    .unwrap();
+    fs::write(
+        app.join("src").join("app").join("mod.rid"),
+        "mod util;\npub fun run() -> i32 { util::one() }\n",
+    )
+    .unwrap();
+    fs::write(
+        app.join("src").join("app").join("util.rid"),
+        "pub fun one() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(math.join("src").join("lib.rid"), "pub mod ops;\n").unwrap();
+    fs::write(
+        math.join("src").join("ops").join("mod.rid"),
+        "pub fun one() -> i32 { 1 }\n",
+    )
+    .unwrap();
+
+    let loaded = package::load(&app).unwrap();
+    assert!(loaded.source.source.contains("pub mod ops {"));
+    assert!(loaded.source.source.contains("pub fun run() -> i32"));
+    assert!(pipeline::compile(&loaded.source.source).success());
+
+    let _ = fs::remove_dir_all(root);
+}

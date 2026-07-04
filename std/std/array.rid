@@ -1,0 +1,33 @@
+use crate::std::iter::{IntoIterator, Iterator};
+use crate::std::option::Option;
+
+pub struct IntoIter<T, const N: usize> {
+    values: [T; N],
+    index: usize,
+}
+
+impl<T, const N: usize> Iterator for IntoIter<T, N> {
+    type Item = T;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.index < N {
+            let value = self.values[self.index];
+            self.index += 1usize;
+            Option::Some(value)
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl<T, const N: usize> IntoIterator for [T; N] {
+    type Item = T;
+    type IntoIter = IntoIter<T, N>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        IntoIter {
+            values: self,
+            index: 0usize,
+        }
+    }
+}

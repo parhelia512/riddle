@@ -566,18 +566,14 @@ impl<'a> Analyzer<'a> {
         code: &'static str,
         extra_labels: &[(TextRange, String, LabelStyle)],
     ) {
-        let help = match code {
-            "E0100" => Some("consider borrowing with `&`".into()),
-            "E0300" => Some("cannot borrow as mutable while already borrowed as immutable".into()),
-            "E0301" => Some("cannot borrow as immutable while already borrowed as mutable".into()),
-            "E0302" => Some("cannot borrow as mutable more than once at a time".into()),
-            "E0303" => {
-                Some("cannot assign while the value is borrowed — the borrow must end first".into())
-            }
-            "E0304" => {
-                Some("cannot move while the value is borrowed — the borrow must end first".into())
-            }
-            _ => None,
+        let notes = match code {
+            "E0100" => vec!["borrow with `&` if the original value must remain usable".into()],
+            "E0300" => vec!["a mutable borrow cannot overlap an existing shared borrow".into()],
+            "E0301" => vec!["a shared borrow cannot overlap an existing mutable borrow".into()],
+            "E0302" => vec!["only one mutable borrow of a place may be active at a time".into()],
+            "E0303" => vec!["the borrow must end before assigning to the value".into()],
+            "E0304" => vec!["the borrow must end before moving the value".into()],
+            _ => Vec::new(),
         };
         let mut labels: Vec<SourceLabel> = span
             .map(|r| {
@@ -600,8 +596,8 @@ impl<'a> Analyzer<'a> {
             severity: Severity::Error,
             message,
             labels,
-            help,
-            notes: Vec::new(),
+            help: None,
+            notes,
         });
     }
 }

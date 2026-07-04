@@ -88,11 +88,11 @@ impl<'a> BodyLower<'a> {
                 message: String::new(),
                 style: LabelStyle::Primary,
             }],
-            help: Some(
-                "the source code could not be lowered — check for syntax or structural errors"
+            help: None,
+            notes: vec![
+                "the source code could not be lowered; check for syntax or structural errors"
                     .into(),
-            ),
-            notes: Vec::new(),
+            ],
         });
     }
 

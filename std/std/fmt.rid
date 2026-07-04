@@ -1,0 +1,117 @@
+#[lang = "debug"]
+pub trait Debug {}
+#[lang = "display"]
+pub trait Display {}
+#[lang = "binary"]
+pub trait Binary {}
+#[lang = "octal"]
+pub trait Octal {}
+#[lang = "lower_hex"]
+pub trait LowerHex {}
+#[lang = "upper_hex"]
+pub trait UpperHex {}
+#[lang = "lower_exp"]
+pub trait LowerExp {}
+#[lang = "upper_exp"]
+pub trait UpperExp {}
+
+impl Debug for bool {}
+impl Debug for char {}
+impl Debug for str {}
+impl Debug for i8 {}
+impl Debug for i16 {}
+impl Debug for i32 {}
+impl Debug for i64 {}
+impl Debug for i128 {}
+impl Debug for isize {}
+impl Debug for u8 {}
+impl Debug for u16 {}
+impl Debug for u32 {}
+impl Debug for u64 {}
+impl Debug for u128 {}
+impl Debug for usize {}
+impl Debug for f16 {}
+impl Debug for f32 {}
+impl Debug for f64 {}
+impl Debug for f128 {}
+
+impl Display for bool {}
+impl Display for char {}
+impl Display for str {}
+impl Display for i8 {}
+impl Display for i16 {}
+impl Display for i32 {}
+impl Display for i64 {}
+impl Display for i128 {}
+impl Display for isize {}
+impl Display for u8 {}
+impl Display for u16 {}
+impl Display for u32 {}
+impl Display for u64 {}
+impl Display for u128 {}
+impl Display for usize {}
+impl Display for f16 {}
+impl Display for f32 {}
+impl Display for f64 {}
+impl Display for f128 {}
+
+impl Binary for i8 {}
+impl Binary for i16 {}
+impl Binary for i32 {}
+impl Binary for i64 {}
+impl Binary for i128 {}
+impl Binary for isize {}
+impl Binary for u8 {}
+impl Binary for u16 {}
+impl Binary for u32 {}
+impl Binary for u64 {}
+impl Binary for u128 {}
+impl Binary for usize {}
+
+impl Octal for i8 {}
+impl Octal for i16 {}
+impl Octal for i32 {}
+impl Octal for i64 {}
+impl Octal for i128 {}
+impl Octal for isize {}
+impl Octal for u8 {}
+impl Octal for u16 {}
+impl Octal for u32 {}
+impl Octal for u64 {}
+impl Octal for u128 {}
+impl Octal for usize {}
+
+impl LowerHex for i8 {}
+impl LowerHex for i16 {}
+impl LowerHex for i32 {}
+impl LowerHex for i64 {}
+impl LowerHex for i128 {}
+impl LowerHex for isize {}
+impl LowerHex for u8 {}
+impl LowerHex for u16 {}
+impl LowerHex for u32 {}
+impl LowerHex for u64 {}
+impl LowerHex for u128 {}
+impl LowerHex for usize {}
+
+impl UpperHex for i8 {}
+impl UpperHex for i16 {}
+impl UpperHex for i32 {}
+impl UpperHex for i64 {}
+impl UpperHex for i128 {}
+impl UpperHex for isize {}
+impl UpperHex for u8 {}
+impl UpperHex for u16 {}
+impl UpperHex for u32 {}
+impl UpperHex for u64 {}
+impl UpperHex for u128 {}
+impl UpperHex for usize {}
+
+impl LowerExp for f16 {}
+impl LowerExp for f32 {}
+impl LowerExp for f64 {}
+impl LowerExp for f128 {}
+impl UpperExp for f16 {}
+impl UpperExp for f32 {}
+impl UpperExp for f64 {}
+impl UpperExp for f128 {}

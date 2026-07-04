@@ -2,9 +2,9 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::{self, Command};
+use std::process;
 
-use riddlec::{diagnostics, pipeline};
+use riddlec::{c_compiler, diagnostics, pipeline};
 
 const USAGE: &str = "usage: riddlec [--verbose] [--backend c] [--output <file>] <file>...";
 
@@ -166,27 +166,9 @@ fn parse_args(args: &[String]) -> Result<Opts, &'static str> {
     })
 }
 
-/// Search for an available C compiler: cc → gcc → clang.
-fn find_cc() -> Option<String> {
-    for cc in &["cc", "gcc", "clang"] {
-        if Command::new(cc).arg("--version").output().is_ok() {
-            return Some(cc.to_string());
-        }
-    }
-    None
-}
-
 /// Compile generated C code to a native executable.
 /// Returns the number of errors (0 on success).
 fn compile_c(c_code: &str, output: Option<&str>, input_files: &[String]) -> usize {
-    let cc = match find_cc() {
-        Some(c) => c,
-        None => {
-            eprintln!("riddlec: no C compiler found (tried cc, gcc, clang)");
-            return 1;
-        }
-    };
-
     // Write C code to a temp file
     let c_path = match output {
         Some(path) if path.ends_with(".c") || path.ends_with(".h") => {
@@ -223,35 +205,19 @@ fn compile_c(c_code: &str, output: Option<&str>, input_files: &[String]) -> usiz
     };
 
     // Derive binary name
-    let exe = match output {
-        Some(path) if !path.ends_with(".c") => path.to_string(),
-        _ => {
-            let base = Path::new(&c_path).file_stem().unwrap().to_string_lossy();
-            if cfg!(windows) {
-                format!("{}.exe", base)
-            } else {
-                base.to_string()
-            }
-        }
+    let exe_path = match output {
+        Some(path) if !path.ends_with(".c") => Path::new(path).to_path_buf(),
+        _ => c_compiler::executable_path(Path::new(&c_path)),
     };
 
     // Compile
-    eprintln!("riddlec: compiling C with `{cc}` → {exe}");
-    let status = Command::new(&cc)
-        .arg("-o")
-        .arg(&exe)
-        .arg(&c_path)
-        .arg("-lgc")
-        .status();
-
-    match status {
-        Ok(s) if s.success() => 0,
-        Ok(s) => {
-            eprintln!("riddlec: C compiler exited with {s}");
-            1
+    match c_compiler::compile_file(Path::new(&c_path), &exe_path) {
+        Ok(cc) => {
+            eprintln!("riddlec: compiled {} with `{cc}`", exe_path.display());
+            0
         }
         Err(e) => {
-            eprintln!("riddlec: failed to run `{cc}`: {e}");
+            eprintln!("riddlec: {e}");
             1
         }
     }

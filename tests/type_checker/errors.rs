@@ -185,6 +185,42 @@ fn array_type_length_must_be_literal() {
 }
 
 #[test]
+fn reversed_array_type_order_reports_rust_style_suggestion() {
+    let result = check(
+        r#"
+        struct Foo {
+            x: [3; i32]
+        }
+
+        fun main() {
+            let t = Foo {
+                x: [1, 2, 3]
+            };
+        }
+        "#,
+    );
+
+    let diag = result
+        .diagnostics
+        .iter()
+        .find(|diag| diag.message.contains("invalid array type syntax"))
+        .expect("missing reversed array type diagnostic");
+    assert!(
+        diag.notes
+            .iter()
+            .any(|note| note.contains("array types use `[T; N]`") && note.contains("`[i32; 3]`")),
+        "{diag:?}"
+    );
+    let msgs = messages(&result);
+    assert!(
+        !msgs
+            .iter()
+            .any(|msg| msg.contains("struct field type mismatch")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
 fn nested_array_type_length_must_be_literal() {
     let result = check(
         r#"

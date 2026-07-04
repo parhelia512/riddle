@@ -643,12 +643,13 @@ impl TypeChecker<'_> {
             };
 
             seen.push(field.name.0.as_str());
-            let pattern = self.lower_type_ref_with_params(
+            let pattern = self.lower_type_ref_with_params_at(
                 &expected_field.ty,
                 &generic_param_map_with_consts(
                     strukt.generics.iter().map(|name| name.0.as_str()),
                     strukt.const_generics.iter().map(|name| name.0.as_str()),
                 ),
+                Some(expected_field.ty_range),
             );
             let expected = substitute_type(&pattern, &subst);
             let actual = if expected.is_unknown_like() || expected_has_param(&expected) {
@@ -1816,7 +1817,9 @@ impl TypeChecker<'_> {
             .fields
             .iter()
             .find(|candidate| candidate.name == *field)
-            .map(|candidate| self.lower_type_ref_with_params(&candidate.ty, &subst))
+            .map(|candidate| {
+                self.lower_type_ref_with_params_at(&candidate.ty, &subst, Some(candidate.ty_range))
+            })
         else {
             self.diagnostic(
                 "E0006",
