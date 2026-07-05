@@ -114,16 +114,19 @@ impl CCompiler {
 }
 
 fn flavor_for(program: &OsStr) -> Flavor {
-    let name = Path::new(program)
-        .file_name()
-        .and_then(OsStr::to_str)
+    let name = program
+        .to_string_lossy()
+        .rsplit(['/', '\\'])
+        .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
+
     match name.as_str() {
         "cl" | "cl.exe" | "clang-cl" | "clang-cl.exe" => Flavor::Msvc,
         _ => Flavor::Unix,
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -141,11 +144,12 @@ mod tests {
 
     #[test]
     fn detects_msvc_drivers() {
-        assert_eq!(flavor_for(OsStr::new("cl.exe")), Flavor::Msvc);
+        assert_eq!(flavor_for(OsStr::new("cl.exe")), Flavor::Msvc, "cl.exe");
         assert_eq!(
-            flavor_for(OsStr::new("C:\\VS\\bin\\clang-cl.exe")),
-            Flavor::Msvc
+            flavor_for(OsStr::new(r"c:\VS\bin\clang-cl.exe")),
+            Flavor::Msvc,
+            "windows path clang-cl.exe"
         );
-        assert_eq!(flavor_for(OsStr::new("gcc")), Flavor::Unix);
+        assert_eq!(flavor_for(OsStr::new("gcc")), Flavor::Unix, "gcc");
     }
 }

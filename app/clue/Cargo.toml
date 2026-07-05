@@ -7,3 +7,7 @@ edition.workspace = true
 clap.workspace = true
 riddlec.workspace = true
 toml.workspace = true
+
+[[test]]
+name = "clue"
+path = "../../tests/clue/clue.rs"
