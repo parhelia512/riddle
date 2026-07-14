@@ -1,7 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
+    ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use ast::{self, support::AstNode};
@@ -30,6 +32,96 @@ pub struct CompileResult {
 pub struct LoadedSource {
     pub source: String,
     pub files: Vec<PathBuf>,
+    pub source_map: SourceMap,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SourceMap {
+    segments: Vec<SourceSegment>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceSegment {
+    generated: Range<usize>,
+    path: PathBuf,
+    source: Arc<str>,
+    original_start: usize,
+}
+
+pub struct MappedSource<'a> {
+    pub path: &'a Path,
+    pub source: &'a str,
+    pub range: rowan::TextRange,
+}
+
+impl SourceMap {
+    pub fn map_range(&self, range: rowan::TextRange) -> Option<MappedSource<'_>> {
+        let start = usize::from(range.start());
+        let end = usize::from(range.end());
+        let segment = self
+            .segments
+            .iter()
+            .find(|segment| segment.generated.contains(&start) && end <= segment.generated.end)
+            .or_else(|| {
+                if end == start {
+                    self.segments
+                        .iter()
+                        .find(|segment| segment.generated.end == start)
+                } else {
+                    None
+                }
+            })?;
+        let original_start = segment.original_start + start - segment.generated.start;
+        let original_end = original_start + end - start;
+        Some(MappedSource {
+            path: &segment.path,
+            source: &segment.source,
+            range: rowan::TextRange::new(
+                (original_start as u32).into(),
+                (original_end as u32).into(),
+            ),
+        })
+    }
+
+    pub fn contains_file(&self, path: &Path) -> bool {
+        self.segments.iter().any(|segment| segment.path == path)
+    }
+
+    pub fn extend(&mut self, mut other: SourceMap, generated_start: usize) {
+        for segment in &mut other.segments {
+            segment.generated.start += generated_start;
+            segment.generated.end += generated_start;
+        }
+        self.segments.extend(other.segments);
+    }
+
+    fn push(
+        &mut self,
+        generated: Range<usize>,
+        path: &Path,
+        source: Arc<str>,
+        original_start: usize,
+    ) {
+        if !generated.is_empty() {
+            self.segments.push(SourceSegment {
+                generated,
+                path: path.to_path_buf(),
+                source,
+                original_start,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompileOptions {
+    pub use_std: bool,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self { use_std: true }
+    }
 }
 
 /// An adapter that lets the diagnostics printer handle diagnostics from
@@ -80,23 +172,43 @@ impl IntoDiagnosticExt for ParseError {
 }
 
 pub fn load_source_file(path: impl AsRef<Path>) -> io::Result<LoadedSource> {
+    load_source_file_with_overlays(path, &HashMap::new())
+}
+
+pub fn load_source_file_with_overlays(
+    path: impl AsRef<Path>,
+    overlays: &HashMap<PathBuf, String>,
+) -> io::Result<LoadedSource> {
     let mut files = Vec::new();
     let mut stack = HashSet::new();
+    let overlays = overlays
+        .iter()
+        .filter_map(|(path, source)| {
+            fs::canonicalize(path)
+                .ok()
+                .map(|path| (path, source.clone()))
+        })
+        .collect::<HashMap<_, _>>();
     let path = fs::canonicalize(path)?;
     let module_dir = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let source = load_source_file_inner(&path, &module_dir, &mut stack, &mut files)?;
-    Ok(LoadedSource { source, files })
+    let expanded = load_source_file_inner(&path, &module_dir, &overlays, &mut stack, &mut files)?;
+    Ok(LoadedSource {
+        source: expanded.source,
+        files,
+        source_map: expanded.source_map,
+    })
 }
 
 fn load_source_file_inner(
     path: &Path,
     module_dir: &Path,
+    overlays: &HashMap<PathBuf, String>,
     stack: &mut HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
-) -> io::Result<String> {
+) -> io::Result<ExpandedSource> {
     let path = fs::canonicalize(path)?;
     if !stack.insert(path.clone()) {
         return Err(io::Error::new(
@@ -105,29 +217,35 @@ fn load_source_file_inner(
         ));
     }
 
-    let source = fs::read_to_string(&path)?;
+    let source: Arc<str> = overlays
+        .get(&path)
+        .cloned()
+        .map(Into::into)
+        .map_or_else(|| fs::read_to_string(&path).map(Into::into), Ok)?;
     files.push(path.clone());
-    let expanded = expand_external_mods(&source, module_dir, stack, files)?;
+    let expanded = expand_external_mods(&source, &path, module_dir, overlays, stack, files)?;
     stack.remove(&path);
     Ok(expanded)
 }
 
 fn expand_external_mods(
-    source: &str,
+    source: &Arc<str>,
+    path: &Path,
     module_dir: &Path,
+    overlays: &HashMap<PathBuf, String>,
     stack: &mut HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
-) -> io::Result<String> {
+) -> io::Result<ExpandedSource> {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
     if !parse.errors.is_empty() {
-        return Ok(source.to_string());
+        return Ok(ExpandedSource::original(path, Arc::clone(source)));
     }
 
     let mut mods = Vec::new();
     collect_external_mods(&parse.syntax(), module_dir, &mut mods);
     if mods.is_empty() {
-        return Ok(source.to_string());
+        return Ok(ExpandedSource::original(path, Arc::clone(source)));
     }
 
     let mut replacements = Vec::new();
@@ -137,26 +255,74 @@ fn expand_external_mods(
         };
         let child = find_module_file(&module_dir, &name)?;
         let child_dir = module_dir.join(&name);
-        let child_source = load_source_file_inner(&child, &child_dir, stack, files)?;
+        let child_source = load_source_file_inner(&child, &child_dir, overlays, stack, files)?;
         let range = module.syntax().text_range();
         let visibility = if module.is_pub() { "pub " } else { "" };
         replacements.push((
             usize::from(range.start()),
             usize::from(range.end()),
-            format!("{visibility}mod {name} {{\n{child_source}\n}}"),
+            format!("{visibility}mod {name} {{\n"),
+            child_source,
         ));
     }
 
-    replacements.sort_by_key(|(start, _, _)| *start);
+    replacements.sort_by_key(|(start, _, _, _)| *start);
     let mut out = String::with_capacity(source.len());
+    let mut source_map = SourceMap::default();
     let mut cursor = 0;
-    for (start, end, replacement) in replacements {
-        out.push_str(&source[cursor..start]);
-        out.push_str(&replacement);
+    for (start, end, prefix, child) in replacements {
+        append_original(&mut out, &mut source_map, path, source, cursor..start);
+        out.push_str(&prefix);
+        let child_start = out.len();
+        out.push_str(&child.source);
+        source_map.extend(child.source_map, child_start);
+        out.push_str("\n}");
         cursor = end;
     }
-    out.push_str(&source[cursor..]);
-    Ok(out)
+    append_original(
+        &mut out,
+        &mut source_map,
+        path,
+        source,
+        cursor..source.len(),
+    );
+    Ok(ExpandedSource {
+        source: out,
+        source_map,
+    })
+}
+
+struct ExpandedSource {
+    source: String,
+    source_map: SourceMap,
+}
+
+impl ExpandedSource {
+    fn original(path: &Path, source: Arc<str>) -> Self {
+        let mut source_map = SourceMap::default();
+        source_map.push(0..source.len(), path, Arc::clone(&source), 0);
+        Self {
+            source: source.to_string(),
+            source_map,
+        }
+    }
+}
+
+fn append_original(
+    out: &mut String,
+    source_map: &mut SourceMap,
+    path: &Path,
+    source: &Arc<str>,
+    original: Range<usize>,
+) {
+    let generated_start = out.len();
+    out.push_str(&source[original.clone()]);
+    source_map.push(
+        generated_start..out.len(),
+        path,
+        Arc::clone(source),
+        original.start,
+    );
 }
 
 struct ExternalMod {
@@ -217,8 +383,14 @@ pub fn generate_c(module: &Module) -> Result<String, String> {
 
 /// Run the full frontend pipeline on `source`.
 pub fn compile(source: &str) -> CompileResult {
-    let owned_source = format!("{source}\n\n{STD_PRELUDE}");
-    let source = owned_source.as_str();
+    compile_with_options(source, CompileOptions::default())
+}
+
+pub fn compile_with_options(source: &str, options: CompileOptions) -> CompileResult {
+    let owned_source = options
+        .use_std
+        .then(|| format!("{source}\n\n{STD_PRELUDE}"));
+    let source = owned_source.as_deref().unwrap_or(source);
 
     // 1. Parse
     let mut parser = IncrementalParser::new();
@@ -281,7 +453,7 @@ pub fn compile(source: &str) -> CompileResult {
         .iter()
         .flat_map(|(_, body)| body.diagnostics.iter())
         .chain(scope_diagnostics.iter())
-        .map(|d| convert_hir_diag(d))
+        .map(convert_hir_diag)
         .collect();
 
     // 4. Type check
@@ -372,6 +544,71 @@ mod tests {
         assert!(loaded.source.contains("mod util {"));
         assert!(loaded.source.contains("fun one() -> i32 { 1 }"));
         assert_eq!(loaded.files.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_map_points_into_external_module() {
+        let root = temp_source_root("source-map");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("main.rid"),
+            "mod util;\nfun main() -> i32 { util::value() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("util.rid"),
+            "pub fun value() -> i32 { missing }\n",
+        )
+        .unwrap();
+
+        let loaded = load_source_file(root.join("main.rid")).unwrap();
+        let start = loaded.source.find("missing").unwrap();
+        let mapped = loaded
+            .source_map
+            .map_range(rowan::TextRange::new(
+                (start as u32).into(),
+                ((start + "missing".len()) as u32).into(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            mapped.path,
+            fs::canonicalize(root.join("util.rid")).unwrap()
+        );
+        assert_eq!(
+            &mapped.source[usize::from(mapped.range.start())..usize::from(mapped.range.end())],
+            "missing"
+        );
+        let generated_eof =
+            loaded.source.find("pub fun").unwrap() + "pub fun value() -> i32 { missing }\n".len();
+        let mapped_eof = loaded
+            .source_map
+            .map_range(rowan::TextRange::empty((generated_eof as u32).into()))
+            .unwrap();
+        assert_eq!(mapped_eof.path, mapped.path);
+        assert_eq!(usize::from(mapped_eof.range.start()), mapped.source.len());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_loader_uses_in_memory_overlays() {
+        let root = temp_source_root("source-overlay");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.rid"), "mod util;\n").unwrap();
+        fs::write(root.join("util.rid"), "pub fun value() -> i32 { 1 }\n").unwrap();
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            root.join("util.rid"),
+            "pub fun value() -> i32 { 2 }\n".into(),
+        );
+
+        let loaded = load_source_file_with_overlays(root.join("main.rid"), &overlays).unwrap();
+
+        assert!(loaded.source.contains("value() -> i32 { 2 }"));
+        assert!(!loaded.source.contains("value() -> i32 { 1 }"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -518,6 +755,103 @@ mod tests {
     }
 
     #[test]
+    fn std_clone_and_comparison_methods_are_callable() {
+        let result = compile(
+            r#"
+            fun main() -> i32 {
+                let value: i32 = 7;
+                let cloned = value.clone();
+                let equal = value.eq(&7);
+                let ordering = value.cmp(&cloned);
+                let partial = value.partial_cmp(&cloned);
+                if equal { cloned } else { 0 }
+            }
+            "#,
+        );
+
+        assert!(
+            result.success(),
+            "hir: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+            result.hir_diagnostics,
+            result.type_result.diagnostics,
+            result.analysis_diagnostics
+        );
+        let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+        assert!(c.contains("clone__i32"), "{c}");
+        assert!(c.contains("cmp__i32"), "{c}");
+        assert!(c.contains("ref_tmp"), "{c}");
+        assert!(!c.contains("&((int32_t)7)"), "{c}");
+    }
+
+    #[test]
+    fn std_operator_trait_methods_are_callable() {
+        let result = compile(
+            r#"
+            fun main() -> i32 {
+                let value: i32 = 12;
+                let reduced = value.sub(2).mul(3).div(2).rem(10);
+                let bits = reduced.bitand(7).bitor(8).bitxor(1);
+                let shifted = bits.shl(1).shr(1);
+                let mut total = shifted;
+                total.add_assign(2);
+                total.sub_assign(1);
+                total.mul_assign(2);
+                total.div_assign(2);
+                total.rem_assign(10);
+                total
+            }
+            "#,
+        );
+
+        assert!(
+            result.success(),
+            "hir: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+            result.hir_diagnostics,
+            result.type_result.diagnostics,
+            result.analysis_diagnostics
+        );
+        let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+        assert!(c.contains("sub__i32"), "{c}");
+        assert!(c.contains("add_assign__i32"), "{c}");
+    }
+
+    #[test]
+    fn compile_can_skip_std() {
+        let result = compile_with_options(
+            r#"
+            fun main() {
+                let value = range(0, 3);
+            }
+            "#,
+            CompileOptions { use_std: false },
+        );
+
+        assert!(!result.success());
+        assert!(
+            result
+                .hir_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unresolved name: `range`")),
+            "{:#?}",
+            result.hir_diagnostics
+        );
+    }
+
+    #[test]
+    fn compile_without_std_accepts_basic_program() {
+        let result = compile_with_options(
+            r#"
+            fun main() {
+                let value = 1;
+            }
+            "#,
+            CompileOptions { use_std: false },
+        );
+
+        assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    }
+
+    #[test]
     fn std_prelude_reexports_core_items() {
         let result = compile(
             r#"
@@ -530,6 +864,265 @@ mod tests {
         );
 
         assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    }
+
+    #[test]
+    fn std_option_and_result_copy_depends_on_payloads() {
+        let copy = compile(
+            r#"
+            fun main() {
+                let option: Option<i32> = Some(1);
+                let first_option = option;
+                let second_option = option;
+                let result: Result<i32, bool> = Ok(1);
+                let first_result = result;
+                let second_result = result;
+            }
+            "#,
+        );
+        assert!(copy.success(), "{:#?}", copy.analysis_diagnostics);
+        assert!(
+            !generate_c(copy.mir_module.as_ref().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+
+        let moved = compile(
+            r#"
+            struct Token { value: i32 }
+
+            fun main() {
+                let option: Option<Token> = Option::Some(Token { value: 1 });
+                let first = option;
+                let second = option;
+            }
+            "#,
+        );
+        assert!(
+            moved
+                .analysis_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("use of moved value: `option`")),
+            "{:#?}",
+            moved.analysis_diagnostics
+        );
+    }
+
+    #[test]
+    fn copy_impl_requires_every_payload_to_be_copy() {
+        let invalid = compile(
+            r#"
+            struct Token { value: i32 }
+            struct Wrapper<T> { value: T }
+            enum TokenState { Empty, Full(Token) }
+
+            impl<T> Copy for Wrapper<T> {}
+            impl Copy for TokenState {}
+
+            fun main() {}
+            "#,
+        );
+
+        let copy_errors = invalid
+            .type_result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0041")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            copy_errors.len(),
+            2,
+            "{:#?}",
+            invalid.type_result.diagnostics
+        );
+        assert!(
+            copy_errors
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Wrapper<T>"))
+        );
+        assert!(
+            copy_errors
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("TokenState"))
+        );
+    }
+
+    #[test]
+    fn copy_impl_accepts_nested_conditional_copy_fields() {
+        let result = compile(
+            r#"
+            struct Nested<T> { value: Option<T> }
+
+            impl<T: Copy> Copy for Nested<T> {}
+
+            fun main() {
+                let value: Nested<i32> = Nested { value: Some(1) };
+                let first = value;
+                let second = value;
+            }
+            "#,
+        );
+
+        assert!(
+            result.success(),
+            "type: {:#?}\nanalysis: {:#?}",
+            result.type_result.diagnostics,
+            result.analysis_diagnostics
+        );
+    }
+
+    #[test]
+    fn enum_match_lowers_variants_guards_bindings_and_values() {
+        let result = compile(
+            r#"
+            enum Message {
+                Quit,
+                Number(i32),
+                Pair { left: i32, right: i32 },
+            }
+
+            fun select(value: Message) -> i32 {
+                match value {
+                    Message::Quit => 0,
+                    Message::Number(number) if number > 10 => number,
+                    Message::Number(number) => number + 1,
+                    Message::Pair { left, right: other } => left + other,
+                }
+            }
+
+            fun main() -> i32 {
+                let pair = Message::Pair { right: 22, left: 20 };
+                select(pair)
+            }
+            "#,
+        );
+
+        assert!(
+            result.success(),
+            "hir: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+            result.hir_diagnostics,
+            result.type_result.diagnostics,
+            result.analysis_diagnostics
+        );
+        let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+        assert!(c.contains("Number_0;"), "{c}");
+        assert!(c.contains(".Pair_left"), "{c}");
+        assert!(c.contains("if ("), "{c}");
+        assert!(c.contains("self->start < self->end"), "{c}");
+    }
+
+    #[test]
+    fn enum_constructor_uses_the_flattened_payload_offset() {
+        let result = compile(
+            r#"
+            enum Value {
+                First(i32),
+                Second(i32),
+            }
+
+            fun main() -> i32 {
+                match Value::Second(7) {
+                    Value::First(value) => value,
+                    Value::Second(value) => value,
+                }
+            }
+            "#,
+        );
+
+        assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+        let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+        assert!(c.contains(".Second_0 ="), "{c}");
+        assert!(!c.contains(".First_0 = ((int32_t)7)"), "{c}");
+    }
+
+    #[test]
+    fn literal_match_preserves_values_and_string_comparison() {
+        let result = compile(
+            r#"
+            fun classify(value: i32) -> i32 {
+                match value {
+                    0 => 10,
+                    1 => 20,
+                    other => other,
+                }
+            }
+
+            fun is_yes(value: str) -> bool {
+                match value {
+                    "yes" => true,
+                    _ => false,
+                }
+            }
+
+            fun main() -> i32 {
+                classify(1)
+            }
+            "#,
+        );
+
+        assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+        let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+        assert!(c.contains("memcmp"), "{c}");
+        assert!(c.contains("== ((int32_t)0)"), "{c}");
+    }
+
+    #[test]
+    fn non_exhaustive_enum_match_is_rejected() {
+        let result = compile(
+            r#"
+            enum State { Ready, Done }
+
+            fun main() -> i32 {
+                match State::Ready {
+                    State::Ready => 1,
+                }
+            }
+            "#,
+        );
+
+        assert!(!result.success());
+        assert!(
+            result
+                .type_result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0039"),
+            "{:#?}",
+            result.type_result.diagnostics
+        );
+    }
+
+    #[test]
+    fn unit_return_in_match_arm_remains_a_return() {
+        let result = compile(
+            r#"
+            enum State { Ready, Done }
+
+            fun consume(state: State) {
+                match state {
+                    State::Ready => { return; },
+                    State::Done => {},
+                }
+            }
+
+            fun main() {
+                consume(State::Ready);
+            }
+            "#,
+        );
+
+        assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+        let module = result.mir_module.as_ref().unwrap();
+        let consume = module
+            .function_order
+            .iter()
+            .map(|id| &module.functions[*id])
+            .find(|function| function.name == "consume")
+            .unwrap();
+        assert!(consume.blocks.iter().any(|(_, block)| {
+            block.label.as_deref() == Some("match_arm")
+                && matches!(block.terminator, mir::instr::Terminator::Return(None))
+        }));
     }
 
     #[test]

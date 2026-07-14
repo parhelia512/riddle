@@ -1,13 +1,44 @@
 use ast::{self, support::AstNode};
 use frontend::incremental::IncrementalParser;
 use hir::{
-    body::{BinaryOp, Expr, ResolvedName},
+    body::{BinaryOp, Expr, ResolvedName, Stmt},
     lower_root,
 };
 use scope_graph::builder::build_scope_graph;
 use scope_graph::resolve::resolve_hir;
 
 use crate::build_hir_and_graph;
+
+#[test]
+fn break_and_continue_parse_and_lower() {
+    let (hir, _) = build_hir_and_graph(
+        r#"
+        fun main() {
+            while true {
+                continue;
+                break;
+            }
+            for item in [1, 2, 3] {
+                break;
+                continue;
+            }
+        }
+        "#,
+    );
+
+    let body_id = *hir.function_bodies.values().next().unwrap();
+    let body = &hir.bodies[body_id];
+    assert!(
+        body.stmts
+            .iter()
+            .any(|(_, stmt)| matches!(stmt, Stmt::Break))
+    );
+    assert!(
+        body.stmts
+            .iter()
+            .any(|(_, stmt)| matches!(stmt, Stmt::Continue))
+    );
+}
 
 #[test]
 fn resolve_hir_updates_expr_path_resolutions() {

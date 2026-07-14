@@ -201,6 +201,76 @@ fn generic_for_loop_lowers_to_iterator_calls() {
 }
 
 #[test]
+fn generic_function_for_loop_uses_concrete_iterator_impl_and_enum_layout() {
+    let module = lower(
+        r#"
+        enum Option<T> {
+            Spare(bool),
+            Some(T),
+            None,
+        }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct Counter<T> { current: T }
+
+        impl<T> Iterator for Counter<T> {
+            type Item = T;
+            fun next(&mut self) -> Option<Self::Item> { Option::None }
+        }
+
+        impl<T> IntoIterator for Counter<T> {
+            type Item = T;
+            type IntoIter = Counter<T>;
+            fun into_iter(self) -> Self::IntoIter { self }
+        }
+
+        fun consume<T: IntoIterator<Item = i32, IntoIter = Counter<i32>>>(values: T) {
+            for value in values {
+                let next = value + 1;
+            }
+        }
+
+        fun main() {
+            consume(Counter { current: 0 });
+        }
+        "#,
+    );
+    let func = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|func| func.name == "consume__Counter_i32")
+        .unwrap();
+    let insts = func
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| block.insts.iter())
+        .collect::<Vec<_>>();
+
+    assert!(insts.iter().any(|inst| {
+        matches!(&inst.kind, mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name.starts_with("into_iter"))
+    }));
+    assert!(insts.iter().any(|inst| {
+        matches!(&inst.kind, mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name.starts_with("next"))
+    }));
+    assert!(
+        insts
+            .iter()
+            .any(|inst| { matches!(inst.kind, mir::instr::InstKind::ExtractValue(_, 2)) })
+    );
+}
+
+#[test]
 fn if_expression_creates_blocks() {
     let module = lower(
         r#"
@@ -242,6 +312,65 @@ fn while_loop_creates_blocks() {
         "expected at least 3 blocks for while, got {}",
         block_count
     );
+}
+
+#[test]
+fn break_and_continue_lower_to_loop_targets_and_skip_dead_code() {
+    let module = lower(
+        r#"
+        fun dead() {}
+
+        fun main() {
+            let mut i = 0;
+            while i < 5 {
+                i += 1;
+                if i == 2 {
+                    continue;
+                    dead();
+                }
+                break;
+                dead();
+            }
+
+            for item in [1, 2, 3] {
+                if item == 1 {
+                    continue;
+                }
+                break;
+            }
+        }
+        "#,
+    );
+    let func = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|func| func.name == "main")
+        .unwrap();
+    let block_id = |label: &str| {
+        func.blocks
+            .iter()
+            .find_map(|(id, block)| (block.label.as_deref() == Some(label)).then_some(id))
+            .unwrap()
+    };
+    let branch_count = |target| {
+        func.blocks
+            .iter()
+            .filter(|(_, block)| {
+                matches!(block.terminator, mir::instr::Terminator::Branch(id) if id == target)
+            })
+            .count()
+    };
+
+    assert!(branch_count(block_id("while_cond")) >= 2, "{func:#?}");
+    assert!(branch_count(block_id("while_exit")) >= 1, "{func:#?}");
+    assert!(branch_count(block_id("for_array_step")) >= 1, "{func:#?}");
+    assert!(branch_count(block_id("for_array_exit")) >= 1, "{func:#?}");
+    assert!(!func.blocks.iter().any(|(_, block)| {
+        block.insts.iter().any(|inst| {
+            matches!(&inst.kind, mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name == "dead")
+        })
+    }));
 }
 
 #[test]

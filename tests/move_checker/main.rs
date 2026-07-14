@@ -11,7 +11,7 @@ fn analyze(source: &str) -> move_checker::AnalysisResult {
     let parse = parser.set_source(source);
     assert!(parse.errors.is_empty(), "parse errors: {:?}", parse.errors);
 
-    let hir = lower_and_resolve(&parse);
+    let hir = lower_and_resolve(parse);
     let type_result = check_hir(&hir);
 
     // Fail if there are type errors — move tests assume well-typed input.

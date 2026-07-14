@@ -22,7 +22,7 @@ impl Block {
         Self {
             label: None,
             insts: Vec::new(),
-            terminator: Terminator::Return(None),
+            terminator: Terminator::Pending,
             start_value,
         }
     }

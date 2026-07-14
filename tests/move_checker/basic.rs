@@ -678,7 +678,7 @@ fn generic_copy_impl_makes_instantiations_copyable() {
 
         struct Box<T> { value: T }
 
-        impl<T> Copy for Box<T> {}
+        impl<T: Copy> Copy for Box<T> {}
 
         fun f() {
             let a: Box<i32> = Box{value: 1};

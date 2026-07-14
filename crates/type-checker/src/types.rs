@@ -177,10 +177,9 @@ impl Type {
                 | Type::Str // fat pointer {ptr, len} — plain data, trivially Copy
                 | Type::Unit
                 | Type::Never
-                | Type::Ref(_, _)
+                | Type::Ref(_, false)
                 | Type::Ptr { .. }
                 | Type::Function(_)
-                | Type::Enum(_, _)
                 | Type::Unknown
                 | Type::Error
         )

@@ -44,6 +44,7 @@ impl<'a> TypeChecker<'a> {
         self.check_traits();
         self.check_impls();
         self.build_trait_env();
+        self.validate_copy_impls();
         self.check_function_bodies();
         self.check_generic_recursion();
         self.result
@@ -92,7 +93,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn lower_trait_env_bounds(
+    pub(crate) fn lower_trait_env_bounds(
         &mut self,
         bounds: &[hir::item_tree::HirGenericBound],
         params: &std::collections::HashMap<String, Type>,
@@ -170,14 +171,11 @@ impl<'a> TypeChecker<'a> {
         }
         let actual = self.check_expr_expected(&mut ctx, body.root_block, &return_ty);
 
-        // Only check tail-type compatibility; return-statement-only functions
-        // are validated inside check_stmt when the return is encountered.
-        // ponytail: full return-path analysis needed to catch missing returns
-        if self.has_tail(body, body.root_block) && !actual.is_never() {
+        if !actual.is_never() {
             self.expect_assignable(
                 &return_ty,
                 &actual,
-                "function return type",
+                "function return",
                 ctx.expr_range(body.root_block),
             );
         }
@@ -235,16 +233,9 @@ impl<'a> TypeChecker<'a> {
             .iter()
             .find_map(|attr| {
                 (attr.name.0 == "lang")
-                    .then(|| attr.value.as_deref())
+                    .then_some(attr.value.as_deref())
                     .flatten()
             })
-    }
-
-    fn has_tail(&self, body: &hir::body::Body, expr: hir::body::ExprId) -> bool {
-        matches!(
-            &body.exprs[expr],
-            hir::body::Expr::Block { tail: Some(_), .. }
-        )
     }
 
     fn check_struct_layouts(&mut self) {
@@ -483,6 +474,10 @@ impl<'a> TypeChecker<'a> {
             "E0035" => vec!["the inferred type must implement every trait bound on the generic parameter".into()],
             "E0036" => vec!["add the required comparison trait impl for this type".into()],
             "E0037" => vec!["make impl where-clause bounds structurally smaller than the implemented type".into()],
+            "E0038" => vec!["use a variant pattern whose shape and fields match the enum declaration".into()],
+            "E0039" => vec!["cover every possible case or add a wildcard arm".into()],
+            "E0041" => vec!["every field must implement `Copy`; add the required generic bounds or remove the impl".into()],
+            "E0042" => vec!["move this statement inside a `while` or `for` loop".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
             "E0021" => vec!["trait method declarations should not have a body".into()],
             "E0022" | "E0025" => vec!["remove the duplicate associated type".into()],
@@ -568,6 +563,27 @@ impl<'a> TypeChecker<'a> {
 
     fn structural_assignable(&self, expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
+            (Type::Ref(expected_inner, expected_mut), Type::Ref(actual_inner, actual_mut)) => {
+                expected_mut == actual_mut
+                    && (expected_inner == actual_inner
+                        || self.numeric_assignable(expected_inner, actual_inner)
+                        || self.structural_assignable(expected_inner, actual_inner))
+            }
+            (
+                Type::Ptr {
+                    mutable: expected_mut,
+                    inner: expected_inner,
+                },
+                Type::Ptr {
+                    mutable: actual_mut,
+                    inner: actual_inner,
+                },
+            ) => {
+                expected_mut == actual_mut
+                    && (expected_inner == actual_inner
+                        || self.numeric_assignable(expected_inner, actual_inner)
+                        || self.structural_assignable(expected_inner, actual_inner))
+            }
             (Type::Array(expected_inner, expected_len), Type::Array(actual_inner, actual_len)) => {
                 expected_len == actual_len
                     && (expected_inner == actual_inner

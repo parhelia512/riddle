@@ -170,6 +170,12 @@ pub struct PartialPath {
     pub edges: Vec<EdgeId>,
 }
 
+impl Default for ScopeGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScopeGraph {
     pub fn new() -> Self {
         let mut nodes = Arena::new();
@@ -220,7 +226,7 @@ impl ScopeGraph {
         let frag = std::mem::replace(
             &mut self.fragments[fid],
             Fragment {
-                ptr: ptr.clone(),
+                ptr: *ptr,
                 nodes: vec![],
                 edges: vec![],
                 entry_scope: self.root, // Placeholder.

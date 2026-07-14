@@ -177,6 +177,12 @@ impl IncrementalParser {
     }
 }
 
+impl Default for IncrementalParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn parse_full(source: &str) -> Parse {
     let tokens = lexer::lex(source);
     let mut lex_errors = lexer_error_diagnostics(source, &tokens);
@@ -256,19 +262,18 @@ fn try_incremental_reparse(
     while let Some(candidate) = node {
         let parent = candidate.parent();
 
-        if let Some(entry) = reparse_entry(candidate.kind()) {
-            if edit_is_inside_stable_boundaries(&candidate, offset, edit_end) {
-                if let Some((fragment, kind)) = reparse_candidate(
-                    &candidate,
-                    entry,
-                    new_source,
-                    offset,
-                    delete_len,
-                    insert.len(),
-                ) {
-                    return Some((fragment, kind));
-                }
-            }
+        if let Some(entry) = reparse_entry(candidate.kind())
+            && edit_is_inside_stable_boundaries(&candidate, offset, edit_end)
+            && let Some((fragment, kind)) = reparse_candidate(
+                &candidate,
+                entry,
+                new_source,
+                offset,
+                delete_len,
+                insert.len(),
+            )
+        {
+            return Some((fragment, kind));
         }
 
         node = parent;
@@ -313,7 +318,7 @@ fn reparse_candidate(
     // A fragment parser must produce exactly one replacement root whose text
     // is byte-for-byte equal to the edited source slice.
     let fragment_root = fragment_parse.syntax();
-    if fragment_root.text().to_string() != fragment_source {
+    if fragment_root.text() != fragment_source {
         return None;
     }
 
@@ -334,6 +339,8 @@ fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         SyntaxKind::VarDecl
         | SyntaxKind::FuncDecl
         | SyntaxKind::StructDecl
+        | SyntaxKind::BreakStmt
+        | SyntaxKind::ContinueStmt
         | SyntaxKind::ReturnStmt
         | SyntaxKind::ExprStmt
         | SyntaxKind::EnumDecl

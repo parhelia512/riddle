@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hir::{
     Name,
-    body::{BinaryOp, Expr, ExprId, MatchArm, PatId, Pattern, ResolvedName, Stmt, StmtId, UnaryOp},
+    body::{
+        BinaryOp, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern, ResolvedName, Stmt,
+        StmtId, UnaryOp,
+    },
     item_tree::{
         FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound, HirTypeRef,
         HirVariantKind, TraitId,
@@ -17,7 +20,100 @@ use crate::{
     types::{ConstArg, IntTy, Type},
 };
 
+enum PatternCoverage {
+    None,
+    Variant(usize),
+    Bool(bool),
+    CatchAll,
+}
+
 impl TypeChecker<'_> {
+    pub(crate) fn expr_always_returns(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> bool {
+        match &ctx.body.exprs[expr_id] {
+            Expr::Block { stmts, tail } => {
+                stmts
+                    .iter()
+                    .any(|stmt| self.stmt_always_returns(ctx, *stmt))
+                    || tail.is_some_and(|tail| self.expr_always_returns(ctx, tail))
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr_always_returns(ctx, *cond)
+                    || else_branch.is_some_and(|else_branch| {
+                        self.expr_always_returns(ctx, *then_branch)
+                            && self.expr_always_returns(ctx, else_branch)
+                    })
+            }
+            Expr::While { condition, .. } => self.expr_always_returns(ctx, *condition),
+            Expr::Match { scrutinee, arms } => {
+                self.expr_always_returns(ctx, *scrutinee)
+                    || self.exhaustive_match_always_returns(ctx, *scrutinee, arms)
+            }
+            Expr::Unsafe { body } => self.expr_always_returns(ctx, *body),
+            _ => self
+                .result
+                .expr_types
+                .get(&(ctx.body_id, expr_id))
+                .is_some_and(Type::is_never),
+        }
+    }
+
+    fn stmt_always_returns(&self, ctx: &BodyCtx<'_>, stmt_id: StmtId) -> bool {
+        match &ctx.body.stmts[stmt_id] {
+            Stmt::Return { .. } | Stmt::Break | Stmt::Continue => true,
+            Stmt::Expr { expr } => self.expr_always_returns(ctx, *expr),
+            Stmt::Let { init, .. } => init.is_some_and(|expr| self.expr_always_returns(ctx, expr)),
+            Stmt::Item { .. } => false,
+        }
+    }
+
+    fn exhaustive_match_always_returns(
+        &self,
+        ctx: &BodyCtx<'_>,
+        scrutinee: ExprId,
+        arms: &[MatchArm],
+    ) -> bool {
+        if arms.is_empty() {
+            return false;
+        }
+
+        let expected = self
+            .result
+            .expr_types
+            .get(&(ctx.body_id, scrutinee))
+            .unwrap_or(&Type::Unknown);
+        let mut covered_variants = HashSet::new();
+        let mut covered_bools = HashSet::new();
+        for arm in arms {
+            if !self.expr_always_returns(ctx, arm.body) {
+                return false;
+            }
+            if arm.guard.is_none() {
+                match self.pattern_coverage(ctx, arm.pat, expected) {
+                    PatternCoverage::CatchAll => return true,
+                    PatternCoverage::Variant(index) => {
+                        covered_variants.insert(index);
+                    }
+                    PatternCoverage::Bool(value) => {
+                        covered_bools.insert(value);
+                    }
+                    PatternCoverage::None => {}
+                }
+                if matches!(expected, Type::Enum(enum_id, _) if covered_variants.len() == self.hir.item_tree.enums[*enum_id].variants.len())
+                {
+                    return true;
+                }
+                if expected == &Type::Bool && covered_bools.len() == 2 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(crate) fn check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
         match &ctx.body.stmts[stmt_id] {
             Stmt::Let {
@@ -72,6 +168,24 @@ impl TypeChecker<'_> {
                     .map(|expr| self.check_expr_expected(ctx, expr, &expected))
                     .unwrap_or(Type::Unit);
                 self.expect_assignable(&expected, &actual, "return value", ctx.stmt_range(stmt_id));
+            }
+            Stmt::Break => {
+                if ctx.loop_depth == 0 {
+                    self.diagnostic(
+                        "E0042",
+                        "`break` outside of a loop",
+                        ctx.stmt_range(stmt_id),
+                    );
+                }
+            }
+            Stmt::Continue => {
+                if ctx.loop_depth == 0 {
+                    self.diagnostic(
+                        "E0042",
+                        "`continue` outside of a loop",
+                        ctx.stmt_range(stmt_id),
+                    );
+                }
             }
             Stmt::Item { .. } => {}
         }
@@ -179,7 +293,9 @@ impl TypeChecker<'_> {
                     "while condition",
                     ctx.expr_range(*condition),
                 );
+                ctx.loop_depth += 1;
                 self.check_expr(ctx, *body);
+                ctx.loop_depth -= 1;
                 Type::Unit
             }
             Expr::For {
@@ -196,13 +312,10 @@ impl TypeChecker<'_> {
             }
             Expr::Call { callee, args } => self.check_call(ctx, *callee, args, expected, span),
             Expr::FieldAccess { base, field } => self.check_field_access(ctx, *base, field, span),
-            Expr::Unsafe { body } => {
-                let ty = match expected {
-                    Some(expected) => self.check_expr_expected(ctx, *body, expected),
-                    None => self.check_expr(ctx, *body),
-                };
-                ty
-            }
+            Expr::Unsafe { body } => match expected {
+                Some(expected) => self.check_expr_expected(ctx, *body, expected),
+                None => self.check_expr(ctx, *body),
+            },
             Expr::IndexAccess { base, index } => {
                 let base_ty = self.check_expr(ctx, *base);
                 let index_ty = self.check_expr(ctx, *index);
@@ -226,12 +339,19 @@ impl TypeChecker<'_> {
             }
         };
 
+        let ty = if ty.is_never() || self.expr_always_returns(ctx, expr_id) {
+            Type::Never
+        } else {
+            ty
+        };
+
         self.result
             .expr_types
             .insert((ctx.body_id, expr_id), ty.clone());
         ty
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_binary(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -280,10 +400,12 @@ impl TypeChecker<'_> {
             ) if expected.is_numeric() => self.check_expr_expected(ctx, lhs, expected),
             _ => self.check_expr(ctx, lhs),
         };
-        if op == BinaryOp::Add && !lhs_ty.is_numeric() && !lhs_ty.is_unknown_like() {
-            if let Some(ty) = self.check_overloaded_add(ctx, expr_id, lhs, rhs, &lhs_ty, span) {
-                return ty;
-            }
+        if op == BinaryOp::Add
+            && !lhs_ty.is_numeric()
+            && !lhs_ty.is_unknown_like()
+            && let Some(ty) = self.check_overloaded_add(ctx, expr_id, lhs, rhs, &lhs_ty, span)
+        {
+            return ty;
         }
         let rhs_ty = match op {
             BinaryOp::Add
@@ -398,6 +520,7 @@ impl TypeChecker<'_> {
         Some(output)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_binary_types(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -409,7 +532,7 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) -> Type {
         match op {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                 self.expect_numeric(lhs_ty, "left operand", ctx.expr_range(lhs));
                 self.expect_numeric(rhs_ty, "right operand", ctx.expr_range(rhs));
                 if !lhs_ty.is_numeric() || !rhs_ty.is_numeric() {
@@ -431,6 +554,25 @@ impl TypeChecker<'_> {
                     );
                     Type::Error
                 }
+            }
+            BinaryOp::Mod => {
+                if !lhs_ty.is_unknown_like()
+                    && !rhs_ty.is_unknown_like()
+                    && (!lhs_ty.is_integer() || !rhs_ty.is_integer())
+                {
+                    self.diagnostic(
+                        "E0003",
+                        format!(
+                            "remainder requires integer operands, got {} and {}",
+                            lhs_ty.display(self.hir),
+                            rhs_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                    return Type::Error;
+                }
+                self.join_numeric_types(lhs_ty, rhs_ty)
+                    .unwrap_or_else(|| lhs_ty.clone())
             }
             BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
                 if !lhs_ty.is_unknown_like()
@@ -566,13 +708,19 @@ impl TypeChecker<'_> {
                 operand_ty
             }
             UnaryOp::Not => {
-                self.expect_assignable(
-                    &Type::Bool,
-                    &operand_ty,
-                    "unary operand",
-                    ctx.expr_range(operand),
-                );
-                Type::Bool
+                if operand_ty.is_unknown_like() || operand_ty.is_bitwise_scalar() {
+                    operand_ty
+                } else {
+                    self.diagnostic(
+                        "E0003",
+                        format!(
+                            "unary `!` requires a bool or integer operand, got {}",
+                            operand_ty.display(self.hir)
+                        ),
+                        ctx.expr_range(operand),
+                    );
+                    Type::Error
+                }
             }
             UnaryOp::Ref => Type::Ref(Box::new(operand_ty), false),
             UnaryOp::MutRef => {
@@ -606,6 +754,16 @@ impl TypeChecker<'_> {
         expected: Option<&Type>,
         span: Option<rowan::TextRange>,
     ) -> Type {
+        if let Some(ResolvedName::EnumVariant(enum_id, variant_index)) = resolved {
+            return self.check_enum_struct_expr(
+                ctx,
+                *enum_id,
+                *variant_index,
+                fields,
+                expected,
+                span,
+            );
+        }
         let Some(ResolvedName::Struct(struct_id)) = resolved else {
             for field in fields {
                 self.check_expr(ctx, field.value);
@@ -686,6 +844,109 @@ impl TypeChecker<'_> {
         ty
     }
 
+    fn check_enum_struct_expr(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        enum_id: hir::item_tree::EnumId,
+        variant_index: usize,
+        fields: &[hir::body::StructExprField],
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let enum_data = self.hir.item_tree.enums[enum_id].clone();
+        let Some(variant) = enum_data.variants.get(variant_index) else {
+            self.diagnostic("E0009", "unknown enum variant", span);
+            return Type::Error;
+        };
+        let HirVariantKind::Struct(expected_items) = &variant.kind else {
+            for field in fields {
+                self.check_expr(ctx, field.value);
+            }
+            self.diagnostic(
+                "E0009",
+                format!("enum variant `{}` is not struct-style", variant.name.0),
+                span,
+            );
+            return Type::Error;
+        };
+
+        let mut subst = match expected {
+            Some(Type::Enum(expected_id, args)) if *expected_id == enum_id => enum_data
+                .generics
+                .iter()
+                .chain(enum_data.const_generics.iter())
+                .zip(args.iter())
+                .map(|(name, ty)| (name.0.clone(), ty.clone()))
+                .collect::<HashMap<_, _>>(),
+            _ => HashMap::new(),
+        };
+        let generic_params = generic_param_map_with_consts(
+            enum_data.generics.iter().map(|name| name.0.as_str()),
+            enum_data.const_generics.iter().map(|name| name.0.as_str()),
+        );
+        let mut seen = HashSet::new();
+
+        for field in fields {
+            if !seen.insert(field.name.0.clone()) {
+                self.check_expr(ctx, field.value);
+                self.diagnostic(
+                    "E0006",
+                    format!("field `{}` is specified more than once", field.name.0),
+                    span,
+                );
+                continue;
+            }
+            let Some(expected_field) = expected_items
+                .iter()
+                .find(|item| item.name.0 == field.name.0)
+            else {
+                self.check_expr(ctx, field.value);
+                self.diagnostic(
+                    "E0006",
+                    format!(
+                        "unknown field `{}` on variant `{}`",
+                        field.name.0, variant.name.0
+                    ),
+                    span,
+                );
+                continue;
+            };
+            let pattern = self.lower_type_ref_with_params(&expected_field.ty, &generic_params);
+            let expected = substitute_type(&pattern, &subst);
+            let actual = if expected.is_unknown_like() || expected_has_param(&expected) {
+                self.check_expr(ctx, field.value)
+            } else {
+                self.check_expr_expected(ctx, field.value, &expected)
+            };
+            collect_subst(&pattern, &actual, &mut subst);
+            let expected = substitute_type(&pattern, &subst);
+            self.expect_assignable(&expected, &actual, "enum variant field", span);
+        }
+
+        for expected_field in expected_items {
+            if !seen.contains(&expected_field.name.0) {
+                self.diagnostic(
+                    "E0007",
+                    format!(
+                        "missing field `{}` in variant `{}`",
+                        expected_field.name.0, variant.name.0
+                    ),
+                    span,
+                );
+            }
+        }
+
+        let args = enum_data
+            .generics
+            .iter()
+            .chain(enum_data.const_generics.iter())
+            .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+            .collect();
+        let ty = Type::Enum(enum_id, args);
+        self.check_type_bounds(ctx, &ty, span);
+        ty
+    }
+
     fn check_match(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -696,6 +957,9 @@ impl TypeChecker<'_> {
     ) -> Type {
         let scrutinee_ty = self.check_expr(ctx, scrutinee);
         let mut result = None;
+        let mut covered_variants = HashSet::new();
+        let mut covered_bools = HashSet::new();
+        let mut has_catch_all = false;
 
         for arm in arms {
             ctx.push_scope();
@@ -715,10 +979,60 @@ impl TypeChecker<'_> {
             };
             ctx.pop_scope();
 
+            if arm.guard.is_none() {
+                match self.pattern_coverage(ctx, arm.pat, &scrutinee_ty) {
+                    PatternCoverage::Variant(index) => {
+                        covered_variants.insert(index);
+                    }
+                    PatternCoverage::Bool(value) => {
+                        covered_bools.insert(value);
+                    }
+                    PatternCoverage::CatchAll => has_catch_all = true,
+                    PatternCoverage::None => {}
+                }
+            }
+
             result = Some(match result {
                 None => arm_ty,
                 Some(prev) => self.join_branch_types(prev, arm_ty, "match arms", span),
             });
+        }
+
+        if let Type::Enum(enum_id, _) = &scrutinee_ty
+            && !has_catch_all
+        {
+            let enum_data = &self.hir.item_tree.enums[*enum_id];
+            let missing = enum_data
+                .variants
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !covered_variants.contains(index))
+                .map(|(_, variant)| variant.name.0.clone())
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                self.diagnostic(
+                    "E0039",
+                    format!(
+                        "non-exhaustive match on `{}`; missing {}",
+                        enum_data.name.0,
+                        missing.join(", ")
+                    ),
+                    span,
+                );
+            }
+        } else if scrutinee_ty == Type::Bool && !has_catch_all && covered_bools.len() < 2 {
+            self.diagnostic("E0039", "non-exhaustive match on `bool`", span);
+        } else if matches!(
+            scrutinee_ty,
+            Type::Int(_)
+                | Type::InferInt
+                | Type::Float(_)
+                | Type::InferFloat
+                | Type::Char
+                | Type::Str
+        ) && !has_catch_all
+        {
+            self.diagnostic("E0039", "non-exhaustive match; add a wildcard arm", span);
         }
 
         result.unwrap_or(Type::Unit)
@@ -738,7 +1052,9 @@ impl TypeChecker<'_> {
             if let Type::Array(item_ty, _) = &iterable_ty {
                 ctx.push_scope();
                 self.bind_pattern(ctx, pat, item_ty);
+                ctx.loop_depth += 1;
                 self.check_expr(ctx, body);
+                ctx.loop_depth -= 1;
                 ctx.pop_scope();
                 return Type::Unit;
             }
@@ -764,6 +1080,14 @@ impl TypeChecker<'_> {
             .associated_type_for(ctx, &iterable_ty, into_iter_trait, "IntoIter")
             .unwrap_or(Type::Unknown);
 
+        if item_ty.is_unknown_like() || into_iter_ty.is_unknown_like() {
+            self.diagnostic(
+                "E0035",
+                "`IntoIterator` must define `Item` and `IntoIter` for use in a for loop",
+                span,
+            );
+        }
+
         if let Some(iterator_trait) = self.find_trait_by_name("Iterator") {
             if !into_iter_ty.is_unknown_like()
                 && !self.type_has_trait_id(ctx, &into_iter_ty, iterator_trait)
@@ -788,28 +1112,137 @@ impl TypeChecker<'_> {
                 );
             }
 
-            if let (Some(into_iter_method), Some(next_method)) = (
-                self.find_trait_impl_method(&iterable_ty, into_iter_trait, "into_iter"),
-                self.find_trait_impl_method(&into_iter_ty, iterator_trait, "next"),
-            ) {
+            let has_into_iter = self.hir.item_tree.traits[into_iter_trait]
+                .methods
+                .iter()
+                .any(|method| method.name.0 == "into_iter");
+            if !has_into_iter {
+                self.diagnostic("E0035", "`IntoIterator` must define `into_iter`", span);
+            }
+            if has_into_iter
+                && let Some((next_ty, some_variant)) =
+                    self.iterator_next_protocol(ctx, iterator_trait, &item_ty, span)
+                && !item_ty.is_unknown_like()
+                && !into_iter_ty.is_unknown_like()
+            {
                 self.result.for_loops.insert(
                     (ctx.body_id, expr_id),
                     ForLoopInfo {
-                        into_iter: into_iter_method.fid,
-                        next: next_method.fid,
+                        into_iter: TraitMethodCall {
+                            trait_id: into_iter_trait,
+                            method: "into_iter".into(),
+                        },
+                        next: TraitMethodCall {
+                            trait_id: iterator_trait,
+                            method: "next".into(),
+                        },
                         item_ty: item_ty.clone(),
                         iter_ty: into_iter_ty.clone(),
+                        next_ty,
+                        some_variant,
                     },
                 );
             }
+        } else {
+            self.diagnostic("E0035", "missing `Iterator` trait", span);
         }
 
         ctx.push_scope();
         self.bind_pattern(ctx, pat, &item_ty);
+        ctx.loop_depth += 1;
         self.check_expr(ctx, body);
+        ctx.loop_depth -= 1;
         ctx.pop_scope();
 
         Type::Unit
+    }
+
+    fn iterator_next_protocol(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        iterator_trait: TraitId,
+        item_ty: &Type,
+        span: Option<rowan::TextRange>,
+    ) -> Option<(Type, usize)> {
+        let Some(next) = self.hir.item_tree.traits[iterator_trait]
+            .methods
+            .iter()
+            .find(|method| method.name.0 == "next")
+            .cloned()
+        else {
+            self.diagnostic("E0035", "`Iterator` must define `next`", span);
+            return None;
+        };
+        let valid_return = next.ret_type.as_ref().is_some_and(|ret| {
+            let HirTypeRef::Named(path) = ret else {
+                return false;
+            };
+            let Some(name) = path.as_single_name() else {
+                return false;
+            };
+            if name.0 != "Option" || path.type_args.len() != 1 {
+                return false;
+            }
+            match &path.type_args[0] {
+                HirTypeRef::Named(item)
+                    if item.segments.len() == 2
+                        && item.segments[0].0 == "Self"
+                        && item.segments[1].0 == "Item" =>
+                {
+                    true
+                }
+                other => {
+                    let actual = self.lower_type_ref_with_params(other, &ctx.generic_params);
+                    actual.is_unknown_like() || self.bound_types_match(item_ty, &actual)
+                }
+            }
+        });
+        let option_id = self.find_enum_by_name("Option");
+        let some_variant = option_id.and_then(|option_id| {
+            self.hir.item_tree.enums[option_id]
+                .variants
+                .iter()
+                .position(|variant| {
+                    variant.name.0 == "Some"
+                        && matches!(&variant.kind, HirVariantKind::Tuple(fields) if fields.len() == 1)
+                })
+        });
+        let (Some(option_id), Some(some_variant)) = (option_id, some_variant) else {
+            self.diagnostic(
+                "E0035",
+                "for loops require an `Option` enum with a single-field `Some` variant",
+                span,
+            );
+            return None;
+        };
+        if !valid_return {
+            self.diagnostic(
+                "E0035",
+                "`Iterator::next` must return `Option<Self::Item>`",
+                span,
+            );
+            return None;
+        }
+        let option = self.hir.item_tree.enums[option_id].clone();
+        let HirVariantKind::Tuple(fields) = &option.variants[some_variant].kind else {
+            unreachable!();
+        };
+        let subst = option
+            .generics
+            .iter()
+            .zip([item_ty.clone()])
+            .map(|(name, ty)| (name.0.clone(), ty))
+            .collect();
+        let payload_ty = self.lower_type_ref_with_params(&fields[0], &subst);
+        if !self.bound_types_match(item_ty, &payload_ty) {
+            self.diagnostic(
+                "E0035",
+                "`Option::Some` payload must match `Iterator::Item`",
+                span,
+            );
+            return None;
+        }
+        Some((Type::Enum(option_id, vec![item_ty.clone()]), some_variant))
     }
 
     fn check_array(
@@ -838,18 +1271,18 @@ impl TypeChecker<'_> {
                 }
             });
         }
-        if let Some(expected_len) = expected_len {
-            if expected_len != elements.len() {
-                self.diagnostic(
-                    "E0001",
-                    format!(
-                        "array length mismatch: expected {}, got {}",
-                        expected_len,
-                        elements.len()
-                    ),
-                    span,
-                );
-            }
+        if let Some(expected_len) = expected_len
+            && expected_len != elements.len()
+        {
+            self.diagnostic(
+                "E0001",
+                format!(
+                    "array length mismatch: expected {}, got {}",
+                    expected_len,
+                    elements.len()
+                ),
+                span,
+            );
         }
 
         Type::Array(
@@ -908,17 +1341,17 @@ impl TypeChecker<'_> {
                 0
             }
         };
-        if let Some(expected_len) = expected_len {
-            if expected_len != len_value {
-                self.diagnostic(
-                    "E0001",
-                    format!(
-                        "array length mismatch: expected {}, got {}",
-                        expected_len, len_value
-                    ),
-                    span,
-                );
-            }
+        if let Some(expected_len) = expected_len
+            && expected_len != len_value
+        {
+            self.diagnostic(
+                "E0001",
+                format!(
+                    "array length mismatch: expected {}, got {}",
+                    expected_len, len_value
+                ),
+                span,
+            );
         }
 
         Type::Array(Box::new(value_ty), ConstArg::Value(len_value))
@@ -1155,10 +1588,10 @@ impl TypeChecker<'_> {
     }
 
     fn enum_variant_type(&self, enum_id: hir::item_tree::EnumId, expected: Option<&Type>) -> Type {
-        if let Some(Type::Enum(expected_id, args)) = expected {
-            if *expected_id == enum_id {
-                return Type::Enum(enum_id, args.clone());
-            }
+        if let Some(Type::Enum(expected_id, args)) = expected
+            && *expected_id == enum_id
+        {
+            return Type::Enum(enum_id, args.clone());
         }
         let args = self.hir.item_tree.enums[enum_id]
             .generics
@@ -1377,7 +1810,7 @@ impl TypeChecker<'_> {
                 .current_generic_bounds(ctx)
                 .into_iter()
                 .find_map(|bound| {
-                    if !bound_target_param(&bound).is_some_and(|name| name == *param) {
+                    if bound_target_param(&bound).is_none_or(|name| name != *param) {
                         return None;
                     }
                     let bound_trait = self.resolve_trait_ref(&bound.trait_ty)?;
@@ -1398,7 +1831,7 @@ impl TypeChecker<'_> {
         subst: &HashMap<String, Type>,
     ) -> bool {
         self.current_generic_bounds(ctx).into_iter().any(|bound| {
-            if !bound_target_param(&bound).is_some_and(|name| name == param) {
+            if bound_target_param(&bound).is_none_or(|name| name != param) {
                 return false;
             }
             let Some(bound_trait) = self.resolve_trait_ref(&bound.trait_ty) else {
@@ -1834,33 +2267,32 @@ impl TypeChecker<'_> {
 
     /// Check that the LHS of an assignment targets a mutable binding.
     fn check_assign_mut(&mut self, ctx: &BodyCtx<'_>, lhs: ExprId, span: Option<rowan::TextRange>) {
-        if let Expr::Path { path, .. } = &ctx.body.exprs[lhs] {
-            if let Some(name) = path.as_single_name() {
-                if ctx.bindings.get(&name.0).is_some() {
-                    self.diagnostic(
-                        "E0031",
-                        format!(
-                            "cannot assign to `{}`, as it is not declared as mutable",
-                            name.0
-                        ),
-                        span,
-                    );
-                    return;
-                }
-            }
+        if let Expr::Path { path, .. } = &ctx.body.exprs[lhs]
+            && let Some(name) = path.as_single_name()
+            && ctx.bindings.get(&name.0).is_some()
+        {
+            self.diagnostic(
+                "E0031",
+                format!(
+                    "cannot assign to `{}`, as it is not declared as mutable",
+                    name.0
+                ),
+                span,
+            );
+            return;
         }
-        if let Some(stmt_id) = self.root_local_of_expr(ctx, lhs) {
-            if let Some((_, false)) = ctx.locals.get(&stmt_id) {
-                let name = self.local_name(ctx, stmt_id);
-                self.diagnostic(
-                    "E0031",
-                    format!(
-                        "cannot assign to `{}`, as it is not declared as mutable",
-                        name
-                    ),
-                    span,
-                );
-            }
+        if let Some(stmt_id) = self.root_local_of_expr(ctx, lhs)
+            && let Some((_, false)) = ctx.locals.get(&stmt_id)
+        {
+            let name = self.local_name(ctx, stmt_id);
+            self.diagnostic(
+                "E0031",
+                format!(
+                    "cannot assign to `{}`, as it is not declared as mutable",
+                    name
+                ),
+                span,
+            );
         }
     }
 
@@ -1887,10 +2319,28 @@ impl TypeChecker<'_> {
 
     fn bind_pattern(&mut self, ctx: &mut BodyCtx<'_>, pat: PatId, expected: &Type) {
         let span = ctx.pat_range(pat);
-        match &ctx.body.pats[pat] {
-            Pattern::Wildcard | Pattern::Literal | Pattern::Path { .. } => {}
+        let pattern = ctx.body.pats[pat].clone();
+        match pattern {
+            Pattern::Wildcard => {}
+            Pattern::Literal(literal) => {
+                let literal_ty = self.literal_pattern_type(&literal, Some(expected));
+                self.expect_assignable(expected, &literal_ty, "literal pattern", span);
+            }
+            Pattern::Path { path } => {
+                self.validate_unit_variant_pattern(expected, path.segments.last(), span);
+            }
             Pattern::Binding { name } => {
-                ctx.bindings.insert(name.0.clone(), expected.clone());
+                if let Some(is_unit) = self.enum_variant_is_unit(expected, &name.0) {
+                    if !is_unit {
+                        self.diagnostic(
+                            "E0038",
+                            format!("variant `{}` requires a payload pattern", name.0),
+                            span,
+                        );
+                    }
+                } else {
+                    ctx.bindings.insert(name.0, expected.clone());
+                }
             }
             Pattern::Tuple { elements } => {
                 let Type::Tuple(expected_elements) = expected else {
@@ -1905,7 +2355,7 @@ impl TypeChecker<'_> {
                         );
                     }
                     for element in elements {
-                        self.bind_pattern(ctx, *element, &Type::Unknown);
+                        self.bind_pattern(ctx, element, &Type::Unknown);
                     }
                     return;
                 };
@@ -1921,25 +2371,313 @@ impl TypeChecker<'_> {
                         span,
                     );
                 }
-                for (index, element) in elements.iter().enumerate() {
+                for (index, element) in elements.into_iter().enumerate() {
                     let ty = expected_elements.get(index).unwrap_or(&Type::Unknown);
-                    self.bind_pattern(ctx, *element, ty);
+                    self.bind_pattern(ctx, element, ty);
                 }
             }
-            Pattern::TupleStruct { elements, .. } => {
-                for element in elements {
-                    self.bind_pattern(ctx, *element, &Type::Unknown);
+            Pattern::TupleStruct { path, elements } => {
+                self.bind_tuple_variant_pattern(ctx, expected, &path, &elements, span);
+            }
+            Pattern::Struct { path, fields } => {
+                self.bind_struct_variant_pattern(ctx, expected, &path, &fields, span);
+            }
+        }
+    }
+
+    fn literal_pattern_type(&mut self, literal: &LiteralPattern, expected: Option<&Type>) -> Type {
+        match literal {
+            LiteralPattern::Int { suffix, .. } => {
+                self.int_literal_type(suffix.as_deref(), expected)
+            }
+            LiteralPattern::Float { suffix, .. } => {
+                self.float_literal_type(suffix.as_deref(), expected)
+            }
+            LiteralPattern::String(_) => Type::Str,
+            LiteralPattern::Char(_) => Type::Char,
+            LiteralPattern::Bool(_) => Type::Bool,
+        }
+    }
+
+    fn enum_variant_is_unit(&self, expected: &Type, name: &str) -> Option<bool> {
+        let Type::Enum(enum_id, _) = expected else {
+            return None;
+        };
+        self.hir.item_tree.enums[*enum_id]
+            .variants
+            .iter()
+            .find(|variant| variant.name.0 == name)
+            .map(|variant| matches!(variant.kind, HirVariantKind::Unit))
+    }
+
+    fn validate_unit_variant_pattern(
+        &mut self,
+        expected: &Type,
+        name: Option<&Name>,
+        span: Option<rowan::TextRange>,
+    ) {
+        let Type::Enum(enum_id, _) = expected else {
+            self.diagnostic("E0038", "path pattern requires an enum value", span);
+            return;
+        };
+        let Some(name) = name else {
+            self.diagnostic("E0038", "invalid enum variant pattern", span);
+            return;
+        };
+        let Some(variant) = self.hir.item_tree.enums[*enum_id]
+            .variants
+            .iter()
+            .find(|variant| variant.name.0 == name.0)
+        else {
+            self.diagnostic(
+                "E0038",
+                format!("unknown variant `{}` for this enum", name.0),
+                span,
+            );
+            return;
+        };
+        if !matches!(variant.kind, HirVariantKind::Unit) {
+            self.diagnostic(
+                "E0038",
+                format!("variant `{}` requires a payload pattern", name.0),
+                span,
+            );
+        }
+    }
+
+    fn bind_tuple_variant_pattern(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expected: &Type,
+        path: &hir::item_tree::HirPath,
+        elements: &[PatId],
+        span: Option<rowan::TextRange>,
+    ) {
+        let Type::Enum(enum_id, args) = expected else {
+            self.diagnostic(
+                "E0038",
+                "tuple variant pattern requires an enum value",
+                span,
+            );
+            for element in elements {
+                self.bind_pattern(ctx, *element, &Type::Unknown);
+            }
+            return;
+        };
+        let Some(name) = path.segments.last() else {
+            self.diagnostic("E0038", "invalid enum variant pattern", span);
+            return;
+        };
+        let enum_data = self.hir.item_tree.enums[*enum_id].clone();
+        let Some(variant) = enum_data
+            .variants
+            .iter()
+            .find(|variant| variant.name.0 == name.0)
+        else {
+            self.diagnostic(
+                "E0038",
+                format!("unknown variant `{}` for `{}`", name.0, enum_data.name.0),
+                span,
+            );
+            return;
+        };
+        let HirVariantKind::Tuple(items) = &variant.kind else {
+            self.diagnostic(
+                "E0038",
+                format!("variant `{}` is not tuple-style", name.0),
+                span,
+            );
+            return;
+        };
+        if elements.len() != items.len() {
+            self.diagnostic(
+                "E0038",
+                format!(
+                    "variant `{}` expects {} field(s), got {}",
+                    name.0,
+                    items.len(),
+                    elements.len()
+                ),
+                span,
+            );
+        }
+        let subst = enum_data
+            .generics
+            .iter()
+            .chain(enum_data.const_generics.iter())
+            .zip(args.iter())
+            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .collect::<HashMap<_, _>>();
+        for (index, element) in elements.iter().enumerate() {
+            let ty = items
+                .get(index)
+                .map(|ty| self.lower_type_ref_with_params(ty, &subst))
+                .unwrap_or(Type::Unknown);
+            self.bind_pattern(ctx, *element, &ty);
+        }
+    }
+
+    fn bind_struct_variant_pattern(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expected: &Type,
+        path: &hir::item_tree::HirPath,
+        fields: &[hir::body::FieldPat],
+        span: Option<rowan::TextRange>,
+    ) {
+        if let Type::Struct(struct_id, args) = expected {
+            let strukt = self.hir.item_tree.structs[*struct_id].clone();
+            if path
+                .segments
+                .last()
+                .is_none_or(|name| name.0 != strukt.name.0)
+            {
+                self.diagnostic(
+                    "E0038",
+                    format!("struct pattern must name `{}`", strukt.name.0),
+                    span,
+                );
+                return;
+            }
+            let subst = strukt
+                .generics
+                .iter()
+                .chain(strukt.const_generics.iter())
+                .zip(args.iter())
+                .map(|(name, ty)| (name.0.clone(), ty.clone()))
+                .collect::<HashMap<_, _>>();
+            let mut seen = HashSet::new();
+            for field in fields {
+                if !seen.insert(field.name.0.clone()) {
+                    self.diagnostic(
+                        "E0038",
+                        format!("field `{}` is bound more than once", field.name.0),
+                        span,
+                    );
+                    continue;
+                }
+                let Some(item) = strukt
+                    .fields
+                    .iter()
+                    .find(|item| item.name.0 == field.name.0)
+                else {
+                    self.diagnostic(
+                        "E0038",
+                        format!("struct `{}` has no field `{}`", strukt.name.0, field.name.0),
+                        span,
+                    );
+                    continue;
+                };
+                let ty = self.lower_type_ref_with_params(&item.ty, &subst);
+                if let Some(pat) = field.pat {
+                    self.bind_pattern(ctx, pat, &ty);
+                } else {
+                    ctx.bindings.insert(field.name.0.clone(), ty);
                 }
             }
-            Pattern::Struct { fields, .. } => {
-                for field in fields {
-                    if let Some(pat) = field.pat {
-                        self.bind_pattern(ctx, pat, &Type::Unknown);
-                    } else {
-                        ctx.bindings.insert(field.name.0.clone(), Type::Unknown);
-                    }
-                }
+            return;
+        }
+
+        let Type::Enum(enum_id, args) = expected else {
+            self.diagnostic(
+                "E0038",
+                "struct variant pattern requires an enum value",
+                span,
+            );
+            return;
+        };
+        let Some(name) = path.segments.last() else {
+            self.diagnostic("E0038", "invalid enum variant pattern", span);
+            return;
+        };
+        let enum_data = self.hir.item_tree.enums[*enum_id].clone();
+        let Some(variant) = enum_data
+            .variants
+            .iter()
+            .find(|variant| variant.name.0 == name.0)
+        else {
+            self.diagnostic(
+                "E0038",
+                format!("unknown variant `{}` for `{}`", name.0, enum_data.name.0),
+                span,
+            );
+            return;
+        };
+        let HirVariantKind::Struct(items) = &variant.kind else {
+            self.diagnostic(
+                "E0038",
+                format!("variant `{}` is not struct-style", name.0),
+                span,
+            );
+            return;
+        };
+        let subst = enum_data
+            .generics
+            .iter()
+            .chain(enum_data.const_generics.iter())
+            .zip(args.iter())
+            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut seen = HashSet::new();
+        for field in fields {
+            if !seen.insert(field.name.0.clone()) {
+                self.diagnostic(
+                    "E0038",
+                    format!("field `{}` is bound more than once", field.name.0),
+                    span,
+                );
+                continue;
             }
+            let Some(item) = items.iter().find(|item| item.name.0 == field.name.0) else {
+                self.diagnostic(
+                    "E0038",
+                    format!("variant `{}` has no field `{}`", name.0, field.name.0),
+                    span,
+                );
+                continue;
+            };
+            let ty = self.lower_type_ref_with_params(&item.ty, &subst);
+            if let Some(pat) = field.pat {
+                self.bind_pattern(ctx, pat, &ty);
+            } else {
+                ctx.bindings.insert(field.name.0.clone(), ty);
+            }
+        }
+    }
+
+    fn pattern_coverage(&self, ctx: &BodyCtx<'_>, pat: PatId, expected: &Type) -> PatternCoverage {
+        let Type::Enum(enum_id, _) = expected else {
+            return match ctx.body.pats[pat] {
+                Pattern::Wildcard | Pattern::Binding { .. } => PatternCoverage::CatchAll,
+                Pattern::Literal(LiteralPattern::Bool(value)) if expected == &Type::Bool => {
+                    PatternCoverage::Bool(value)
+                }
+                _ => PatternCoverage::None,
+            };
+        };
+        let enum_data = &self.hir.item_tree.enums[*enum_id];
+        match &ctx.body.pats[pat] {
+            Pattern::Wildcard => PatternCoverage::CatchAll,
+            Pattern::Binding { name } => enum_data
+                .variants
+                .iter()
+                .position(|variant| variant.name.0 == name.0)
+                .map(PatternCoverage::Variant)
+                .unwrap_or(PatternCoverage::CatchAll),
+            Pattern::Path { path }
+            | Pattern::TupleStruct { path, .. }
+            | Pattern::Struct { path, .. } => path
+                .segments
+                .last()
+                .and_then(|name| {
+                    enum_data
+                        .variants
+                        .iter()
+                        .position(|variant| variant.name.0 == name.0)
+                })
+                .map(PatternCoverage::Variant)
+                .unwrap_or(PatternCoverage::None),
+            _ => PatternCoverage::None,
         }
     }
 

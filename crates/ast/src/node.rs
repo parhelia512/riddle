@@ -42,6 +42,8 @@ ast_node!(Attribute, Attribute);
 // statements / declarations
 ast_node!(VarDecl, VarDecl);
 ast_node!(FuncDecl, FuncDecl);
+ast_node!(BreakStmt, BreakStmt);
+ast_node!(ContinueStmt, ContinueStmt);
 ast_node!(ReturnStmt, ReturnStmt);
 ast_node!(ExprStmt, ExprStmt);
 ast_node!(StructDecl, StructDecl);
@@ -1186,6 +1188,14 @@ impl EnumPattern {
         support::children(&self.syntax)
     }
 
+    pub fn is_tuple(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::LParen).is_some()
+    }
+
+    pub fn is_struct(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::LBrace).is_some()
+    }
+
     pub fn fields(&self) -> impl Iterator<Item = StructPattern> + '_ {
         support::children(&self.syntax)
     }
@@ -1309,6 +1319,8 @@ pub enum Stmt {
     ImplDecl(ImplDecl),
     ConstDecl(ConstDecl),
     TypeAliasDecl(TypeAliasDecl),
+    BreakStmt(BreakStmt),
+    ContinueStmt(ContinueStmt),
     ReturnStmt(ReturnStmt),
     ExprStmt(ExprStmt),
     ModDecl(ModDecl),
@@ -1328,6 +1340,8 @@ impl AstNode for Stmt {
             SyntaxKind::ImplDecl => Some(Stmt::ImplDecl(ImplDecl { syntax: node })),
             SyntaxKind::ConstDecl => Some(Stmt::ConstDecl(ConstDecl { syntax: node })),
             SyntaxKind::TypeAliasDecl => Some(Stmt::TypeAliasDecl(TypeAliasDecl { syntax: node })),
+            SyntaxKind::BreakStmt => Some(Stmt::BreakStmt(BreakStmt { syntax: node })),
+            SyntaxKind::ContinueStmt => Some(Stmt::ContinueStmt(ContinueStmt { syntax: node })),
             SyntaxKind::ReturnStmt => Some(Stmt::ReturnStmt(ReturnStmt { syntax: node })),
             SyntaxKind::ExprStmt => Some(Stmt::ExprStmt(ExprStmt { syntax: node })),
             SyntaxKind::ModDecl => Some(Stmt::ModDecl(ModDecl { syntax: node })),
@@ -1348,6 +1362,8 @@ impl AstNode for Stmt {
             Stmt::ImplDecl(it) => it.syntax(),
             Stmt::ConstDecl(it) => it.syntax(),
             Stmt::TypeAliasDecl(it) => it.syntax(),
+            Stmt::BreakStmt(it) => it.syntax(),
+            Stmt::ContinueStmt(it) => it.syntax(),
             Stmt::ReturnStmt(it) => it.syntax(),
             Stmt::ExprStmt(it) => it.syntax(),
             Stmt::ModDecl(it) => it.syntax(),

@@ -104,6 +104,7 @@ fn fmt_func(f: &mut fmt::Formatter<'_>, func: &Function, indent: usize) -> fmt::
         // 终止指令
         write!(f, "  {}  ", pad)?;
         match &block.terminator {
+            Terminator::Pending => writeln!(f, "<pending>")?,
             Terminator::Branch(target) => {
                 let tl = func.blocks[*target].label.as_deref().unwrap_or("?");
                 writeln!(f, "br block_{}", tl)?;
@@ -117,6 +118,7 @@ fn fmt_func(f: &mut fmt::Formatter<'_>, func: &Function, indent: usize) -> fmt::
                 Some(v) => writeln!(f, "return v{}", v.0)?,
                 None => writeln!(f, "return")?,
             },
+            Terminator::Unreachable => writeln!(f, "unreachable")?,
         }
     }
 
@@ -185,6 +187,13 @@ impl fmt::Display for InstFmt<'_> {
             InstKind::StructValue(fields) => {
                 let flds: Vec<String> = fields.iter().map(|a| format!("v{}", a.0)).collect();
                 write!(f, "struct [{}]", flds.join(", "))
+            }
+            InstKind::SparseStructValue(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|(index, value)| format!("#{index}: v{}", value.0))
+                    .collect::<Vec<_>>();
+                write!(f, "struct {{ {} }}", fields.join(", "))
             }
             InstKind::ArrayValue(elems) => {
                 let el: Vec<String> = elems.iter().map(|a| format!("v{}", a.0)).collect();

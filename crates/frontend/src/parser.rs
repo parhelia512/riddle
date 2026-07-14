@@ -322,6 +322,7 @@ impl<'s> Parser<'s> {
         (self.events, self.tokens, self.errors, self.source)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn reparse(
         mut self,
         entry: ReparseEntry,
@@ -391,6 +392,8 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Struct
                 | SyntaxKind::Mod
                 | SyntaxKind::Use
+                | SyntaxKind::Break
+                | SyntaxKind::Continue
                 | SyntaxKind::Return
                 | SyntaxKind::Enum
                 | SyntaxKind::Trait
@@ -461,9 +464,11 @@ impl<'s> Parser<'s> {
             SyntaxKind::Impl => self.impl_decl(),
             SyntaxKind::Const => self.const_decl(),
             SyntaxKind::TypeKw => self.type_alias_decl(),
+            SyntaxKind::Break => self.loop_control_stmt(SyntaxKind::BreakStmt),
+            SyntaxKind::Continue => self.loop_control_stmt(SyntaxKind::ContinueStmt),
             SyntaxKind::Return => self.return_stmt(),
             SyntaxKind::Extern => self.extern_decl(),
-            SyntaxKind::Eof => return,
+            SyntaxKind::Eof => (),
             _ => self.expr_stmt(),
         }
     }
@@ -802,6 +807,13 @@ impl<'s> Parser<'s> {
 
         self.expect(SyntaxKind::Semi);
         m.complete(self, SyntaxKind::ReturnStmt);
+    }
+
+    fn loop_control_stmt(&mut self, kind: SyntaxKind) {
+        let m = self.start();
+        self.bump();
+        self.expect(SyntaxKind::Semi);
+        m.complete(self, kind);
     }
 
     fn block(&mut self) -> CompletedMarker {
@@ -2001,7 +2013,6 @@ fn prefix_binding_power(op: SyntaxKind) -> u8 {
 /// left < right => left combination
 ///
 /// left > right => right combination
-
 fn infix_binding_power(op: SyntaxKind) -> Option<(u8, u8)> {
     match op {
         SyntaxKind::Eq

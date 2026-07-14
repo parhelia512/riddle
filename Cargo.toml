@@ -1,11 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["app/clue",
+members = [
+    "app/clue",
     "app/riddle-lsp",
     "app/riddlec",
     "crates/ast",
     "crates/escape-analysis",
     "crates/frontend",
+    "crates/gc",
     "crates/hir",
     "crates/mir",
     "crates/move-checker",
@@ -19,6 +21,7 @@ default-members = [
     "crates/ast",
     "crates/escape-analysis",
     "crates/frontend",
+    "crates/gc",
     "crates/hir",
     "crates/mir",
     "crates/move-checker",
@@ -30,23 +33,6 @@ default-members = [
 version = "0.1.0"
 edition = "2024"
 
-[workspace.dependencies]
-ast = { path = "crates/ast" }
-clap = { version = "4.6.1", features = ["derive"] }
-clue = { path = "app/clue" }
-escape-analysis = { path = "crates/escape-analysis" }
-frontend = { path = "crates/frontend" }
-hir = { path = "crates/hir" }
-la-arena = "0.3"
-logos = "0.16"
-move-checker = { path = "crates/move-checker" }
-rowan = "0.15"
-scope-graph = { path = "crates/scope-graph" }
-type-checker = { path = "crates/type-checker" }
-mir = { path = "crates/mir" }
-riddlec = { path = "app/riddlec" }
-toml = "0.8"
-
 [package]
 name = "riddle"
 version.workspace = true
@@ -54,18 +40,17 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-clap.workspace = true
-clue.workspace = true
-frontend.workspace = true
-hir.workspace = true
+clap = { version = "4.6.1", features = ["derive"] }
+clue = { path = "app/clue" }
+frontend = { path = "crates/frontend" }
+hir = { path = "crates/hir" }
 lsp-types = "0.94.1"
-mir.workspace = true
-riddlec.workspace = true
-rowan.workspace = true
+mir = { path = "crates/mir" }
+riddlec = { path = "app/riddlec" }
+rowan = "0.15"
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
-toml.workspace = true
 tower-lsp = "0.20.0"
-type-checker.workspace = true
+type-checker = { path = "crates/type-checker" }
 
 [features]
 install-bins = []
@@ -86,11 +71,11 @@ path = "app/riddlec/src/main.rs"
 required-features = ["install-bins"]
 
 [dev-dependencies]
-ast.workspace = true
-escape-analysis.workspace = true
-frontend.workspace = true
-hir.workspace = true
-mir.workspace = true
-move-checker.workspace = true
-scope-graph.workspace = true
-type-checker.workspace = true
+ast = { path = "crates/ast" }
+escape-analysis = { path = "crates/escape-analysis" }
+frontend = { path = "crates/frontend" }
+hir = { path = "crates/hir" }
+mir = { path = "crates/mir" }
+move-checker = { path = "crates/move-checker" }
+scope-graph = { path = "crates/scope-graph" }
+type-checker = { path = "crates/type-checker" }

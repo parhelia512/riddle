@@ -188,10 +188,20 @@ fn c_heap_alloc() {
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    // GC promotion: escaping local → GC_MALLOC
+    // GC promotion: escaping local -> bundled Riddle GC.
     assert!(
-        result.contains("GC_MALLOC"),
-        "missing GC_MALLOC: {}",
+        result.contains("rgc_alloc"),
+        "missing rgc_alloc: {}",
+        result
+    );
+    assert!(
+        result.contains("void rgc_collect(void)"),
+        "missing bundled GC runtime: {}",
+        result
+    );
+    assert!(
+        !result.contains("GC_MALLOC") && !result.contains("#include <gc.h>"),
+        "Boehm GC should not be emitted: {}",
         result
     );
 }
@@ -243,10 +253,10 @@ fn c_backend_alloca_for_non_escaping_struct() {
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    // Non-escaping struct should NOT use GC_MALLOC
+    // Non-escaping struct should stay on the stack and not pull in the GC runtime.
     assert!(
-        !result.contains("GC_MALLOC"),
-        "non-escaping struct should not use GC_MALLOC, got:\n{}",
+        !result.contains("rgc_alloc"),
+        "non-escaping struct should not use rgc_alloc, got:\n{}",
         result
     );
     assert!(result.contains("return"), "missing return");
@@ -681,6 +691,16 @@ fn c_backend_lowers_non_copy_array_into_iterator() {
     assert!(
         result.contains("next__ArrayIter_Token_2"),
         "missing ArrayIter::next monomorph:\n{}",
+        result
+    );
+    assert!(
+        result.contains("  ArrayIter_Token_2 s"),
+        "array iterator construction lost its const argument:\n{}",
+        result
+    );
+    assert!(
+        result.contains("next__ArrayIter_Token_2((&"),
+        "Iterator::next should receive the iterator slot by reference:\n{}",
         result
     );
     assert!(

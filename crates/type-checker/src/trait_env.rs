@@ -43,19 +43,54 @@ pub struct TraitEnv {
 impl TraitEnv {
     /// Whether `ty` implements the trait identified by `trait_id`.
     pub fn type_implements(&self, ty: &Type, trait_id: TraitId) -> bool {
+        self.type_implements_inner(ty, trait_id, &[], 0)
+    }
+
+    pub(crate) fn type_implements_assuming(
+        &self,
+        ty: &Type,
+        trait_id: TraitId,
+        assumptions: &[TraitBound],
+    ) -> bool {
+        self.type_implements_inner(ty, trait_id, assumptions, 0)
+    }
+
+    fn type_implements_inner(
+        &self,
+        ty: &Type,
+        trait_id: TraitId,
+        assumptions: &[TraitBound],
+        depth: usize,
+    ) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        if assumptions
+            .iter()
+            .any(|bound| bound.trait_id == trait_id && bound.ty == *ty)
+        {
+            return true;
+        }
         if self.has_builtin_impl(ty, trait_id) {
             return true;
         }
-        if let Some(impls) = self.trait_impls.get(&trait_id) {
-            if impls.iter().any(|candidate| {
+        if let Some(impls) = self.trait_impls.get(&trait_id)
+            && impls.iter().any(|candidate| {
                 self.impl_subst(candidate, ty)
-                    .map(|subst| self.bounds_satisfied(&candidate.bounds, &subst))
+                    .map(|subst| {
+                        self.bounds_satisfied_inner(
+                            &candidate.bounds,
+                            &subst,
+                            assumptions,
+                            depth + 1,
+                        )
+                    })
                     .unwrap_or(false)
-            }) {
-                return true;
-            }
+            })
+        {
+            return true;
         }
-        self.derive_impl_for_composite(ty, trait_id)
+        self.derive_impl_for_composite(ty, trait_id, assumptions, depth + 1)
     }
 
     /// Convenience: `type_implements(ty, copy_trait_id)`.
@@ -104,12 +139,20 @@ impl TraitEnv {
         false
     }
 
-    fn derive_impl_for_composite(&self, ty: &Type, trait_id: TraitId) -> bool {
+    fn derive_impl_for_composite(
+        &self,
+        ty: &Type,
+        trait_id: TraitId,
+        assumptions: &[TraitBound],
+        depth: usize,
+    ) -> bool {
         match ty {
             Type::Tuple(elements) => elements
                 .iter()
-                .all(|elem| self.type_implements(elem, trait_id)),
-            Type::Array(inner, _) => self.type_implements(inner, trait_id),
+                .all(|elem| self.type_implements_inner(elem, trait_id, assumptions, depth)),
+            Type::Array(inner, _) => {
+                self.type_implements_inner(inner, trait_id, assumptions, depth)
+            }
             _ => false,
         }
     }
@@ -128,9 +171,19 @@ impl TraitEnv {
     }
 
     fn bounds_satisfied(&self, bounds: &[TraitBound], subst: &HashMap<String, Type>) -> bool {
+        self.bounds_satisfied_inner(bounds, subst, &[], 0)
+    }
+
+    fn bounds_satisfied_inner(
+        &self,
+        bounds: &[TraitBound],
+        subst: &HashMap<String, Type>,
+        assumptions: &[TraitBound],
+        depth: usize,
+    ) -> bool {
         bounds.iter().all(|bound| {
             let actual = substitute_type(&bound.ty, subst);
-            if !self.type_implements(&actual, bound.trait_id) {
+            if !self.type_implements_inner(&actual, bound.trait_id, assumptions, depth + 1) {
                 return false;
             }
             bound.assoc_constraints.iter().all(|constraint| {

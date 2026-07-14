@@ -68,6 +68,7 @@ impl IncrementalTypeChecker {
         checker.check_traits();
         checker.check_impls();
         checker.build_trait_env();
+        checker.validate_copy_impls();
 
         for (fid, function) in hir.item_tree.functions.iter() {
             let Some(body_id) = hir.function_bodies.get(&fid).copied() else {
@@ -75,9 +76,9 @@ impl IncrementalTypeChecker {
             };
 
             let body = &hir.bodies[body_id];
-            let ptr = body.root_ptr.clone();
+            let ptr = body.root_ptr;
             let body_hash = body_fingerprint(body);
-            live_ptrs.insert(ptr.clone());
+            live_ptrs.insert(ptr);
 
             if let Some(cached) = self.bodies.get(&ptr).filter(|cached| {
                 cached.type_context_hash == type_context_hash && cached.body_hash == body_hash
@@ -102,7 +103,11 @@ impl IncrementalTypeChecker {
                 .expr_types
                 .iter()
                 .filter_map(|((checked_body, expr), ty)| {
-                    (*checked_body == body_id).then(|| (*expr, ty.clone()))
+                    if *checked_body == body_id {
+                        Some((*expr, ty.clone()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             let generic_calls = checker
@@ -110,7 +115,11 @@ impl IncrementalTypeChecker {
                 .generic_calls
                 .iter()
                 .filter_map(|((checked_body, expr), call)| {
-                    (*checked_body == body_id).then(|| (*expr, call.clone()))
+                    if *checked_body == body_id {
+                        Some((*expr, call.clone()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             let trait_method_calls = checker
@@ -118,7 +127,11 @@ impl IncrementalTypeChecker {
                 .trait_method_calls
                 .iter()
                 .filter_map(|((checked_body, expr), call)| {
-                    (*checked_body == body_id).then(|| (*expr, call.clone()))
+                    if *checked_body == body_id {
+                        Some((*expr, call.clone()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             let operator_calls = checker
@@ -126,7 +139,11 @@ impl IncrementalTypeChecker {
                 .operator_calls
                 .iter()
                 .filter_map(|((checked_body, expr), call)| {
-                    (*checked_body == body_id).then(|| (*expr, call.clone()))
+                    if *checked_body == body_id {
+                        Some((*expr, call.clone()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             let for_loops = checker
@@ -134,7 +151,11 @@ impl IncrementalTypeChecker {
                 .for_loops
                 .iter()
                 .filter_map(|((checked_body, expr), info)| {
-                    (*checked_body == body_id).then(|| (*expr, info.clone()))
+                    if *checked_body == body_id {
+                        Some((*expr, info.clone()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
 

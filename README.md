@@ -6,7 +6,7 @@
 
 ## Install
 
-```powershell
+```bash
 cargo install --path . --features install-bins --force --target-dir "$env:TEMP\riddle-install"
 ```
 

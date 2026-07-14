@@ -45,47 +45,47 @@ pub trait Add {
     fun add(self, rhs: Self) -> Self::Output;
 }
 #[lang = "sub"]
-pub trait Sub { type Output; }
+pub trait Sub { type Output; fun sub(self, rhs: Self) -> Self::Output; }
 #[lang = "mul"]
-pub trait Mul { type Output; }
+pub trait Mul { type Output; fun mul(self, rhs: Self) -> Self::Output; }
 #[lang = "div"]
-pub trait Div { type Output; }
+pub trait Div { type Output; fun div(self, rhs: Self) -> Self::Output; }
 #[lang = "rem"]
-pub trait Rem { type Output; }
+pub trait Rem { type Output; fun rem(self, rhs: Self) -> Self::Output; }
 #[lang = "neg"]
-pub trait Neg { type Output; }
+pub trait Neg { type Output; fun neg(self) -> Self::Output; }
 #[lang = "not"]
-pub trait Not { type Output; }
+pub trait Not { type Output; fun not(self) -> Self::Output; }
 #[lang = "bitand"]
-pub trait BitAnd { type Output; }
+pub trait BitAnd { type Output; fun bitand(self, rhs: Self) -> Self::Output; }
 #[lang = "bitor"]
-pub trait BitOr { type Output; }
+pub trait BitOr { type Output; fun bitor(self, rhs: Self) -> Self::Output; }
 #[lang = "bitxor"]
-pub trait BitXor { type Output; }
+pub trait BitXor { type Output; fun bitxor(self, rhs: Self) -> Self::Output; }
 #[lang = "shl"]
-pub trait Shl { type Output; }
+pub trait Shl { type Output; fun shl(self, rhs: Self) -> Self::Output; }
 #[lang = "shr"]
-pub trait Shr { type Output; }
+pub trait Shr { type Output; fun shr(self, rhs: Self) -> Self::Output; }
 #[lang = "add_assign"]
-pub trait AddAssign {}
+pub trait AddAssign { fun add_assign(&mut self, rhs: Self); }
 #[lang = "sub_assign"]
-pub trait SubAssign {}
+pub trait SubAssign { fun sub_assign(&mut self, rhs: Self); }
 #[lang = "mul_assign"]
-pub trait MulAssign {}
+pub trait MulAssign { fun mul_assign(&mut self, rhs: Self); }
 #[lang = "div_assign"]
-pub trait DivAssign {}
+pub trait DivAssign { fun div_assign(&mut self, rhs: Self); }
 #[lang = "rem_assign"]
-pub trait RemAssign {}
+pub trait RemAssign { fun rem_assign(&mut self, rhs: Self); }
 #[lang = "bitand_assign"]
-pub trait BitAndAssign {}
+pub trait BitAndAssign { fun bitand_assign(&mut self, rhs: Self); }
 #[lang = "bitor_assign"]
-pub trait BitOrAssign {}
+pub trait BitOrAssign { fun bitor_assign(&mut self, rhs: Self); }
 #[lang = "bitxor_assign"]
-pub trait BitXorAssign {}
+pub trait BitXorAssign { fun bitxor_assign(&mut self, rhs: Self); }
 #[lang = "shl_assign"]
-pub trait ShlAssign {}
+pub trait ShlAssign { fun shl_assign(&mut self, rhs: Self); }
 #[lang = "shr_assign"]
-pub trait ShrAssign {}
+pub trait ShrAssign { fun shr_assign(&mut self, rhs: Self); }
 
 impl Add for i8 { type Output = i8; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
 impl Add for i16 { type Output = i16; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
@@ -104,316 +104,308 @@ impl Add for f32 { type Output = f32; fun add(self, rhs: Self) -> Self::Output {
 impl Add for f64 { type Output = f64; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
 impl Add for f128 { type Output = f128; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
 
-impl Sub for i8 { type Output = i8; }
-impl Sub for i16 { type Output = i16; }
-impl Sub for i32 { type Output = i32; }
-impl Sub for i64 { type Output = i64; }
-impl Sub for i128 { type Output = i128; }
-impl Sub for isize { type Output = isize; }
-impl Sub for u8 { type Output = u8; }
-impl Sub for u16 { type Output = u16; }
-impl Sub for u32 { type Output = u32; }
-impl Sub for u64 { type Output = u64; }
-impl Sub for u128 { type Output = u128; }
-impl Sub for usize { type Output = usize; }
-impl Sub for f16 { type Output = f16; }
-impl Sub for f32 { type Output = f32; }
-impl Sub for f64 { type Output = f64; }
-impl Sub for f128 { type Output = f128; }
+impl Sub for i8 { type Output = i8; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for i16 { type Output = i16; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for i32 { type Output = i32; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for i64 { type Output = i64; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for i128 { type Output = i128; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for isize { type Output = isize; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for u8 { type Output = u8; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for u16 { type Output = u16; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for u32 { type Output = u32; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for u64 { type Output = u64; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for u128 { type Output = u128; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for usize { type Output = usize; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for f16 { type Output = f16; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for f32 { type Output = f32; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for f64 { type Output = f64; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
+impl Sub for f128 { type Output = f128; fun sub(self, rhs: Self) -> Self::Output { self - rhs } }
 
-impl Mul for i8 { type Output = i8; }
-impl Mul for i16 { type Output = i16; }
-impl Mul for i32 { type Output = i32; }
-impl Mul for i64 { type Output = i64; }
-impl Mul for i128 { type Output = i128; }
-impl Mul for isize { type Output = isize; }
-impl Mul for u8 { type Output = u8; }
-impl Mul for u16 { type Output = u16; }
-impl Mul for u32 { type Output = u32; }
-impl Mul for u64 { type Output = u64; }
-impl Mul for u128 { type Output = u128; }
-impl Mul for usize { type Output = usize; }
-impl Mul for f16 { type Output = f16; }
-impl Mul for f32 { type Output = f32; }
-impl Mul for f64 { type Output = f64; }
-impl Mul for f128 { type Output = f128; }
+impl Mul for i8 { type Output = i8; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for i16 { type Output = i16; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for i32 { type Output = i32; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for i64 { type Output = i64; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for i128 { type Output = i128; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for isize { type Output = isize; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for u8 { type Output = u8; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for u16 { type Output = u16; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for u32 { type Output = u32; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for u64 { type Output = u64; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for u128 { type Output = u128; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for usize { type Output = usize; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for f16 { type Output = f16; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for f32 { type Output = f32; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for f64 { type Output = f64; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
+impl Mul for f128 { type Output = f128; fun mul(self, rhs: Self) -> Self::Output { self * rhs } }
 
-impl Div for i8 { type Output = i8; }
-impl Div for i16 { type Output = i16; }
-impl Div for i32 { type Output = i32; }
-impl Div for i64 { type Output = i64; }
-impl Div for i128 { type Output = i128; }
-impl Div for isize { type Output = isize; }
-impl Div for u8 { type Output = u8; }
-impl Div for u16 { type Output = u16; }
-impl Div for u32 { type Output = u32; }
-impl Div for u64 { type Output = u64; }
-impl Div for u128 { type Output = u128; }
-impl Div for usize { type Output = usize; }
-impl Div for f16 { type Output = f16; }
-impl Div for f32 { type Output = f32; }
-impl Div for f64 { type Output = f64; }
-impl Div for f128 { type Output = f128; }
+impl Div for i8 { type Output = i8; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for i16 { type Output = i16; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for i32 { type Output = i32; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for i64 { type Output = i64; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for i128 { type Output = i128; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for isize { type Output = isize; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for u8 { type Output = u8; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for u16 { type Output = u16; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for u32 { type Output = u32; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for u64 { type Output = u64; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for u128 { type Output = u128; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for usize { type Output = usize; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for f16 { type Output = f16; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for f32 { type Output = f32; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for f64 { type Output = f64; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
+impl Div for f128 { type Output = f128; fun div(self, rhs: Self) -> Self::Output { self / rhs } }
 
-impl Rem for i8 { type Output = i8; }
-impl Rem for i16 { type Output = i16; }
-impl Rem for i32 { type Output = i32; }
-impl Rem for i64 { type Output = i64; }
-impl Rem for i128 { type Output = i128; }
-impl Rem for isize { type Output = isize; }
-impl Rem for u8 { type Output = u8; }
-impl Rem for u16 { type Output = u16; }
-impl Rem for u32 { type Output = u32; }
-impl Rem for u64 { type Output = u64; }
-impl Rem for u128 { type Output = u128; }
-impl Rem for usize { type Output = usize; }
-impl Rem for f16 { type Output = f16; }
-impl Rem for f32 { type Output = f32; }
-impl Rem for f64 { type Output = f64; }
-impl Rem for f128 { type Output = f128; }
+impl Rem for i8 { type Output = i8; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for i16 { type Output = i16; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for i32 { type Output = i32; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for i64 { type Output = i64; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for i128 { type Output = i128; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for isize { type Output = isize; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for u8 { type Output = u8; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for u16 { type Output = u16; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for u32 { type Output = u32; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for u64 { type Output = u64; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for u128 { type Output = u128; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
+impl Rem for usize { type Output = usize; fun rem(self, rhs: Self) -> Self::Output { self % rhs } }
 
-impl Neg for i8 { type Output = i8; }
-impl Neg for i16 { type Output = i16; }
-impl Neg for i32 { type Output = i32; }
-impl Neg for i64 { type Output = i64; }
-impl Neg for i128 { type Output = i128; }
-impl Neg for isize { type Output = isize; }
-impl Neg for f16 { type Output = f16; }
-impl Neg for f32 { type Output = f32; }
-impl Neg for f64 { type Output = f64; }
-impl Neg for f128 { type Output = f128; }
+impl Neg for i8 { type Output = i8; fun neg(self) -> Self::Output { -self } }
+impl Neg for i16 { type Output = i16; fun neg(self) -> Self::Output { -self } }
+impl Neg for i32 { type Output = i32; fun neg(self) -> Self::Output { -self } }
+impl Neg for i64 { type Output = i64; fun neg(self) -> Self::Output { -self } }
+impl Neg for i128 { type Output = i128; fun neg(self) -> Self::Output { -self } }
+impl Neg for isize { type Output = isize; fun neg(self) -> Self::Output { -self } }
+impl Neg for f16 { type Output = f16; fun neg(self) -> Self::Output { -self } }
+impl Neg for f32 { type Output = f32; fun neg(self) -> Self::Output { -self } }
+impl Neg for f64 { type Output = f64; fun neg(self) -> Self::Output { -self } }
+impl Neg for f128 { type Output = f128; fun neg(self) -> Self::Output { -self } }
 
-impl Not for bool { type Output = bool; }
-impl Not for i8 { type Output = i8; }
-impl Not for i16 { type Output = i16; }
-impl Not for i32 { type Output = i32; }
-impl Not for i64 { type Output = i64; }
-impl Not for i128 { type Output = i128; }
-impl Not for isize { type Output = isize; }
-impl Not for u8 { type Output = u8; }
-impl Not for u16 { type Output = u16; }
-impl Not for u32 { type Output = u32; }
-impl Not for u64 { type Output = u64; }
-impl Not for u128 { type Output = u128; }
-impl Not for usize { type Output = usize; }
+impl Not for bool { type Output = bool; fun not(self) -> Self::Output { !self } }
+impl Not for i8 { type Output = i8; fun not(self) -> Self::Output { !self } }
+impl Not for i16 { type Output = i16; fun not(self) -> Self::Output { !self } }
+impl Not for i32 { type Output = i32; fun not(self) -> Self::Output { !self } }
+impl Not for i64 { type Output = i64; fun not(self) -> Self::Output { !self } }
+impl Not for i128 { type Output = i128; fun not(self) -> Self::Output { !self } }
+impl Not for isize { type Output = isize; fun not(self) -> Self::Output { !self } }
+impl Not for u8 { type Output = u8; fun not(self) -> Self::Output { !self } }
+impl Not for u16 { type Output = u16; fun not(self) -> Self::Output { !self } }
+impl Not for u32 { type Output = u32; fun not(self) -> Self::Output { !self } }
+impl Not for u64 { type Output = u64; fun not(self) -> Self::Output { !self } }
+impl Not for u128 { type Output = u128; fun not(self) -> Self::Output { !self } }
+impl Not for usize { type Output = usize; fun not(self) -> Self::Output { !self } }
 
-impl BitAnd for bool { type Output = bool; }
-impl BitAnd for i8 { type Output = i8; }
-impl BitAnd for i16 { type Output = i16; }
-impl BitAnd for i32 { type Output = i32; }
-impl BitAnd for i64 { type Output = i64; }
-impl BitAnd for i128 { type Output = i128; }
-impl BitAnd for isize { type Output = isize; }
-impl BitAnd for u8 { type Output = u8; }
-impl BitAnd for u16 { type Output = u16; }
-impl BitAnd for u32 { type Output = u32; }
-impl BitAnd for u64 { type Output = u64; }
-impl BitAnd for u128 { type Output = u128; }
-impl BitAnd for usize { type Output = usize; }
+impl BitAnd for bool { type Output = bool; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for i8 { type Output = i8; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for i16 { type Output = i16; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for i32 { type Output = i32; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for i64 { type Output = i64; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for i128 { type Output = i128; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for isize { type Output = isize; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for u8 { type Output = u8; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for u16 { type Output = u16; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for u32 { type Output = u32; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for u64 { type Output = u64; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for u128 { type Output = u128; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
+impl BitAnd for usize { type Output = usize; fun bitand(self, rhs: Self) -> Self::Output { self & rhs } }
 
-impl BitOr for bool { type Output = bool; }
-impl BitOr for i8 { type Output = i8; }
-impl BitOr for i16 { type Output = i16; }
-impl BitOr for i32 { type Output = i32; }
-impl BitOr for i64 { type Output = i64; }
-impl BitOr for i128 { type Output = i128; }
-impl BitOr for isize { type Output = isize; }
-impl BitOr for u8 { type Output = u8; }
-impl BitOr for u16 { type Output = u16; }
-impl BitOr for u32 { type Output = u32; }
-impl BitOr for u64 { type Output = u64; }
-impl BitOr for u128 { type Output = u128; }
-impl BitOr for usize { type Output = usize; }
+impl BitOr for bool { type Output = bool; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for i8 { type Output = i8; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for i16 { type Output = i16; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for i32 { type Output = i32; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for i64 { type Output = i64; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for i128 { type Output = i128; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for isize { type Output = isize; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for u8 { type Output = u8; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for u16 { type Output = u16; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for u32 { type Output = u32; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for u64 { type Output = u64; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for u128 { type Output = u128; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
+impl BitOr for usize { type Output = usize; fun bitor(self, rhs: Self) -> Self::Output { self | rhs } }
 
-impl BitXor for bool { type Output = bool; }
-impl BitXor for i8 { type Output = i8; }
-impl BitXor for i16 { type Output = i16; }
-impl BitXor for i32 { type Output = i32; }
-impl BitXor for i64 { type Output = i64; }
-impl BitXor for i128 { type Output = i128; }
-impl BitXor for isize { type Output = isize; }
-impl BitXor for u8 { type Output = u8; }
-impl BitXor for u16 { type Output = u16; }
-impl BitXor for u32 { type Output = u32; }
-impl BitXor for u64 { type Output = u64; }
-impl BitXor for u128 { type Output = u128; }
-impl BitXor for usize { type Output = usize; }
+impl BitXor for bool { type Output = bool; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for i8 { type Output = i8; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for i16 { type Output = i16; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for i32 { type Output = i32; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for i64 { type Output = i64; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for i128 { type Output = i128; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for isize { type Output = isize; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for u8 { type Output = u8; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for u16 { type Output = u16; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for u32 { type Output = u32; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for u64 { type Output = u64; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for u128 { type Output = u128; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
+impl BitXor for usize { type Output = usize; fun bitxor(self, rhs: Self) -> Self::Output { self ^ rhs } }
 
-impl Shl for i8 { type Output = i8; }
-impl Shl for i16 { type Output = i16; }
-impl Shl for i32 { type Output = i32; }
-impl Shl for i64 { type Output = i64; }
-impl Shl for i128 { type Output = i128; }
-impl Shl for isize { type Output = isize; }
-impl Shl for u8 { type Output = u8; }
-impl Shl for u16 { type Output = u16; }
-impl Shl for u32 { type Output = u32; }
-impl Shl for u64 { type Output = u64; }
-impl Shl for u128 { type Output = u128; }
-impl Shl for usize { type Output = usize; }
+impl Shl for i8 { type Output = i8; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for i16 { type Output = i16; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for i32 { type Output = i32; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for i64 { type Output = i64; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for i128 { type Output = i128; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for isize { type Output = isize; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for u8 { type Output = u8; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for u16 { type Output = u16; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for u32 { type Output = u32; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for u64 { type Output = u64; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for u128 { type Output = u128; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
+impl Shl for usize { type Output = usize; fun shl(self, rhs: Self) -> Self::Output { self << rhs } }
 
-impl Shr for i8 { type Output = i8; }
-impl Shr for i16 { type Output = i16; }
-impl Shr for i32 { type Output = i32; }
-impl Shr for i64 { type Output = i64; }
-impl Shr for i128 { type Output = i128; }
-impl Shr for isize { type Output = isize; }
-impl Shr for u8 { type Output = u8; }
-impl Shr for u16 { type Output = u16; }
-impl Shr for u32 { type Output = u32; }
-impl Shr for u64 { type Output = u64; }
-impl Shr for u128 { type Output = u128; }
-impl Shr for usize { type Output = usize; }
+impl Shr for i8 { type Output = i8; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for i16 { type Output = i16; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for i32 { type Output = i32; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for i64 { type Output = i64; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for i128 { type Output = i128; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for isize { type Output = isize; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for u8 { type Output = u8; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for u16 { type Output = u16; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for u32 { type Output = u32; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for u64 { type Output = u64; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for u128 { type Output = u128; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
+impl Shr for usize { type Output = usize; fun shr(self, rhs: Self) -> Self::Output { self >> rhs } }
 
-impl AddAssign for i8 {}
-impl AddAssign for i16 {}
-impl AddAssign for i32 {}
-impl AddAssign for i64 {}
-impl AddAssign for i128 {}
-impl AddAssign for isize {}
-impl AddAssign for u8 {}
-impl AddAssign for u16 {}
-impl AddAssign for u32 {}
-impl AddAssign for u64 {}
-impl AddAssign for u128 {}
-impl AddAssign for usize {}
-impl AddAssign for f16 {}
-impl AddAssign for f32 {}
-impl AddAssign for f64 {}
-impl AddAssign for f128 {}
+impl AddAssign for i8 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for i16 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for i32 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for i64 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for i128 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for isize { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for u8 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for u16 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for u32 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for u64 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for u128 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for usize { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for f16 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for f32 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for f64 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
+impl AddAssign for f128 { fun add_assign(&mut self, rhs: Self) { *self += rhs; } }
 
-impl SubAssign for i8 {}
-impl SubAssign for i16 {}
-impl SubAssign for i32 {}
-impl SubAssign for i64 {}
-impl SubAssign for i128 {}
-impl SubAssign for isize {}
-impl SubAssign for u8 {}
-impl SubAssign for u16 {}
-impl SubAssign for u32 {}
-impl SubAssign for u64 {}
-impl SubAssign for u128 {}
-impl SubAssign for usize {}
-impl SubAssign for f16 {}
-impl SubAssign for f32 {}
-impl SubAssign for f64 {}
-impl SubAssign for f128 {}
+impl SubAssign for i8 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for i16 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for i32 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for i64 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for i128 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for isize { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for u8 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for u16 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for u32 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for u64 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for u128 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for usize { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for f16 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for f32 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for f64 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
+impl SubAssign for f128 { fun sub_assign(&mut self, rhs: Self) { *self -= rhs; } }
 
-impl MulAssign for i8 {}
-impl MulAssign for i16 {}
-impl MulAssign for i32 {}
-impl MulAssign for i64 {}
-impl MulAssign for i128 {}
-impl MulAssign for isize {}
-impl MulAssign for u8 {}
-impl MulAssign for u16 {}
-impl MulAssign for u32 {}
-impl MulAssign for u64 {}
-impl MulAssign for u128 {}
-impl MulAssign for usize {}
-impl MulAssign for f16 {}
-impl MulAssign for f32 {}
-impl MulAssign for f64 {}
-impl MulAssign for f128 {}
+impl MulAssign for i8 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for i16 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for i32 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for i64 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for i128 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for isize { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for u8 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for u16 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for u32 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for u64 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for u128 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for usize { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for f16 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for f32 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for f64 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
+impl MulAssign for f128 { fun mul_assign(&mut self, rhs: Self) { *self *= rhs; } }
 
-impl DivAssign for i8 {}
-impl DivAssign for i16 {}
-impl DivAssign for i32 {}
-impl DivAssign for i64 {}
-impl DivAssign for i128 {}
-impl DivAssign for isize {}
-impl DivAssign for u8 {}
-impl DivAssign for u16 {}
-impl DivAssign for u32 {}
-impl DivAssign for u64 {}
-impl DivAssign for u128 {}
-impl DivAssign for usize {}
-impl DivAssign for f16 {}
-impl DivAssign for f32 {}
-impl DivAssign for f64 {}
-impl DivAssign for f128 {}
+impl DivAssign for i8 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for i16 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for i32 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for i64 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for i128 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for isize { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for u8 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for u16 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for u32 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for u64 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for u128 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for usize { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for f16 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for f32 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for f64 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
+impl DivAssign for f128 { fun div_assign(&mut self, rhs: Self) { *self /= rhs; } }
 
-impl RemAssign for i8 {}
-impl RemAssign for i16 {}
-impl RemAssign for i32 {}
-impl RemAssign for i64 {}
-impl RemAssign for i128 {}
-impl RemAssign for isize {}
-impl RemAssign for u8 {}
-impl RemAssign for u16 {}
-impl RemAssign for u32 {}
-impl RemAssign for u64 {}
-impl RemAssign for u128 {}
-impl RemAssign for usize {}
-impl RemAssign for f16 {}
-impl RemAssign for f32 {}
-impl RemAssign for f64 {}
-impl RemAssign for f128 {}
+impl RemAssign for i8 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for i16 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for i32 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for i64 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for i128 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for isize { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for u8 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for u16 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for u32 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for u64 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for u128 { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
+impl RemAssign for usize { fun rem_assign(&mut self, rhs: Self) { *self %= rhs; } }
 
-impl BitAndAssign for bool {}
-impl BitAndAssign for i8 {}
-impl BitAndAssign for i16 {}
-impl BitAndAssign for i32 {}
-impl BitAndAssign for i64 {}
-impl BitAndAssign for i128 {}
-impl BitAndAssign for isize {}
-impl BitAndAssign for u8 {}
-impl BitAndAssign for u16 {}
-impl BitAndAssign for u32 {}
-impl BitAndAssign for u64 {}
-impl BitAndAssign for u128 {}
-impl BitAndAssign for usize {}
+impl BitAndAssign for bool { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for i8 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for i16 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for i32 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for i64 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for i128 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for isize { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for u8 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for u16 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for u32 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for u64 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for u128 { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
+impl BitAndAssign for usize { fun bitand_assign(&mut self, rhs: Self) { *self &= rhs; } }
 
-impl BitOrAssign for bool {}
-impl BitOrAssign for i8 {}
-impl BitOrAssign for i16 {}
-impl BitOrAssign for i32 {}
-impl BitOrAssign for i64 {}
-impl BitOrAssign for i128 {}
-impl BitOrAssign for isize {}
-impl BitOrAssign for u8 {}
-impl BitOrAssign for u16 {}
-impl BitOrAssign for u32 {}
-impl BitOrAssign for u64 {}
-impl BitOrAssign for u128 {}
-impl BitOrAssign for usize {}
+impl BitOrAssign for bool { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for i8 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for i16 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for i32 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for i64 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for i128 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for isize { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for u8 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for u16 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for u32 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for u64 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for u128 { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
+impl BitOrAssign for usize { fun bitor_assign(&mut self, rhs: Self) { *self |= rhs; } }
 
-impl BitXorAssign for bool {}
-impl BitXorAssign for i8 {}
-impl BitXorAssign for i16 {}
-impl BitXorAssign for i32 {}
-impl BitXorAssign for i64 {}
-impl BitXorAssign for i128 {}
-impl BitXorAssign for isize {}
-impl BitXorAssign for u8 {}
-impl BitXorAssign for u16 {}
-impl BitXorAssign for u32 {}
-impl BitXorAssign for u64 {}
-impl BitXorAssign for u128 {}
-impl BitXorAssign for usize {}
+impl BitXorAssign for bool { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for i8 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for i16 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for i32 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for i64 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for i128 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for isize { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for u8 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for u16 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for u32 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for u64 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for u128 { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
+impl BitXorAssign for usize { fun bitxor_assign(&mut self, rhs: Self) { *self ^= rhs; } }
 
-impl ShlAssign for i8 {}
-impl ShlAssign for i16 {}
-impl ShlAssign for i32 {}
-impl ShlAssign for i64 {}
-impl ShlAssign for i128 {}
-impl ShlAssign for isize {}
-impl ShlAssign for u8 {}
-impl ShlAssign for u16 {}
-impl ShlAssign for u32 {}
-impl ShlAssign for u64 {}
-impl ShlAssign for u128 {}
-impl ShlAssign for usize {}
+impl ShlAssign for i8 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for i16 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for i32 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for i64 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for i128 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for isize { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for u8 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for u16 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for u32 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for u64 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for u128 { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
+impl ShlAssign for usize { fun shl_assign(&mut self, rhs: Self) { *self <<= rhs; } }
 
-impl ShrAssign for i8 {}
-impl ShrAssign for i16 {}
-impl ShrAssign for i32 {}
-impl ShrAssign for i64 {}
-impl ShrAssign for i128 {}
-impl ShrAssign for isize {}
-impl ShrAssign for u8 {}
-impl ShrAssign for u16 {}
-impl ShrAssign for u32 {}
-impl ShrAssign for u64 {}
-impl ShrAssign for u128 {}
-impl ShrAssign for usize {}
+impl ShrAssign for i8 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for i16 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for i32 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for i64 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for i128 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for isize { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for u8 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for u16 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for u32 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for u64 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for u128 { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }
+impl ShrAssign for usize { fun shr_assign(&mut self, rhs: Self) { *self >>= rhs; } }

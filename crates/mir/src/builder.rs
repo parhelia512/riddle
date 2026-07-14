@@ -119,6 +119,10 @@ impl<'f> Builder<'f> {
         self.emit(InstKind::StructValue(fields), ty)
     }
 
+    pub fn sparse_struct_value(&mut self, fields: Vec<(usize, Value)>, ty: Type) -> Value {
+        self.emit(InstKind::SparseStructValue(fields), ty)
+    }
+
     pub fn array_value(&mut self, elements: Vec<Value>, ty: Type) -> Value {
         self.emit(InstKind::ArrayValue(elements), ty)
     }
@@ -152,12 +156,16 @@ impl<'f> Builder<'f> {
             .set_terminator(self.current_block, Terminator::Return(value));
     }
 
-    /// Returns true if the current block still has the default Return(None)
-    /// terminator — meaning no explicit return has been set yet.
+    pub fn set_unreachable(&mut self) {
+        self.func
+            .set_terminator(self.current_block, Terminator::Unreachable);
+    }
+
+    /// Returns true if the current block has no terminator yet.
     pub fn needs_return(&self) -> bool {
         matches!(
             self.func.blocks[self.current_block].terminator,
-            Terminator::Return(None)
+            Terminator::Pending
         )
     }
 

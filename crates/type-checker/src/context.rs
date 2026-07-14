@@ -17,6 +17,7 @@ pub(crate) struct BodyCtx<'a> {
     pub(crate) generic_params: HashMap<String, Type>,
     pub(crate) locals: HashMap<StmtId, (Type, bool)>,
     pub(crate) bindings: ScopedBindings,
+    pub(crate) loop_depth: usize,
     source_map: &'a SourceMap,
 }
 
@@ -38,6 +39,7 @@ impl<'a> BodyCtx<'a> {
             generic_params,
             locals: HashMap::new(),
             bindings: ScopedBindings::default(),
+            loop_depth: 0,
             source_map: &body.source_map,
         }
     }

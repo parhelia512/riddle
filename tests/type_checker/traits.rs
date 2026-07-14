@@ -913,6 +913,98 @@ fn rejects_bounds_outside_function_generics_for_now() {
 }
 
 #[test]
+fn accepts_for_loop_over_generic_into_iterator_bound() {
+    let result = check(
+        r#"
+        enum Option<T> { Some(T), None }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct Counter { current: i32 }
+
+        impl Iterator for Counter {
+            type Item = i32;
+            fun next(&mut self) -> Option<Self::Item> { Option::None }
+        }
+
+        impl IntoIterator for Counter {
+            type Item = i32;
+            type IntoIter = Counter;
+            fun into_iter(self) -> Self::IntoIter { self }
+        }
+
+        fun consume<T: IntoIterator<Item = i32, IntoIter = Counter>>(values: T) {
+            for value in values {
+                let next = value + 1;
+            }
+        }
+
+        fun main() {
+            consume(Counter { current: 0 });
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn rejects_iterator_next_with_non_option_result() {
+    let result = check(
+        r#"
+        enum Option<T> { Some(T), None }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> bool;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct Counter { current: i32 }
+
+        impl Iterator for Counter {
+            type Item = i32;
+            fun next(&mut self) -> bool { false }
+        }
+
+        impl IntoIterator for Counter {
+            type Item = i32;
+            type IntoIter = Counter;
+            fun into_iter(self) -> Self::IntoIter { self }
+        }
+
+        fun main() {
+            let counter = Counter { current: 0 };
+            for value in counter {
+                let next = value + 1;
+            }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message.contains("Iterator::next"))
+    );
+}
+
+#[test]
 fn accepts_outer_attributes_on_common_ast_nodes() {
     let result = check(
         r#"

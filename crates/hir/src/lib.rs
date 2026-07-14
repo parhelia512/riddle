@@ -135,7 +135,11 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
                 items.push(TopLevelItem::Impl(iid));
             }
 
-            ast::Stmt::VarDecl(_) | ast::Stmt::ReturnStmt(_) | ast::Stmt::ExprStmt(_) => {}
+            ast::Stmt::VarDecl(_)
+            | ast::Stmt::BreakStmt(_)
+            | ast::Stmt::ContinueStmt(_)
+            | ast::Stmt::ReturnStmt(_)
+            | ast::Stmt::ExprStmt(_) => {}
         }
     }
     items

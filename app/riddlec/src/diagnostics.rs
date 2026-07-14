@@ -1,27 +1,40 @@
 use std::io::{self, Write};
 
-use crate::pipeline::{CompileResult, DiagnosticExt, IntoDiagnosticExt};
+use crate::pipeline::{CompileResult, DiagnosticExt, IntoDiagnosticExt, LoadedSource};
 
 /// Print diagnostics to stderr in rustc-inspired format.
 /// Returns the error count.
 pub fn report(result: &CompileResult, source: Option<&str>, source_name: &str) -> usize {
     let mut stderr = io::stderr();
+    report_with(result, |diagnostic, stage| {
+        print_rust_style(&mut stderr, source, source_name, diagnostic, stage)
+    })
+}
+
+pub fn report_mapped(result: &CompileResult, source: &LoadedSource, source_name: &str) -> usize {
+    let mut stderr = io::stderr();
+    report_with(result, |diagnostic, stage| {
+        print_mapped(&mut stderr, source, source_name, diagnostic, stage)
+    })
+}
+
+fn report_with(result: &CompileResult, mut emit: impl FnMut(&DiagnosticExt, &str)) -> usize {
     let mut count = 0;
 
     for e in &result.parse_errors {
-        print_rust_style(&mut stderr, source, source_name, &e.to_ext(), "parse error");
+        emit(&e.to_ext(), "parse error");
         count += 1;
     }
 
     for d in &result.hir_diagnostics {
-        print_rust_style(&mut stderr, source, source_name, &d.to_ext(), "hir error");
+        emit(&d.to_ext(), "hir error");
         if d.severity == type_checker::Severity::Error {
             count += 1;
         }
     }
 
     for d in &result.type_result.diagnostics {
-        print_rust_style(&mut stderr, source, source_name, &d.to_ext(), "type error");
+        emit(&d.to_ext(), "type error");
         if d.severity == type_checker::Severity::Error {
             count += 1;
         }
@@ -33,13 +46,66 @@ pub fn report(result: &CompileResult, source: Option<&str>, source_name: &str) -
             "E0200" => "escape",
             _ => "analysis",
         };
-        print_rust_style(&mut stderr, source, source_name, &d.to_ext(), stage);
+        emit(&d.to_ext(), stage);
         if d.severity == type_checker::Severity::Error {
             count += 1;
         }
     }
 
     count
+}
+
+fn print_mapped(
+    out: &mut impl Write,
+    source: &LoadedSource,
+    source_name: &str,
+    diagnostic: &DiagnosticExt,
+    stage: &str,
+) {
+    let Some(primary) = diagnostic
+        .labels
+        .first()
+        .and_then(|label| source.source_map.map_range(label.range))
+    else {
+        print_rust_style(out, Some(&source.source), source_name, diagnostic, stage);
+        return;
+    };
+
+    let mut mapped = diagnostic.clone();
+    mapped.labels = diagnostic
+        .labels
+        .iter()
+        .filter_map(|label| {
+            let location = source.source_map.map_range(label.range)?;
+            (location.path == primary.path).then(|| type_checker::SourceLabel {
+                range: location.range,
+                message: label.message.clone(),
+                style: label.style,
+            })
+        })
+        .collect();
+    for label in diagnostic.labels.iter().skip(1) {
+        let Some(location) = source.source_map.map_range(label.range) else {
+            continue;
+        };
+        if location.path != primary.path && !label.message.is_empty() {
+            let line_col = offset_to_line_col(location.source, location.range.start());
+            mapped.notes.push(format!(
+                "{}:{}:{}: {}",
+                location.path.display(),
+                line_col.line,
+                line_col.col,
+                label.message
+            ));
+        }
+    }
+    print_rust_style(
+        out,
+        Some(primary.source),
+        &primary.path.display().to_string(),
+        &mapped,
+        stage,
+    );
 }
 
 pub fn report_verbose(result: &CompileResult, _source: Option<&str>, _source_name: &str) {
@@ -110,7 +176,7 @@ fn print_rust_style(
     };
 
     // Header
-    let _ = write!(out, "{severity_str}[{code}]: {}\n", d.message);
+    let _ = writeln!(out, "{severity_str}[{code}]: {}", d.message);
 
     // Primary label — show source context
     if let (Some(source), Some(primary)) = (source, d.labels.first()) {
@@ -245,8 +311,8 @@ fn annotate_source(source: &str, labels: &[type_checker::SourceLabel]) -> String
                 let end = if end_byte == 0 { line_len } else { end_byte };
                 // Clamp start to line bounds — CST ranges can include leading trivia
                 let start = start_byte.min(line_len);
-                for i in start..end.min(line_len) {
-                    markers[i] = if is_primary { b'^' } else { b'-' };
+                for marker in markers.iter_mut().take(end.min(line_len)).skip(start) {
+                    *marker = if is_primary { b'^' } else { b'-' };
                 }
             }
 

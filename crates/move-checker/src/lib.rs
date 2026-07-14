@@ -98,29 +98,29 @@ impl<'a> Analyzer<'a> {
             | Expr::BoolLiteral { .. } => {}
 
             Expr::Path { path, resolved } => {
-                if let Some(name) = path.as_single_name() {
-                    if let Some(moved) = ctx.bindings.get(&name.0) {
-                        if *moved {
-                            let extra = resolved
-                                .as_ref()
-                                .and_then(|resolved| {
-                                    if let ResolvedName::Local(stmt) = resolved {
-                                        let p = Place::root(*stmt);
-                                        Some(self.move_site_labels(ctx, &p))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or_default();
-                            self.diag_with_labels(
-                                format!("use of moved value: `{}`", name.0),
-                                span,
-                                "E0100",
-                                &extra,
-                            );
-                        }
-                        return;
+                if let Some(name) = path.as_single_name()
+                    && let Some(moved) = ctx.bindings.get(&name.0)
+                {
+                    if *moved {
+                        let extra = resolved
+                            .as_ref()
+                            .and_then(|resolved| {
+                                if let ResolvedName::Local(stmt) = resolved {
+                                    let p = Place::root(*stmt);
+                                    Some(self.move_site_labels(ctx, &p))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        self.diag_with_labels(
+                            format!("use of moved value: `{}`", name.0),
+                            span,
+                            "E0100",
+                            &extra,
+                        );
                     }
+                    return;
                 }
                 if let Some(ResolvedName::Local(stmt)) = resolved {
                     let place = Place::root(*stmt);
@@ -148,17 +148,16 @@ impl<'a> Analyzer<'a> {
                 self.move_check_expr(ctx, *lhs);
                 self.move_check_expr(ctx, *rhs);
                 if op.is_assignment() {
-                    if let Some(lhs_place) = self.place_from_expr(ctx, *lhs) {
-                        if !ctx.escaping_locals.contains(&lhs_place.local) {
-                            if self.has_any_borrow(ctx, &lhs_place) {
-                                let name = self.expr_name(ctx, *lhs);
-                                self.diag(
-                                    format!("cannot assign to `{}` while borrowed", name),
-                                    span,
-                                    "E0303",
-                                );
-                            }
-                        }
+                    if let Some(lhs_place) = self.place_from_expr(ctx, *lhs)
+                        && !ctx.escaping_locals.contains(&lhs_place.local)
+                        && self.has_any_borrow(ctx, &lhs_place)
+                    {
+                        let name = self.expr_name(ctx, *lhs);
+                        self.diag(
+                            format!("cannot assign to `{}` while borrowed", name),
+                            span,
+                            "E0303",
+                        );
                     }
                     self.consume_if_local(ctx, *rhs);
                 }
@@ -168,46 +167,48 @@ impl<'a> Analyzer<'a> {
                 self.move_check_expr(ctx, *operand);
                 match op {
                     UnaryOp::Ref | UnaryOp::MutRef => {
-                        if let Some(place) = self.place_from_expr(ctx, *operand) {
-                            if !ctx.escaping_locals.contains(&place.local) {
-                                if *op == UnaryOp::Ref {
-                                    if self.has_mut_borrow(ctx, &place) {
-                                        let name = self.expr_name(ctx, *operand);
-                                        self.diag(
-                                            format!("cannot borrow `{}` as immutable because it is also borrowed as mutable", name),
-                                            span,
-                                            "E0301",
-                                        );
-                                    } else {
-                                        ctx.shared_borrows.entry(place).or_default().push(
-                                            BorrowRecord {
-                                                scope_depth: ctx.scope_depth,
-                                            },
-                                        );
-                                    }
+                        if let Some(place) = self.place_from_expr(ctx, *operand)
+                            && !ctx.escaping_locals.contains(&place.local)
+                        {
+                            if *op == UnaryOp::Ref {
+                                if self.has_mut_borrow(ctx, &place) {
+                                    let name = self.expr_name(ctx, *operand);
+                                    self.diag(
+                                        format!("cannot borrow `{}` as immutable because it is also borrowed as mutable", name),
+                                        span,
+                                        "E0301",
+                                    );
                                 } else {
-                                    if self.has_shared_borrow(ctx, &place) {
-                                        let name = self.expr_name(ctx, *operand);
-                                        self.diag(
-                                            format!("cannot borrow `{}` as mutable because it is also borrowed as immutable", name),
-                                            span,
-                                            "E0300",
-                                        );
-                                    } else if self.has_mut_borrow(ctx, &place) {
-                                        let name = self.expr_name(ctx, *operand);
-                                        self.diag(
-                                            format!("cannot borrow `{}` as mutable more than once at a time", name),
-                                            span,
-                                            "E0302",
-                                        );
-                                    } else {
-                                        ctx.mutable_borrows.entry(place).or_default().push(
-                                            BorrowRecord {
-                                                scope_depth: ctx.scope_depth,
-                                            },
-                                        );
-                                    }
+                                    ctx.shared_borrows.entry(place).or_default().push(
+                                        BorrowRecord {
+                                            scope_depth: ctx.scope_depth,
+                                        },
+                                    );
                                 }
+                            } else if self.has_shared_borrow(ctx, &place) {
+                                let name = self.expr_name(ctx, *operand);
+                                self.diag(
+                                    format!("cannot borrow `{}` as mutable because it is also borrowed as immutable", name),
+                                    span,
+                                    "E0300",
+                                );
+                            } else if self.has_mut_borrow(ctx, &place) {
+                                let name = self.expr_name(ctx, *operand);
+                                self.diag(
+                                    format!(
+                                        "cannot borrow `{}` as mutable more than once at a time",
+                                        name
+                                    ),
+                                    span,
+                                    "E0302",
+                                );
+                            } else {
+                                ctx.mutable_borrows
+                                    .entry(place)
+                                    .or_default()
+                                    .push(BorrowRecord {
+                                        scope_depth: ctx.scope_depth,
+                                    });
                             }
                         }
                     }
@@ -285,19 +286,18 @@ impl<'a> Analyzer<'a> {
             }
 
             Expr::Call { callee, args } => {
-                if let Expr::FieldAccess { base, .. } = &ctx.body.exprs[*callee] {
-                    if let Some(place) = self.place_from_expr(ctx, *base) {
-                        if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
-                            let extra = self.move_site_labels(ctx, &place);
-                            let label = self.expr_name(ctx, *base);
-                            self.diag_with_labels(
-                                format!("use of moved value: `{}`", label),
-                                span,
-                                "E0100",
-                                &extra,
-                            );
-                        }
-                    }
+                if let Expr::FieldAccess { base, .. } = &ctx.body.exprs[*callee]
+                    && let Some(place) = self.place_from_expr(ctx, *base)
+                    && ctx.moved_places.iter().any(|m| place_overlaps(m, &place))
+                {
+                    let extra = self.move_site_labels(ctx, &place);
+                    let label = self.expr_name(ctx, *base);
+                    self.diag_with_labels(
+                        format!("use of moved value: `{}`", label),
+                        span,
+                        "E0100",
+                        &extra,
+                    );
                 }
                 self.move_check_expr(ctx, *callee);
                 for arg in args {
@@ -324,32 +324,32 @@ impl<'a> Analyzer<'a> {
                 if !base_moved {
                     self.move_check_expr(ctx, *base);
                 }
-                if let Some(place) = self.place_from_expr(ctx, expr_id) {
-                    if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
-                        let extra = self.move_site_labels(ctx, &place);
-                        self.diag_with_labels(
-                            format!("use of moved field: `{}`", field.0),
-                            span,
-                            "E0100",
-                            &extra,
-                        );
-                    }
+                if let Some(place) = self.place_from_expr(ctx, expr_id)
+                    && ctx.moved_places.iter().any(|m| place_overlaps(m, &place))
+                {
+                    let extra = self.move_site_labels(ctx, &place);
+                    self.diag_with_labels(
+                        format!("use of moved field: `{}`", field.0),
+                        span,
+                        "E0100",
+                        &extra,
+                    );
                 }
             }
 
             Expr::IndexAccess { base, index } => {
                 self.move_check_expr(ctx, *base);
                 self.move_check_expr(ctx, *index);
-                if let Some(place) = self.place_from_expr(ctx, expr_id) {
-                    if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
-                        let extra = self.move_site_labels(ctx, &place);
-                        self.diag_with_labels(
-                            "use of moved value from array".into(),
-                            span,
-                            "E0100",
-                            &extra,
-                        );
-                    }
+                if let Some(place) = self.place_from_expr(ctx, expr_id)
+                    && ctx.moved_places.iter().any(|m| place_overlaps(m, &place))
+                {
+                    let extra = self.move_site_labels(ctx, &place);
+                    self.diag_with_labels(
+                        "use of moved value from array".into(),
+                        span,
+                        "E0100",
+                        &extra,
+                    );
                 }
             }
         }
@@ -371,32 +371,32 @@ impl<'a> Analyzer<'a> {
                     self.consume_if_local(ctx, *v);
                 }
             }
+            Stmt::Break | Stmt::Continue => {}
             Stmt::Item { .. } => {}
         }
     }
 
     fn consume_if_local(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
-        if let Expr::Path { path, resolved } = &ctx.body.exprs[expr_id] {
-            if let Some(name) = path.as_single_name() {
-                if ctx.bindings.contains(&name.0) {
-                    let ty = self
-                        .type_result
-                        .expr_types
-                        .get(&(ctx.body_id, expr_id))
-                        .cloned()
-                        .unwrap_or(Type::Unknown);
-                    if !self.trait_env.type_is_copy(&ty) {
-                        ctx.bindings.mark_moved(&name.0);
-                        // Record move site for secondary label.
-                        let span = ctx.expr_range(expr_id);
-                        if let Some(ResolvedName::Local(stmt)) = resolved {
-                            let p = Place::root(*stmt);
-                            ctx.moved_sites.insert(p, (span, "value moved here".into()));
-                        }
-                    }
-                    return;
+        if let Expr::Path { path, resolved } = &ctx.body.exprs[expr_id]
+            && let Some(name) = path.as_single_name()
+            && ctx.bindings.contains(&name.0)
+        {
+            let ty = self
+                .type_result
+                .expr_types
+                .get(&(ctx.body_id, expr_id))
+                .cloned()
+                .unwrap_or(Type::Unknown);
+            if !self.trait_env.type_is_copy(&ty) {
+                ctx.bindings.mark_moved(&name.0);
+                // Record move site for secondary label.
+                let span = ctx.expr_range(expr_id);
+                if let Some(ResolvedName::Local(stmt)) = resolved {
+                    let p = Place::root(*stmt);
+                    ctx.moved_sites.insert(p, (span, "value moved here".into()));
                 }
             }
+            return;
         }
 
         let Some(place) = self.place_from_expr(ctx, expr_id) else {
@@ -411,16 +411,14 @@ impl<'a> Analyzer<'a> {
         if self.trait_env.type_is_copy(&ty) {
             return;
         }
-        if !ctx.escaping_locals.contains(&place.local) {
-            if self.has_any_borrow(ctx, &place) {
-                let name = self.expr_name(ctx, expr_id);
-                self.diag(
-                    format!("cannot move `{}` while borrowed", name),
-                    ctx.expr_range(expr_id),
-                    "E0304",
-                );
-                return;
-            }
+        if !ctx.escaping_locals.contains(&place.local) && self.has_any_borrow(ctx, &place) {
+            let name = self.expr_name(ctx, expr_id);
+            self.diag(
+                format!("cannot move `{}` while borrowed", name),
+                ctx.expr_range(expr_id),
+                "E0304",
+            );
+            return;
         }
         ctx.moved_places.insert(place.clone());
         let span = ctx.expr_range(expr_id);
@@ -551,11 +549,10 @@ impl<'a> Analyzer<'a> {
             }
         }
         match best {
-            Some((_, &(ref span, ref desc))) => match span {
-                Some(range) => vec![(*range, desc.clone(), LabelStyle::Secondary)],
-                None => vec![],
-            },
-            None => vec![],
+            Some((_, (Some(range), desc))) => {
+                vec![(*range, desc.clone(), LabelStyle::Secondary)]
+            }
+            _ => vec![],
         }
     }
 

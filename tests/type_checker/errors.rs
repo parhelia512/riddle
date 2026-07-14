@@ -35,6 +35,146 @@ fn reports_return_type_mismatch() {
 }
 
 #[test]
+fn reports_missing_return_path() {
+    let result = check(
+        r#"
+        fun choose(flag: bool) -> i32 {
+            if flag {
+                return 1;
+            }
+            let done = true;
+        }
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("function return type mismatch")),
+        "{msgs:#?}"
+    );
+}
+
+#[test]
+fn accepts_functions_when_every_path_returns() {
+    let result = check(
+        r#"
+        fun choose(flag: bool) -> i32 {
+            if flag {
+                return 1;
+            } else {
+                return 2;
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_returning_and_value_branches_together() {
+    let result = check(
+        r#"
+        fun choose(flag: bool) -> i32 {
+            if flag {
+                return 1;
+            } else {
+                2
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn validates_break_and_continue_loop_context() {
+    let result = check(
+        r#"
+        fun valid() {
+            while true {
+                if true {
+                    continue;
+                }
+                break;
+            }
+
+            for item in [1, 2, 3] {
+                continue;
+                break;
+            }
+        }
+
+        fun invalid() {
+            break;
+            continue;
+        }
+        "#,
+    );
+
+    let diagnostics = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0042")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2, "{:#?}", result.diagnostics);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("`break`"))
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("`continue`"))
+    );
+}
+
+#[test]
+fn checks_boolean_match_return_paths() {
+    let complete = check(
+        r#"
+        fun choose(flag: bool) -> i32 {
+            match flag {
+                true => { return 1; },
+                false => { return 2; },
+            }
+        }
+        "#,
+    );
+    assert_eq!(complete.diagnostics, vec![]);
+
+    let incomplete = check(
+        r#"
+        fun choose(flag: bool) -> i32 {
+            match flag {
+                true => { return 1; },
+            }
+        }
+        "#,
+    );
+    assert!(
+        incomplete
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code == "E0039")
+    );
+
+    let integer = check(
+        r#"
+        fun choose(value: i32) -> i32 {
+            match value {
+                1 => { return 1; },
+            }
+        }
+        "#,
+    );
+    assert!(integer.diagnostics.iter().any(|diag| diag.code == "E0039"));
+}
+
+#[test]
 fn checks_function_call_arguments() {
     let result = check(
         r#"

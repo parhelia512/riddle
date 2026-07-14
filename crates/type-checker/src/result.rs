@@ -70,8 +70,10 @@ pub struct OperatorCall {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForLoopInfo {
-    pub into_iter: FunctionId,
-    pub next: FunctionId,
+    pub into_iter: TraitMethodCall,
+    pub next: TraitMethodCall,
     pub item_ty: Type,
     pub iter_ty: Type,
+    pub next_ty: Type,
+    pub some_variant: usize,
 }

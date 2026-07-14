@@ -1,5 +1,10 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+    process,
+    sync::Mutex,
+};
 
 use frontend::syntax_kind::SyntaxKind;
 use hir::body::{Expr, ResolvedName, Stmt};
@@ -12,7 +17,7 @@ use lsp_types::{
     SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
     TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
-use riddlec::pipeline::{CompileResult, DiagnosticExt, IntoDiagnosticExt};
+use riddlec::pipeline::{CompileOptions, CompileResult, DiagnosticExt, IntoDiagnosticExt};
 use rowan::TextRange;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -21,6 +26,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 struct Backend {
     client: Client,
     docs: Mutex<HashMap<lsp_types::Url, Document>>,
+    compile_options: CompileOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +76,8 @@ impl LanguageServer for Backend {
             text: params.text_document.text,
             version: Some(params.text_document.version),
         };
-        self.docs.lock().unwrap().insert(uri.clone(), doc.clone());
-        self.publish(uri, doc).await;
+        self.docs.lock().unwrap().insert(uri, doc);
+        self.publish_all().await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -83,14 +89,15 @@ impl LanguageServer for Backend {
             text,
             version: Some(params.text_document.version),
         };
-        self.docs.lock().unwrap().insert(uri.clone(), doc.clone());
-        self.publish(uri, doc).await;
+        self.docs.lock().unwrap().insert(uri, doc);
+        self.publish_all().await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.docs.lock().unwrap().remove(&uri);
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        self.publish_all().await;
     }
 
     async fn semantic_tokens_full(
@@ -106,17 +113,23 @@ impl LanguageServer for Backend {
             .map(|doc| doc.text.clone())
             .unwrap_or_default();
 
-        Ok(Some(SemanticTokensResult::Tokens(semantic_tokens(&text))))
+        Ok(Some(SemanticTokensResult::Tokens(
+            semantic_tokens_with_options(&text, self.compile_options),
+        )))
     }
 }
 
 impl Backend {
-    async fn publish(&self, uri: lsp_types::Url, doc: Document) {
-        let result = riddlec::pipeline::compile(&doc.text);
-        let diagnostics = collect_diagnostics(&uri, &doc.text, &result);
-        self.client
-            .publish_diagnostics(uri, diagnostics, doc.version)
-            .await;
+    async fn publish_all(&self) {
+        let docs = self.docs.lock().unwrap().clone();
+        // ponytail: recompile each open document; group by project if latency becomes measurable.
+        for (uri, doc) in &docs {
+            let diagnostics =
+                collect_document_diagnostics(uri, &doc.text, &docs, self.compile_options);
+            self.client
+                .publish_diagnostics(uri.clone(), diagnostics, doc.version)
+                .await;
+        }
     }
 }
 
@@ -134,21 +147,156 @@ fn collect_diagnostics(
     result: &CompileResult,
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-
-    for diagnostic in &result.parse_errors {
-        out.push(to_lsp(uri, source, diagnostic.to_ext()));
+    for diagnostic in diagnostic_exts(result) {
+        push_diagnostic(&mut out, uri, source, diagnostic);
     }
-    for diagnostic in &result.hir_diagnostics {
-        out.push(to_lsp(uri, source, diagnostic.to_ext()));
-    }
-    for diagnostic in &result.type_result.diagnostics {
-        out.push(to_lsp(uri, source, diagnostic.to_ext()));
-    }
-    for diagnostic in &result.analysis_diagnostics {
-        out.push(to_lsp(uri, source, diagnostic.to_ext()));
-    }
-
     out
+}
+
+fn collect_document_diagnostics(
+    uri: &lsp_types::Url,
+    source: &str,
+    docs: &HashMap<lsp_types::Url, Document>,
+    options: CompileOptions,
+) -> Vec<Diagnostic> {
+    let Ok(path) = uri.to_file_path() else {
+        let result = riddlec::pipeline::compile_with_options(source, options);
+        return collect_diagnostics(uri, source, &result);
+    };
+    let Some(root) = clue::find_project_root(&path) else {
+        let result = riddlec::pipeline::compile_with_options(source, options);
+        return collect_diagnostics(uri, source, &result);
+    };
+    let overlays = docs
+        .iter()
+        .filter_map(|(uri, document)| {
+            uri.to_file_path()
+                .ok()
+                .map(|path| (path, document.text.clone()))
+        })
+        .collect::<HashMap<PathBuf, String>>();
+    let analysis = match clue::analyze_project_with_options(&root, &overlays, options) {
+        Ok(analysis) => analysis,
+        Err(error) => return vec![project_error(error)],
+    };
+    let Ok(path) = fs::canonicalize(path) else {
+        return Vec::new();
+    };
+    if !analysis.source.source_map.contains_file(&path) {
+        let result = riddlec::pipeline::compile_with_options(source, options);
+        return collect_diagnostics(uri, source, &result);
+    }
+
+    let entry = fs::canonicalize(&analysis.entry).ok();
+    diagnostic_exts(&analysis.result)
+        .filter_map(|diagnostic| {
+            if diagnostic.labels.is_empty() && entry.as_deref() == Some(path.as_path()) {
+                return Some(to_lsp(uri, source, diagnostic));
+            }
+            to_lsp_mapped(&path, &analysis.source.source_map, diagnostic)
+        })
+        .collect()
+}
+
+fn diagnostic_exts(result: &CompileResult) -> impl Iterator<Item = DiagnosticExt> + '_ {
+    result
+        .parse_errors
+        .iter()
+        .map(IntoDiagnosticExt::to_ext)
+        .chain(result.hir_diagnostics.iter().map(IntoDiagnosticExt::to_ext))
+        .chain(
+            result
+                .type_result
+                .diagnostics
+                .iter()
+                .map(IntoDiagnosticExt::to_ext),
+        )
+        .chain(
+            result
+                .analysis_diagnostics
+                .iter()
+                .map(IntoDiagnosticExt::to_ext),
+        )
+}
+
+fn to_lsp_mapped(
+    current_path: &Path,
+    source_map: &riddlec::pipeline::SourceMap,
+    diagnostic: DiagnosticExt,
+) -> Option<Diagnostic> {
+    let primary = diagnostic
+        .labels
+        .first()
+        .and_then(|label| source_map.map_range(label.range))?;
+    if primary.path != current_path {
+        return None;
+    }
+
+    let mut message = diagnostic.message;
+    if let Some(help) = diagnostic.help {
+        message.push_str("\nhelp: ");
+        message.push_str(&help);
+    }
+    for note in diagnostic.notes {
+        message.push_str("\nnote: ");
+        message.push_str(&note);
+    }
+    let related_information = diagnostic
+        .labels
+        .iter()
+        .skip(1)
+        .filter(|label| !label.message.is_empty())
+        .filter_map(|label| {
+            let mapped = source_map.map_range(label.range)?;
+            let uri = lsp_types::Url::from_file_path(mapped.path).ok()?;
+            Some(DiagnosticRelatedInformation {
+                location: Location::new(uri, range(mapped.source, mapped.range)),
+                message: label.message.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Some(Diagnostic {
+        range: range(primary.source, primary.range),
+        severity: Some(severity(diagnostic.severity)),
+        code: (!diagnostic.code.is_empty()).then(|| NumberOrString::String(diagnostic.code.into())),
+        source: Some("riddle".into()),
+        message,
+        related_information: (!related_information.is_empty()).then_some(related_information),
+        ..Diagnostic::default()
+    })
+}
+
+fn project_error(error: impl std::fmt::Display) -> Diagnostic {
+    Diagnostic {
+        range: Range::default(),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("clue".into()),
+        message: error.to_string(),
+        ..Diagnostic::default()
+    }
+}
+
+fn push_diagnostic(
+    out: &mut Vec<Diagnostic>,
+    uri: &lsp_types::Url,
+    source: &str,
+    diagnostic: DiagnosticExt,
+) {
+    if diagnostic_in_source(source, &diagnostic) {
+        out.push(to_lsp(uri, source, diagnostic));
+    }
+}
+
+fn diagnostic_in_source(source: &str, diagnostic: &DiagnosticExt) -> bool {
+    diagnostic
+        .labels
+        .first()
+        .is_none_or(|label| range_in_source(source, label.range))
+}
+
+fn range_in_source(source: &str, range: TextRange) -> bool {
+    usize::from(range.end()) <= source.len()
 }
 
 fn to_lsp(uri: &lsp_types::Url, source: &str, diagnostic: DiagnosticExt) -> Diagnostic {
@@ -172,7 +320,7 @@ fn to_lsp(uri: &lsp_types::Url, source: &str, diagnostic: DiagnosticExt) -> Diag
         .labels
         .iter()
         .skip(1)
-        .filter(|label| !label.message.is_empty())
+        .filter(|label| !label.message.is_empty() && range_in_source(source, label.range))
         .map(|label| DiagnosticRelatedInformation {
             location: Location::new(uri.clone(), range(source, label.range)),
             message: label.message.clone(),
@@ -265,9 +413,14 @@ fn semantic_tokens_legend() -> SemanticTokensLegend {
     }
 }
 
+#[cfg(test)]
 fn semantic_tokens(source: &str) -> SemanticTokens {
+    semantic_tokens_with_options(source, CompileOptions::default())
+}
+
+fn semantic_tokens_with_options(source: &str, options: CompileOptions) -> SemanticTokens {
     let tokens = frontend::lexer::lex(source);
-    let result = riddlec::pipeline::compile(source);
+    let result = riddlec::pipeline::compile_with_options(source, options);
     let mut raw_tokens = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
@@ -303,6 +456,35 @@ fn semantic_tokens(source: &str) -> SemanticTokens {
     let mut raw_tokens = remove_overlapping_tokens(raw_tokens);
     raw_tokens.sort_by_key(|token| (token.range.start(), token.range.end()));
     encode_semantic_tokens(source, raw_tokens)
+}
+
+const USAGE: &str = "usage: riddle-lsp [--no-std]";
+
+struct Opts {
+    compile_options: CompileOptions,
+}
+
+fn parse_args(args: &[String]) -> std::result::Result<Opts, &'static str> {
+    let mut use_std = true;
+
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--no-std" => use_std = false,
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("riddle-lsp {}", riddlec::GIT_HASH);
+                process::exit(0);
+            }
+            _ => return Err("unknown flag"),
+        }
+    }
+
+    Ok(Opts {
+        compile_options: CompileOptions { use_std },
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -379,7 +561,7 @@ fn variable_modifiers_for_resolution(
 ) -> Option<u32> {
     match resolved {
         Some(ResolvedName::Local(stmt_id)) => match &body.stmts[*stmt_id] {
-            Stmt::Let { is_mut, .. } => Some((*is_mut).then_some(MOD_MUTABLE).unwrap_or(0)),
+            Stmt::Let { is_mut, .. } => Some(if *is_mut { MOD_MUTABLE } else { 0 }),
             _ => None,
         },
         Some(ResolvedName::Param(_)) => Some(0),
@@ -483,7 +665,7 @@ fn semantic_token(
 fn ident_token_type(tokens: &[frontend::lexer::Token], index: usize, source: &str) -> Option<u32> {
     let previous = previous_significant(tokens, index).map(|token| token.kind);
     let next = next_significant(tokens, index).map(|token| token.kind);
-    let token_type = match previous {
+    match previous {
         Some(SyntaxKind::Fun) => Some(TOKEN_FUNCTION),
         Some(SyntaxKind::Struct) => Some(TOKEN_STRUCT),
         Some(SyntaxKind::Enum) => Some(TOKEN_ENUM),
@@ -500,8 +682,7 @@ fn ident_token_type(tokens: &[frontend::lexer::Token], index: usize, source: &st
         _ if next == Some(SyntaxKind::LParen) => Some(TOKEN_FUNCTION),
         _ if token_starts_uppercase(tokens[index].text(source)) => Some(TOKEN_TYPE),
         _ => None,
-    };
-    token_type
+    }
 }
 
 fn previous_significant(
@@ -536,6 +717,8 @@ fn is_keyword(kind: SyntaxKind) -> bool {
             | SyntaxKind::If
             | SyntaxKind::Else
             | SyntaxKind::While
+            | SyntaxKind::Break
+            | SyntaxKind::Continue
             | SyntaxKind::Return
             | SyntaxKind::As
             | SyntaxKind::SelfKw
@@ -598,9 +781,45 @@ fn is_operator(kind: SyntaxKind) -> bool {
     )
 }
 
+#[tokio::main]
+async fn main() {
+    let args = env::args().collect::<Vec<_>>();
+    let opts = match parse_args(&args) {
+        Ok(opts) => opts,
+        Err(msg) => {
+            eprintln!("riddle-lsp: {msg}");
+            eprintln!("{USAGE}");
+            process::exit(1);
+        }
+    };
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    let (service, socket) = LspService::new(|client| Backend {
+        client,
+        docs: Mutex::new(HashMap::new()),
+        compile_options: opts.compile_options,
+    });
+    Server::new(stdin, stdout, socket)
+        .concurrency_level(1)
+        .serve(service)
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "riddle-lsp-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn position_counts_utf16_columns() {
@@ -695,6 +914,116 @@ mod tests {
     }
 
     #[test]
+    fn collect_diagnostics_ignores_appended_std_diagnostics() {
+        let source = include_str!("../../../std/std/array.rid");
+        let result = riddlec::pipeline::compile(source);
+        let uri = lsp_types::Url::parse("file:///std/std/array.rid").unwrap();
+        let diagnostics = collect_diagnostics(&uri, source, &result);
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| !diagnostic
+                .message
+                .contains("expected IntoIter<T, N>, got IntoIter<T, N>")),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn project_diagnostics_use_unsaved_module_source() {
+        let root = temp_root("project-diagnostics");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Clue.toml"),
+            "[package]\nname = \"app\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.rid"),
+            "mod util;\nfun main() -> i32 { util::value() }\n",
+        )
+        .unwrap();
+        let util = root.join("src/util.rid");
+        fs::write(&util, "pub fun value() -> i32 { 1 }\n").unwrap();
+        let uri = lsp_types::Url::from_file_path(&util).unwrap();
+        let text = "pub fun value() -> i32 { missing }\n".to_string();
+        let docs = HashMap::from([(
+            uri.clone(),
+            Document {
+                text: text.clone(),
+                version: Some(1),
+            },
+        )]);
+
+        let diagnostics =
+            collect_document_diagnostics(&uri, &text, &docs, CompileOptions::default());
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unresolved name: `missing`")),
+            "{diagnostics:#?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_diagnostics_follow_peer_overlay_removal() {
+        let root = temp_root("peer-overlay-removal");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Clue.toml"),
+            "[package]\nname = \"app\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        let main = root.join("src/main.rid");
+        let main_text = "mod util;\nfun main() -> i32 { util::value() }\n".to_string();
+        fs::write(&main, &main_text).unwrap();
+        let util = root.join("src/util.rid");
+        fs::write(&util, "pub fun value() -> i32 { 1 }\n").unwrap();
+        let main_uri = lsp_types::Url::from_file_path(&main).unwrap();
+        let util_uri = lsp_types::Url::from_file_path(&util).unwrap();
+        let mut docs = HashMap::from([
+            (
+                main_uri.clone(),
+                Document {
+                    text: main_text.clone(),
+                    version: Some(1),
+                },
+            ),
+            (
+                util_uri.clone(),
+                Document {
+                    text: "pub fun other() -> i32 { 1 }\n".into(),
+                    version: Some(1),
+                },
+            ),
+        ]);
+
+        let stale =
+            collect_document_diagnostics(&main_uri, &main_text, &docs, CompileOptions::default());
+        assert!(
+            stale
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unresolved")),
+            "{stale:#?}"
+        );
+
+        docs.remove(&util_uri);
+        let refreshed =
+            collect_document_diagnostics(&main_uri, &main_text, &docs, CompileOptions::default());
+        assert!(refreshed.is_empty(), "{refreshed:#?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_args_accepts_no_std() {
+        let args = vec!["riddle-lsp".into(), "--no-std".into()];
+        let opts = parse_args(&args).unwrap();
+
+        assert!(!opts.compile_options.use_std);
+    }
+
+    #[test]
     fn semantic_tokens_place_local_declaration_and_use_on_identifier() {
         let source = "fun main() {\n  let mut foo_bar = 1; foo_bar;\n}";
         let tokens = semantic_token_positions(&semantic_tokens(source));
@@ -756,15 +1085,4 @@ mod tests {
             })
             .collect()
     }
-}
-
-#[tokio::main]
-async fn main() {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(|client| Backend {
-        client,
-        docs: Mutex::new(HashMap::new()),
-    });
-    Server::new(stdin, stdout, socket).serve(service).await;
 }

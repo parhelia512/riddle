@@ -30,6 +30,10 @@ pub enum SyntaxKind {
     Else,
     #[token("while")]
     While,
+    #[token("break")]
+    Break,
+    #[token("continue")]
+    Continue,
     #[token("return")]
     Return,
     #[token("as")]
@@ -205,6 +209,8 @@ pub enum SyntaxKind {
     IfStmt,
     WhileStmt,
     ForExpr,
+    BreakStmt,
+    ContinueStmt,
     ReturnStmt,
     Block,
     ExprStmt,
@@ -274,7 +280,7 @@ impl rowan::Language for RiddleLang {
         // Safe: #[repr(u16)] with sequential discriminants 0..=Eof are all valid
         if raw.0 <= SyntaxKind::Eof as u16 {
             // Safety: raw.0 is within the valid discriminant range
-            unsafe { std::mem::transmute(raw.0) }
+            unsafe { std::mem::transmute::<u16, SyntaxKind>(raw.0) }
         } else {
             SyntaxKind::ErrorNode
         }

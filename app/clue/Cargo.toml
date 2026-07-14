@@ -4,10 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-clap.workspace = true
-riddlec.workspace = true
-toml.workspace = true
-
-[[test]]
-name = "clue"
-path = "../../tests/clue/clue.rs"
+anyhow = "1.0"
+clap = { version = "4.6.1", features = ["derive"] }
+riddlec = { path = "../riddlec" }
+toml = "0.8"

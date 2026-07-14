@@ -5,8 +5,8 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-escape-analysis.workspace = true
-hir.workspace = true
-type-checker.workspace = true
-la-arena.workspace = true
-rowan.workspace = true
+escape-analysis = { path = "../escape-analysis" }
+hir = { path = "../hir" }
+la-arena = "0.3"
+rowan = "0.15"
+type-checker = { path = "../type-checker" }

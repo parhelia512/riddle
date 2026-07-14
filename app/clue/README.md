@@ -1,0 +1,51 @@
+# Clue
+
+Clue manages and builds Riddle projects.
+
+```bash
+# Initialize a directory without overwriting an existing manifest or entry file
+clue init <path> [--bin|--lib]
+
+# Create a project in a new directory
+clue new <path> [--bin|--lib]
+
+# Check the whole project without generating C
+clue check [path]
+
+# Generate .clue/build/<package>.c
+clue build [path]
+```
+
+Binary projects are the default. Clue supports local path dependencies declared in
+`Clue.toml`; it does not resolve registry, version, or git dependencies.
+Diagnostics from external modules and path dependencies point to their original
+source files. The Riddle LSP uses the same project loader, includes unsaved files,
+and refreshes diagnostics for every open document after a change.
+
+## Library API
+
+The crate exposes project operations plus project analysis for tools such as the LSP:
+
+```rust
+use clue::{ProjectKind, build, check, new};
+use std::path::Path;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new("hello");
+    new(root, ProjectKind::Binary)?;
+    check(root)?;
+    build(root)?;
+    Ok(())
+}
+```
+
+Use `init` instead of `new` to initialize an existing directory. Both functions
+refuse to overwrite an existing manifest or target entry file.
+
+## Source Layout
+
+- `main.rs`: CLI argument parsing and command dispatch
+- `lib.rs`: public project operations and analysis API
+- `project.rs`: project creation, templates, and dependency loading
+- `manifest.rs`: `Clue.toml` serialization and parsing
+- `build.rs`: compilation and build cache

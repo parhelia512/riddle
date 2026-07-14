@@ -142,7 +142,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 for stmt in stmts {
                     self.escape_check_stmt(ctx, *stmt);
                 }
-                tail.map_or(false, |t| ctx.escaping_exprs.contains(&t))
+                tail.is_some_and(|t| ctx.escaping_exprs.contains(&t))
             }
 
             Expr::Unary {
@@ -230,7 +230,7 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.mark_escaping_exprs(ctx, *eb);
                 }
                 let t = ctx.escaping_exprs.contains(then_branch);
-                let e = else_branch.map_or(false, |eb| ctx.escaping_exprs.contains(&eb));
+                let e = else_branch.is_some_and(|eb| ctx.escaping_exprs.contains(&eb));
                 t || e
             }
 
@@ -263,10 +263,9 @@ impl<'a> EscapeAnalyzer<'a> {
                     resolved: Some(ResolvedName::Local(stmt)),
                     ..
                 } = &ctx.body.exprs[*base]
+                    && let Some(target) = ctx.stmt_ref_source.get(stmt).cloned()
                 {
-                    if let Some(target) = ctx.stmt_ref_source.get(stmt).cloned() {
-                        ctx.expr_ref_source.insert(expr_id, target);
-                    }
+                    ctx.expr_ref_source.insert(expr_id, target);
                 }
                 ctx.escaping_exprs.contains(base)
             }
@@ -278,10 +277,9 @@ impl<'a> EscapeAnalyzer<'a> {
                     resolved: Some(ResolvedName::Local(stmt)),
                     ..
                 } = &ctx.body.exprs[*base]
+                    && let Some(target) = ctx.stmt_ref_source.get(stmt).cloned()
                 {
-                    if let Some(target) = ctx.stmt_ref_source.get(stmt).cloned() {
-                        ctx.expr_ref_source.insert(expr_id, target);
-                    }
+                    ctx.expr_ref_source.insert(expr_id, target);
                 }
                 ctx.escaping_exprs.contains(base)
             }
@@ -326,26 +324,18 @@ impl<'a> EscapeAnalyzer<'a> {
                 .map(|s| s.contains(&i))
                 .unwrap_or(true); // extern / unknown → conservative
 
-            if let Some(target) = ctx.ref_to_place.get(arg) {
-                if callee_param_escapes {
-                    ctx.escaping_locals.insert(target.local);
-                }
+            if callee_param_escapes && let Some(target) = ctx.ref_to_place.get(arg) {
+                ctx.escaping_locals.insert(target.local);
             }
-            if let Some(target) = ctx.expr_ref_source.get(arg) {
-                if callee_param_escapes {
-                    ctx.escaping_locals.insert(target.local);
-                }
+            if callee_param_escapes && let Some(target) = ctx.expr_ref_source.get(arg) {
+                ctx.escaping_locals.insert(target.local);
             }
             // — param-to-param chain: &param_i passed to callee.
-            if let Some(&p_idx) = ctx.ref_to_param.get(arg) {
-                if callee_param_escapes {
-                    ctx.escaping_params.insert(p_idx);
-                }
+            if callee_param_escapes && let Some(&p_idx) = ctx.ref_to_param.get(arg) {
+                ctx.escaping_params.insert(p_idx);
             }
-            if let Some(&p_idx) = ctx.expr_param_source.get(arg) {
-                if callee_param_escapes {
-                    ctx.escaping_params.insert(p_idx);
-                }
+            if callee_param_escapes && let Some(&p_idx) = ctx.expr_param_source.get(arg) {
+                ctx.escaping_params.insert(p_idx);
             }
         }
     }
@@ -383,6 +373,7 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.mark_return_sources(ctx, *v);
                 }
             }
+            Stmt::Break | Stmt::Continue => {}
             Stmt::Item { .. } => {}
         }
     }
@@ -487,38 +478,36 @@ impl<'a> EscapeAnalyzer<'a> {
             let escaping: Vec<ExprId> = ctx.escaping_exprs.iter().copied().collect();
             for escaping_expr in escaping {
                 // Local targets
-                if let Some(target) = ctx.ref_to_place.get(&escaping_expr).cloned() {
-                    if ctx.escaping_locals.insert(target.local) {
-                        changed = true;
-                    }
+                if let Some(target) = ctx.ref_to_place.get(&escaping_expr).cloned()
+                    && ctx.escaping_locals.insert(target.local)
+                {
+                    changed = true;
                 }
-                if let Some(target) = ctx.expr_ref_source.get(&escaping_expr).cloned() {
-                    if ctx.escaping_locals.insert(target.local) {
-                        changed = true;
-                    }
+                if let Some(target) = ctx.expr_ref_source.get(&escaping_expr).cloned()
+                    && ctx.escaping_locals.insert(target.local)
+                {
+                    changed = true;
                 }
                 // Param targets
-                if let Some(&p_idx) = ctx.ref_to_param.get(&escaping_expr) {
-                    if ctx.escaping_params.insert(p_idx) {
-                        changed = true;
-                    }
+                if let Some(&p_idx) = ctx.ref_to_param.get(&escaping_expr)
+                    && ctx.escaping_params.insert(p_idx)
+                {
+                    changed = true;
                 }
-                if let Some(&p_idx) = ctx.expr_param_source.get(&escaping_expr) {
-                    if ctx.escaping_params.insert(p_idx) {
-                        changed = true;
-                    }
+                if let Some(&p_idx) = ctx.expr_param_source.get(&escaping_expr)
+                    && ctx.escaping_params.insert(p_idx)
+                {
+                    changed = true;
                 }
                 // stmt_ref_source indirection via Path(Local)
                 if let Expr::Path {
                     resolved: Some(ResolvedName::Local(stmt)),
                     ..
                 } = &ctx.body.exprs[escaping_expr]
+                    && let Some(target) = ctx.stmt_ref_source.get(stmt).cloned()
+                    && ctx.escaping_locals.insert(target.local)
                 {
-                    if let Some(target) = ctx.stmt_ref_source.get(stmt).cloned() {
-                        if ctx.escaping_locals.insert(target.local) {
-                            changed = true;
-                        }
-                    }
+                    changed = true;
                 }
             }
 
@@ -554,10 +543,10 @@ impl<'a> EscapeAnalyzer<'a> {
 
             // Chain through stmt_ref_source
             for stmt in &locals {
-                if let Some(source) = ctx.stmt_ref_source.get(stmt).cloned() {
-                    if ctx.escaping_locals.insert(source.local) {
-                        changed = true;
-                    }
+                if let Some(source) = ctx.stmt_ref_source.get(stmt).cloned()
+                    && ctx.escaping_locals.insert(source.local)
+                {
+                    changed = true;
                 }
             }
             let locals2: Vec<StmtId> = ctx.escaping_locals.iter().copied().collect();

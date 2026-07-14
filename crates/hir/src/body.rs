@@ -84,6 +84,8 @@ pub enum Stmt {
     Return {
         value: Option<ExprId>,
     },
+    Break,
+    Continue,
     /// `mod inner { ... }` or `use foo::bar;` inside a function body.
     /// All such items are promoted to the global ItemTree, so we only
     /// keep an id-level reference here.
@@ -204,7 +206,7 @@ pub struct MatchArm {
 pub enum Pattern {
     Wildcard,
     /// A literal pattern such as `1` or `"x"`.
-    Literal,
+    Literal(LiteralPattern),
     /// A bare identifier that binds a new name, e.g. `x` in `match v { x => ... }`.
     Binding {
         name: Name,
@@ -226,6 +228,15 @@ pub enum Pattern {
         path: HirPath,
         fields: Vec<FieldPat>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum LiteralPattern {
+    Int { value: i64, suffix: Option<String> },
+    Float { value: f64, suffix: Option<String> },
+    String(String),
+    Char(String),
+    Bool(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +402,8 @@ impl BodyPrinter<'_> {
                 out.push(';');
                 out
             }
+            Stmt::Break => String::from("break;"),
+            Stmt::Continue => String::from("continue;"),
             Stmt::Expr { expr } => {
                 let mut out = self.print_expr(*expr, 0, indent);
                 out.push(';');
@@ -724,7 +737,7 @@ impl BodyPrinter<'_> {
             HirTypeRef::Tuple(elements) => {
                 let inner = elements
                     .iter()
-                    .map(|t| Self::type_text(t))
+                    .map(Self::type_text)
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({})", inner)
@@ -739,7 +752,17 @@ impl BodyPrinter<'_> {
     fn print_pat(&self, pat: PatId) -> String {
         match &self.body.pats[pat] {
             Pattern::Wildcard => "_".to_string(),
-            Pattern::Literal => "<lit>".to_string(),
+            Pattern::Literal(literal) => match literal {
+                LiteralPattern::Int { value, suffix } => {
+                    format!("{}{}", value, suffix.as_deref().unwrap_or_default())
+                }
+                LiteralPattern::Float { value, suffix } => {
+                    format!("{}{}", value, suffix.as_deref().unwrap_or_default())
+                }
+                LiteralPattern::String(value) => value.clone(),
+                LiteralPattern::Char(value) => format!("'{value}'"),
+                LiteralPattern::Bool(value) => value.to_string(),
+            },
             Pattern::Binding { name } => name.0.clone(),
             Pattern::Path { path } => path.display(),
             Pattern::Tuple { elements } => {

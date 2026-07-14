@@ -1,0 +1,4 @@
+[package]
+name = "gc"
+version.workspace = true
+edition.workspace = true

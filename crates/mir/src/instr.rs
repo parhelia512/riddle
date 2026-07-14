@@ -144,6 +144,9 @@ pub enum InstKind {
     /// Construct a struct value: `result = struct { fields... }`
     StructValue(Vec<Value>),
 
+    /// Construct an aggregate by field index; unspecified fields are zeroed.
+    SparseStructValue(Vec<(usize, Value)>),
+
     /// Construct an array value: `result = [ elements... ]`
     ArrayValue(Vec<Value>),
 
@@ -160,6 +163,9 @@ pub enum InstKind {
 /// Block terminator — every basic block must end with exactly one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Terminator {
+    /// Temporary builder state; must be replaced before code generation.
+    Pending,
+
     /// Unconditional jump to another block.
     Branch(BlockId),
 
@@ -168,4 +174,7 @@ pub enum Terminator {
 
     /// Return from the function.
     Return(Option<Value>),
+
+    /// Mark a control-flow path that cannot be reached by a valid program.
+    Unreachable,
 }

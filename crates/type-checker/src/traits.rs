@@ -33,6 +33,135 @@ impl TypeChecker<'_> {
         }
     }
 
+    pub(crate) fn validate_copy_impls(&mut self) {
+        let Some(copy_trait) = self.find_lang_trait("copy") else {
+            return;
+        };
+        let impls = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .map(|(_, imp)| imp.clone())
+            .collect::<Vec<_>>();
+
+        for imp in impls {
+            if imp
+                .trait_ty
+                .as_ref()
+                .and_then(|trait_ty| self.resolve_trait_ref(trait_ty))
+                != Some(copy_trait)
+            {
+                continue;
+            }
+            let params = crate::lowering::generic_param_map_with_consts(
+                imp.generics.iter().map(|name| name.0.as_str()),
+                imp.const_generics.iter().map(|name| name.0.as_str()),
+            );
+            let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
+            let bounds = self.lower_trait_env_bounds(&imp.generic_bounds, &params);
+            let self_ty_text = self_ty.display(self.hir);
+            let Some(fields) = self.copy_impl_fields(&self_ty) else {
+                self.diagnostic(
+                    "E0041",
+                    format!("`Copy` cannot be implemented for `{self_ty_text}`"),
+                    None,
+                );
+                continue;
+            };
+            let non_copy = fields
+                .into_iter()
+                .filter_map(|(name, ty)| {
+                    (!self
+                        .result
+                        .trait_env
+                        .type_implements_assuming(&ty, copy_trait, &bounds))
+                    .then(|| format!("{name}: {}", ty.display(self.hir)))
+                })
+                .collect::<Vec<_>>();
+            if !non_copy.is_empty() {
+                self.diagnostic(
+                    "E0041",
+                    format!(
+                        "`Copy` impl for `{self_ty_text}` has non-Copy field(s): {}",
+                        non_copy.join(", ")
+                    ),
+                    None,
+                );
+            }
+        }
+    }
+
+    fn copy_impl_fields(&mut self, ty: &Type) -> Option<Vec<(String, Type)>> {
+        match ty {
+            Type::Struct(struct_id, args) => {
+                let strukt = self.hir.item_tree.structs[*struct_id].clone();
+                let subst = strukt
+                    .generics
+                    .iter()
+                    .chain(strukt.const_generics.iter())
+                    .zip(args.iter())
+                    .map(|(name, ty)| (name.0.clone(), ty.clone()))
+                    .collect::<HashMap<_, _>>();
+                Some(
+                    strukt
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            (
+                                field.name.0.clone(),
+                                self.lower_type_ref_with_params(&field.ty, &subst),
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            Type::Enum(enum_id, args) => {
+                let enum_data = self.hir.item_tree.enums[*enum_id].clone();
+                let subst = enum_data
+                    .generics
+                    .iter()
+                    .chain(enum_data.const_generics.iter())
+                    .zip(args.iter())
+                    .map(|(name, ty)| (name.0.clone(), ty.clone()))
+                    .collect::<HashMap<_, _>>();
+                let mut fields = Vec::new();
+                for variant in &enum_data.variants {
+                    match &variant.kind {
+                        hir::item_tree::HirVariantKind::Unit => {}
+                        hir::item_tree::HirVariantKind::Tuple(items) => {
+                            fields.extend(items.iter().enumerate().map(|(index, item)| {
+                                (
+                                    format!("{}.{index}", variant.name.0),
+                                    self.lower_type_ref_with_params(item, &subst),
+                                )
+                            }));
+                        }
+                        hir::item_tree::HirVariantKind::Struct(items) => {
+                            fields.extend(items.iter().map(|item| {
+                                (
+                                    format!("{}.{}", variant.name.0, item.name.0),
+                                    self.lower_type_ref_with_params(&item.ty, &subst),
+                                )
+                            }));
+                        }
+                    }
+                }
+                Some(fields)
+            }
+            Type::Tuple(items) => Some(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ty)| (index.to_string(), ty.clone()))
+                    .collect(),
+            ),
+            Type::Array(inner, _) => Some(vec![("element".into(), *inner.clone())]),
+            ty if ty.is_fundamentally_copy() => Some(Vec::new()),
+            _ => None,
+        }
+    }
+
     fn check_trait_decl(&mut self, tr: &HirTrait) {
         let mut methods = HashSet::new();
         for method in &tr.methods {

@@ -92,7 +92,7 @@ impl TypeChecker<'_> {
             HirTypeRef::Tuple(elements) => {
                 let inner = elements
                     .iter()
-                    .map(|t| Self::type_text(t))
+                    .map(Self::type_text)
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({})", inner)
@@ -290,7 +290,7 @@ impl TypeChecker<'_> {
             .find_map(|(id, strukt)| (strukt.name.0 == name).then_some(id))
     }
 
-    fn find_enum_by_name(&self, name: &str) -> Option<EnumId> {
+    pub(crate) fn find_enum_by_name(&self, name: &str) -> Option<EnumId> {
         self.hir
             .item_tree
             .enums

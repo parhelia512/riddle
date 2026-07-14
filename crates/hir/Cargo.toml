@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ast.workspace = true
-frontend.workspace = true
-la-arena.workspace = true
-rowan.workspace = true
+ast = { path = "../ast" }
+frontend = { path = "../frontend" }
+la-arena = "0.3"
+rowan = "0.15"

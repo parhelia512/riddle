@@ -27,6 +27,6 @@ pub fn lex(input: &str) -> Vec<Token> {
 impl Token {
     #[inline]
     pub fn text<'a>(&self, source: &'a str) -> &'a str {
-        &source[self.span.start as usize..self.span.end as usize]
+        &source[self.span.clone()]
     }
 }

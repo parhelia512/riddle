@@ -14,6 +14,7 @@ Cargo.lock
 
 # C
 *.c
+!crates/gc/src/runtime.c
 
 # Editors
 .vscode/
@@ -33,6 +34,6 @@ Cargo.lock
 *.exe
 
 # AI
-.junie/
-.claude/
-.agents/
+/.junie
+/.claude
+/.agents

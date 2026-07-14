@@ -1,22 +1,24 @@
 #[lang = "clone"]
-pub trait Clone {}
+pub trait Clone {
+    fun clone(&self) -> Self;
+}
 
-impl Clone for bool {}
-impl Clone for char {}
-impl Clone for str {}
-impl Clone for i8 {}
-impl Clone for i16 {}
-impl Clone for i32 {}
-impl Clone for i64 {}
-impl Clone for i128 {}
-impl Clone for isize {}
-impl Clone for u8 {}
-impl Clone for u16 {}
-impl Clone for u32 {}
-impl Clone for u64 {}
-impl Clone for u128 {}
-impl Clone for usize {}
-impl Clone for f16 {}
-impl Clone for f32 {}
-impl Clone for f64 {}
-impl Clone for f128 {}
+impl Clone for bool { fun clone(&self) -> Self { *self } }
+impl Clone for char { fun clone(&self) -> Self { *self } }
+impl Clone for str { fun clone(&self) -> Self { *self } }
+impl Clone for i8 { fun clone(&self) -> Self { *self } }
+impl Clone for i16 { fun clone(&self) -> Self { *self } }
+impl Clone for i32 { fun clone(&self) -> Self { *self } }
+impl Clone for i64 { fun clone(&self) -> Self { *self } }
+impl Clone for i128 { fun clone(&self) -> Self { *self } }
+impl Clone for isize { fun clone(&self) -> Self { *self } }
+impl Clone for u8 { fun clone(&self) -> Self { *self } }
+impl Clone for u16 { fun clone(&self) -> Self { *self } }
+impl Clone for u32 { fun clone(&self) -> Self { *self } }
+impl Clone for u64 { fun clone(&self) -> Self { *self } }
+impl Clone for u128 { fun clone(&self) -> Self { *self } }
+impl Clone for usize { fun clone(&self) -> Self { *self } }
+impl Clone for f16 { fun clone(&self) -> Self { *self } }
+impl Clone for f32 { fun clone(&self) -> Self { *self } }
+impl Clone for f64 { fun clone(&self) -> Self { *self } }
+impl Clone for f128 { fun clone(&self) -> Self { *self } }

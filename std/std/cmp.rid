@@ -1,31 +1,50 @@
+use crate::std::option::Option;
+
+pub enum Ordering {
+    Less,
+    Equal,
+    Greater,
+}
+
+impl crate::std::marker::Copy for Ordering {}
+
 #[lang = "partial_eq"]
-pub trait PartialEq {}
+pub trait PartialEq {
+    fun eq(&self, other: &Self) -> bool;
+}
+
 #[lang = "eq"]
 pub trait Eq {}
-#[lang = "partial_ord"]
-pub trait PartialOrd {}
-#[lang = "ord"]
-pub trait Ord {}
 
-impl PartialEq for bool {}
-impl PartialEq for char {}
-impl PartialEq for str {}
-impl PartialEq for i8 {}
-impl PartialEq for i16 {}
-impl PartialEq for i32 {}
-impl PartialEq for i64 {}
-impl PartialEq for i128 {}
-impl PartialEq for isize {}
-impl PartialEq for u8 {}
-impl PartialEq for u16 {}
-impl PartialEq for u32 {}
-impl PartialEq for u64 {}
-impl PartialEq for u128 {}
-impl PartialEq for usize {}
-impl PartialEq for f16 {}
-impl PartialEq for f32 {}
-impl PartialEq for f64 {}
-impl PartialEq for f128 {}
+#[lang = "partial_ord"]
+pub trait PartialOrd {
+    fun partial_cmp(&self, other: &Self) -> Option<Ordering>;
+}
+
+#[lang = "ord"]
+pub trait Ord {
+    fun cmp(&self, other: &Self) -> Ordering;
+}
+
+impl PartialEq for bool { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for char { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for str { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for i8 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for i16 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for i32 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for i64 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for i128 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for isize { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for u8 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for u16 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for u32 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for u64 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for u128 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for usize { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for f16 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for f32 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for f64 { fun eq(&self, other: &Self) -> bool { *self == *other } }
+impl PartialEq for f128 { fun eq(&self, other: &Self) -> bool { *self == *other } }
 
 impl Eq for bool {}
 impl Eq for char {}
@@ -43,38 +62,40 @@ impl Eq for u64 {}
 impl Eq for u128 {}
 impl Eq for usize {}
 
-impl PartialOrd for bool {}
-impl PartialOrd for char {}
-impl PartialOrd for str {}
-impl PartialOrd for i8 {}
-impl PartialOrd for i16 {}
-impl PartialOrd for i32 {}
-impl PartialOrd for i64 {}
-impl PartialOrd for i128 {}
-impl PartialOrd for isize {}
-impl PartialOrd for u8 {}
-impl PartialOrd for u16 {}
-impl PartialOrd for u32 {}
-impl PartialOrd for u64 {}
-impl PartialOrd for u128 {}
-impl PartialOrd for usize {}
-impl PartialOrd for f16 {}
-impl PartialOrd for f32 {}
-impl PartialOrd for f64 {}
-impl PartialOrd for f128 {}
+impl PartialOrd for bool {
+    fun partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Option::Some(self.cmp(other))
+    }
+}
+impl PartialOrd for char { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for i8 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for i16 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for i32 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for i64 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for i128 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for isize { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for u8 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for u16 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for u32 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for u64 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for u128 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for usize { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { Option::Some(self.cmp(other)) } }
+impl PartialOrd for f16 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { if *self != *self || *other != *other { Option::None } else if *self < *other { Option::Some(Ordering::Less) } else if *self > *other { Option::Some(Ordering::Greater) } else { Option::Some(Ordering::Equal) } } }
+impl PartialOrd for f32 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { if *self != *self || *other != *other { Option::None } else if *self < *other { Option::Some(Ordering::Less) } else if *self > *other { Option::Some(Ordering::Greater) } else { Option::Some(Ordering::Equal) } } }
+impl PartialOrd for f64 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { if *self != *self || *other != *other { Option::None } else if *self < *other { Option::Some(Ordering::Less) } else if *self > *other { Option::Some(Ordering::Greater) } else { Option::Some(Ordering::Equal) } } }
+impl PartialOrd for f128 { fun partial_cmp(&self, other: &Self) -> Option<Ordering> { if *self != *self || *other != *other { Option::None } else if *self < *other { Option::Some(Ordering::Less) } else if *self > *other { Option::Some(Ordering::Greater) } else { Option::Some(Ordering::Equal) } } }
 
-impl Ord for bool {}
-impl Ord for char {}
-impl Ord for str {}
-impl Ord for i8 {}
-impl Ord for i16 {}
-impl Ord for i32 {}
-impl Ord for i64 {}
-impl Ord for i128 {}
-impl Ord for isize {}
-impl Ord for u8 {}
-impl Ord for u16 {}
-impl Ord for u32 {}
-impl Ord for u64 {}
-impl Ord for u128 {}
-impl Ord for usize {}
+impl Ord for bool { fun cmp(&self, other: &Self) -> Ordering { if *self == *other { Ordering::Equal } else if *self { Ordering::Greater } else { Ordering::Less } } }
+impl Ord for char { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for i8 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for i16 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for i32 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for i64 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for i128 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for isize { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u8 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u16 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u32 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u64 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for u128 { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }
+impl Ord for usize { fun cmp(&self, other: &Self) -> Ordering { if *self < *other { Ordering::Less } else if *self > *other { Ordering::Greater } else { Ordering::Equal } } }

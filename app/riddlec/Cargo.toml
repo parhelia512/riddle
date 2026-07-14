@@ -4,12 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ast.workspace = true
-escape-analysis.workspace = true
-frontend.workspace = true
-hir.workspace = true
-move-checker.workspace = true
-scope-graph.workspace = true
-type-checker.workspace = true
-mir.workspace = true
-rowan.workspace = true
+ast = { path = "../../crates/ast" }
+escape-analysis = { path = "../../crates/escape-analysis" }
+frontend = { path = "../../crates/frontend" }
+hir = { path = "../../crates/hir" }
+mir = { path = "../../crates/mir" }
+move-checker = { path = "../../crates/move-checker" }
+rowan = "0.15"
+scope-graph = { path = "../../crates/scope-graph" }
+type-checker = { path = "../../crates/type-checker" }

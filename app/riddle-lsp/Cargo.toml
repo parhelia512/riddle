@@ -4,11 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-frontend.workspace = true
-hir.workspace = true
+clue = { path = "../clue" }
+frontend = { path = "../../crates/frontend" }
+hir = { path = "../../crates/hir" }
 lsp-types = "0.94.1"
-riddlec.workspace = true
-rowan.workspace = true
+riddlec = { path = "../riddlec" }
+rowan = "0.15"
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
 tower-lsp = "0.20.0"
-type-checker.workspace = true
+type-checker = { path = "../../crates/type-checker" }

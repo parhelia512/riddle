@@ -12,8 +12,9 @@ use rowan::{TextRange, ast::SyntaxNodePtr};
 use super::{
     HirFile,
     body::{
-        BinaryOp, Body, BodyItem, Diagnostic, Expr, ExprId, FieldPat, LabelStyle, MatchArm, PatId,
-        Pattern, Severity, SourceLabel, SourceMap, Stmt, StmtId, StructExprField, UnaryOp,
+        BinaryOp, Body, BodyItem, Diagnostic, Expr, ExprId, FieldPat, LabelStyle, LiteralPattern,
+        MatchArm, PatId, Pattern, Severity, SourceLabel, SourceMap, Stmt, StmtId, StructExprField,
+        UnaryOp,
     },
     item_tree::HirTypeRef,
     item_tree::{HirPath, PathAnchor},
@@ -175,6 +176,10 @@ impl<'a> BodyLower<'a> {
                 let value = self.lower_optional_expr(ret.value());
                 Some(self.alloc_stmt(Stmt::Return { value }, range))
             }
+
+            ast::Stmt::BreakStmt(_) => Some(self.alloc_stmt(Stmt::Break, range)),
+
+            ast::Stmt::ContinueStmt(_) => Some(self.alloc_stmt(Stmt::Continue, range)),
 
             ast::Stmt::ExprStmt(es) => {
                 let expr = self.lower_required_expr(es.expr(), "missing expression statement");
@@ -559,7 +564,37 @@ impl<'a> BodyLower<'a> {
         let range = pat.syntax().text_range();
         match pat {
             ast::Pattern::Wildcard(_) => self.alloc_pat(Pattern::Wildcard, range),
-            ast::Pattern::Literal(_) => self.alloc_pat(Pattern::Literal, range),
+            ast::Pattern::Literal(literal) => {
+                let token = literal.literal_token();
+                let text = token
+                    .as_ref()
+                    .map(|token| token.text().to_string())
+                    .unwrap_or_default();
+                let literal = match token.map(|token| token.kind()) {
+                    Some(SyntaxKind::Number) => {
+                        let (digits, radix, suffix) = split_int_literal(&text);
+                        let value = i64::from_str_radix(&digits, radix).unwrap_or_else(|_| {
+                            self.diagnostic("invalid integer literal pattern", range);
+                            0
+                        });
+                        LiteralPattern::Int { value, suffix }
+                    }
+                    Some(SyntaxKind::Float) => {
+                        let (number, suffix) = split_float_literal(&text);
+                        let value = number.parse().unwrap_or_else(|_| {
+                            self.diagnostic("invalid float literal pattern", range);
+                            0.0
+                        });
+                        LiteralPattern::Float { value, suffix }
+                    }
+                    Some(SyntaxKind::String) => LiteralPattern::String(text),
+                    Some(SyntaxKind::Char) => LiteralPattern::Char(lower_char_literal(&text)),
+                    Some(SyntaxKind::True) => LiteralPattern::Bool(true),
+                    Some(SyntaxKind::False) => LiteralPattern::Bool(false),
+                    _ => LiteralPattern::Bool(false),
+                };
+                self.alloc_pat(Pattern::Literal(literal), range)
+            }
             ast::Pattern::Tuple(tp) => {
                 let elements = tp.elements().map(|p| self.lower_pattern(p)).collect();
                 self.alloc_pat(Pattern::Tuple { elements }, range)
@@ -578,17 +613,10 @@ impl<'a> BodyLower<'a> {
             }
             ast::Pattern::Enum(ep) => {
                 let path = ep.path().lower();
-                let tuple_elems: Vec<PatId> =
-                    ep.elements().map(|p| self.lower_pattern(p)).collect();
-                if !tuple_elems.is_empty() {
-                    self.alloc_pat(
-                        Pattern::TupleStruct {
-                            path,
-                            elements: tuple_elems,
-                        },
-                        range,
-                    )
-                } else {
+                if ep.is_tuple() {
+                    let elements = ep.elements().map(|p| self.lower_pattern(p)).collect();
+                    self.alloc_pat(Pattern::TupleStruct { path, elements }, range)
+                } else if ep.is_struct() {
                     let fields: Vec<FieldPat> = ep
                         .fields()
                         .map(|fp| {
@@ -597,15 +625,13 @@ impl<'a> BodyLower<'a> {
                             FieldPat { name, pat }
                         })
                         .collect();
-                    if fields.is_empty() {
-                        match path.as_single_name() {
-                            Some(name) => {
-                                self.alloc_pat(Pattern::Binding { name: name.clone() }, range)
-                            }
-                            None => self.alloc_pat(Pattern::Path { path }, range),
+                    self.alloc_pat(Pattern::Struct { path, fields }, range)
+                } else {
+                    match path.as_single_name() {
+                        Some(name) => {
+                            self.alloc_pat(Pattern::Binding { name: name.clone() }, range)
                         }
-                    } else {
-                        self.alloc_pat(Pattern::Struct { path, fields }, range)
+                        None => self.alloc_pat(Pattern::Path { path }, range),
                     }
                 }
             }

@@ -68,9 +68,9 @@ impl<'a> ScopeGraphBuilder<'a> {
         self.encode_items(&top_level, root_scope, &mut frag_nodes, &mut frag_edges);
 
         // Wrap root-level graph pieces in one root fragment.
-        let root_ptr = self.root_ptr.clone();
+        let root_ptr = self.root_ptr;
         let frag = Fragment {
-            ptr: root_ptr.clone(),
+            ptr: root_ptr,
             nodes: frag_nodes,
             edges: frag_edges,
             entry_scope: root_scope,
@@ -664,9 +664,7 @@ impl<'a> ScopeGraphBuilder<'a> {
                 self.resolve_module_in_scope(lookup_scope, segment)
             };
 
-            let Some(module_id) = module_id else {
-                return None;
-            };
+            let module_id = module_id?;
 
             let scopes = self.mod_scopes[&module_id];
             lookup_scope = scopes.internal;
@@ -726,10 +724,10 @@ impl<'a> ScopeGraphBuilder<'a> {
 
         // Use the body's root block syntax pointer as the fragment key so this body can be
         // independently invalidated when its source range changes.
-        let ptr = body.root_ptr.clone();
+        let ptr = body.root_ptr;
 
         let frag = Fragment {
-            ptr: ptr.clone(),
+            ptr,
             nodes,
             edges,
             entry_scope: entry,
@@ -810,6 +808,7 @@ impl<'a> ScopeGraphBuilder<'a> {
                 }
                 current_scope
             }
+            Stmt::Break | Stmt::Continue => current_scope,
             Stmt::Expr { expr } => {
                 self.walk_expr_for_refs(body_id, body, *expr, current_scope, nodes, edges);
                 current_scope
@@ -1059,7 +1058,7 @@ impl<'a> ScopeGraphBuilder<'a> {
 
                 *current = next;
             }
-            Pattern::Wildcard | Pattern::Literal | Pattern::Path { .. } => {}
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
             Pattern::Tuple { elements } => {
                 for e in elements {
                     self.emit_pat_bindings(body, *e, current, nodes, edges);
@@ -1074,6 +1073,21 @@ impl<'a> ScopeGraphBuilder<'a> {
                 for fp in fields {
                     if let Some(sub) = fp.pat {
                         self.emit_pat_bindings(body, sub, current, nodes, edges);
+                    } else {
+                        let next = self.sg.alloc_node(Node::Scope(ScopeKind::Block));
+                        nodes.push(next);
+                        let edge = self.sg.add_edge(next, *current, EdgeKind::Lex, 0);
+                        edges.push(edge);
+                        let pop = self.sg.alloc_node(Node::PopSymbol {
+                            name: fp.name.clone(),
+                            define: DefRef::PatternBinding {
+                                name: fp.name.clone(),
+                            },
+                        });
+                        nodes.push(pop);
+                        let edge = self.sg.add_edge(next, pop, EdgeKind::Def, 0);
+                        edges.push(edge);
+                        *current = next;
                     }
                 }
             }
