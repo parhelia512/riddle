@@ -143,14 +143,33 @@ void rgc_init(void *stack_bottom) {
 }
 
 void rgc_collect(void) {
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+    uintptr_t registers[11];
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "stp x19, x20, [x9, #0]\n"
+        "stp x21, x22, [x9, #16]\n"
+        "stp x23, x24, [x9, #32]\n"
+        "stp x25, x26, [x9, #48]\n"
+        "stp x27, x28, [x9, #64]\n"
+        "str x29, [x9, #80]\n"
+        :
+        : "r"(registers)
+        : "x9", "memory");
+#else
     int stack_top = 0;
+#endif
 
     if (!rgc_stack_bottom) {
         // ponytail: embedded hosts leak safely until they provide a stack bottom.
         return;
     }
 
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+    rgc_mark_roots(registers, rgc_stack_bottom);
+#else
     rgc_mark_roots(&stack_top, rgc_stack_bottom);
+#endif
     rgc_sweep();
 }
 
