@@ -96,7 +96,16 @@ jobs:
 
       - name: 运行测试（仅原生目标）
         if: matrix.cross != true
-        run: cargo test --workspace --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --target ${{ matrix.target }} 2>&1 | tee test.log
+          STATUS=${PIPESTATUS[0]}
+          if [ "$STATUS" -ne 0 ]; then
+            DETAILS=$(tail -n 80 test.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=Test failure::${DETAILS}"
+            exit "$STATUS"
+          fi
 
       - name: Release 构建
         run: cargo build --workspace --release --target ${{ matrix.target }}
