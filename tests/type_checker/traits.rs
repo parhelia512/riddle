@@ -5,7 +5,7 @@ fn accepts_matching_trait_impl_required_items() {
     let result = check(
         r#"
         trait Show {
-            fun show(value: i32) -> str;
+            fun show(value: i32) -> &str;
             type Output;
             type Default = bool;
         }
@@ -13,7 +13,7 @@ fn accepts_matching_trait_impl_required_items() {
         struct Widget {}
 
         impl Show for Widget {
-            fun show(value: i32) -> str {
+            fun show(value: i32) -> &str {
                 "ok"
             }
 

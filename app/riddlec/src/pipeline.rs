@@ -1047,7 +1047,7 @@ mod tests {
                 }
             }
 
-            fun is_yes(value: str) -> bool {
+            fun is_yes(value: &str) -> bool {
                 match value {
                     "yes" => true,
                     _ => false,

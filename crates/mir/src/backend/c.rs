@@ -157,6 +157,18 @@ impl Backend for CBackend {
 
         // Extern function declarations
         for ext in &module.externs {
+            if ext.params.iter().any(|ty| matches!(ty, Type::Str)) {
+                return Err(format!(
+                    "C extern function `{}` cannot take unsized `str`; use `&str`",
+                    ext.name
+                ));
+            }
+            if matches!(ext.ret_type, Type::Str) {
+                return Err(format!(
+                    "C extern function `{}` cannot return unsized `str`; use `&str`",
+                    ext.name
+                ));
+            }
             if is_builtin_extern(&ext.name) {
                 continue;
             }
@@ -690,7 +702,7 @@ impl CBackend {
                             .get(a.0 as usize)
                             .map(|s| s.as_str())
                             .unwrap_or("");
-                        if is_extern && (arg_ct.contains("size_t len;") || arg_ct == "riddle_str") {
+                        if is_extern && arg_ct == "riddle_str" {
                             // Fat pointer struct → extract .ptr for C FFI
                             if self.is_indirect(*a) {
                                 format!("{}->ptr", arg_name)
@@ -706,6 +718,24 @@ impl CBackend {
                 if matches!(&inst.ty, Type::Unit | Type::Never | Type::Void) {
                     writeln!(out, "  {}({});", callee_name, args_str.join(", ")).unwrap();
                     self.set(v, "".into(), "void".into());
+                } else if is_extern && is_fat_repr(&inst.ty) {
+                    let ffi_name = fresh_c(&mut self.counter, "ffi_str");
+                    let name = fresh_c(&mut self.counter, "call");
+                    self.set(v, name.clone(), ct.clone());
+                    writeln!(
+                        out,
+                        "  const char* {} = {}({});",
+                        ffi_name,
+                        callee_name,
+                        args_str.join(", ")
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "  {} {} = (riddle_str){{ {}, {} ? strlen({}) : 0 }};",
+                        ct, name, ffi_name, ffi_name, ffi_name
+                    )
+                    .unwrap();
                 } else {
                     let name = fresh_c(&mut self.counter, "call");
                     self.set(v, name.clone(), ct.clone());
@@ -936,11 +966,10 @@ fn ctype_of(ty: &Type) -> String {
     }
 }
 
-/// C type for FFI declarations — `str` and `&str` map to plain `const char*`
-/// (C functions expect C strings, not the fat pointer struct).
+/// C type for FFI declarations — `&str` maps to plain `const char*` because C
+/// functions expect C strings, not the fat pointer struct.
 fn ctype_of_ffi(ty: &Type) -> String {
     match ty {
-        Type::Str => "const char*".into(),
         Type::Ref(inner, _) if !inner.is_sized() => "const char*".into(),
         _ => ctype_of(ty),
     }

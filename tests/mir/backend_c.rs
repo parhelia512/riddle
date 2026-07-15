@@ -285,7 +285,7 @@ fn c_str_slice_return() {
 fn c_raw_string_return_escapes_content() {
     let module = lower(
         r####"
-        fun hello() -> str {
+        fun hello() -> &str {
             return r###"say "hi"
 "###;
         }
@@ -378,11 +378,11 @@ fn c_backend_assigns_if_phi_inputs_before_branching() {
 fn c_backend_provides_string_builtins() {
     let module = lower(
         r#"
-        extern "C" fun str_len(s: str) -> usize;
-        extern "C" fun str_byte(s: str, idx: usize) -> u8;
+        extern "C" fun str_len(s: &str) -> usize;
+        extern "C" fun str_byte(s: &str, idx: usize) -> u8;
 
         fun main() -> u8 {
-            let s: str = "abc";
+            let s: &str = "abc";
             let _len = str_len(s);
             return str_byte(s, 1usize);
         }
@@ -409,6 +409,69 @@ fn c_backend_provides_string_builtins() {
         !result.contains("extern int8_t str_byte"),
         "str_byte should be builtin:\n{}",
         result
+    );
+}
+
+#[test]
+fn c_backend_wraps_string_extern_returns() {
+    let module = lower(
+        r#"
+        extern "C" fun greeting() -> &str;
+
+        fun hello() -> &str {
+            return greeting();
+        }
+        "#,
+    );
+    let result = CBackend::new().compile(&module).unwrap();
+    assert!(
+        result.contains("extern const char* greeting(void);")
+            && result.contains("const char* ffi_str")
+            && result.contains("(riddle_str){ ffi_str"),
+        "extern string return was not wrapped:\n{result}"
+    );
+}
+
+#[test]
+fn c_backend_separates_defined_extern_string_abi_from_imports() {
+    let module = lower(
+        r#"
+        extern "C" fun echo(value: &str) -> &str {
+            value
+        }
+
+        fun call_echo() -> &str {
+            echo("hello")
+        }
+        "#,
+    );
+    assert!(module.externs.iter().all(|ext| ext.name != "echo"));
+
+    let result = CBackend::new().compile(&module).unwrap();
+    assert!(
+        result.contains("riddle_str echo(riddle_str p0);")
+            && !result.contains("extern const char* echo")
+            && !result.contains("const char* ffi_str"),
+        "defined extern string function used the import ABI:\n{result}"
+    );
+}
+
+#[test]
+fn c_backend_compares_string_pattern_by_contents() {
+    let module = lower(
+        r#"
+        fun is_hello(value: &str) -> bool {
+            match value {
+                "hello" => true,
+                _ => false,
+            }
+        }
+        "#,
+    );
+    let result = CBackend::new().compile(&module).unwrap();
+    assert!(
+        result.contains("memcmp("),
+        "string comparison missing:\n{result}"
     );
 }
 

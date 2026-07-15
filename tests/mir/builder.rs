@@ -79,6 +79,18 @@ fn build_multiple_blocks() {
 }
 
 #[test]
+fn string_const_is_shared_str_ref() {
+    let mut func = Function::new("test".into(), Type::Unit);
+    let mut builder = Builder::new(&mut func);
+    builder.sconst("\"hello\"".into());
+
+    assert_eq!(
+        func.blocks[func.entry].insts[0].ty,
+        Type::Ref(Box::new(Type::Str), false)
+    );
+}
+
+#[test]
 fn values_are_unique_across_precreated_blocks() {
     let mut func = Function::new("test".into(), Type::Unit);
     let left = func.new_block_labeled("left");

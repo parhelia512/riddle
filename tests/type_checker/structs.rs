@@ -26,11 +26,11 @@ fn checks_struct_literal_shorthand_and_associated_function_call() {
         struct Point {
             x: i32,
             y: i64,
-            label: str,
+            label: &str,
         }
 
         impl Point {
-            fun new(x: i32, y: i64, label: str) -> Point {
+            fun new(x: i32, y: i64, label: &str) -> Point {
                 Point{x, y, label}
             }
         }

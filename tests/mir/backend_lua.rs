@@ -86,7 +86,7 @@ fn lua_bool_literal() {
 fn lua_string_literal() {
     let module = lower(
         r#"
-        fun greeting() -> str {
+        fun greeting() -> &str {
             return "hello";
         }
         "#,

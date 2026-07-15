@@ -67,6 +67,7 @@ pub fn lower_hir(
         .item_tree
         .extern_function_ids
         .iter()
+        .filter(|&&fid| !hir.function_bodies.contains_key(&fid))
         .map(|&fid| {
             let func = &hir.item_tree.functions[fid];
             (func.name.0.clone(), func)
@@ -560,7 +561,10 @@ impl<'a> LowerCtx<'a> {
                     );
                     // 检查是否是 extern 函数调用
                     let is_extern = target_fid
-                        .map(|fid| self.hir.item_tree.extern_function_ids.contains(&fid))
+                        .map(|fid| {
+                            self.hir.item_tree.extern_function_ids.contains(&fid)
+                                && !self.hir.function_bodies.contains_key(&fid)
+                        })
                         .unwrap_or(false);
                     let func_ref = if is_extern {
                         FuncRef::Extern(name)

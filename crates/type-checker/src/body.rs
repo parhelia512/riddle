@@ -149,11 +149,15 @@ impl TypeChecker<'_> {
                             ctx.stmt_range(stmt_id),
                         );
                     }
+                    let inferred = declared.is_unknown_like() && !explicit_error;
                     let local_ty = if explicit_error {
                         declared
                     } else {
                         declared.or(init_ty)
                     };
+                    if inferred {
+                        self.expect_sized_value(&local_ty, ctx.stmt_range(stmt_id));
+                    }
                     ctx.locals.insert(stmt_id, (local_ty, *is_mut));
                 } else {
                     ctx.locals.insert(stmt_id, (declared, *is_mut));
@@ -192,7 +196,8 @@ impl TypeChecker<'_> {
     }
 
     pub(crate) fn check_expr(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) -> Type {
-        self.check_expr_inner(ctx, expr_id, None)
+        let ty = self.check_expr_inner(ctx, expr_id, None);
+        self.finish_value_expr(ctx, expr_id, ty)
     }
 
     pub(crate) fn check_expr_expected(
@@ -201,7 +206,33 @@ impl TypeChecker<'_> {
         expr_id: ExprId,
         expected: &Type,
     ) -> Type {
-        self.check_expr_inner(ctx, expr_id, Some(expected))
+        let ty = self.check_expr_inner(ctx, expr_id, Some(expected));
+        self.finish_value_expr(ctx, expr_id, ty)
+    }
+
+    fn check_place_expr(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) -> Type {
+        if matches!(
+            &ctx.body.exprs[expr_id],
+            Expr::Unary {
+                op: UnaryOp::Deref,
+                ..
+            }
+        ) {
+            self.check_expr_inner(ctx, expr_id, None)
+        } else {
+            self.check_expr(ctx, expr_id)
+        }
+    }
+
+    fn finish_value_expr(&mut self, ctx: &BodyCtx<'_>, expr_id: ExprId, ty: Type) -> Type {
+        if ty.is_valid_value_type() {
+            return ty;
+        }
+        self.expect_sized_value(&ty, ctx.expr_range(expr_id));
+        self.result
+            .expr_types
+            .insert((ctx.body_id, expr_id), Type::Error);
+        Type::Error
     }
 
     fn check_expr_inner(
@@ -217,7 +248,7 @@ impl TypeChecker<'_> {
             Expr::FloatLiteral { suffix, .. } => {
                 self.float_literal_type(suffix.as_deref(), expected)
             }
-            Expr::StringLiteral { .. } => Type::Str,
+            Expr::StringLiteral { .. } => Type::Ref(Box::new(Type::Str), false),
             Expr::CharLiteral { .. } => Type::Char,
             Expr::BoolLiteral { .. } => Type::Bool,
             Expr::Path { path, resolved } => {
@@ -363,7 +394,8 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) -> Type {
         if op == BinaryOp::Assign {
-            let lhs_ty = self.check_expr(ctx, lhs);
+            let lhs_ty = self.check_place_expr(ctx, lhs);
+            self.expect_sized_value(&lhs_ty, span);
             let rhs_ty = self.check_expr_expected(ctx, rhs, &lhs_ty);
             self.expect_assignable(&lhs_ty, &rhs_ty, "assignment", span);
             self.check_assign_mut(ctx, lhs, span);
@@ -394,6 +426,7 @@ impl TypeChecker<'_> {
         }
 
         let lhs_ty = match (op, expected) {
+            (BinaryOp::Eq | BinaryOp::Neq, _) => self.check_place_expr(ctx, lhs),
             (
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod,
                 Some(expected),
@@ -408,13 +441,12 @@ impl TypeChecker<'_> {
             return ty;
         }
         let rhs_ty = match op {
+            BinaryOp::Eq | BinaryOp::Neq => self.check_place_expr(ctx, rhs),
             BinaryOp::Add
             | BinaryOp::Sub
             | BinaryOp::Mul
             | BinaryOp::Div
             | BinaryOp::Mod
-            | BinaryOp::Eq
-            | BinaryOp::Neq
             | BinaryOp::Lt
             | BinaryOp::Gt
             | BinaryOp::LtEq
@@ -697,6 +729,7 @@ impl TypeChecker<'_> {
         _span: Option<rowan::TextRange>,
     ) -> Type {
         let operand_ty = match (op, expected) {
+            (UnaryOp::Ref | UnaryOp::MutRef, _) => self.check_place_expr(ctx, operand),
             (UnaryOp::Neg | UnaryOp::Pos, Some(expected)) if expected.is_numeric() => {
                 self.check_expr_expected(ctx, operand, expected)
             }
@@ -1022,15 +1055,18 @@ impl TypeChecker<'_> {
             }
         } else if scrutinee_ty == Type::Bool && !has_catch_all && covered_bools.len() < 2 {
             self.diagnostic("E0039", "non-exhaustive match on `bool`", span);
-        } else if matches!(
-            scrutinee_ty,
+        } else if (matches!(
+            &scrutinee_ty,
             Type::Int(_)
                 | Type::InferInt
                 | Type::Float(_)
                 | Type::InferFloat
                 | Type::Char
                 | Type::Str
-        ) && !has_catch_all
+        ) || matches!(
+            &scrutinee_ty,
+            Type::Ref(inner, false) if matches!(inner.as_ref(), Type::Str)
+        )) && !has_catch_all
         {
             self.diagnostic("E0039", "non-exhaustive match; add a wildcard arm", span);
         }
@@ -1285,14 +1321,16 @@ impl TypeChecker<'_> {
             );
         }
 
-        Type::Array(
+        let ty = Type::Array(
             Box::new(
                 element_ty
                     .or_else(|| expected_element.cloned())
                     .unwrap_or(Type::Unknown),
             ),
             ConstArg::Value(elements.len()),
-        )
+        );
+        self.expect_sized_value(&ty, span);
+        ty
     }
 
     fn check_array_repeat(
@@ -1354,7 +1392,9 @@ impl TypeChecker<'_> {
             );
         }
 
-        Type::Array(Box::new(value_ty), ConstArg::Value(len_value))
+        let ty = Type::Array(Box::new(value_ty), ConstArg::Value(len_value));
+        self.expect_sized_value(&ty, span);
+        ty
     }
 
     fn repeat_value_is_copy(&self, ty: &Type) -> bool {
@@ -1471,6 +1511,9 @@ impl TypeChecker<'_> {
                 .chain(function.const_generics.iter())
                 .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
                 .collect::<Vec<_>>();
+            for arg in &args {
+                self.expect_sized_value(arg, span);
+            }
             self.generic_edges.push(GenericEdge {
                 caller: ctx.function_id,
                 callee: fid,
@@ -1647,18 +1690,28 @@ impl TypeChecker<'_> {
         ty: &Type,
         span: Option<rowan::TextRange>,
     ) {
+        self.expect_sized_value(ty, span);
+        self.check_type_bounds_inner(ctx, ty, span);
+    }
+
+    pub(crate) fn check_type_bounds_inner(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        ty: &Type,
+        span: Option<rowan::TextRange>,
+    ) {
         match ty {
             Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
-                self.check_type_bounds(ctx, inner, span)
+                self.check_type_bounds_inner(ctx, inner, span)
             }
             Type::Tuple(elements) => {
                 for element in elements {
-                    self.check_type_bounds(ctx, element, span);
+                    self.check_type_bounds_inner(ctx, element, span);
                 }
             }
             Type::Struct(struct_id, args) => {
                 for arg in args {
-                    self.check_type_bounds(ctx, arg, span);
+                    self.check_type_bounds_inner(ctx, arg, span);
                 }
                 let strukt = self.hir.item_tree.structs[*struct_id].clone();
                 let subst = strukt
@@ -1672,7 +1725,7 @@ impl TypeChecker<'_> {
             }
             Type::Enum(enum_id, args) => {
                 for arg in args {
-                    self.check_type_bounds(ctx, arg, span);
+                    self.check_type_bounds_inner(ctx, arg, span);
                 }
                 let enum_data = self.hir.item_tree.enums[*enum_id].clone();
                 let subst = enum_data
@@ -1926,6 +1979,12 @@ impl TypeChecker<'_> {
                     | (Type::Str, Type::Str)
                     | (Type::Unit, Type::Unit)
             )
+            || matches!(
+                (lhs_ty, rhs_ty),
+                (Type::Ref(lhs, false), Type::Ref(rhs, false))
+                    if matches!(lhs.as_ref(), Type::Str)
+                        && matches!(rhs.as_ref(), Type::Str)
+            )
     }
 
     fn is_builtin_ordering(&self, lhs_ty: &Type, rhs_ty: &Type) -> bool {
@@ -1943,7 +2002,7 @@ impl TypeChecker<'_> {
         args: &[ExprId],
         span: Option<rowan::TextRange>,
     ) -> Type {
-        let base_ty = self.check_expr(ctx, base);
+        let base_ty = self.check_place_expr(ctx, base);
         let Some(method) = self.find_method(ctx, &base_ty, &method_name) else {
             for arg in args {
                 self.check_expr(ctx, *arg);
@@ -2267,6 +2326,23 @@ impl TypeChecker<'_> {
 
     /// Check that the LHS of an assignment targets a mutable binding.
     fn check_assign_mut(&mut self, ctx: &BodyCtx<'_>, lhs: ExprId, span: Option<rowan::TextRange>) {
+        if let Expr::Unary {
+            operand,
+            op: UnaryOp::Deref,
+        } = &ctx.body.exprs[lhs]
+        {
+            if matches!(
+                self.result.expr_types.get(&(ctx.body_id, *operand)),
+                Some(Type::Ref(_, false) | Type::Ptr { mutable: false, .. })
+            ) {
+                self.diagnostic(
+                    "E0031",
+                    "cannot mutate through a shared reference or const pointer",
+                    span,
+                );
+            }
+            return;
+        }
         if let Expr::Path { path, .. } = &ctx.body.exprs[lhs]
             && let Some(name) = path.as_single_name()
             && ctx.bindings.get(&name.0).is_some()
@@ -2393,7 +2469,7 @@ impl TypeChecker<'_> {
             LiteralPattern::Float { suffix, .. } => {
                 self.float_literal_type(suffix.as_deref(), expected)
             }
-            LiteralPattern::String(_) => Type::Str,
+            LiteralPattern::String(_) => Type::Ref(Box::new(Type::Str), false),
             LiteralPattern::Char(_) => Type::Char,
             LiteralPattern::Bool(_) => Type::Bool,
         }

@@ -48,7 +48,10 @@ impl<'f> Builder<'f> {
     }
 
     pub fn sconst(&mut self, value: String) -> Value {
-        self.emit(InstKind::Const(ConstValue::String(value)), Type::Str)
+        self.emit(
+            InstKind::Const(ConstValue::String(value)),
+            Type::Ref(Box::new(Type::Str), false),
+        )
     }
 
     pub fn char_const(&mut self, value: char) -> Value {

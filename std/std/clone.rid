@@ -5,7 +5,7 @@ pub trait Clone {
 
 impl Clone for bool { fun clone(&self) -> Self { *self } }
 impl Clone for char { fun clone(&self) -> Self { *self } }
-impl Clone for str { fun clone(&self) -> Self { *self } }
+impl Clone for &str { fun clone(&self) -> Self { *self } }
 impl Clone for i8 { fun clone(&self) -> Self { *self } }
 impl Clone for i16 { fun clone(&self) -> Self { *self } }
 impl Clone for i32 { fun clone(&self) -> Self { *self } }

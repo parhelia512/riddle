@@ -3,6 +3,29 @@ use frontend::incremental::{IncrementalParser, ReparseMode};
 use type_checker::IncrementalTypeChecker;
 
 #[test]
+fn incremental_reports_unsized_declarations() {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(
+        r#"
+        struct Bad { value: str }
+        fun main() {}
+        "#,
+    );
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let mut checker = IncrementalTypeChecker::new();
+    let hir = lower_and_resolve(parse);
+    let result = checker.check(&hir);
+    assert!(
+        result
+            .result
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code == "E0043")
+    );
+}
+
+#[test]
 fn incremental_type_checker_reuses_unchanged_bodies() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(

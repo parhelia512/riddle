@@ -85,7 +85,7 @@ fn js_bool_literal() {
 fn js_string_literal() {
     let module = lower(
         r#"
-        fun hello() -> str {
+        fun hello() -> &str {
             return "world";
         }
         "#,

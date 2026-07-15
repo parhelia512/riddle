@@ -65,6 +65,8 @@ impl IncrementalTypeChecker {
         let mut stats = IncrementalStats::default();
         let mut live_ptrs = HashSet::new();
 
+        checker.check_value_type_declarations();
+        checker.check_struct_layouts();
         checker.check_traits();
         checker.check_impls();
         checker.build_trait_env();

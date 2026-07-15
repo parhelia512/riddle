@@ -159,8 +159,28 @@ impl Type {
     /// Returns `true` if this type has a known size at compile time.
     /// Unsized types (like `str`) can only exist behind a pointer/reference.
     pub fn is_sized(&self) -> bool {
-        !matches!(self, Type::Str)
-        // ponytail: only str is unsized for now; [T] slices would also be unsized
+        match self {
+            Type::Str => false,
+            Type::Tuple(elements) => elements.iter().all(Type::is_sized),
+            Type::Array(inner, _) => inner.is_sized(),
+            Type::Struct(_, args) | Type::Enum(_, args) => args.iter().all(Type::is_sized),
+            _ => true,
+        }
+    }
+
+    pub(crate) fn is_valid_value_type(&self) -> bool {
+        match self {
+            Type::Str => false,
+            Type::Ref(inner, _) | Type::Ptr { inner, .. } => {
+                matches!(inner.as_ref(), Type::Str) || inner.is_valid_value_type()
+            }
+            Type::Tuple(elements) => elements.iter().all(Type::is_valid_value_type),
+            Type::Array(inner, _) => inner.is_valid_value_type(),
+            Type::Struct(_, args) | Type::Enum(_, args) => {
+                args.iter().all(Type::is_valid_value_type)
+            }
+            _ => true,
+        }
     }
 
     /// Compiler-intrinsic `Copy` candidates – types that are `Copy`
@@ -174,7 +194,6 @@ impl Type {
                 | Type::InferFloat
                 | Type::Bool
                 | Type::Char
-                | Type::Str // fat pointer {ptr, len} — plain data, trivially Copy
                 | Type::Unit
                 | Type::Never
                 | Type::Ref(_, false)

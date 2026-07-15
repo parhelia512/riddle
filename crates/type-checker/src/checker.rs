@@ -40,6 +40,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub fn check(mut self) -> TypeCheckResult {
+        self.check_value_type_declarations();
         self.check_struct_layouts();
         self.check_traits();
         self.check_impls();
@@ -48,6 +49,182 @@ impl<'a> TypeChecker<'a> {
         self.check_function_bodies();
         self.check_generic_recursion();
         self.result
+    }
+
+    pub(crate) fn check_value_type_declarations(&mut self) {
+        let structs = self
+            .hir
+            .item_tree
+            .structs
+            .iter()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        for item in structs {
+            let params = crate::lowering::generic_param_map_with_consts(
+                item.generics.iter().map(|name| name.0.as_str()),
+                item.const_generics.iter().map(|name| name.0.as_str()),
+            );
+            for field in item.fields {
+                let ty =
+                    self.lower_type_ref_with_params_at(&field.ty, &params, Some(field.ty_range));
+                self.expect_sized_value(&ty, Some(field.ty_range));
+            }
+        }
+
+        let enums = self
+            .hir
+            .item_tree
+            .enums
+            .iter()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        for item in enums {
+            let params = crate::lowering::generic_param_map_with_consts(
+                item.generics.iter().map(|name| name.0.as_str()),
+                item.const_generics.iter().map(|name| name.0.as_str()),
+            );
+            for variant in item.variants {
+                match variant.kind {
+                    hir::item_tree::HirVariantKind::Unit => {}
+                    hir::item_tree::HirVariantKind::Tuple(fields) => {
+                        for field in fields {
+                            let ty = self.lower_type_ref_with_params(&field, &params);
+                            self.expect_sized_value(&ty, None);
+                        }
+                    }
+                    hir::item_tree::HirVariantKind::Struct(fields) => {
+                        for field in fields {
+                            let ty = self.lower_type_ref_with_params_at(
+                                &field.ty,
+                                &params,
+                                Some(field.ty_range),
+                            );
+                            self.expect_sized_value(&ty, Some(field.ty_range));
+                        }
+                    }
+                }
+            }
+        }
+
+        let functions = self
+            .hir
+            .item_tree
+            .functions
+            .iter()
+            .map(|(id, function)| (id, function.clone()))
+            .collect::<Vec<_>>();
+        for (id, function) in functions {
+            let outer_generics = self.impl_generic_names(id);
+            let outer_const_generics = self.impl_const_generic_names(id);
+            let mut params = crate::lowering::generic_param_map_with_consts(
+                outer_generics
+                    .iter()
+                    .map(String::as_str)
+                    .chain(function.generics.iter().map(|name| name.0.as_str())),
+                outer_const_generics
+                    .iter()
+                    .map(String::as_str)
+                    .chain(function.const_generics.iter().map(|name| name.0.as_str())),
+            );
+            if let Some(self_ty_ref) = self.impl_self_ty_ref(id).cloned() {
+                let self_ty = self.lower_type_ref_with_params(&self_ty_ref, &params);
+                params.insert("Self".into(), self_ty);
+            }
+            self.check_function_value_types(&function, &params);
+        }
+
+        let traits = self
+            .hir
+            .item_tree
+            .traits
+            .iter()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        for item in traits {
+            for method in item.methods {
+                let mut params = crate::lowering::generic_param_map_with_consts(
+                    method.generics.iter().map(|name| name.0.as_str()),
+                    method.const_generics.iter().map(|name| name.0.as_str()),
+                );
+                params.insert("Self".into(), Type::Param("Self".into()));
+                self.check_function_value_types(&method, &params);
+            }
+            for alias in item.type_aliases {
+                let Some(alias) = alias.ty else {
+                    continue;
+                };
+                let params =
+                    std::collections::HashMap::from([("Self".into(), Type::Param("Self".into()))]);
+                let ty = self.lower_type_ref_with_params(&alias, &params);
+                self.expect_sized_value(&ty, None);
+            }
+        }
+
+        let consts = self
+            .hir
+            .item_tree
+            .consts
+            .iter()
+            .map(|(id, item)| (id, item.clone()))
+            .collect::<Vec<_>>();
+        for (id, item) in consts {
+            let params = self.impl_item_type_params(|imp| imp.consts.contains(&id));
+            let ty = self.lower_type_ref_with_params(&item.ty, &params);
+            self.expect_sized_value(&ty, None);
+        }
+
+        let aliases = self
+            .hir
+            .item_tree
+            .type_aliases
+            .iter()
+            .map(|(id, item)| (id, item.clone()))
+            .collect::<Vec<_>>();
+        for (id, item) in aliases {
+            let Some(alias) = item.ty else {
+                continue;
+            };
+            let params = self.impl_item_type_params(|imp| imp.type_aliases.contains(&id));
+            let ty = self.lower_type_ref_with_params(&alias, &params);
+            self.expect_sized_value(&ty, None);
+        }
+    }
+
+    fn check_function_value_types(
+        &mut self,
+        function: &HirFunction,
+        params: &std::collections::HashMap<String, Type>,
+    ) {
+        for param in &function.params {
+            let ty = self.lower_type_ref_with_params(&param.ty, params);
+            self.expect_sized_value(&ty, None);
+        }
+        if let Some(return_ty) = &function.ret_type {
+            let ty = self.lower_type_ref_with_params(return_ty, params);
+            self.expect_sized_value(&ty, None);
+        }
+    }
+
+    fn impl_item_type_params(
+        &mut self,
+        owns: impl Fn(&hir::item_tree::HirImpl) -> bool,
+    ) -> std::collections::HashMap<String, Type> {
+        let owner = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .find_map(|(_, imp)| owns(imp).then(|| imp.clone()));
+        let Some(owner) = owner else {
+            return std::collections::HashMap::new();
+        };
+        let mut params = crate::lowering::generic_param_map_with_consts(
+            owner.generics.iter().map(|name| name.0.as_str()),
+            owner.const_generics.iter().map(|name| name.0.as_str()),
+        );
+        let self_ty = self.lower_type_ref_with_params(&owner.self_ty, &params);
+        params.insert("Self".into(), self_ty);
+        params
     }
 
     pub(crate) fn build_trait_env(&mut self) {
@@ -164,10 +341,10 @@ impl<'a> TypeChecker<'a> {
             return_ty.clone(),
             params,
         );
-        self.check_type_bounds(&ctx, &return_ty, None);
+        self.check_type_bounds_inner(&ctx, &return_ty, None);
         for param in &function.params {
             let param_ty = self.lower_type_ref_with_params(&param.ty, &ctx.generic_params);
-            self.check_type_bounds(&ctx, &param_ty, None);
+            self.check_type_bounds_inner(&ctx, &param_ty, None);
         }
         let actual = self.check_expr_expected(&mut ctx, body.root_block, &return_ty);
 
@@ -238,7 +415,7 @@ impl<'a> TypeChecker<'a> {
             })
     }
 
-    fn check_struct_layouts(&mut self) {
+    pub(crate) fn check_struct_layouts(&mut self) {
         let structs = self
             .hir
             .item_tree
@@ -430,12 +607,6 @@ impl<'a> TypeChecker<'a> {
         if actual.is_never() {
             return;
         }
-        // str → &str coercion (unsized coercion for string literals)
-        if matches!(actual, Type::Str)
-            && matches!(expected, Type::Ref(inner, _) if matches!(**inner, Type::Str))
-        {
-            return;
-        }
         self.diagnostic(
             "E0001",
             format!(
@@ -443,6 +614,20 @@ impl<'a> TypeChecker<'a> {
                 context,
                 expected.display(self.hir),
                 actual.display(self.hir)
+            ),
+            span,
+        );
+    }
+
+    pub(crate) fn expect_sized_value(&mut self, ty: &Type, span: Option<TextRange>) {
+        if ty.is_valid_value_type() {
+            return;
+        }
+        self.diagnostic(
+            "E0043",
+            format!(
+                "type `{}` contains unsized `str` in a position that requires a sized type",
+                ty.display(self.hir)
             ),
             span,
         );
@@ -478,6 +663,7 @@ impl<'a> TypeChecker<'a> {
             "E0039" => vec!["cover every possible case or add a wildcard arm".into()],
             "E0041" => vec!["every field must implement `Copy`; add the required generic bounds or remove the impl".into()],
             "E0042" => vec!["move this statement inside a `while` or `for` loop".into()],
+            "E0043" => vec!["use `&str` or a raw pointer; unsized `str` must be behind a reference or pointer".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
             "E0021" => vec!["trait method declarations should not have a body".into()],
             "E0022" | "E0025" => vec!["remove the duplicate associated type".into()],

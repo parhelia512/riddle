@@ -59,7 +59,20 @@ fn string_literal() {
         "#,
     );
     let func = &module.functions[module.function_order[0]];
-    assert!(!func.blocks[func.entry].insts.is_empty());
+    let string = func.blocks[func.entry]
+        .insts
+        .iter()
+        .find(|inst| {
+            matches!(
+                inst.kind,
+                mir::instr::InstKind::Const(mir::instr::ConstValue::String(_))
+            )
+        })
+        .expect("missing string constant");
+    assert_eq!(
+        string.ty,
+        mir::types::Type::Ref(Box::new(mir::types::Type::Str), false)
+    );
 }
 
 #[test]
