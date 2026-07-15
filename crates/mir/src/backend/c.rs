@@ -91,6 +91,13 @@ impl Backend for CBackend {
         writeln!(out, "#include <stdio.h>").unwrap();
         writeln!(out, "#include <stdlib.h>").unwrap();
         writeln!(out, "#include <string.h>").unwrap();
+        writeln!(out, "#if defined(__FLT128_MANT_DIG__)").unwrap();
+        writeln!(out, "typedef _Float128 riddle_f128;").unwrap();
+        writeln!(out, "#elif defined(__SIZEOF_FLOAT128__)").unwrap();
+        writeln!(out, "typedef __float128 riddle_f128;").unwrap();
+        writeln!(out, "#else").unwrap();
+        writeln!(out, "typedef long double riddle_f128;").unwrap();
+        writeln!(out, "#endif").unwrap();
         writeln!(out).unwrap();
         if self.needs_gc {
             writeln!(out, "{}", gc::RUNTIME_C).unwrap();
@@ -936,8 +943,7 @@ fn ctype_of(ty: &Type) -> String {
             FloatTy::F16 => "_Float16".into(),
             FloatTy::F32 => "float".into(),
             FloatTy::F64 => "double".into(),
-            // ponytail: F128 uses __float128 (GCC/Clang); long double may differ by target
-            FloatTy::F128 => "__float128".into(),
+            FloatTy::F128 => "riddle_f128".into(),
         },
         Type::Bool => "bool".into(),
         Type::Char => "char".into(),

@@ -55,6 +55,20 @@ fn c_return_value() {
 }
 
 #[test]
+fn c_backend_uses_portable_f128_alias() {
+    let module = lower("fun identity(value: f128) -> f128 { value }");
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+
+    assert!(result.contains("typedef _Float128 riddle_f128;"));
+    assert!(
+        result.contains("riddle_f128 identity (riddle_f128"),
+        "f128 signature should use the portable alias:\n{}",
+        result
+    );
+}
+
+#[test]
 fn c_arithmetic() {
     let module = lower(
         r#"
