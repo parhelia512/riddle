@@ -8,6 +8,14 @@
 #define RGC_MIN_HEAP (1024u * 1024u)
 #endif
 
+#if defined(_MSC_VER)
+#define RGC_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define RGC_NOINLINE __attribute__((noinline))
+#else
+#define RGC_NOINLINE
+#endif
+
 typedef struct RgcHeader RgcHeader;
 typedef struct RgcMarkStack RgcMarkStack;
 
@@ -31,7 +39,7 @@ static void *rgc_stack_bottom = NULL;
 
 void rgc_init(void *stack_bottom);
 void *rgc_alloc(size_t size);
-void rgc_collect(void);
+RGC_NOINLINE void rgc_collect(void);
 
 static void *rgc_payload(RgcHeader *object) {
     return (void *)(object + 1);
@@ -142,7 +150,7 @@ void rgc_init(void *stack_bottom) {
     rgc_stack_bottom = stack_bottom;
 }
 
-void rgc_collect(void) {
+RGC_NOINLINE void rgc_collect(void) {
 #if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
     uintptr_t registers[11];
     __asm__ volatile(
