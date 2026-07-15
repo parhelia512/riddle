@@ -1,9 +1,13 @@
+use std::collections::HashSet;
+
 use rowan::TextRange;
 
 use hir::{
     HirFile,
     body::BodyId,
-    item_tree::{FunctionId, HirFunction, HirTypeRef, StructId},
+    item_tree::{
+        EnumId, FunctionId, HirConstArg, HirFunction, HirTypeRef, HirVariantKind, StructId,
+    },
 };
 
 use crate::{
@@ -17,6 +21,7 @@ pub struct TypeChecker<'a> {
     pub(crate) hir: &'a HirFile,
     pub(crate) result: TypeCheckResult,
     pub(crate) generic_edges: Vec<GenericEdge>,
+    infinite_layout_types: HashSet<NominalType>,
 }
 
 pub(crate) struct GenericEdge {
@@ -24,6 +29,12 @@ pub(crate) struct GenericEdge {
     pub(crate) callee: FunctionId,
     pub(crate) grows: bool,
     pub(crate) span: Option<TextRange>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum NominalType {
+    Struct(StructId),
+    Enum(EnumId),
 }
 
 pub fn check_hir(hir: &HirFile) -> TypeCheckResult {
@@ -36,12 +47,13 @@ impl<'a> TypeChecker<'a> {
             hir,
             result: TypeCheckResult::default(),
             generic_edges: Vec::new(),
+            infinite_layout_types: HashSet::new(),
         }
     }
 
     pub fn check(mut self) -> TypeCheckResult {
         self.check_value_type_declarations();
-        self.check_struct_layouts();
+        self.check_type_layouts();
         self.check_traits();
         self.check_impls();
         self.build_trait_env();
@@ -415,7 +427,7 @@ impl<'a> TypeChecker<'a> {
             })
     }
 
-    pub(crate) fn check_struct_layouts(&mut self) {
+    pub(crate) fn check_type_layouts(&mut self) {
         let structs = self
             .hir
             .item_tree
@@ -433,9 +445,14 @@ impl<'a> TypeChecker<'a> {
 
         for (id, name, name_range, fields) in structs {
             if let Some(field_range) = fields.iter().find_map(|field| {
-                self.type_ref_contains_inline_struct(&field.ty, id, &mut Vec::new())
-                    .then_some(field.ty_range)
+                self.type_ref_contains_inline_type(
+                    &field.ty,
+                    NominalType::Struct(id),
+                    &mut Vec::new(),
+                )
+                .then_some(field.ty_range)
             }) {
+                self.infinite_layout_types.insert(NominalType::Struct(id));
                 self.diagnostic(
                     "E0072",
                     format!("recursive type `{name}` has infinite size"),
@@ -450,51 +467,130 @@ impl<'a> TypeChecker<'a> {
                 );
             }
         }
+
+        let enums = self
+            .hir
+            .item_tree
+            .enums
+            .iter()
+            .map(|(id, item)| (id, item.name.0.clone(), item.variants.clone()))
+            .collect::<Vec<_>>();
+        for (id, name, variants) in enums {
+            let target = NominalType::Enum(id);
+            let recursive_field = variants.iter().find_map(|variant| match &variant.kind {
+                HirVariantKind::Unit => None,
+                HirVariantKind::Tuple(fields) => fields
+                    .iter()
+                    .any(|field| self.type_ref_contains_inline_type(field, target, &mut Vec::new()))
+                    .then_some(None),
+                HirVariantKind::Struct(fields) => fields.iter().find_map(|field| {
+                    self.type_ref_contains_inline_type(&field.ty, target, &mut Vec::new())
+                        .then_some(Some(field.ty_range))
+                }),
+            });
+            if let Some(field_range) = recursive_field {
+                self.infinite_layout_types.insert(target);
+                self.diagnostic(
+                    "E0072",
+                    format!("recursive type `{name}` has infinite size"),
+                    field_range,
+                );
+            }
+        }
     }
 
-    fn type_ref_contains_inline_struct(
+    fn type_ref_contains_inline_type(
         &self,
         ty: &HirTypeRef,
-        target: StructId,
-        seen: &mut Vec<StructId>,
+        target: NominalType,
+        seen: &mut Vec<NominalType>,
     ) -> bool {
         match ty {
             HirTypeRef::Named(path) => {
                 let Some(name) = path.as_single_name().map(|name| name.0.as_str()) else {
                     return false;
                 };
-                let Some((sid, strukt)) = self
-                    .hir
-                    .item_tree
-                    .structs
-                    .iter()
-                    .find(|(_, strukt)| strukt.name.0 == name)
-                else {
+                let Some(current) = self.find_nominal_type(name) else {
                     return false;
                 };
-                if sid == target {
+                if current == target {
                     return true;
                 }
-                if seen.contains(&sid) {
+                if seen.contains(&current) {
                     return false;
                 }
-                seen.push(sid);
-                let found = strukt
-                    .fields
-                    .iter()
-                    .any(|field| self.type_ref_contains_inline_struct(&field.ty, target, seen));
+                seen.push(current);
+                let found = self.nominal_type_contains_inline_target(current, target, seen);
                 seen.pop();
                 found
             }
             HirTypeRef::Tuple(elements) => elements
                 .iter()
-                .any(|ty| self.type_ref_contains_inline_struct(ty, target, seen)),
-            HirTypeRef::Array(inner, _) => {
-                self.type_ref_contains_inline_struct(inner, target, seen)
-            }
+                .any(|ty| self.type_ref_contains_inline_type(ty, target, seen)),
+            HirTypeRef::Array(_, HirConstArg::Value(0)) => false,
+            HirTypeRef::Array(inner, _) => self.type_ref_contains_inline_type(inner, target, seen),
             HirTypeRef::Const(_) => false,
             HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
             HirTypeRef::Unknown | HirTypeRef::Error => false,
+        }
+    }
+
+    fn find_nominal_type(&self, name: &str) -> Option<NominalType> {
+        self.hir
+            .item_tree
+            .structs
+            .iter()
+            .find_map(|(id, item)| (item.name.0 == name).then_some(NominalType::Struct(id)))
+            .or_else(|| {
+                self.hir
+                    .item_tree
+                    .enums
+                    .iter()
+                    .find_map(|(id, item)| (item.name.0 == name).then_some(NominalType::Enum(id)))
+            })
+    }
+
+    fn nominal_type_contains_inline_target(
+        &self,
+        current: NominalType,
+        target: NominalType,
+        seen: &mut Vec<NominalType>,
+    ) -> bool {
+        match current {
+            NominalType::Struct(id) => self.hir.item_tree.structs[id]
+                .fields
+                .iter()
+                .any(|field| self.type_ref_contains_inline_type(&field.ty, target, seen)),
+            NominalType::Enum(id) => {
+                self.hir.item_tree.enums[id]
+                    .variants
+                    .iter()
+                    .any(|variant| match &variant.kind {
+                        HirVariantKind::Unit => false,
+                        HirVariantKind::Tuple(fields) => fields
+                            .iter()
+                            .any(|field| self.type_ref_contains_inline_type(field, target, seen)),
+                        HirVariantKind::Struct(fields) => fields.iter().any(|field| {
+                            self.type_ref_contains_inline_type(&field.ty, target, seen)
+                        }),
+                    })
+            }
+        }
+    }
+
+    pub(crate) fn type_has_infinite_layout(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Struct(id, _) => self
+                .infinite_layout_types
+                .contains(&NominalType::Struct(*id)),
+            Type::Enum(id, _) => self.infinite_layout_types.contains(&NominalType::Enum(*id)),
+            Type::Tuple(fields) => fields
+                .iter()
+                .any(|field| self.type_has_infinite_layout(field)),
+            Type::Array(_, crate::ConstArg::Value(0)) => false,
+            Type::Array(inner, _) => self.type_has_infinite_layout(inner),
+            Type::Ref(_, _) | Type::Ptr { .. } => false,
+            _ => false,
         }
     }
 
@@ -650,7 +746,7 @@ impl<'a> TypeChecker<'a> {
             "E0008" => vec!["only references can be dereferenced, and only arrays can be indexed".into()],
             "E0009" => vec!["check that the path names a struct definition".into()],
             "E0010" => vec!["ensure tuple element counts match".into()],
-            "E0011" => vec!["valid numeric suffixes include i8, i16, i32, i64, u8, u16, u32, u64, f32, and f64".into()],
+            "E0011" => vec!["use a valid numeric suffix and keep the literal within that type's range".into()],
             "E0012" => vec!["this source and target type pair does not support `as` conversion".into()],
             "E0013" => vec!["check the impl block and receiver type".into()],
             "E0020" | "E0024" => vec!["remove the duplicate definition".into()],

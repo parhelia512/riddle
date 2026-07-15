@@ -232,8 +232,16 @@ pub enum Pattern {
 
 #[derive(Debug, Clone)]
 pub enum LiteralPattern {
-    Int { value: i64, suffix: Option<String> },
-    Float { value: f64, suffix: Option<String> },
+    Int {
+        value: i64,
+        suffix: Option<String>,
+        valid: bool,
+    },
+    Float {
+        value: f64,
+        suffix: Option<String>,
+        valid: bool,
+    },
     String(String),
     Char(String),
     Bool(bool),
@@ -753,10 +761,10 @@ impl BodyPrinter<'_> {
         match &self.body.pats[pat] {
             Pattern::Wildcard => "_".to_string(),
             Pattern::Literal(literal) => match literal {
-                LiteralPattern::Int { value, suffix } => {
+                LiteralPattern::Int { value, suffix, .. } => {
                     format!("{}{}", value, suffix.as_deref().unwrap_or_default())
                 }
-                LiteralPattern::Float { value, suffix } => {
+                LiteralPattern::Float { value, suffix, .. } => {
                     format!("{}{}", value, suffix.as_deref().unwrap_or_default())
                 }
                 LiteralPattern::String(value) => value.clone(),

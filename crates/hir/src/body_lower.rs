@@ -358,9 +358,16 @@ impl<'a> BodyLower<'a> {
                 )
             }
 
-            ast::Expr::ParenExpr(p) => {
-                self.lower_required_expr(p.inner(), "missing parenthesized expression")
-            }
+            ast::Expr::ParenExpr(p) => match p.inner() {
+                Some(inner) => self.lower_expr(inner),
+                None => self.alloc_expr(
+                    Expr::Block {
+                        stmts: Vec::new(),
+                        tail: None,
+                    },
+                    range,
+                ),
+            },
 
             ast::Expr::BinaryExpr(b) => {
                 let lhs = self.lower_required_expr(b.lhs(), "missing lhs of binary expression");
@@ -573,19 +580,33 @@ impl<'a> BodyLower<'a> {
                 let literal = match token.map(|token| token.kind()) {
                     Some(SyntaxKind::Number) => {
                         let (digits, radix, suffix) = split_int_literal(&text);
-                        let value = i64::from_str_radix(&digits, radix).unwrap_or_else(|_| {
-                            self.diagnostic("invalid integer literal pattern", range);
-                            0
-                        });
-                        LiteralPattern::Int { value, suffix }
+                        let (value, valid) = match i64::from_str_radix(&digits, radix) {
+                            Ok(value) => (value, true),
+                            Err(_) => {
+                                self.diagnostic("invalid integer literal pattern", range);
+                                (0, false)
+                            }
+                        };
+                        LiteralPattern::Int {
+                            value,
+                            suffix,
+                            valid,
+                        }
                     }
                     Some(SyntaxKind::Float) => {
                         let (number, suffix) = split_float_literal(&text);
-                        let value = number.parse().unwrap_or_else(|_| {
-                            self.diagnostic("invalid float literal pattern", range);
-                            0.0
-                        });
-                        LiteralPattern::Float { value, suffix }
+                        let (value, valid) = match number.parse() {
+                            Ok(value) => (value, true),
+                            Err(_) => {
+                                self.diagnostic("invalid float literal pattern", range);
+                                (0.0, false)
+                            }
+                        };
+                        LiteralPattern::Float {
+                            value,
+                            suffix,
+                            valid,
+                        }
                     }
                     Some(SyntaxKind::String) => LiteralPattern::String(text),
                     Some(SyntaxKind::Char) => LiteralPattern::Char(lower_char_literal(&text)),

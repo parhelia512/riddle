@@ -1,6 +1,7 @@
 mod body;
 mod checker;
 mod context;
+mod coverage;
 pub mod incremental;
 mod lowering;
 mod result;

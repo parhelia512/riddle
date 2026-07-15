@@ -175,6 +175,614 @@ fn checks_boolean_match_return_paths() {
 }
 
 #[test]
+fn checks_open_scalar_match_exhaustiveness() {
+    let complete = check(
+        r#"
+        fun signed(value: i32) -> i32 {
+            match value {
+                0 => 0,
+                _ => 1,
+            }
+        }
+
+        fun unsigned(value: u8) -> i32 {
+            match value {
+                0 => 0,
+                other => 1,
+            }
+        }
+
+        fun decimal(value: f64) -> i32 {
+            match value {
+                0.0 => 0,
+                _ => 1,
+            }
+        }
+
+        fun character(value: char) -> i32 {
+            match value {
+                'a' => 0,
+                _ => 1,
+            }
+        }
+        "#,
+    );
+    assert_eq!(complete.diagnostics, vec![]);
+
+    let incomplete = check(
+        r#"
+        fun signed(value: i32) -> i32 {
+            match value { 0 => 0 }
+        }
+
+        fun unsigned(value: u8) -> i32 {
+            match value { 0 => 0 }
+        }
+
+        fun decimal(value: f64) -> i32 {
+            match value { 0.0 => 0 }
+        }
+
+        fun character(value: char) -> i32 {
+            match value { 'a' => 0 }
+        }
+        "#,
+    );
+    let missing = incomplete
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0039")
+        .collect::<Vec<_>>();
+    assert_eq!(missing.len(), 4, "{:#?}", incomplete.diagnostics);
+    assert!(
+        missing
+            .iter()
+            .all(|diagnostic| diagnostic.message.contains("missing pattern `_`")),
+        "{missing:#?}"
+    );
+}
+
+#[test]
+fn reports_uncovered_integer_ranges() {
+    let result = check(
+        r#"
+        fun signed(value: i32) -> i32 {
+            match value {
+                0 => 0,
+                2 => 2,
+                2147483647 => 3,
+            }
+        }
+
+        fun unsigned(value: u8) -> i32 {
+            match value {
+                0 => 0,
+                2 => 2,
+                4 => 4,
+                255 => 5,
+            }
+        }
+
+        fun guarded(value: u8, condition: bool) -> i32 {
+            match value {
+                _ if condition => 1,
+            }
+        }
+        "#,
+    );
+
+    let diagnostics = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0039")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 3, "{:#?}", result.diagnostics);
+
+    assert_eq!(
+        diagnostics[0].notes[0],
+        "uncovered i32 ranges for `_`: `-2147483648..=-1`, `1`, `3..=2147483646`"
+    );
+    assert_eq!(
+        diagnostics[1].notes[0],
+        "uncovered u8 ranges for `_`: `1`, `3`, `5..=254`"
+    );
+    assert_eq!(
+        diagnostics[2].notes[0],
+        "uncovered u8 ranges for `_`: `0..=255`"
+    );
+}
+
+#[test]
+fn invalid_integer_patterns_do_not_cover_values() {
+    let result = check(
+        r#"
+        fun wrong_suffix(value: u8) -> i32 {
+            match value {
+                0i32 => 0,
+            }
+        }
+
+        fun overflow(value: u8) -> i32 {
+            match value {
+                256 => 0,
+                _ => 1,
+            }
+        }
+        "#,
+    );
+
+    let non_exhaustive = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0039")
+        .unwrap();
+    assert_eq!(
+        non_exhaustive.notes[0],
+        "uncovered u8 ranges for `_`: `0..=255`"
+    );
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("integer literal `256` is out of range for `u8`")
+    }));
+}
+
+#[test]
+fn accepts_fully_enumerated_u8_match() {
+    let arms = (0u16..=255)
+        .map(|value| format!("{value} => {value},"))
+        .collect::<String>();
+    let result = check(&format!(
+        "fun complete(value: u8) -> i32 {{ match value {{ {arms} }} }}"
+    ));
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn reports_wide_integer_range_boundaries() {
+    let result = check(
+        r#"
+        fun signed(value: i128) -> i32 {
+            match value { 0 => 0 }
+        }
+
+        fun unsigned(value: u128) -> i32 {
+            match value { 0 => 0 }
+        }
+        "#,
+    );
+    let diagnostics = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0039")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2, "{:#?}", result.diagnostics);
+    assert_eq!(
+        diagnostics[0].notes[0],
+        "uncovered i128 ranges for `_`: `-170141183460469231731687303715884105728..=-1`, `1..=170141183460469231731687303715884105727`"
+    );
+    assert_eq!(
+        diagnostics[1].notes[0],
+        "uncovered u128 ranges for `_`: `1..=340282366920938463463374607431768211455`"
+    );
+}
+
+#[test]
+fn formats_nested_and_truncated_integer_ranges() {
+    let result = check(
+        r#"
+        fun pair(value: (u8, u8)) -> i32 {
+            match value {}
+        }
+
+        fun sparse(value: u8) -> i32 {
+            match value {
+                0 => 0,
+                2 => 0,
+                4 => 0,
+                6 => 0,
+                8 => 0,
+                10 => 0,
+                12 => 0,
+                14 => 0,
+                16 => 0,
+                18 => 0,
+            }
+        }
+        "#,
+    );
+    let diagnostics = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0039")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2, "{:#?}", result.diagnostics);
+    assert_eq!(
+        diagnostics[0].notes[0],
+        "uncovered u8 ranges for integer position 1 in `(_, _)`: `0..=255`"
+    );
+    assert_eq!(
+        diagnostics[0].notes[1],
+        "uncovered u8 ranges for integer position 2 in `(_, _)`: `0..=255`"
+    );
+    assert_eq!(
+        diagnostics[1].notes[0],
+        "uncovered u8 ranges for `_`: `1`, `3`, `5`, `7`, `9`, `11`, `13`, `15`, and 2 more"
+    );
+}
+
+#[test]
+fn rejects_uncovered_enum_payload_patterns() {
+    let result = check(
+        r#"
+        enum State { Ready, Done(i32) }
+
+        fun main() -> i32 {
+            match State::Ready {
+                State::Ready => 1,
+                State::Done(1) => 2,
+            }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code == "E0039" && diag.message.contains("State::Done(_)") }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn checks_nested_and_product_pattern_exhaustiveness() {
+    let result = check(
+        r#"
+        enum Bit { Zero, One }
+        enum Value { Flag(bool), Bit(Bit), Empty }
+
+        fun enum_payload(value: Value) -> i32 {
+            match value {
+                Value::Flag(true) => 1,
+                Value::Bit(Bit::Zero) => 2,
+                Value::Empty => 3,
+            }
+        }
+
+        fun pair(value: (bool, bool)) -> i32 {
+            match value {
+                (true, _) => 1,
+                (false, true) => 2,
+            }
+        }
+
+        fun single(value: (bool,)) -> i32 {
+            match value {
+                (true,) => 1,
+            }
+        }
+        "#,
+    );
+
+    let missing = result
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.code == "E0039")
+        .map(|diag| diag.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        missing
+            .iter()
+            .any(|message| message.contains("Value::Flag(false)")),
+        "{missing:#?}"
+    );
+    assert!(
+        missing
+            .iter()
+            .any(|message| message.contains("(false, false)")),
+        "{missing:#?}"
+    );
+    assert!(
+        missing.iter().any(|message| message.contains("(false,)")),
+        "{missing:#?}"
+    );
+}
+
+#[test]
+fn checks_struct_and_generic_payload_exhaustiveness() {
+    let result = check(
+        r#"
+        struct Flags { left: bool, right: bool }
+        enum Maybe<T> { Some(T), None }
+
+        fun flags(value: Flags) -> i32 {
+            match value {
+                Flags { left: true } => 1,
+                Flags { left: false, right: true } => 2,
+            }
+        }
+
+        fun maybe(value: Maybe<bool>) -> i32 {
+            match value {
+                Maybe::Some(true) => 1,
+                Maybe::None => 0,
+            }
+        }
+        "#,
+    );
+
+    let missing = result
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.code == "E0039")
+        .map(|diag| diag.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        missing
+            .iter()
+            .any(|message| message.contains("Flags { left: false, right: false }")),
+        "{missing:#?}"
+    );
+    assert!(
+        missing
+            .iter()
+            .any(|message| message.contains("Maybe::Some(false)")),
+        "{missing:#?}"
+    );
+}
+
+#[test]
+fn guarded_patterns_do_not_make_a_match_exhaustive() {
+    let result = check(
+        r#"
+        fun choose(value: bool, condition: bool) -> i32 {
+            match value {
+                true if condition => 1,
+                false => 2,
+            }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code == "E0039" && diag.message.contains("true") }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn accepts_exhaustive_nested_patterns_as_returning() {
+    let result = check(
+        r#"
+        enum State { Ready, Done(bool) }
+        enum Maybe<T> { Some(T), None }
+        enum Box<T> { Wrap(T) }
+        enum Void {}
+        struct Flags { left: bool, right: bool }
+
+        fun choose(state: State) -> i32 {
+            match state {
+                State::Ready => { return 0; },
+                State::Done(true) => { return 1; },
+                State::Done(false) => { return 2; },
+            }
+        }
+
+        fun pair(value: (bool, bool)) -> i32 {
+            match value {
+                (true, _) => { return 1; },
+                (false, _) => { return 2; },
+            }
+        }
+
+        fun flags(value: Flags) -> i32 {
+            match value {
+                Flags { left: true } => { return 1; },
+                Flags { left: false } => { return 2; },
+            }
+        }
+
+        fun maybe(value: Maybe<bool>) -> i32 {
+            match value {
+                Maybe::Some(_) => { return 1; },
+                Maybe::None => { return 0; },
+            }
+        }
+
+        fun impossible(value: Void) -> i32 {
+            match value {}
+        }
+
+        fun unit_value(value: ()) -> i32 {
+            match value {
+                () => { return 0; },
+            }
+        }
+
+        fun nested_box(value: Box<Box<bool>>) -> i32 {
+            match value {
+                Box::Wrap(Box::Wrap(true)) => { return 1; },
+                Box::Wrap(Box::Wrap(false)) => { return 0; },
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn unit_uses_empty_tuple_syntax() {
+    let valid = check(
+        r#"
+        fun identity(value: ()) -> () {
+            value
+        }
+
+        fun make() -> () {
+            ()
+        }
+
+        fun main() {
+            identity(());
+            make();
+        }
+        "#,
+    );
+    assert_eq!(valid.diagnostics, vec![]);
+
+    let old_alias = check("fun invalid(value: unit) {}");
+    assert!(old_alias.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0034" && diagnostic.message.contains("unknown type `unit`")
+    }));
+}
+
+#[test]
+fn ignores_uninhabited_constructor_spaces() {
+    let result = check(
+        r#"
+        enum Void {}
+        enum Outcome { Impossible(Void), Done }
+        struct NeverFlags { impossible: Void, flag: bool }
+
+        fun outcome(value: Outcome) -> i32 {
+            match value {
+                Outcome::Done => { return 1; },
+            }
+        }
+
+        fun pair(value: (Void, bool)) -> i32 {
+            match value {}
+        }
+
+        fun flags(value: NeverFlags) -> i32 {
+            match value {}
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn checks_array_inhabitability_for_coverage() {
+    let result = check(
+        r#"
+        enum Void {}
+
+        fun impossible(value: [Void; 1]) -> i32 {
+            match value {}
+        }
+
+        fun empty(value: [Void; 0]) -> i32 {
+            match value {}
+        }
+        "#,
+    );
+
+    let diagnostics = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0039")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 1, "{:#?}", result.diagnostics);
+    assert!(diagnostics[0].message.contains("missing pattern `_`"));
+}
+
+#[test]
+fn recursive_generic_constructor_space_terminates() {
+    let result = check(
+        r#"
+        enum Grow<T> { Next(Grow<(T, T)>) }
+        enum Loop { Again(Loop) }
+
+        fun impossible(value: Grow<bool>) -> i32 {
+            match value {}
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0039"),
+        "{:#?}",
+        result.diagnostics
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0072")
+            .count(),
+        2,
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn invalid_patterns_do_not_contribute_to_coverage() {
+    let result = check(
+        r#"
+        enum Left { Same, Tuple(bool), Named { flag: bool } }
+        enum Right { Same, Tuple(bool), Named { flag: bool } }
+        enum Singleton { Only }
+        struct Flags { flag: bool }
+
+        fun wrong_enum(value: Left) -> i32 {
+            match value {
+                Right::Same => 1,
+                Right::Tuple(_) => 2,
+                Right::Named { flag: _ } => 3,
+            }
+        }
+
+        fun wrong_field(value: Flags) -> i32 {
+            match value {
+                Flags { missing: _ } => 1,
+            }
+        }
+
+        fun unknown_enum_owner(value: Singleton) -> i32 {
+            match value {
+                Missing::Only => 1,
+            }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0038")
+            .count()
+            >= 5,
+        "{:#?}",
+        result.diagnostics
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0039")
+            .count()
+            >= 3,
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn checks_function_call_arguments() {
     let result = check(
         r#"

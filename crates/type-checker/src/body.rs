@@ -20,13 +20,6 @@ use crate::{
     types::{ConstArg, IntTy, Type},
 };
 
-enum PatternCoverage {
-    None,
-    Variant(usize),
-    Bool(bool),
-    CatchAll,
-}
-
 impl TypeChecker<'_> {
     pub(crate) fn expr_always_returns(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> bool {
         match &ctx.body.exprs[expr_id] {
@@ -48,10 +41,6 @@ impl TypeChecker<'_> {
                     })
             }
             Expr::While { condition, .. } => self.expr_always_returns(ctx, *condition),
-            Expr::Match { scrutinee, arms } => {
-                self.expr_always_returns(ctx, *scrutinee)
-                    || self.exhaustive_match_always_returns(ctx, *scrutinee, arms)
-            }
             Expr::Unsafe { body } => self.expr_always_returns(ctx, *body),
             _ => self
                 .result
@@ -68,50 +57,6 @@ impl TypeChecker<'_> {
             Stmt::Let { init, .. } => init.is_some_and(|expr| self.expr_always_returns(ctx, expr)),
             Stmt::Item { .. } => false,
         }
-    }
-
-    fn exhaustive_match_always_returns(
-        &self,
-        ctx: &BodyCtx<'_>,
-        scrutinee: ExprId,
-        arms: &[MatchArm],
-    ) -> bool {
-        if arms.is_empty() {
-            return false;
-        }
-
-        let expected = self
-            .result
-            .expr_types
-            .get(&(ctx.body_id, scrutinee))
-            .unwrap_or(&Type::Unknown);
-        let mut covered_variants = HashSet::new();
-        let mut covered_bools = HashSet::new();
-        for arm in arms {
-            if !self.expr_always_returns(ctx, arm.body) {
-                return false;
-            }
-            if arm.guard.is_none() {
-                match self.pattern_coverage(ctx, arm.pat, expected) {
-                    PatternCoverage::CatchAll => return true,
-                    PatternCoverage::Variant(index) => {
-                        covered_variants.insert(index);
-                    }
-                    PatternCoverage::Bool(value) => {
-                        covered_bools.insert(value);
-                    }
-                    PatternCoverage::None => {}
-                }
-                if matches!(expected, Type::Enum(enum_id, _) if covered_variants.len() == self.hir.item_tree.enums[*enum_id].variants.len())
-                {
-                    return true;
-                }
-                if expected == &Type::Bool && covered_bools.len() == 2 {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     pub(crate) fn check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
@@ -990,9 +935,6 @@ impl TypeChecker<'_> {
     ) -> Type {
         let scrutinee_ty = self.check_expr(ctx, scrutinee);
         let mut result = None;
-        let mut covered_variants = HashSet::new();
-        let mut covered_bools = HashSet::new();
-        let mut has_catch_all = false;
 
         for arm in arms {
             ctx.push_scope();
@@ -1012,66 +954,36 @@ impl TypeChecker<'_> {
             };
             ctx.pop_scope();
 
-            if arm.guard.is_none() {
-                match self.pattern_coverage(ctx, arm.pat, &scrutinee_ty) {
-                    PatternCoverage::Variant(index) => {
-                        covered_variants.insert(index);
-                    }
-                    PatternCoverage::Bool(value) => {
-                        covered_bools.insert(value);
-                    }
-                    PatternCoverage::CatchAll => has_catch_all = true,
-                    PatternCoverage::None => {}
-                }
-            }
-
             result = Some(match result {
                 None => arm_ty,
                 Some(prev) => self.join_branch_types(prev, arm_ty, "match arms", span),
             });
         }
 
-        if let Type::Enum(enum_id, _) = &scrutinee_ty
-            && !has_catch_all
-        {
-            let enum_data = &self.hir.item_tree.enums[*enum_id];
-            let missing = enum_data
-                .variants
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !covered_variants.contains(index))
-                .map(|(_, variant)| variant.name.0.clone())
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                self.diagnostic(
-                    "E0039",
-                    format!(
-                        "non-exhaustive match on `{}`; missing {}",
-                        enum_data.name.0,
-                        missing.join(", ")
-                    ),
-                    span,
-                );
+        let missing = self.missing_match_pattern(ctx, arms, &scrutinee_ty);
+        if let Some((pattern, range_notes)) = &missing {
+            let message = if pattern == "_" {
+                "non-exhaustive match; missing pattern `_`; add a wildcard arm".to_string()
+            } else {
+                format!("non-exhaustive match; missing pattern `{pattern}`")
+            };
+            self.diagnostic("E0039", message, span);
+            if !range_notes.is_empty()
+                && let Some(diagnostic) = self.result.diagnostics.last_mut()
+            {
+                diagnostic.notes.splice(0..0, range_notes.iter().cloned());
             }
-        } else if scrutinee_ty == Type::Bool && !has_catch_all && covered_bools.len() < 2 {
-            self.diagnostic("E0039", "non-exhaustive match on `bool`", span);
-        } else if (matches!(
-            &scrutinee_ty,
-            Type::Int(_)
-                | Type::InferInt
-                | Type::Float(_)
-                | Type::InferFloat
-                | Type::Char
-                | Type::Str
-        ) || matches!(
-            &scrutinee_ty,
-            Type::Ref(inner, false) if matches!(inner.as_ref(), Type::Str)
-        )) && !has_catch_all
-        {
-            self.diagnostic("E0039", "non-exhaustive match; add a wildcard arm", span);
         }
 
-        result.unwrap_or(Type::Unit)
+        let exhaustive = !scrutinee_ty.is_unknown_like() && missing.is_none();
+        let all_arms_return = arms
+            .iter()
+            .all(|arm| self.expr_always_returns(ctx, arm.body));
+        if scrutinee_ty.is_never() || (exhaustive && all_arms_return) {
+            Type::Never
+        } else {
+            result.unwrap_or(Type::Unit)
+        }
     }
 
     fn check_for(
@@ -2401,9 +2313,24 @@ impl TypeChecker<'_> {
             Pattern::Literal(literal) => {
                 let literal_ty = self.literal_pattern_type(&literal, Some(expected));
                 self.expect_assignable(expected, &literal_ty, "literal pattern", span);
+                if let LiteralPattern::Int {
+                    value, valid: true, ..
+                } = literal
+                    && let Type::Int(ty) = literal_ty
+                    && !ty.contains_i64(value)
+                {
+                    self.diagnostic(
+                        "E0011",
+                        format!(
+                            "integer literal `{value}` is out of range for `{}`",
+                            ty.as_str()
+                        ),
+                        span,
+                    );
+                }
             }
             Pattern::Path { path } => {
-                self.validate_unit_variant_pattern(expected, path.segments.last(), span);
+                self.validate_unit_variant_pattern(expected, &path, span);
             }
             Pattern::Binding { name } => {
                 if let Some(is_unit) = self.enum_variant_is_unit(expected, &name.0) {
@@ -2419,6 +2346,9 @@ impl TypeChecker<'_> {
                 }
             }
             Pattern::Tuple { elements } => {
+                if elements.is_empty() && expected == &Type::Unit {
+                    return;
+                }
                 let Type::Tuple(expected_elements) = expected else {
                     if !expected.is_unknown_like() {
                         self.diagnostic(
@@ -2489,33 +2419,26 @@ impl TypeChecker<'_> {
     fn validate_unit_variant_pattern(
         &mut self,
         expected: &Type,
-        name: Option<&Name>,
+        path: &hir::item_tree::HirPath,
         span: Option<rowan::TextRange>,
     ) {
         let Type::Enum(enum_id, _) = expected else {
             self.diagnostic("E0038", "path pattern requires an enum value", span);
             return;
         };
-        let Some(name) = name else {
-            self.diagnostic("E0038", "invalid enum variant pattern", span);
-            return;
-        };
-        let Some(variant) = self.hir.item_tree.enums[*enum_id]
-            .variants
-            .iter()
-            .find(|variant| variant.name.0 == name.0)
-        else {
+        let Some(index) = self.enum_variant_index(*enum_id, path) else {
             self.diagnostic(
                 "E0038",
-                format!("unknown variant `{}` for this enum", name.0),
+                format!("unknown variant `{}` for this enum", path.display()),
                 span,
             );
             return;
         };
+        let variant = &self.hir.item_tree.enums[*enum_id].variants[index];
         if !matches!(variant.kind, HirVariantKind::Unit) {
             self.diagnostic(
                 "E0038",
-                format!("variant `{}` requires a payload pattern", name.0),
+                format!("variant `{}` requires a payload pattern", variant.name.0),
                 span,
             );
         }
@@ -2540,27 +2463,24 @@ impl TypeChecker<'_> {
             }
             return;
         };
-        let Some(name) = path.segments.last() else {
-            self.diagnostic("E0038", "invalid enum variant pattern", span);
-            return;
-        };
         let enum_data = self.hir.item_tree.enums[*enum_id].clone();
-        let Some(variant) = enum_data
-            .variants
-            .iter()
-            .find(|variant| variant.name.0 == name.0)
-        else {
+        let Some(index) = self.enum_variant_index(*enum_id, path) else {
             self.diagnostic(
                 "E0038",
-                format!("unknown variant `{}` for `{}`", name.0, enum_data.name.0),
+                format!(
+                    "unknown variant `{}` for `{}`",
+                    path.display(),
+                    enum_data.name.0
+                ),
                 span,
             );
             return;
         };
+        let variant = &enum_data.variants[index];
         let HirVariantKind::Tuple(items) = &variant.kind else {
             self.diagnostic(
                 "E0038",
-                format!("variant `{}` is not tuple-style", name.0),
+                format!("variant `{}` is not tuple-style", variant.name.0),
                 span,
             );
             return;
@@ -2570,7 +2490,7 @@ impl TypeChecker<'_> {
                 "E0038",
                 format!(
                     "variant `{}` expects {} field(s), got {}",
-                    name.0,
+                    variant.name.0,
                     items.len(),
                     elements.len()
                 ),
@@ -2662,27 +2582,24 @@ impl TypeChecker<'_> {
             );
             return;
         };
-        let Some(name) = path.segments.last() else {
-            self.diagnostic("E0038", "invalid enum variant pattern", span);
-            return;
-        };
         let enum_data = self.hir.item_tree.enums[*enum_id].clone();
-        let Some(variant) = enum_data
-            .variants
-            .iter()
-            .find(|variant| variant.name.0 == name.0)
-        else {
+        let Some(index) = self.enum_variant_index(*enum_id, path) else {
             self.diagnostic(
                 "E0038",
-                format!("unknown variant `{}` for `{}`", name.0, enum_data.name.0),
+                format!(
+                    "unknown variant `{}` for `{}`",
+                    path.display(),
+                    enum_data.name.0
+                ),
                 span,
             );
             return;
         };
+        let variant = &enum_data.variants[index];
         let HirVariantKind::Struct(items) = &variant.kind else {
             self.diagnostic(
                 "E0038",
-                format!("variant `{}` is not struct-style", name.0),
+                format!("variant `{}` is not struct-style", variant.name.0),
                 span,
             );
             return;
@@ -2707,7 +2624,10 @@ impl TypeChecker<'_> {
             let Some(item) = items.iter().find(|item| item.name.0 == field.name.0) else {
                 self.diagnostic(
                     "E0038",
-                    format!("variant `{}` has no field `{}`", name.0, field.name.0),
+                    format!(
+                        "variant `{}` has no field `{}`",
+                        variant.name.0, field.name.0
+                    ),
                     span,
                 );
                 continue;
@@ -2718,42 +2638,6 @@ impl TypeChecker<'_> {
             } else {
                 ctx.bindings.insert(field.name.0.clone(), ty);
             }
-        }
-    }
-
-    fn pattern_coverage(&self, ctx: &BodyCtx<'_>, pat: PatId, expected: &Type) -> PatternCoverage {
-        let Type::Enum(enum_id, _) = expected else {
-            return match ctx.body.pats[pat] {
-                Pattern::Wildcard | Pattern::Binding { .. } => PatternCoverage::CatchAll,
-                Pattern::Literal(LiteralPattern::Bool(value)) if expected == &Type::Bool => {
-                    PatternCoverage::Bool(value)
-                }
-                _ => PatternCoverage::None,
-            };
-        };
-        let enum_data = &self.hir.item_tree.enums[*enum_id];
-        match &ctx.body.pats[pat] {
-            Pattern::Wildcard => PatternCoverage::CatchAll,
-            Pattern::Binding { name } => enum_data
-                .variants
-                .iter()
-                .position(|variant| variant.name.0 == name.0)
-                .map(PatternCoverage::Variant)
-                .unwrap_or(PatternCoverage::CatchAll),
-            Pattern::Path { path }
-            | Pattern::TupleStruct { path, .. }
-            | Pattern::Struct { path, .. } => path
-                .segments
-                .last()
-                .and_then(|name| {
-                    enum_data
-                        .variants
-                        .iter()
-                        .position(|variant| variant.name.0 == name.0)
-                })
-                .map(PatternCoverage::Variant)
-                .unwrap_or(PatternCoverage::None),
-            _ => PatternCoverage::None,
         }
     }
 

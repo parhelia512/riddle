@@ -270,6 +270,19 @@ impl IntTy {
             Self::Usize => "usize",
         }
     }
+
+    pub(crate) fn contains_i64(self, value: i64) -> bool {
+        match self {
+            Self::I8 => i8::try_from(value).is_ok(),
+            Self::I16 => i16::try_from(value).is_ok(),
+            Self::I32 => i32::try_from(value).is_ok(),
+            Self::I64 | Self::I128 | Self::Isize => true,
+            Self::U8 => u8::try_from(value).is_ok(),
+            Self::U16 => u16::try_from(value).is_ok(),
+            Self::U32 => u32::try_from(value).is_ok(),
+            Self::U64 | Self::U128 | Self::Usize => value >= 0,
+        }
+    }
 }
 
 impl FloatTy {

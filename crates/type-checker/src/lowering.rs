@@ -45,6 +45,7 @@ impl TypeChecker<'_> {
                 mutable: *mutable,
                 inner: Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
             },
+            HirTypeRef::Tuple(elements) if elements.is_empty() => Type::Unit,
             HirTypeRef::Tuple(elements) => Type::Tuple(
                 elements
                     .iter()
@@ -154,7 +155,6 @@ impl TypeChecker<'_> {
             "bool" => Type::Bool,
             "str" => Type::Str,
             "char" => Type::Char,
-            "unit" => Type::Unit,
             _ => {
                 if let Some(param_ty) = params.get(name) {
                     param_ty.clone()
@@ -228,7 +228,7 @@ impl TypeChecker<'_> {
         }
         IntTy::parse(name).is_some()
             || FloatTy::parse(name).is_some()
-            || matches!(name, "bool" | "str" | "char" | "unit")
+            || matches!(name, "bool" | "str" | "char")
             || self.find_struct_by_name(name).is_some()
             || self.find_enum_by_name(name).is_some()
     }

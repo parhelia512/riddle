@@ -1384,7 +1384,9 @@ impl<'s> Parser<'s> {
             SyntaxKind::LParen => {
                 let m = self.start();
                 self.bump();
-                self.expr_bp_restricted(0, restrictions);
+                if !self.at(SyntaxKind::RParen) {
+                    self.expr_bp_restricted(0, restrictions);
+                }
                 self.expect(SyntaxKind::RParen);
                 Some(m.complete(self, SyntaxKind::ParenExpr))
             }

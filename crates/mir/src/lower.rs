@@ -1109,14 +1109,14 @@ impl<'a> LowerCtx<'a> {
         expected: &type_checker::Type,
     ) -> Value {
         match literal {
-            LiteralPattern::Int { value, suffix } => {
+            LiteralPattern::Int { value, suffix, .. } => {
                 let ty = match self.convert_type(expected) {
                     Type::Int(ty) => ty,
                     _ => parse_int_suffix(suffix.as_deref()),
                 };
                 builder.iconst(*value as i128, ty)
             }
-            LiteralPattern::Float { value, suffix } => {
+            LiteralPattern::Float { value, suffix, .. } => {
                 let ty = match self.convert_type(expected) {
                     Type::Float(ty) => ty,
                     _ => parse_float_suffix(suffix.as_deref()),
@@ -1402,7 +1402,6 @@ impl<'a> LowerCtx<'a> {
                     "bool" => type_checker::Type::Bool,
                     "str" => type_checker::Type::Str,
                     "char" => type_checker::Type::Char,
-                    "unit" => type_checker::Type::Unit,
                     _ => {
                         let args = path
                             .type_args
@@ -1439,6 +1438,7 @@ impl<'a> LowerCtx<'a> {
                 mutable: *mutable,
                 inner: Box::new(self.lower_hir_type_for_pattern(inner, subst)),
             },
+            HirTypeRef::Tuple(items) if items.is_empty() => type_checker::Type::Unit,
             HirTypeRef::Tuple(items) => type_checker::Type::Tuple(
                 items
                     .iter()
@@ -1974,6 +1974,7 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Ptr { inner, .. } => {
                 Type::Ptr(Box::new(self.convert_hir_type(inner)))
             }
+            hir::item_tree::HirTypeRef::Tuple(elems) if elems.is_empty() => Type::Unit,
             hir::item_tree::HirTypeRef::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_hir_type(e)).collect())
             }
@@ -2547,6 +2548,7 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Ptr { inner, .. } => Type::Ptr(Box::new(
                 self.convert_hir_type_with_substs(inner, subst, const_subst),
             )),
+            hir::item_tree::HirTypeRef::Tuple(elems) if elems.is_empty() => Type::Unit,
             hir::item_tree::HirTypeRef::Tuple(elems) => Type::Tuple(
                 elems
                     .iter()

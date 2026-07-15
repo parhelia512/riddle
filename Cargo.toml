@@ -15,6 +15,7 @@ members = [
     "crates/type-checker",
 ]
 default-members = [
+    ".",
     "app/clue",
     "app/riddle-lsp",
     "app/riddlec",
