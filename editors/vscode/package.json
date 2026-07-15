@@ -1,0 +1,78 @@
+{
+  "name": "riddle",
+  "displayName": "Riddle",
+  "description": "Language support for Riddle",
+  "version": "0.1.0",
+  "publisher": "riddle-lang",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/riddle-lang/riddle"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:riddle"
+  ],
+  "main": "./dist/extension.js",
+  "files": [
+    "dist/extension.js",
+    "language-configuration.json",
+    "syntaxes",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "esbuild extension.js --bundle --minify --platform=node --external:vscode --outfile=dist/extension.js",
+    "check": "node --check extension.js && npm run build",
+    "vscode:prepublish": "npm run build"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "riddle",
+        "aliases": [
+          "Riddle",
+          "riddle"
+        ],
+        "extensions": [
+          ".rid"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "riddle",
+        "scopeName": "source.riddle",
+        "path": "./syntaxes/riddle.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Riddle",
+      "properties": {
+        "riddle.server.path": {
+          "type": "string",
+          "default": "riddle-lsp",
+          "description": "Path to the riddle-lsp executable."
+        },
+        "riddle.server.arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Arguments passed to riddle-lsp."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "vscode-languageclient": "^10.1.0"
+  }
+}

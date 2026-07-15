@@ -1,0 +1,13 @@
+[language-server.riddle-lsp]
+command = "riddle-lsp"
+
+[[language]]
+name = "riddle"
+scope = "source.riddle"
+language-id = "riddle"
+file-types = ["rid"]
+roots = ["Clue.toml", ".git"]
+comment-tokens = "//"
+indent = { tab-width = 4, unit = "    " }
+grammar = "rust"
+language-servers = ["riddle-lsp"]

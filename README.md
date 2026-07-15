@@ -10,6 +10,8 @@ Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.1.0` 提供
 - `clue`：创建、检查和构建 Riddle 项目；
 - `riddle-lsp`：为编辑器提供诊断和语义高亮。
 
+仓库中的 [`editors`](./editors) 目录提供 Helix、VS Code 和 Zed 的 `riddle-lsp` 适配。
+
 ## 安装
 
 预编译版本可从 [GitHub Releases](https://github.com/riddle-lang/riddle/releases) 下载。解压对应平台的 zip，并把二进制所在目录加入 `PATH`。

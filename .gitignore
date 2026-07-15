@@ -10,6 +10,7 @@
 # Rust
 /target
 Cargo.lock
+!/editors/zed/Cargo.lock
 **/.clue/
 
 # C
@@ -22,6 +23,10 @@ Cargo.lock
 .zed/
 .helix/
 *.iml
+/editors/vscode/node_modules/
+/editors/vscode/dist/
+/editors/vscode/*.vsix
+/editors/zed/target/
 
 # Logs
 *.log
