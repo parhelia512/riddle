@@ -1,9 +1,6 @@
-name: Build and Release
+name: Nightly Build
 
 on:
-  push:
-    tags:
-      - "v*"
   schedule:
     # 每天 UTC 2:00 运行（北京时间约 10:00）
     - cron: "0 2 * * *"
@@ -37,17 +34,6 @@ jobs:
         id: check
         run: |
           CURRENT=$(git rev-parse HEAD)
-
-          if [ "${{ github.event_name }}" = "push" ]; then
-            VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-            if [ "${{ github.ref_name }}" != "v${VERSION}" ]; then
-              echo "标签 ${{ github.ref_name }} 与 Cargo 版本 ${VERSION} 不匹配"
-              exit 1
-            fi
-            echo "稳定版本标签，开始构建"
-            echo "should-build=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
 
           # 强制构建（手动触发且勾选了 force）
           if [ "${{ github.event_name == 'workflow_dispatch' && inputs.force }}" = "true" ]; then
@@ -171,11 +157,7 @@ jobs:
 
           cp LICENSE README.md dist/
 
-          if [ "${{ github.event_name }}" = "push" ]; then
-            ZIPNAME="riddle-${{ github.ref_name }}-${SUFFIX}.zip"
-          else
-            ZIPNAME="riddle-${HASH}-nightly-${SUFFIX}.zip"
-          fi
+          ZIPNAME="riddle-${HASH}-nightly-${SUFFIX}.zip"
           if [ "${{ matrix.platform }}" = "windows" ]; then
             powershell -Command "Compress-Archive -Path dist\* -DestinationPath ${ZIPNAME}"
           else
@@ -209,7 +191,6 @@ jobs:
           merge-multiple: true
 
       - name: 更新 nightly tag 并推送
-        if: github.event_name != 'push'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -217,14 +198,12 @@ jobs:
           git push -f origin nightly
 
       - name: 删除旧的 Release（保留 tag）
-        if: github.event_name != 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete nightly --yes 2>/dev/null || true
 
       - name: 创建新的 Nightly Release
-        if: github.event_name != 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -254,15 +233,6 @@ jobs:
           EOF
           )"
 
-      - name: 创建稳定 Release
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${{ github.ref_name }}" riddle-*.zip \
-            --title "Riddle ${{ github.ref_name }}" \
-            --generate-notes
-
   # ── 失败通知 ─────────────────────────────────────────────────
   notify:
     name: 通知失败
@@ -271,5 +241,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: |
-          echo "构建或发布失败！请检查运行日志："
+          echo "夜间构建失败！请检查运行日志："
           echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
