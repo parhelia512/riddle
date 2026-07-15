@@ -55,7 +55,11 @@ impl LanguageServer for Backend {
             },
             server_info: Some(ServerInfo {
                 name: "riddle-lsp".into(),
-                version: Some(riddlec::GIT_HASH.into()),
+                version: Some(format!(
+                    "{} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    riddlec::GIT_HASH
+                )),
             }),
         })
     }
@@ -475,7 +479,11 @@ fn parse_args(args: &[String]) -> std::result::Result<Opts, &'static str> {
                 process::exit(0);
             }
             "--version" | "-V" => {
-                println!("riddle-lsp {}", riddlec::GIT_HASH);
+                println!(
+                    "riddle-lsp {} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    riddlec::GIT_HASH
+                );
                 process::exit(0);
             }
             _ => return Err("unknown flag"),

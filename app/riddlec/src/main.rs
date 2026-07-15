@@ -155,7 +155,11 @@ fn parse_args(args: &[String]) -> Result<Opts, &'static str> {
                 process::exit(0);
             }
             "--version" | "-V" => {
-                println!("riddlec {}", riddlec::GIT_HASH);
+                println!(
+                    "riddlec {} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    riddlec::GIT_HASH
+                );
                 process::exit(0);
             }
             other if other.starts_with('-') => {
@@ -213,7 +217,7 @@ fn print_help() {
     println!("  --no-std                 compile without the bundled standard library");
     println!("  --backend, -b <name>    generate code for target: c");
     println!("  --output, -o <file>     write generated code to file");
-    println!("  --version, -V            print version (git commit hash)");
+    println!("  --version, -V            print version and git commit hash");
     println!("  --help, -h               show this help");
 }
 
