@@ -48,20 +48,21 @@ pub fn resolve_hir(hir: &mut HirFile, sg: &ScopeGraph) {
                 Expr::Path { path, .. } | Expr::Struct { path, .. } => path.display(),
                 _ => String::new(),
             };
-            let range = hir.bodies[*body].source_map.expr_ranges.get(expr).copied();
+            let range = hir.bodies[*body]
+                .source_map
+                .expr_ranges
+                .get(expr)
+                .copied()
+                .expect("lowered expression should have a source range");
             hir.bodies[*body].diagnostics.push(hir::body::Diagnostic {
                 code: "E0050",
                 severity: hir::body::Severity::Error,
                 message: format!("unresolved name: `{}`", path_text),
-                labels: range
-                    .map(|r| {
-                        vec![hir::body::SourceLabel {
-                            range: r,
-                            message: String::new(),
-                            style: hir::body::LabelStyle::Primary,
-                        }]
-                    })
-                    .unwrap_or_default(),
+                labels: vec![hir::body::SourceLabel {
+                    range,
+                    message: String::new(),
+                    style: hir::body::LabelStyle::Primary,
+                }],
                 help: None,
                 notes: Vec::new(),
             });
@@ -94,6 +95,10 @@ fn def_to_resolved_name(def: &DefRef) -> ResolvedName {
         DefRef::Local { stmt } => ResolvedName::Local(*stmt),
         DefRef::PatternBinding { .. } => ResolvedName::Unresolved,
         DefRef::Param { index, .. } => ResolvedName::Param(*index),
+        DefRef::LambdaParam { lambda, index, .. } => ResolvedName::LambdaParam {
+            lambda: *lambda,
+            index: *index,
+        },
         DefRef::ConstParam { .. } => ResolvedName::Unresolved,
         DefRef::UseAlias { .. } => ResolvedName::Unresolved,
         DefRef::EnumVariant { enum_id, index } => ResolvedName::EnumVariant(*enum_id, *index),

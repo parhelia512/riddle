@@ -15,7 +15,10 @@ async function activate(context) {
     {
       documentSelector: [{ scheme: 'file', language: 'riddle' }],
       synchronize: {
-        fileEvents: vscode.workspace.createFileSystemWatcher('**/Clue.toml'),
+        fileEvents: [
+          vscode.workspace.createFileSystemWatcher('**/*.rid'),
+          vscode.workspace.createFileSystemWatcher('**/Clue.toml'),
+        ],
       },
     },
   );

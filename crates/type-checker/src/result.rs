@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use hir::{
-    body::{BodyId, ExprId},
+    body::{BodyId, ExprId, StmtId},
     item_tree::{FunctionId, TraitId},
 };
 use rowan::TextRange;
@@ -47,9 +47,57 @@ pub struct TypeCheckResult {
     pub trait_method_calls: HashMap<(BodyId, ExprId), TraitMethodCall>,
     pub operator_calls: HashMap<(BodyId, ExprId), OperatorCall>,
     pub for_loops: HashMap<(BodyId, ExprId), ForLoopInfo>,
+    pub lambda_infos: HashMap<(BodyId, ExprId), LambdaInfo>,
+    pub closure_kinds: HashMap<(BodyId, ExprId), ClosureKind>,
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaptureMode {
+    Shared,
+    Mutable,
+    Value,
+}
+
+impl CaptureMode {
+    pub(crate) fn merge(self, other: Self) -> Self {
+        use CaptureMode::{Mutable, Shared, Value};
+        match (self, other) {
+            (Value, _) | (_, Value) => Value,
+            (Mutable, _) | (_, Mutable) => Mutable,
+            _ => Shared,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CaptureSource {
+    Local(StmtId),
+    Param(usize),
+    LambdaParam { lambda: ExprId, index: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureKind {
+    Fn,
+    FnMut,
+    FnOnce,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LambdaCapture {
+    pub source: CaptureSource,
+    pub name: String,
+    pub ty: Type,
+    pub mode: CaptureMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LambdaInfo {
+    pub captures: Vec<LambdaCapture>,
+    pub kind: ClosureKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

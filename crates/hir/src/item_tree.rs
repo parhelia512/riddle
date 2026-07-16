@@ -64,12 +64,14 @@ pub struct HirAttr {
 #[derive(Debug, Clone)]
 pub struct HirFunction {
     pub name: Name,
+    pub name_range: TextRange,
     pub visibility: Visibility,
     pub generics: Vec<Name>,
     pub const_generics: Vec<Name>,
     pub generic_bounds: Vec<HirGenericBound>,
     pub params: Vec<HirParam>,
     pub ret_type: Option<HirTypeRef>,
+    pub ret_type_range: Option<TextRange>,
     pub has_body: bool,
     pub attrs: Vec<HirAttr>,
 }
@@ -78,7 +80,9 @@ pub struct HirFunction {
 pub struct HirGenericBound {
     pub param: Name,
     pub target_ty: HirTypeRef,
+    pub target_range: TextRange,
     pub trait_ty: HirTypeRef,
+    pub trait_range: TextRange,
     pub assoc_constraints: Vec<HirAssocTypeConstraint>,
 }
 
@@ -86,12 +90,15 @@ pub struct HirGenericBound {
 pub struct HirAssocTypeConstraint {
     pub name: Name,
     pub ty: HirTypeRef,
+    pub range: TextRange,
 }
 
 #[derive(Debug, Clone)]
 pub struct HirParam {
     pub name: Name,
+    pub name_range: TextRange,
     pub ty: HirTypeRef,
+    pub ty_range: TextRange,
     pub attrs: Vec<HirAttr>,
 }
 
@@ -118,6 +125,7 @@ pub struct HirStructField {
 #[derive(Debug, Clone)]
 pub struct HirEnum {
     pub name: Name,
+    pub name_range: TextRange,
     pub visibility: Visibility,
     pub generics: Vec<Name>,
     pub const_generics: Vec<Name>,
@@ -129,7 +137,9 @@ pub struct HirEnum {
 #[derive(Debug, Clone)]
 pub struct HirEnumVariant {
     pub name: Name,
+    pub name_range: TextRange,
     pub kind: HirVariantKind,
+    pub field_ranges: Vec<TextRange>,
     pub attrs: Vec<HirAttr>,
 }
 
@@ -156,8 +166,10 @@ pub struct HirTrait {
 pub struct HirImpl {
     /// The implementing type's path (`T` in `impl T` / `impl Trait for T`).
     pub self_ty: HirTypeRef,
+    pub self_ty_range: TextRange,
     /// The trait being implemented, if any (`Trait` in `impl Trait for T`).
     pub trait_ty: Option<HirTypeRef>,
+    pub trait_ty_range: Option<TextRange>,
     pub generics: Vec<Name>,
     pub const_generics: Vec<Name>,
     pub generic_bounds: Vec<HirGenericBound>,
@@ -170,8 +182,10 @@ pub struct HirImpl {
 #[derive(Debug, Clone)]
 pub struct HirConst {
     pub name: Name,
+    pub name_range: TextRange,
     pub visibility: Visibility,
     pub ty: HirTypeRef,
+    pub ty_range: TextRange,
     pub has_value: bool,
     pub attrs: Vec<HirAttr>,
 }
@@ -179,8 +193,10 @@ pub struct HirConst {
 #[derive(Debug, Clone)]
 pub struct HirTypeAlias {
     pub name: Name,
+    pub name_range: TextRange,
     pub visibility: Visibility,
     pub ty: Option<HirTypeRef>,
+    pub ty_range: Option<TextRange>,
     pub attrs: Vec<HirAttr>,
 }
 
@@ -205,6 +221,7 @@ pub struct HirUseTree {
     /// Prefix path, which may be an empty segment (top-level `{a, b}` form).
     pub prefix: HirPath,
     pub kind: HirUseTreeKind,
+    pub range: TextRange,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +262,10 @@ pub enum HirTypeRef {
     Tuple(Vec<HirTypeRef>),
     Array(Box<HirTypeRef>, HirConstArg),
     Const(HirConstArg),
+    Function {
+        params: Vec<HirTypeRef>,
+        ret: Box<HirTypeRef>,
+    },
     Unknown,
     Error,
 }
@@ -324,6 +345,14 @@ impl HirTypeRef {
             }
             HirTypeRef::Array(inner, len) => format!("[{}; {}]", inner.display(), len.display()),
             HirTypeRef::Const(value) => value.display(),
+            HirTypeRef::Function { params, ret } => {
+                let params = params
+                    .iter()
+                    .map(HirTypeRef::display)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("fun({params}) -> {}", ret.display())
+            }
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
         }

@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rowan::TextRange;
 
 use hir::{
     HirFile,
-    body::BodyId,
+    body::{BodyId, ExprId},
     item_tree::{
         EnumId, FunctionId, HirConstArg, HirFunction, HirTypeRef, HirVariantKind, StructId,
     },
@@ -22,8 +22,18 @@ pub struct TypeChecker<'a> {
     pub(crate) result: TypeCheckResult,
     pub(crate) generic_edges: Vec<GenericEdge>,
     infinite_layout_types: HashSet<NominalType>,
+    next_infer: u32,
+    infer_values: HashMap<u32, Type>,
+    pending_lambdas: Vec<PendingLambda>,
 }
 
+struct PendingLambda {
+    body_id: BodyId,
+    expr: ExprId,
+    params: Vec<(String, Option<TextRange>, Type)>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct GenericEdge {
     pub(crate) caller: FunctionId,
     pub(crate) callee: FunctionId,
@@ -48,6 +58,9 @@ impl<'a> TypeChecker<'a> {
             result: TypeCheckResult::default(),
             generic_edges: Vec::new(),
             infinite_layout_types: HashSet::new(),
+            next_infer: 0,
+            infer_values: HashMap::new(),
+            pending_lambdas: Vec::new(),
         }
     }
 
@@ -96,12 +109,14 @@ impl<'a> TypeChecker<'a> {
                 item.const_generics.iter().map(|name| name.0.as_str()),
             );
             for variant in item.variants {
+                let field_ranges = variant.field_ranges;
                 match variant.kind {
                     hir::item_tree::HirVariantKind::Unit => {}
                     hir::item_tree::HirVariantKind::Tuple(fields) => {
-                        for field in fields {
-                            let ty = self.lower_type_ref_with_params(&field, &params);
-                            self.expect_sized_value(&ty, None);
+                        for (field, range) in fields.into_iter().zip(field_ranges) {
+                            let ty =
+                                self.lower_type_ref_with_params_at(&field, &params, Some(range));
+                            self.expect_sized_value(&ty, Some(range));
                         }
                     }
                     hir::item_tree::HirVariantKind::Struct(fields) => {
@@ -139,7 +154,9 @@ impl<'a> TypeChecker<'a> {
                     .chain(function.const_generics.iter().map(|name| name.0.as_str())),
             );
             if let Some(self_ty_ref) = self.impl_self_ty_ref(id).cloned() {
-                let self_ty = self.lower_type_ref_with_params(&self_ty_ref, &params);
+                let range = self.impl_self_ty_range(id).unwrap_or(function.name_range);
+                let self_ty =
+                    self.lower_type_ref_with_params_at(&self_ty_ref, &params, Some(range));
                 params.insert("Self".into(), self_ty);
             }
             self.check_function_value_types(&function, &params);
@@ -162,13 +179,14 @@ impl<'a> TypeChecker<'a> {
                 self.check_function_value_types(&method, &params);
             }
             for alias in item.type_aliases {
-                let Some(alias) = alias.ty else {
+                let Some(alias_ty) = alias.ty else {
                     continue;
                 };
                 let params =
                     std::collections::HashMap::from([("Self".into(), Type::Param("Self".into()))]);
-                let ty = self.lower_type_ref_with_params(&alias, &params);
-                self.expect_sized_value(&ty, None);
+                let range = alias.ty_range.unwrap_or(alias.name_range);
+                let ty = self.lower_type_ref_with_params_at(&alias_ty, &params, Some(range));
+                self.expect_sized_value(&ty, Some(range));
             }
         }
 
@@ -181,8 +199,8 @@ impl<'a> TypeChecker<'a> {
             .collect::<Vec<_>>();
         for (id, item) in consts {
             let params = self.impl_item_type_params(|imp| imp.consts.contains(&id));
-            let ty = self.lower_type_ref_with_params(&item.ty, &params);
-            self.expect_sized_value(&ty, None);
+            let ty = self.lower_type_ref_with_params_at(&item.ty, &params, Some(item.ty_range));
+            self.expect_sized_value(&ty, Some(item.ty_range));
         }
 
         let aliases = self
@@ -197,8 +215,9 @@ impl<'a> TypeChecker<'a> {
                 continue;
             };
             let params = self.impl_item_type_params(|imp| imp.type_aliases.contains(&id));
-            let ty = self.lower_type_ref_with_params(&alias, &params);
-            self.expect_sized_value(&ty, None);
+            let range = item.ty_range.unwrap_or(item.name_range);
+            let ty = self.lower_type_ref_with_params_at(&alias, &params, Some(range));
+            self.expect_sized_value(&ty, Some(range));
         }
     }
 
@@ -208,12 +227,13 @@ impl<'a> TypeChecker<'a> {
         params: &std::collections::HashMap<String, Type>,
     ) {
         for param in &function.params {
-            let ty = self.lower_type_ref_with_params(&param.ty, params);
-            self.expect_sized_value(&ty, None);
+            let ty = self.lower_type_ref_with_params_at(&param.ty, params, Some(param.ty_range));
+            self.expect_sized_value(&ty, Some(param.ty_range));
         }
         if let Some(return_ty) = &function.ret_type {
-            let ty = self.lower_type_ref_with_params(return_ty, params);
-            self.expect_sized_value(&ty, None);
+            let range = function.ret_type_range.unwrap_or(function.name_range);
+            let ty = self.lower_type_ref_with_params_at(return_ty, params, Some(range));
+            self.expect_sized_value(&ty, Some(range));
         }
     }
 
@@ -234,7 +254,8 @@ impl<'a> TypeChecker<'a> {
             owner.generics.iter().map(|name| name.0.as_str()),
             owner.const_generics.iter().map(|name| name.0.as_str()),
         );
-        let self_ty = self.lower_type_ref_with_params(&owner.self_ty, &params);
+        let self_ty =
+            self.lower_type_ref_with_params_at(&owner.self_ty, &params, Some(owner.self_ty_range));
         params.insert("Self".into(), self_ty);
         params
     }
@@ -261,7 +282,8 @@ impl<'a> TypeChecker<'a> {
                 imp.generics.iter().map(|name| name.0.as_str()),
                 imp.const_generics.iter().map(|name| name.0.as_str()),
             );
-            let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
+            let self_ty =
+                self.lower_type_ref_with_params_at(&imp.self_ty, &params, Some(imp.self_ty_range));
             let bounds = self.lower_trait_env_bounds(&imp.generic_bounds, &params);
             let assoc_types = imp
                 .type_aliases
@@ -271,7 +293,11 @@ impl<'a> TypeChecker<'a> {
                     alias.ty.as_ref().map(|ty| {
                         (
                             alias.name.0.clone(),
-                            self.lower_type_ref_with_params(ty, &params),
+                            self.lower_type_ref_with_params_at(
+                                ty,
+                                &params,
+                                alias.ty_range.or(Some(alias.name_range)),
+                            ),
                         )
                     })
                 })
@@ -292,14 +318,22 @@ impl<'a> TypeChecker<'a> {
             .filter_map(|bound| {
                 let trait_id = self.resolve_trait_ref(&bound.trait_ty)?;
                 Some(TraitBound {
-                    ty: self.lower_type_ref_with_params(&bound.target_ty, params),
+                    ty: self.lower_type_ref_with_params_at(
+                        &bound.target_ty,
+                        params,
+                        Some(bound.target_range),
+                    ),
                     trait_id,
                     assoc_constraints: bound
                         .assoc_constraints
                         .iter()
                         .map(|constraint| TraitAssocConstraint {
                             name: constraint.name.0.clone(),
-                            ty: self.lower_type_ref_with_params(&constraint.ty, params),
+                            ty: self.lower_type_ref_with_params_at(
+                                &constraint.ty,
+                                params,
+                                Some(constraint.range),
+                            ),
                         })
                         .collect(),
                 })
@@ -337,13 +371,31 @@ impl<'a> TypeChecker<'a> {
                 .chain(function.const_generics.iter().map(|name| name.0.as_str())),
         );
         if let Some(self_ty_ref) = self.impl_self_ty_ref(function_id).cloned() {
-            let self_ty = self.lower_type_ref_with_params(&self_ty_ref, &params);
+            let self_ty_range = self
+                .hir
+                .item_tree
+                .impls
+                .iter()
+                .find_map(|(_, imp)| {
+                    imp.methods
+                        .contains(&function_id)
+                        .then_some(imp.self_ty_range)
+                })
+                .unwrap_or(function.name_range);
+            let self_ty =
+                self.lower_type_ref_with_params_at(&self_ty_ref, &params, Some(self_ty_range));
             params.insert("Self".into(), self_ty);
         }
         let return_ty = function
             .ret_type
             .as_ref()
-            .map(|ty| self.lower_type_ref_with_params(ty, &params))
+            .map(|ty| {
+                self.lower_type_ref_with_params_at(
+                    ty,
+                    &params,
+                    function.ret_type_range.or(Some(function.name_range)),
+                )
+            })
             .unwrap_or(Type::Unit);
         let mut ctx = BodyCtx::new(
             body_id,
@@ -353,10 +405,18 @@ impl<'a> TypeChecker<'a> {
             return_ty.clone(),
             params,
         );
-        self.check_type_bounds_inner(&ctx, &return_ty, None);
+        self.check_type_bounds_inner(
+            &ctx,
+            &return_ty,
+            function.ret_type_range.or(Some(function.name_range)),
+        );
         for param in &function.params {
-            let param_ty = self.lower_type_ref_with_params(&param.ty, &ctx.generic_params);
-            self.check_type_bounds_inner(&ctx, &param_ty, None);
+            let param_ty = self.lower_type_ref_with_params_at(
+                &param.ty,
+                &ctx.generic_params,
+                Some(param.ty_range),
+            );
+            self.check_type_bounds_inner(&ctx, &param_ty, Some(param.ty_range));
         }
         let actual = self.check_expr_expected(&mut ctx, body.root_block, &return_ty);
 
@@ -367,6 +427,197 @@ impl<'a> TypeChecker<'a> {
                 "function return",
                 ctx.expr_range(body.root_block),
             );
+        }
+        self.finish_inference(body_id);
+    }
+
+    pub(crate) fn fresh_infer(&mut self) -> Type {
+        let id = self.next_infer;
+        self.next_infer += 1;
+        Type::InferVar(id)
+    }
+
+    pub(crate) fn resolve_type(&self, ty: &Type) -> Type {
+        match ty {
+            Type::InferVar(id) => self
+                .infer_values
+                .get(id)
+                .map(|value| self.resolve_type(value))
+                .unwrap_or_else(|| ty.clone()),
+            Type::Ref(inner, mutable) => Type::Ref(Box::new(self.resolve_type(inner)), *mutable),
+            Type::Ptr { mutable, inner } => Type::Ptr {
+                mutable: *mutable,
+                inner: Box::new(self.resolve_type(inner)),
+            },
+            Type::Tuple(elements) => Type::Tuple(
+                elements
+                    .iter()
+                    .map(|item| self.resolve_type(item))
+                    .collect(),
+            ),
+            Type::Array(inner, len) => Type::Array(Box::new(self.resolve_type(inner)), len.clone()),
+            Type::Struct(id, args) => {
+                Type::Struct(*id, args.iter().map(|arg| self.resolve_type(arg)).collect())
+            }
+            Type::Enum(id, args) => {
+                Type::Enum(*id, args.iter().map(|arg| self.resolve_type(arg)).collect())
+            }
+            Type::Fn(params, ret) => Type::Fn(
+                params
+                    .iter()
+                    .map(|param| self.resolve_type(param))
+                    .collect(),
+                Box::new(self.resolve_type(ret)),
+            ),
+            _ => ty.clone(),
+        }
+    }
+
+    pub(crate) fn callable_type(&mut self, ty: &Type) -> Type {
+        let ty = self.resolve_type(ty);
+        let Type::Function(fid) = ty else {
+            return ty;
+        };
+        let function = self.hir.item_tree.functions[fid].clone();
+        Type::Fn(
+            function
+                .params
+                .iter()
+                .map(|param| {
+                    self.lower_type_ref_with_params_at(
+                        &param.ty,
+                        &HashMap::new(),
+                        Some(param.ty_range),
+                    )
+                })
+                .collect(),
+            Box::new(
+                function
+                    .ret_type
+                    .as_ref()
+                    .map(|ret| {
+                        self.lower_type_ref_with_params_at(
+                            ret,
+                            &HashMap::new(),
+                            function.ret_type_range.or(Some(function.name_range)),
+                        )
+                    })
+                    .unwrap_or(Type::Unit),
+            ),
+        )
+    }
+
+    pub(crate) fn unify_types(&mut self, lhs: &Type, rhs: &Type) -> bool {
+        let lhs = self.callable_type(lhs);
+        let rhs = self.callable_type(rhs);
+        match (&lhs, &rhs) {
+            (Type::InferVar(id), ty) | (ty, Type::InferVar(id)) => {
+                if matches!(ty, Type::InferVar(other) if other == id) {
+                    true
+                } else {
+                    self.infer_values.insert(*id, ty.clone());
+                    true
+                }
+            }
+            (Type::Ref(a, am), Type::Ref(b, bm)) => am == bm && self.unify_types(a, b),
+            (
+                Type::Ptr {
+                    mutable: am,
+                    inner: a,
+                },
+                Type::Ptr {
+                    mutable: bm,
+                    inner: b,
+                },
+            ) => am == bm && self.unify_types(a, b),
+            (Type::Tuple(a), Type::Tuple(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| self.unify_types(a, b))
+            }
+            (Type::Array(a, al), Type::Array(b, bl)) => al == bl && self.unify_types(a, b),
+            (Type::Struct(a, aa), Type::Struct(b, ba)) => {
+                a == b
+                    && aa.len() == ba.len()
+                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types(a, b))
+            }
+            (Type::Enum(a, aa), Type::Enum(b, ba)) => {
+                a == b
+                    && aa.len() == ba.len()
+                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types(a, b))
+            }
+            (Type::Fn(ap, ar), Type::Fn(bp, br)) => {
+                ap.len() == bp.len()
+                    && ap.iter().zip(bp).all(|(a, b)| self.unify_types(a, b))
+                    && self.unify_types(ar, br)
+            }
+            _ => lhs == rhs || self.numeric_assignable(&lhs, &rhs),
+        }
+    }
+
+    pub(crate) fn record_lambda(
+        &mut self,
+        body_id: BodyId,
+        expr: ExprId,
+        params: Vec<(String, Option<TextRange>, Type)>,
+    ) {
+        self.pending_lambdas.push(PendingLambda {
+            body_id,
+            expr,
+            params,
+        });
+    }
+
+    fn finish_inference(&mut self, body_id: BodyId) {
+        let exprs = self
+            .result
+            .expr_types
+            .iter()
+            .filter(|((bid, _), _)| *bid == body_id)
+            .map(|(key, ty)| (*key, self.resolve_type(ty)))
+            .collect::<Vec<_>>();
+        for (key, ty) in exprs {
+            self.result.expr_types.insert(key, ty);
+        }
+        let lambdas = self
+            .result
+            .lambda_infos
+            .iter()
+            .filter(|((checked_body, _), _)| *checked_body == body_id)
+            .map(|(key, info)| {
+                let mut info = info.clone();
+                for capture in &mut info.captures {
+                    capture.ty = self.resolve_type(&capture.ty);
+                }
+                (*key, info)
+            })
+            .collect::<Vec<_>>();
+        for (key, info) in lambdas {
+            self.result.lambda_infos.insert(key, info);
+        }
+        let pending = self
+            .pending_lambdas
+            .iter()
+            .filter(|lambda| lambda.body_id == body_id)
+            .map(|lambda| {
+                (
+                    lambda.expr,
+                    lambda
+                        .params
+                        .iter()
+                        .map(|(name, range, ty)| (name.clone(), *range, self.resolve_type(ty)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (_, params) in pending {
+            for (name, range, ty) in params {
+                if matches!(ty, Type::InferVar(_)) {
+                    self.diagnostic(
+                        "E0045",
+                        format!("cannot infer type of anonymous function parameter `{name}`"),
+                        range,
+                    );
+                }
+            }
         }
     }
 
@@ -405,6 +656,14 @@ impl<'a> TypeChecker<'a> {
             .impls
             .iter()
             .find_map(|(_, imp)| imp.methods.contains(&function_id).then_some(&imp.self_ty))
+    }
+
+    pub(crate) fn impl_self_ty_range(&self, function_id: FunctionId) -> Option<TextRange> {
+        self.hir.item_tree.impls.iter().find_map(|(_, imp)| {
+            imp.methods
+                .contains(&function_id)
+                .then_some(imp.self_ty_range)
+        })
     }
 
     pub(crate) fn find_lang_trait(&self, lang: &str) -> Option<hir::item_tree::TraitId> {
@@ -473,27 +732,45 @@ impl<'a> TypeChecker<'a> {
             .item_tree
             .enums
             .iter()
-            .map(|(id, item)| (id, item.name.0.clone(), item.variants.clone()))
+            .map(|(id, item)| {
+                (
+                    id,
+                    item.name.0.clone(),
+                    item.name_range,
+                    item.variants.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        for (id, name, variants) in enums {
+        for (id, name, name_range, variants) in enums {
             let target = NominalType::Enum(id);
-            let recursive_field = variants.iter().find_map(|variant| match &variant.kind {
-                HirVariantKind::Unit => None,
-                HirVariantKind::Tuple(fields) => fields
-                    .iter()
-                    .any(|field| self.type_ref_contains_inline_type(field, target, &mut Vec::new()))
-                    .then_some(None),
-                HirVariantKind::Struct(fields) => fields.iter().find_map(|field| {
-                    self.type_ref_contains_inline_type(&field.ty, target, &mut Vec::new())
-                        .then_some(Some(field.ty_range))
-                }),
-            });
+            let recursive_field =
+                variants.iter().find_map(|variant| match &variant.kind {
+                    HirVariantKind::Unit => None,
+                    HirVariantKind::Tuple(fields) => fields
+                        .iter()
+                        .zip(&variant.field_ranges)
+                        .find_map(|(field, range)| {
+                            self.type_ref_contains_inline_type(field, target, &mut Vec::new())
+                                .then_some(*range)
+                        }),
+                    HirVariantKind::Struct(fields) => fields.iter().find_map(|field| {
+                        self.type_ref_contains_inline_type(&field.ty, target, &mut Vec::new())
+                            .then_some(field.ty_range)
+                    }),
+                });
             if let Some(field_range) = recursive_field {
                 self.infinite_layout_types.insert(target);
                 self.diagnostic(
                     "E0072",
                     format!("recursive type `{name}` has infinite size"),
-                    field_range,
+                    Some(name_range),
+                );
+                self.result.diagnostics.last_mut().unwrap().labels.push(
+                    crate::result::SourceLabel {
+                        range: field_range,
+                        message: "recursive field".into(),
+                        style: crate::result::LabelStyle::Secondary,
+                    },
                 );
             }
         }
@@ -531,6 +808,7 @@ impl<'a> TypeChecker<'a> {
             HirTypeRef::Array(inner, _) => self.type_ref_contains_inline_type(inner, target, seen),
             HirTypeRef::Const(_) => false,
             HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
+            HirTypeRef::Function { .. } => false,
             HirTypeRef::Unknown | HirTypeRef::Error => false,
         }
     }
@@ -594,7 +872,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_generic_recursion(&mut self) {
+    pub(crate) fn check_generic_recursion(&mut self) {
         for i in 0..self.generic_edges.len() {
             if !self.generic_edges[i].grows {
                 continue;
@@ -643,6 +921,9 @@ impl<'a> TypeChecker<'a> {
         context: &str,
         span: Option<TextRange>,
     ) -> Type {
+        if self.unify_types(&lhs, &rhs) {
+            return self.resolve_type(&lhs);
+        }
         if lhs.is_never() {
             return rhs;
         }
@@ -692,11 +973,16 @@ impl<'a> TypeChecker<'a> {
         context: &str,
         span: Option<TextRange>,
     ) {
+        if self.unify_types(expected, actual) {
+            return;
+        }
+        let expected = self.resolve_type(expected);
+        let actual = self.resolve_type(actual);
         if expected.is_unknown_like()
             || actual.is_unknown_like()
             || expected == actual
-            || self.numeric_assignable(expected, actual)
-            || self.structural_assignable(expected, actual)
+            || self.numeric_assignable(&expected, &actual)
+            || self.structural_assignable(&expected, &actual)
         {
             return;
         }
@@ -735,6 +1021,7 @@ impl<'a> TypeChecker<'a> {
         message: impl Into<String>,
         span: Option<TextRange>,
     ) {
+        let span = span.expect("type-checker diagnostics require a source range");
         let notes = match code {
             "E0001" => vec!["expected one type but found another; consider an explicit type annotation or cast".into()],
             "E0002" => vec!["all branches must produce values of the same type; ensure both branches return compatible types".into()],
@@ -760,6 +1047,8 @@ impl<'a> TypeChecker<'a> {
             "E0041" => vec!["every field must implement `Copy`; add the required generic bounds or remove the impl".into()],
             "E0042" => vec!["move this statement inside a `while` or `for` loop".into()],
             "E0043" => vec!["use `&str` or a raw pointer; unsized `str` must be behind a reference or pointer".into()],
+            "E0044" => vec!["pass the value as an explicit anonymous function parameter".into()],
+            "E0045" => vec!["add an explicit parameter type or use the function where its signature is known".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
             "E0021" => vec!["trait method declarations should not have a body".into()],
             "E0022" | "E0025" => vec!["remove the duplicate associated type".into()],
@@ -773,15 +1062,11 @@ impl<'a> TypeChecker<'a> {
             code,
             severity: Severity::Error,
             message: message.into(),
-            labels: span
-                .map(|r| {
-                    vec![SourceLabel {
-                        range: r,
-                        message: String::new(),
-                        style: LabelStyle::Primary,
-                    }]
-                })
-                .unwrap_or_default(),
+            labels: vec![SourceLabel {
+                range: span,
+                message: String::new(),
+                style: LabelStyle::Primary,
+            }],
             help: None,
             notes,
         });
@@ -791,13 +1076,14 @@ impl<'a> TypeChecker<'a> {
         &mut self,
         suffix: Option<&str>,
         expected: Option<&Type>,
+        span: Option<TextRange>,
     ) -> Type {
         if let Some(suffix) = suffix {
             return IntTy::parse(suffix).map(Type::Int).unwrap_or_else(|| {
                 self.diagnostic(
                     "E0011",
                     format!("unknown integer literal suffix `{suffix}`"),
-                    None,
+                    span,
                 );
                 Type::Error
             });
@@ -813,13 +1099,14 @@ impl<'a> TypeChecker<'a> {
         &mut self,
         suffix: Option<&str>,
         expected: Option<&Type>,
+        span: Option<TextRange>,
     ) -> Type {
         if let Some(suffix) = suffix {
             return FloatTy::parse(suffix).map(Type::Float).unwrap_or_else(|| {
                 self.diagnostic(
                     "E0011",
                     format!("unknown float literal suffix `{suffix}`"),
-                    None,
+                    span,
                 );
                 Type::Error
             });

@@ -1,5 +1,5 @@
 use crate::check;
-use type_checker::{FloatTy, IntTy, Type};
+use type_checker::{CaptureMode, ClosureKind, FloatTy, IntTy, Type};
 
 #[test]
 fn accepts_basic_function_body() {
@@ -243,5 +243,136 @@ fn reports_growing_generic_recursion() {
     assert!(result.diagnostics.iter().any(|diag| {
         diag.message
             .contains("generic recursion grows type arguments")
+    }));
+}
+
+#[test]
+fn infers_and_calls_anonymous_function() {
+    let result = check(
+        r#"
+        fun apply(f: fun(i32) -> i32, value: i32) -> i32 {
+            f(value)
+        }
+
+        fun main() -> i32 {
+            let inc = fun(x) { x + 1 };
+            apply(inc, 41)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn later_call_constrains_anonymous_parameter_type() {
+    let result = check(
+        r#"
+        fun main() -> i32 {
+            let identity = fun(value) { value };
+            identity(42)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn infers_shared_closure_capture() {
+    let result = check(
+        r#"
+        fun main() -> i32 {
+            let base = 1;
+            let add = fun(x: i32) { x + base };
+            add(41)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    let info = result.lambda_infos.values().next().unwrap();
+    assert_eq!(info.kind, ClosureKind::Fn);
+    assert_eq!(info.captures.len(), 1);
+    assert_eq!(info.captures[0].name, "base");
+    assert_eq!(info.captures[0].mode, CaptureMode::Shared);
+}
+
+#[test]
+fn infers_mutable_closure_capture() {
+    let result = check(
+        r#"
+        fun main() -> i32 {
+            let mut total = 0;
+            let mut add = fun(value: i32) -> i32 {
+                total += value;
+                total
+            };
+            add(1)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    let info = result.lambda_infos.values().next().unwrap();
+    assert_eq!(info.kind, ClosureKind::FnMut);
+    assert_eq!(info.captures[0].mode, CaptureMode::Mutable);
+}
+
+#[test]
+fn mutable_closure_requires_mutable_binding() {
+    let result = check("fun main() { let mut total = 0; let add = fun() { total += 1; }; add(); }");
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0031" && diagnostic.message.contains("mutable closure")
+    }));
+}
+
+#[test]
+fn infers_once_closure_capture() {
+    let result = check(
+        r#"
+        struct Token { value: i32 }
+        fun consume(value: Token) {}
+        fun main() {
+            let token = Token { value: 1 };
+            let once = fun() { consume(token); };
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    let info = result.lambda_infos.values().next().unwrap();
+    assert_eq!(info.kind, ClosureKind::FnOnce);
+    assert_eq!(info.captures[0].mode, CaptureMode::Value);
+}
+
+#[test]
+fn nested_closure_does_not_capture_inner_parameters_in_outer_environment() {
+    let result = check(
+        r#"
+        fun nested(base: i32) -> fun(i32) -> fun(i32) -> i32 {
+            fun(first: i32) {
+                fun(second: i32) { base + first + second }
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert!(
+        result
+            .lambda_infos
+            .values()
+            .all(|info| { info.captures.iter().all(|capture| capture.name != "second") })
+    );
+}
+
+#[test]
+fn reports_uninferred_anonymous_parameter() {
+    let result = check("fun main() { let id = fun(x) { x }; }");
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0045" && diagnostic.message.contains("parameter `x`")
     }));
 }

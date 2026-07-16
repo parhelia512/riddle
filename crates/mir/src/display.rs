@@ -184,6 +184,15 @@ impl fmt::Display for InstFmt<'_> {
                 let args_str: Vec<String> = args.iter().map(|a| format!("v{}", a.0)).collect();
                 write!(f, "call {:?}({})", callee, args_str.join(", "))
             }
+            InstKind::FunctionRef(function) => write!(f, "function_ref {:?}", function),
+            InstKind::CallIndirect(callee, args) => {
+                let args = args
+                    .iter()
+                    .map(|arg| format!("v{}", arg.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "call_indirect v{}({})", callee.0, args)
+            }
             InstKind::StructValue(fields) => {
                 let flds: Vec<String> = fields.iter().map(|a| format!("v{}", a.0)).collect();
                 write!(f, "struct [{}]", flds.join(", "))

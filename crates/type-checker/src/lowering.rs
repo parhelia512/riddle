@@ -10,23 +10,18 @@ use crate::{
 
 impl TypeChecker<'_> {
     pub(crate) fn lower_type_alias(&mut self, type_alias: TypeAliasId) -> Type {
-        self.hir.item_tree.type_aliases[type_alias]
+        let alias = self.hir.item_tree.type_aliases[type_alias].clone();
+        alias
             .ty
             .as_ref()
-            .map(|ty| self.lower_type_ref(ty))
+            .map(|ty| {
+                self.lower_type_ref_with_params_at(
+                    ty,
+                    &HashMap::new(),
+                    alias.ty_range.or(Some(alias.name_range)),
+                )
+            })
             .unwrap_or(Type::Unknown)
-    }
-
-    pub(crate) fn lower_type_ref(&mut self, ty: &HirTypeRef) -> Type {
-        self.lower_type_ref_with_params(ty, &HashMap::new())
-    }
-
-    pub(crate) fn lower_type_ref_with_params(
-        &mut self,
-        ty: &HirTypeRef,
-        params: &HashMap<String, Type>,
-    ) -> Type {
-        self.lower_type_ref_with_params_at(ty, params, None)
     }
 
     pub(crate) fn lower_type_ref_with_params_at(
@@ -68,6 +63,16 @@ impl TypeChecker<'_> {
                 )
             }
             HirTypeRef::Const(value) => Type::Const(self.lower_const_arg(value, params)),
+            HirTypeRef::Function {
+                params: fn_params,
+                ret,
+            } => Type::Fn(
+                fn_params
+                    .iter()
+                    .map(|param| self.lower_type_ref_with_params_at(param, params, span))
+                    .collect(),
+                Box::new(self.lower_type_ref_with_params_at(ret, params, span)),
+            ),
             HirTypeRef::Unknown => Type::Unknown,
             HirTypeRef::Error => Type::Error,
         }
@@ -102,6 +107,14 @@ impl TypeChecker<'_> {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
             HirTypeRef::Const(value) => value.display(),
+            HirTypeRef::Function { params, ret } => {
+                let params = params
+                    .iter()
+                    .map(Self::type_text)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("fun({params}) -> {}", Self::type_text(ret))
+            }
         }
     }
 
@@ -159,21 +172,23 @@ impl TypeChecker<'_> {
                 if let Some(param_ty) = params.get(name) {
                     param_ty.clone()
                 } else if let Some(struct_id) = self.find_struct_by_name(name) {
-                    let args = self.lower_type_args(&path.type_args, params);
+                    let args = self.lower_type_args(&path.type_args, params, span);
                     self.check_type_arg_count(
                         name,
                         self.hir.item_tree.structs[struct_id].generics.len()
                             + self.hir.item_tree.structs[struct_id].const_generics.len(),
                         args.len(),
+                        span,
                     );
                     Type::Struct(struct_id, args)
                 } else if let Some(enum_id) = self.find_enum_by_name(name) {
-                    let args = self.lower_type_args(&path.type_args, params);
+                    let args = self.lower_type_args(&path.type_args, params, span);
                     self.check_type_arg_count(
                         name,
                         self.hir.item_tree.enums[enum_id].generics.len()
                             + self.hir.item_tree.enums[enum_id].const_generics.len(),
                         args.len(),
+                        span,
                     );
                     Type::Enum(enum_id, args)
                 } else {
@@ -188,9 +203,10 @@ impl TypeChecker<'_> {
         &mut self,
         args: &[HirTypeRef],
         params: &HashMap<String, Type>,
+        span: Option<TextRange>,
     ) -> Vec<Type> {
         args.iter()
-            .map(|arg| self.lower_type_ref_with_params(arg, params))
+            .map(|arg| self.lower_type_ref_with_params_at(arg, params, span))
             .collect()
     }
 
@@ -233,14 +249,20 @@ impl TypeChecker<'_> {
             || self.find_enum_by_name(name).is_some()
     }
 
-    fn check_type_arg_count(&mut self, name: &str, expected: usize, actual: usize) {
+    fn check_type_arg_count(
+        &mut self,
+        name: &str,
+        expected: usize,
+        actual: usize,
+        span: Option<TextRange>,
+    ) {
         if expected == actual {
             return;
         }
         self.diagnostic(
             "E0032",
             format!("type `{name}` expects {expected} type argument(s), got {actual}"),
-            None,
+            span,
         );
     }
 
@@ -264,7 +286,8 @@ impl TypeChecker<'_> {
             imp.generics.iter().map(|name| name.0.as_str()),
             imp.const_generics.iter().map(|name| name.0.as_str()),
         );
-        let expected = self.lower_type_ref_with_params(&imp.self_ty, &params);
+        let expected =
+            self.lower_type_ref_with_params_at(&imp.self_ty, &params, Some(imp.self_ty_range));
         let mut subst = HashMap::new();
         if collect_subst(&expected, actual, &mut subst) {
             for name in imp.generics.iter().chain(imp.const_generics.iter()) {
@@ -357,11 +380,17 @@ impl TypeChecker<'_> {
             else {
                 continue;
             };
+            let alias = self.hir.item_tree.type_aliases[*alias_id].clone();
             return Some(
-                self.hir.item_tree.type_aliases[*alias_id]
+                alias
                     .ty
-                    .clone()
-                    .map(|ty| self.lower_type_ref_with_params(&ty, &subst))
+                    .map(|ty| {
+                        self.lower_type_ref_with_params_at(
+                            &ty,
+                            &subst,
+                            alias.ty_range.or(Some(alias.name_range)),
+                        )
+                    })
                     .unwrap_or(Type::Unknown),
             );
         }

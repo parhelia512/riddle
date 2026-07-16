@@ -1,4 +1,6 @@
 mod basic;
+#[path = "../support/diagnostics.rs"]
+mod diagnostic_support;
 
 use ast::{self, support::AstNode};
 use frontend::{incremental::IncrementalParser, tree_builder::Parse};
@@ -21,8 +23,10 @@ fn analyze(source: &str) -> move_checker::AnalysisResult {
         type_result.diagnostics
     );
 
-    let escape_result = escape_analysis::analyze_escapes(&hir);
-    move_checker::analyze(&hir, &type_result, &escape_result)
+    let escape_result = escape_analysis::analyze_escapes(&hir, &type_result);
+    let result = move_checker::analyze(&hir, &type_result, &escape_result);
+    diagnostic_support::assert_type_diagnostics(source, &result.diagnostics);
+    result
 }
 
 fn lower_and_resolve(parse: &Parse) -> HirFile {
@@ -31,6 +35,12 @@ fn lower_and_resolve(parse: &Parse) -> HirFile {
     let mut hir = lower_root(root);
     let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
+    diagnostic_support::assert_hir_diagnostics(
+        &syntax.to_string(),
+        hir.bodies
+            .iter()
+            .flat_map(|(_, body)| body.diagnostics.iter()),
+    );
     hir
 }
 

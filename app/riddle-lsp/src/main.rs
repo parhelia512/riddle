@@ -1,38 +1,63 @@
 use std::{
     collections::HashMap,
-    env, fs,
-    path::{Path, PathBuf},
-    process,
-    sync::Mutex,
+    env, process,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
+mod diagnostics;
 
+use diagnostics::{DiagnosticSessions, collect_workspace_diagnostics_cancellable};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use diagnostics::{
+    PublishedDiagnostics, collect_diagnostics, collect_document_diagnostics,
+    collect_workspace_diagnostics, collect_workspace_diagnostics_with_sessions, position, range,
+    to_lsp,
+};
 use frontend::syntax_kind::SyntaxKind;
 use hir::body::{Expr, ResolvedName, Stmt};
+#[cfg(test)]
+use lsp_types::Position;
 use lsp_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams, InitializeResult,
-    InitializedParams, Location, MessageType, NumberOrString, Position, PositionEncodingKind,
-    Range, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, FileChangeType, FileEvent, InitializeParams, InitializeResult,
+    InitializedParams, MessageType, PositionEncodingKind, SemanticToken, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
     TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
-use riddlec::pipeline::{CompileOptions, CompileResult, DiagnosticExt, IntoDiagnosticExt};
+use riddlec::pipeline::CompileOptions;
 use rowan::TextRange;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-#[derive(Debug)]
 struct Backend {
     client: Client,
-    docs: Mutex<HashMap<lsp_types::Url, Document>>,
+    docs: Arc<Mutex<HashMap<lsp_types::Url, Document>>>,
+    published: Arc<Mutex<HashMap<lsp_types::Url, diagnostics::PublishedDiagnostics>>>,
+    publish_gate: Arc<tokio::sync::Mutex<()>>,
+    diagnostic_revision: Arc<AtomicU64>,
+    diagnostic_sessions: Arc<Mutex<DiagnosticSessions>>,
+    semantic_tokens: Arc<Mutex<HashMap<lsp_types::Url, CachedSemanticTokens>>>,
     compile_options: CompileOptions,
 }
+
+const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 struct Document {
     text: String,
     version: Option<i32>,
+}
+
+#[derive(Clone)]
+struct CachedSemanticTokens {
+    text: String,
+    tokens: SemanticTokens,
 }
 
 #[tower_lsp::async_trait]
@@ -81,7 +106,7 @@ impl LanguageServer for Backend {
             version: Some(params.text_document.version),
         };
         self.docs.lock().unwrap().insert(uri, doc);
-        self.publish_all().await;
+        self.schedule_diagnostics();
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -94,14 +119,21 @@ impl LanguageServer for Backend {
             version: Some(params.text_document.version),
         };
         self.docs.lock().unwrap().insert(uri, doc);
-        self.publish_all().await;
+        self.schedule_diagnostics();
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.docs.lock().unwrap().remove(&uri);
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
-        self.publish_all().await;
+        self.semantic_tokens.lock().unwrap().remove(&uri);
+        self.schedule_diagnostics();
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        if params.changes.iter().any(watched_change_resets_sessions) {
+            *self.diagnostic_sessions.lock().unwrap() = DiagnosticSessions::default();
+        }
+        self.schedule_diagnostics();
     }
 
     async fn semantic_tokens_full(
@@ -109,30 +141,178 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
-        let text = self
+        let Some(text) = self
             .docs
             .lock()
             .unwrap()
             .get(&uri)
             .map(|doc| doc.text.clone())
-            .unwrap_or_default();
+        else {
+            return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: Vec::new(),
+            })));
+        };
+        if let Some(cached) = self
+            .semantic_tokens
+            .lock()
+            .unwrap()
+            .get(&uri)
+            .filter(|cached| cached.text == text)
+        {
+            return Ok(Some(SemanticTokensResult::Tokens(cached.tokens.clone())));
+        }
 
-        Ok(Some(SemanticTokensResult::Tokens(
-            semantic_tokens_with_options(&text, self.compile_options),
-        )))
+        let analyzed_text = text.clone();
+        let tokens =
+            tokio::task::spawn_blocking(move || semantic_tokens_for_source(&analyzed_text))
+                .await
+                .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let is_current = self
+            .docs
+            .lock()
+            .unwrap()
+            .get(&uri)
+            .is_some_and(|document| document.text == text);
+        if !is_current {
+            return Ok(None);
+        }
+        self.semantic_tokens.lock().unwrap().insert(
+            uri,
+            CachedSemanticTokens {
+                text,
+                tokens: tokens.clone(),
+            },
+        );
+
+        Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
 }
 
+fn watched_change_resets_sessions(change: &FileEvent) -> bool {
+    change.typ != FileChangeType::CHANGED
+        || change
+            .uri
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            == Some("Clue.toml")
+}
+
 impl Backend {
-    async fn publish_all(&self) {
-        let docs = self.docs.lock().unwrap().clone();
-        // ponytail: recompile each open document; group by project if latency becomes measurable.
-        for (uri, doc) in &docs {
-            let diagnostics =
-                collect_document_diagnostics(uri, &doc.text, &docs, self.compile_options);
-            self.client
-                .publish_diagnostics(uri.clone(), diagnostics, doc.version)
-                .await;
+    fn schedule_diagnostics(&self) {
+        let revision = self.diagnostic_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let client = self.client.clone();
+        let docs = Arc::clone(&self.docs);
+        let published_state = Arc::clone(&self.published);
+        let publish_gate = Arc::clone(&self.publish_gate);
+        let diagnostic_revision = Arc::clone(&self.diagnostic_revision);
+        let diagnostic_sessions = Arc::clone(&self.diagnostic_sessions);
+        let compile_options = self.compile_options;
+
+        tokio::spawn(async move {
+            tokio::time::sleep(DIAGNOSTICS_DEBOUNCE).await;
+            if diagnostic_revision.load(Ordering::SeqCst) != revision {
+                return;
+            }
+
+            let docs = docs.lock().unwrap().clone();
+            let analysis_revision = Arc::clone(&diagnostic_revision);
+            let published = tokio::task::spawn_blocking(move || {
+                let mut sessions = diagnostic_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if analysis_revision.load(Ordering::SeqCst) != revision {
+                    return Ok(None);
+                }
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    collect_workspace_diagnostics_cancellable(
+                        &docs,
+                        compile_options,
+                        &mut sessions,
+                        || analysis_revision.load(Ordering::SeqCst) != revision,
+                    )
+                }));
+                match result {
+                    Ok(published) => Ok(published),
+                    Err(_) => {
+                        *sessions = DiagnosticSessions::default();
+                        Err(())
+                    }
+                }
+            })
+            .await;
+            let published = match published {
+                Ok(Ok(Some(published))) => published,
+                Ok(Ok(None)) => return,
+                Ok(Err(())) | Err(_) => {
+                    client
+                        .log_message(MessageType::ERROR, "riddle-lsp analysis failed")
+                        .await;
+                    return;
+                }
+            };
+            if diagnostic_revision.load(Ordering::SeqCst) != revision {
+                return;
+            }
+
+            let _publish_guard = publish_gate.lock().await;
+            if diagnostic_revision.load(Ordering::SeqCst) != revision {
+                return;
+            }
+            publish_diagnostics(
+                &client,
+                &published_state,
+                &diagnostic_revision,
+                revision,
+                published,
+            )
+            .await;
+        });
+    }
+}
+
+async fn publish_diagnostics(
+    client: &Client,
+    published_state: &Mutex<HashMap<lsp_types::Url, diagnostics::PublishedDiagnostics>>,
+    diagnostic_revision: &AtomicU64,
+    revision: u64,
+    published: Vec<diagnostics::PublishedDiagnostics>,
+) {
+    let current = published
+        .into_iter()
+        .map(|published| (published.uri.clone(), published))
+        .collect::<HashMap<_, _>>();
+    let (previous, uris) = {
+        let previous = published_state.lock().unwrap();
+        let mut uris = previous
+            .keys()
+            .chain(current.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        uris.dedup();
+        (previous.clone(), uris)
+    };
+
+    for uri in uris {
+        if diagnostic_revision.load(Ordering::SeqCst) != revision {
+            return;
+        }
+        if previous.get(&uri) == current.get(&uri) {
+            continue;
+        }
+        let (diagnostics, version) = current
+            .get(&uri)
+            .map(|published| (published.diagnostics.clone(), published.version))
+            .unwrap_or_default();
+        client
+            .publish_diagnostics(uri.clone(), diagnostics, version)
+            .await;
+        let mut actual = published_state.lock().unwrap();
+        if let Some(published) = current.get(&uri) {
+            actual.insert(uri, published.clone());
+        } else {
+            actual.remove(&uri);
         }
     }
 }
@@ -143,236 +323,6 @@ fn full_text(changes: Vec<TextDocumentContentChangeEvent>) -> Option<String> {
         .rev()
         .find(|change| change.range.is_none())
         .map(|change| change.text)
-}
-
-fn collect_diagnostics(
-    uri: &lsp_types::Url,
-    source: &str,
-    result: &CompileResult,
-) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    for diagnostic in diagnostic_exts(result) {
-        push_diagnostic(&mut out, uri, source, diagnostic);
-    }
-    out
-}
-
-fn collect_document_diagnostics(
-    uri: &lsp_types::Url,
-    source: &str,
-    docs: &HashMap<lsp_types::Url, Document>,
-    options: CompileOptions,
-) -> Vec<Diagnostic> {
-    let Ok(path) = uri.to_file_path() else {
-        let result = riddlec::pipeline::compile_with_options(source, options);
-        return collect_diagnostics(uri, source, &result);
-    };
-    let Some(root) = clue::find_project_root(&path) else {
-        let result = riddlec::pipeline::compile_with_options(source, options);
-        return collect_diagnostics(uri, source, &result);
-    };
-    let overlays = docs
-        .iter()
-        .filter_map(|(uri, document)| {
-            uri.to_file_path()
-                .ok()
-                .map(|path| (path, document.text.clone()))
-        })
-        .collect::<HashMap<PathBuf, String>>();
-    let analysis = match clue::analyze_project_with_options(&root, &overlays, options) {
-        Ok(analysis) => analysis,
-        Err(error) => return vec![project_error(error)],
-    };
-    let Ok(path) = fs::canonicalize(path) else {
-        return Vec::new();
-    };
-    if !analysis.source.source_map.contains_file(&path) {
-        let result = riddlec::pipeline::compile_with_options(source, options);
-        return collect_diagnostics(uri, source, &result);
-    }
-
-    let entry = fs::canonicalize(&analysis.entry).ok();
-    diagnostic_exts(&analysis.result)
-        .filter_map(|diagnostic| {
-            if diagnostic.labels.is_empty() && entry.as_deref() == Some(path.as_path()) {
-                return Some(to_lsp(uri, source, diagnostic));
-            }
-            to_lsp_mapped(&path, &analysis.source.source_map, diagnostic)
-        })
-        .collect()
-}
-
-fn diagnostic_exts(result: &CompileResult) -> impl Iterator<Item = DiagnosticExt> + '_ {
-    result
-        .parse_errors
-        .iter()
-        .map(IntoDiagnosticExt::to_ext)
-        .chain(result.hir_diagnostics.iter().map(IntoDiagnosticExt::to_ext))
-        .chain(
-            result
-                .type_result
-                .diagnostics
-                .iter()
-                .map(IntoDiagnosticExt::to_ext),
-        )
-        .chain(
-            result
-                .analysis_diagnostics
-                .iter()
-                .map(IntoDiagnosticExt::to_ext),
-        )
-}
-
-fn to_lsp_mapped(
-    current_path: &Path,
-    source_map: &riddlec::pipeline::SourceMap,
-    diagnostic: DiagnosticExt,
-) -> Option<Diagnostic> {
-    let primary = diagnostic
-        .labels
-        .first()
-        .and_then(|label| source_map.map_range(label.range))?;
-    if primary.path != current_path {
-        return None;
-    }
-
-    let mut message = diagnostic.message;
-    if let Some(help) = diagnostic.help {
-        message.push_str("\nhelp: ");
-        message.push_str(&help);
-    }
-    for note in diagnostic.notes {
-        message.push_str("\nnote: ");
-        message.push_str(&note);
-    }
-    let related_information = diagnostic
-        .labels
-        .iter()
-        .skip(1)
-        .filter(|label| !label.message.is_empty())
-        .filter_map(|label| {
-            let mapped = source_map.map_range(label.range)?;
-            let uri = lsp_types::Url::from_file_path(mapped.path).ok()?;
-            Some(DiagnosticRelatedInformation {
-                location: Location::new(uri, range(mapped.source, mapped.range)),
-                message: label.message.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    Some(Diagnostic {
-        range: range(primary.source, primary.range),
-        severity: Some(severity(diagnostic.severity)),
-        code: (!diagnostic.code.is_empty()).then(|| NumberOrString::String(diagnostic.code.into())),
-        source: Some("riddle".into()),
-        message,
-        related_information: (!related_information.is_empty()).then_some(related_information),
-        ..Diagnostic::default()
-    })
-}
-
-fn project_error(error: impl std::fmt::Display) -> Diagnostic {
-    Diagnostic {
-        range: Range::default(),
-        severity: Some(DiagnosticSeverity::ERROR),
-        source: Some("clue".into()),
-        message: error.to_string(),
-        ..Diagnostic::default()
-    }
-}
-
-fn push_diagnostic(
-    out: &mut Vec<Diagnostic>,
-    uri: &lsp_types::Url,
-    source: &str,
-    diagnostic: DiagnosticExt,
-) {
-    if diagnostic_in_source(source, &diagnostic) {
-        out.push(to_lsp(uri, source, diagnostic));
-    }
-}
-
-fn diagnostic_in_source(source: &str, diagnostic: &DiagnosticExt) -> bool {
-    diagnostic
-        .labels
-        .first()
-        .is_none_or(|label| range_in_source(source, label.range))
-}
-
-fn range_in_source(source: &str, range: TextRange) -> bool {
-    usize::from(range.end()) <= source.len()
-}
-
-fn to_lsp(uri: &lsp_types::Url, source: &str, diagnostic: DiagnosticExt) -> Diagnostic {
-    let primary = diagnostic
-        .labels
-        .first()
-        .map(|label| label.range)
-        .unwrap_or_else(|| TextRange::empty(0.into()));
-
-    let mut message = diagnostic.message;
-    if let Some(help) = diagnostic.help {
-        message.push_str("\nhelp: ");
-        message.push_str(&help);
-    }
-    for note in diagnostic.notes {
-        message.push_str("\nnote: ");
-        message.push_str(&note);
-    }
-
-    let related_information = diagnostic
-        .labels
-        .iter()
-        .skip(1)
-        .filter(|label| !label.message.is_empty() && range_in_source(source, label.range))
-        .map(|label| DiagnosticRelatedInformation {
-            location: Location::new(uri.clone(), range(source, label.range)),
-            message: label.message.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    Diagnostic {
-        range: range(source, primary),
-        severity: Some(severity(diagnostic.severity)),
-        code: (!diagnostic.code.is_empty()).then(|| NumberOrString::String(diagnostic.code.into())),
-        source: Some("riddle".into()),
-        message,
-        related_information: (!related_information.is_empty()).then_some(related_information),
-        ..Diagnostic::default()
-    }
-}
-
-fn severity(severity: type_checker::Severity) -> DiagnosticSeverity {
-    match severity {
-        type_checker::Severity::Error => DiagnosticSeverity::ERROR,
-        type_checker::Severity::Warning => DiagnosticSeverity::WARNING,
-        type_checker::Severity::Note => DiagnosticSeverity::INFORMATION,
-        type_checker::Severity::Help => DiagnosticSeverity::HINT,
-    }
-}
-
-fn range(source: &str, range: TextRange) -> Range {
-    Range::new(
-        position(source, range.start().into()),
-        position(source, range.end().into()),
-    )
-}
-
-fn position(source: &str, offset: usize) -> Position {
-    let offset = offset.min(source.len());
-    let mut line = 0u32;
-    let mut character = 0u32;
-
-    for ch in source[..offset].chars() {
-        if ch == '\n' {
-            line += 1;
-            character = 0;
-        } else {
-            character += ch.len_utf16() as u32;
-        }
-    }
-
-    Position::new(line, character)
 }
 
 const TOKEN_KEYWORD: u32 = 0;
@@ -389,6 +339,7 @@ const TOKEN_ENUM: u32 = 10;
 const TOKEN_INTERFACE: u32 = 11;
 const TOKEN_PROPERTY: u32 = 12;
 const TOKEN_NAMESPACE: u32 = 13;
+const TOKEN_PARAMETER: u32 = 14;
 const MOD_DECLARATION: u32 = 1 << 0;
 const MOD_MUTABLE: u32 = 1 << 1;
 
@@ -409,6 +360,7 @@ fn semantic_tokens_legend() -> SemanticTokensLegend {
             SemanticTokenType::INTERFACE,
             SemanticTokenType::PROPERTY,
             SemanticTokenType::NAMESPACE,
+            SemanticTokenType::PARAMETER,
         ],
         token_modifiers: vec![
             SemanticTokenModifier::DECLARATION,
@@ -417,9 +369,9 @@ fn semantic_tokens_legend() -> SemanticTokensLegend {
     }
 }
 
-fn semantic_tokens_with_options(source: &str, options: CompileOptions) -> SemanticTokens {
+fn semantic_tokens_for_source(source: &str) -> SemanticTokens {
     let tokens = frontend::lexer::lex(source);
-    let result = riddlec::pipeline::compile_with_options(source, options);
+    let result = riddlec::pipeline::resolve_with_options(source, CompileOptions { use_std: false });
     let mut raw_tokens = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
@@ -442,19 +394,10 @@ fn semantic_tokens_with_options(source: &str, options: CompileOptions) -> Semant
     }
 
     if let Some(hir) = &result.hir {
-        collect_hir_variable_tokens(hir, source, &mut raw_tokens);
+        collect_hir_symbol_tokens(hir, source, &mut raw_tokens);
     }
 
-    raw_tokens.sort_by_key(|token| {
-        (
-            token.token_type != TOKEN_VARIABLE,
-            token.range.start(),
-            token.range.end(),
-        )
-    });
-    let mut raw_tokens = remove_overlapping_tokens(raw_tokens);
-    raw_tokens.sort_by_key(|token| (token.range.start(), token.range.end()));
-    encode_semantic_tokens(source, raw_tokens)
+    encode_semantic_tokens(source, remove_overlapping_tokens(raw_tokens))
 }
 
 const USAGE: &str = "usage: riddle-lsp [--no-std]";
@@ -497,34 +440,60 @@ struct RawSemanticToken {
     token_modifiers_bitset: u32,
 }
 
-fn collect_hir_variable_tokens(hir: &hir::HirFile, source: &str, out: &mut Vec<RawSemanticToken>) {
+fn collect_hir_symbol_tokens(hir: &hir::HirFile, source: &str, out: &mut Vec<RawSemanticToken>) {
     let source_len = source.len();
+
+    for (_, function) in hir.item_tree.functions.iter() {
+        for param in &function.params {
+            if range_is_in_source(param.name_range, source_len) {
+                out.push(RawSemanticToken {
+                    range: param.name_range,
+                    token_type: TOKEN_PARAMETER,
+                    token_modifiers_bitset: MOD_DECLARATION,
+                });
+            }
+        }
+    }
+
     for (_, body) in hir.bodies.iter() {
         for (_, stmt) in body.stmts.iter() {
             if let Stmt::Let {
                 name_range, is_mut, ..
             } = stmt
             {
+                if !is_mut {
+                    continue;
+                }
                 let Some(range) = *name_range else {
                     continue;
                 };
                 if !range_is_in_source(range, source_len) {
                     continue;
                 }
-
-                let mut modifiers = MOD_DECLARATION;
-                if *is_mut {
-                    modifiers |= MOD_MUTABLE;
-                }
                 out.push(RawSemanticToken {
                     range,
                     token_type: TOKEN_VARIABLE,
-                    token_modifiers_bitset: modifiers,
+                    token_modifiers_bitset: MOD_DECLARATION | MOD_MUTABLE,
                 });
             }
         }
 
         for (expr_id, expr) in body.exprs.iter() {
+            if let Expr::Lambda { params, .. } = expr {
+                for param in params {
+                    let Some(range) = param.name_range else {
+                        continue;
+                    };
+                    if range_is_in_source(range, source_len) {
+                        out.push(RawSemanticToken {
+                            range,
+                            token_type: TOKEN_PARAMETER,
+                            token_modifiers_bitset: MOD_DECLARATION,
+                        });
+                    }
+                }
+            }
+
             let Expr::Path { path, resolved } = expr else {
                 continue;
             };
@@ -544,30 +513,32 @@ fn collect_hir_variable_tokens(hir: &hir::HirFile, source: &str, out: &mut Vec<R
                 continue;
             }
 
-            let Some(token_modifiers_bitset) =
-                variable_modifiers_for_resolution(body, resolved.as_ref())
+            let Some((token_type, token_modifiers_bitset)) =
+                semantic_token_for_resolution(body, resolved.as_ref())
             else {
                 continue;
             };
             out.push(RawSemanticToken {
                 range,
-                token_type: TOKEN_VARIABLE,
+                token_type,
                 token_modifiers_bitset,
             });
         }
     }
 }
 
-fn variable_modifiers_for_resolution(
+fn semantic_token_for_resolution(
     body: &hir::body::Body,
     resolved: Option<&ResolvedName>,
-) -> Option<u32> {
+) -> Option<(u32, u32)> {
     match resolved {
         Some(ResolvedName::Local(stmt_id)) => match &body.stmts[*stmt_id] {
-            Stmt::Let { is_mut, .. } => Some(if *is_mut { MOD_MUTABLE } else { 0 }),
+            Stmt::Let { is_mut: true, .. } => Some((TOKEN_VARIABLE, MOD_MUTABLE)),
             _ => None,
         },
-        Some(ResolvedName::Param(_)) => Some(0),
+        Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => {
+            Some((TOKEN_PARAMETER, 0))
+        }
         _ => None,
     }
 }
@@ -587,17 +558,47 @@ fn trim_source_range(source: &str, range: TextRange) -> Option<TextRange> {
 }
 
 fn remove_overlapping_tokens(raw_tokens: Vec<RawSemanticToken>) -> Vec<RawSemanticToken> {
-    let mut out = Vec::new();
-    for token in raw_tokens {
-        if out
-            .iter()
-            .any(|kept: &RawSemanticToken| ranges_overlap(kept.range, token.range))
+    let (mut preferred, mut fallback): (Vec<_>, Vec<_>) = raw_tokens
+        .into_iter()
+        .partition(|token| matches!(token.token_type, TOKEN_VARIABLE | TOKEN_PARAMETER));
+    preferred.sort_by_key(|token| (token.range.start(), token.range.end()));
+    fallback.sort_by_key(|token| (token.range.start(), token.range.end()));
+
+    let mut kept_preferred: Vec<RawSemanticToken> = Vec::new();
+    for token in preferred {
+        if kept_preferred
+            .last()
+            .is_some_and(|kept| ranges_overlap(kept.range, token.range))
         {
             continue;
         }
-        out.push(token);
+        kept_preferred.push(token);
     }
-    out
+
+    let mut preferred_index = 0;
+    let mut kept_fallback: Vec<RawSemanticToken> = Vec::new();
+    for token in fallback {
+        while kept_preferred
+            .get(preferred_index)
+            .is_some_and(|preferred| preferred.range.end() <= token.range.start())
+        {
+            preferred_index += 1;
+        }
+        if kept_preferred
+            .get(preferred_index)
+            .is_some_and(|preferred| ranges_overlap(preferred.range, token.range))
+            || kept_fallback
+                .last()
+                .is_some_and(|kept| ranges_overlap(kept.range, token.range))
+        {
+            continue;
+        }
+        kept_fallback.push(token);
+    }
+
+    kept_preferred.extend(kept_fallback);
+    kept_preferred.sort_by_key(|token| (token.range.start(), token.range.end()));
+    kept_preferred
 }
 
 fn ranges_overlap(a: TextRange, b: TextRange) -> bool {
@@ -606,6 +607,9 @@ fn ranges_overlap(a: TextRange, b: TextRange) -> bool {
 
 fn encode_semantic_tokens(source: &str, raw_tokens: Vec<RawSemanticToken>) -> SemanticTokens {
     let mut data = Vec::new();
+    let mut cursor = 0;
+    let mut line = 0;
+    let mut character = 0;
     let mut prev_line = 0;
     let mut prev_start = 0;
 
@@ -619,13 +623,25 @@ fn encode_semantic_tokens(source: &str, raw_tokens: Vec<RawSemanticToken>) -> Se
             continue;
         }
 
-        let start = position(source, start_offset);
+        let Some(skipped) = source.get(cursor..start_offset) else {
+            continue;
+        };
+        for ch in skipped.chars() {
+            if ch == '\n' {
+                line += 1;
+                character = 0;
+            } else {
+                character += ch.len_utf16() as u32;
+            }
+        }
+        cursor = start_offset;
+
         let length = text.chars().map(char::len_utf16).sum::<usize>() as u32;
-        let delta_line = start.line - prev_line;
+        let delta_line = line - prev_line;
         let delta_start = if delta_line == 0 {
-            start.character - prev_start
+            character - prev_start
         } else {
-            start.character
+            character
         };
 
         data.push(SemanticToken {
@@ -635,8 +651,8 @@ fn encode_semantic_tokens(source: &str, raw_tokens: Vec<RawSemanticToken>) -> Se
             token_type: token.token_type,
             token_modifiers_bitset: token.token_modifiers_bitset,
         });
-        prev_line = start.line;
-        prev_start = start.character;
+        prev_line = line;
+        prev_start = character;
     }
 
     SemanticTokens {
@@ -799,13 +815,15 @@ async fn main() {
     let stdout = tokio::io::stdout();
     let (service, socket) = LspService::new(|client| Backend {
         client,
-        docs: Mutex::new(HashMap::new()),
+        docs: Arc::new(Mutex::new(HashMap::new())),
+        published: Arc::new(Mutex::new(HashMap::new())),
+        publish_gate: Arc::new(tokio::sync::Mutex::new(())),
+        diagnostic_revision: Arc::new(AtomicU64::new(0)),
+        diagnostic_sessions: Arc::new(Mutex::new(DiagnosticSessions::default())),
+        semantic_tokens: Arc::new(Mutex::new(HashMap::new())),
         compile_options: opts.compile_options,
     });
-    Server::new(stdin, stdout, socket)
-        .concurrency_level(1)
-        .serve(service)
-        .await;
+    Server::new(stdin, stdout, socket).serve(service).await;
 }
 
 #[cfg(test)]

@@ -14,9 +14,12 @@ use hir::{
 
 use crate::{
     checker::{GenericEdge, TypeChecker},
-    context::BodyCtx,
+    context::{BodyCtx, LambdaCtx},
     lowering::{collect_subst, generic_param_map_with_consts, substitute_type},
-    result::{ForLoopInfo, OperatorCall, TraitMethodCall},
+    result::{
+        CaptureMode, CaptureSource, ClosureKind, ForLoopInfo, LambdaCapture, LambdaInfo,
+        OperatorCall, TraitMethodCall,
+    },
     types::{ConstArg, IntTy, Type},
 };
 
@@ -107,6 +110,15 @@ impl TypeChecker<'_> {
                 } else {
                     ctx.locals.insert(stmt_id, (declared, *is_mut));
                 }
+                if let Some(init) = init
+                    && let Some(kind) = self
+                        .result
+                        .closure_kinds
+                        .get(&(ctx.body_id, *init))
+                        .copied()
+                {
+                    ctx.local_closures.insert(stmt_id, kind);
+                }
             }
             Stmt::Expr { expr } => {
                 self.check_expr(ctx, *expr);
@@ -189,15 +201,38 @@ impl TypeChecker<'_> {
         let span = ctx.expr_range(expr_id);
         let ty = match &ctx.body.exprs[expr_id] {
             Expr::Missing => Type::Error,
-            Expr::IntLiteral { suffix, .. } => self.int_literal_type(suffix.as_deref(), expected),
+            Expr::IntLiteral { suffix, .. } => {
+                self.int_literal_type(suffix.as_deref(), expected, span)
+            }
             Expr::FloatLiteral { suffix, .. } => {
-                self.float_literal_type(suffix.as_deref(), expected)
+                self.float_literal_type(suffix.as_deref(), expected, span)
             }
             Expr::StringLiteral { .. } => Type::Ref(Box::new(Type::Str), false),
             Expr::CharLiteral { .. } => Type::Char,
             Expr::BoolLiteral { .. } => Type::Bool,
             Expr::Path { path, resolved } => {
-                if let Some(binding_ty) = path
+                if let Some(lambda) = ctx.lambdas.last() {
+                    let binding_capture = path
+                        .as_single_name()
+                        .is_some_and(|name| ctx.bindings.is_before(&name.0, lambda.binding_depth));
+                    let resolved_capture = match resolved {
+                        Some(ResolvedName::Local(stmt)) => lambda.outer_locals.contains(stmt),
+                        Some(ResolvedName::Param(_)) => true,
+                        Some(ResolvedName::LambdaParam { lambda: owner, .. }) => {
+                            *owner != lambda.expr
+                        }
+                        _ => false,
+                    };
+                    if binding_capture && !resolved_capture {
+                        self.diagnostic(
+                            "E0044",
+                            format!("anonymous function cannot capture `{}`", path.display()),
+                            span,
+                        );
+                        return Type::Error;
+                    }
+                }
+                let ty = if let Some(binding_ty) = path
                     .as_single_name()
                     .and_then(|name| ctx.bindings.get(&name.0))
                     .cloned()
@@ -213,7 +248,24 @@ impl TypeChecker<'_> {
                     self.enum_variant_type(*enum_id, expected)
                 } else {
                     self.type_of_resolved_name(ctx, resolved.as_ref())
+                };
+                if let Some(source) = self.capture_source(ctx, resolved.as_ref()) {
+                    self.record_capture(
+                        ctx,
+                        source,
+                        path.display(),
+                        ty.clone(),
+                        CaptureMode::Shared,
+                    );
                 }
+                if let Some(ResolvedName::Local(stmt)) = resolved
+                    && let Some(kind) = ctx.local_closures.get(stmt).copied()
+                {
+                    self.result
+                        .closure_kinds
+                        .insert((ctx.body_id, expr_id), kind);
+                }
+                ty
             }
             Expr::Struct {
                 resolved, fields, ..
@@ -287,6 +339,20 @@ impl TypeChecker<'_> {
                 self.check_array_repeat(ctx, *value, *len, expected, span)
             }
             Expr::Call { callee, args } => self.check_call(ctx, *callee, args, expected, span),
+            Expr::Lambda {
+                params,
+                ret_type,
+                ret_type_range,
+                body,
+            } => self.check_lambda(
+                ctx,
+                expr_id,
+                params,
+                ret_type,
+                *ret_type_range,
+                *body,
+                expected,
+            ),
             Expr::FieldAccess { base, field } => self.check_field_access(ctx, *base, field, span),
             Expr::Unsafe { body } => match expected {
                 Some(expected) => self.check_expr_expected(ctx, *body, expected),
@@ -311,7 +377,7 @@ impl TypeChecker<'_> {
             }
             Expr::Cast { base, target } => {
                 self.check_expr(ctx, *base);
-                self.lower_type_ref(target)
+                self.lower_type_ref_with_params_at(target, &HashMap::new(), span)
             }
         };
 
@@ -403,7 +469,403 @@ impl TypeChecker<'_> {
             _ => self.check_expr(ctx, rhs),
         };
 
+        if matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::LtEq
+                | BinaryOp::GtEq
+        ) {
+            self.unify_types(&lhs_ty, &rhs_ty);
+        }
+        let lhs_ty = self.resolve_type(&lhs_ty);
+        let rhs_ty = self.resolve_type(&rhs_ty);
         self.check_binary_types(ctx, lhs, rhs, op, &lhs_ty, &rhs_ty, span)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_lambda(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        params: &[hir::body::LambdaParam],
+        ret_type: &HirTypeRef,
+        ret_type_range: Option<rowan::TextRange>,
+        body: ExprId,
+        expected: Option<&Type>,
+    ) -> Type {
+        let expected = expected.map(|ty| self.callable_type(ty));
+        let expected_fn = match expected.as_ref() {
+            Some(Type::Fn(params, ret)) => Some((params.as_slice(), ret.as_ref())),
+            _ => None,
+        };
+        if let Some((expected_params, _)) = expected_fn
+            && expected_params.len() != params.len()
+        {
+            self.diagnostic(
+                "E0005",
+                format!(
+                    "anonymous function expects {} parameter(s), expected signature has {}",
+                    params.len(),
+                    expected_params.len()
+                ),
+                ctx.expr_range(expr_id),
+            );
+        }
+
+        let param_types = params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                if matches!(param.ty, HirTypeRef::Unknown) {
+                    expected_fn
+                        .and_then(|(expected, _)| expected.get(index).cloned())
+                        .unwrap_or_else(|| self.fresh_infer())
+                } else {
+                    self.lower_type_ref_with_params_at(
+                        &param.ty,
+                        &ctx.generic_params,
+                        param
+                            .ty_range
+                            .or(param.name_range)
+                            .or(ctx.expr_range(expr_id)),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let return_ty = if matches!(ret_type, HirTypeRef::Unknown) {
+            expected_fn
+                .map(|(_, ret)| ret.clone())
+                .unwrap_or_else(|| self.fresh_infer())
+        } else {
+            self.lower_type_ref_with_params_at(
+                ret_type,
+                &ctx.generic_params,
+                ret_type_range.or(ctx.expr_range(expr_id)),
+            )
+        };
+
+        let old_return = std::mem::replace(&mut ctx.return_ty, return_ty.clone());
+        let old_loop_depth = std::mem::replace(&mut ctx.loop_depth, 0);
+        ctx.lambdas.push(LambdaCtx {
+            expr: expr_id,
+            params: param_types.clone(),
+            outer_locals: ctx.locals.keys().copied().collect(),
+            binding_depth: ctx.bindings.depth(),
+            captures: Vec::new(),
+        });
+        let actual = self.check_expr_expected(ctx, body, &return_ty);
+        self.expect_assignable(
+            &return_ty,
+            &actual,
+            "anonymous function return",
+            ctx.expr_range(body),
+        );
+        self.infer_capture_uses(ctx, body, CaptureMode::Value);
+        let lambda = ctx.lambdas.pop().expect("lambda context must be present");
+        ctx.return_ty = old_return;
+        ctx.loop_depth = old_loop_depth;
+
+        let kind = if lambda
+            .captures
+            .iter()
+            .any(|capture| capture.mode == CaptureMode::Value)
+        {
+            ClosureKind::FnOnce
+        } else if lambda
+            .captures
+            .iter()
+            .any(|capture| capture.mode == CaptureMode::Mutable)
+        {
+            ClosureKind::FnMut
+        } else {
+            ClosureKind::Fn
+        };
+        self.result.lambda_infos.insert(
+            (ctx.body_id, expr_id),
+            LambdaInfo {
+                captures: lambda.captures,
+                kind,
+            },
+        );
+        self.result
+            .closure_kinds
+            .insert((ctx.body_id, expr_id), kind);
+
+        self.record_lambda(
+            ctx.body_id,
+            expr_id,
+            params
+                .iter()
+                .zip(&param_types)
+                .map(|(param, ty)| {
+                    (
+                        param.name.0.clone(),
+                        param
+                            .name_range
+                            .or(param.ty_range)
+                            .or(ctx.expr_range(expr_id)),
+                        ty.clone(),
+                    )
+                })
+                .collect(),
+        );
+        Type::Fn(param_types, Box::new(return_ty))
+    }
+
+    fn capture_source(
+        &self,
+        ctx: &BodyCtx<'_>,
+        resolved: Option<&ResolvedName>,
+    ) -> Option<CaptureSource> {
+        let lambda = ctx.lambdas.last()?;
+        match resolved? {
+            ResolvedName::Local(stmt) if lambda.outer_locals.contains(stmt) => {
+                Some(CaptureSource::Local(*stmt))
+            }
+            ResolvedName::Param(index) => Some(CaptureSource::Param(*index)),
+            ResolvedName::LambdaParam {
+                lambda: owner,
+                index,
+            } if *owner != lambda.expr => Some(CaptureSource::LambdaParam {
+                lambda: *owner,
+                index: *index,
+            }),
+            _ => None,
+        }
+    }
+
+    fn record_capture(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        source: CaptureSource,
+        name: String,
+        ty: Type,
+        mode: CaptureMode,
+    ) {
+        let mode = if mode == CaptureMode::Value && self.result.trait_env.type_is_copy(&ty) {
+            CaptureMode::Shared
+        } else {
+            mode
+        };
+        let lambda = ctx
+            .lambdas
+            .last_mut()
+            .expect("captures are only recorded inside lambdas");
+        if let Some(capture) = lambda
+            .captures
+            .iter_mut()
+            .find(|capture| capture.source == source)
+        {
+            capture.mode = capture.mode.merge(mode);
+            return;
+        }
+        lambda.captures.push(LambdaCapture {
+            source,
+            name,
+            ty,
+            mode,
+        });
+    }
+
+    fn record_capture_use(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId, mode: CaptureMode) {
+        match ctx.body.exprs[expr_id].clone() {
+            Expr::Path { path, resolved } => {
+                let Some(source) = self.capture_source(ctx, resolved.as_ref()) else {
+                    return;
+                };
+                let ty = self
+                    .result
+                    .expr_types
+                    .get(&(ctx.body_id, expr_id))
+                    .cloned()
+                    .unwrap_or(Type::Unknown);
+                self.record_capture(ctx, source, path.display(), ty, mode);
+            }
+            Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
+                // ponytail: capture the whole binding; add place projections when
+                // disjoint-field borrow conflicts become a measured limitation.
+                self.record_capture_use(ctx, base, mode);
+            }
+            _ => {}
+        }
+    }
+
+    fn infer_capture_uses(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId, mode: CaptureMode) {
+        match ctx.body.exprs[expr_id].clone() {
+            Expr::Missing
+            | Expr::IntLiteral { .. }
+            | Expr::FloatLiteral { .. }
+            | Expr::StringLiteral { .. }
+            | Expr::CharLiteral { .. }
+            | Expr::BoolLiteral { .. } => {}
+            Expr::Path { .. } => self.record_capture_use(ctx, expr_id, mode),
+            Expr::Struct { fields, .. } => {
+                for field in fields {
+                    self.infer_capture_uses(ctx, field.value, CaptureMode::Value);
+                }
+            }
+            Expr::Binary { lhs, rhs, op } if op.is_assignment() => {
+                self.infer_capture_uses(ctx, lhs, CaptureMode::Mutable);
+                self.infer_capture_uses(ctx, rhs, CaptureMode::Value);
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.infer_capture_uses(ctx, lhs, CaptureMode::Shared);
+                self.infer_capture_uses(ctx, rhs, CaptureMode::Shared);
+            }
+            Expr::Unary { operand, op } => {
+                let operand_mode = match op {
+                    UnaryOp::MutRef => CaptureMode::Mutable,
+                    UnaryOp::Ref | UnaryOp::Deref | UnaryOp::Neg | UnaryOp::Pos | UnaryOp::Not => {
+                        CaptureMode::Shared
+                    }
+                };
+                self.infer_capture_uses(ctx, operand, operand_mode);
+            }
+            Expr::Block { stmts, tail } => {
+                for stmt in stmts {
+                    match ctx.body.stmts[stmt].clone() {
+                        Stmt::Let {
+                            init: Some(init), ..
+                        } => {
+                            self.infer_capture_uses(ctx, init, CaptureMode::Value);
+                        }
+                        Stmt::Expr { expr } => {
+                            self.infer_capture_uses(ctx, expr, CaptureMode::Shared);
+                        }
+                        Stmt::Return { value: Some(value) } => {
+                            self.infer_capture_uses(ctx, value, CaptureMode::Value);
+                        }
+                        Stmt::Let { init: None, .. }
+                        | Stmt::Return { value: None }
+                        | Stmt::Break
+                        | Stmt::Continue
+                        | Stmt::Item { .. } => {}
+                    }
+                }
+                if let Some(tail) = tail {
+                    self.infer_capture_uses(ctx, tail, mode);
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.infer_capture_uses(ctx, cond, CaptureMode::Shared);
+                self.infer_capture_uses(ctx, then_branch, mode);
+                if let Some(branch) = else_branch {
+                    self.infer_capture_uses(ctx, branch, mode);
+                }
+            }
+            Expr::While { condition, body } => {
+                self.infer_capture_uses(ctx, condition, CaptureMode::Shared);
+                self.infer_capture_uses(ctx, body, CaptureMode::Shared);
+            }
+            Expr::For { iterable, body, .. } => {
+                self.infer_capture_uses(ctx, iterable, CaptureMode::Value);
+                self.infer_capture_uses(ctx, body, CaptureMode::Shared);
+            }
+            Expr::Match { scrutinee, arms } => {
+                self.infer_capture_uses(ctx, scrutinee, CaptureMode::Value);
+                for arm in arms {
+                    if let Some(guard) = arm.guard {
+                        self.infer_capture_uses(ctx, guard, CaptureMode::Shared);
+                    }
+                    self.infer_capture_uses(ctx, arm.body, mode);
+                }
+            }
+            Expr::Array { elements } => {
+                for element in elements {
+                    self.infer_capture_uses(ctx, element, CaptureMode::Value);
+                }
+            }
+            Expr::ArrayRepeat { value, len } => {
+                self.infer_capture_uses(ctx, value, CaptureMode::Value);
+                self.infer_capture_uses(ctx, len, CaptureMode::Shared);
+            }
+            Expr::Call { callee, args } => {
+                let callee_mode = match self.result.closure_kinds.get(&(ctx.body_id, callee)) {
+                    Some(ClosureKind::FnOnce) => CaptureMode::Value,
+                    Some(ClosureKind::FnMut) => CaptureMode::Mutable,
+                    _ => CaptureMode::Shared,
+                };
+                self.infer_capture_uses(ctx, callee, callee_mode);
+                for arg in args {
+                    self.infer_capture_uses(ctx, arg, CaptureMode::Value);
+                }
+            }
+            Expr::Lambda { .. } => {
+                let nested = self
+                    .result
+                    .lambda_infos
+                    .get(&(ctx.body_id, expr_id))
+                    .cloned();
+                if let (Some(nested), Some(outer)) = (nested, ctx.lambdas.last()) {
+                    let outer_expr = outer.expr;
+                    let outer_locals = outer.outer_locals.clone();
+                    for capture in nested.captures {
+                        let comes_from_outside = match &capture.source {
+                            CaptureSource::Local(stmt) => outer_locals.contains(stmt),
+                            CaptureSource::Param(_) => true,
+                            CaptureSource::LambdaParam { lambda, .. } => *lambda != outer_expr,
+                        };
+                        if comes_from_outside {
+                            self.record_capture(
+                                ctx,
+                                capture.source,
+                                capture.name,
+                                capture.ty,
+                                capture.mode,
+                            );
+                        }
+                    }
+                }
+            }
+            Expr::FieldAccess { base, .. } => {
+                self.infer_capture_uses(ctx, base, mode);
+            }
+            Expr::IndexAccess { base, index } => {
+                self.infer_capture_uses(ctx, base, mode);
+                self.infer_capture_uses(ctx, index, CaptureMode::Shared);
+            }
+            Expr::Unsafe { body } => self.infer_capture_uses(ctx, body, mode),
+            Expr::Cast { base, .. } => {
+                self.infer_capture_uses(ctx, base, CaptureMode::Shared);
+            }
+        }
+    }
+
+    fn check_mutable_closure_binding(&mut self, ctx: &BodyCtx<'_>, callee: ExprId) {
+        let Expr::Path { path, resolved } = &ctx.body.exprs[callee] else {
+            return;
+        };
+        let immutable = match resolved {
+            Some(ResolvedName::Local(stmt)) => {
+                ctx.locals.get(stmt).is_some_and(|(_, mutable)| !mutable)
+            }
+            Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => true,
+            _ => path
+                .as_single_name()
+                .is_some_and(|name| ctx.bindings.get(&name.0).is_some()),
+        };
+        if immutable {
+            self.diagnostic(
+                "E0031",
+                "cannot call a mutable closure through an immutable binding",
+                ctx.expr_range(callee),
+            );
+        }
     }
 
     fn check_overloaded_add(
@@ -422,7 +884,11 @@ impl TypeChecker<'_> {
         let method = self.find_trait_impl_method(lhs_ty, trait_id, "add")?;
 
         let receiver = method.function.params.first()?;
-        let expected_receiver = self.lower_type_ref_with_params(&receiver.ty, &method.subst);
+        let expected_receiver = self.lower_type_ref_with_params_at(
+            &receiver.ty,
+            &method.subst,
+            Some(receiver.ty_range),
+        );
         let actual_receiver = self.receiver_argument_type(lhs_ty, &expected_receiver);
         self.expect_assignable(
             &expected_receiver,
@@ -443,7 +909,11 @@ impl TypeChecker<'_> {
             );
             return Some(Type::Error);
         };
-        let expected_rhs = self.lower_type_ref_with_params(&rhs_param.ty, &method.subst);
+        let expected_rhs = self.lower_type_ref_with_params_at(
+            &rhs_param.ty,
+            &method.subst,
+            Some(rhs_param.ty_range),
+        );
         let actual_rhs = self.check_expr_expected(ctx, rhs, &expected_rhs);
         self.expect_assignable(
             &expected_rhs,
@@ -464,7 +934,16 @@ impl TypeChecker<'_> {
                 .function
                 .ret_type
                 .as_ref()
-                .map(|ty| self.lower_type_ref_with_params(ty, &method.subst))
+                .map(|ty| {
+                    self.lower_type_ref_with_params_at(
+                        ty,
+                        &method.subst,
+                        method
+                            .function
+                            .ret_type_range
+                            .or(Some(method.function.name_range)),
+                    )
+                })
                 .unwrap_or(Type::Unit),
         )
     }
@@ -889,7 +1368,11 @@ impl TypeChecker<'_> {
                 );
                 continue;
             };
-            let pattern = self.lower_type_ref_with_params(&expected_field.ty, &generic_params);
+            let pattern = self.lower_type_ref_with_params_at(
+                &expected_field.ty,
+                &generic_params,
+                Some(expected_field.ty_range),
+            );
             let expected = substitute_type(&pattern, &subst);
             let actual = if expected.is_unknown_like() || expected_has_param(&expected) {
                 self.check_expr(ctx, field.value)
@@ -1140,7 +1623,11 @@ impl TypeChecker<'_> {
                     true
                 }
                 other => {
-                    let actual = self.lower_type_ref_with_params(other, &ctx.generic_params);
+                    let actual = self.lower_type_ref_with_params_at(
+                        other,
+                        &ctx.generic_params,
+                        next.ret_type_range.or(Some(next.name_range)),
+                    );
                     actual.is_unknown_like() || self.bound_types_match(item_ty, &actual)
                 }
             }
@@ -1181,7 +1668,15 @@ impl TypeChecker<'_> {
             .zip([item_ty.clone()])
             .map(|(name, ty)| (name.0.clone(), ty))
             .collect();
-        let payload_ty = self.lower_type_ref_with_params(&fields[0], &subst);
+        let payload_ty = self.lower_type_ref_with_params_at(
+            &fields[0],
+            &subst,
+            option.variants[some_variant]
+                .field_ranges
+                .first()
+                .copied()
+                .or(Some(option.variants[some_variant].name_range)),
+        );
         if !self.bound_types_match(item_ty, &payload_ty) {
             self.diagnostic(
                 "E0035",
@@ -1345,6 +1840,42 @@ impl TypeChecker<'_> {
         }
 
         let callee_ty = self.check_expr(ctx, callee);
+        if self
+            .result
+            .closure_kinds
+            .get(&(ctx.body_id, callee))
+            .is_some_and(|kind| *kind == ClosureKind::FnMut)
+        {
+            self.check_mutable_closure_binding(ctx, callee);
+        }
+        let resolved_callee = self.resolve_type(&callee_ty);
+        if let Type::Fn(params, ret) = resolved_callee {
+            if args.len() != params.len() {
+                self.diagnostic(
+                    "E0005",
+                    format!(
+                        "function value expects {} argument(s), got {}",
+                        params.len(),
+                        args.len()
+                    ),
+                    span,
+                );
+            }
+            for (index, arg) in args.iter().enumerate() {
+                if let Some(param) = params.get(index) {
+                    let actual = self.check_expr_expected(ctx, *arg, param);
+                    self.expect_assignable(
+                        param,
+                        &actual,
+                        "function argument",
+                        ctx.expr_range(*arg),
+                    );
+                } else {
+                    self.check_expr(ctx, *arg);
+                }
+            }
+            return self.resolve_type(&ret);
+        }
         let Type::Function(fid) = callee_ty else {
             for arg in args {
                 self.check_expr(ctx, *arg);
@@ -1380,7 +1911,8 @@ impl TypeChecker<'_> {
 
         for (index, arg) in args.iter().enumerate() {
             if let Some(param) = function.params.get(index) {
-                let pattern = self.lower_type_ref_with_params(&param.ty, &params);
+                let pattern =
+                    self.lower_type_ref_with_params_at(&param.ty, &params, Some(param.ty_range));
                 let expected = substitute_type(&pattern, &subst);
                 let actual = if expected_has_param(&expected) {
                     self.check_expr(ctx, *arg)
@@ -1442,7 +1974,16 @@ impl TypeChecker<'_> {
         function
             .ret_type
             .as_ref()
-            .map(|ty| substitute_type(&self.lower_type_ref_with_params(ty, &params), &subst))
+            .map(|ty| {
+                substitute_type(
+                    &self.lower_type_ref_with_params_at(
+                        ty,
+                        &params,
+                        function.ret_type_range.or(Some(function.name_range)),
+                    ),
+                    &subst,
+                )
+            })
             .unwrap_or(Type::Unit)
     }
 
@@ -1511,7 +2052,15 @@ impl TypeChecker<'_> {
 
         for (index, arg) in args.iter().enumerate() {
             if let Some(field) = fields.get(index) {
-                let pattern = self.lower_type_ref_with_params(field, &params);
+                let pattern = self.lower_type_ref_with_params_at(
+                    field,
+                    &params,
+                    variant
+                        .field_ranges
+                        .get(index)
+                        .copied()
+                        .or(Some(variant.name_range)),
+                );
                 let expected = substitute_type(&pattern, &subst);
                 let actual = if expected_has_param(&expected) {
                     self.check_expr(ctx, *arg)
@@ -1565,7 +2114,11 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) {
         for bound in &function.generic_bounds {
-            let actual = self.lower_type_ref_with_params(&bound.target_ty, subst);
+            let actual = self.lower_type_ref_with_params_at(
+                &bound.target_ty,
+                subst,
+                Some(bound.target_range),
+            );
             if actual.is_unknown_like() {
                 continue;
             }
@@ -1576,7 +2129,7 @@ impl TypeChecker<'_> {
                         "generic bound references unknown trait `{}`",
                         bound.trait_ty.display()
                     ),
-                    span,
+                    Some(bound.trait_range),
                 );
                 continue;
             };
@@ -1621,6 +2174,12 @@ impl TypeChecker<'_> {
                     self.check_type_bounds_inner(ctx, element, span);
                 }
             }
+            Type::Fn(params, ret) => {
+                for param in params {
+                    self.check_type_bounds_inner(ctx, param, span);
+                }
+                self.check_type_bounds_inner(ctx, ret, span);
+            }
             Type::Struct(struct_id, args) => {
                 for arg in args {
                     self.check_type_bounds_inner(ctx, arg, span);
@@ -1662,6 +2221,7 @@ impl TypeChecker<'_> {
             | Type::Error
             | Type::InferInt
             | Type::InferFloat
+            | Type::InferVar(_)
             | Type::Int(_)
             | Type::Float(_)
             | Type::Bool
@@ -1681,7 +2241,11 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) {
         for bound in bounds {
-            let actual = self.lower_type_ref_with_params(&bound.target_ty, subst);
+            let actual = self.lower_type_ref_with_params_at(
+                &bound.target_ty,
+                subst,
+                Some(bound.target_range),
+            );
             if actual.is_unknown_like() {
                 continue;
             }
@@ -1692,7 +2256,7 @@ impl TypeChecker<'_> {
                         "generic bound references unknown trait `{}`",
                         bound.trait_ty.display()
                     ),
-                    span,
+                    Some(bound.trait_range),
                 );
                 continue;
             };
@@ -1806,7 +2370,8 @@ impl TypeChecker<'_> {
                 return false;
             }
             required_assoc.iter().all(|required| {
-                let expected = self.lower_type_ref_with_params(&required.ty, subst);
+                let expected =
+                    self.lower_type_ref_with_params_at(&required.ty, subst, Some(required.range));
                 self.bound_assoc_type(ctx, &bound, &required.name.0)
                     .map(|actual| self.bound_types_match(&expected, &actual))
                     .unwrap_or(false)
@@ -1822,7 +2387,8 @@ impl TypeChecker<'_> {
         subst: &HashMap<String, Type>,
     ) -> bool {
         assoc_constraints.iter().all(|constraint| {
-            let expected = self.lower_type_ref_with_params(&constraint.ty, subst);
+            let expected =
+                self.lower_type_ref_with_params_at(&constraint.ty, subst, Some(constraint.range));
             self.result
                 .trait_env
                 .associated_type(actual, trait_id, &constraint.name.0)
@@ -1837,7 +2403,11 @@ impl TypeChecker<'_> {
         subst: &HashMap<String, Type>,
     ) -> bool {
         imp.generic_bounds.iter().all(|bound| {
-            let actual = self.lower_type_ref_with_params(&bound.target_ty, subst);
+            let actual = self.lower_type_ref_with_params_at(
+                &bound.target_ty,
+                subst,
+                Some(bound.target_range),
+            );
             let Some(trait_id) = self.resolve_trait_ref(&bound.trait_ty) else {
                 return false;
             };
@@ -1856,7 +2426,13 @@ impl TypeChecker<'_> {
             .assoc_constraints
             .iter()
             .find(|constraint| constraint.name.0 == name)
-            .map(|constraint| self.lower_type_ref_with_params(&constraint.ty, &ctx.generic_params))
+            .map(|constraint| {
+                self.lower_type_ref_with_params_at(
+                    &constraint.ty,
+                    &ctx.generic_params,
+                    Some(constraint.range),
+                )
+            })
     }
 
     fn trait_implies(
@@ -1962,7 +2538,11 @@ impl TypeChecker<'_> {
         }
 
         if let Some(receiver) = method.function.params.first() {
-            let expected = self.lower_type_ref_with_params(&receiver.ty, &method.subst);
+            let expected = self.lower_type_ref_with_params_at(
+                &receiver.ty,
+                &method.subst,
+                Some(receiver.ty_range),
+            );
             let actual = self.receiver_argument_type(&base_ty, &expected);
             if matches!(expected, Type::Ref(_, true)) {
                 self.check_assign_mut(ctx, base, ctx.expr_range(base));
@@ -1972,7 +2552,11 @@ impl TypeChecker<'_> {
 
         for (index, arg) in args.iter().enumerate() {
             if let Some(param) = method.function.params.get(index + receiver_count) {
-                let expected = self.lower_type_ref_with_params(&param.ty, &method.subst);
+                let expected = self.lower_type_ref_with_params_at(
+                    &param.ty,
+                    &method.subst,
+                    Some(param.ty_range),
+                );
                 let actual = self.check_expr_expected(ctx, *arg, &expected);
                 self.expect_assignable(&expected, &actual, "method argument", ctx.expr_range(*arg));
             } else {
@@ -1984,7 +2568,16 @@ impl TypeChecker<'_> {
             .function
             .ret_type
             .as_ref()
-            .map(|ty| self.lower_type_ref_with_params(ty, &method.subst))
+            .map(|ty| {
+                self.lower_type_ref_with_params_at(
+                    ty,
+                    &method.subst,
+                    method
+                        .function
+                        .ret_type_range
+                        .or(Some(method.function.name_range)),
+                )
+            })
             .unwrap_or(Type::Unit)
     }
 
@@ -2237,7 +2830,12 @@ impl TypeChecker<'_> {
     }
 
     /// Check that the LHS of an assignment targets a mutable binding.
-    fn check_assign_mut(&mut self, ctx: &BodyCtx<'_>, lhs: ExprId, span: Option<rowan::TextRange>) {
+    fn check_assign_mut(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        lhs: ExprId,
+        span: Option<rowan::TextRange>,
+    ) {
         if let Expr::Unary {
             operand,
             op: UnaryOp::Deref,
@@ -2255,6 +2853,7 @@ impl TypeChecker<'_> {
             }
             return;
         }
+        self.record_capture_use(ctx, lhs, CaptureMode::Mutable);
         if let Expr::Path { path, .. } = &ctx.body.exprs[lhs]
             && let Some(name) = path.as_single_name()
             && ctx.bindings.get(&name.0).is_some()
@@ -2281,6 +2880,16 @@ impl TypeChecker<'_> {
                 ),
                 span,
             );
+            return;
+        }
+        if matches!(
+            &ctx.body.exprs[lhs],
+            Expr::Path {
+                resolved: Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }),
+                ..
+            }
+        ) {
+            self.diagnostic("E0031", "cannot assign to an immutable parameter", span);
         }
     }
 
@@ -2311,7 +2920,7 @@ impl TypeChecker<'_> {
         match pattern {
             Pattern::Wildcard => {}
             Pattern::Literal(literal) => {
-                let literal_ty = self.literal_pattern_type(&literal, Some(expected));
+                let literal_ty = self.literal_pattern_type(&literal, Some(expected), span);
                 self.expect_assignable(expected, &literal_ty, "literal pattern", span);
                 if let LiteralPattern::Int {
                     value, valid: true, ..
@@ -2391,13 +3000,18 @@ impl TypeChecker<'_> {
         }
     }
 
-    fn literal_pattern_type(&mut self, literal: &LiteralPattern, expected: Option<&Type>) -> Type {
+    fn literal_pattern_type(
+        &mut self,
+        literal: &LiteralPattern,
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
         match literal {
             LiteralPattern::Int { suffix, .. } => {
-                self.int_literal_type(suffix.as_deref(), expected)
+                self.int_literal_type(suffix.as_deref(), expected, span)
             }
             LiteralPattern::Float { suffix, .. } => {
-                self.float_literal_type(suffix.as_deref(), expected)
+                self.float_literal_type(suffix.as_deref(), expected, span)
             }
             LiteralPattern::String(_) => Type::Ref(Box::new(Type::Str), false),
             LiteralPattern::Char(_) => Type::Char,
@@ -2507,7 +3121,17 @@ impl TypeChecker<'_> {
         for (index, element) in elements.iter().enumerate() {
             let ty = items
                 .get(index)
-                .map(|ty| self.lower_type_ref_with_params(ty, &subst))
+                .map(|ty| {
+                    self.lower_type_ref_with_params_at(
+                        ty,
+                        &subst,
+                        variant
+                            .field_ranges
+                            .get(index)
+                            .copied()
+                            .or(Some(variant.name_range)),
+                    )
+                })
                 .unwrap_or(Type::Unknown);
             self.bind_pattern(ctx, *element, &ty);
         }
@@ -2564,7 +3188,7 @@ impl TypeChecker<'_> {
                     );
                     continue;
                 };
-                let ty = self.lower_type_ref_with_params(&item.ty, &subst);
+                let ty = self.lower_type_ref_with_params_at(&item.ty, &subst, Some(item.ty_range));
                 if let Some(pat) = field.pat {
                     self.bind_pattern(ctx, pat, &ty);
                 } else {
@@ -2632,7 +3256,7 @@ impl TypeChecker<'_> {
                 );
                 continue;
             };
-            let ty = self.lower_type_ref_with_params(&item.ty, &subst);
+            let ty = self.lower_type_ref_with_params_at(&item.ty, &subst, Some(item.ty_range));
             if let Some(pat) = field.pat {
                 self.bind_pattern(ctx, pat, &ty);
             } else {
@@ -2656,13 +3280,27 @@ impl TypeChecker<'_> {
                 .function
                 .params
                 .get(*index)
-                .map(|param| self.lower_type_ref_with_params(&param.ty, &ctx.generic_params))
+                .map(|param| {
+                    self.lower_type_ref_with_params_at(
+                        &param.ty,
+                        &ctx.generic_params,
+                        Some(param.ty_range),
+                    )
+                })
+                .unwrap_or(Type::Unknown),
+            Some(ResolvedName::LambdaParam { lambda, index }) => ctx
+                .lambdas
+                .iter()
+                .rev()
+                .find(|current| current.expr == *lambda)
+                .and_then(|current| current.params.get(*index))
+                .cloned()
                 .unwrap_or(Type::Unknown),
             Some(ResolvedName::Function(fid)) => Type::Function(*fid),
             Some(ResolvedName::Struct(sid)) => Type::Struct(*sid, Vec::new()),
             Some(ResolvedName::Const(cid)) => {
                 let konst = &self.hir.item_tree.consts[*cid];
-                self.lower_type_ref(&konst.ty)
+                self.lower_type_ref_with_params_at(&konst.ty, &HashMap::new(), Some(konst.ty_range))
             }
             Some(ResolvedName::TypeAlias(tid)) => self.lower_type_alias(*tid),
             Some(ResolvedName::Unresolved) | None => Type::Unknown,
@@ -2688,6 +3326,7 @@ fn expected_has_param(ty: &Type) -> bool {
         Type::Tuple(elements) => elements.iter().any(expected_has_param),
         Type::Array(inner, len) => expected_has_param(inner) || const_has_param(len),
         Type::Struct(_, args) | Type::Enum(_, args) => args.iter().any(expected_has_param),
+        Type::Fn(params, ret) => params.iter().any(expected_has_param) || expected_has_param(ret),
         _ => false,
     }
 }
@@ -2732,6 +3371,12 @@ fn type_contains_unresolved_const_param(ty: &Type, params: &HashMap<String, Type
         Type::Struct(_, args) | Type::Enum(_, args) => args
             .iter()
             .any(|arg| type_contains_unresolved_const_param(arg, params)),
+        Type::Fn(fn_params, ret) => {
+            fn_params
+                .iter()
+                .any(|arg| type_contains_unresolved_const_param(arg, params))
+                || type_contains_unresolved_const_param(ret, params)
+        }
         _ => false,
     }
 }
@@ -2747,6 +3392,9 @@ fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
         HirTypeRef::Tuple(elements) => elements.iter().any(type_ref_contains_error),
         HirTypeRef::Named(path) => path.type_args.iter().any(type_ref_contains_error),
         HirTypeRef::Const(value) => matches!(value, hir::item_tree::HirConstArg::Error),
+        HirTypeRef::Function { params, ret } => {
+            params.iter().any(type_ref_contains_error) || type_ref_contains_error(ret)
+        }
         HirTypeRef::Unknown => false,
     }
 }

@@ -58,14 +58,15 @@ impl TypeChecker<'_> {
                 imp.generics.iter().map(|name| name.0.as_str()),
                 imp.const_generics.iter().map(|name| name.0.as_str()),
             );
-            let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
+            let self_ty =
+                self.lower_type_ref_with_params_at(&imp.self_ty, &params, Some(imp.self_ty_range));
             let bounds = self.lower_trait_env_bounds(&imp.generic_bounds, &params);
             let self_ty_text = self_ty.display(self.hir);
             let Some(fields) = self.copy_impl_fields(&self_ty) else {
                 self.diagnostic(
                     "E0041",
                     format!("`Copy` cannot be implemented for `{self_ty_text}`"),
-                    None,
+                    Some(imp.self_ty_range),
                 );
                 continue;
             };
@@ -86,7 +87,7 @@ impl TypeChecker<'_> {
                         "`Copy` impl for `{self_ty_text}` has non-Copy field(s): {}",
                         non_copy.join(", ")
                     ),
-                    None,
+                    Some(imp.self_ty_range),
                 );
             }
         }
@@ -110,7 +111,11 @@ impl TypeChecker<'_> {
                         .map(|field| {
                             (
                                 field.name.0.clone(),
-                                self.lower_type_ref_with_params(&field.ty, &subst),
+                                self.lower_type_ref_with_params_at(
+                                    &field.ty,
+                                    &subst,
+                                    Some(field.ty_range),
+                                ),
                             )
                         })
                         .collect(),
@@ -133,7 +138,15 @@ impl TypeChecker<'_> {
                             fields.extend(items.iter().enumerate().map(|(index, item)| {
                                 (
                                     format!("{}.{index}", variant.name.0),
-                                    self.lower_type_ref_with_params(item, &subst),
+                                    self.lower_type_ref_with_params_at(
+                                        item,
+                                        &subst,
+                                        variant
+                                            .field_ranges
+                                            .get(index)
+                                            .copied()
+                                            .or(Some(variant.name_range)),
+                                    ),
                                 )
                             }));
                         }
@@ -141,7 +154,11 @@ impl TypeChecker<'_> {
                             fields.extend(items.iter().map(|item| {
                                 (
                                     format!("{}.{}", variant.name.0, item.name.0),
-                                    self.lower_type_ref_with_params(&item.ty, &subst),
+                                    self.lower_type_ref_with_params_at(
+                                        &item.ty,
+                                        &subst,
+                                        Some(item.ty_range),
+                                    ),
                                 )
                             }));
                         }
@@ -172,7 +189,7 @@ impl TypeChecker<'_> {
                         "trait `{}` has duplicate method `{}`",
                         tr.name.0, method.name.0
                     ),
-                    None,
+                    Some(method.name_range),
                 );
             }
 
@@ -183,7 +200,7 @@ impl TypeChecker<'_> {
                         "trait method `{}::{}` must not have a body",
                         tr.name.0, method.name.0
                     ),
-                    None,
+                    Some(method.name_range),
                 );
             }
         }
@@ -197,7 +214,7 @@ impl TypeChecker<'_> {
                         "trait `{}` has duplicate associated type `{}`",
                         tr.name.0, assoc.name.0
                     ),
-                    None,
+                    Some(assoc.name_range),
                 );
             }
         }
@@ -219,7 +236,7 @@ impl TypeChecker<'_> {
                     self_ty_text,
                     self.type_ref_source_text(trait_ty)
                 ),
-                None,
+                imp.trait_ty_range.or(Some(imp.self_ty_range)),
             );
             return;
         };
@@ -227,7 +244,7 @@ impl TypeChecker<'_> {
         let tr = self.hir.item_tree.traits[trait_id].clone();
         self.check_impl_paterson(imp, &self_ty_text);
         self.check_trait_impl(&self_ty_text, &tr, imp);
-        self.check_lang_trait_dependencies(&self_ty_text, trait_id);
+        self.check_lang_trait_dependencies(&self_ty_text, trait_id, imp.self_ty_range);
     }
 
     fn check_impl_paterson(&mut self, imp: &HirImpl, self_ty_text: &str) {
@@ -250,7 +267,7 @@ impl TypeChecker<'_> {
                     self.type_ref_source_text(&bound.target_ty),
                     self_ty_text
                 ),
-                None,
+                Some(bound.trait_range),
             );
         }
     }
@@ -268,7 +285,7 @@ impl TypeChecker<'_> {
                         "impl for `{}` has duplicate method `{}`",
                         impl_name, method.name.0
                     ),
-                    None,
+                    Some(method.name_range),
                 );
             }
         }
@@ -283,7 +300,7 @@ impl TypeChecker<'_> {
                         "impl for `{}` has duplicate associated type `{}`",
                         impl_name, assoc.name.0
                     ),
-                    None,
+                    Some(assoc.name_range),
                 );
             }
         }
@@ -304,7 +321,7 @@ impl TypeChecker<'_> {
                         "impl for `{}` of trait `{}` missing method `{}`",
                         self_ty_text, tr.name.0, required.name.0
                     ),
-                    None,
+                    Some(imp.self_ty_range),
                 );
                 continue;
             };
@@ -330,7 +347,7 @@ impl TypeChecker<'_> {
                         "impl for `{}` of trait `{}` missing associated type `{}`",
                         self_ty_text, tr.name.0, required.name.0
                     ),
-                    None,
+                    Some(imp.self_ty_range),
                 );
             }
         }
@@ -340,6 +357,7 @@ impl TypeChecker<'_> {
         &mut self,
         self_ty_text: &str,
         trait_id: hir::item_tree::TraitId,
+        span: rowan::TextRange,
     ) {
         let Some(lang) = self.trait_lang(trait_id).map(str::to_string) else {
             return;
@@ -359,7 +377,7 @@ impl TypeChecker<'_> {
                         "impl `{}` for `{}` requires `{}`",
                         self.hir.item_tree.traits[trait_id].name.0, self_ty_text, required_name
                     ),
-                    None,
+                    Some(span),
                 );
             }
         }
@@ -396,7 +414,8 @@ impl TypeChecker<'_> {
             imp.generics.iter().map(|name| name.0.as_str()),
             imp.const_generics.iter().map(|name| name.0.as_str()),
         );
-        let self_ty = self.lower_type_ref_with_params(&imp.self_ty, &params);
+        let self_ty =
+            self.lower_type_ref_with_params_at(&imp.self_ty, &params, Some(imp.self_ty_range));
         params.insert("Self".into(), self_ty);
 
         if expected.params.len() != actual.params.len() {
@@ -409,7 +428,7 @@ impl TypeChecker<'_> {
                     expected.params.len(),
                     actual.params.len()
                 ),
-                None,
+                Some(actual.name_range),
             );
         }
 
@@ -418,8 +437,16 @@ impl TypeChecker<'_> {
                 continue;
             };
 
-            let expected_ty = self.lower_type_ref_with_params(&expected_param.ty, &params);
-            let actual_ty = self.lower_type_ref_with_params(&actual_param.ty, &params);
+            let expected_ty = self.lower_type_ref_with_params_at(
+                &expected_param.ty,
+                &params,
+                Some(expected_param.ty_range),
+            );
+            let actual_ty = self.lower_type_ref_with_params_at(
+                &actual_param.ty,
+                &params,
+                Some(actual_param.ty_range),
+            );
             if !self.signature_types_match(&expected_ty, &actual_ty) {
                 self.diagnostic(
                     "E0029",
@@ -431,7 +458,7 @@ impl TypeChecker<'_> {
                         expected_ty.display(self.hir),
                         actual_ty.display(self.hir)
                     ),
-                    None,
+                    Some(actual_param.ty_range),
                 );
             }
         }
@@ -439,12 +466,24 @@ impl TypeChecker<'_> {
         let expected_ret = expected
             .ret_type
             .as_ref()
-            .map(|ty| self.lower_type_ref_with_params(ty, &params))
+            .map(|ty| {
+                self.lower_type_ref_with_params_at(
+                    ty,
+                    &params,
+                    expected.ret_type_range.or(Some(expected.name_range)),
+                )
+            })
             .unwrap_or(Type::Unit);
         let actual_ret = actual
             .ret_type
             .as_ref()
-            .map(|ty| self.lower_type_ref_with_params(ty, &params))
+            .map(|ty| {
+                self.lower_type_ref_with_params_at(
+                    ty,
+                    &params,
+                    actual.ret_type_range.or(Some(actual.name_range)),
+                )
+            })
             .unwrap_or(Type::Unit);
         if !self.signature_types_match(&expected_ret, &actual_ret) {
             self.diagnostic(
@@ -456,7 +495,7 @@ impl TypeChecker<'_> {
                     expected_ret.display(self.hir),
                     actual_ret.display(self.hir)
                 ),
-                None,
+                actual.ret_type_range.or(Some(actual.name_range)),
             );
         }
     }
@@ -491,6 +530,14 @@ impl TypeChecker<'_> {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", self.type_ref_source_text(inner))
             }
+            HirTypeRef::Function { params, ret } => {
+                let params = params
+                    .iter()
+                    .map(|param| self.type_ref_source_text(param))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("fun({params}) -> {}", self.type_ref_source_text(ret))
+            }
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
         }
@@ -524,6 +571,7 @@ fn type_ref_size(ty: &HirTypeRef, generics: &HashSet<&str>) -> usize {
                 .sum::<usize>()
         }
         HirTypeRef::Array(inner, _) => 1 + type_ref_size(inner, generics),
+        HirTypeRef::Function { .. } => 1,
         HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => 0,
     }
 }

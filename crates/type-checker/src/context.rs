@@ -1,12 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hir::{
-    body::{Body, BodyId, SourceMap, StmtId},
+    body::{Body, BodyId, ExprId, SourceMap, StmtId},
     item_tree::{FunctionId, HirFunction},
 };
 use rowan::TextRange;
 
-use crate::types::Type;
+use crate::{
+    result::{ClosureKind, LambdaCapture},
+    types::Type,
+};
 
 pub(crate) struct BodyCtx<'a> {
     pub(crate) body_id: BodyId,
@@ -16,8 +19,10 @@ pub(crate) struct BodyCtx<'a> {
     pub(crate) return_ty: Type,
     pub(crate) generic_params: HashMap<String, Type>,
     pub(crate) locals: HashMap<StmtId, (Type, bool)>,
+    pub(crate) local_closures: HashMap<StmtId, ClosureKind>,
     pub(crate) bindings: ScopedBindings,
     pub(crate) loop_depth: usize,
+    pub(crate) lambdas: Vec<LambdaCtx>,
     source_map: &'a SourceMap,
 }
 
@@ -38,8 +43,10 @@ impl<'a> BodyCtx<'a> {
             return_ty,
             generic_params,
             locals: HashMap::new(),
+            local_closures: HashMap::new(),
             bindings: ScopedBindings::default(),
             loop_depth: 0,
+            lambdas: Vec::new(),
             source_map: &body.source_map,
         }
     }
@@ -63,6 +70,14 @@ impl<'a> BodyCtx<'a> {
     pub(crate) fn pat_range(&self, id: hir::body::PatId) -> Option<TextRange> {
         self.source_map.pat_ranges.get(&id).copied()
     }
+}
+
+pub(crate) struct LambdaCtx {
+    pub(crate) expr: ExprId,
+    pub(crate) params: Vec<Type>,
+    pub(crate) outer_locals: HashSet<StmtId>,
+    pub(crate) binding_depth: usize,
+    pub(crate) captures: Vec<LambdaCapture>,
 }
 
 /// Scoped name → type bindings (from `match` patterns, `if let`, etc.).
@@ -89,5 +104,18 @@ impl ScopedBindings {
 
     pub(crate) fn get(&self, name: &str) -> Option<&Type> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    pub(crate) fn is_before(&self, name: &str, depth: usize) -> bool {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
+            .is_some_and(|index| index < depth)
     }
 }

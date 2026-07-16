@@ -89,12 +89,41 @@ fn generated_c_with_gc_and_loop_control_compiles_and_runs() {
     fs::write(
         project.join("src/main.rid"),
         r#"struct Data { value: i32 }
+struct Token { value: i32 }
 
 extern "C" fun rgc_collect();
 
 fun escaped(value: i32) -> &Data {
     let local = Data { value };
     &local
+}
+
+fun take(token: Token) -> i32 { token.value }
+
+fun make_adder(base: i32) -> fun(i32) -> i32 {
+    fun(value: i32) { base + value }
+}
+
+fun mutable_capture() -> i32 {
+    let mut total = 0;
+    let mut add = fun(value: i32) -> i32 {
+        total += value;
+        total
+    };
+    add(1);
+    add(2)
+}
+
+fun value_capture() -> i32 {
+    let token = Token { value: 7 };
+    let consume = fun() { take(token) };
+    consume()
+}
+
+fun nested(base: i32) -> fun(i32) -> fun(i32) -> i32 {
+    fun(first: i32) {
+        fun(second: i32) { base + first + second }
+    }
 }
 
 fun main() -> i32 {
@@ -115,7 +144,12 @@ fun main() -> i32 {
         if value == 5 { break; }
         for_sum += value;
     }
-    if (*first).value == 42 && (*second).value == 7 && while_sum == 8 && for_sum == 8 {
+    let add = make_adder(40);
+    let outer = nested(10);
+    let inner = outer(20);
+    if (*first).value == 42 && (*second).value == 7 && while_sum == 8 && for_sum == 8
+        && add(2) == 42 && mutable_capture() == 3 && value_capture() == 7
+        && inner(12) == 42 {
         0
     } else {
         1

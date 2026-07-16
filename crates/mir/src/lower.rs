@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use escape_analysis::EscapeResult;
 use hir::{
@@ -8,7 +9,7 @@ use hir::{
         ResolvedName, Stmt, StmtId, UnaryOp as HirUnOp,
     },
 };
-use type_checker::TypeCheckResult;
+use type_checker::{CaptureMode, CaptureSource, LambdaInfo, TypeCheckResult};
 
 use crate::builder::Builder;
 use crate::func::Function;
@@ -36,7 +37,7 @@ pub fn lower_hir(
         current_body: None,
         current_function: None,
         scope_map: HashMap::new(),
-        mut_bindings: HashSet::new(),
+        storage_bindings: HashSet::new(),
         pattern_bindings: Vec::new(),
         generic_subst: HashMap::new(),
         generic_tc_subst: HashMap::new(),
@@ -44,6 +45,11 @@ pub fn lower_hir(
         mono_functions: HashMap::new(),
         mono_methods: HashMap::new(),
         loop_targets: Vec::new(),
+        lambda_functions: HashMap::new(),
+        function_adapters: HashMap::new(),
+        capture_access: HashMap::new(),
+        current_lambda: None,
+        lambda_counter: 0,
     };
 
     // 遍历所有有函数体的函数
@@ -101,9 +107,8 @@ struct LowerCtx<'a> {
     current_function: Option<hir::item_tree::FunctionId>,
     /// Maps let-bound StmtId → Value for local variable resolution.
     scope_map: HashMap<StmtId, Value>,
-    /// StmtIds of `mut` bindings — their Value is a storage location (Alloca),
-    /// so Path resolution must emit a Load to read the current value.
-    mut_bindings: HashSet<StmtId>,
+    /// StmtIds backed by storage rather than a direct SSA value.
+    storage_bindings: HashSet<StmtId>,
     pattern_bindings: Vec<HashMap<String, Value>>,
     generic_subst: HashMap<String, Type>,
     generic_tc_subst: HashMap<String, type_checker::Type>,
@@ -111,6 +116,17 @@ struct LowerCtx<'a> {
     mono_functions: HashMap<(hir::item_tree::FunctionId, String), String>,
     mono_methods: HashMap<(hir::item_tree::FunctionId, String), String>,
     loop_targets: Vec<LoopTargets>,
+    lambda_functions: HashMap<(BodyId, ExprId), String>,
+    function_adapters: HashMap<hir::item_tree::FunctionId, String>,
+    capture_access: HashMap<CaptureSource, CaptureAccess>,
+    current_lambda: Option<ExprId>,
+    lambda_counter: u32,
+}
+
+#[derive(Clone)]
+struct CaptureAccess {
+    place: Value,
+    ty: Type,
 }
 
 #[derive(Clone, Copy)]
@@ -145,8 +161,10 @@ impl<'a> LowerCtx<'a> {
         let body = &self.hir.bodies[body_id];
         self.expr_cache.clear();
         self.scope_map.clear();
-        self.mut_bindings.clear();
+        self.storage_bindings.clear();
         self.pattern_bindings.clear();
+        self.capture_access.clear();
+        self.current_lambda = None;
         self.current_body = Some(body_id);
         let old_current_function = self.current_function;
         let old_generic_subst = self.generic_subst.clone();
@@ -202,6 +220,306 @@ impl<'a> LowerCtx<'a> {
         func
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn lower_lambda(
+        &mut self,
+        builder: &mut Builder,
+        outer_params: &[Value],
+        body_id: BodyId,
+        expr_id: ExprId,
+        params: &[hir::body::LambdaParam],
+        lambda_body: ExprId,
+        ty: &Type,
+    ) -> Value {
+        let Some(call_signature) = closure_call_signature(ty) else {
+            return builder.unit_const();
+        };
+        let info = self
+            .type_result
+            .lambda_infos
+            .get(&(body_id, expr_id))
+            .cloned()
+            .unwrap_or(LambdaInfo {
+                captures: Vec::new(),
+                kind: type_checker::ClosureKind::Fn,
+            });
+        let (name, needs_lowering) = match self.lambda_functions.get(&(body_id, expr_id)) {
+            Some(name) => (name.clone(), false),
+            None => {
+                self.lambda_counter += 1;
+                let name = format!("__riddle_lambda_{}", self.lambda_counter);
+                self.lambda_functions
+                    .insert((body_id, expr_id), name.clone());
+                (name, true)
+            }
+        };
+        let capture_types = info
+            .captures
+            .iter()
+            .map(|capture| self.convert_type(&capture.ty))
+            .collect::<Vec<_>>();
+        let env_struct = StructType {
+            name: format!("{}_env", name),
+            fields: info
+                .captures
+                .iter()
+                .zip(&capture_types)
+                .enumerate()
+                .map(|(index, (capture, ty))| {
+                    let field_ty = match capture.mode {
+                        CaptureMode::Shared | CaptureMode::Mutable => {
+                            Type::Ptr(Box::new(ty.clone()))
+                        }
+                        CaptureMode::Value => ty.clone(),
+                    };
+                    (format!("capture_{}_{}", index, capture.name), field_ty)
+                })
+                .collect(),
+        };
+
+        let env_value = if info.captures.is_empty() {
+            self.null_env(builder)
+        } else {
+            // ponytail: closure environments always use the GC heap; add stack
+            // promotion only when escape-analysis data shows it matters.
+            let env_ty = Type::Struct(env_struct.clone());
+            let env_ptr = builder.heap_alloc(env_ty);
+            for (index, (capture, capture_ty)) in
+                info.captures.iter().zip(&capture_types).enumerate()
+            {
+                let field_ty = env_struct.fields[index].1.clone();
+                let value = match capture.mode {
+                    CaptureMode::Shared | CaptureMode::Mutable => {
+                        self.capture_place(builder, outer_params, &capture.source, capture_ty)
+                    }
+                    CaptureMode::Value => {
+                        self.capture_value(builder, outer_params, &capture.source, capture_ty)
+                    }
+                };
+                let field = builder.field_ptr(env_ptr, index, field_ty);
+                builder.store(value, field);
+            }
+            builder.cast(CastOp::PtrToPtr, env_ptr, closure_env_type())
+        };
+
+        if needs_lowering {
+            self.lower_lambda_function(
+                body_id,
+                expr_id,
+                params,
+                lambda_body,
+                &name,
+                &call_signature,
+                &info,
+                &capture_types,
+                &env_struct,
+            );
+        }
+
+        let call = builder.function_ref(FuncRef::Local(name), Type::FnPtr(call_signature));
+        builder.struct_value(vec![call, env_value], ty.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_lambda_function(
+        &mut self,
+        body_id: BodyId,
+        expr_id: ExprId,
+        params: &[hir::body::LambdaParam],
+        lambda_body: ExprId,
+        name: &str,
+        call_signature: &FnPtrType,
+        info: &LambdaInfo,
+        capture_types: &[Type],
+        env_struct: &StructType,
+    ) {
+        let body = &self.hir.bodies[body_id];
+        let old_expr_cache = std::mem::take(&mut self.expr_cache);
+        let old_scope_map = std::mem::take(&mut self.scope_map);
+        let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
+        let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
+        let old_loop_targets = std::mem::take(&mut self.loop_targets);
+        let old_capture_access = std::mem::take(&mut self.capture_access);
+        let old_current_lambda = self.current_lambda.replace(expr_id);
+        let old_current_body = self.current_body.replace(body_id);
+
+        let mut function = Function::new(name.to_string(), (*call_signature.ret).clone());
+        let env_param = function.add_param("__env".into(), closure_env_type());
+        let param_values = params
+            .iter()
+            .zip(call_signature.params.iter().skip(1))
+            .map(|(param, ty)| function.add_param(param.name.0.clone(), ty.clone()))
+            .collect::<Vec<_>>();
+        function.blocks[function.entry].start_value = function.next_value;
+        let is_unit = matches!(function.ret_type, Type::Unit | Type::Never);
+        {
+            let mut lambda_builder = Builder::new(&mut function);
+            if !info.captures.is_empty() {
+                let env_ptr_ty = Type::Ptr(Box::new(Type::Struct(env_struct.clone())));
+                let env_ptr = lambda_builder.cast(CastOp::PtrToPtr, env_param, env_ptr_ty.clone());
+                for (index, (capture, capture_ty)) in
+                    info.captures.iter().zip(capture_types).enumerate()
+                {
+                    let field_ty = env_struct.fields[index].1.clone();
+                    let field = lambda_builder.field_ptr(env_ptr, index, field_ty.clone());
+                    let place = match capture.mode {
+                        CaptureMode::Shared | CaptureMode::Mutable => {
+                            lambda_builder.load(field, field_ty)
+                        }
+                        CaptureMode::Value => field,
+                    };
+                    self.capture_access.insert(
+                        capture.source.clone(),
+                        CaptureAccess {
+                            place,
+                            ty: capture_ty.clone(),
+                        },
+                    );
+                }
+            }
+            let result = self.lower_expr(&mut lambda_builder, &param_values, body, lambda_body);
+            if lambda_builder.needs_return() {
+                lambda_builder.set_return((!is_unit).then_some(result));
+            }
+        }
+        self.module.add_function(function);
+
+        self.expr_cache = old_expr_cache;
+        self.scope_map = old_scope_map;
+        self.storage_bindings = old_storage_bindings;
+        self.pattern_bindings = old_pattern_bindings;
+        self.loop_targets = old_loop_targets;
+        self.capture_access = old_capture_access;
+        self.current_lambda = old_current_lambda;
+        self.current_body = old_current_body;
+    }
+
+    fn capture_value(
+        &mut self,
+        builder: &mut Builder,
+        params: &[Value],
+        source: &CaptureSource,
+        ty: &Type,
+    ) -> Value {
+        if let Some(access) = self.capture_access.get(source).cloned() {
+            return builder.load(access.place, access.ty);
+        }
+        match source {
+            CaptureSource::Local(stmt) => {
+                let value = self
+                    .scope_map
+                    .get(stmt)
+                    .copied()
+                    .unwrap_or_else(|| builder.unit_const());
+                if self.storage_bindings.contains(stmt) {
+                    builder.load(value, ty.clone())
+                } else {
+                    value
+                }
+            }
+            CaptureSource::Param(index) => params
+                .get(*index)
+                .copied()
+                .unwrap_or_else(|| builder.unit_const()),
+            CaptureSource::LambdaParam { lambda, index }
+                if self.current_lambda == Some(*lambda) =>
+            {
+                params
+                    .get(*index)
+                    .copied()
+                    .unwrap_or_else(|| builder.unit_const())
+            }
+            CaptureSource::LambdaParam { .. } => builder.unit_const(),
+        }
+    }
+
+    fn capture_place(
+        &mut self,
+        builder: &mut Builder,
+        params: &[Value],
+        source: &CaptureSource,
+        ty: &Type,
+    ) -> Value {
+        if let Some(access) = self.capture_access.get(source) {
+            return access.place;
+        }
+        if let CaptureSource::Local(stmt) = source
+            && self.storage_bindings.contains(stmt)
+            && let Some(place) = self.scope_map.get(stmt)
+        {
+            return *place;
+        }
+        let value = self.capture_value(builder, params, source, ty);
+        let place = builder.heap_alloc(ty.clone());
+        builder.store(value, place);
+        place
+    }
+
+    fn null_env(&self, builder: &mut Builder) -> Value {
+        let zero = builder.iconst(0, IntTy::Usize);
+        builder.cast(CastOp::IntToPtr, zero, closure_env_type())
+    }
+
+    fn lower_function_value(
+        &mut self,
+        builder: &mut Builder,
+        fid: hir::item_tree::FunctionId,
+        ty: &Type,
+    ) -> Value {
+        let Some(signature) = closure_call_signature(ty) else {
+            return builder.unit_const();
+        };
+        let adapter = if let Some(name) = self.function_adapters.get(&fid) {
+            name.clone()
+        } else {
+            let target = self.function_name(fid);
+            let name = format!("__riddle_fn_adapter_{}", target);
+            self.function_adapters.insert(fid, name.clone());
+
+            let mut function = Function::new(name.clone(), (*signature.ret).clone());
+            function.add_param("__env".into(), closure_env_type());
+            let parameter_names = self.hir.item_tree.functions[fid]
+                .params
+                .iter()
+                .map(|param| param.name.0.clone())
+                .collect::<Vec<_>>();
+            let arguments = signature
+                .params
+                .iter()
+                .skip(1)
+                .enumerate()
+                .map(|(index, param_ty)| {
+                    let param_name = parameter_names
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| format!("p{}", index));
+                    function.add_param(param_name, param_ty.clone())
+                })
+                .collect::<Vec<_>>();
+            function.blocks[function.entry].start_value = function.next_value;
+            let is_extern = self.hir.item_tree.extern_function_ids.contains(&fid)
+                && !self.hir.function_bodies.contains_key(&fid);
+            let target = if is_extern {
+                FuncRef::Extern(target)
+            } else {
+                FuncRef::Local(target)
+            };
+            {
+                let mut adapter_builder = Builder::new(&mut function);
+                let result = adapter_builder.call(target, arguments, (*signature.ret).clone());
+                adapter_builder.set_return(
+                    (!matches!(signature.ret.as_ref(), Type::Unit | Type::Never)).then_some(result),
+                );
+            }
+            self.module.add_function(function);
+            name
+        };
+
+        let call = builder.function_ref(FuncRef::Local(adapter), Type::FnPtr(signature));
+        let env = self.null_env(builder);
+        builder.struct_value(vec![call, env], ty.clone())
+    }
+
     // 表达式降级
 
     fn lower_expr(
@@ -247,23 +565,55 @@ impl<'a> LowerCtx<'a> {
 
             Expr::Path { path, resolved } => match resolved {
                 Some(ResolvedName::Local(stmt)) => {
+                    if let Some(access) = self
+                        .capture_access
+                        .get(&CaptureSource::Local(*stmt))
+                        .cloned()
+                    {
+                        return builder.load(access.place, access.ty);
+                    }
                     let storage = self
                         .scope_map
                         .get(stmt)
                         .copied()
                         .unwrap_or_else(|| builder.unit_const());
-                    if self.mut_bindings.contains(stmt) {
+                    if self.storage_bindings.contains(stmt) {
                         // mut binding: need to Load from storage to get current value
                         builder.load(storage, mir_type.clone())
                     } else {
                         storage
                     }
                 }
-                Some(ResolvedName::Param(idx)) => param_values
-                    .get(*idx)
-                    .copied()
-                    .unwrap_or_else(|| builder.unit_const()),
-                Some(ResolvedName::Function(_)) => builder.unit_const(),
+                Some(ResolvedName::Param(idx)) => self
+                    .capture_access
+                    .get(&CaptureSource::Param(*idx))
+                    .cloned()
+                    .map(|access| builder.load(access.place, access.ty))
+                    .unwrap_or_else(|| {
+                        param_values
+                            .get(*idx)
+                            .copied()
+                            .unwrap_or_else(|| builder.unit_const())
+                    }),
+                Some(ResolvedName::LambdaParam { lambda, index }) => {
+                    let source = CaptureSource::LambdaParam {
+                        lambda: *lambda,
+                        index: *index,
+                    };
+                    if self.current_lambda == Some(*lambda) {
+                        param_values
+                            .get(*index)
+                            .copied()
+                            .unwrap_or_else(|| builder.unit_const())
+                    } else if let Some(access) = self.capture_access.get(&source).cloned() {
+                        builder.load(access.place, access.ty)
+                    } else {
+                        builder.unit_const()
+                    }
+                }
+                Some(ResolvedName::Function(fid)) => {
+                    self.lower_function_value(builder, *fid, &mir_type)
+                }
                 Some(ResolvedName::EnumVariant(enum_id, idx)) => {
                     self.lower_enum_variant_value(builder, *enum_id, *idx, Vec::new(), mir_type)
                 }
@@ -337,7 +687,11 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::Unary { operand, op } => {
-                let ov = self.lower_expr(builder, param_values, body, *operand);
+                let ov = if matches!(op, HirUnOp::Ref | HirUnOp::MutRef) {
+                    self.lower_lvalue(builder, param_values, body, *operand)
+                } else {
+                    self.lower_expr(builder, param_values, body, *operand)
+                };
                 // +x is a no-op, return operand directly
                 if matches!(op, HirUnOp::Pos) {
                     return ov;
@@ -522,6 +876,26 @@ impl<'a> LowerCtx<'a> {
                         arg_vals,
                         mir_type,
                     )
+                } else if self.callee_function_id(*callee).is_none() {
+                    let callee_value = self.lower_expr(builder, param_values, body, *callee);
+                    let mut arg_values = args
+                        .iter()
+                        .map(|arg| self.lower_expr(builder, param_values, body, *arg))
+                        .collect::<Vec<_>>();
+                    let callee_ty = self
+                        .current_body
+                        .and_then(|body_id| self.type_result.expr_types.get(&(body_id, *callee)))
+                        .map(|ty| self.convert_type(ty))
+                        .unwrap_or(Type::Unit);
+                    if let Some(signature) = closure_call_signature(&callee_ty) {
+                        let call =
+                            builder.extract_value(callee_value, 0, Type::FnPtr(signature.clone()));
+                        let env = builder.extract_value(callee_value, 1, closure_env_type());
+                        arg_values.insert(0, env);
+                        builder.call_indirect(call, arg_values, mir_type)
+                    } else {
+                        builder.call_indirect(callee_value, arg_values, mir_type)
+                    }
                 } else {
                     let target_fid = self.callee_function_id(*callee);
                     let name = if let (Some(fid), Expr::FieldAccess { base, .. }) =
@@ -573,6 +947,23 @@ impl<'a> LowerCtx<'a> {
                     };
                     builder.call(func_ref, arg_vals, mir_type)
                 }
+            }
+
+            Expr::Lambda {
+                params,
+                body: lambda_body,
+                ..
+            } => {
+                let body_id = self.current_body.expect("lambda outside of a body");
+                self.lower_lambda(
+                    builder,
+                    param_values,
+                    body_id,
+                    expr_id,
+                    params,
+                    *lambda_body,
+                    &mir_type,
+                )
             }
 
             Expr::FieldAccess { base, field } => {
@@ -1463,6 +1854,13 @@ impl<'a> LowerCtx<'a> {
                 HirConstArg::Unknown => ConstArg::Unknown,
                 HirConstArg::Error => ConstArg::Error,
             }),
+            HirTypeRef::Function { params, ret } => type_checker::Type::Fn(
+                params
+                    .iter()
+                    .map(|param| self.lower_hir_type_for_pattern(param, subst))
+                    .collect(),
+                Box::new(self.lower_hir_type_for_pattern(ret, subst)),
+            ),
             HirTypeRef::Unknown => type_checker::Type::Unknown,
             HirTypeRef::Error => type_checker::Type::Error,
         }
@@ -1667,14 +2065,32 @@ impl<'a> LowerCtx<'a> {
         match expr {
             Expr::Path { resolved, .. } => match resolved {
                 Some(ResolvedName::Local(stmt)) => self
-                    .scope_map
-                    .get(stmt)
-                    .copied()
+                    .capture_access
+                    .get(&CaptureSource::Local(*stmt))
+                    .map(|access| access.place)
+                    .or_else(|| self.scope_map.get(stmt).copied())
                     .unwrap_or_else(|| builder.unit_const()),
-                Some(ResolvedName::Param(idx)) => param_values
-                    .get(*idx)
-                    .copied()
+                Some(ResolvedName::Param(idx)) => self
+                    .capture_access
+                    .get(&CaptureSource::Param(*idx))
+                    .map(|access| access.place)
+                    .or_else(|| param_values.get(*idx).copied())
                     .unwrap_or_else(|| builder.unit_const()),
+                Some(ResolvedName::LambdaParam { lambda, index }) => {
+                    let source = CaptureSource::LambdaParam {
+                        lambda: *lambda,
+                        index: *index,
+                    };
+                    self.capture_access
+                        .get(&source)
+                        .map(|access| access.place)
+                        .or_else(|| {
+                            (self.current_lambda == Some(*lambda))
+                                .then(|| param_values.get(*index).copied())
+                                .flatten()
+                        })
+                        .unwrap_or_else(|| builder.unit_const())
+                }
                 _ => builder.unit_const(),
             },
             Expr::IndexAccess { base, index } => {
@@ -1735,6 +2151,7 @@ impl<'a> LowerCtx<'a> {
                         let init_val = self.lower_expr(builder, param_values, body, *init_expr);
                         builder.store(init_val, ptr);
                     }
+                    self.storage_bindings.insert(stmt_id);
                     ptr
                 } else if *is_mut {
                     // mut bindings: always use Alloca for reassignable storage
@@ -1750,7 +2167,7 @@ impl<'a> LowerCtx<'a> {
                         let init_val = self.lower_expr(builder, param_values, body, *init_expr);
                         builder.store(init_val, ptr);
                     }
-                    self.mut_bindings.insert(stmt_id);
+                    self.storage_bindings.insert(stmt_id);
                     ptr
                 } else if let Some(init_expr) = init {
                     self.lower_expr(builder, param_values, body, *init_expr)
@@ -1900,11 +2317,19 @@ impl<'a> LowerCtx<'a> {
                     .as_ref()
                     .map(|rt| self.convert_hir_type(rt))
                     .unwrap_or(Type::Unit);
-                Type::FnPtr(FnPtrType {
+                closure_value_type(FnPtrType {
                     params,
                     ret: Box::new(ret),
                 })
             }
+            TcType::Fn(params, ret) => closure_value_type(FnPtrType {
+                params: params
+                    .iter()
+                    .map(|param| self.convert_type(param))
+                    .collect(),
+                ret: Box::new(self.convert_type(ret)),
+            }),
+            TcType::InferVar(_) => Type::Unit,
             TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
             TcType::Const(_) => Type::Unit,
             TcType::Unknown | TcType::Error => Type::Unit,
@@ -1983,6 +2408,13 @@ impl<'a> LowerCtx<'a> {
                 self.hir_const_arg_to_usize(len, &HashMap::new()),
             ),
             hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
+            hir::item_tree::HirTypeRef::Function { params, ret } => closure_value_type(FnPtrType {
+                params: params
+                    .iter()
+                    .map(|param| self.convert_hir_type(param))
+                    .collect(),
+                ret: Box::new(self.convert_hir_type(ret)),
+            }),
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
@@ -2234,15 +2666,19 @@ impl<'a> LowerCtx<'a> {
         let old_const_subst = std::mem::replace(&mut self.generic_const_subst, subst.consts);
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
-        let old_mut_bindings = std::mem::take(&mut self.mut_bindings);
+        let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
         let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
+        let old_capture_access = std::mem::take(&mut self.capture_access);
+        let old_current_lambda = self.current_lambda;
         let old_current_body = self.current_body;
         let body_id = *self.hir.function_bodies.get(&fid)?;
         let func = self.lower_function(fid, mono_name.clone(), body_id);
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
-        self.mut_bindings = old_mut_bindings;
+        self.storage_bindings = old_storage_bindings;
         self.pattern_bindings = old_pattern_bindings;
+        self.capture_access = old_capture_access;
+        self.current_lambda = old_current_lambda;
         self.current_body = old_current_body;
         self.generic_subst = old_subst;
         self.generic_tc_subst = old_tc_subst;
@@ -2301,15 +2737,19 @@ impl<'a> LowerCtx<'a> {
         let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
-        let old_mut_bindings = std::mem::take(&mut self.mut_bindings);
+        let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
         let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
+        let old_capture_access = std::mem::take(&mut self.capture_access);
+        let old_current_lambda = self.current_lambda;
         let old_current_body = self.current_body;
         let body_id = *self.hir.function_bodies.get(&fid)?;
         let func = self.lower_function(fid, mono_name.clone(), body_id);
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
-        self.mut_bindings = old_mut_bindings;
+        self.storage_bindings = old_storage_bindings;
         self.pattern_bindings = old_pattern_bindings;
+        self.capture_access = old_capture_access;
+        self.current_lambda = old_current_lambda;
         self.current_body = old_current_body;
         self.generic_subst = old_subst;
         self.generic_tc_subst = old_tc_subst;
@@ -2560,6 +3000,13 @@ impl<'a> LowerCtx<'a> {
                 self.hir_const_arg_to_usize(len, const_subst),
             ),
             hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
+            hir::item_tree::HirTypeRef::Function { params, ret } => closure_value_type(FnPtrType {
+                params: params
+                    .iter()
+                    .map(|param| self.convert_hir_type_with_substs(param, subst, const_subst))
+                    .collect(),
+                ret: Box::new(self.convert_hir_type_with_substs(ret, subst, const_subst)),
+            }),
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
@@ -2643,6 +3090,40 @@ impl<'a> LowerCtx<'a> {
                 .unwrap_or(0),
             hir::item_tree::HirConstArg::Unknown | hir::item_tree::HirConstArg::Error => 0,
         }
+    }
+}
+
+fn closure_env_type() -> Type {
+    Type::Ptr(Box::new(Type::Unit))
+}
+
+fn closure_value_type(signature: FnPtrType) -> Type {
+    let mut hasher = DefaultHasher::new();
+    signature.hash(&mut hasher);
+    let mut call_params = Vec::with_capacity(signature.params.len() + 1);
+    call_params.push(closure_env_type());
+    call_params.extend(signature.params.clone());
+    let call = Type::FnPtr(FnPtrType {
+        params: call_params,
+        ret: signature.ret,
+    });
+    Type::Struct(StructType {
+        name: format!("riddle_closure_{:016x}", hasher.finish()),
+        fields: vec![("call".into(), call), ("env".into(), closure_env_type())],
+    })
+}
+
+fn closure_call_signature(ty: &Type) -> Option<FnPtrType> {
+    let Type::Struct(strukt) = ty else {
+        return None;
+    };
+    match strukt.fields.first().map(|(_, ty)| ty) {
+        Some(Type::FnPtr(signature))
+            if strukt.fields.get(1).map(|field| &field.1) == Some(&closure_env_type()) =>
+        {
+            Some(signature.clone())
+        }
+        _ => None,
     }
 }
 
@@ -2865,6 +3346,8 @@ fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
         (Type::Float(_), Type::Float(_)) => CastOp::FloatToFloat,
         (Type::Bool, Type::Int(_)) => CastOp::BoolToInt,
         (Type::Int(_), Type::Bool) => CastOp::IntToBool,
+        (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
+        (Type::Ptr(_), Type::Ptr(_)) => CastOp::PtrToPtr,
         _ => CastOp::IntToInt,
     }
 }

@@ -579,7 +579,11 @@ impl<'a> ScopeGraphBuilder<'a> {
                         code: "E0051",
                         severity: hir::body::Severity::Error,
                         message: "empty use declaration".into(),
-                        labels: Vec::new(),
+                        labels: vec![hir::body::SourceLabel {
+                            range: tree.range,
+                            message: String::new(),
+                            style: hir::body::LabelStyle::Primary,
+                        }],
                         help: None,
                         notes: Vec::new(),
                     });
@@ -604,6 +608,7 @@ impl<'a> ScopeGraphBuilder<'a> {
                     let joined = HirUseTree {
                         prefix: joined,
                         kind: child.kind.clone(),
+                        range: child.range,
                     };
                     self.encode_use_tree(&joined, current_scope, frag_nodes, frag_edges);
                 }
@@ -622,7 +627,11 @@ impl<'a> ScopeGraphBuilder<'a> {
                             "glob import target not found: `{}`",
                             tree.prefix.display()
                         ),
-                        labels: Vec::new(),
+                        labels: vec![hir::body::SourceLabel {
+                            range: tree.range,
+                            message: String::new(),
+                            style: hir::body::LabelStyle::Primary,
+                        }],
                         help: None,
                         notes: Vec::new(),
                     });
@@ -874,6 +883,32 @@ impl<'a> ScopeGraphBuilder<'a> {
                 for a in args {
                     self.walk_expr_for_refs(body_id, body, *a, current_scope, nodes, edges);
                 }
+            }
+            Expr::Lambda {
+                params,
+                body: lambda_body,
+                ..
+            } => {
+                let lambda_scope = self.sg.alloc_node(Node::Scope(ScopeKind::FunctionScope));
+                nodes.push(lambda_scope);
+                let edge = self
+                    .sg
+                    .add_edge(lambda_scope, current_scope, EdgeKind::Lex, 0);
+                edges.push(edge);
+                for (index, param) in params.iter().enumerate() {
+                    let pop = self.sg.alloc_node(Node::PopSymbol {
+                        name: param.name.clone(),
+                        define: DefRef::LambdaParam {
+                            body_id,
+                            lambda: eid,
+                            index,
+                        },
+                    });
+                    nodes.push(pop);
+                    let edge = self.sg.add_edge(lambda_scope, pop, EdgeKind::Def, 0);
+                    edges.push(edge);
+                }
+                self.walk_expr_for_refs(body_id, body, *lambda_body, lambda_scope, nodes, edges);
             }
             Expr::FieldAccess { base, .. } => {
                 self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);

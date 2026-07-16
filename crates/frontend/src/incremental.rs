@@ -367,6 +367,7 @@ fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         | SyntaxKind::UnaryExpr
         | SyntaxKind::ParenExpr
         | SyntaxKind::CallExpr
+        | SyntaxKind::LambdaExpr
         | SyntaxKind::FieldExpr
         | SyntaxKind::StructExpr
         | SyntaxKind::StructExprField
@@ -377,6 +378,7 @@ fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         | SyntaxKind::RefType
         | SyntaxKind::TupleType
         | SyntaxKind::ArrayType => Some(ReparseEntry::Type),
+        SyntaxKind::FnType => Some(ReparseEntry::Type),
 
         SyntaxKind::UseDecl | SyntaxKind::ModDecl => Some(ReparseEntry::Statement),
 

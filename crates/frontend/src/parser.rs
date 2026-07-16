@@ -291,7 +291,7 @@ impl<'s> Parser<'s> {
                 rowan::TextSize::from(span.end as u32),
             )
         } else {
-            TextRange::new(0.into(), 0.into())
+            TextRange::empty(rowan::TextSize::from(self.source.len() as u32))
         }
     }
 
@@ -383,6 +383,9 @@ impl<'s> Parser<'s> {
     }
 
     fn at_stmt_start(&self) -> bool {
+        if self.at(SyntaxKind::Fun) && self.nth(1) == SyntaxKind::LParen {
+            return false;
+        }
         matches!(
             self.current(),
             SyntaxKind::Hash
@@ -433,6 +436,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::AmpAmp
                 | SyntaxKind::Star
                 | SyntaxKind::Bang
+                | SyntaxKind::Fun
         )
     }
 
@@ -455,6 +459,7 @@ impl<'s> Parser<'s> {
         match self.current() {
             SyntaxKind::Pub => self.pub_item(),
             SyntaxKind::Let => self.var_decl(),
+            SyntaxKind::Fun if self.nth(1) == SyntaxKind::LParen => self.expr_stmt(),
             SyntaxKind::Fun => self.func_decl(),
             SyntaxKind::Struct => self.struct_decl(),
             SyntaxKind::Mod => self.mod_decl(),
@@ -748,6 +753,45 @@ impl<'s> Parser<'s> {
         } else {
             self.expect(SyntaxKind::Ident);
             self.expect(SyntaxKind::Colon);
+            self.ty();
+        }
+        m.complete(self, SyntaxKind::Param);
+    }
+
+    fn lambda_expr(&mut self) -> CompletedMarker {
+        let m = self.start();
+        self.expect(SyntaxKind::Fun);
+        self.lambda_param_list();
+        if self.at(SyntaxKind::Arrow) {
+            self.bump();
+            self.ty();
+        }
+        self.block();
+        m.complete(self, SyntaxKind::LambdaExpr)
+    }
+
+    fn lambda_param_list(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::LParen);
+        if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
+            self.lambda_param();
+            while self.at(SyntaxKind::Comma) {
+                self.bump();
+                if self.at(SyntaxKind::RParen) {
+                    break;
+                }
+                self.lambda_param();
+            }
+        }
+        self.expect(SyntaxKind::RParen);
+        m.complete(self, SyntaxKind::ParamList);
+    }
+
+    fn lambda_param(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::Ident);
+        if self.at(SyntaxKind::Colon) {
+            self.bump();
             self.ty();
         }
         m.complete(self, SyntaxKind::Param);
@@ -1357,6 +1401,8 @@ impl<'s> Parser<'s> {
 
             SyntaxKind::Unsafe => Some(self.unsafe_expr()),
 
+            SyntaxKind::Fun => Some(self.lambda_expr()),
+
             SyntaxKind::LBracket => {
                 let m = self.start();
                 self.bump();
@@ -1498,6 +1544,27 @@ impl<'s> Parser<'s> {
                 let m = self.start();
                 self.bump();
                 m.complete(self, SyntaxKind::ConstType);
+            }
+            SyntaxKind::Fun => {
+                let m = self.start();
+                self.bump();
+                self.expect(SyntaxKind::LParen);
+                if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
+                    self.ty();
+                    while self.at(SyntaxKind::Comma) {
+                        self.bump();
+                        if self.at(SyntaxKind::RParen) {
+                            break;
+                        }
+                        self.ty();
+                    }
+                }
+                self.expect(SyntaxKind::RParen);
+                if self.at(SyntaxKind::Arrow) {
+                    self.bump();
+                    self.ty();
+                }
+                m.complete(self, SyntaxKind::FnType);
             }
             SyntaxKind::Ident
             | SyntaxKind::SelfKw
@@ -1882,6 +1949,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::LParen
                 | SyntaxKind::LBracket
                 | SyntaxKind::Number
+                | SyntaxKind::Fun
         )
     }
 

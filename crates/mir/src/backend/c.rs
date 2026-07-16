@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::backend::Backend;
 use crate::func::Function;
@@ -103,15 +104,43 @@ impl Backend for CBackend {
             writeln!(out, "{}", gc::RUNTIME_C).unwrap();
         }
 
-        // Emit struct type definitions
         let structs = collect_structs(module);
+        for strukt in &structs {
+            writeln!(out, "typedef struct {} {};", strukt.name, strukt.name).unwrap();
+        }
+        if !structs.is_empty() {
+            writeln!(out).unwrap();
+        }
+
+        for signature in collect_fn_ptrs(module) {
+            let params = signature
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| c_param_decl(ty, &format!("p{index}")))
+                .collect::<Vec<_>>();
+            writeln!(
+                out,
+                "typedef {} (*{})({});",
+                ctype_of(&signature.ret),
+                fn_ptr_name(&signature),
+                if params.is_empty() {
+                    "void".into()
+                } else {
+                    params.join(", ")
+                }
+            )
+            .unwrap();
+        }
+        writeln!(out).unwrap();
+
         for s in &structs {
-            writeln!(out, "typedef struct {{").unwrap();
+            writeln!(out, "struct {} {{", s.name).unwrap();
             for (name, ty) in &s.fields {
                 let (pre, suf) = c_decl_parts(ty);
                 writeln!(out, "  {} {}{};", pre, sanitize(name), suf).unwrap();
             }
-            writeln!(out, "}} {};", s.name).unwrap();
+            writeln!(out, "}};").unwrap();
             writeln!(out).unwrap();
         }
 
@@ -757,6 +786,33 @@ impl CBackend {
                     .unwrap();
                 }
             }
+
+            InstKind::FunctionRef(function) => {
+                let name = match function {
+                    FuncRef::Local(name) | FuncRef::Intrinsic(name) | FuncRef::Extern(name) => {
+                        sanitize(name)
+                    }
+                };
+                self.set_inline(v, name, ctype_of(&inst.ty));
+            }
+
+            InstKind::CallIndirect(callee, args) => {
+                let ct = ctype_of(&inst.ty);
+                let callee = self.name(*callee).to_owned();
+                let args = args
+                    .iter()
+                    .map(|arg| self.name(*arg).to_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if matches!(&inst.ty, Type::Unit | Type::Never | Type::Void) {
+                    writeln!(out, "  {}({});", callee, args).unwrap();
+                    self.set(v, "".into(), "void".into());
+                } else {
+                    let name = fresh_c(&mut self.counter, "call");
+                    self.set(v, name.clone(), ct.clone());
+                    writeln!(out, "  {} {} = {}({});", ct, name, callee, args).unwrap();
+                }
+            }
         }
         Ok(())
     }
@@ -798,10 +854,20 @@ fn collect_structs(module: &Module) -> Vec<StructType> {
     let mut seen: HashMap<String, StructType> = HashMap::new();
     for &fid in &module.function_order {
         let func = &module.functions[fid];
+        collect_struct_type(&func.ret_type, &mut seen);
+        for param in &func.params {
+            collect_struct_type(&param.ty, &mut seen);
+        }
         for (_bid, block) in func.blocks.iter() {
             for inst in &block.insts {
                 collect_struct_type(&inst.ty, &mut seen);
             }
+        }
+    }
+    for external in &module.externs {
+        collect_struct_type(&external.ret_type, &mut seen);
+        for param in &external.params {
+            collect_struct_type(param, &mut seen);
         }
     }
     let mut out: Vec<StructType> = seen.into_values().collect();
@@ -811,6 +877,58 @@ fn collect_structs(module: &Module) -> Vec<StructType> {
             .then_with(|| a.name.cmp(&b.name))
     });
     out
+}
+
+fn collect_fn_ptrs(module: &Module) -> Vec<FnPtrType> {
+    let mut seen = HashSet::new();
+    for &fid in &module.function_order {
+        let function = &module.functions[fid];
+        collect_fn_ptr_type(&function.ret_type, &mut seen);
+        for param in &function.params {
+            collect_fn_ptr_type(&param.ty, &mut seen);
+        }
+        for (_, block) in function.blocks.iter() {
+            for inst in &block.insts {
+                collect_fn_ptr_type(&inst.ty, &mut seen);
+            }
+        }
+    }
+    for external in &module.externs {
+        collect_fn_ptr_type(&external.ret_type, &mut seen);
+        for param in &external.params {
+            collect_fn_ptr_type(param, &mut seen);
+        }
+    }
+    let mut signatures = seen.into_iter().collect::<Vec<_>>();
+    signatures.sort_by_key(fn_ptr_name);
+    signatures
+}
+
+fn collect_fn_ptr_type(ty: &Type, seen: &mut HashSet<FnPtrType>) {
+    match ty {
+        Type::FnPtr(signature) => {
+            if seen.insert(signature.clone()) {
+                for param in &signature.params {
+                    collect_fn_ptr_type(param, seen);
+                }
+                collect_fn_ptr_type(&signature.ret, seen);
+            }
+        }
+        Type::Struct(strukt) => {
+            for (_, field) in &strukt.fields {
+                collect_fn_ptr_type(field, seen);
+            }
+        }
+        Type::Ptr(inner) | Type::Ref(inner, _) | Type::Array(inner, _) => {
+            collect_fn_ptr_type(inner, seen)
+        }
+        Type::Tuple(elements) => {
+            for element in elements {
+                collect_fn_ptr_type(element, seen);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn module_has_heap_alloc(module: &Module) -> bool {
@@ -841,6 +959,12 @@ fn collect_struct_type(ty: &Type, seen: &mut HashMap<String, StructType>) {
             for elem in elems {
                 collect_struct_type(elem, seen);
             }
+        }
+        Type::FnPtr(signature) => {
+            for param in &signature.params {
+                collect_struct_type(param, seen);
+            }
+            collect_struct_type(&signature.ret, seen);
         }
         _ => {}
     }
@@ -912,6 +1036,11 @@ fn inst_operands(inst: &Inst) -> Vec<Value> {
         InstKind::IndexPtr(base, index) => vec![*base, *index],
         InstKind::Phi(pairs) => pairs.iter().map(|(v, _)| *v).collect(),
         InstKind::Call(_, args) => args.clone(),
+        InstKind::CallIndirect(callee, args) => {
+            let mut values = vec![*callee];
+            values.extend(args);
+            values
+        }
         _ => vec![], // Const, HeapAlloc, Alloca: no operands
     }
 }
@@ -967,9 +1096,15 @@ fn ctype_of(ty: &Type) -> String {
             format!("struct {{ {} }}", fields.join(" "))
         }
         Type::Enum(e) => format!("enum_{}", e.name),
-        Type::FnPtr(_) => "void*".into(),
+        Type::FnPtr(signature) => fn_ptr_name(signature),
         Type::Unit | Type::Never | Type::Void => "void".into(),
     }
+}
+
+fn fn_ptr_name(signature: &FnPtrType) -> String {
+    let mut hasher = DefaultHasher::new();
+    signature.hash(&mut hasher);
+    format!("riddle_fn_{:016x}", hasher.finish())
 }
 
 /// C type for FFI declarations — `&str` maps to plain `const char*` because C

@@ -10,7 +10,8 @@ use hir::{
     place::Place,
 };
 use type_checker::{
-    Diagnostic, LabelStyle, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult,
+    CaptureMode, CaptureSource, ClosureKind, Diagnostic, LabelStyle, LambdaInfo, Severity,
+    SourceLabel, TraitEnv, Type, TypeCheckResult,
 };
 
 #[derive(Debug, Default)]
@@ -18,8 +19,8 @@ pub struct AnalysisResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Run move/borrow checking. Escape analysis results are consumed read-only
-/// to skip borrow checks for heap-allocated (escaping) locals.
+/// Run move/borrow checking. Escape analysis identifies storage duration only;
+/// heap allocation does not relax move or borrow rules.
 pub fn analyze(
     hir: &HirFile,
     type_result: &TypeCheckResult,
@@ -149,7 +150,6 @@ impl<'a> Analyzer<'a> {
                 self.move_check_expr(ctx, *rhs);
                 if op.is_assignment() {
                     if let Some(lhs_place) = self.place_from_expr(ctx, *lhs)
-                        && !ctx.escaping_locals.contains(&lhs_place.local)
                         && self.has_any_borrow(ctx, &lhs_place)
                     {
                         let name = self.expr_name(ctx, *lhs);
@@ -167,9 +167,7 @@ impl<'a> Analyzer<'a> {
                 self.move_check_expr(ctx, *operand);
                 match op {
                     UnaryOp::Ref | UnaryOp::MutRef => {
-                        if let Some(place) = self.place_from_expr(ctx, *operand)
-                            && !ctx.escaping_locals.contains(&place.local)
-                        {
+                        if let Some(place) = self.place_from_expr(ctx, *operand) {
                             if *op == UnaryOp::Ref {
                                 if self.has_mut_borrow(ctx, &place) {
                                     let name = self.expr_name(ctx, *operand);
@@ -304,6 +302,26 @@ impl<'a> Analyzer<'a> {
                     self.move_check_expr(ctx, *arg);
                     self.consume_if_local(ctx, *arg);
                 }
+                if self
+                    .type_result
+                    .closure_kinds
+                    .get(&(ctx.body_id, *callee))
+                    .is_some_and(|kind| *kind == ClosureKind::FnOnce)
+                {
+                    self.consume_if_local(ctx, *callee);
+                }
+            }
+
+            Expr::Lambda { params, body, .. } => {
+                if let Some(info) = self
+                    .type_result
+                    .lambda_infos
+                    .get(&(ctx.body_id, expr_id))
+                    .cloned()
+                {
+                    self.apply_capture_effects(ctx, expr_id, &info);
+                    self.move_check_lambda_body(ctx, params, *body, &info);
+                }
             }
 
             Expr::Unsafe { body } => {
@@ -387,7 +405,10 @@ impl<'a> Analyzer<'a> {
                 .get(&(ctx.body_id, expr_id))
                 .cloned()
                 .unwrap_or(Type::Unknown);
-            if !self.trait_env.type_is_copy(&ty) {
+            let closure_kind = self.type_result.closure_kinds.get(&(ctx.body_id, expr_id));
+            if !self.trait_env.type_is_copy(&ty)
+                || matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
+            {
                 ctx.bindings.mark_moved(&name.0);
                 // Record move site for secondary label.
                 let span = ctx.expr_range(expr_id);
@@ -408,10 +429,13 @@ impl<'a> Analyzer<'a> {
             .get(&(ctx.body_id, expr_id))
             .cloned()
             .unwrap_or(Type::Unknown);
-        if self.trait_env.type_is_copy(&ty) {
+        let closure_kind = self.type_result.closure_kinds.get(&(ctx.body_id, expr_id));
+        if self.trait_env.type_is_copy(&ty)
+            && !matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
+        {
             return;
         }
-        if !ctx.escaping_locals.contains(&place.local) && self.has_any_borrow(ctx, &place) {
+        if self.has_any_borrow(ctx, &place) {
             let name = self.expr_name(ctx, expr_id);
             self.diag(
                 format!("cannot move `{}` while borrowed", name),
@@ -424,6 +448,129 @@ impl<'a> Analyzer<'a> {
         let span = ctx.expr_range(expr_id);
         let desc = "value moved here".to_string();
         ctx.moved_sites.insert(place, (span, desc));
+    }
+
+    fn apply_capture_effects(&mut self, ctx: &mut BodyCtx<'_>, lambda: ExprId, info: &LambdaInfo) {
+        let span = ctx.expr_range(lambda);
+        for capture in &info.captures {
+            if ctx.bindings.get(&capture.name).copied() == Some(true) {
+                self.diag(
+                    format!("use of moved value: `{}`", capture.name),
+                    span,
+                    "E0100",
+                );
+                continue;
+            }
+            let place = match capture.source {
+                CaptureSource::Local(stmt) => Some(Place::root(stmt)),
+                CaptureSource::Param(_) | CaptureSource::LambdaParam { .. } => None,
+            };
+            if let Some(place) = &place
+                && ctx
+                    .moved_places
+                    .iter()
+                    .any(|moved| place_overlaps(moved, place))
+            {
+                let extra = self.move_site_labels(ctx, place);
+                self.diag_with_labels(
+                    format!("use of moved value: `{}`", capture.name),
+                    span,
+                    "E0100",
+                    &extra,
+                );
+                continue;
+            }
+
+            match capture.mode {
+                CaptureMode::Shared => {
+                    if let Some(place) = place {
+                        if self.has_mut_borrow(ctx, &place) {
+                            self.diag(
+                                format!(
+                                    "cannot capture `{}` by shared reference while mutably borrowed",
+                                    capture.name
+                                ),
+                                span,
+                                "E0301",
+                            );
+                        } else {
+                            ctx.shared_borrows
+                                .entry(place)
+                                .or_default()
+                                .push(BorrowRecord {
+                                    scope_depth: ctx.scope_depth,
+                                });
+                        }
+                    }
+                }
+                CaptureMode::Mutable => {
+                    if let Some(place) = place {
+                        if self.has_shared_borrow(ctx, &place) {
+                            self.diag(
+                                format!(
+                                    "cannot capture `{}` mutably while shared-borrowed",
+                                    capture.name
+                                ),
+                                span,
+                                "E0300",
+                            );
+                        } else if self.has_mut_borrow(ctx, &place) {
+                            self.diag(
+                                format!("cannot capture `{}` mutably more than once", capture.name),
+                                span,
+                                "E0302",
+                            );
+                        } else {
+                            ctx.mutable_borrows
+                                .entry(place)
+                                .or_default()
+                                .push(BorrowRecord {
+                                    scope_depth: ctx.scope_depth,
+                                });
+                        }
+                    }
+                }
+                CaptureMode::Value => {
+                    if self.trait_env.type_is_copy(&capture.ty) {
+                        continue;
+                    }
+                    if let Some(place) = place {
+                        if self.has_any_borrow(ctx, &place) {
+                            self.diag(
+                                format!(
+                                    "cannot move `{}` into closure while borrowed",
+                                    capture.name
+                                ),
+                                span,
+                                "E0304",
+                            );
+                            continue;
+                        }
+                        ctx.moved_places.insert(place.clone());
+                        ctx.moved_sites
+                            .insert(place, (span, "value moved into closure here".into()));
+                    }
+                    ctx.bindings.mark_moved(&capture.name);
+                }
+            }
+        }
+    }
+
+    fn move_check_lambda_body(
+        &mut self,
+        outer: &BodyCtx<'_>,
+        params: &[hir::body::LambdaParam],
+        body: ExprId,
+        info: &LambdaInfo,
+    ) {
+        let mut ctx = BodyCtx::new(outer.body_id, outer.body, outer.escaping_locals.clone());
+        ctx.seed_params(
+            params
+                .iter()
+                .map(|param| param.name.0.as_str())
+                .chain(info.captures.iter().map(|capture| capture.name.as_str())),
+        );
+        self.move_check_expr(&mut ctx, body);
     }
 
     fn place_from_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<Place> {
@@ -563,6 +710,7 @@ impl<'a> Analyzer<'a> {
         code: &'static str,
         extra_labels: &[(TextRange, String, LabelStyle)],
     ) {
+        let span = span.expect("move-checker diagnostics require a source range");
         let notes = match code {
             "E0100" => vec!["borrow with `&` if the original value must remain usable".into()],
             "E0300" => vec!["a mutable borrow cannot overlap an existing shared borrow".into()],
@@ -572,15 +720,11 @@ impl<'a> Analyzer<'a> {
             "E0304" => vec!["the borrow must end before moving the value".into()],
             _ => Vec::new(),
         };
-        let mut labels: Vec<SourceLabel> = span
-            .map(|r| {
-                vec![SourceLabel {
-                    range: r,
-                    message: String::new(),
-                    style: LabelStyle::Primary,
-                }]
-            })
-            .unwrap_or_default();
+        let mut labels = vec![SourceLabel {
+            range: span,
+            message: String::new(),
+            style: LabelStyle::Primary,
+        }];
         for (range, msg, style) in extra_labels {
             labels.push(SourceLabel {
                 range: *range,

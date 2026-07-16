@@ -78,6 +78,8 @@ pub enum CastOp {
     FloatToFloat,
     BoolToInt,
     IntToBool,
+    IntToPtr,
+    PtrToPtr,
 }
 
 // IR 指令
@@ -140,6 +142,12 @@ pub enum InstKind {
 
     /// Function call: `result = call(func, args)`
     Call(FuncRef, Vec<Value>),
+
+    /// Obtain a typed function pointer.
+    FunctionRef(FuncRef),
+
+    /// Call a function pointer value.
+    CallIndirect(Value, Vec<Value>),
 
     /// Construct a struct value: `result = struct { fields... }`
     StructValue(Vec<Value>),

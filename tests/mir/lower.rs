@@ -837,3 +837,71 @@ fn pos_unary_is_noop() {
         entry.terminator
     );
 }
+
+#[test]
+fn anonymous_function_lowers_to_function_pointer_call() {
+    let module = lower(
+        r#"
+        fun apply(f: fun(i32) -> i32, value: i32) -> i32 {
+            f(value)
+        }
+
+        fun main() -> i32 {
+            let inc = fun(x) { x + 1 };
+            apply(inc, 41)
+        }
+        "#,
+    );
+
+    assert!(
+        module
+            .function_order
+            .iter()
+            .any(|id| module.functions[*id].name.starts_with("__riddle_lambda_"))
+    );
+    let apply = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "apply")
+        .unwrap();
+    assert!(apply.blocks.iter().any(|(_, block)| {
+        block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::CallIndirect(..)))
+    }));
+}
+
+#[test]
+fn capturing_closure_lowers_environment_and_hidden_parameter() {
+    let module = lower(
+        r#"
+        fun main() -> i32 {
+            let base = 40;
+            let add = fun(value: i32) { base + value };
+            add(2)
+        }
+        "#,
+    );
+
+    let lambda = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name.starts_with("__riddle_lambda_"))
+        .unwrap();
+    assert!(matches!(lambda.params[0].ty, mir::types::Type::Ptr(_)));
+    let main = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "main")
+        .unwrap();
+    assert!(main.blocks.iter().any(|(_, block)| {
+        block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+    }));
+}

@@ -6,7 +6,10 @@ use item_tree::{FunctionId, HirModule, HirUse, ItemTree, ModuleId, TopLevelItem}
 use la_arena::Arena;
 use lower::{AstLower, Lower};
 
-use ast::{self, Root, support::AstNode};
+use ast::{
+    self, Root,
+    support::{AstNode, trimmed_range},
+};
 
 pub mod body;
 pub mod body_lower;
@@ -175,12 +178,27 @@ pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: ast::ModDecl) -> ModuleId {
 pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree::ImplId {
     use item_tree::{HirImpl, HirTypeRef};
 
-    let first_ty = i.self_type().map(|t| t.lower());
-    let second_ty = i.trait_type().map(|t| t.lower());
-    let (self_ty, trait_ty) = if i.has_for() {
-        (second_ty.unwrap_or(HirTypeRef::Error), first_ty)
+    let impl_range = trimmed_range(i.syntax());
+    let first_ty_ast = i.self_type();
+    let first_ty_range = first_ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
+    let first_ty = first_ty_ast.map(|ty| ty.lower());
+    let second_ty_ast = i.trait_type();
+    let second_ty_range = second_ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
+    let second_ty = second_ty_ast.map(|ty| ty.lower());
+    let (self_ty, self_ty_range, trait_ty, trait_ty_range) = if i.has_for() {
+        (
+            second_ty.unwrap_or(HirTypeRef::Error),
+            second_ty_range.unwrap_or(impl_range),
+            first_ty,
+            first_ty_range,
+        )
     } else {
-        (first_ty.unwrap_or(HirTypeRef::Error), None)
+        (
+            first_ty.unwrap_or(HirTypeRef::Error),
+            first_ty_range.unwrap_or(impl_range),
+            None,
+            None,
+        )
     };
     let generic_params = i.generic_params();
     let generics = lower::lower_generic_params(generic_params.clone());
@@ -219,7 +237,9 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
 
     hir.item_tree.impls.alloc(HirImpl {
         self_ty,
+        self_ty_range,
         trait_ty,
+        trait_ty_range,
         generics,
         const_generics,
         generic_bounds,

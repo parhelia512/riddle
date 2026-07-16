@@ -784,3 +784,90 @@ fn block_tail_moves_value() {
             .any(|m| m.contains("use of moved value") && m.contains("p"))
     );
 }
+
+#[test]
+fn anonymous_function_parameters_follow_move_rules() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun main() {
+            let consume_twice = fun(value: Point) {
+                let first = value;
+                let second = value;
+            };
+        }
+        "#,
+    );
+
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|message| message.contains("use of moved value") && message.contains("value"))
+    );
+}
+
+#[test]
+fn value_capture_moves_non_copy_binding() {
+    let result = analyze(
+        r#"
+        struct Token { value: i32 }
+        fun consume(value: Token) {}
+
+        fun main() {
+            let token = Token { value: 1 };
+            let once = fun() { consume(token); };
+            let again = token;
+        }
+        "#,
+    );
+
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|message| message.contains("use of moved value") && message.contains("token"))
+    );
+}
+
+#[test]
+fn once_closure_cannot_be_called_twice() {
+    let result = analyze(
+        r#"
+        struct Token { value: i32 }
+        fun consume(value: Token) {}
+
+        fun main() {
+            let token = Token { value: 1 };
+            let once = fun() { consume(token); };
+            once();
+            once();
+        }
+        "#,
+    );
+
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|message| message.contains("use of moved value") && message.contains("once"))
+    );
+}
+
+#[test]
+fn shared_capture_blocks_assignment_while_closure_is_live() {
+    let result = analyze(
+        r#"
+        fun main() {
+            let mut base = 1;
+            let read = fun() { base };
+            base = 2;
+            read();
+        }
+        "#,
+    );
+
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|message| message.contains("cannot assign") && message.contains("base"))
+    );
+}

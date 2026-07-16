@@ -111,6 +111,11 @@ pub enum DefRef {
         fn_id: FunctionId,
         index: usize,
     },
+    LambdaParam {
+        body_id: BodyId,
+        lambda: ExprId,
+        index: usize,
+    },
     ConstParam {
         name: Name,
     },

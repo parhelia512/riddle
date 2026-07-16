@@ -41,8 +41,46 @@ pub fn analyze_project_with_options(
     overlays: &HashMap<PathBuf, String>,
     options: riddlec::pipeline::CompileOptions,
 ) -> anyhow::Result<ProjectAnalysis> {
+    analyze_project_impl(path, overlays, options, true)
+}
+
+pub fn check_project_with_options(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String>,
+    options: riddlec::pipeline::CompileOptions,
+) -> anyhow::Result<ProjectAnalysis> {
+    analyze_project_impl(path, overlays, options, false)
+}
+
+pub fn check_project_with_session(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String>,
+    options: riddlec::pipeline::CompileOptions,
+    session: &mut riddlec::pipeline::CheckSession,
+) -> anyhow::Result<ProjectAnalysis> {
     let package = project::load_with_overlays(path, overlays)?;
-    let result = riddlec::pipeline::compile_with_options(&package.source.source, options);
+    let result = session.check_with_options(&package.source.source, options);
+    Ok(ProjectAnalysis {
+        entry: package.entry,
+        source: package.source,
+        result,
+        package_name: package.name,
+        manifest_fingerprint: package.manifest_fingerprint,
+    })
+}
+
+fn analyze_project_impl(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String>,
+    options: riddlec::pipeline::CompileOptions,
+    build: bool,
+) -> anyhow::Result<ProjectAnalysis> {
+    let package = project::load_with_overlays(path, overlays)?;
+    let result = if build {
+        riddlec::pipeline::compile_with_options(&package.source.source, options)
+    } else {
+        riddlec::pipeline::check_with_options(&package.source.source, options)
+    };
     Ok(ProjectAnalysis {
         entry: package.entry,
         source: package.source,
@@ -53,7 +91,11 @@ pub fn analyze_project_with_options(
 }
 
 pub fn check(path: &Path) -> anyhow::Result<()> {
-    let analysis = analyze_project(path, &HashMap::new())?;
+    let analysis = check_project_with_options(
+        path,
+        &HashMap::new(),
+        riddlec::pipeline::CompileOptions::default(),
+    )?;
     let errors = riddlec::diagnostics::report_mapped(
         &analysis.result,
         &analysis.source,

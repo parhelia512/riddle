@@ -6,6 +6,7 @@ use hir::{
     item_tree::FunctionId,
     place::Place,
 };
+use type_checker::{CaptureMode, CaptureSource, TypeCheckResult};
 
 /// Result of escape analysis: which locals must be heap-allocated.
 #[derive(Debug, Default)]
@@ -22,7 +23,7 @@ impl EscapeResult {
 /// Run escape analysis on all function bodies with inter-procedural
 /// refinement: a reference passed to a local function only forces heap
 /// allocation when the callee's corresponding parameter actually escapes.
-pub fn analyze_escapes(hir: &HirFile) -> EscapeResult {
+pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeResult {
     // Initialize: conservatively assume every param of every function escapes.
     let mut initial: HashMap<FunctionId, FnSummary> = HashMap::new();
     for (fid, func) in hir.item_tree.functions.iter() {
@@ -34,6 +35,7 @@ pub fn analyze_escapes(hir: &HirFile) -> EscapeResult {
 
     let mut analyzer = EscapeAnalyzer {
         hir,
+        type_result,
         result: EscapeResult::default(),
         fn_param_escapes: initial,
         last_ctx: None,
@@ -57,6 +59,7 @@ type FnSummary = HashSet<usize>;
 
 struct EscapeAnalyzer<'a> {
     hir: &'a HirFile,
+    type_result: &'a TypeCheckResult,
     result: EscapeResult,
     /// Summaries from the previous Fixpoint iteration.
     /// Initially empty (= conservative: assume all params escape).
@@ -217,6 +220,20 @@ impl<'a> EscapeAnalyzer<'a> {
                     || args
                         .iter()
                         .any(|arg| ctx.expr_param_source.contains_key(arg))
+            }
+
+            Expr::Lambda { body, .. } => {
+                if let Some(info) = self.type_result.lambda_infos.get(&(ctx.body_id, expr_id)) {
+                    for capture in &info.captures {
+                        if matches!(capture.mode, CaptureMode::Shared | CaptureMode::Mutable)
+                            && let CaptureSource::Local(stmt) = capture.source
+                        {
+                            ctx.escaping_locals.insert(stmt);
+                        }
+                    }
+                }
+                self.mark_escaping_exprs(ctx, *body);
+                false
             }
 
             Expr::If {
@@ -563,6 +580,7 @@ impl<'a> EscapeAnalyzer<'a> {
 
 /// Escape analysis context for a single body.
 struct EscapeCtx<'a> {
+    body_id: BodyId,
     body: &'a Body,
 
     root_tail: Option<ExprId>,
@@ -585,8 +603,8 @@ struct EscapeCtx<'a> {
 
 impl<'a> EscapeCtx<'a> {
     fn new(body_id: BodyId, body: &'a Body) -> Self {
-        let _ = body_id;
         Self {
+            body_id,
             body,
             root_tail: None,
             escaping_exprs: HashSet::new(),

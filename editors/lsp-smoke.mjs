@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 
 const command = process.argv[2] ?? 'riddle-lsp';
+const uri = 'file:///riddle-lsp-smoke.rid';
+const stableUri = 'file:///riddle-lsp-stable.rid';
 const server = spawn(command, [], { stdio: ['pipe', 'pipe', 'inherit'] });
 let input = Buffer.alloc(0);
 const messages = [];
@@ -59,6 +61,7 @@ try {
   });
   const initialized = await read((message) => message.id === 1);
   assert.equal(initialized.result.serverInfo.name, 'riddle-lsp');
+  assert.equal(initialized.result.capabilities.positionEncoding, 'utf-16');
   assert(initialized.result.capabilities.semanticTokensProvider);
 
   send({ jsonrpc: '2.0', method: 'initialized', params: {} });
@@ -67,7 +70,7 @@ try {
     method: 'textDocument/didOpen',
     params: {
       textDocument: {
-        uri: 'file:///riddle-lsp-smoke.rid',
+        uri,
         languageId: 'riddle',
         version: 1,
         text: 'fun main() { missing; }',
@@ -75,18 +78,131 @@ try {
     },
   });
   const diagnostics = await read(
-    (message) => message.method === 'textDocument/publishDiagnostics',
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === uri &&
+      message.params.version === 1,
   );
-  assert(diagnostics.params.diagnostics.length > 0);
+  assert.equal(diagnostics.params.diagnostics.length, 1);
+  const [unresolved] = diagnostics.params.diagnostics;
+  assert.equal(unresolved.code, 'E0050');
+  assert.equal(unresolved.source, 'riddle');
+  assert.equal(unresolved.severity, 1);
+  assert.equal(unresolved.message, 'unresolved name: `missing`');
+  assert.deepEqual(unresolved.range, {
+    start: { line: 0, character: 13 },
+    end: { line: 0, character: 20 },
+  });
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didChange',
+    params: {
+      textDocument: { uri, version: 2 },
+      contentChanges: [{ text: 'fun main() {}' }],
+    },
+  });
+  const fixed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === uri &&
+      message.params.version === 2,
+  );
+  assert.deepEqual(fixed.params.diagnostics, []);
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: stableUri,
+        languageId: 'riddle',
+        version: 1,
+        text: 'fun stable() { stable_missing; }',
+      },
+    },
+  });
+  const stable = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === stableUri &&
+      message.params.version === 1,
+  );
+  assert.equal(stable.params.diagnostics[0].code, 'E0050');
+
+  const lastBurstVersion = 14;
+  for (let version = 3; version <= lastBurstVersion; version += 1) {
+    send({
+      jsonrpc: '2.0',
+      method: 'textDocument/didChange',
+      params: {
+        textDocument: { uri, version },
+        contentChanges: [{ text: `fun main() { missing_${version}; }` }],
+      },
+    });
+  }
+  const latest = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === uri &&
+      message.params.version === lastBurstVersion,
+  );
+  assert.equal(latest.params.diagnostics[0].code, 'E0050');
+  assert.equal(
+    messages.some(
+      (message) =>
+        message.method === 'textDocument/publishDiagnostics' &&
+        message.params.uri === uri &&
+        message.params.version >= 3 &&
+        message.params.version < lastBurstVersion,
+    ),
+    false,
+    'stale diagnostics were published during a change burst',
+  );
+  assert.equal(
+    messages.some(
+      (message) =>
+        message.method === 'textDocument/publishDiagnostics' &&
+        message.params.uri === stableUri,
+    ),
+    false,
+    'unchanged diagnostics were published again',
+  );
 
   send({
     jsonrpc: '2.0',
     id: 2,
     method: 'textDocument/semanticTokens/full',
-    params: { textDocument: { uri: 'file:///riddle-lsp-smoke.rid' } },
+    params: { textDocument: { uri } },
   });
   const semanticTokens = await read((message) => message.id === 2);
   assert(semanticTokens.result.data.length > 0);
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri } },
+  });
+  const closed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === uri &&
+      message.params.version == null,
+  );
+  assert.deepEqual(closed.params.diagnostics, []);
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: stableUri } },
+  });
+  const stableClosed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === stableUri &&
+      message.params.version == null,
+  );
+  assert.deepEqual(stableClosed.params.diagnostics, []);
 
   send({ jsonrpc: '2.0', id: 3, method: 'shutdown', params: null });
   await read((message) => message.id === 3);

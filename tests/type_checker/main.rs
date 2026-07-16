@@ -1,4 +1,6 @@
 mod basic;
+#[path = "../support/diagnostics.rs"]
+mod diagnostic_support;
 mod dst;
 mod errors;
 mod incremental;
@@ -17,7 +19,9 @@ fn check(source: &str) -> TypeCheckResult {
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
     let hir = lower_and_resolve(parse);
-    check_hir(&hir)
+    let result = check_hir(&hir);
+    diagnostic_support::assert_type_diagnostics(source, &result.diagnostics);
+    result
 }
 
 fn lower_and_resolve(parse: &Parse) -> HirFile {
@@ -26,6 +30,12 @@ fn lower_and_resolve(parse: &Parse) -> HirFile {
     let mut hir = lower_root(root);
     let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
+    diagnostic_support::assert_hir_diagnostics(
+        &syntax.to_string(),
+        hir.bodies
+            .iter()
+            .flat_map(|(_, body)| body.diagnostics.iter()),
+    );
     hir
 }
 

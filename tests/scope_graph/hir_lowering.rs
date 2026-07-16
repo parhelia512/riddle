@@ -322,3 +322,23 @@ fn resolves_enum_variant_in_path() {
         unresolved
     );
 }
+
+#[test]
+fn lowers_and_resolves_anonymous_function_parameters() {
+    let (mut hir, sg) = build_hir_and_graph("fun main() { let inc = fun(x) { x + 1 }; inc(41); }");
+    resolve_hir(&mut hir, &sg);
+
+    let body = &hir.bodies[*hir.function_bodies.values().next().unwrap()];
+    assert!(
+        body.exprs
+            .iter()
+            .any(|(_, expr)| matches!(expr, Expr::Lambda { .. }))
+    );
+    assert!(body.exprs.iter().any(|(_, expr)| matches!(
+        expr,
+        Expr::Path {
+            resolved: Some(ResolvedName::LambdaParam { index: 0, .. }),
+            ..
+        }
+    )));
+}

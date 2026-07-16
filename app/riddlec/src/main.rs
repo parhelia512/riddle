@@ -44,7 +44,12 @@ fn main() {
         };
         let source = loaded.source;
 
-        let result = pipeline::compile_with_options(
+        let compile = if opts.backend.is_some() {
+            pipeline::compile_with_options
+        } else {
+            pipeline::check_with_options
+        };
+        let result = compile(
             &source,
             pipeline::CompileOptions {
                 use_std: opts.use_std,

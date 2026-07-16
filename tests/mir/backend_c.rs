@@ -19,6 +19,85 @@ fn c_simple_function() {
 }
 
 #[test]
+fn c_anonymous_function_uses_typed_function_pointer() {
+    let module = lower(
+        r#"
+        fun apply(f: fun(i32) -> i32, value: i32) -> i32 {
+            f(value)
+        }
+
+        fun main() -> i32 {
+            let inc = fun(x) { x + 1 };
+            apply(inc, 41)
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("typedef int32_t (*riddle_fn_"),
+        "{generated}"
+    );
+    assert!(generated.contains("__riddle_lambda_"), "{generated}");
+    assert!(generated.contains("f.call(f.env, value)"), "{generated}");
+}
+
+#[test]
+fn c_closure_capture_uses_heap_environment() {
+    let module = lower(
+        r#"
+        fun main() -> i32 {
+            let base = 40;
+            let add = fun(value: i32) { base + value };
+            add(2)
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("rgc_alloc"), "{generated}");
+    assert!(generated.contains("__riddle_lambda_1_env"), "{generated}");
+    assert!(generated.contains("capture_0_base"), "{generated}");
+    assert!(generated.contains(".call("), "{generated}");
+}
+
+#[test]
+fn c_returned_closure_keeps_parameter_alive() {
+    let module = lower(
+        r#"
+        fun make_adder(base: i32) -> fun(i32) -> i32 {
+            fun(value: i32) { base + value }
+        }
+
+        fun main() -> i32 {
+            let add = make_adder(40);
+            add(2)
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("make_adder"), "{generated}");
+    assert!(generated.contains("rgc_alloc"), "{generated}");
+    assert!(generated.contains("capture_0_base"), "{generated}");
+}
+
+#[test]
+fn c_named_function_value_uses_empty_environment_adapter() {
+    let module = lower(
+        r#"
+        fun inc(value: i32) -> i32 { value + 1 }
+        fun apply(f: fun(i32) -> i32, value: i32) -> i32 { f(value) }
+        fun main() -> i32 { apply(inc, 41) }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("__riddle_fn_adapter_inc"), "{generated}");
+    assert!(generated.contains("apply(s"), "{generated}");
+}
+
+#[test]
 fn c_backend_unit_main_returns_zero() {
     let module = lower(
         r#"
@@ -549,12 +628,12 @@ fn c_backend_monomorphizes_generic_structs() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains("} Box_i32;"),
+        result.contains("struct Box_i32 {"),
         "missing i32 monomorph:\n{}",
         result
     );
     assert!(
-        result.contains("} Box_bool;"),
+        result.contains("struct Box_bool {"),
         "missing bool monomorph:\n{}",
         result
     );

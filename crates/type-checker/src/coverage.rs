@@ -478,12 +478,27 @@ impl TypeChecker<'_> {
                                 HirVariantKind::Unit => Vec::new(),
                                 HirVariantKind::Tuple(fields) => fields
                                     .iter()
-                                    .map(|field| self.lower_type_ref_with_params(field, &params))
+                                    .enumerate()
+                                    .map(|(field_index, field)| {
+                                        self.lower_type_ref_with_params_at(
+                                            field,
+                                            &params,
+                                            variant
+                                                .field_ranges
+                                                .get(field_index)
+                                                .copied()
+                                                .or(Some(variant.name_range)),
+                                        )
+                                    })
                                     .collect(),
                                 HirVariantKind::Struct(fields) => fields
                                     .iter()
                                     .map(|field| {
-                                        self.lower_type_ref_with_params(&field.ty, &params)
+                                        self.lower_type_ref_with_params_at(
+                                            &field.ty,
+                                            &params,
+                                            Some(field.ty_range),
+                                        )
                                     })
                                     .collect(),
                             },
@@ -513,7 +528,13 @@ impl TypeChecker<'_> {
                     fields: strukt
                         .fields
                         .iter()
-                        .map(|field| self.lower_type_ref_with_params(&field.ty, &params))
+                        .map(|field| {
+                            self.lower_type_ref_with_params_at(
+                                &field.ty,
+                                &params,
+                                Some(field.ty_range),
+                            )
+                        })
                         .collect(),
                 }])
             }

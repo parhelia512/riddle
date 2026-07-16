@@ -62,6 +62,7 @@ ast_node!(BinaryExpr, BinaryExpr);
 ast_node!(UnaryExpr, UnaryExpr);
 ast_node!(ParenExpr, ParenExpr);
 ast_node!(CallExpr, CallExpr);
+ast_node!(LambdaExpr, LambdaExpr);
 ast_node!(ArgList, ArgList);
 ast_node!(FieldExpr, FieldExpr);
 ast_node!(IndexExpr, IndexExpr);
@@ -94,6 +95,7 @@ ast_node!(PtrType, PtrType);
 ast_node!(TupleType, TupleType);
 ast_node!(ArrayType, ArrayType);
 ast_node!(ConstType, ConstType);
+ast_node!(FnType, FnType);
 
 // patterns
 ast_node!(WildcardPat, WildcardPattern);
@@ -720,6 +722,24 @@ impl Block {
     }
 }
 
+impl LambdaExpr {
+    pub fn param_list(&self) -> Option<ParamList> {
+        support::child(&self.syntax)
+    }
+
+    pub fn return_type(&self) -> Option<Type> {
+        let arrow = support::token_of(&self.syntax, SyntaxKind::Arrow)?;
+        self.syntax
+            .children()
+            .filter(|node| node.text_range().start() > arrow.text_range().start())
+            .find_map(Type::cast)
+    }
+
+    pub fn body(&self) -> Option<Block> {
+        support::child(&self.syntax)
+    }
+}
+
 impl IfStmt {
     pub fn condition(&self) -> Option<Expr> {
         support::child(&self.syntax)
@@ -1141,6 +1161,28 @@ impl ConstType {
     }
 }
 
+impl FnType {
+    pub fn param_types(&self) -> impl Iterator<Item = Type> + '_ {
+        let arrow = support::token_of(&self.syntax, SyntaxKind::Arrow)
+            .map(|token| token.text_range().start());
+        self.syntax.children().filter_map(move |node| {
+            if arrow.is_some_and(|offset| node.text_range().start() > offset) {
+                None
+            } else {
+                Type::cast(node)
+            }
+        })
+    }
+
+    pub fn return_type(&self) -> Option<Type> {
+        let arrow = support::token_of(&self.syntax, SyntaxKind::Arrow)?;
+        self.syntax
+            .children()
+            .filter(|node| node.text_range().start() > arrow.text_range().start())
+            .find_map(Type::cast)
+    }
+}
+
 // ── Patterns ───────────────────────────────────────────────────────────
 
 impl LiteralPat {
@@ -1388,6 +1430,7 @@ pub enum Expr {
     UnaryExpr(UnaryExpr),
     ParenExpr(ParenExpr),
     CallExpr(CallExpr),
+    LambdaExpr(LambdaExpr),
     FieldExpr(FieldExpr),
     IndexExpr(IndexExpr),
     StructExpr(StructExpr),
@@ -1414,6 +1457,7 @@ impl AstNode for Expr {
             SyntaxKind::UnaryExpr => Some(Expr::UnaryExpr(UnaryExpr { syntax: node })),
             SyntaxKind::ParenExpr => Some(Expr::ParenExpr(ParenExpr { syntax: node })),
             SyntaxKind::CallExpr => Some(Expr::CallExpr(CallExpr { syntax: node })),
+            SyntaxKind::LambdaExpr => Some(Expr::LambdaExpr(LambdaExpr { syntax: node })),
             SyntaxKind::FieldExpr => Some(Expr::FieldExpr(FieldExpr { syntax: node })),
             SyntaxKind::IndexExpr => Some(Expr::IndexExpr(IndexExpr { syntax: node })),
             SyntaxKind::StructExpr => Some(Expr::StructExpr(StructExpr { syntax: node })),
@@ -1441,6 +1485,7 @@ impl AstNode for Expr {
             Expr::UnaryExpr(it) => it.syntax(),
             Expr::ParenExpr(it) => it.syntax(),
             Expr::CallExpr(it) => it.syntax(),
+            Expr::LambdaExpr(it) => it.syntax(),
             Expr::FieldExpr(it) => it.syntax(),
             Expr::IndexExpr(it) => it.syntax(),
             Expr::StructExpr(it) => it.syntax(),
@@ -1478,6 +1523,7 @@ pub enum Type {
     Tuple(TupleType),
     Array(ArrayType),
     Const(ConstType),
+    Function(FnType),
 }
 
 impl AstNode for Type {
@@ -1489,6 +1535,7 @@ impl AstNode for Type {
             SyntaxKind::TupleType => Some(Type::Tuple(TupleType { syntax: node })),
             SyntaxKind::ArrayType => Some(Type::Array(ArrayType { syntax: node })),
             SyntaxKind::ConstType => Some(Type::Const(ConstType { syntax: node })),
+            SyntaxKind::FnType => Some(Type::Function(FnType { syntax: node })),
             _ => None,
         }
     }
@@ -1501,6 +1548,7 @@ impl AstNode for Type {
             Type::Tuple(it) => it.syntax(),
             Type::Array(it) => it.syntax(),
             Type::Const(it) => it.syntax(),
+            Type::Function(it) => it.syntax(),
         }
     }
 }

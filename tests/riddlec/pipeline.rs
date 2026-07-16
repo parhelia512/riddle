@@ -12,6 +12,127 @@ fn temp_source_root(name: &str) -> PathBuf {
     ))
 }
 
+fn assert_same_check_result(left: &CompileResult, right: &CompileResult) {
+    let parse_errors = |result: &CompileResult| {
+        result
+            .parse_errors
+            .iter()
+            .map(|error| (error.message.clone(), error.span))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(parse_errors(left), parse_errors(right));
+    assert_eq!(left.hir_diagnostics, right.hir_diagnostics);
+    assert_eq!(left.type_result.diagnostics, right.type_result.diagnostics);
+    assert_eq!(left.analysis_diagnostics, right.analysis_diagnostics);
+}
+
+#[test]
+fn replacement_keeps_utf8_boundaries() {
+    assert_eq!(replacement("a😀b", "a😀xyb"), (5, 0, "xy"));
+    assert_eq!(replacement("a😀b", "ab"), (1, 4, ""));
+}
+
+#[test]
+fn check_session_matches_stateless_checks_across_edits() {
+    let mut session = CheckSession::new();
+    let options = CompileOptions { use_std: true };
+    let sources = [
+        "fun stable() -> i32 { 1 }\nfun main() { let value = 1; value; }",
+        "// 😀\nfun stable() -> i32 { 1 }\nfun main() { missing; }",
+        "// 😀\nfun stable() -> i32 { 1 }\nfun main() { let value = 2; value; }",
+    ];
+
+    for source in sources {
+        let expected = check_with_options(source, options);
+        let actual = session.check_with_options(source, options);
+        assert_same_check_result(&actual, &expected);
+    }
+}
+
+#[test]
+fn check_session_shifts_cached_diagnostics_with_their_bodies() {
+    let source = r#"
+struct Wrap<T> { inner: T }
+struct Bad { value: str }
+trait Flag { fun value() -> bool; }
+struct Marker {}
+impl Flag for Marker {}
+fun f<T>(x: T) -> T { g(Wrap { inner: x }) }
+fun g<T>(x: T) -> T { f(Wrap { inner: x }) }
+fun bad() { let value: bool = 1; }
+"#;
+    let options = CompileOptions { use_std: false };
+    let mut session = CheckSession::new();
+    let first = session.check_with_options(source, options);
+    assert_same_check_result(&first, &check_with_options(source, options));
+
+    let shifted = format!("// 😀\n{source}");
+    let actual = session.check_with_options(&shifted, options);
+    let expected = check_with_options(&shifted, options);
+    assert_same_check_result(&actual, &expected);
+    assert!(
+        actual
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0033")
+    );
+    assert!(["E0026", "E0043"].iter().all(|code| {
+        actual
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == *code)
+    }));
+}
+
+#[test]
+fn check_session_does_not_shift_signature_diagnostics_with_body() {
+    let options = CompileOptions { use_std: false };
+    let mut session = CheckSession::new();
+    let source = "fun bad(value: str) {}";
+    let first = session.check_with_options(source, options);
+    assert_same_check_result(&first, &check_with_options(source, options));
+
+    let shifted = "fun bad(value: str)  {}";
+    let actual = session.check_with_options(shifted, options);
+    let expected = check_with_options(shifted, options);
+    assert_same_check_result(&actual, &expected);
+
+    let signature_label = actual
+        .type_result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0043")
+        .flat_map(|diagnostic| &diagnostic.labels)
+        .find(|label| {
+            let range = std::ops::Range::<usize>::from(label.range);
+            shifted.get(range) == Some("str")
+        });
+    assert!(signature_label.is_some());
+}
+
+#[test]
+fn check_session_invalidates_globals_when_declarations_change() {
+    let options = CompileOptions { use_std: false };
+    let mut session = CheckSession::new();
+    let valid = "struct Value { field: &str }\nfun main() {}";
+    let first = session.check_with_options(valid, options);
+    assert_same_check_result(&first, &check_with_options(valid, options));
+
+    let invalid = "struct Value { field: str }\nfun main() {}";
+    let actual = session.check_with_options(invalid, options);
+    let expected = check_with_options(invalid, options);
+    assert_same_check_result(&actual, &expected);
+    assert!(
+        actual
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0043")
+    );
+}
+
 #[test]
 fn load_source_file_expands_external_mods() {
     let root = temp_source_root("external-mods");
@@ -74,6 +195,68 @@ fn source_map_points_into_external_module() {
     assert_eq!(usize::from(mapped_eof.range.start()), mapped.source.len());
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_map_keeps_empty_files() {
+    let root = temp_source_root("empty-source-map");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("main.rid");
+    fs::write(&path, "").unwrap();
+
+    let loaded = load_source_file(&path).unwrap();
+    let mapped = loaded
+        .source_map
+        .map_range(rowan::TextRange::empty(0.into()))
+        .unwrap();
+
+    assert_eq!(mapped.path, fs::canonicalize(path).unwrap());
+    assert_eq!(mapped.source, "");
+    assert!(mapped.range.is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn syntax_error_at_eof_stays_in_user_source_with_std_enabled() {
+    let source = "fun main() {";
+    let result = compile(source);
+
+    assert!(!result.parse_errors.is_empty());
+    assert!(
+        result
+            .parse_errors
+            .iter()
+            .all(|error| usize::from(error.span.end()) <= source.len()),
+        "{:#?}",
+        result.parse_errors
+    );
+    assert!(
+        result
+            .parse_errors
+            .iter()
+            .any(|error| usize::from(error.span.start()) == source.len()),
+        "{:#?}",
+        result.parse_errors
+    );
+}
+
+#[test]
+fn pipeline_stops_at_the_requested_stage() {
+    let source = "fun main() { let value = 1; value; }";
+    let options = CompileOptions { use_std: false };
+
+    let resolved = resolve_with_options(source, options);
+    assert!(resolved.hir.is_some());
+    assert!(resolved.type_result.expr_types.is_empty());
+    assert!(resolved.mir_module.is_none());
+
+    let checked = check_with_options(source, options);
+    assert!(!checked.type_result.expr_types.is_empty());
+    assert!(checked.mir_module.is_none());
+
+    let built = compile_with_options(source, options);
+    assert!(built.success());
+    assert!(built.mir_module.is_some());
 }
 
 #[test]

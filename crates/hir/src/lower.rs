@@ -2,7 +2,7 @@ use la_arena::Arena;
 
 use ast::{
     self, ExternFnDecl, FuncDecl, Param, StructDecl, StructField, StructFieldList, Type,
-    support::AstNode,
+    support::{AstNode, trimmed_range},
 };
 use frontend::syntax_kind::{SyntaxKind, SyntaxToken};
 
@@ -69,22 +69,32 @@ pub fn lower_generic_bounds(
                     param
                         .bounds
                         .into_iter()
-                        .map(move |bound| HirGenericBound {
-                            param: name.clone(),
-                            target_ty: HirTypeRef::Named(HirPath {
-                                anchor: PathAnchor::Plain,
-                                segments: vec![name.clone()],
-                                type_args: Vec::new(),
-                            }),
-                            trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
-                            assoc_constraints: bound
+                        .map(move |bound| {
+                            let trait_range = trimmed_range(bound.trait_path.syntax());
+                            let assoc_constraints = bound
                                 .assoc_constraints
                                 .into_iter()
-                                .map(|constraint| HirAssocTypeConstraint {
-                                    name: Name(constraint.name),
-                                    ty: constraint.ty.lower(),
+                                .map(|constraint| {
+                                    let range = trimmed_range(constraint.ty.syntax());
+                                    HirAssocTypeConstraint {
+                                        name: Name(constraint.name),
+                                        ty: constraint.ty.lower(),
+                                        range,
+                                    }
                                 })
-                                .collect(),
+                                .collect();
+                            HirGenericBound {
+                                param: name.clone(),
+                                target_ty: HirTypeRef::Named(HirPath {
+                                    anchor: PathAnchor::Plain,
+                                    segments: vec![name.clone()],
+                                    type_args: Vec::new(),
+                                }),
+                                target_range: trait_range,
+                                trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                                trait_range,
+                                assoc_constraints,
+                            }
                         })
                         .collect::<Vec<_>>()
                         .into_iter()
@@ -95,24 +105,32 @@ pub fn lower_generic_bounds(
 
     if let Some(where_clause) = where_clause {
         bounds.extend(where_clause.predicates().flat_map(|predicate| {
+            let target_range = trimmed_range(predicate.target_ty.syntax());
             let target_ty = predicate.target_ty.lower();
             let param = generic_bound_param_name(&target_ty);
-            predicate
-                .bounds
-                .into_iter()
-                .map(move |bound| HirGenericBound {
-                    param: param.clone(),
-                    target_ty: target_ty.clone(),
-                    trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
-                    assoc_constraints: bound
-                        .assoc_constraints
-                        .into_iter()
-                        .map(|constraint| HirAssocTypeConstraint {
+            predicate.bounds.into_iter().map(move |bound| {
+                let trait_range = trimmed_range(bound.trait_path.syntax());
+                let assoc_constraints = bound
+                    .assoc_constraints
+                    .into_iter()
+                    .map(|constraint| {
+                        let range = trimmed_range(constraint.ty.syntax());
+                        HirAssocTypeConstraint {
                             name: Name(constraint.name),
                             ty: constraint.ty.lower(),
-                        })
-                        .collect(),
-                })
+                            range,
+                        }
+                    })
+                    .collect();
+                HirGenericBound {
+                    param: param.clone(),
+                    target_ty: target_ty.clone(),
+                    target_range,
+                    trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                    trait_range,
+                    assoc_constraints,
+                }
+            })
         }));
     }
 
@@ -154,10 +172,27 @@ pub fn lower_visibility(is_pub: bool) -> Visibility {
 impl Lower for Param {
     type Output = HirParam;
     fn lower(self) -> Self::Output {
-        let name = lower_name(self.name());
-        let ty = self.ty().lower();
+        let range = trimmed_range(self.syntax());
+        let name_token = self.name();
+        let name_range = name_token
+            .as_ref()
+            .map(|token| token.text_range())
+            .unwrap_or(range);
+        let name = lower_name(name_token);
+        let ty_ast = self.ty();
+        let ty_range = ty_ast
+            .as_ref()
+            .map(|ty| trimmed_range(ty.syntax()))
+            .unwrap_or(range);
+        let ty = ty_ast.lower();
         let attrs = lower_attrs(self.syntax());
-        HirParam { name, ty, attrs }
+        HirParam {
+            name,
+            name_range,
+            ty,
+            ty_range,
+            attrs,
+        }
     }
 }
 
@@ -165,7 +200,13 @@ impl AstLower for FuncDecl {
     type Id = FunctionId;
     type Item = HirFunction;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
-        let name = lower_name(self.name());
+        let range = trimmed_range(self.syntax());
+        let name_token = self.name();
+        let name_range = name_token
+            .as_ref()
+            .map(|token| token.text_range())
+            .unwrap_or(range);
+        let name = lower_name(name_token);
         let generic_params = self.generic_params();
         let generics = lower_generic_params(generic_params.clone());
         let const_generics = lower_const_generic_params(generic_params.clone());
@@ -174,18 +215,22 @@ impl AstLower for FuncDecl {
             .param_list()
             .map(|pl| pl.params().map(|p| p.lower()).collect())
             .unwrap_or_default();
-        let ret_type = self.return_type().map(|ty| ty.lower());
+        let ret_type_ast = self.return_type();
+        let ret_type_range = ret_type_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
+        let ret_type = ret_type_ast.map(|ty| ty.lower());
         let has_body = self.body().is_some();
         let attrs = lower_attrs(self.syntax());
         let visibility = lower_visibility(self.is_pub());
         arena.alloc(HirFunction {
             name,
+            name_range,
             visibility,
             generics,
             const_generics,
             generic_bounds,
             params,
             ret_type,
+            ret_type_range,
             has_body,
             attrs,
         })
@@ -235,7 +280,13 @@ impl AstLower for ast::EnumDecl {
     type Id = EnumId;
     type Item = HirEnum;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
-        let name = lower_name(self.name());
+        let range = trimmed_range(self.syntax());
+        let name_token = self.name();
+        let name_range = name_token
+            .as_ref()
+            .map(|token| token.text_range())
+            .unwrap_or(range);
+        let name = lower_name(name_token);
         let generic_params = self.generic_params();
         let generics = lower_generic_params(generic_params.clone());
         let const_generics = lower_const_generic_params(generic_params.clone());
@@ -245,6 +296,7 @@ impl AstLower for ast::EnumDecl {
         let visibility = lower_visibility(self.is_pub());
         arena.alloc(HirEnum {
             name,
+            name_range,
             visibility,
             generics,
             const_generics,
@@ -258,17 +310,37 @@ impl AstLower for ast::EnumDecl {
 impl Lower for ast::EnumVariant {
     type Output = HirEnumVariant;
     fn lower(self) -> Self::Output {
-        let name = lower_name(self.name());
-        let tuple: Vec<HirTypeRef> = self.tuple_types().map(|t| t.lower()).collect();
+        let range = trimmed_range(self.syntax());
+        let name_token = self.name();
+        let name_range = name_token
+            .as_ref()
+            .map(|token| token.text_range())
+            .unwrap_or(range);
+        let name = lower_name(name_token);
+        let (tuple, mut field_ranges): (Vec<HirTypeRef>, Vec<_>) = self
+            .tuple_types()
+            .map(|ty| {
+                let range = trimmed_range(ty.syntax());
+                (ty.lower(), range)
+            })
+            .unzip();
         let kind = if let Some(field_list) = self.field_list() {
-            HirVariantKind::Struct(Some(field_list).lower())
+            let fields = Some(field_list).lower();
+            field_ranges = fields.iter().map(|field| field.ty_range).collect();
+            HirVariantKind::Struct(fields)
         } else if !tuple.is_empty() {
             HirVariantKind::Tuple(tuple)
         } else {
             HirVariantKind::Unit
         };
         let attrs = lower_attrs(self.syntax());
-        HirEnumVariant { name, kind, attrs }
+        HirEnumVariant {
+            name,
+            name_range,
+            kind,
+            field_ranges,
+            attrs,
+        }
     }
 }
 
@@ -281,7 +353,13 @@ impl AstLower for ast::TraitDecl {
         let methods = self
             .methods()
             .map(|m| {
-                let mname = lower_name(m.name());
+                let method_range = trimmed_range(m.syntax());
+                let method_name = m.name();
+                let method_name_range = method_name
+                    .as_ref()
+                    .map(|token| token.text_range())
+                    .unwrap_or(method_range);
+                let mname = lower_name(method_name);
                 let params = m
                     .param_list()
                     .map(|pl| {
@@ -299,16 +377,20 @@ impl AstLower for ast::TraitDecl {
                             .collect()
                     })
                     .unwrap_or_default();
-                let ret_type = m.return_type().map(|ty| ty.lower());
+                let ret_type_ast = m.return_type();
+                let ret_type_range = ret_type_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
+                let ret_type = ret_type_ast.map(|ty| ty.lower());
                 let generic_params = m.generic_params();
                 HirFunction {
                     name: mname,
+                    name_range: method_name_range,
                     visibility: lower_visibility(m.is_pub()),
                     generics: lower_generic_params(generic_params.clone()),
                     const_generics: lower_const_generic_params(generic_params.clone()),
                     generic_bounds: lower_generic_bounds(generic_params, m.where_clause()),
                     params,
                     ret_type,
+                    ret_type_range,
                     has_body: m.body().is_some(),
                     attrs: lower_attrs(m.syntax()),
                 }
@@ -316,11 +398,23 @@ impl AstLower for ast::TraitDecl {
             .collect();
         let type_aliases = self
             .type_aliases()
-            .map(|t| HirTypeAlias {
-                name: lower_name(t.name()),
-                visibility: lower_visibility(t.is_pub()),
-                ty: t.ty().map(|ty| ty.lower()),
-                attrs: lower_attrs(t.syntax()),
+            .map(|t| {
+                let range = trimmed_range(t.syntax());
+                let name_token = t.name();
+                let name_range = name_token
+                    .as_ref()
+                    .map(|token| token.text_range())
+                    .unwrap_or(range);
+                let ty_ast = t.ty();
+                let ty_range = ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
+                HirTypeAlias {
+                    name: lower_name(name_token),
+                    name_range,
+                    visibility: lower_visibility(t.is_pub()),
+                    ty: ty_ast.map(|ty| ty.lower()),
+                    ty_range,
+                    attrs: lower_attrs(t.syntax()),
+                }
             })
             .collect();
         let attrs = lower_attrs(self.syntax());
@@ -351,15 +445,28 @@ impl AstLower for ast::ConstDecl {
     type Id = ConstId;
     type Item = HirConst;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
-        let name = lower_name(self.name());
-        let ty = self.ty().lower();
+        let range = trimmed_range(self.syntax());
+        let name_token = self.name();
+        let name_range = name_token
+            .as_ref()
+            .map(|token| token.text_range())
+            .unwrap_or(range);
+        let name = lower_name(name_token);
+        let ty_ast = self.ty();
+        let ty_range = ty_ast
+            .as_ref()
+            .map(|ty| trimmed_range(ty.syntax()))
+            .unwrap_or(range);
+        let ty = ty_ast.lower();
         let has_value = self.value().is_some();
         let attrs = lower_attrs(self.syntax());
         let visibility = lower_visibility(self.is_pub());
         arena.alloc(HirConst {
             name,
+            name_range,
             visibility,
             ty,
+            ty_range,
             has_value,
             attrs,
         })
@@ -370,14 +477,24 @@ impl AstLower for ast::TypeAliasDecl {
     type Id = TypeAliasId;
     type Item = HirTypeAlias;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
-        let name = lower_name(self.name());
-        let ty = self.ty().map(|t| t.lower());
+        let range = trimmed_range(self.syntax());
+        let name_token = self.name();
+        let name_range = name_token
+            .as_ref()
+            .map(|token| token.text_range())
+            .unwrap_or(range);
+        let name = lower_name(name_token);
+        let ty_ast = self.ty();
+        let ty_range = ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
+        let ty = ty_ast.map(|t| t.lower());
         let attrs = lower_attrs(self.syntax());
         let visibility = lower_visibility(self.is_pub());
         arena.alloc(HirTypeAlias {
             name,
+            name_range,
             visibility,
             ty,
+            ty_range,
             attrs,
         })
     }
@@ -400,8 +517,8 @@ impl Lower for StructField {
         let ty = self.ty().lower();
         let ty_range = self
             .ty()
-            .map(|ty| ty.syntax().text_range())
-            .unwrap_or_else(|| self.syntax().text_range());
+            .map(|ty| trimmed_range(ty.syntax()))
+            .unwrap_or_else(|| trimmed_range(self.syntax()));
         let attrs = lower_attrs(self.syntax());
         HirStructField {
             name,
@@ -446,6 +563,15 @@ impl Lower for Type {
                 .value()
                 .map(|value| HirTypeRef::Const(HirConstArg::Value(value)))
                 .unwrap_or(HirTypeRef::Error),
+            Type::Function(function) => HirTypeRef::Function {
+                params: function.param_types().map(Lower::lower).collect(),
+                ret: Box::new(
+                    function
+                        .return_type()
+                        .map(Lower::lower)
+                        .unwrap_or_else(|| HirTypeRef::Tuple(Vec::new())),
+                ),
+            },
         }
     }
 }
@@ -531,6 +657,7 @@ impl Lower for Option<ast::Path> {
 impl Lower for ast::UseTree {
     type Output = HirUseTree;
     fn lower(self) -> Self::Output {
+        let range = trimmed_range(self.syntax());
         let prefix = self.path().lower();
         let kind = if self.is_glob() {
             HirUseTreeKind::Glob
@@ -540,6 +667,10 @@ impl Lower for ast::UseTree {
             let alias = self.alias().map(|t| Name(t.text().to_string()));
             HirUseTreeKind::Simple { alias }
         };
-        HirUseTree { prefix, kind }
+        HirUseTree {
+            prefix,
+            kind,
+            range,
+        }
     }
 }

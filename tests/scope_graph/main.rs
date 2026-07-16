@@ -1,4 +1,6 @@
 mod basic;
+#[path = "../support/diagnostics.rs"]
+mod diagnostic_support;
 mod hir_lowering;
 mod impls;
 mod imports;
@@ -40,7 +42,8 @@ fn build_hir_and_graph_from_parse(parse: &Parse) -> (HirFile, ScopeGraph) {
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
     let hir = lower_root(root);
-    let (sg, _) = build_scope_graph(&hir, &syntax);
+    let (sg, diagnostics) = build_scope_graph(&hir, &syntax);
+    diagnostic_support::assert_hir_diagnostics(&syntax.to_string(), &diagnostics);
     (hir, sg)
 }
 
@@ -176,6 +179,7 @@ fn def_kind(def: &DefRef) -> DefKind {
         DefRef::Module { .. } => DefKind::Module,
         DefRef::Local { .. } => DefKind::Local,
         DefRef::Param { .. } => DefKind::Param,
+        DefRef::LambdaParam { .. } => DefKind::Param,
         DefRef::ConstParam { .. } => DefKind::Param,
         DefRef::PatternBinding { .. } => DefKind::Local,
         DefRef::UseAlias { .. } => DefKind::UseAlias,

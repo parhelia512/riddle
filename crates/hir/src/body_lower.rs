@@ -12,9 +12,9 @@ use rowan::{TextRange, ast::SyntaxNodePtr};
 use super::{
     HirFile,
     body::{
-        BinaryOp, Body, BodyItem, Diagnostic, Expr, ExprId, FieldPat, LabelStyle, LiteralPattern,
-        MatchArm, PatId, Pattern, Severity, SourceLabel, SourceMap, Stmt, StmtId, StructExprField,
-        UnaryOp,
+        BinaryOp, Body, BodyItem, Diagnostic, Expr, ExprId, FieldPat, LabelStyle, LambdaParam,
+        LiteralPattern, MatchArm, PatId, Pattern, Severity, SourceLabel, SourceMap, Stmt, StmtId,
+        StructExprField, UnaryOp,
     },
     item_tree::HirTypeRef,
     item_tree::{HirPath, PathAnchor},
@@ -97,10 +97,8 @@ impl<'a> BodyLower<'a> {
         });
     }
 
-    fn missing_expr(&mut self, message: impl Into<String>) -> ExprId {
+    fn missing_expr(&mut self, message: impl Into<String>, range: TextRange) -> ExprId {
         let msg = message.into();
-        // Missing expressions have a degenerate zero-width span.
-        let range = TextRange::empty(0u32.into());
         self.diagnostic(msg, range);
         self.alloc_expr(Expr::Missing, range)
     }
@@ -109,10 +107,15 @@ impl<'a> BodyLower<'a> {
         expr.map(|expr| self.lower_expr(expr))
     }
 
-    fn lower_required_expr(&mut self, expr: Option<ast::Expr>, msg: impl Into<String>) -> ExprId {
+    fn lower_required_expr(
+        &mut self,
+        expr: Option<ast::Expr>,
+        msg: impl Into<String>,
+        fallback: TextRange,
+    ) -> ExprId {
         match expr {
             Some(e) => self.lower_expr(e),
-            None => self.missing_expr(msg),
+            None => self.missing_expr(msg, fallback),
         }
     }
 
@@ -120,10 +123,11 @@ impl<'a> BodyLower<'a> {
         &mut self,
         block: Option<ast::Block>,
         msg: impl Into<String>,
+        fallback: TextRange,
     ) -> ExprId {
         match block {
             Some(b) => self.lower_block(b),
-            None => self.missing_expr(msg),
+            None => self.missing_expr(msg, fallback),
         }
     }
 
@@ -138,7 +142,7 @@ impl<'a> BodyLower<'a> {
     }
 
     fn lower_block(&mut self, block: ast::Block) -> ExprId {
-        let range = block.syntax().text_range();
+        let range = trimmed_range(block.syntax());
         let stmts = block
             .stmts()
             .filter_map(|stmt| self.lower_stmt(stmt))
@@ -148,7 +152,7 @@ impl<'a> BodyLower<'a> {
     }
 
     fn lower_stmt(&mut self, stmt: ast::Stmt) -> Option<StmtId> {
-        let range = stmt.syntax().text_range();
+        let range = trimmed_range(stmt.syntax());
         match stmt {
             ast::Stmt::VarDecl(var) => {
                 let name_token = var.name();
@@ -182,7 +186,8 @@ impl<'a> BodyLower<'a> {
             ast::Stmt::ContinueStmt(_) => Some(self.alloc_stmt(Stmt::Continue, range)),
 
             ast::Stmt::ExprStmt(es) => {
-                let expr = self.lower_required_expr(es.expr(), "missing expression statement");
+                let expr =
+                    self.lower_required_expr(es.expr(), "missing expression statement", range);
                 Some(self.alloc_stmt(Stmt::Expr { expr }, range))
             }
 
@@ -293,7 +298,7 @@ impl<'a> BodyLower<'a> {
     }
 
     fn lower_expr(&mut self, expr: ast::Expr) -> ExprId {
-        let range = expr.syntax().text_range();
+        let range = trimmed_range(expr.syntax());
         match expr {
             ast::Expr::Number(n) => {
                 let text = n
@@ -370,19 +375,21 @@ impl<'a> BodyLower<'a> {
             },
 
             ast::Expr::BinaryExpr(b) => {
-                let lhs = self.lower_required_expr(b.lhs(), "missing lhs of binary expression");
-                let rhs = self.lower_required_expr(b.rhs(), "missing rhs of binary expression");
+                let lhs =
+                    self.lower_required_expr(b.lhs(), "missing lhs of binary expression", range);
+                let rhs =
+                    self.lower_required_expr(b.rhs(), "missing rhs of binary expression", range);
                 let Some(op) = b.op_token().and_then(lower_binary_op) else {
-                    return self.missing_expr("missing binary operator");
+                    return self.missing_expr("missing binary operator", range);
                 };
                 self.alloc_expr(Expr::Binary { lhs, rhs, op }, range)
             }
 
             ast::Expr::UnaryExpr(u) => {
                 let Some(token) = u.op_token() else {
-                    return self.missing_expr("missing unary operator");
+                    return self.missing_expr("missing unary operator", range);
                 };
-                let operand = self.lower_required_expr(u.operand(), "missing unary operand");
+                let operand = self.lower_required_expr(u.operand(), "missing unary operand", range);
                 let is_mut = u.is_mut();
                 if token.kind() == SyntaxKind::AmpAmp {
                     let inner_op = if is_mut {
@@ -406,7 +413,7 @@ impl<'a> BodyLower<'a> {
                     );
                 }
                 let Some(base_op) = lower_unary_op(Some(token)) else {
-                    return self.missing_expr("unknown unary operator");
+                    return self.missing_expr("unknown unary operator", range);
                 };
                 let op = if is_mut && base_op == UnaryOp::Ref {
                     UnaryOp::MutRef
@@ -422,19 +429,20 @@ impl<'a> BodyLower<'a> {
                 let body = u
                     .body()
                     .map(|b| self.lower_block(b))
-                    .unwrap_or_else(|| self.missing_expr("missing unsafe block body"));
+                    .unwrap_or_else(|| self.missing_expr("missing unsafe block body", range));
                 self.alloc_expr(Expr::Unsafe { body }, range)
             }
 
             ast::Expr::CastExpr(c) => {
-                let base = self.lower_required_expr(c.base(), "missing cast operand");
+                let base = self.lower_required_expr(c.base(), "missing cast operand", range);
                 let target = self.lower_optional_type(c.ty());
                 self.alloc_expr(Expr::Cast { base, target }, range)
             }
 
             ast::Expr::IfStmt(i) => {
-                let cond = self.lower_required_expr(i.condition(), "missing if condition");
-                let then_branch = self.lower_required_block(i.then_branch(), "missing if body");
+                let cond = self.lower_required_expr(i.condition(), "missing if condition", range);
+                let then_branch =
+                    self.lower_required_block(i.then_branch(), "missing if body", range);
                 let else_branch = match i.else_branch() {
                     Some(ElseBranch::Block(b)) => Some(self.lower_block(b)),
                     Some(ElseBranch::IfStmt(i)) => Some(self.lower_expr(ast::Expr::IfStmt(i))),
@@ -451,8 +459,9 @@ impl<'a> BodyLower<'a> {
             }
 
             ast::Expr::WhileStmt(w) => {
-                let condition = self.lower_required_expr(w.condition(), "missing while condition");
-                let body = self.lower_required_block(w.body(), "missing while body");
+                let condition =
+                    self.lower_required_expr(w.condition(), "missing while condition", range);
+                let body = self.lower_required_block(w.body(), "missing while body", range);
                 self.alloc_expr(Expr::While { condition, body }, range)
             }
 
@@ -464,8 +473,9 @@ impl<'a> BodyLower<'a> {
                     .unwrap_or(range);
                 let name = lower_name(name_token);
                 let pat = self.alloc_pat(Pattern::Binding { name }, pat_range);
-                let iterable = self.lower_required_expr(f.iterable(), "missing for iterable");
-                let body = self.lower_required_block(f.body(), "missing for body");
+                let iterable =
+                    self.lower_required_expr(f.iterable(), "missing for iterable", range);
+                let body = self.lower_required_block(f.body(), "missing for body", range);
                 self.alloc_expr(
                     Expr::For {
                         pat,
@@ -477,19 +487,62 @@ impl<'a> BodyLower<'a> {
             }
 
             ast::Expr::CallExpr(c) => {
-                let callee = self.lower_required_expr(c.callee(), "missing call callee");
+                let callee = self.lower_required_expr(c.callee(), "missing call callee", range);
                 let args = self.lower_arg_list(c.arg_list());
                 self.alloc_expr(Expr::Call { callee, args }, range)
             }
 
+            ast::Expr::LambdaExpr(lambda) => {
+                let params = lambda
+                    .param_list()
+                    .map(|list| {
+                        list.params()
+                            .map(|param| {
+                                let name_token = param.name();
+                                let ty = param.ty();
+                                LambdaParam {
+                                    name: lower_name(name_token.clone()),
+                                    name_range: name_token.map(|token| token.text_range()),
+                                    ty_range: ty.as_ref().map(|ty| trimmed_range(ty.syntax())),
+                                    ty: self.lower_optional_type(ty),
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ret_type = lambda.return_type();
+                let ret_type_range = ret_type.as_ref().map(|ty| trimmed_range(ty.syntax()));
+                let ret_type = self.lower_optional_type(ret_type);
+                let body = self.lower_required_block(
+                    lambda.body(),
+                    "missing anonymous function body",
+                    range,
+                );
+                self.alloc_expr(
+                    Expr::Lambda {
+                        params,
+                        ret_type,
+                        ret_type_range,
+                        body,
+                    },
+                    range,
+                )
+            }
+
             ast::Expr::MatchExpr(m) => {
-                let scrutinee = self.lower_required_expr(m.scrutinee(), "missing match scrutinee");
+                let scrutinee =
+                    self.lower_required_expr(m.scrutinee(), "missing match scrutinee", range);
                 let arms = m
                     .arms()
                     .map(|arm| {
                         let pat = self.lower_arm_pattern(arm.pattern());
                         let guard = self.lower_optional_expr(arm.guard());
-                        let body = self.lower_required_expr(arm.body(), "missing match arm body");
+                        let arm_range = trimmed_range(arm.syntax());
+                        let body = self.lower_required_expr(
+                            arm.body(),
+                            "missing match arm body",
+                            arm_range,
+                        );
                         MatchArm { pat, guard, body }
                     })
                     .collect();
@@ -498,8 +551,10 @@ impl<'a> BodyLower<'a> {
 
             ast::Expr::ArrayExpr(a) => {
                 if a.is_repeat() {
-                    let value = self.lower_required_expr(a.repeat_value(), "missing array value");
-                    let len = self.lower_required_expr(a.repeat_len(), "missing array length");
+                    let value =
+                        self.lower_required_expr(a.repeat_value(), "missing array value", range);
+                    let len =
+                        self.lower_required_expr(a.repeat_len(), "missing array length", range);
                     self.alloc_expr(Expr::ArrayRepeat { value, len }, range)
                 } else {
                     let elements = a.elements().map(|e| self.lower_expr(e)).collect();
@@ -545,14 +600,15 @@ impl<'a> BodyLower<'a> {
             }
 
             ast::Expr::FieldExpr(f) => {
-                let base = self.lower_required_expr(f.base(), "missing field base");
+                let base = self.lower_required_expr(f.base(), "missing field base", range);
                 let field = lower_name(f.field_name());
                 self.alloc_expr(Expr::FieldAccess { base, field }, range)
             }
 
             ast::Expr::IndexExpr(idx) => {
-                let base = self.lower_required_expr(idx.base(), "missing index base");
-                let index = self.lower_required_expr(idx.index(), "missing index expression");
+                let base = self.lower_required_expr(idx.base(), "missing index base", range);
+                let index =
+                    self.lower_required_expr(idx.index(), "missing index expression", range);
                 self.alloc_expr(Expr::IndexAccess { base, index }, range)
             }
         }
@@ -568,7 +624,7 @@ impl<'a> BodyLower<'a> {
     }
 
     fn lower_pattern(&mut self, pat: ast::Pattern) -> PatId {
-        let range = pat.syntax().text_range();
+        let range = trimmed_range(pat.syntax());
         match pat {
             ast::Pattern::Wildcard(_) => self.alloc_pat(Pattern::Wildcard, range),
             ast::Pattern::Literal(literal) => {

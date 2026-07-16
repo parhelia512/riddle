@@ -6,3 +6,4 @@ publish = false
 
 [dependencies]
 hir = { path = "../hir" }
+type-checker = { path = "../type-checker" }

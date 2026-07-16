@@ -140,6 +140,14 @@ impl<'f> Builder<'f> {
         self.emit(InstKind::Call(callee, args), ret_ty)
     }
 
+    pub fn function_ref(&mut self, function: FuncRef, ty: Type) -> Value {
+        self.emit(InstKind::FunctionRef(function), ty)
+    }
+
+    pub fn call_indirect(&mut self, callee: Value, args: Vec<Value>, ret_ty: Type) -> Value {
+        self.emit(InstKind::CallIndirect(callee, args), ret_ty)
+    }
+
     // 终止指令
 
     pub fn set_branch(&mut self, target: BlockId) {

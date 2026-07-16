@@ -171,6 +171,12 @@ pub enum Expr {
         callee: ExprId,
         args: Vec<ExprId>,
     },
+    Lambda {
+        params: Vec<LambdaParam>,
+        ret_type: HirTypeRef,
+        ret_type_range: Option<TextRange>,
+        body: ExprId,
+    },
     FieldAccess {
         base: ExprId,
         field: Name,
@@ -199,6 +205,14 @@ pub struct MatchArm {
     pub pat: PatId,
     pub guard: Option<ExprId>,
     pub body: ExprId,
+}
+
+#[derive(Debug, Clone)]
+pub struct LambdaParam {
+    pub name: Name,
+    pub name_range: Option<TextRange>,
+    pub ty: HirTypeRef,
+    pub ty_range: Option<TextRange>,
 }
 
 /// Lowered pattern. Bindings introduced by patterns become locals in the arm body.
@@ -257,6 +271,7 @@ pub struct FieldPat {
 pub enum ResolvedName {
     Local(StmtId),
     Param(usize),
+    LambdaParam { lambda: ExprId, index: usize },
     Function(FunctionId),
     Struct(StructId),
     Enum(item_tree::EnumId),
@@ -497,6 +512,33 @@ impl BodyPrinter<'_> {
                     .join(", ");
                 format!("{}({})", callee, args)
             }
+            Expr::Lambda {
+                params,
+                ret_type,
+                body,
+                ..
+            } => {
+                let params = params
+                    .iter()
+                    .map(|param| {
+                        if matches!(param.ty, HirTypeRef::Unknown) {
+                            param.name.0.clone()
+                        } else {
+                            format!("{}: {}", param.name.0, param.ty.display())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret = if matches!(ret_type, HirTypeRef::Unknown) {
+                    String::new()
+                } else {
+                    format!(" -> {}", ret_type.display())
+                };
+                format!(
+                    "fun({params}){ret} {}",
+                    self.print_block_like(*body, indent)
+                )
+            }
             Expr::FieldAccess { base, field } => {
                 let base = self.print_expr(*base, current_prec, indent);
                 format!("({}.{})", base, field.0)
@@ -645,6 +687,7 @@ impl BodyPrinter<'_> {
             | Expr::Array { .. }
             | Expr::ArrayRepeat { .. } => 100,
             Expr::Call { .. } | Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => 90,
+            Expr::Lambda { .. } => 70,
             Expr::Cast { .. } => 85,
             Expr::Unary { .. } => 80,
             Expr::Binary { op, .. } => Self::binary_prec(op),
@@ -754,6 +797,14 @@ impl BodyPrinter<'_> {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
             HirTypeRef::Const(value) => value.display(),
+            HirTypeRef::Function { params, ret } => {
+                let params = params
+                    .iter()
+                    .map(Self::type_text)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("fun({params}) -> {}", Self::type_text(ret))
+            }
         }
     }
 
