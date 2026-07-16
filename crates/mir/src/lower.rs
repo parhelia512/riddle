@@ -18,6 +18,13 @@ use crate::module::Module;
 use crate::types::*;
 use crate::value::{BlockId, FuncRef, Value};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinOperator {
+    Binary(BinOp),
+    Unary(UnOp),
+    Assign(BinOp),
+}
+
 /// Lower a type-checked HIR module into MIR.
 ///
 /// `analysis` determines whether each local variable escapes its scope;
@@ -28,11 +35,23 @@ pub fn lower_hir(
     type_result: &TypeCheckResult,
     escape_result: &EscapeResult,
 ) -> Module {
+    let method_impls = hir
+        .item_tree
+        .impls
+        .iter()
+        .flat_map(|(impl_id, imp)| {
+            imp.methods
+                .iter()
+                .copied()
+                .map(move |function_id| (function_id, impl_id))
+        })
+        .collect();
     let mut ctx = LowerCtx {
         hir,
         type_result,
         analysis: escape_result,
         module: Module::new("main"),
+        method_impls,
         expr_cache: HashMap::new(),
         current_body: None,
         current_function: None,
@@ -54,7 +73,8 @@ pub fn lower_hir(
 
     // 遍历所有有函数体的函数
     for (fid, func) in hir.item_tree.functions.iter() {
-        if !func.generics.is_empty()
+        if ctx.builtin_operator_for_method(fid).is_some()
+            || !func.generics.is_empty()
             || ctx
                 .impl_for_method(fid)
                 .map(|imp| !imp.generics.is_empty() || !imp.const_generics.is_empty())
@@ -101,6 +121,7 @@ struct LowerCtx<'a> {
     type_result: &'a TypeCheckResult,
     analysis: &'a EscapeResult,
     module: Module,
+    method_impls: HashMap<hir::item_tree::FunctionId, hir::item_tree::ImplId>,
     expr_cache: HashMap<ExprId, Value>,
     /// The BodyId currently being lowered, used to look up expr_types.
     current_body: Option<BodyId>,
@@ -898,12 +919,28 @@ impl<'a> LowerCtx<'a> {
                     }
                 } else {
                     let target_fid = self.callee_function_id(*callee);
-                    let name = if let (Some(fid), Expr::FieldAccess { base, .. }) =
-                        (target_fid, &body.exprs[*callee])
+                    let method_target = match (target_fid, &body.exprs[*callee]) {
+                        (Some(fid), Expr::FieldAccess { base, .. }) => {
+                            Some((self.actual_method_fid(*callee, fid, *base), *base))
+                        }
+                        _ => None,
+                    };
+                    if let Some((fid, base)) = method_target
+                        && let Some(op) = self.builtin_operator_for_method(fid)
                     {
-                        let actual_fid = self.actual_method_fid(*callee, fid, *base);
-                        self.mono_method_name(actual_fid, *base)
-                            .unwrap_or_else(|| self.function_name(actual_fid))
+                        return self.lower_builtin_operator_method_call(
+                            builder,
+                            param_values,
+                            body,
+                            base,
+                            args,
+                            op,
+                        );
+                    }
+
+                    let name = if let Some((fid, base)) = method_target {
+                        self.mono_method_name(fid, base)
+                            .unwrap_or_else(|| self.function_name(fid))
                     } else {
                         target_fid
                             .map(|fid| {
@@ -913,21 +950,17 @@ impl<'a> LowerCtx<'a> {
                             .unwrap_or_else(|| callee_name(body, *callee))
                     };
                     let mut arg_vals: Vec<Value> = Vec::new();
-                    if let Expr::FieldAccess { base, .. } = &body.exprs[*callee]
-                        && let Some(fid) = target_fid
-                    {
-                        let receiver_fid = self.actual_method_fid(*callee, fid, *base);
-                        if let Some(receiver) =
+                    if let Some((receiver_fid, base)) = method_target
+                        && let Some(receiver) =
                             self.hir.item_tree.functions[receiver_fid].params.first()
-                        {
-                            arg_vals.push(self.lower_receiver_arg(
-                                builder,
-                                param_values,
-                                body,
-                                *base,
-                                &receiver.ty,
-                            ));
-                        }
+                    {
+                        arg_vals.push(self.lower_receiver_arg(
+                            builder,
+                            param_values,
+                            body,
+                            base,
+                            &receiver.ty,
+                        ));
                     }
                     arg_vals.extend(
                         args.iter()
@@ -1962,6 +1995,53 @@ impl<'a> LowerCtx<'a> {
         builder.call(FuncRef::Local(name), args, ret_ty)
     }
 
+    fn lower_builtin_operator_method_call(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        base: ExprId,
+        args: &[ExprId],
+        op: BuiltinOperator,
+    ) -> Value {
+        let value_ty = self
+            .current_body
+            .and_then(|bid| self.type_result.expr_types.get(&(bid, base)))
+            .map(|ty| self.convert_type(ty))
+            .unwrap_or(Type::Unit);
+        match op {
+            BuiltinOperator::Binary(op) => {
+                let lhs = self.lower_expr(builder, param_values, body, base);
+                let rhs = self.lower_expr(
+                    builder,
+                    param_values,
+                    body,
+                    *args.first().expect("checked binary operator missing rhs"),
+                );
+                builder.binop(op, lhs, rhs, value_ty)
+            }
+            BuiltinOperator::Unary(op) => {
+                let operand = self.lower_expr(builder, param_values, body, base);
+                builder.unop(op, operand, value_ty)
+            }
+            BuiltinOperator::Assign(op) => {
+                let place = self.lower_lvalue(builder, param_values, body, base);
+                let rhs = self.lower_expr(
+                    builder,
+                    param_values,
+                    body,
+                    *args
+                        .first()
+                        .expect("checked assignment operator missing rhs"),
+                );
+                let lhs = builder.load(place, value_ty.clone());
+                let value = builder.binop(op, lhs, rhs, value_ty);
+                builder.store(value, place);
+                builder.unit_const()
+            }
+        }
+    }
+
     fn actual_method_fid(
         &mut self,
         callee: ExprId,
@@ -2758,11 +2838,67 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn impl_for_method(&self, fid: hir::item_tree::FunctionId) -> Option<&hir::item_tree::HirImpl> {
-        self.hir
-            .item_tree
-            .impls
-            .iter()
-            .find_map(|(_, imp)| imp.methods.contains(&fid).then_some(imp))
+        self.method_impls
+            .get(&fid)
+            .map(|impl_id| &self.hir.item_tree.impls[*impl_id])
+    }
+
+    fn builtin_operator_for_method(
+        &self,
+        fid: hir::item_tree::FunctionId,
+    ) -> Option<BuiltinOperator> {
+        let imp = self.impl_for_method(fid)?;
+        if !imp.generics.is_empty() || !imp.const_generics.is_empty() {
+            return None;
+        }
+        let scalar = primitive_scalar_name(&imp.self_ty)?;
+        let trait_id = self.resolve_trait_ref(imp.trait_ty.as_ref()?)?;
+        let trait_item = &self.hir.item_tree.traits[trait_id];
+        let lang = trait_item.attrs.iter().find_map(|attr| {
+            (attr.name.0 == "lang")
+                .then_some(attr.value.as_deref())
+                .flatten()
+        })?;
+        let function = &self.hir.item_tree.functions[fid];
+        if !function.generics.is_empty() || !function.const_generics.is_empty() {
+            return None;
+        }
+        let method = function.name.0.as_str();
+        let op = builtin_operator(lang, method)?;
+        builtin_operator_supports(op, scalar).then_some(())?;
+        trait_operator_contract(trait_item, method, op).then_some(())?;
+        self.impl_operator_contract(imp, function, op).then_some(op)
+    }
+
+    fn impl_operator_contract(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        function: &hir::item_tree::HirFunction,
+        op: BuiltinOperator,
+    ) -> bool {
+        if !operator_params_match(function, &imp.self_ty, op) {
+            return false;
+        }
+        match op {
+            BuiltinOperator::Assign(_) => returns_unit(function),
+            BuiltinOperator::Binary(_) | BuiltinOperator::Unary(_) => {
+                let Some(ret) = function.ret_type.as_ref() else {
+                    return false;
+                };
+                if type_matches_self(ret, &imp.self_ty) {
+                    return true;
+                }
+                is_self_output(ret)
+                    && imp.type_aliases.iter().any(|alias_id| {
+                        let alias = &self.hir.item_tree.type_aliases[*alias_id];
+                        alias.name.0 == "Output"
+                            && alias
+                                .ty
+                                .as_ref()
+                                .is_some_and(|ty| type_matches_self(ty, &imp.self_ty))
+                    })
+            }
+        }
     }
 
     fn function_name(&self, fid: hir::item_tree::FunctionId) -> String {
@@ -3175,6 +3311,186 @@ fn mono_type_name(ty: &Type) -> String {
 
 // 辅助函数
 
+fn primitive_scalar_name(ty: &hir::item_tree::HirTypeRef) -> Option<&str> {
+    let hir::item_tree::HirTypeRef::Named(path) = ty else {
+        return None;
+    };
+    path.as_single_name()
+        .map(|name| name.0.as_str())
+        .filter(|name| {
+            matches!(
+                *name,
+                "bool"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "isize"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "usize"
+                    | "f16"
+                    | "f32"
+                    | "f64"
+                    | "f128"
+            )
+        })
+}
+
+fn builtin_operator(lang: &str, method: &str) -> Option<BuiltinOperator> {
+    let operator = match (lang, method) {
+        ("add", "add") => BuiltinOperator::Binary(BinOp::Add),
+        ("sub", "sub") => BuiltinOperator::Binary(BinOp::Sub),
+        ("mul", "mul") => BuiltinOperator::Binary(BinOp::Mul),
+        ("div", "div") => BuiltinOperator::Binary(BinOp::Div),
+        ("rem", "rem") => BuiltinOperator::Binary(BinOp::Mod),
+        ("neg", "neg") => BuiltinOperator::Unary(UnOp::Neg),
+        ("not", "not") => BuiltinOperator::Unary(UnOp::Not),
+        ("bitand", "bitand") => BuiltinOperator::Binary(BinOp::BitAnd),
+        ("bitor", "bitor") => BuiltinOperator::Binary(BinOp::BitOr),
+        ("bitxor", "bitxor") => BuiltinOperator::Binary(BinOp::BitXor),
+        ("shl", "shl") => BuiltinOperator::Binary(BinOp::Shl),
+        ("shr", "shr") => BuiltinOperator::Binary(BinOp::Shr),
+        ("add_assign", "add_assign") => BuiltinOperator::Assign(BinOp::Add),
+        ("sub_assign", "sub_assign") => BuiltinOperator::Assign(BinOp::Sub),
+        ("mul_assign", "mul_assign") => BuiltinOperator::Assign(BinOp::Mul),
+        ("div_assign", "div_assign") => BuiltinOperator::Assign(BinOp::Div),
+        ("rem_assign", "rem_assign") => BuiltinOperator::Assign(BinOp::Mod),
+        ("bitand_assign", "bitand_assign") => BuiltinOperator::Assign(BinOp::BitAnd),
+        ("bitor_assign", "bitor_assign") => BuiltinOperator::Assign(BinOp::BitOr),
+        ("bitxor_assign", "bitxor_assign") => BuiltinOperator::Assign(BinOp::BitXor),
+        ("shl_assign", "shl_assign") => BuiltinOperator::Assign(BinOp::Shl),
+        ("shr_assign", "shr_assign") => BuiltinOperator::Assign(BinOp::Shr),
+        _ => return None,
+    };
+    Some(operator)
+}
+
+fn builtin_operator_supports(op: BuiltinOperator, scalar: &str) -> bool {
+    let integer = matches!(
+        scalar,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+    );
+    let float = matches!(scalar, "f16" | "f32" | "f64" | "f128");
+    let signed = matches!(scalar, "i8" | "i16" | "i32" | "i64" | "i128" | "isize");
+    match op {
+        BuiltinOperator::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+        | BuiltinOperator::Assign(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => {
+            integer || float
+        }
+        BuiltinOperator::Binary(BinOp::Mod) | BuiltinOperator::Assign(BinOp::Mod) => integer,
+        BuiltinOperator::Unary(UnOp::Neg) => signed || float,
+        BuiltinOperator::Unary(UnOp::Not) => scalar == "bool" || integer,
+        BuiltinOperator::Binary(BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
+        | BuiltinOperator::Assign(BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) => {
+            scalar == "bool" || integer
+        }
+        BuiltinOperator::Binary(BinOp::Shl | BinOp::Shr)
+        | BuiltinOperator::Assign(BinOp::Shl | BinOp::Shr) => integer,
+        BuiltinOperator::Unary(UnOp::Ref | UnOp::MutRef | UnOp::Deref) => false,
+    }
+}
+
+fn operator_params_match(
+    function: &hir::item_tree::HirFunction,
+    self_ty: &hir::item_tree::HirTypeRef,
+    op: BuiltinOperator,
+) -> bool {
+    match op {
+        BuiltinOperator::Binary(_) => {
+            function.params.len() == 2
+                && type_matches_self(&function.params[0].ty, self_ty)
+                && type_matches_self(&function.params[1].ty, self_ty)
+        }
+        BuiltinOperator::Unary(_) => {
+            function.params.len() == 1 && type_matches_self(&function.params[0].ty, self_ty)
+        }
+        BuiltinOperator::Assign(_) => {
+            function.params.len() == 2
+                && matches!(
+                    &function.params[0].ty,
+                    hir::item_tree::HirTypeRef::Ref(inner, true)
+                        if type_matches_self(inner, self_ty)
+                )
+                && type_matches_self(&function.params[1].ty, self_ty)
+        }
+    }
+}
+
+fn type_matches_self(
+    ty: &hir::item_tree::HirTypeRef,
+    self_ty: &hir::item_tree::HirTypeRef,
+) -> bool {
+    ty == self_ty
+        || matches!(
+            ty,
+            hir::item_tree::HirTypeRef::Named(path)
+                if path.as_single_name().is_some_and(|name| name.0 == "Self")
+        )
+}
+
+fn trait_operator_contract(
+    trait_item: &hir::item_tree::HirTrait,
+    method: &str,
+    op: BuiltinOperator,
+) -> bool {
+    let Some(function) = trait_item
+        .methods
+        .iter()
+        .find(|function| function.name.0 == method)
+    else {
+        return false;
+    };
+    if !function.generics.is_empty() || !function.const_generics.is_empty() {
+        return false;
+    }
+    let self_ty = hir::item_tree::HirTypeRef::Named(hir::item_tree::HirPath {
+        anchor: hir::item_tree::PathAnchor::Plain,
+        segments: vec![hir::Name("Self".into())],
+        type_args: Vec::new(),
+    });
+    if !operator_params_match(function, &self_ty, op) {
+        return false;
+    }
+    match op {
+        BuiltinOperator::Assign(_) => returns_unit(function),
+        BuiltinOperator::Binary(_) | BuiltinOperator::Unary(_) => {
+            trait_item
+                .type_aliases
+                .iter()
+                .any(|alias| alias.name.0 == "Output" && alias.ty.is_none())
+                && function.ret_type.as_ref().is_some_and(is_self_output)
+        }
+    }
+}
+
+fn is_self_output(ty: &hir::item_tree::HirTypeRef) -> bool {
+    let hir::item_tree::HirTypeRef::Named(path) = ty else {
+        return false;
+    };
+    is_self_associated_path(path) && path.segments[1].0 == "Output"
+}
+
+fn returns_unit(function: &hir::item_tree::HirFunction) -> bool {
+    function.ret_type.as_ref().is_none_or(
+        |ty| matches!(ty, hir::item_tree::HirTypeRef::Tuple(elements) if elements.is_empty()),
+    )
+}
+
 fn convert_binop(op: &HirBinOp) -> BinOp {
     match op {
         HirBinOp::Add => BinOp::Add,
@@ -3349,5 +3665,95 @@ fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
         (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
         (Type::Ptr(_), Type::Ptr(_)) => CastOp::PtrToPtr,
         _ => CastOp::IntToInt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lang_operator_methods_map_to_mir_operations() {
+        let cases = [
+            ("add", "add", BuiltinOperator::Binary(BinOp::Add)),
+            ("sub", "sub", BuiltinOperator::Binary(BinOp::Sub)),
+            ("mul", "mul", BuiltinOperator::Binary(BinOp::Mul)),
+            ("div", "div", BuiltinOperator::Binary(BinOp::Div)),
+            ("rem", "rem", BuiltinOperator::Binary(BinOp::Mod)),
+            ("neg", "neg", BuiltinOperator::Unary(UnOp::Neg)),
+            ("not", "not", BuiltinOperator::Unary(UnOp::Not)),
+            ("bitand", "bitand", BuiltinOperator::Binary(BinOp::BitAnd)),
+            ("bitor", "bitor", BuiltinOperator::Binary(BinOp::BitOr)),
+            ("bitxor", "bitxor", BuiltinOperator::Binary(BinOp::BitXor)),
+            ("shl", "shl", BuiltinOperator::Binary(BinOp::Shl)),
+            ("shr", "shr", BuiltinOperator::Binary(BinOp::Shr)),
+            (
+                "add_assign",
+                "add_assign",
+                BuiltinOperator::Assign(BinOp::Add),
+            ),
+            (
+                "sub_assign",
+                "sub_assign",
+                BuiltinOperator::Assign(BinOp::Sub),
+            ),
+            (
+                "mul_assign",
+                "mul_assign",
+                BuiltinOperator::Assign(BinOp::Mul),
+            ),
+            (
+                "div_assign",
+                "div_assign",
+                BuiltinOperator::Assign(BinOp::Div),
+            ),
+            (
+                "rem_assign",
+                "rem_assign",
+                BuiltinOperator::Assign(BinOp::Mod),
+            ),
+            (
+                "bitand_assign",
+                "bitand_assign",
+                BuiltinOperator::Assign(BinOp::BitAnd),
+            ),
+            (
+                "bitor_assign",
+                "bitor_assign",
+                BuiltinOperator::Assign(BinOp::BitOr),
+            ),
+            (
+                "bitxor_assign",
+                "bitxor_assign",
+                BuiltinOperator::Assign(BinOp::BitXor),
+            ),
+            (
+                "shl_assign",
+                "shl_assign",
+                BuiltinOperator::Assign(BinOp::Shl),
+            ),
+            (
+                "shr_assign",
+                "shr_assign",
+                BuiltinOperator::Assign(BinOp::Shr),
+            ),
+        ];
+
+        for (lang, method, expected) in cases {
+            assert_eq!(builtin_operator(lang, method), Some(expected));
+        }
+        assert_eq!(builtin_operator("add", "sub"), None);
+        assert!(!builtin_operator_supports(
+            BuiltinOperator::Binary(BinOp::Add),
+            "bool"
+        ));
+        assert!(!builtin_operator_supports(
+            BuiltinOperator::Binary(BinOp::BitAnd),
+            "f32"
+        ));
+        assert!(builtin_operator_supports(
+            BuiltinOperator::Binary(BinOp::BitAnd),
+            "bool"
+        ));
     }
 }

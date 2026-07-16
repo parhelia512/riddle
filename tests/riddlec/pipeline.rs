@@ -450,21 +450,34 @@ fn std_clone_and_comparison_methods_are_callable() {
 }
 
 #[test]
-fn std_operator_trait_methods_are_callable() {
+fn std_operator_trait_methods_emit_native_c_without_wrappers() {
     let result = compile(
         r#"
-            fun main() -> i32 {
-                let value: i32 = 12;
-                let reduced = value.sub(2).mul(3).div(2).rem(10);
-                let bits = reduced.bitand(7).bitor(8).bitxor(1);
-                let shifted = bits.shl(1).shr(1);
-                let mut total = shifted;
-                total.add_assign(2);
-                total.sub_assign(1);
-                total.mul_assign(2);
-                total.div_assign(2);
-                total.rem_assign(10);
-                total
+            fun main() -> i64 {
+                let mut value: i64 = 64i64;
+                let added = value.add(2i64);
+                let subtracted = added.sub(1i64);
+                let multiplied = subtracted.mul(3i64);
+                let divided = multiplied.div(2i64);
+                let remainder = divided.rem(5i64);
+                let masked = remainder.bitand(7i64);
+                let combined = masked.bitor(8i64);
+                let toggled = combined.bitxor(3i64);
+                let shifted = toggled.shl(1i64).shr(1i64);
+                let negated = shifted.not().neg();
+
+                value.add_assign(3i64);
+                value.sub_assign(1i64);
+                value.mul_assign(2i64);
+                value.div_assign(2i64);
+                value.rem_assign(63i64);
+                value.bitand_assign(31i64);
+                value.bitor_assign(8i64);
+                value.bitxor_assign(1i64);
+                value.shl_assign(1i64);
+                value.shr_assign(1i64);
+
+                if true.not() { value } else { value + negated }
             }
             "#,
     );
@@ -477,8 +490,34 @@ fn std_operator_trait_methods_are_callable() {
         result.analysis_diagnostics
     );
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
-    assert!(c.contains("sub__i32"), "{c}");
-    assert!(c.contains("add_assign__i32"), "{c}");
+    for method in [
+        "add__",
+        "sub__",
+        "mul__",
+        "div__",
+        "rem__",
+        "neg__",
+        "not__",
+        "bitand__",
+        "bitor__",
+        "bitxor__",
+        "shl__",
+        "shr__",
+        "add_assign__",
+        "sub_assign__",
+        "mul_assign__",
+        "div_assign__",
+        "rem_assign__",
+        "bitand_assign__",
+        "bitor_assign__",
+        "bitxor_assign__",
+        "shl_assign__",
+        "shr_assign__",
+    ] {
+        assert!(!c.contains(method), "unexpected `{method}` wrapper:\n{c}");
+    }
+    assert!(c.contains(" + "), "expected native C addition:\n{c}");
+    assert!(c.contains("(-("), "expected native C negation:\n{c}");
 }
 
 #[test]

@@ -430,6 +430,229 @@ fn i32_add_lowers_to_builtin_binop() {
 }
 
 #[test]
+fn primitive_lang_operator_methods_lower_without_wrapper_functions() {
+    let module = lower(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+
+        #[lang = "neg"]
+        trait Neg {
+            type Output;
+            fun neg(self) -> Self::Output;
+        }
+
+        #[lang = "add_assign"]
+        trait AddAssign {
+            fun add_assign(&mut self, rhs: Self);
+        }
+
+        impl Add for i32 {
+            type Output = i32;
+            fun add(self, rhs: Self) -> Self::Output { self + rhs }
+        }
+
+        impl Neg for i32 {
+            type Output = i32;
+            fun neg(self) -> Self::Output { -self }
+        }
+
+        impl AddAssign for i32 {
+            fun add_assign(&mut self, rhs: Self) { *self += rhs; }
+        }
+
+        fun main() -> i32 {
+            let mut value: i32 = 1;
+            let sum = value.add(2);
+            let negated = sum.neg();
+            value.add_assign(3);
+            value + negated
+        }
+        "#,
+    );
+
+    let wrappers = module
+        .function_order
+        .iter()
+        .map(|fid| module.functions[*fid].name.as_str())
+        .filter(|name| matches!(*name, "add__i32" | "neg__i32" | "add_assign__i32"))
+        .collect::<Vec<_>>();
+    assert!(wrappers.is_empty(), "unexpected wrappers: {wrappers:?}");
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    let instructions = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| block.insts.iter())
+        .collect::<Vec<_>>();
+
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction.kind,
+        mir::instr::InstKind::BinOp(mir::instr::BinOp::Add, _, _)
+    )));
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction.kind,
+        mir::instr::InstKind::UnOp(mir::instr::UnOp::Neg, _)
+    )));
+    assert!(!instructions.iter().any(|instruction| matches!(
+        &instruction.kind,
+        mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
+            if name == "add__i32" || name == "neg__i32" || name == "add_assign__i32"
+    )));
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.kind, mir::instr::InstKind::Store(_, _)))
+            .count(),
+        2,
+        "initialization and add_assign must both write to value"
+    );
+    assert!(instructions.windows(4).any(|window| {
+        matches!(
+            window[0].kind,
+            mir::instr::InstKind::Const(mir::instr::ConstValue::Int(3, _))
+        ) && matches!(window[1].kind, mir::instr::InstKind::Load(_))
+            && matches!(
+                window[2].kind,
+                mir::instr::InstKind::BinOp(mir::instr::BinOp::Add, _, _)
+            )
+            && matches!(window[3].kind, mir::instr::InstKind::Store(_, _))
+    }));
+}
+
+#[test]
+fn primitive_operator_trait_without_lang_marker_keeps_ordinary_method() {
+    let module = lower(
+        r#"
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+
+        impl Add for i32 {
+            type Output = i32;
+            fun add(self, rhs: Self) -> Self::Output { self + rhs }
+        }
+
+        fun main() -> i32 {
+            let value: i32 = 1;
+            value.add(2)
+        }
+        "#,
+    );
+
+    assert!(
+        module
+            .function_order
+            .iter()
+            .any(|fid| module.functions[*fid].name == "add__i32")
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    assert!(
+        main.blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|instruction| matches!(
+                &instruction.kind,
+                mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
+                    if name == "add__i32"
+            )))
+    );
+}
+
+#[test]
+fn malformed_lang_operator_signature_keeps_ordinary_method() {
+    let module = lower(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            fun add(self) -> i32;
+        }
+
+        impl Add for i32 {
+            fun add(self) -> i32 { self }
+        }
+
+        fun main() -> i32 {
+            let value: i32 = 1;
+            value.add()
+        }
+        "#,
+    );
+
+    assert!(
+        module
+            .function_order
+            .iter()
+            .any(|fid| module.functions[*fid].name == "add__i32")
+    );
+}
+
+#[test]
+fn generic_lang_operator_method_uses_builtin_after_monomorphization() {
+    let module = lower(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+
+        impl Add for i32 {
+            type Output = i32;
+            fun add(self, rhs: Self) -> Self::Output { self + rhs }
+        }
+
+        fun sum<T: Add<Output = T>>(left: T, right: T) -> T {
+            left.add(right)
+        }
+
+        fun main() -> i32 {
+            sum(1, 2)
+        }
+        "#,
+    );
+
+    assert!(
+        module
+            .function_order
+            .iter()
+            .all(|fid| module.functions[*fid].name != "add__i32")
+    );
+    let sum = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "sum__i32")
+        .unwrap();
+    assert!(
+        sum.blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|instruction| matches!(
+                instruction.kind,
+                mir::instr::InstKind::BinOp(mir::instr::BinOp::Add, _, _)
+            )))
+    );
+    assert!(!sum.blocks.iter().any(|(_, block)| {
+        block
+            .insts
+            .iter()
+            .any(|instruction| matches!(instruction.kind, mir::instr::InstKind::Call(_, _)))
+    }));
+}
+
+#[test]
 fn overloaded_add_lowers_to_method_call() {
     let module = lower(
         r#"
