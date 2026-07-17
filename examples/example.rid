@@ -5,7 +5,9 @@ enum Foo{
     B
 }
 
-impl PartialEq for Foo {}
+impl PartialEq for Foo {
+
+}
 impl Eq for Foo {}
 
 impl Foo{
