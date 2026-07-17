@@ -321,11 +321,33 @@ fn infers_mutable_closure_capture() {
 
 #[test]
 fn mutable_closure_requires_mutable_binding() {
-    let result = check("fun main() { let mut total = 0; let add = fun() { total += 1; }; add(); }");
+    let source = "fun main() { let mut total = 0; let add = fun() { total += 1; }; add(); }";
+    let result = check(source);
 
-    assert!(result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0031" && diagnostic.message.contains("mutable closure")
-    }));
+    let diagnostic = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code == "E0031" && diagnostic.message.contains("mutable closure")
+        })
+        .unwrap();
+    assert_eq!(
+        diagnostic.notes,
+        ["add `mut` to the closure binding because calling it may update captured state"]
+    );
+    assert_eq!(
+        &source[diagnostic.labels[0].range], "add",
+        "the primary label should point at the immutable binding"
+    );
+    assert_eq!(
+        usize::from(diagnostic.labels[0].range.start()),
+        source.find("add").unwrap()
+    );
+    assert_eq!(
+        diagnostic.labels[1].style,
+        type_checker::LabelStyle::Secondary
+    );
+    assert_eq!(&source[diagnostic.labels[1].range], "add");
 }
 
 #[test]

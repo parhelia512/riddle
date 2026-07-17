@@ -1022,6 +1022,7 @@ impl<'a> TypeChecker<'a> {
         span: Option<TextRange>,
     ) {
         let span = span.expect("type-checker diagnostics require a source range");
+        let message = message.into();
         let notes = match code {
             "E0001" => vec!["expected one type but found another; consider an explicit type annotation or cast".into()],
             "E0002" => vec!["all branches must produce values of the same type; ensure both branches return compatible types".into()],
@@ -1037,6 +1038,9 @@ impl<'a> TypeChecker<'a> {
             "E0012" => vec!["this source and target type pair does not support `as` conversion".into()],
             "E0013" => vec!["check the impl block and receiver type".into()],
             "E0020" | "E0024" => vec!["remove the duplicate definition".into()],
+            "E0031" if message == "cannot call a mutable closure through an immutable binding" => {
+                vec!["add `mut` to the closure binding because calling it may update captured state".into()]
+            }
             "E0031" => vec!["add `mut` to the `let` binding if reassignment is intended".into()],
             "E0033" => vec!["recursive generic calls must reuse the same type arguments; wrapping them requires infinitely many instantiations".into()],
             "E0035" => vec!["the inferred type must implement every trait bound on the generic parameter".into()],
@@ -1061,7 +1065,7 @@ impl<'a> TypeChecker<'a> {
         self.result.diagnostics.push(Diagnostic {
             code,
             severity: Severity::Error,
-            message: message.into(),
+            message,
             labels: vec![SourceLabel {
                 range: span,
                 message: String::new(),

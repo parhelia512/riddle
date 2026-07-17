@@ -18,9 +18,9 @@ const DOCUMENTED_ERROR_CODES: &[&str] = &[
 const SOURCE_UNREACHABLE_CODES: &[&str] = &["E0012", "E0021", "E0200"];
 
 fn temp_root(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    env::temp_dir().join(format!(
         "riddle-lsp-{name}-{}-{}",
-        std::process::id(),
+        process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -920,30 +920,33 @@ fn reachable_diagnostic_producers_have_exact_primary_and_lsp_spans() {
 }
 
 #[test]
-fn closure_diagnostic_spans_point_at_the_failing_use() {
+fn closure_diagnostic_spans_point_at_the_relevant_source() {
     let cases = [
         (
             "E0031",
             "mutable closure",
             "fun main() { let mut total = 0; let add = fun() { total += 1; }; add(); }",
             "add",
+            false,
         ),
         (
             "E0100",
             "use of moved value: `once`",
             "struct Token { value: i32 } fun take(value: Token) {} fun main() { let token = Token { value: 1 }; let once = fun() { take(token); }; once(); once(); }",
             "once",
+            true,
         ),
         (
             "E0303",
             "assign to `base` while borrowed",
             "fun main() { let mut base = 1; let read = fun() { base }; base = 2; read(); }",
             "base = 2",
+            true,
         ),
     ];
     let uri = lsp_types::Url::parse("file:///closure-spans.rid").unwrap();
 
-    for (code, message, source, expected) in cases {
+    for (code, message, source, expected, use_last) in cases {
         let result =
             riddlec::pipeline::compile_with_options(source, CompileOptions { use_std: false });
         let diagnostic = result
@@ -958,7 +961,12 @@ fn closure_diagnostic_spans_point_at_the_failing_use() {
             .iter()
             .find(|label| label.style == type_checker::LabelStyle::Primary)
             .unwrap();
-        let start = source.rfind(expected).unwrap();
+        let start = if use_last {
+            source.rfind(expected)
+        } else {
+            source.find(expected)
+        }
+        .unwrap();
         let end = start + expected.len();
 
         assert_eq!(
@@ -1230,17 +1238,17 @@ fn watched_topology_and_manifest_changes_reset_analysis_sessions() {
     let rid = lsp_types::Url::parse("file:///workspace/src/main.rid").unwrap();
     let manifest = lsp_types::Url::parse("file:///workspace/Clue.toml").unwrap();
 
-    assert!(!watched_change_resets_sessions(&lsp_types::FileEvent {
+    assert!(!watched_change_resets_sessions(&FileEvent {
         uri: rid.clone(),
-        typ: lsp_types::FileChangeType::CHANGED,
+        typ: FileChangeType::CHANGED,
     }));
-    assert!(watched_change_resets_sessions(&lsp_types::FileEvent {
+    assert!(watched_change_resets_sessions(&FileEvent {
         uri: rid,
-        typ: lsp_types::FileChangeType::CREATED,
+        typ: FileChangeType::CREATED,
     }));
-    assert!(watched_change_resets_sessions(&lsp_types::FileEvent {
+    assert!(watched_change_resets_sessions(&FileEvent {
         uri: manifest,
-        typ: lsp_types::FileChangeType::CHANGED,
+        typ: FileChangeType::CHANGED,
     }));
 }
 

@@ -17,8 +17,8 @@ use crate::{
     context::{BodyCtx, LambdaCtx},
     lowering::{collect_subst, generic_param_map_with_consts, substitute_type},
     result::{
-        CaptureMode, CaptureSource, ClosureKind, ForLoopInfo, LambdaCapture, LambdaInfo,
-        OperatorCall, TraitMethodCall,
+        CaptureMode, CaptureSource, ClosureKind, ForLoopInfo, LabelStyle, LambdaCapture,
+        LambdaInfo, OperatorCall, SourceLabel, TraitMethodCall,
     },
     types::{ConstArg, IntTy, Type},
 };
@@ -850,21 +850,37 @@ impl TypeChecker<'_> {
         let Expr::Path { path, resolved } = &ctx.body.exprs[callee] else {
             return;
         };
-        let immutable = match resolved {
-            Some(ResolvedName::Local(stmt)) => {
-                ctx.locals.get(stmt).is_some_and(|(_, mutable)| !mutable)
-            }
-            Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => true,
-            _ => path
-                .as_single_name()
-                .is_some_and(|name| ctx.bindings.get(&name.0).is_some()),
+        let (immutable, binding_range) = match resolved {
+            Some(ResolvedName::Local(stmt)) => (
+                ctx.locals.get(stmt).is_some_and(|(_, mutable)| !mutable),
+                match &ctx.body.stmts[*stmt] {
+                    Stmt::Let { name_range, .. } => *name_range,
+                    _ => None,
+                },
+            ),
+            Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => (true, None),
+            _ => (
+                path.as_single_name()
+                    .is_some_and(|name| ctx.bindings.get(&name.0).is_some()),
+                None,
+            ),
         };
         if immutable {
+            let call_range = ctx.expr_range(callee);
             self.diagnostic(
                 "E0031",
                 "cannot call a mutable closure through an immutable binding",
-                ctx.expr_range(callee),
+                binding_range.or(call_range),
             );
+            if let (Some(_), Some(call_range)) = (binding_range, call_range) {
+                let diagnostic = self.result.diagnostics.last_mut().unwrap();
+                diagnostic.labels[0].message = "immutable closure binding".into();
+                diagnostic.labels.push(SourceLabel {
+                    range: call_range,
+                    message: "mutable closure called here".into(),
+                    style: LabelStyle::Secondary,
+                });
+            }
         }
     }
 

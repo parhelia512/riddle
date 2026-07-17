@@ -6,9 +6,13 @@ fun print_digit(n: i32){
 }
 
 fun main(){
-    let t = fun(x) {
-        x+1
+    let mut v = 1;
+    v+=1;
+    let f = fun(x) {
+        v = v + 1;
+        v = x;
+        v
     };
-    let v = t(1);
-    print_digit(v);
+    let vv = f(1);
+    print_digit(vv);
 }

@@ -49,7 +49,7 @@ lsp-types = "0.94.1"
 mir = { path = "crates/mir" }
 riddlec = { path = "app/riddlec" }
 rowan = "0.15"
-tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sync", "time"] }
 tower-lsp = "0.20.0"
 type-checker = { path = "crates/type-checker" }
 
