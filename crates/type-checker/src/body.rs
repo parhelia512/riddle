@@ -377,7 +377,8 @@ impl TypeChecker<'_> {
             }
             Expr::Cast { base, target } => {
                 let source_ty = self.check_expr(ctx, *base);
-                let target_ty = self.lower_type_ref_with_params_at(target, &HashMap::new(), span);
+                let target_ty =
+                    self.lower_type_ref_with_params_at(target, &ctx.generic_params, span);
                 if !source_ty.is_unknown_like()
                     && !matches!(target_ty, Type::Error)
                     && !is_supported_cast(&source_ty, &target_ty)
@@ -1922,9 +1923,17 @@ impl TypeChecker<'_> {
         };
 
         let function = &self.hir.item_tree.functions[fid];
+        let impl_generics = self.impl_generic_names(fid);
+        let impl_const_generics = self.impl_const_generic_names(fid);
         let params = generic_param_map_with_consts(
-            function.generics.iter().map(|name| name.0.as_str()),
-            function.const_generics.iter().map(|name| name.0.as_str()),
+            impl_generics
+                .iter()
+                .map(String::as_str)
+                .chain(function.generics.iter().map(|name| name.0.as_str())),
+            impl_const_generics
+                .iter()
+                .map(String::as_str)
+                .chain(function.const_generics.iter().map(|name| name.0.as_str())),
         );
         let mut subst = HashMap::new();
         if args.len() != function.params.len() {
@@ -1963,13 +1972,28 @@ impl TypeChecker<'_> {
             }
         }
 
-        if !function.generics.is_empty() || !function.const_generics.is_empty() {
-            if function
-                .generics
+        if let (Some(expected), Some(return_ty)) = (expected, function.ret_type.as_ref()) {
+            let return_pattern = self.lower_type_ref_with_params_at(
+                return_ty,
+                &params,
+                function.ret_type_range.or(Some(function.name_range)),
+            );
+            collect_subst(&return_pattern, expected, &mut subst);
+        }
+
+        if !impl_generics.is_empty()
+            || !impl_const_generics.is_empty()
+            || !function.generics.is_empty()
+            || !function.const_generics.is_empty()
+        {
+            let unresolved = impl_generics
                 .iter()
-                .chain(function.const_generics.iter())
-                .any(|name| subst.get(&name.0).is_none_or(generic_arg_unknown))
-            {
+                .map(String::as_str)
+                .chain(function.generics.iter().map(|name| name.0.as_str()))
+                .chain(impl_const_generics.iter().map(String::as_str))
+                .chain(function.const_generics.iter().map(|name| name.0.as_str()))
+                .any(|name| subst.get(name).is_none_or(generic_arg_unknown));
+            if unresolved {
                 self.diagnostic(
                     "E0005",
                     format!(
@@ -1980,11 +2004,13 @@ impl TypeChecker<'_> {
                 );
             }
             self.check_generic_bounds(ctx, function, &subst, span);
-            let args = function
-                .generics
+            let args = impl_generics
                 .iter()
-                .chain(function.const_generics.iter())
-                .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+                .map(String::as_str)
+                .chain(function.generics.iter().map(|name| name.0.as_str()))
+                .chain(impl_const_generics.iter().map(String::as_str))
+                .chain(function.const_generics.iter().map(|name| name.0.as_str()))
+                .map(|name| subst.get(name).cloned().unwrap_or(Type::Unknown))
                 .collect::<Vec<_>>();
             for arg in &args {
                 self.expect_sized_value(arg, span);

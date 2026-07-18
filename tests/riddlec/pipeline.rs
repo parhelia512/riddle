@@ -421,6 +421,98 @@ fn std_range_iterator_type_checks() {
 }
 
 #[test]
+fn std_basic_value_methods_compile() {
+    let result = compile(
+        r#"
+            struct Token {
+                value: i32,
+            }
+
+            fun main() -> i32 {
+                let some: Option<i32> = Some(2);
+                let option_value = some.unwrap_or(0);
+                let none: Option<i32> = None;
+                let fallback = none.or(Some(4)).unwrap_or(0);
+
+                let ok: Result<i32, bool> = Ok(3);
+                let result_value = ok.unwrap_or(0);
+                let has_value = ok.ok().is_some();
+                let err: Result<i32, bool> = Err(true);
+                let has_error = err.err().is_some();
+
+                let token: Option<Token> = Some(Token { value: 5 });
+                let token_is_present = token.is_some();
+                let token_value = token.unwrap_or(Token { value: 0 }).value;
+
+                let text: &str = "abc";
+                let byte = text.byte_at(1usize).unwrap_or(0u8) as i32;
+
+                if some.is_some() && none.is_none() && ok.is_ok() && err.is_err()
+                    && has_value && has_error && text.byte_at(3usize).is_none()
+                    && token_is_present && token_value == 5
+                    && text.len() == 3usize && !text.is_empty() {
+                    option_value + fallback + result_value + byte
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(
+        result.success(),
+        "hir: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+    let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+    assert!(c.contains("return s.len"), "{c}");
+    assert!(c.contains("s.ptr[i]"), "{c}");
+    assert!(c.contains("is_some__Option_i32"), "{c}");
+}
+
+#[test]
+fn std_string_and_vector_compile() {
+    let result = compile(
+        r#"
+            fun main() -> i32 {
+                let mut values: Vector<i32> = Vector::new();
+                values.push(1);
+                values.push(2);
+                let fallback = 0;
+                let first = *values.get(0usize).unwrap_or(&fallback);
+                let missing = values.get(2usize).is_none();
+                let last = values.pop().unwrap_or(0);
+
+                let mut text = String::from_str("hello");
+                text.push_str(" world");
+                if first == 1 && last == 2 && missing
+                    && text.len() == 11usize && text.as_str() == "hello world" {
+                    0
+                } else {
+                    1
+                }
+            }
+            "#,
+    );
+
+    assert!(
+        result.success(),
+        "parse: {:#?}\nhir: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+    let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+    assert!(c.contains("new__Vector_i32"), "{c}");
+    assert!(c.contains("vector_grow"), "{c}");
+    assert!(c.contains("size_of_ptr__i32"), "{c}");
+    assert!(c.contains("str_from_raw"), "{c}");
+}
+
+#[test]
 fn std_clone_and_comparison_methods_are_callable() {
     let result = compile(
         r#"
@@ -857,10 +949,15 @@ fn unit_return_does_not_hide_non_exhaustive_payload_match() {
 fn std_modules_expose_core_items() {
     let result = compile(
         r#"
+            use std::String;
+            use std::Vector;
+
             fun main() {
                 let value = std::option::Option::Some(1);
                 let mut iter: Range = std::ops::range(0, 3);
                 let first = iter.next();
+                let text = String::new();
+                let values: Vector<i32> = Vector::new();
             }
             "#,
     );

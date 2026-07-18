@@ -297,6 +297,74 @@ fn standard_library_basics_compile_and_run() {
 }
 
 #[test]
+fn string_and_vector_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping String and Vector runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("string-vector");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"fun main() -> i32 {
+    let mut values: Vector<i32> = Vector::new();
+    let mut index = 0;
+    while index < 10 {
+        values.push(index);
+        index += 1;
+    }
+
+    let fallback = -1;
+    let first = *values.get(0usize).unwrap_or(&fallback);
+    let missing = values.get(10usize).is_none();
+    let mut replacement = -1;
+    {
+        let second = values.get_mut(1usize).unwrap_or(&mut replacement);
+        *second = 20;
+    }
+    let last = values.pop().unwrap_or(-1);
+    let capacity_grew = values.capacity() >= 10usize;
+    let mut sum = 0;
+    for value in values {
+        sum += value;
+    }
+
+    let mut text = String::from_str("hello");
+    text.push_str(" world");
+    let text_matches = text.len() == 11usize && text.as_str() == "hello world";
+    text.clear();
+    let text_cleared = text.is_empty() && text.as_str() == "";
+    let empty = String::new();
+    let empty_view = empty.as_str() == "";
+
+    let mut cleared: Vector<i32> = Vector::new();
+    cleared.push(1);
+    cleared.clear();
+    let vector_cleared = cleared.is_empty();
+
+    if first == 0 && last == 9 && missing && capacity_grew && sum == 55
+        && text_matches && text_cleared && empty_view && vector_cleared {
+        0
+    } else {
+        1
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn build_loads_local_path_dependencies() {
     if c_compiler().is_none() {
         eprintln!("skipping native dependency build test: no C compiler found");

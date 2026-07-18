@@ -1,6 +1,45 @@
+use crate::std::option::Option;
+
 pub enum Result<T, E> {
     Ok(T),
     Err(E),
+}
+
+impl<T, E> Result<T, E> {
+    pub fun is_ok(&self) -> bool {
+        match *self {
+            Result::Ok(_) => true,
+            Result::Err(_) => false,
+        }
+    }
+
+    pub fun is_err(&self) -> bool {
+        match *self {
+            Result::Ok(_) => false,
+            Result::Err(_) => true,
+        }
+    }
+
+    pub fun unwrap_or(self, fallback: T) -> T {
+        match self {
+            Result::Ok(value) => value,
+            Result::Err(_) => fallback,
+        }
+    }
+
+    pub fun ok(self) -> Option<T> {
+        match self {
+            Result::Ok(value) => Option::Some(value),
+            Result::Err(_) => Option::None,
+        }
+    }
+
+    pub fun err(self) -> Option<E> {
+        match self {
+            Result::Ok(_) => Option::None,
+            Result::Err(error) => Option::Some(error),
+        }
+    }
 }
 
 impl<T: crate::std::marker::Copy, E: crate::std::marker::Copy> crate::std::marker::Copy for Result<T, E> {}

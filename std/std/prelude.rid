@@ -8,3 +8,5 @@ pub use crate::std::option::Option;
 pub use crate::std::option::Option::{None, Some};
 pub use crate::std::result::Result;
 pub use crate::std::result::Result::{Err, Ok};
+pub use crate::std::string::String;
+pub use crate::std::vector::Vector;

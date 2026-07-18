@@ -1,0 +1,72 @@
+use crate::std::option::Option;
+use crate::std::vector::Vector;
+
+extern "C" {
+    fun str_len(value: &str) -> usize;
+    fun str_byte(value: &str, index: usize) -> u8;
+    fun str_from_raw(data: *const u8, len: usize) -> &str;
+}
+
+pub struct String {
+    bytes: Vector<u8>,
+}
+
+impl String {
+    pub fun new() -> String {
+        String {
+            bytes: Vector::new(),
+        }
+    }
+
+    pub fun from_str(value: &str) -> String {
+        let mut output = String::new();
+        output.push_str(value);
+        output
+    }
+
+    pub fun as_str(&self) -> &str {
+        str_from_raw(self.bytes.as_ptr(), self.bytes.len())
+    }
+
+    pub fun len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fun capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    pub fun is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fun push_str(&mut self, value: &str) {
+        let mut index = 0usize;
+        while index < value.len() {
+            self.bytes.push(str_byte(value, index));
+            index += 1usize;
+        }
+    }
+
+    pub fun clear(&mut self) {
+        self.bytes.clear();
+    }
+}
+
+impl str {
+    pub fun len(&self) -> usize {
+        str_len(self)
+    }
+
+    pub fun is_empty(&self) -> bool {
+        self.len() == 0usize
+    }
+
+    pub fun byte_at(&self, index: usize) -> Option<u8> {
+        if index < self.len() {
+            Option::Some(str_byte(self, index))
+        } else {
+            Option::None
+        }
+    }
+}

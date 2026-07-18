@@ -1,5 +1,7 @@
 pub mod option;
 pub mod result;
+pub mod string;
+pub mod vector;
 pub mod iter;
 pub mod array;
 pub mod marker;
@@ -7,3 +9,6 @@ pub mod clone;
 pub mod cmp;
 pub mod ops;
 pub mod prelude;
+
+pub use crate::std::string::String;
+pub use crate::std::vector::Vector;

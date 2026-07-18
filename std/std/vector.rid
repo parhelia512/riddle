@@ -1,0 +1,124 @@
+use crate::std::iter::{IntoIterator, Iterator};
+use crate::std::option::Option;
+
+extern "C" {
+    fun size_of_ptr<T>(value: *const T) -> usize;
+    fun vector_grow(
+        data: *mut u8,
+        len: usize,
+        capacity: usize,
+        item_size: usize
+    ) -> *mut u8;
+}
+
+pub struct Vector<T> {
+    data: *mut T,
+    len: usize,
+    capacity: usize,
+}
+
+pub struct VectorIntoIter<T> {
+    data: *mut T,
+    index: usize,
+    len: usize,
+}
+
+impl<T> Vector<T> {
+    pub fun new() -> Vector<T> {
+        Vector {
+            data: 0usize as *mut T,
+            len: 0usize,
+            capacity: 0usize,
+        }
+    }
+
+    pub fun len(&self) -> usize {
+        self.len
+    }
+
+    pub fun capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fun is_empty(&self) -> bool {
+        self.len == 0usize
+    }
+
+    pub fun push(&mut self, value: T) {
+        if self.len == self.capacity {
+            self.data = vector_grow(
+                self.data as *mut u8,
+                self.len,
+                self.capacity,
+                size_of_ptr(self.data as *const T)
+            ) as *mut T;
+            if self.capacity == 0usize {
+                self.capacity = 4usize;
+            } else {
+                self.capacity *= 2usize;
+            }
+        }
+        self.data[self.len] = value;
+        self.len += 1usize;
+    }
+
+    pub fun pop(&mut self) -> Option<T> {
+        if self.len == 0usize {
+            Option::None
+        } else {
+            self.len -= 1usize;
+            Option::Some(self.data[self.len])
+        }
+    }
+
+    pub fun get(&self, index: usize) -> Option<&T> {
+        if index < self.len {
+            Option::Some(&self.data[index])
+        } else {
+            Option::None
+        }
+    }
+
+    pub fun get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index < self.len {
+            Option::Some(&mut self.data[index])
+        } else {
+            Option::None
+        }
+    }
+
+    pub fun clear(&mut self) {
+        self.len = 0usize;
+    }
+
+    pub fun as_ptr(&self) -> *const T {
+        self.data as *const T
+    }
+}
+
+impl<T> Iterator for VectorIntoIter<T> {
+    type Item = T;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.index < self.len {
+            let value = self.data[self.index];
+            self.index += 1usize;
+            Option::Some(value)
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl<T> IntoIterator for Vector<T> {
+    type Item = T;
+    type IntoIter = VectorIntoIter<T>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        VectorIntoIter {
+            data: self.data,
+            index: 0usize,
+            len: self.len,
+        }
+    }
+}

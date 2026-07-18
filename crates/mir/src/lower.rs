@@ -94,6 +94,10 @@ pub fn lower_hir(
         .extern_function_ids
         .iter()
         .filter(|&&fid| !hir.function_bodies.contains_key(&fid))
+        .filter(|&&fid| {
+            let function = &hir.item_tree.functions[fid];
+            function.generics.is_empty() && function.const_generics.is_empty()
+        })
         .map(|&fid| {
             let func = &hir.item_tree.functions[fid];
             (func.name.0.clone(), func)
@@ -2102,7 +2106,6 @@ impl<'a> LowerCtx<'a> {
         base: ExprId,
         expected: &hir::item_tree::HirTypeRef,
     ) -> Value {
-        let base_val = self.lower_expr(builder, param_values, body, base);
         let base_ty = self
             .current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, base)))
@@ -2110,17 +2113,23 @@ impl<'a> LowerCtx<'a> {
             .unwrap_or(Type::Unit);
 
         match expected {
-            hir::item_tree::HirTypeRef::Ref(_, _) if matches!(base_ty, Type::Ref(_, _)) => base_val,
-            hir::item_tree::HirTypeRef::Ref(_, mutable) => {
-                let expected_ty = Type::Ref(Box::new(base_ty), *mutable);
-                let op = if *mutable {
-                    HirUnOp::MutRef
-                } else {
-                    HirUnOp::Ref
-                };
-                builder.unop(convert_unop(&op), base_val, expected_ty)
+            hir::item_tree::HirTypeRef::Ref(_, _) if matches!(base_ty, Type::Ref(_, _)) => {
+                self.lower_expr(builder, param_values, body, base)
             }
-            _ => base_val,
+            hir::item_tree::HirTypeRef::Ref(_, true) => {
+                let place = self.lower_lvalue(builder, param_values, body, base);
+                builder.unop(
+                    convert_unop(&HirUnOp::MutRef),
+                    place,
+                    Type::Ref(Box::new(base_ty), true),
+                )
+            }
+            hir::item_tree::HirTypeRef::Ref(_, mutable) => {
+                let base_val = self.lower_expr(builder, param_values, body, base);
+                let expected_ty = Type::Ref(Box::new(base_ty), *mutable);
+                builder.unop(convert_unop(&HirUnOp::Ref), base_val, expected_ty)
+            }
+            _ => self.lower_expr(builder, param_values, body, base),
         }
     }
 
@@ -2774,7 +2783,12 @@ impl<'a> LowerCtx<'a> {
         callee: ExprId,
     ) -> Option<String> {
         let function = &self.hir.item_tree.functions[fid];
-        if function.generics.is_empty() {
+        let imp = self.impl_for_method(fid).cloned();
+        let outer_generics = imp
+            .as_ref()
+            .map(|imp| imp.generics.as_slice())
+            .unwrap_or_default();
+        if outer_generics.is_empty() && function.generics.is_empty() {
             return None;
         }
         let body_id = self.current_body?;
@@ -2790,30 +2804,64 @@ impl<'a> LowerCtx<'a> {
             .iter()
             .map(|arg| self.convert_type(arg))
             .collect::<Vec<_>>();
-        let suffix = args
+        let type_names = outer_generics
             .iter()
-            .map(mono_type_name)
+            .chain(function.generics.iter())
+            .collect::<Vec<_>>();
+        let subst = type_names
+            .iter()
+            .zip(args.iter())
+            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .collect::<HashMap<_, _>>();
+        let suffix = if let Some(imp) = &imp {
+            let refs = subst
+                .iter()
+                .map(|(name, ty)| (name.as_str(), ty))
+                .collect::<HashMap<_, _>>();
+            std::iter::once(mono_type_name(&self.convert_hir_type_with_substs(
+                &imp.self_ty,
+                &refs,
+                &HashMap::new(),
+            )))
+            .chain(args.iter().skip(outer_generics.len()).map(mono_type_name))
             .collect::<Vec<_>>()
-            .join("_");
+            .join("_")
+        } else {
+            args.iter()
+                .map(mono_type_name)
+                .collect::<Vec<_>>()
+                .join("_")
+        };
         let key = (fid, suffix.clone());
         if let Some(name) = self.mono_functions.get(&key) {
             return Some(name.clone());
         }
 
-        let subst = function
-            .generics
-            .iter()
-            .zip(args.iter())
-            .map(|(name, ty)| (name.0.clone(), ty.clone()))
-            .collect();
-        let tc_subst = function
-            .generics
+        let tc_subst = type_names
             .iter()
             .zip(tc_args)
             .map(|(name, ty)| (name.0.clone(), ty))
             .collect();
         let mono_name = format!("{}__{}", function.name.0, suffix);
         self.mono_functions.insert(key, mono_name.clone());
+
+        if !self.hir.function_bodies.contains_key(&fid) {
+            let old_subst = std::mem::replace(&mut self.generic_subst, subst);
+            let params = function
+                .params
+                .iter()
+                .map(|param| self.convert_hir_type(&param.ty))
+                .collect();
+            let ret = function
+                .ret_type
+                .as_ref()
+                .map(|ty| self.convert_hir_type(ty))
+                .unwrap_or(Type::Unit);
+            self.generic_subst = old_subst;
+            self.module.add_extern(mono_name.clone(), params, ret);
+            return Some(mono_name);
+        }
+
         let old_subst = std::mem::replace(&mut self.generic_subst, subst);
         let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
