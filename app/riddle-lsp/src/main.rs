@@ -13,22 +13,25 @@ use diagnostics::{DiagnosticSessions, collect_workspace_diagnostics_cancellable}
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use diagnostics::{
-    PublishedDiagnostics, collect_diagnostics, collect_document_diagnostics,
-    collect_workspace_diagnostics, collect_workspace_diagnostics_with_sessions, position, range,
-    to_lsp,
+    collect_diagnostics, collect_document_diagnostics, collect_workspace_diagnostics,
+    collect_workspace_diagnostics_with_sessions, position, range, to_lsp,
 };
 use frontend::syntax_kind::SyntaxKind;
 use hir::body::{Expr, ResolvedName, Stmt};
+use hir::item_tree::HirTypeRef;
 #[cfg(test)]
 use lsp_types::Position;
 use lsp_types::{
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, FileChangeType, FileEvent, InitializeParams, InitializeResult,
-    InitializedParams, MessageType, PositionEncodingKind, SemanticToken, SemanticTokenModifier,
+    InitializedParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, MessageType,
+    NumberOrString, OneOf, PositionEncodingKind, Range, SemanticToken, SemanticTokenModifier,
     SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
     SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
+    WorkspaceEdit,
 };
 use riddlec::pipeline::CompileOptions;
 use rowan::TextRange;
@@ -69,6 +72,8 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                code_action_provider: Some(true.into()),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(
                     SemanticTokensOptions {
                         legend: semantic_tokens_legend(),
@@ -129,13 +134,6 @@ impl LanguageServer for Backend {
         self.schedule_diagnostics();
     }
 
-    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        if params.changes.iter().any(watched_change_resets_sessions) {
-            *self.diagnostic_sessions.lock().unwrap() = DiagnosticSessions::default();
-        }
-        self.schedule_diagnostics();
-    }
-
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
@@ -187,6 +185,155 @@ impl LanguageServer for Backend {
 
         Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let Some(text) = self
+            .docs
+            .lock()
+            .unwrap()
+            .get(&uri)
+            .map(|document| document.text.clone())
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        let analyzed_text = text.clone();
+        let hints = tokio::task::spawn_blocking(move || {
+            inlay_hints_for_source(&analyzed_text, params.range)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        if self
+            .docs
+            .lock()
+            .unwrap()
+            .get(&uri)
+            .is_none_or(|document| document.text != text)
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(hints))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        Ok(Some(quick_fixes(
+            &params.text_document.uri,
+            &params.context.diagnostics,
+        )))
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        if params.changes.iter().any(watched_change_resets_sessions) {
+            *self.diagnostic_sessions.lock().unwrap() = DiagnosticSessions::default();
+        }
+        self.schedule_diagnostics();
+    }
+}
+
+const MUTABLE_CLOSURE_BINDING_MESSAGE: &str =
+    "cannot call a mutable closure through an immutable binding\nimmutable closure binding";
+
+fn quick_fixes(uri: &lsp_types::Url, diagnostics: &[lsp_types::Diagnostic]) -> CodeActionResponse {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.source.as_deref() == Some("riddle")
+                && matches!(
+                    &diagnostic.code,
+                    Some(NumberOrString::String(code)) if code == "E0031"
+                )
+                && diagnostic
+                    .message
+                    .starts_with(MUTABLE_CLOSURE_BINDING_MESSAGE)
+        })
+        .map(|diagnostic| {
+            let start = diagnostic.range.start;
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Add `mut` to closure binding".into(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(HashMap::from([(
+                        uri.clone(),
+                        vec![TextEdit::new(Range::new(start, start), "mut ".into())],
+                    )])),
+                    ..WorkspaceEdit::default()
+                }),
+                is_preferred: Some(true),
+                ..CodeAction::default()
+            })
+        })
+        .collect()
+}
+
+fn inlay_hints_for_source(source: &str, range: Range) -> Vec<InlayHint> {
+    // ponytail: document-local type hints; reuse project analysis when cross-module hints matter.
+    let resolved =
+        riddlec::pipeline::resolve_with_options(source, CompileOptions { use_std: false });
+    let Some(hir) = resolved.hir.as_ref() else {
+        return Vec::new();
+    };
+    let type_result = type_checker::check_hir(hir);
+    let mut hints = Vec::new();
+
+    for (body_id, body) in hir.bodies.iter() {
+        for (_, statement) in body.stmts.iter() {
+            let Stmt::Let {
+                name_range: Some(name_range),
+                ty: HirTypeRef::Unknown,
+                init: Some(init),
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            if matches!(body.exprs[*init], Expr::Struct { .. }) {
+                continue;
+            }
+            let Some(init_range) = body.source_map.expr_ranges.get(init).copied() else {
+                continue;
+            };
+            if resolved
+                .hir_diagnostics
+                .iter()
+                .chain(type_result.diagnostics.iter())
+                .filter(|diagnostic| diagnostic.severity == type_checker::Severity::Error)
+                .flat_map(|diagnostic| &diagnostic.labels)
+                .any(|label| ranges_overlap(label.range, init_range))
+            {
+                continue;
+            }
+            let Some(ty) = type_result.expr_types.get(&(body_id, *init)) else {
+                continue;
+            };
+            if matches!(
+                ty,
+                type_checker::Type::Unknown
+                    | type_checker::Type::Error
+                    | type_checker::Type::InferVar(_)
+                    | type_checker::Type::Never
+            ) {
+                continue;
+            }
+            hints.push(InlayHint {
+                position: diagnostics::position(source, usize::from(name_range.end())),
+                label: InlayHintLabel::String(format!(": {}", ty.display(hir))),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: None,
+                tooltip: None,
+                padding_left: None,
+                padding_right: None,
+                data: None,
+            });
+        }
+    }
+
+    hints.retain(|hint| {
+        range.start.line <= hint.position.line && hint.position.line <= range.end.line
+    });
+    hints.sort_by_key(|hint| (hint.position.line, hint.position.character));
+    hints
 }
 
 fn watched_change_resets_sessions(change: &FileEvent) -> bool {
@@ -756,6 +903,7 @@ fn is_keyword(kind: SyntaxKind) -> bool {
             | SyntaxKind::Extern
             | SyntaxKind::Unsafe
             | SyntaxKind::For
+            | SyntaxKind::In
             | SyntaxKind::Where
             | SyntaxKind::True
             | SyntaxKind::False

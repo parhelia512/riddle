@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::pipeline::{CompileResult, DiagnosticExt, IntoDiagnosticExt, LoadedSource};
 
@@ -6,47 +6,48 @@ use crate::pipeline::{CompileResult, DiagnosticExt, IntoDiagnosticExt, LoadedSou
 /// Returns the error count.
 pub fn report(result: &CompileResult, source: Option<&str>, source_name: &str) -> usize {
     let mut stderr = io::stderr();
-    report_with(result, |diagnostic, stage| {
-        print_rust_style(&mut stderr, source, source_name, diagnostic, stage)
-    })
+    let color = stderr.is_terminal();
+    let errors = report_with(result, |diagnostic| {
+        print_rust_style(&mut stderr, source, source_name, diagnostic, color)
+    });
+    print_summary(&mut stderr, errors, color);
+    errors
 }
 
 pub fn report_mapped(result: &CompileResult, source: &LoadedSource, source_name: &str) -> usize {
     let mut stderr = io::stderr();
-    report_with(result, |diagnostic, stage| {
-        print_mapped(&mut stderr, source, source_name, diagnostic, stage)
-    })
+    let color = stderr.is_terminal();
+    let errors = report_with(result, |diagnostic| {
+        print_mapped(&mut stderr, source, source_name, diagnostic, color)
+    });
+    print_summary(&mut stderr, errors, color);
+    errors
 }
 
-fn report_with(result: &CompileResult, mut emit: impl FnMut(&DiagnosticExt, &str)) -> usize {
+fn report_with(result: &CompileResult, mut emit: impl FnMut(&DiagnosticExt)) -> usize {
     let mut count = 0;
 
     for e in &result.parse_errors {
-        emit(&e.to_ext(), "parse error");
+        emit(&e.to_ext());
         count += 1;
     }
 
     for d in &result.hir_diagnostics {
-        emit(&d.to_ext(), "hir error");
+        emit(&d.to_ext());
         if d.severity == type_checker::Severity::Error {
             count += 1;
         }
     }
 
     for d in &result.type_result.diagnostics {
-        emit(&d.to_ext(), "type error");
+        emit(&d.to_ext());
         if d.severity == type_checker::Severity::Error {
             count += 1;
         }
     }
 
     for d in &result.analysis_diagnostics {
-        let stage = match d.code {
-            "E0100" => "move error",
-            "E0200" => "escape",
-            _ => "analysis",
-        };
-        emit(&d.to_ext(), stage);
+        emit(&d.to_ext());
         if d.severity == type_checker::Severity::Error {
             count += 1;
         }
@@ -60,14 +61,15 @@ fn print_mapped(
     source: &LoadedSource,
     source_name: &str,
     diagnostic: &DiagnosticExt,
-    stage: &str,
+    color: bool,
 ) {
     let Some(primary) = diagnostic
         .labels
-        .first()
+        .iter()
+        .find(|label| label.style == type_checker::LabelStyle::Primary)
         .and_then(|label| source.source_map.map_range(label.range))
     else {
-        print_rust_style(out, Some(&source.source), source_name, diagnostic, stage);
+        print_rust_style(out, Some(&source.source), source_name, diagnostic, color);
         return;
     };
 
@@ -84,7 +86,7 @@ fn print_mapped(
             })
         })
         .collect();
-    for label in diagnostic.labels.iter().skip(1) {
+    for label in &diagnostic.labels {
         let Some(location) = source.source_map.map_range(label.range) else {
             continue;
         };
@@ -92,19 +94,25 @@ fn print_mapped(
             let line_col = offset_to_line_col(location.source, location.range.start());
             mapped.notes.push(format!(
                 "{}:{}:{}: {}",
-                location.path.display(),
+                display_path(location.path),
                 line_col.line,
                 line_col.col,
                 label.message
             ));
         }
     }
+    let mapped_source_name =
+        if std::fs::canonicalize(source_name).is_ok_and(|path| path == primary.path) {
+            display_path(std::path::Path::new(source_name))
+        } else {
+            display_path(primary.path)
+        };
     print_rust_style(
         out,
         Some(primary.source),
-        &primary.path.display().to_string(),
+        &mapped_source_name,
         &mapped,
-        stage,
+        color,
     );
 }
 
@@ -147,8 +155,6 @@ pub fn report_verbose(result: &CompileResult, _source: Option<&str>, _source_nam
     }
 }
 
-// ── rustc-style formatting ──────────────────────────────────────────────
-
 const RED: &str = "\x1b[1;31m";
 const YELLOW: &str = "\x1b[1;33m";
 const BLUE: &str = "\x1b[1;34m";
@@ -160,190 +166,318 @@ fn print_rust_style(
     source: Option<&str>,
     source_name: &str,
     d: &DiagnosticExt,
-    stage: &str,
+    color: bool,
 ) {
-    let severity_str = match d.severity {
-        type_checker::Severity::Error => format!("{RED}error{RESET}"),
-        type_checker::Severity::Warning => format!("{YELLOW}warning{RESET}"),
-        type_checker::Severity::Note => format!("{CYAN}note{RESET}"),
-        type_checker::Severity::Help => format!("{BLUE}help{RESET}"),
+    let severity = match d.severity {
+        type_checker::Severity::Error => "error",
+        type_checker::Severity::Warning => "warning",
+        type_checker::Severity::Note => "note",
+        type_checker::Severity::Help => "help",
     };
+    let primary_color = enabled_color(
+        color,
+        match d.severity {
+            type_checker::Severity::Error => RED,
+            type_checker::Severity::Warning => YELLOW,
+            type_checker::Severity::Note => CYAN,
+            type_checker::Severity::Help => BLUE,
+        },
+    );
+    let blue = enabled_color(color, BLUE);
+    let reset = enabled_color(color, RESET);
 
-    let code = if d.code.is_empty() {
-        stage.to_string()
+    if d.code.is_empty() {
+        let _ = writeln!(out, "{primary_color}{severity}{reset}: {}", d.message);
     } else {
-        d.code.to_string()
-    };
+        let _ = writeln!(
+            out,
+            "{primary_color}{severity}[{}]{reset}: {}",
+            d.code, d.message
+        );
+    }
 
-    // Header
-    let _ = writeln!(out, "{severity_str}[{code}]: {}", d.message);
-
-    // Primary label — show source context
-    if let (Some(source), Some(primary)) = (source, d.labels.first()) {
-        // Skip leading whitespace in range (CST ranges include leading trivia)
+    let primary = d
+        .labels
+        .iter()
+        .find(|label| label.style == type_checker::LabelStyle::Primary);
+    let gutter_width = if let (Some(source), Some(primary)) = (source, primary) {
         let trim_start = trim_leading_trivia(source, primary.range.start(), primary.range.end());
         let line_col = offset_to_line_col(source, trim_start);
         let _ = writeln!(
             out,
-            " {BLUE}-->{RESET} {source_name}:{}:{}",
+            " {blue}-->{reset} {source_name}:{}:{}",
             line_col.line, line_col.col
         );
 
-        let annotated = annotate_source(source, &d.labels);
-        let _ = write!(out, "{}", annotated);
+        let (annotated, width) = annotate_source(source, &d.labels, primary_color, blue, reset);
+        let _ = write!(out, "{annotated}");
+        width
     } else {
-        let _ = writeln!(out, " {BLUE}-->{RESET} {source_name}");
+        let _ = writeln!(out, " {blue}-->{reset} {source_name}");
+        1
+    };
+
+    if let Some(help) = &d.help {
+        let _ = writeln!(
+            out,
+            " {blue}{:>gutter_width$}={reset} {blue}help{reset}: {help}",
+            ""
+        );
     }
 
-    // Help
-    if let Some(ref help) = d.help {
-        let _ = writeln!(out, "{BLUE}help{RESET}: {help}");
-    }
-
-    // Notes
     for note in &d.notes {
-        let _ = writeln!(out, "{CYAN}note{RESET}: {note}");
+        let cyan = enabled_color(color, CYAN);
+        let _ = writeln!(
+            out,
+            " {blue}{:>gutter_width$}={reset} {cyan}note{reset}: {note}",
+            ""
+        );
     }
 
     let _ = writeln!(out);
 }
 
-/// Build a gutter prefix like ` 10 | ` or `    | ` with consistent width.
-fn gutter(line_no: Option<usize>, width: usize) -> String {
-    match line_no {
-        Some(n) => format!(" {BLUE}{:>width$} |{RESET} ", n, width = width),
-        None => format!(" {:>width$} | ", "", width = width),
+fn print_summary(out: &mut impl Write, errors: usize, color: bool) {
+    if errors == 0 {
+        return;
+    }
+    let red = enabled_color(color, RED);
+    let reset = enabled_color(color, RESET);
+    let suffix = if errors == 1 { "" } else { "s" };
+    let _ = writeln!(
+        out,
+        "{red}error{reset}: aborting due to {errors} previous error{suffix}"
+    );
+}
+
+fn enabled_color(enabled: bool, code: &'static str) -> &'static str {
+    if enabled { code } else { "" }
+}
+
+fn display_path(path: &std::path::Path) -> String {
+    let path = path.display().to_string();
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
     }
 }
 
-/// Annotate source text with underline markers for diagnostic labels.
-fn annotate_source(source: &str, labels: &[type_checker::SourceLabel]) -> String {
-    // Group labels by line
-    let mut line_labels: std::collections::BTreeMap<usize, Vec<(usize, usize, &str, bool)>> =
-        std::collections::BTreeMap::new();
+fn gutter(line_no: Option<usize>, width: usize, color: bool) -> String {
+    let blue = enabled_color(color, BLUE);
+    let reset = enabled_color(color, RESET);
+    match line_no {
+        Some(n) => format!(" {blue}{n:>width$} |{reset} "),
+        None => format!(" {blue}{:>width$} |{reset} ", ""),
+    }
+}
+
+fn annotate_source<'a>(
+    source: &'a str,
+    labels: &'a [type_checker::SourceLabel],
+    primary_color: &str,
+    secondary_color: &str,
+    reset: &str,
+) -> (String, usize) {
+    let mut line_labels: std::collections::BTreeMap<
+        usize,
+        Vec<(usize, Option<usize>, &'a str, bool)>,
+    > = std::collections::BTreeMap::new();
 
     for label in labels {
-        // Trim leading/trailing whitespace from the source range — CST ranges
-        // include trivia that shouldn't be highlighted.
         let (trim_start, trim_end) = trim_range(source, label.range.start(), label.range.end());
-        if trim_start >= trim_end {
-            continue;
-        }
         let start_lc = offset_to_line_col(source, trim_start);
         let end_lc = offset_to_line_col(source, trim_end);
         let is_primary = matches!(label.style, type_checker::LabelStyle::Primary);
 
         if start_lc.line == end_lc.line {
-            let s = (start_lc.col - 1).min(end_lc.col - 1);
-            let e = (start_lc.col - 1).max(end_lc.col - 1);
-            // Ponytail: only add if there's at least one visible span on this line.
-            if s < e {
-                line_labels.entry(start_lc.line).or_default().push((
-                    s,
-                    e,
-                    label.message.as_str(),
-                    is_primary,
-                ));
-            }
+            let start = start_lc.col - 1;
+            let end = (end_lc.col - 1).max(start + 1);
+            line_labels.entry(start_lc.line).or_default().push((
+                start,
+                Some(end),
+                label.message.as_str(),
+                is_primary,
+            ));
         } else {
-            // Start line: from start_byte to end of line
             line_labels.entry(start_lc.line).or_default().push((
                 start_lc.col - 1,
-                0,
+                None,
                 label.message.as_str(),
                 is_primary,
             ));
-            // Intermediate lines: highlight full line
             for line in (start_lc.line + 1)..end_lc.line {
-                line_labels.entry(line).or_default().push((
+                line_labels
+                    .entry(line)
+                    .or_default()
+                    .push((0, None, "", is_primary));
+            }
+            if end_lc.col > 1 {
+                line_labels.entry(end_lc.line).or_default().push((
                     0,
-                    0,
-                    label.message.as_str(),
+                    Some(end_lc.col - 1),
+                    "",
                     is_primary,
                 ));
             }
-            // End line: from beginning to end_byte
-            line_labels.entry(end_lc.line).or_default().push((
-                0,
-                end_lc.col - 1,
-                label.message.as_str(),
-                is_primary,
-            ));
         }
     }
 
     if line_labels.is_empty() {
-        return String::new();
+        return (String::new(), 1);
     }
 
-    // Collect lines and strip \r (Windows CRLF)
     let raw_lines: Vec<String> = source
-        .lines()
+        .split('\n')
         .map(|s| s.trim_end_matches('\r').to_string())
         .collect();
     let max_line = line_labels.keys().last().copied().unwrap_or(1);
-    let min_line = line_labels.keys().next().copied().unwrap_or(1);
     let gutter_w = max_line.to_string().len().max(1);
-
-    let context_start = (min_line - 1).max(1);
-    let context_end = (max_line + 1).min(raw_lines.len());
-
     let mut out = String::new();
-    // Opening margin line (rustc style)
-    out.push_str(&format!(" {:>width$} |\n", "", width = gutter_w));
+    out.push_str(gutter(None, gutter_w, !secondary_color.is_empty()).trim_end());
+    out.push('\n');
 
-    for line_no in context_start..=context_end {
+    let mut previous_line = None;
+    for (&line_no, labels_for_line) in &line_labels {
+        if previous_line.is_some_and(|previous| line_no > previous + 1) {
+            out.push_str(" ...\n");
+        }
+        previous_line = Some(line_no);
         let source_line = raw_lines.get(line_no - 1).map(|s| s.as_str()).unwrap_or("");
-
-        // Source line with gutter
         out.push_str(&format!(
             "{}{}\n",
-            gutter(Some(line_no), gutter_w),
+            gutter(Some(line_no), gutter_w, !secondary_color.is_empty()),
             source_line
         ));
 
-        // Marker line
-        if let Some(labels_for_line) = line_labels.get(&line_no) {
-            let line_len = source_line.len().max(1);
-            let mut markers: Vec<u8> = vec![b' '; line_len];
+        let source_chars: Vec<char> = source_line.chars().collect();
+        let line_len = labels_for_line
+            .iter()
+            .map(|(start, end, _, _)| end.unwrap_or(source_chars.len()).max(start + 1))
+            .max()
+            .unwrap_or(1)
+            .max(source_chars.len())
+            .max(1);
+        let mut markers = vec![0_u8; line_len];
 
-            for &(start_byte, end_byte, _msg, is_primary) in labels_for_line {
-                let end = if end_byte == 0 { line_len } else { end_byte };
-                // Clamp start to line bounds — CST ranges can include leading trivia
-                let start = start_byte.min(line_len);
-                for marker in markers.iter_mut().take(end.min(line_len)).skip(start) {
-                    *marker = if is_primary { b'^' } else { b'-' };
+        for &(start, end, _, is_primary) in labels_for_line {
+            let marker = if is_primary { 2 } else { 1 };
+            for current in markers
+                .iter_mut()
+                .take(end.unwrap_or(line_len).min(line_len))
+                .skip(start.min(line_len))
+            {
+                if marker == 2 || *current == 0 {
+                    *current = marker;
                 }
-            }
-
-            // Trim trailing spaces
-            while markers.last() == Some(&b' ') {
-                markers.pop();
-            }
-            let underline: String = markers.iter().map(|&b| b as char).collect();
-
-            if !underline.is_empty() {
-                out.push_str(&format!(
-                    "{}{RED}{}{RESET}",
-                    gutter(None, gutter_w),
-                    underline
-                ));
-
-                // Show label message (primary first, then secondary)
-                for &(_, _, msg, is_primary) in labels_for_line {
-                    if !msg.is_empty() {
-                        out.push_str(&format!(" {msg}"));
-                        if is_primary {
-                            break; // only first message per line
-                        }
-                    }
-                }
-                out.push('\n');
             }
         }
+
+        while markers.last() == Some(&0) {
+            markers.pop();
+        }
+        if markers.is_empty() {
+            continue;
+        }
+
+        out.push_str(&gutter(None, gutter_w, !secondary_color.is_empty()));
+        for (index, marker) in markers.iter().enumerate() {
+            match marker {
+                2 => out.push_str(&format!("{primary_color}^{reset}")),
+                1 => out.push_str(&format!("{secondary_color}-{reset}")),
+                _ if source_chars.get(index) == Some(&'\t') => out.push('\t'),
+                _ => out.push(' '),
+            }
+        }
+
+        let messages = labels_for_line
+            .iter()
+            .filter_map(|(_, _, message, _)| (!message.is_empty()).then_some(*message))
+            .collect::<Vec<_>>();
+        if !messages.is_empty() {
+            let message_color = labels_for_line
+                .iter()
+                .find(|(_, _, message, _)| !message.is_empty())
+                .map_or(secondary_color, |(_, _, _, primary)| {
+                    if *primary {
+                        primary_color
+                    } else {
+                        secondary_color
+                    }
+                });
+            out.push_str(&format!(" {message_color}{}{reset}", messages.join("; ")));
+        }
+        out.push('\n');
     }
 
-    out
+    out.push_str(gutter(None, gutter_w, !secondary_color.is_empty()).trim_end());
+    out.push('\n');
+    (out, gutter_w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_style_output_preserves_diagnostic_hierarchy() {
+        let source =
+            "struct Foo{}\n\nfun main(){\n    let a = Foo{};\n    let b = a;\n    let c = a;\n}\n";
+        let moved = source.find("a;\n    let c").unwrap();
+        let used = source.rfind("a;").unwrap();
+        let mut diagnostic = DiagnosticExt {
+            code: "E0100",
+            severity: type_checker::Severity::Error,
+            message: "use of moved value: `a`".into(),
+            labels: vec![
+                type_checker::SourceLabel {
+                    range: rowan::TextRange::new((used as u32).into(), ((used + 1) as u32).into()),
+                    message: "value used here after move".into(),
+                    style: type_checker::LabelStyle::Primary,
+                },
+                type_checker::SourceLabel {
+                    range: rowan::TextRange::new(
+                        (moved as u32).into(),
+                        ((moved + 1) as u32).into(),
+                    ),
+                    message: "value moved here".into(),
+                    style: type_checker::LabelStyle::Secondary,
+                },
+            ],
+            help: Some("borrow with `&` to keep using the value".into()),
+            notes: vec!["non-Copy values move on assignment".into()],
+        };
+        let mut output = Vec::new();
+        print_rust_style(&mut output, Some(source), "main.rid", &diagnostic, false);
+        print_summary(&mut output, 1, false);
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.starts_with("error[E0100]: use of moved value: `a`\n"));
+        assert!(output.contains(" --> main.rid:6:13\n"));
+        assert!(output.contains(" 5 |     let b = a;\n   |             - value moved here\n"));
+        assert!(
+            output.contains(" 6 |     let c = a;\n   |             ^ value used here after move\n")
+        );
+        assert!(output.contains("  = help: borrow with `&` to keep using the value\n"));
+        assert!(output.contains("  = note: non-Copy values move on assignment\n"));
+        assert!(output.ends_with("error: aborting due to 1 previous error\n"));
+        assert!(!output.contains("\x1b["));
+
+        diagnostic.code = "";
+        let mut no_code_output = Vec::new();
+        print_rust_style(
+            &mut no_code_output,
+            Some(source),
+            "main.rid",
+            &diagnostic,
+            false,
+        );
+        assert!(
+            String::from_utf8(no_code_output)
+                .unwrap()
+                .starts_with("error: ")
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

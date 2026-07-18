@@ -1,0 +1,6 @@
+struct Foo{}
+
+fun main(){
+    let a = 1;
+    let b = a as 2;
+}

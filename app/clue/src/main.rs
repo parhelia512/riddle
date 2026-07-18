@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
-use clue::{ProjectKind, build, check, init, new};
+use clue::{ProjectKind, build, check, init, new, run};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -13,8 +14,17 @@ struct Cli {
 enum Commands {
     Init(ProjectArgs),
     New(ProjectArgs),
-    Check { path: Option<PathBuf> },
-    Build { path: Option<PathBuf> },
+    Check {
+        path: Option<PathBuf>,
+    },
+    Build {
+        path: Option<PathBuf>,
+    },
+    Run {
+        path: Option<PathBuf>,
+        #[arg(last = true)]
+        args: Vec<OsString>,
+    },
 }
 
 #[derive(Args)]
@@ -54,6 +64,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Build { path } => {
             build(path.as_deref().unwrap_or_else(|| std::path::Path::new(".")))?;
+        }
+        Commands::Run { path, args } => {
+            let status = run(
+                path.as_deref().unwrap_or_else(|| std::path::Path::new(".")),
+                &args,
+            )?;
+            std::process::exit(status.code().unwrap_or(1));
         }
     }
 

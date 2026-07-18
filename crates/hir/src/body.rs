@@ -448,7 +448,7 @@ impl BodyPrinter<'_> {
         }
     }
 
-    fn use_tree_text(t: &super::item_tree::HirUseTree) -> String {
+    fn use_tree_text(t: &item_tree::HirUseTree) -> String {
         use super::item_tree::HirUseTreeKind::*;
         let prefix = t.prefix.display();
         match &t.kind {

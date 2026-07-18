@@ -645,12 +645,10 @@ pub(crate) fn range(source: &str, range: TextRange) -> Range {
     try_range(source, normalize_range(source, range).unwrap_or(range)).unwrap_or_default()
 }
 
-#[cfg(test)]
 fn try_position(source: &str, offset: usize) -> Option<Position> {
     LineIndex::new(source).position(source, offset)
 }
 
-#[cfg(test)]
 pub(crate) fn position(source: &str, offset: usize) -> Position {
     let mut offset = offset.min(source.len());
     while !source.is_char_boundary(offset) {

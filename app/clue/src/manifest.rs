@@ -44,6 +44,7 @@ fn document(name: &str, value: Value) -> String {
 pub struct Manifest {
     pub name: String,
     pub entry: PathBuf,
+    pub kind: ProjectKind,
     pub fingerprint: String,
     pub dependencies: Vec<Dependency>,
 }
@@ -72,12 +73,9 @@ pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
     })?;
     let name = string_field(package, "name", "package")?;
     validate_package_name(&name).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
-    let entry = match optional_string_field(package, "entry", "package")? {
-        Some(path) => root.join(path),
-        None => match target_path(root, &value, kind)? {
-            Some(path) => path,
-            None => entry_file(root, &name, kind)?,
-        },
+    let (entry, kind) = match optional_string_field(package, "entry", "package")? {
+        Some(path) => (root.join(path), kind),
+        None => target_path(root, &value, kind)?.unwrap_or((entry_file(root, &name, kind)?, kind)),
     };
     if !entry.is_file() {
         return Err(Error::new(
@@ -89,6 +87,7 @@ pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
     Ok(Manifest {
         name,
         entry,
+        kind,
         fingerprint: value.to_string(),
         dependencies: dependencies(&value)?,
     })
@@ -101,7 +100,11 @@ pub(crate) fn validate_package_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn target_path(root: &Path, value: &Value, kind: ProjectKind) -> io::Result<Option<PathBuf>> {
+fn target_path(
+    root: &Path,
+    value: &Value,
+    kind: ProjectKind,
+) -> io::Result<Option<(PathBuf, ProjectKind)>> {
     if kind == ProjectKind::Binary
         && let Some(bin) = value
             .get("bin")
@@ -109,13 +112,19 @@ fn target_path(root: &Path, value: &Value, kind: ProjectKind) -> io::Result<Opti
             .and_then(|targets| targets.first())
             .and_then(Value::as_table)
     {
-        return Ok(Some(root.join(
-            optional_string_field(bin, "path", "bin")?.unwrap_or_else(|| "src/main.rid".into()),
+        return Ok(Some((
+            root.join(
+                optional_string_field(bin, "path", "bin")?.unwrap_or_else(|| "src/main.rid".into()),
+            ),
+            ProjectKind::Binary,
         )));
     }
     if let Some(lib) = table(value, "lib") {
-        return Ok(Some(root.join(
-            optional_string_field(lib, "path", "lib")?.unwrap_or_else(|| "src/lib.rid".into()),
+        return Ok(Some((
+            root.join(
+                optional_string_field(lib, "path", "lib")?.unwrap_or_else(|| "src/lib.rid".into()),
+            ),
+            ProjectKind::Library,
         )));
     }
     Ok(None)

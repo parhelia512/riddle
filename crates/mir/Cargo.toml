@@ -5,7 +5,6 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-ast = { path = "../ast" }
 escape-analysis = { path = "../escape-analysis" }
 gc = { path = "../gc" }
 hir = { path = "../hir" }

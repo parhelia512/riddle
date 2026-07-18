@@ -15,7 +15,7 @@ const DOCUMENTED_ERROR_CODES: &[&str] = &[
     "E0037", "E0038", "E0039", "E0040", "E0041", "E0042", "E0043", "E0044", "E0045", "E0050",
     "E0051", "E0052", "E0072", "E0100", "E0200", "E0300", "E0301", "E0302", "E0303", "E0304",
 ];
-const SOURCE_UNREACHABLE_CODES: &[&str] = &["E0012", "E0021", "E0200"];
+const SOURCE_UNREACHABLE_CODES: &[&str] = &["E0021", "E0200"];
 
 fn temp_root(name: &str) -> PathBuf {
     env::temp_dir().join(format!(
@@ -255,6 +255,56 @@ fn semantic_tokens_classifies_core_tokens() {
     assert!(types.contains(&TOKEN_VARIABLE));
     assert!(types.contains(&TOKEN_STRING));
     assert!(types.contains(&TOKEN_COMMENT));
+}
+
+#[test]
+fn semantic_tokens_classify_every_keyword() {
+    let source = "let fun struct if else while break continue return as self mod use mut pub super crate enum trait impl match const type extern unsafe for in where true false";
+    let tokens = semantic_tokens(source);
+
+    assert_eq!(
+        tokens
+            .data
+            .iter()
+            .filter(|token| token.token_type == TOKEN_KEYWORD)
+            .count(),
+        source.split_whitespace().count()
+    );
+}
+
+#[test]
+fn inlay_hints_show_inferred_types() {
+    let source =
+        "struct Foo{}\n\nfun main(){\n    let a = Foo{};\n    let b = a;\n    let c = a;\n}";
+    let hints = inlay_hints_for_source(
+        source,
+        Range::new(Position::new(0, 0), Position::new(u32::MAX, 0)),
+    );
+    let type_hints = hints
+        .iter()
+        .filter(|hint| hint.kind == Some(lsp_types::InlayHintKind::TYPE))
+        .collect::<Vec<_>>();
+
+    assert_eq!(hints.len(), 2);
+    assert_eq!(type_hints.len(), 2);
+    assert!(type_hints.iter().all(|hint| {
+        matches!(&hint.label, lsp_types::InlayHintLabel::String(label) if label == ": Foo")
+    }));
+}
+
+#[test]
+fn inlay_hints_skip_invalid_initializers() {
+    let source = "fun main(){\n    let a = 1;\n    let b = a as 2;\n    let c = missing;\n}";
+    let hints = inlay_hints_for_source(
+        source,
+        Range::new(Position::new(0, 0), Position::new(u32::MAX, 0)),
+    );
+
+    assert_eq!(hints.len(), 1, "{hints:#?}");
+    assert!(matches!(
+        &hints[0].label,
+        lsp_types::InlayHintLabel::String(label) if label == ": i32"
+    ));
 }
 
 #[test]
@@ -595,6 +645,13 @@ fn reachable_diagnostic_producers_have_exact_primary_and_lsp_spans() {
             "fun check(value: u8) { match value { 256 => {}, _ => {} } }",
             "256",
             "256",
+        ),
+        (
+            "E0012",
+            "cannot cast `bool` to `f64`",
+            "fun main() { let value = true as f64; }",
+            "true as f64",
+            "true as f64",
         ),
         (
             "E0013",

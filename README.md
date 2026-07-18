@@ -11,7 +11,7 @@ Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.1.0` 提供
 ## 工具
 
 - `riddlec`：检查 Riddle 源码并生成 C；
-- `clue`：创建、检查和构建 Riddle 项目；
+- `clue`：创建、检查、构建和运行 Riddle 项目；
 - `riddle-lsp`：为编辑器提供诊断和语义高亮。
 
 仓库中的 [`editors`](./editors) 目录提供 Helix、VS Code 和 Zed 的 `riddle-lsp` 适配。
@@ -45,9 +45,10 @@ clue new hello
 cd hello
 clue check
 clue build
+clue run
 ```
 
-`clue build` 会生成 `.clue/build/hello.c`。如需本机可执行文件，再使用系统中的 `cc`、`gcc` 或 `clang` 编译该 C 文件。
+`clue build` 会保留 `.clue/build/hello.c`，并调用 `CC` 或系统中的 `cc`、`gcc`、`clang` 生成同目录下的本机可执行文件。`clue run` 会先完成相同构建，再运行该程序。
 
 ## 许可证
 

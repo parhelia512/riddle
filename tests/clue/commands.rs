@@ -26,10 +26,17 @@ fn clue(args: &[&str], root: &Path) -> Output {
 fn c_compiler() -> Option<OsString> {
     std::env::var_os("CC")
         .into_iter()
-        .chain(["cc", "gcc", "clang"].into_iter().map(OsString::from))
+        .chain(
+            ["cc", "gcc", "clang", "clang-cl", "cl"]
+                .into_iter()
+                .map(OsString::from),
+        )
         .find(|compiler| {
+            let is_msvc = Path::new(compiler)
+                .file_stem()
+                .is_some_and(|name| name == "cl" || name == "clang-cl");
             Command::new(compiler)
-                .arg("--version")
+                .arg(if is_msvc { "/?" } else { "--version" })
                 .output()
                 .is_ok_and(|output| output.status.success())
         })
@@ -62,6 +69,11 @@ fn init_creates_a_buildable_binary_project() {
     );
     assert!(String::from_utf8_lossy(&check.stdout).contains("clue: checked"));
 
+    if c_compiler().is_none() {
+        eprintln!("skipping native build assertions: no C compiler found");
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
     let build = clue(&["build", "hello"], &root);
     assert!(
         build.status.success(),
@@ -69,6 +81,15 @@ fn init_creates_a_buildable_binary_project() {
         String::from_utf8_lossy(&build.stderr)
     );
     assert!(project.join(".clue/build/hello.c").is_file());
+    assert!(
+        project
+            .join(if cfg!(windows) {
+                ".clue/build/hello.exe"
+            } else {
+                ".clue/build/hello"
+            })
+            .is_file()
+    );
 
     let fresh = clue(&["build", "hello"], &root);
     assert!(fresh.status.success());
@@ -78,10 +99,10 @@ fn init_creates_a_buildable_binary_project() {
 
 #[test]
 fn generated_c_with_gc_and_loop_control_compiles_and_runs() {
-    let Some(compiler) = c_compiler() else {
+    if c_compiler().is_none() {
         eprintln!("skipping C runtime test: no cc, gcc, or clang found");
         return;
-    };
+    }
     let root = temp_root("native-gc");
     fs::create_dir_all(&root).unwrap();
     assert!(clue(&["new", "app"], &root).status.success());
@@ -169,19 +190,12 @@ fun main() -> i32 {
     assert!(generated.contains("rgc_alloc"));
     assert!(!generated.contains("GC_MALLOC") && !generated.contains("<gc.h>"));
 
-    let executable = project.join(if cfg!(windows) { "app.exe" } else { "app" });
-    let compile = Command::new(&compiler)
-        .args(["-std=c11", "-O2"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&executable)
-        .output()
-        .unwrap();
-    assert!(
-        compile.status.success(),
-        "{}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
+    let executable = project.join(if cfg!(windows) {
+        ".clue/build/app.exe"
+    } else {
+        ".clue/build/app"
+    });
+    assert!(executable.is_file());
     let run = Command::new(&executable).output().unwrap();
     assert!(
         run.status.success(),
@@ -215,11 +229,79 @@ fn new_requires_a_missing_destination() {
     assert!(!clue(&["new", "existing"], &root).status.success());
     assert!(clue(&["new", "library", "--lib"], &root).status.success());
     assert!(root.join("library/src/lib.rid").is_file());
+    assert!(clue(&["build", "library"], &root).status.success());
+    assert!(root.join("library/.clue/build/library.c").is_file());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn run_builds_the_binary_and_propagates_its_status() {
+    if c_compiler().is_none() {
+        eprintln!("skipping clue run test: no C compiler found");
+        return;
+    }
+    let root = temp_root("run");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(root.join("app/src/main.rid"), "fun main() -> i32 { 7 }\n").unwrap();
+
+    let output = clue(&["run", "app", "--", "ignored"], &root);
+    assert_eq!(output.status.code(), Some(7), "{output:#?}");
+    assert!(
+        root.join(if cfg!(windows) {
+            "app/.clue/build/app.exe"
+        } else {
+            "app/.clue/build/app"
+        })
+        .is_file()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn standard_library_basics_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping standard library runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("stdlib");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"fun main() -> i32 {
+    let value: Option<i32> = Some(2);
+    let error: Result<i32, bool> = Err(true);
+    let text: &str = "abc";
+    if value.is_some() && value.unwrap_or(0) == 2
+        && error.is_err() && error.err().is_some()
+        && text.len() == 3usize && text.byte_at(1usize).unwrap_or(0u8) == 98u8
+        && text.byte_at(3usize).is_none() {
+        0
+    } else {
+        1
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn build_loads_local_path_dependencies() {
+    if c_compiler().is_none() {
+        eprintln!("skipping native dependency build test: no C compiler found");
+        return;
+    }
     let root = temp_root("dependency");
     fs::create_dir_all(&root).unwrap();
     assert!(clue(&["new", "math", "--lib"], &root).status.success());

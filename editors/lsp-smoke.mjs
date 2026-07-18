@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 const command = process.argv[2] ?? 'riddle-lsp';
 const uri = 'file:///riddle-lsp-smoke.rid';
 const stableUri = 'file:///riddle-lsp-stable.rid';
+const fixUri = 'file:///riddle-lsp-fix.rid';
 const server = spawn(command, [], { stdio: ['pipe', 'pipe', 'inherit'] });
 let input = Buffer.alloc(0);
 const messages = [];
@@ -62,6 +63,8 @@ try {
   const initialized = await read((message) => message.id === 1);
   assert.equal(initialized.result.serverInfo.name, 'riddle-lsp');
   assert.equal(initialized.result.capabilities.positionEncoding, 'utf-16');
+  assert.equal(initialized.result.capabilities.codeActionProvider, true);
+  assert.equal(initialized.result.capabilities.inlayHintProvider, true);
   assert(initialized.result.capabilities.semanticTokensProvider);
 
   send({ jsonrpc: '2.0', method: 'initialized', params: {} });
@@ -130,6 +133,79 @@ try {
   );
   assert.equal(stable.params.diagnostics[0].code, 'E0050');
 
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: fixUri,
+        languageId: 'riddle',
+        version: 1,
+        text: 'fun main() { let mut total = 0; let add = fun() { total += 1; }; add(); }',
+      },
+    },
+  });
+  const fixDiagnostics = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === fixUri &&
+      message.params.version === 1,
+  );
+  const mutableClosure = fixDiagnostics.params.diagnostics.find(
+    (diagnostic) => diagnostic.code === 'E0031',
+  );
+  assert(mutableClosure);
+  assert.equal(mutableClosure.relatedInformation[0].message, 'mutable closure called here');
+
+  send({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'textDocument/codeAction',
+    params: {
+      textDocument: { uri: fixUri },
+      range: mutableClosure.range,
+      context: { diagnostics: [mutableClosure], only: ['quickfix'] },
+    },
+  });
+  const codeActions = await read((message) => message.id === 2);
+  assert.equal(codeActions.result.length, 1);
+  assert.equal(codeActions.result[0].kind, 'quickfix');
+  assert.equal(codeActions.result[0].isPreferred, true);
+  assert.deepEqual(codeActions.result[0].edit.changes[fixUri][0], {
+    range: { start: mutableClosure.range.start, end: mutableClosure.range.start },
+    newText: 'mut ',
+  });
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didChange',
+    params: {
+      textDocument: { uri: fixUri, version: 2 },
+      contentChanges: [
+        { text: 'struct Foo{}\n\nfun main(){\n    let a = Foo{};\n    let b = a;\n    let c = a;\n}' },
+      ],
+    },
+  });
+  await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === fixUri &&
+      message.params.version === 2 &&
+      message.params.diagnostics.some((diagnostic) => diagnostic.code === 'E0100'),
+  );
+  send({
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'textDocument/inlayHint',
+    params: {
+      textDocument: { uri: fixUri },
+      range: { start: { line: 0, character: 0 }, end: { line: 6, character: 1 } },
+    },
+  });
+  const inlayHints = await read((message) => message.id === 3);
+  assert.equal(inlayHints.result.length, 2);
+  assert.equal(inlayHints.result.filter((hint) => hint.label === ': Foo').length, 2);
+
   const lastBurstVersion = 14;
   for (let version = 3; version <= lastBurstVersion; version += 1) {
     send({
@@ -171,11 +247,11 @@ try {
 
   send({
     jsonrpc: '2.0',
-    id: 2,
+    id: 4,
     method: 'textDocument/semanticTokens/full',
     params: { textDocument: { uri } },
   });
-  const semanticTokens = await read((message) => message.id === 2);
+  const semanticTokens = await read((message) => message.id === 4);
   assert(semanticTokens.result.data.length > 0);
 
   send({
@@ -204,8 +280,21 @@ try {
   );
   assert.deepEqual(stableClosed.params.diagnostics, []);
 
-  send({ jsonrpc: '2.0', id: 3, method: 'shutdown', params: null });
-  await read((message) => message.id === 3);
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: fixUri } },
+  });
+  const fixClosed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === fixUri &&
+      message.params.version == null,
+  );
+  assert.deepEqual(fixClosed.params.diagnostics, []);
+
+  send({ jsonrpc: '2.0', id: 5, method: 'shutdown', params: null });
+  await read((message) => message.id === 5);
   send({ jsonrpc: '2.0', method: 'exit' });
   console.log('riddle-lsp stdio handshake passed');
 } finally {

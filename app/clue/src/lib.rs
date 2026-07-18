@@ -4,7 +4,9 @@ mod project;
 
 use anyhow::bail;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
 pub use project::{ProjectKind, init, new};
 
@@ -12,6 +14,7 @@ pub struct ProjectAnalysis {
     pub entry: PathBuf,
     pub source: riddlec::pipeline::LoadedSource,
     pub result: riddlec::pipeline::CompileResult,
+    pub kind: ProjectKind,
     package_name: String,
     manifest_fingerprint: String,
 }
@@ -64,6 +67,7 @@ pub fn check_project_with_session(
         entry: package.entry,
         source: package.source,
         result,
+        kind: package.kind,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
     })
@@ -85,6 +89,7 @@ fn analyze_project_impl(
         entry: package.entry,
         source: package.source,
         result,
+        kind: package.kind,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
     })
@@ -109,5 +114,17 @@ pub fn check(path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn build(path: &Path) -> anyhow::Result<()> {
-    build::run(path)
+    build::run(path).map(|_| ())
+}
+
+pub fn run(path: &Path, args: &[OsString]) -> anyhow::Result<ExitStatus> {
+    let artifact = build::run(path)?;
+    let build::BuildArtifact::Executable(executable) = artifact else {
+        bail!("cannot run a library package");
+    };
+    Command::new(&executable)
+        .args(args)
+        .current_dir(path)
+        .status()
+        .map_err(|error| anyhow::anyhow!("failed to run `{}`: {error}", executable.display()))
 }

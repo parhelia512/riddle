@@ -18,6 +18,55 @@ fn reports_let_initializer_mismatch() {
 }
 
 #[test]
+fn validates_cast_source_and_target_types() {
+    let accepted = check(
+        r#"
+        fun accepted(pointer: *const i32) {
+            let integer = 1 as i64;
+            let float = 1 as f64;
+            let truncated = 1.5 as i32;
+            let boolean = 1 as bool;
+            let from_boolean = true as i32;
+            let raw = 0 as *const i32;
+            let mutable = pointer as *mut i32;
+        }
+        "#,
+    );
+    assert!(
+        accepted
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0012"),
+        "{:#?}",
+        accepted.diagnostics
+    );
+
+    let rejected = check(
+        r#"
+        struct Point { x: i32 }
+
+        fun rejected(point: Point) {
+            let float = true as f64;
+            let boolean = 1.5 as bool;
+            let character = 'a' as i32;
+            let aggregate = point as i32;
+        }
+        "#,
+    );
+    let diagnostics = rejected
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0012")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 4, "{:#?}", rejected.diagnostics);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.message.starts_with("cannot cast `"))
+    );
+}
+
+#[test]
 fn reports_return_type_mismatch() {
     let result = check(
         r#"

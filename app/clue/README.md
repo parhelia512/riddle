@@ -12,8 +12,11 @@ clue new <path> [--bin|--lib]
 # Check the whole project without generating C
 clue check [path]
 
-# Generate .clue/build/<package>.c
+# Generate C and build .clue/build/<package>[.exe]
 clue build [path]
+
+# Build and run a binary package
+clue run [path] [-- <args>...]
 ```
 
 Binary projects are the default. Clue supports local path dependencies declared in
@@ -22,12 +25,16 @@ Diagnostics from external modules and path dependencies point to their original
 source files. The Riddle LSP uses the same project loader, includes unsaved files,
 and refreshes diagnostics for every open document after a change.
 
+Binary builds use `CC` when set, then try `cc`, `gcc`, `clang`, `clang-cl`, and
+`cl`. Library builds keep the generated `.clue/build/<package>.c` without linking
+an executable.
+
 ## Library API
 
 The crate exposes project operations plus project analysis for tools such as the LSP:
 
 ```rust
-use clue::{ProjectKind, build, check, new};
+use clue::{ProjectKind, build, check, new, run};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     new(root, ProjectKind::Binary)?;
     check(root)?;
     build(root)?;
+    run(root, &[])?;
     Ok(())
 }
 ```

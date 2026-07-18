@@ -204,7 +204,7 @@ impl<'a> ScopeGraphBuilder<'a> {
     fn emit_named_def(
         &mut self,
         parent_scope: NodeId,
-        name: hir::Name,
+        name: Name,
         def: DefRef,
         frag_nodes: &mut Vec<NodeId>,
         frag_edges: &mut Vec<EdgeId>,
@@ -396,7 +396,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         }
     }
 
-    fn impl_const_generics_for_method(&self, fid: FunctionId) -> Vec<hir::Name> {
+    fn impl_const_generics_for_method(&self, fid: FunctionId) -> Vec<Name> {
         self.hir
             .item_tree
             .impls

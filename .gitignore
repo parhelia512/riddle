@@ -26,6 +26,7 @@ Cargo.lock
 /editors/vscode/node_modules/
 /editors/vscode/dist/
 /editors/vscode/*.vsix
+/editors/dist/
 /editors/zed/target/
 
 # Logs

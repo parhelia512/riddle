@@ -93,6 +93,7 @@ fn update_gitignore(path: &Path) -> anyhow::Result<()> {
 pub(crate) struct LoadedPackage {
     pub name: String,
     pub entry: PathBuf,
+    pub kind: ProjectKind,
     pub manifest_fingerprint: String,
     pub source: pipeline::LoadedSource,
 }
@@ -178,6 +179,7 @@ fn load_inner(
     Ok(LoadedPackage {
         name: manifest.name,
         entry: manifest.entry,
+        kind: manifest.kind,
         manifest_fingerprint,
         source: pipeline::LoadedSource {
             source,

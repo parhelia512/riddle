@@ -2103,15 +2103,16 @@ impl<'a> LowerCtx<'a> {
         expected: &hir::item_tree::HirTypeRef,
     ) -> Value {
         let base_val = self.lower_expr(builder, param_values, body, base);
-        let expected_ty = self.convert_hir_type(expected);
         let base_ty = self
             .current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, base)))
             .map(|t| self.convert_type(t))
             .unwrap_or(Type::Unit);
 
-        match &expected_ty {
-            Type::Ref(inner, mutable) if inner.as_ref() == &base_ty => {
+        match expected {
+            hir::item_tree::HirTypeRef::Ref(_, _) if matches!(base_ty, Type::Ref(_, _)) => base_val,
+            hir::item_tree::HirTypeRef::Ref(_, mutable) => {
+                let expected_ty = Type::Ref(Box::new(base_ty), *mutable);
                 let op = if *mutable {
                     HirUnOp::MutRef
                 } else {
@@ -2973,7 +2974,7 @@ impl<'a> LowerCtx<'a> {
     ) -> Option<MirSubst> {
         let mut subst = MirSubst::default();
         match receiver_ty {
-            type_checker::Type::Struct(_, args) => {
+            type_checker::Type::Struct(_, args) | type_checker::Type::Enum(_, args) => {
                 for (name, ty) in imp.generics.iter().zip(args.iter()) {
                     subst.types.insert(name.0.clone(), self.convert_type(ty));
                     subst.tc_types.insert(name.0.clone(), ty.clone());
@@ -3664,7 +3665,7 @@ fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
         (Type::Int(_), Type::Bool) => CastOp::IntToBool,
         (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
         (Type::Ptr(_), Type::Ptr(_)) => CastOp::PtrToPtr,
-        _ => CastOp::IntToInt,
+        _ => unreachable!("unsupported cast reached MIR lowering: {source:?} as {target:?}"),
     }
 }
 

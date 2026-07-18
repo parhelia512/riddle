@@ -111,15 +111,15 @@ impl<'a> TypeChecker<'a> {
             for variant in item.variants {
                 let field_ranges = variant.field_ranges;
                 match variant.kind {
-                    hir::item_tree::HirVariantKind::Unit => {}
-                    hir::item_tree::HirVariantKind::Tuple(fields) => {
+                    HirVariantKind::Unit => {}
+                    HirVariantKind::Tuple(fields) => {
                         for (field, range) in fields.into_iter().zip(field_ranges) {
                             let ty =
                                 self.lower_type_ref_with_params_at(&field, &params, Some(range));
                             self.expect_sized_value(&ty, Some(range));
                         }
                     }
-                    hir::item_tree::HirVariantKind::Struct(fields) => {
+                    HirVariantKind::Struct(fields) => {
                         for field in fields {
                             let ty = self.lower_type_ref_with_params_at(
                                 &field.ty,
@@ -182,8 +182,7 @@ impl<'a> TypeChecker<'a> {
                 let Some(alias_ty) = alias.ty else {
                     continue;
                 };
-                let params =
-                    std::collections::HashMap::from([("Self".into(), Type::Param("Self".into()))]);
+                let params = HashMap::from([("Self".into(), Type::Param("Self".into()))]);
                 let range = alias.ty_range.unwrap_or(alias.name_range);
                 let ty = self.lower_type_ref_with_params_at(&alias_ty, &params, Some(range));
                 self.expect_sized_value(&ty, Some(range));
@@ -224,7 +223,7 @@ impl<'a> TypeChecker<'a> {
     fn check_function_value_types(
         &mut self,
         function: &HirFunction,
-        params: &std::collections::HashMap<String, Type>,
+        params: &HashMap<String, Type>,
     ) {
         for param in &function.params {
             let ty = self.lower_type_ref_with_params_at(&param.ty, params, Some(param.ty_range));
@@ -240,7 +239,7 @@ impl<'a> TypeChecker<'a> {
     fn impl_item_type_params(
         &mut self,
         owns: impl Fn(&hir::item_tree::HirImpl) -> bool,
-    ) -> std::collections::HashMap<String, Type> {
+    ) -> HashMap<String, Type> {
         let owner = self
             .hir
             .item_tree
@@ -248,7 +247,7 @@ impl<'a> TypeChecker<'a> {
             .iter()
             .find_map(|(_, imp)| owns(imp).then(|| imp.clone()));
         let Some(owner) = owner else {
-            return std::collections::HashMap::new();
+            return HashMap::new();
         };
         let mut params = crate::lowering::generic_param_map_with_consts(
             owner.generics.iter().map(|name| name.0.as_str()),
@@ -311,7 +310,7 @@ impl<'a> TypeChecker<'a> {
     pub(crate) fn lower_trait_env_bounds(
         &mut self,
         bounds: &[hir::item_tree::HirGenericBound],
-        params: &std::collections::HashMap<String, Type>,
+        params: &HashMap<String, Type>,
     ) -> Vec<TraitBound> {
         bounds
             .iter()
@@ -717,13 +716,16 @@ impl<'a> TypeChecker<'a> {
                     format!("recursive type `{name}` has infinite size"),
                     Some(name_range),
                 );
-                self.result.diagnostics.last_mut().unwrap().labels.push(
-                    crate::result::SourceLabel {
+                self.result
+                    .diagnostics
+                    .last_mut()
+                    .unwrap()
+                    .labels
+                    .push(SourceLabel {
                         range: field_range,
                         message: "recursive field".into(),
-                        style: crate::result::LabelStyle::Secondary,
-                    },
-                );
+                        style: LabelStyle::Secondary,
+                    });
             }
         }
 
@@ -765,13 +767,16 @@ impl<'a> TypeChecker<'a> {
                     format!("recursive type `{name}` has infinite size"),
                     Some(name_range),
                 );
-                self.result.diagnostics.last_mut().unwrap().labels.push(
-                    crate::result::SourceLabel {
+                self.result
+                    .diagnostics
+                    .last_mut()
+                    .unwrap()
+                    .labels
+                    .push(SourceLabel {
                         range: field_range,
                         message: "recursive field".into(),
-                        style: crate::result::LabelStyle::Secondary,
-                    },
-                );
+                        style: LabelStyle::Secondary,
+                    });
             }
         }
     }

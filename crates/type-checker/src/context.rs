@@ -59,11 +59,11 @@ impl<'a> BodyCtx<'a> {
         self.bindings.pop_scope();
     }
 
-    pub(crate) fn expr_range(&self, id: hir::body::ExprId) -> Option<TextRange> {
+    pub(crate) fn expr_range(&self, id: ExprId) -> Option<TextRange> {
         self.source_map.expr_ranges.get(&id).copied()
     }
 
-    pub(crate) fn stmt_range(&self, id: hir::body::StmtId) -> Option<TextRange> {
+    pub(crate) fn stmt_range(&self, id: StmtId) -> Option<TextRange> {
         self.source_map.stmt_ranges.get(&id).copied()
     }
 

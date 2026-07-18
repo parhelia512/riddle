@@ -376,8 +376,23 @@ impl TypeChecker<'_> {
                 }
             }
             Expr::Cast { base, target } => {
-                self.check_expr(ctx, *base);
-                self.lower_type_ref_with_params_at(target, &HashMap::new(), span)
+                let source_ty = self.check_expr(ctx, *base);
+                let target_ty = self.lower_type_ref_with_params_at(target, &HashMap::new(), span);
+                if !source_ty.is_unknown_like()
+                    && !matches!(target_ty, Type::Error)
+                    && !is_supported_cast(&source_ty, &target_ty)
+                {
+                    self.diagnostic(
+                        "E0012",
+                        format!(
+                            "cannot cast `{}` to `{}`",
+                            source_ty.display(self.hir),
+                            target_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                }
+                target_ty
             }
         };
 
@@ -970,7 +985,7 @@ impl TypeChecker<'_> {
         _lhs: ExprId,
         rhs: ExprId,
         lhs_ty: &Type,
-        trait_id: hir::item_tree::TraitId,
+        trait_id: TraitId,
     ) -> Option<Type> {
         let Type::Param(param) = lhs_ty else {
             return None;
@@ -2125,7 +2140,7 @@ impl TypeChecker<'_> {
     fn check_generic_bounds(
         &mut self,
         ctx: &BodyCtx<'_>,
-        function: &hir::item_tree::HirFunction,
+        function: &HirFunction,
         subst: &HashMap<String, Type>,
         span: Option<rowan::TextRange>,
     ) {
@@ -2312,7 +2327,7 @@ impl TypeChecker<'_> {
         &mut self,
         ctx: &BodyCtx<'_>,
         actual: &Type,
-        trait_id: hir::item_tree::TraitId,
+        trait_id: TraitId,
         assoc_constraints: &[HirAssocTypeConstraint],
         subst: &HashMap<String, Type>,
     ) -> bool {
@@ -2371,7 +2386,7 @@ impl TypeChecker<'_> {
         &mut self,
         ctx: &BodyCtx<'_>,
         param: &str,
-        required_trait: hir::item_tree::TraitId,
+        required_trait: TraitId,
         required_assoc: &[HirAssocTypeConstraint],
         subst: &HashMap<String, Type>,
     ) -> bool {
@@ -2398,7 +2413,7 @@ impl TypeChecker<'_> {
     fn assoc_constraints_match(
         &mut self,
         actual: &Type,
-        trait_id: hir::item_tree::TraitId,
+        trait_id: TraitId,
         assoc_constraints: &[HirAssocTypeConstraint],
         subst: &HashMap<String, Type>,
     ) -> bool {
@@ -2451,11 +2466,7 @@ impl TypeChecker<'_> {
             })
     }
 
-    fn trait_implies(
-        &self,
-        actual: hir::item_tree::TraitId,
-        required: hir::item_tree::TraitId,
-    ) -> bool {
+    fn trait_implies(&self, actual: TraitId, required: TraitId) -> bool {
         if actual == required {
             return true;
         }
@@ -2697,7 +2708,7 @@ impl TypeChecker<'_> {
     fn find_trait_impl_method(
         &mut self,
         receiver_ty: &Type,
-        trait_id: hir::item_tree::TraitId,
+        trait_id: TraitId,
         method_name: &str,
     ) -> Option<ResolvedMethod> {
         let impls = self
@@ -3331,7 +3342,7 @@ struct ResolvedMethod {
     fid: FunctionId,
     function: HirFunction,
     subst: HashMap<String, Type>,
-    trait_id: Option<hir::item_tree::TraitId>,
+    trait_id: Option<TraitId>,
 }
 
 fn expected_has_param(ty: &Type) -> bool {
@@ -3368,6 +3379,24 @@ fn generic_arg_unknown(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Unknown | Type::Error | Type::Const(ConstArg::Unknown | ConstArg::Error)
+    )
+}
+
+fn is_supported_cast(source: &Type, target: &Type) -> bool {
+    let source = match source {
+        Type::Ref(inner, _) => inner.as_ref(),
+        source => source,
+    };
+    matches!(
+        (source, target),
+        (
+            Type::Int(_) | Type::InferInt,
+            Type::Int(_) | Type::Float(_) | Type::Bool | Type::Ptr { .. }
+        ) | (
+            Type::Float(_) | Type::InferFloat,
+            Type::Int(_) | Type::Float(_)
+        ) | (Type::Bool, Type::Int(_))
+            | (Type::Ptr { .. }, Type::Ptr { .. })
     )
 }
 

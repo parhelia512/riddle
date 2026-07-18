@@ -42,15 +42,13 @@ fn main() {
                 continue;
             }
         };
-        let source = loaded.source;
-
         let compile = if opts.backend.is_some() {
             pipeline::compile_with_options
         } else {
             pipeline::check_with_options
         };
         let result = compile(
-            &source,
+            &loaded.source,
             pipeline::CompileOptions {
                 use_std: opts.use_std,
             },
@@ -60,11 +58,11 @@ fn main() {
             if opts.files.len() > 1 {
                 println!("== {file} ==");
             }
-            diagnostics::report_verbose(&result, Some(&source), file);
+            diagnostics::report_verbose(&result, Some(&loaded.source), file);
             println!();
         }
 
-        total_errors += diagnostics::report(&result, Some(&source), file);
+        total_errors += diagnostics::report_mapped(&result, &loaded, file);
 
         if result.success()
             && let Some(ref module) = result.mir_module
