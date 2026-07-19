@@ -6,5 +6,5 @@ fun main(){
     let a = 1;
     let b = 2;
     let c = String::new();
-    let d = c.is_empty();
+    let d = c.;
 }

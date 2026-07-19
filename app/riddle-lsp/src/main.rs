@@ -18,18 +18,22 @@ pub(crate) use diagnostics::{
 };
 use frontend::syntax_kind::SyntaxKind;
 use hir::body::{Expr, ResolvedName, Stmt};
-use hir::item_tree::HirTypeRef;
+use hir::item_tree::{
+    FunctionId, HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem,
+    Visibility,
+};
 #[cfg(test)]
 use lsp_types::Position;
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, FileChangeType, FileEvent, InitializeParams, InitializeResult,
-    InitializedParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, MessageType,
-    NumberOrString, OneOf, PositionEncodingKind, Range, SemanticToken, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionOptions,
+    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, FileChangeType, FileEvent,
+    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintKind,
+    InlayHintLabel, InlayHintParams, MessageType, NumberOrString, OneOf, PositionEncodingKind,
+    Range, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
     TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
     WorkspaceEdit,
 };
@@ -73,6 +77,11 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 code_action_provider: Some(true.into()),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: Some(vec![".".into(), ":".into()]),
+                    ..CompletionOptions::default()
+                }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(
                     SemanticTokensOptions {
@@ -162,10 +171,17 @@ impl LanguageServer for Backend {
         }
 
         let analyzed_text = text.clone();
-        let tokens =
-            tokio::task::spawn_blocking(move || semantic_tokens_for_source(&analyzed_text))
-                .await
-                .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let compile_options = self.compile_options;
+        let default_library_source = is_standard_library_uri(&uri);
+        let tokens = tokio::task::spawn_blocking(move || {
+            semantic_tokens_for_source_with_options(
+                &analyzed_text,
+                compile_options,
+                default_library_source,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
         let is_current = self
             .docs
             .lock()
@@ -214,6 +230,38 @@ impl LanguageServer for Backend {
         }
 
         Ok(Some(hints))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(text) = self
+            .docs
+            .lock()
+            .unwrap()
+            .get(&uri)
+            .map(|document| document.text.clone())
+        else {
+            return Ok(Some(CompletionResponse::Array(Vec::new())));
+        };
+        let analyzed_text = text.clone();
+        let compile_options = self.compile_options;
+        let items = tokio::task::spawn_blocking(move || {
+            completion_items_for_source(&analyzed_text, position, compile_options)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        if self
+            .docs
+            .lock()
+            .unwrap()
+            .get(&uri)
+            .is_none_or(|document| document.text != text)
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(CompletionResponse::Array(items)))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
@@ -334,6 +382,581 @@ fn inlay_hints_for_source(source: &str, range: Range) -> Vec<InlayHint> {
     });
     hints.sort_by_key(|hint| (hint.position.line, hint.position.character));
     hints
+}
+
+const COMPLETION_MARKER: &str = "__riddle_completion";
+const COMPLETION_KEYWORDS: &[&str] = &[
+    "let", "fun", "struct", "if", "else", "while", "break", "continue", "return", "as", "self",
+    "mod", "use", "mut", "pub", "super", "crate", "enum", "trait", "impl", "match", "const",
+    "type", "extern", "unsafe", "for", "in", "where", "true", "false",
+];
+const COMPLETION_BUILTIN_TYPES: &[&str] = &[
+    "bool", "char", "str", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64",
+    "u128", "usize", "f16", "f32", "f64", "f128",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionContext<'a> {
+    General,
+    Member,
+    Associated(&'a str),
+}
+
+fn completion_items_for_source(
+    source: &str,
+    position: lsp_types::Position,
+    compile_options: CompileOptions,
+) -> Vec<CompletionItem> {
+    let Some(offset) = offset_for_position(source, position) else {
+        return Vec::new();
+    };
+    let start = identifier_start(source, offset);
+    let end = identifier_end(source, offset);
+    let prefix = &source[start..offset];
+    let before = &source[..start];
+    let context = if before.ends_with('.') {
+        CompletionContext::Member
+    } else if let Some(path) = before.strip_suffix("::") {
+        CompletionContext::Associated(trailing_identifier(path))
+    } else {
+        CompletionContext::General
+    };
+
+    let mut analyzed_source = source.to_string();
+    if context != CompletionContext::General {
+        analyzed_source.replace_range(start..end, COMPLETION_MARKER);
+    }
+    let mut resolved = riddlec::pipeline::resolve_with_options(&analyzed_source, compile_options);
+    let marker_end = start + COMPLETION_MARKER.len();
+    if resolved.hir.is_none()
+        && context != CompletionContext::General
+        && !analyzed_source[marker_end..].trim_start().starts_with(';')
+    {
+        analyzed_source.insert(marker_end, ';');
+        resolved = riddlec::pipeline::resolve_with_options(&analyzed_source, compile_options);
+    }
+    let mut items = Vec::new();
+
+    if context == CompletionContext::General {
+        items.extend(COMPLETION_KEYWORDS.iter().map(|keyword| {
+            completion_item(keyword, CompletionItemKind::KEYWORD, Some("keyword".into()))
+        }));
+        items.extend(COMPLETION_BUILTIN_TYPES.iter().map(|ty| {
+            completion_item(
+                ty,
+                CompletionItemKind::TYPE_PARAMETER,
+                Some("builtin type".into()),
+            )
+        }));
+    }
+
+    if let Some(hir) = resolved.hir.as_ref() {
+        match context {
+            CompletionContext::General => {
+                collect_global_completions(hir, source.len(), &mut items);
+                collect_local_completions(hir, offset, &mut items);
+            }
+            CompletionContext::Member => {
+                let types = type_checker::check_hir(hir);
+                collect_member_completions(hir, &types, source.len(), &mut items);
+            }
+            CompletionContext::Associated(qualifier) if !qualifier.is_empty() => {
+                collect_associated_completions(hir, qualifier, source.len(), &mut items);
+            }
+            CompletionContext::Associated(_) => {}
+        }
+    }
+
+    items.retain(|item| item.label.starts_with(prefix));
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+    items.dedup_by(|left, right| left.label == right.label);
+    items
+}
+
+fn collect_global_completions(
+    hir: &hir::HirFile,
+    source_len: usize,
+    out: &mut Vec<CompletionItem>,
+) {
+    for item in &hir.item_tree.top_level {
+        push_top_level_item(hir, *item, source_len, true, out);
+    }
+    for (_, use_item) in hir.item_tree.uses.iter() {
+        if use_item.visibility.is_public() {
+            push_use_tree(&use_item.tree, out);
+        }
+    }
+}
+
+fn collect_local_completions(hir: &hir::HirFile, offset: usize, out: &mut Vec<CompletionItem>) {
+    // ponytail: document-local scopes; use the project scope graph for cross-module completion.
+    for (function_id, body_id) in &hir.function_bodies {
+        let hir_body = &hir.bodies[*body_id];
+        let Some(root_range) = hir_body.source_map.expr_ranges.get(&hir_body.root_block) else {
+            continue;
+        };
+        if !range_contains_offset(*root_range, offset) {
+            continue;
+        }
+        for param in &hir.item_tree.functions[*function_id].params {
+            out.push(completion_item(
+                &param.name.0,
+                CompletionItemKind::VARIABLE,
+                Some(param.ty.display()),
+            ));
+        }
+        for (_, statement) in hir_body.stmts.iter() {
+            if let Stmt::Let {
+                name,
+                name_range: Some(name_range),
+                ty,
+                ..
+            } = statement
+                && usize::from(name_range.start()) < offset
+            {
+                let detail = (ty != &HirTypeRef::Unknown).then(|| ty.display());
+                out.push(completion_item(
+                    &name.0,
+                    CompletionItemKind::VARIABLE,
+                    detail,
+                ));
+            }
+        }
+        for (_, expr) in hir_body.exprs.iter() {
+            let Expr::Lambda {
+                params,
+                body: lambda_body,
+                ..
+            } = expr
+            else {
+                continue;
+            };
+            let Some(lambda_range) = hir_body.source_map.expr_ranges.get(lambda_body) else {
+                continue;
+            };
+            if range_contains_offset(*lambda_range, offset) {
+                for param in params {
+                    out.push(completion_item(
+                        &param.name.0,
+                        CompletionItemKind::VARIABLE,
+                        Some(param.ty.display()),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn collect_member_completions(
+    hir: &hir::HirFile,
+    types: &type_checker::TypeCheckResult,
+    source_len: usize,
+    out: &mut Vec<CompletionItem>,
+) {
+    let receiver = hir.bodies.iter().find_map(|(body_id, body)| {
+        body.exprs.iter().find_map(|(_, expr)| {
+            let Expr::FieldAccess { base, field } = expr else {
+                return None;
+            };
+            (field.0 == COMPLETION_MARKER)
+                .then(|| types.expr_types.get(&(body_id, *base)))
+                .flatten()
+        })
+    });
+    let Some(receiver) = receiver else {
+        return;
+    };
+
+    if let Some(struct_id) = receiver_struct_id(receiver) {
+        let struct_item = &hir.item_tree.structs[struct_id];
+        if usize::from(struct_item.name_range.start()) < source_len {
+            for field in &struct_item.fields {
+                out.push(completion_item(
+                    &field.name.0,
+                    CompletionItemKind::FIELD,
+                    Some(field.ty.display()),
+                ));
+            }
+        }
+    }
+
+    for (_, impl_item) in hir.item_tree.impls.iter() {
+        if !type_ref_matches_type(hir, &impl_item.self_ty, receiver) {
+            continue;
+        }
+        for function_id in &impl_item.methods {
+            let function = &hir.item_tree.functions[*function_id];
+            if function
+                .params
+                .first()
+                .is_some_and(|param| param.name.0 == "self")
+                && (item_is_visible(function.visibility.clone(), function.name_range, source_len)
+                    || impl_item.trait_ty.is_some())
+            {
+                out.push(function_completion(function, CompletionItemKind::METHOD));
+            }
+        }
+    }
+}
+
+fn collect_associated_completions(
+    hir: &hir::HirFile,
+    qualifier: &str,
+    source_len: usize,
+    out: &mut Vec<CompletionItem>,
+) {
+    for (_, enum_item) in hir.item_tree.enums.iter() {
+        if enum_item.name.0 == qualifier {
+            for variant in &enum_item.variants {
+                out.push(completion_item(
+                    &variant.name.0,
+                    CompletionItemKind::ENUM_MEMBER,
+                    Some(format!("{}::{}", enum_item.name.0, variant.name.0)),
+                ));
+            }
+        }
+    }
+    for (_, module) in hir.item_tree.modules.iter() {
+        if module.name.0 != qualifier {
+            continue;
+        }
+        for item in module.items.iter().flatten() {
+            push_top_level_item(hir, *item, source_len, false, out);
+            if let TopLevelItem::Use(use_id) = item {
+                let use_item = &hir.item_tree.uses[*use_id];
+                if use_item.visibility.is_public() {
+                    push_use_tree(&use_item.tree, out);
+                }
+            }
+        }
+    }
+    for (_, impl_item) in hir.item_tree.impls.iter() {
+        if type_ref_name(&impl_item.self_ty) != Some(qualifier) {
+            continue;
+        }
+        for function_id in &impl_item.methods {
+            let function = &hir.item_tree.functions[*function_id];
+            if function
+                .params
+                .first()
+                .is_none_or(|param| param.name.0 != "self")
+                && item_is_visible(function.visibility.clone(), function.name_range, source_len)
+            {
+                out.push(function_completion(function, CompletionItemKind::FUNCTION));
+            }
+        }
+        for const_id in &impl_item.consts {
+            let item = &hir.item_tree.consts[*const_id];
+            if item_is_visible(item.visibility.clone(), item.name_range, source_len) {
+                out.push(completion_item(
+                    &item.name.0,
+                    CompletionItemKind::CONSTANT,
+                    Some(item.ty.display()),
+                ));
+            }
+        }
+        for type_alias_id in &impl_item.type_aliases {
+            let item = &hir.item_tree.type_aliases[*type_alias_id];
+            if item_is_visible(item.visibility.clone(), item.name_range, source_len) {
+                out.push(completion_item(
+                    &item.name.0,
+                    CompletionItemKind::TYPE_PARAMETER,
+                    item.ty.as_ref().map(HirTypeRef::display),
+                ));
+            }
+        }
+    }
+}
+
+fn push_top_level_item(
+    hir: &hir::HirFile,
+    item: TopLevelItem,
+    source_len: usize,
+    allow_private_user_item: bool,
+    out: &mut Vec<CompletionItem>,
+) {
+    match item {
+        TopLevelItem::Function(id) => {
+            let item = &hir.item_tree.functions[id];
+            if visible_for_completion(
+                &item.visibility,
+                item.name_range,
+                source_len,
+                allow_private_user_item,
+            ) {
+                out.push(function_completion(item, CompletionItemKind::FUNCTION));
+            }
+        }
+        TopLevelItem::Struct(id) => {
+            let item = &hir.item_tree.structs[id];
+            if visible_for_completion(
+                &item.visibility,
+                item.name_range,
+                source_len,
+                allow_private_user_item,
+            ) {
+                out.push(completion_item(
+                    &item.name.0,
+                    CompletionItemKind::STRUCT,
+                    Some(format!("struct {}", item.name.0)),
+                ));
+            }
+        }
+        TopLevelItem::Module(id) => {
+            let item = &hir.item_tree.modules[id];
+            if allow_private_user_item || item.visibility.is_public() {
+                out.push(completion_item(
+                    &item.name.0,
+                    CompletionItemKind::MODULE,
+                    Some(format!("mod {}", item.name.0)),
+                ));
+            }
+        }
+        TopLevelItem::Enum(id) => {
+            let item = &hir.item_tree.enums[id];
+            if visible_for_completion(
+                &item.visibility,
+                item.name_range,
+                source_len,
+                allow_private_user_item,
+            ) {
+                out.push(completion_item(
+                    &item.name.0,
+                    CompletionItemKind::ENUM,
+                    Some(format!("enum {}", item.name.0)),
+                ));
+            }
+        }
+        TopLevelItem::Trait(id) => {
+            let item = &hir.item_tree.traits[id];
+            if allow_private_user_item || item.visibility.is_public() {
+                out.push(completion_item(
+                    &item.name.0,
+                    CompletionItemKind::INTERFACE,
+                    Some(format!("trait {}", item.name.0)),
+                ));
+            }
+        }
+        TopLevelItem::Const(id) => {
+            let item = &hir.item_tree.consts[id];
+            if visible_for_completion(
+                &item.visibility,
+                item.name_range,
+                source_len,
+                allow_private_user_item,
+            ) {
+                out.push(completion_item(
+                    &item.name.0,
+                    CompletionItemKind::CONSTANT,
+                    Some(item.ty.display()),
+                ));
+            }
+        }
+        TopLevelItem::TypeAlias(id) => {
+            let item = &hir.item_tree.type_aliases[id];
+            if visible_for_completion(
+                &item.visibility,
+                item.name_range,
+                source_len,
+                allow_private_user_item,
+            ) {
+                out.push(completion_item(
+                    &item.name.0,
+                    CompletionItemKind::TYPE_PARAMETER,
+                    item.ty.as_ref().map(HirTypeRef::display),
+                ));
+            }
+        }
+        TopLevelItem::Use(_) | TopLevelItem::Impl(_) => {}
+    }
+}
+
+fn push_use_tree(tree: &HirUseTree, out: &mut Vec<CompletionItem>) {
+    match &tree.kind {
+        HirUseTreeKind::Simple { alias } => {
+            let name = alias
+                .as_ref()
+                .or_else(|| tree.prefix.segments.last())
+                .map(|name| name.0.as_str());
+            if let Some(name) = name {
+                out.push(completion_item(
+                    name,
+                    CompletionItemKind::REFERENCE,
+                    Some(format!("use {}", tree.prefix.display())),
+                ));
+            }
+        }
+        HirUseTreeKind::List(items) => {
+            for item in items {
+                push_use_tree(item, out);
+            }
+        }
+        HirUseTreeKind::Glob => {}
+    }
+}
+
+fn function_completion(function: &HirFunction, kind: CompletionItemKind) -> CompletionItem {
+    let params = function
+        .params
+        .iter()
+        .map(|param| {
+            if param.name.0 == "self" {
+                match &param.ty {
+                    HirTypeRef::Ref(_, true) => "&mut self".into(),
+                    HirTypeRef::Ref(_, false) => "&self".into(),
+                    _ => "self".into(),
+                }
+            } else {
+                format!("{}: {}", param.name.0, param.ty.display())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ret = function
+        .ret_type
+        .as_ref()
+        .map(HirTypeRef::display)
+        .unwrap_or_else(|| "()".into());
+    let mut item = completion_item(
+        &function.name.0,
+        kind,
+        Some(format!("fun {}({params}) -> {ret}", function.name.0)),
+    );
+    item.label_details = Some(CompletionItemLabelDetails {
+        detail: Some(format!("({params})")),
+        description: Some(ret),
+    });
+    item.insert_text = Some(function.name.0.clone());
+    item
+}
+
+fn completion_item(
+    label: &str,
+    kind: CompletionItemKind,
+    detail: Option<String>,
+) -> CompletionItem {
+    CompletionItem {
+        label: label.into(),
+        kind: Some(kind),
+        detail,
+        ..CompletionItem::default()
+    }
+}
+
+fn visible_for_completion(
+    visibility: &Visibility,
+    range: TextRange,
+    source_len: usize,
+    allow_private_user_item: bool,
+) -> bool {
+    visibility.is_public() || (allow_private_user_item && usize::from(range.start()) < source_len)
+}
+
+fn item_is_visible(visibility: Visibility, range: TextRange, source_len: usize) -> bool {
+    visibility.is_public() || usize::from(range.start()) < source_len
+}
+
+fn receiver_struct_id(ty: &type_checker::Type) -> Option<StructId> {
+    match ty {
+        type_checker::Type::Struct(id, _) => Some(*id),
+        type_checker::Type::Ref(inner, _) | type_checker::Type::Ptr { inner, .. } => {
+            receiver_struct_id(inner)
+        }
+        _ => None,
+    }
+}
+
+fn type_ref_matches_type(
+    hir: &hir::HirFile,
+    expected: &HirTypeRef,
+    actual: &type_checker::Type,
+) -> bool {
+    match (expected, actual) {
+        (HirTypeRef::Ref(expected, _), type_checker::Type::Ref(actual, _))
+        | (HirTypeRef::Ref(expected, _), type_checker::Type::Ptr { inner: actual, .. }) => {
+            type_ref_matches_type(hir, expected, actual)
+        }
+        (
+            HirTypeRef::Ptr {
+                inner: expected, ..
+            },
+            type_checker::Type::Ptr { inner: actual, .. },
+        ) => type_ref_matches_type(hir, expected, actual),
+        (HirTypeRef::Array(expected, _), type_checker::Type::Array(actual, _)) => {
+            type_ref_matches_type(hir, expected, actual)
+        }
+        (HirTypeRef::Named(_), type_checker::Type::Ref(actual, _))
+        | (HirTypeRef::Named(_), type_checker::Type::Ptr { inner: actual, .. }) => {
+            type_ref_matches_type(hir, expected, actual)
+        }
+        (HirTypeRef::Named(_), _) => type_ref_name(expected).is_some_and(|expected| {
+            let actual = actual.display(hir);
+            actual.split('<').next() == Some(expected)
+        }),
+        _ => false,
+    }
+}
+
+fn type_ref_name(ty: &HirTypeRef) -> Option<&str> {
+    match ty {
+        HirTypeRef::Named(path) => path.segments.last().map(|name| name.0.as_str()),
+        HirTypeRef::Ref(inner, _) | HirTypeRef::Ptr { inner, .. } => type_ref_name(inner),
+        _ => None,
+    }
+}
+
+fn offset_for_position(source: &str, position: lsp_types::Position) -> Option<usize> {
+    let mut line_start = 0;
+    for _ in 0..position.line {
+        line_start += source[line_start..].find('\n')? + 1;
+    }
+    let line_end = source[line_start..]
+        .find('\n')
+        .map(|offset| line_start + offset)
+        .unwrap_or(source.len());
+    let line = source[line_start..line_end]
+        .strip_suffix('\r')
+        .unwrap_or(&source[line_start..line_end]);
+    let mut utf16_column = 0;
+    for (byte, ch) in line.char_indices() {
+        if utf16_column == position.character {
+            return Some(line_start + byte);
+        }
+        utf16_column += ch.len_utf16() as u32;
+        if utf16_column > position.character {
+            return None;
+        }
+    }
+    (utf16_column == position.character).then_some(line_start + line.len())
+}
+
+fn identifier_start(source: &str, offset: usize) -> usize {
+    source[..offset]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !is_identifier_continue(*ch))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0)
+}
+
+fn identifier_end(source: &str, offset: usize) -> usize {
+    source[offset..]
+        .char_indices()
+        .find(|(_, ch)| !is_identifier_continue(*ch))
+        .map(|(index, _)| offset + index)
+        .unwrap_or(source.len())
+}
+
+fn trailing_identifier(source: &str) -> &str {
+    &source[identifier_start(source, source.len())..]
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn range_contains_offset(range: TextRange, offset: usize) -> bool {
+    usize::from(range.start()) <= offset && offset <= usize::from(range.end())
 }
 
 fn watched_change_resets_sessions(change: &FileEvent) -> bool {
@@ -489,6 +1112,8 @@ const TOKEN_NAMESPACE: u32 = 13;
 const TOKEN_PARAMETER: u32 = 14;
 const MOD_DECLARATION: u32 = 1 << 0;
 const MOD_MUTABLE: u32 = 1 << 1;
+const MOD_STATIC: u32 = 1 << 2;
+const MOD_DEFAULT_LIBRARY: u32 = 1 << 3;
 
 fn semantic_tokens_legend() -> SemanticTokensLegend {
     SemanticTokensLegend {
@@ -512,13 +1137,24 @@ fn semantic_tokens_legend() -> SemanticTokensLegend {
         token_modifiers: vec![
             SemanticTokenModifier::DECLARATION,
             SemanticTokenModifier::new("mutable"),
+            SemanticTokenModifier::STATIC,
+            SemanticTokenModifier::DEFAULT_LIBRARY,
         ],
     }
 }
 
+#[cfg(test)]
 fn semantic_tokens_for_source(source: &str) -> SemanticTokens {
+    semantic_tokens_for_source_with_options(source, CompileOptions { use_std: false }, false)
+}
+
+fn semantic_tokens_for_source_with_options(
+    source: &str,
+    compile_options: CompileOptions,
+    default_library_source: bool,
+) -> SemanticTokens {
     let tokens = frontend::lexer::lex(source);
-    let result = riddlec::pipeline::resolve_with_options(source, CompileOptions { use_std: false });
+    let result = riddlec::pipeline::resolve_with_options(source, compile_options);
     let mut raw_tokens = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
@@ -541,10 +1177,20 @@ fn semantic_tokens_for_source(source: &str) -> SemanticTokens {
     }
 
     if let Some(hir) = &result.hir {
-        collect_hir_symbol_tokens(hir, source, &mut raw_tokens);
+        collect_hir_symbol_tokens(
+            hir,
+            source,
+            &tokens,
+            default_library_source,
+            &mut raw_tokens,
+        );
     }
 
     encode_semantic_tokens(source, remove_overlapping_tokens(raw_tokens))
+}
+
+fn is_standard_library_uri(uri: &lsp_types::Url) -> bool {
+    uri.path().contains("/std/std/") || uri.path().ends_with("/std/lib.rid")
 }
 
 const USAGE: &str = "usage: riddle-lsp [--no-std]";
@@ -587,12 +1233,150 @@ struct RawSemanticToken {
     token_modifiers_bitset: u32,
 }
 
-fn collect_hir_symbol_tokens(hir: &hir::HirFile, source: &str, out: &mut Vec<RawSemanticToken>) {
+fn collect_hir_symbol_tokens(
+    hir: &hir::HirFile,
+    source: &str,
+    tokens: &[frontend::lexer::Token],
+    default_library_source: bool,
+    out: &mut Vec<RawSemanticToken>,
+) {
     let source_len = source.len();
+    let mut symbol_types = HashMap::new();
+    let mut method_modifiers = HashMap::new();
+    let mut function_modifiers = HashMap::new();
 
-    for (_, function) in hir.item_tree.functions.iter() {
+    for (_, item) in hir.item_tree.structs.iter() {
+        let in_source = range_is_in_source(item.name_range, source_len);
+        let modifiers = if default_library_source || !in_source {
+            MOD_DEFAULT_LIBRARY
+        } else {
+            0
+        };
+        if in_source {
+            symbol_types.insert(item.name.0.as_str(), (TOKEN_STRUCT, modifiers));
+        } else {
+            symbol_types
+                .entry(item.name.0.as_str())
+                .or_insert((TOKEN_STRUCT, modifiers));
+        }
+    }
+    for (_, item) in hir.item_tree.enums.iter() {
+        let in_source = range_is_in_source(item.name_range, source_len);
+        let modifiers = if default_library_source || !in_source {
+            MOD_DEFAULT_LIBRARY
+        } else {
+            0
+        };
+        if in_source {
+            symbol_types.insert(item.name.0.as_str(), (TOKEN_ENUM, modifiers));
+        } else {
+            symbol_types
+                .entry(item.name.0.as_str())
+                .or_insert((TOKEN_ENUM, modifiers));
+        }
+        for variant in &item.variants {
+            let in_source = range_is_in_source(variant.name_range, source_len);
+            let modifiers = if default_library_source || !in_source {
+                MOD_DEFAULT_LIBRARY
+            } else {
+                0
+            };
+            if in_source {
+                symbol_types.insert(variant.name.0.as_str(), (TOKEN_ENUM, modifiers));
+            } else {
+                symbol_types
+                    .entry(variant.name.0.as_str())
+                    .or_insert((TOKEN_ENUM, modifiers));
+            }
+        }
+    }
+    for (_, item) in hir.item_tree.traits.iter() {
+        symbol_types.entry(item.name.0.as_str()).or_insert((
+            TOKEN_INTERFACE,
+            if default_library_source {
+                MOD_DEFAULT_LIBRARY
+            } else {
+                0
+            },
+        ));
+        for method in &item.methods {
+            if range_is_in_source(method.name_range, source_len) {
+                let mut modifiers = MOD_DECLARATION;
+                if method
+                    .params
+                    .first()
+                    .is_none_or(|param| param.name.0 != "self")
+                {
+                    modifiers |= MOD_STATIC;
+                }
+                if default_library_source {
+                    modifiers |= MOD_DEFAULT_LIBRARY;
+                }
+                out.push(RawSemanticToken {
+                    range: method.name_range,
+                    token_type: TOKEN_METHOD,
+                    token_modifiers_bitset: modifiers,
+                });
+            }
+        }
+    }
+    for (_, item) in hir.item_tree.impls.iter() {
+        for method_id in &item.methods {
+            let method = &hir.item_tree.functions[*method_id];
+            let in_source = range_is_in_source(method.name_range, source_len);
+            let mut modifiers = 0;
+            if method
+                .params
+                .first()
+                .is_none_or(|param| param.name.0 != "self")
+            {
+                modifiers |= MOD_STATIC;
+            }
+            if default_library_source || !in_source {
+                modifiers |= MOD_DEFAULT_LIBRARY;
+            }
+            method_modifiers.insert(*method_id, modifiers);
+            if in_source {
+                out.push(RawSemanticToken {
+                    range: method.name_range,
+                    token_type: TOKEN_METHOD,
+                    token_modifiers_bitset: MOD_DECLARATION | modifiers,
+                });
+            }
+        }
+    }
+    for token in tokens {
+        let Some(&(token_type, token_modifiers_bitset)) = symbol_types.get(token.text(source))
+        else {
+            continue;
+        };
+        out.push(RawSemanticToken {
+            range: TextRange::new(
+                (token.span.start as u32).into(),
+                (token.span.end as u32).into(),
+            ),
+            token_type,
+            token_modifiers_bitset,
+        });
+    }
+
+    for (function_id, function) in hir.item_tree.functions.iter() {
+        let in_source = range_is_in_source(function.name_range, source_len);
+        let modifiers = if default_library_source || !in_source {
+            MOD_DEFAULT_LIBRARY
+        } else {
+            0
+        };
+        function_modifiers.insert(function_id, modifiers);
+        if in_source && !method_modifiers.contains_key(&function_id) {
+            out.push(RawSemanticToken {
+                range: function.name_range,
+                token_type: TOKEN_FUNCTION,
+                token_modifiers_bitset: MOD_DECLARATION | modifiers,
+            });
+        }
         for param in &function.params {
-            if range_is_in_source(param.name_range, source_len) {
+            if param.name.0 != "self" && range_is_in_source(param.name_range, source_len) {
                 out.push(RawSemanticToken {
                     range: param.name_range,
                     token_type: TOKEN_PARAMETER,
@@ -644,7 +1428,10 @@ fn collect_hir_symbol_tokens(hir: &hir::HirFile, source: &str, out: &mut Vec<Raw
             let Expr::Path { path, resolved } = expr else {
                 continue;
             };
-            if path.as_single_name().is_none() {
+            let Some(name) = path.segments.last() else {
+                continue;
+            };
+            if path.as_single_name().is_some() && name.0 == "self" {
                 continue;
             }
 
@@ -652,7 +1439,7 @@ fn collect_hir_symbol_tokens(hir: &hir::HirFile, source: &str, out: &mut Vec<Raw
                 .source_map
                 .expr_ranges
                 .get(&expr_id)
-                .and_then(|range| trim_source_range(source, *range))
+                .and_then(|range| last_identifier_range(source, *range))
             else {
                 continue;
             };
@@ -660,9 +1447,12 @@ fn collect_hir_symbol_tokens(hir: &hir::HirFile, source: &str, out: &mut Vec<Raw
                 continue;
             }
 
-            let Some((token_type, token_modifiers_bitset)) =
-                semantic_token_for_resolution(body, resolved.as_ref())
-            else {
+            let Some((token_type, token_modifiers_bitset)) = semantic_token_for_resolution(
+                body,
+                resolved.as_ref(),
+                &method_modifiers,
+                &function_modifiers,
+            ) else {
                 continue;
             };
             out.push(RawSemanticToken {
@@ -677,6 +1467,8 @@ fn collect_hir_symbol_tokens(hir: &hir::HirFile, source: &str, out: &mut Vec<Raw
 fn semantic_token_for_resolution(
     body: &hir::body::Body,
     resolved: Option<&ResolvedName>,
+    method_modifiers: &HashMap<FunctionId, u32>,
+    function_modifiers: &HashMap<FunctionId, u32>,
 ) -> Option<(u32, u32)> {
     match resolved {
         Some(ResolvedName::Local(stmt_id)) => match &body.stmts[*stmt_id] {
@@ -686,6 +1478,22 @@ fn semantic_token_for_resolution(
         Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => {
             Some((TOKEN_PARAMETER, 0))
         }
+        Some(ResolvedName::Function(function_id)) => {
+            if let Some(modifiers) = method_modifiers.get(function_id) {
+                Some((TOKEN_METHOD, *modifiers))
+            } else {
+                Some((
+                    TOKEN_FUNCTION,
+                    function_modifiers.get(function_id).copied().unwrap_or(0),
+                ))
+            }
+        }
+        Some(ResolvedName::Struct(_)) => Some((TOKEN_STRUCT, 0)),
+        Some(ResolvedName::Enum(_) | ResolvedName::EnumVariant(_, _)) => Some((TOKEN_ENUM, 0)),
+        Some(ResolvedName::Trait(_)) => Some((TOKEN_INTERFACE, 0)),
+        Some(ResolvedName::TypeAlias(_)) => Some((TOKEN_TYPE, 0)),
+        Some(ResolvedName::Module(_)) => Some((TOKEN_NAMESPACE, 0)),
+        Some(ResolvedName::Const(_)) => Some((TOKEN_VARIABLE, 0)),
         _ => None,
     }
 }
@@ -704,11 +1512,40 @@ fn trim_source_range(source: &str, range: TextRange) -> Option<TextRange> {
     (start < end).then(|| TextRange::new((start as u32).into(), (end as u32).into()))
 }
 
+fn last_identifier_range(source: &str, range: TextRange) -> Option<TextRange> {
+    let range = trim_source_range(source, range)?;
+    let end = usize::from(range.end());
+    let text = source.get(usize::from(range.start())..end)?;
+    let length = text
+        .chars()
+        .rev()
+        .take_while(|ch| is_identifier_continue(*ch))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    (length > 0).then(|| TextRange::new(((end - length) as u32).into(), (end as u32).into()))
+}
+
 fn remove_overlapping_tokens(raw_tokens: Vec<RawSemanticToken>) -> Vec<RawSemanticToken> {
-    let (mut preferred, mut fallback): (Vec<_>, Vec<_>) = raw_tokens
-        .into_iter()
-        .partition(|token| matches!(token.token_type, TOKEN_VARIABLE | TOKEN_PARAMETER));
-    preferred.sort_by_key(|token| (token.range.start(), token.range.end()));
+    let (mut preferred, mut fallback): (Vec<_>, Vec<_>) =
+        raw_tokens.into_iter().partition(|token| {
+            matches!(
+                token.token_type,
+                TOKEN_FUNCTION
+                    | TOKEN_METHOD
+                    | TOKEN_VARIABLE
+                    | TOKEN_STRUCT
+                    | TOKEN_ENUM
+                    | TOKEN_INTERFACE
+                    | TOKEN_PARAMETER
+            )
+        });
+    preferred.sort_by_key(|token| {
+        (
+            token.range.start(),
+            token.range.end(),
+            std::cmp::Reverse(token.token_modifiers_bitset.count_ones()),
+        )
+    });
     fallback.sort_by_key(|token| (token.range.start(), token.range.end()));
 
     let mut kept_preferred: Vec<RawSemanticToken> = Vec::new();
@@ -829,6 +1666,10 @@ fn semantic_token(
 }
 
 fn ident_token_type(tokens: &[frontend::lexer::Token], index: usize, source: &str) -> Option<u32> {
+    let text = tokens[index].text(source);
+    if COMPLETION_BUILTIN_TYPES.contains(&text) {
+        return Some(TOKEN_KEYWORD);
+    }
     let previous = previous_significant(tokens, index).map(|token| token.kind);
     let next = next_significant(tokens, index).map(|token| token.kind);
     match previous {
@@ -846,7 +1687,7 @@ fn ident_token_type(tokens: &[frontend::lexer::Token], index: usize, source: &st
             }
         }
         _ if next == Some(SyntaxKind::LParen) => Some(TOKEN_FUNCTION),
-        _ if token_starts_uppercase(tokens[index].text(source)) => Some(TOKEN_TYPE),
+        _ if token_starts_uppercase(text) => Some(TOKEN_TYPE),
         _ => None,
     }
 }

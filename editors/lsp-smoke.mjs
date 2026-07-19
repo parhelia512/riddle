@@ -5,6 +5,7 @@ const command = process.argv[2] ?? 'riddle-lsp';
 const uri = 'file:///riddle-lsp-smoke.rid';
 const stableUri = 'file:///riddle-lsp-stable.rid';
 const fixUri = 'file:///riddle-lsp-fix.rid';
+const completionUri = 'file:///riddle-lsp-completion.rid';
 const server = spawn(command, [], { stdio: ['pipe', 'pipe', 'inherit'] });
 let input = Buffer.alloc(0);
 const messages = [];
@@ -58,12 +59,19 @@ try {
     jsonrpc: '2.0',
     id: 1,
     method: 'initialize',
-    params: { processId: null, rootUri: null, capabilities: {} },
+    params: {
+      processId: null,
+      rootUri: null,
+      capabilities: {
+        textDocument: { completion: { completionItem: { labelDetailsSupport: true } } },
+      },
+    },
   });
   const initialized = await read((message) => message.id === 1);
   assert.equal(initialized.result.serverInfo.name, 'riddle-lsp');
   assert.equal(initialized.result.capabilities.positionEncoding, 'utf-16');
   assert.equal(initialized.result.capabilities.codeActionProvider, true);
+  assert.deepEqual(initialized.result.capabilities.completionProvider.triggerCharacters, ['.', ':']);
   assert.equal(initialized.result.capabilities.inlayHintProvider, true);
   assert(initialized.result.capabilities.semanticTokensProvider);
 
@@ -245,13 +253,53 @@ try {
     'unchanged diagnostics were published again',
   );
 
+  const completionText = 'fun main() { let c = String::new(); let d = c.i }';
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: completionUri,
+        languageId: 'riddle',
+        version: 1,
+        text: completionText,
+      },
+    },
+  });
+  await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === completionUri &&
+      message.params.version === 1,
+  );
   send({
     jsonrpc: '2.0',
     id: 4,
+    method: 'textDocument/completion',
+    params: {
+      textDocument: { uri: completionUri },
+      position: { line: 0, character: completionText.indexOf('c.i') + 3 },
+    },
+  });
+  const completions = await read((message) => message.id === 4);
+  assert(
+    completions.result.some(
+      (item) =>
+        item.label === 'is_empty' &&
+        item.labelDetails.detail === '(&self)' &&
+        item.labelDetails.description === 'bool' &&
+        item.insertText === 'is_empty' &&
+        item.kind === 2,
+    ),
+  );
+
+  send({
+    jsonrpc: '2.0',
+    id: 5,
     method: 'textDocument/semanticTokens/full',
     params: { textDocument: { uri } },
   });
-  const semanticTokens = await read((message) => message.id === 4);
+  const semanticTokens = await read((message) => message.id === 5);
   assert(semanticTokens.result.data.length > 0);
 
   send({
@@ -293,8 +341,21 @@ try {
   );
   assert.deepEqual(fixClosed.params.diagnostics, []);
 
-  send({ jsonrpc: '2.0', id: 5, method: 'shutdown', params: null });
-  await read((message) => message.id === 5);
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: completionUri } },
+  });
+  const completionClosed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === completionUri &&
+      message.params.version == null,
+  );
+  assert.deepEqual(completionClosed.params.diagnostics, []);
+
+  send({ jsonrpc: '2.0', id: 6, method: 'shutdown', params: null });
+  await read((message) => message.id === 6);
   send({ jsonrpc: '2.0', method: 'exit' });
   console.log('riddle-lsp stdio handshake passed');
 } finally {

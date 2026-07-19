@@ -242,6 +242,147 @@ fn full_text_uses_latest_full_sync_change() {
 }
 
 #[test]
+fn completion_positions_use_utf16_columns() {
+    let source = "😀name\r\nnext";
+
+    assert_eq!(offset_for_position(source, Position::new(0, 2)), Some(4));
+    assert_eq!(offset_for_position(source, Position::new(0, 1)), None);
+    assert_eq!(
+        offset_for_position(source, Position::new(1, 4)),
+        Some(source.len())
+    );
+}
+
+#[test]
+fn completion_filters_keywords_globals_and_locals_by_prefix() {
+    let source = "struct Widget {}\nfun helper() {}\nfun main(value: i32) { let local = 1; loc }";
+    let local_position = position(source, source.rfind("loc").unwrap() + 3);
+    let local =
+        completion_items_for_source(source, local_position, CompileOptions { use_std: false });
+
+    assert_eq!(
+        local
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["local"]
+    );
+
+    let helper_start = source.find("helper() {}").unwrap();
+    let helper_position = position(source, helper_start + 3);
+    let globals =
+        completion_items_for_source(source, helper_position, CompileOptions { use_std: false });
+    let helper = globals.iter().find(|item| item.label == "helper").unwrap();
+    let helper_label = helper.label_details.as_ref().unwrap();
+    assert_eq!(helper_label.detail.as_deref(), Some("()"));
+    assert_eq!(helper_label.description.as_deref(), Some("()"));
+
+    let keyword_source = "fun main() { ret }";
+    let keywords = completion_items_for_source(
+        keyword_source,
+        position(keyword_source, keyword_source.find("ret").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(keywords.iter().any(|item| item.label == "return"));
+}
+
+#[test]
+fn completion_resolves_fields_and_instance_methods() {
+    let source = "struct Point { x: i32, y: i32 }\nimpl Point { fun origin() -> Point { Point { x: 0, y: 0 } } fun magnitude(&self) -> i32 { self.x } fun offset(&self, value: i32) -> i32 { value } }\nfun main() { let point = Point { x: 1, y: 2 }; point. }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("point.").unwrap() + "point.".len()),
+        CompileOptions { use_std: false },
+    );
+    let labels = items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(labels.contains(&"x"), "{items:#?}");
+    assert!(labels.contains(&"y"), "{items:#?}");
+    assert!(labels.contains(&"magnitude"), "{items:#?}");
+    assert!(labels.contains(&"offset"), "{items:#?}");
+    assert!(!labels.contains(&"origin"), "{items:#?}");
+
+    let magnitude = items.iter().find(|item| item.label == "magnitude").unwrap();
+    let magnitude_label = magnitude.label_details.as_ref().unwrap();
+    assert_eq!(magnitude_label.detail.as_deref(), Some("(&self)"));
+    assert_eq!(magnitude_label.description.as_deref(), Some("i32"));
+    assert_eq!(magnitude.insert_text.as_deref(), Some("magnitude"));
+
+    let offset = items.iter().find(|item| item.label == "offset").unwrap();
+    let offset_label = offset.label_details.as_ref().unwrap();
+    assert_eq!(offset_label.detail.as_deref(), Some("(&self, value: i32)"));
+    assert_eq!(offset_label.description.as_deref(), Some("i32"));
+}
+
+#[test]
+fn completion_filters_member_candidates_after_the_dot() {
+    let source = "struct Foo { bar: i32 }\nfun main() { let c = Foo { bar: 1 }; c.b }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("c.b").unwrap() + "c.b".len()),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "bar"), "{items:#?}");
+}
+
+#[test]
+fn completion_recovers_incomplete_let_member_access() {
+    let source = "use std::String;\n\nfun main() {\n    let c = String::new();\n    let d = c.\n}";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("c.\n").unwrap() + "c.".len()),
+        CompileOptions::default(),
+    );
+
+    let as_str = items.iter().find(|item| item.label == "as_str").unwrap();
+    let label = as_str.label_details.as_ref().unwrap();
+    assert_eq!(label.detail.as_deref(), Some("(&self)"));
+    assert_eq!(label.description.as_deref(), Some("&str"));
+    assert_eq!(as_str.insert_text.as_deref(), Some("as_str"));
+}
+
+#[test]
+fn completion_resolves_std_associated_functions() {
+    let source = "fun main() { let value = String::ne; }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("ne;").unwrap() + 2),
+        CompileOptions::default(),
+    );
+
+    assert!(
+        items.iter().any(|item| {
+            item.label == "new"
+                && item.label_details.as_ref().is_some_and(|label| {
+                    label.detail.as_deref() == Some("()")
+                        && label.description.as_deref() == Some("String")
+                })
+                && item.kind == Some(lsp_types::CompletionItemKind::FUNCTION)
+        }),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn completion_includes_std_prelude_imports() {
+    let source = "fun main() { Str }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("Str").unwrap() + 3),
+        CompileOptions::default(),
+    );
+
+    assert!(
+        items.iter().any(|item| item.label == "String"),
+        "{items:#?}"
+    );
+}
+
+#[test]
 fn semantic_tokens_classifies_core_tokens() {
     let tokens = semantic_tokens("fun main() {\n  let mut x = \"hi\"; // ok\n}");
     let types = tokens
@@ -330,6 +471,228 @@ fn semantic_tokens_keep_utf16_positions_across_lines() {
     assert_eq!(function.line, 1);
     assert_eq!(function.start, 4);
     assert_eq!(function.length, 4);
+}
+
+#[test]
+fn semantic_tokens_highlight_str_and_self_as_keywords() {
+    let source = "struct Foo { text: &str }\nimpl Foo { fun get(&self) -> &str { self.text } }";
+    let tokens = semantic_token_positions(&semantic_tokens(source));
+
+    assert!(
+        tokens.iter().any(|token| {
+            token.line == 0
+                && token.start == 20
+                && token.length == 3
+                && token.token_type == TOKEN_KEYWORD
+        }),
+        "{tokens:#?}"
+    );
+    assert!(
+        tokens.iter().any(|token| {
+            token.line == 1
+                && token.start == 20
+                && token.length == 4
+                && token.token_type == TOKEN_KEYWORD
+        }),
+        "{tokens:#?}"
+    );
+    assert!(
+        tokens.iter().any(|token| {
+            token.line == 1
+                && token.start == 36
+                && token.length == 4
+                && token.token_type == TOKEN_KEYWORD
+        }),
+        "{tokens:#?}"
+    );
+}
+
+#[test]
+fn semantic_tokens_distinguish_methods_structs_enums_and_traits() {
+    let source = r#"struct Point {}
+enum State { Ready }
+trait Draw { fun draw(&self); }
+impl Draw for Point { fun draw(&self) {} }
+fun main() {
+    let point = Point {};
+    point.draw();
+    let state = State::Ready;
+}"#;
+    let tokens = semantic_token_positions(&semantic_tokens(source));
+    let symbols = tokens
+        .iter()
+        .map(|token| {
+            let line = source.lines().nth(token.line as usize).unwrap();
+            let start = token.start as usize;
+            let end = start + token.length as usize;
+            (
+                &line[start..end],
+                token.token_type,
+                token.token_modifiers_bitset,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|(text, kind, _)| *text == "Point" && *kind == TOKEN_STRUCT)
+            .count(),
+        3,
+        "{symbols:#?}"
+    );
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|(text, kind, _)| matches!((*text, *kind), ("State" | "Ready", TOKEN_ENUM)))
+            .count(),
+        4,
+        "{symbols:#?}"
+    );
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|(text, kind, _)| *text == "Draw" && *kind == TOKEN_INTERFACE)
+            .count(),
+        2,
+        "{symbols:#?}"
+    );
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|(text, kind, _)| *text == "draw" && *kind == TOKEN_METHOD)
+            .count(),
+        3,
+        "{symbols:#?}"
+    );
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|(text, kind, modifiers)| {
+                *text == "draw" && *kind == TOKEN_METHOD && *modifiers == MOD_DECLARATION
+            })
+            .count(),
+        2,
+        "{symbols:#?}"
+    );
+}
+
+#[test]
+fn semantic_tokens_classify_std_structs_and_associated_new() {
+    let source = include_str!("../../std/std/string.rid");
+    let tokens = semantic_token_positions(&semantic_tokens_for_source_with_options(
+        source,
+        CompileOptions::default(),
+        true,
+    ));
+    let symbols = tokens
+        .iter()
+        .map(|token| {
+            let line = source.lines().nth(token.line as usize).unwrap();
+            let start = token.start as usize;
+            let end = start + token.length as usize;
+            (
+                &line[start..end],
+                token.token_type,
+                token.token_modifiers_bitset,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for name in ["String", "Vector"] {
+        let expected = source.match_indices(name).count();
+        let actual = symbols
+            .iter()
+            .filter(|(text, kind, modifiers)| {
+                *text == name && *kind == TOKEN_STRUCT && *modifiers & MOD_DEFAULT_LIBRARY != 0
+            })
+            .count();
+        assert_eq!(actual, expected, "{name}: {symbols:#?}");
+    }
+
+    let new_tokens = symbols
+        .iter()
+        .filter(|(text, kind, _)| *text == "new" && *kind == TOKEN_METHOD)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        new_tokens.len(),
+        source.match_indices("new").count(),
+        "{symbols:#?}"
+    );
+    assert!(
+        new_tokens.iter().all(|(_, _, modifiers)| {
+            *modifiers & MOD_STATIC != 0 && *modifiers & MOD_DEFAULT_LIBRARY != 0
+        }),
+        "{symbols:#?}"
+    );
+}
+
+#[test]
+fn semantic_tokens_classify_primitives_type_annotations_and_free_functions() {
+    let source = r#"fun make(value: i32, size: usize, enabled: bool) -> String {
+    String::new()
+}
+
+fun main() {
+    let s: String = make(1i32, 0usize, true);
+}"#;
+    let tokens = semantic_token_positions(&semantic_tokens_for_source_with_options(
+        source,
+        CompileOptions::default(),
+        false,
+    ));
+    let symbols = tokens
+        .iter()
+        .map(|token| {
+            let line = source.lines().nth(token.line as usize).unwrap();
+            let start = token.start as usize;
+            let end = start + token.length as usize;
+            (
+                &line[start..end],
+                token.token_type,
+                token.token_modifiers_bitset,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for primitive in ["i32", "usize", "bool"] {
+        assert!(
+            symbols
+                .iter()
+                .any(|(text, kind, _)| { *text == primitive && *kind == TOKEN_KEYWORD }),
+            "{primitive}: {symbols:#?}"
+        );
+    }
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|(text, kind, modifiers)| {
+                *text == "String" && *kind == TOKEN_STRUCT && *modifiers & MOD_DEFAULT_LIBRARY != 0
+            })
+            .count(),
+        3,
+        "{symbols:#?}"
+    );
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|(text, kind, _)| *text == "make" && *kind == TOKEN_FUNCTION)
+            .count(),
+        2,
+        "{symbols:#?}"
+    );
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|(text, kind, modifiers)| {
+                matches!(*text, "make" | "main")
+                    && *kind == TOKEN_FUNCTION
+                    && *modifiers == MOD_DECLARATION
+            })
+            .count(),
+        2,
+        "{symbols:#?}"
+    );
 }
 
 #[test]

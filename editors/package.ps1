@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $dist = Join-Path $PSScriptRoot "dist"
+$intellij = Join-Path $PSScriptRoot "intellij"
 $vscode = Join-Path $PSScriptRoot "vscode"
 New-Item -ItemType Directory -Force $dist | Out-Null
 
@@ -14,6 +15,23 @@ try {
 
     npx --yes @vscode/vsce package --out (Join-Path $dist "riddle-vscode.vsix")
     if ($LASTEXITCODE -ne 0) { throw "VS Code packaging failed" }
+} finally {
+    Pop-Location
+}
+
+Push-Location $intellij
+try {
+    & .\gradlew.bat --no-daemon buildPlugin
+    if ($LASTEXITCODE -ne 0) { throw "JetBrains plugin packaging failed" }
+
+    $intellijPackage = Get-ChildItem -Path "build\distributions\riddle-intellij-*.zip" -File |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($null -eq $intellijPackage) { throw "JetBrains plugin package was not generated" }
+
+    Copy-Item -Force `
+        -LiteralPath $intellijPackage.FullName `
+        -Destination (Join-Path $dist "riddle-intellij.zip")
 } finally {
     Pop-Location
 }
