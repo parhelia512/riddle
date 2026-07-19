@@ -471,13 +471,15 @@ fn c_backend_assigns_if_phi_inputs_before_branching() {
 fn c_backend_provides_string_builtins() {
     let module = lower(
         r#"
-        extern "C" fun str_len(s: &str) -> usize;
-        extern "C" fun str_byte(s: &str, idx: usize) -> u8;
+        unsafe extern "C" {
+            safe fun str_len(s: &str) -> usize;
+            fun str_byte(s: &str, idx: usize) -> u8;
+        }
 
         fun main() -> u8 {
             let s: &str = "abc";
             let _len = str_len(s);
-            return str_byte(s, 1usize);
+            return unsafe { str_byte(s, 1usize) };
         }
         "#,
     );
@@ -512,7 +514,7 @@ fn c_backend_wraps_string_extern_returns() {
         extern "C" fun greeting() -> &str;
 
         fun hello() -> &str {
-            return greeting();
+            return unsafe { greeting() };
         }
         "#,
     );

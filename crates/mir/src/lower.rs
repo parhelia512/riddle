@@ -1944,13 +1944,18 @@ impl<'a> LowerCtx<'a> {
                 HirConstArg::Unknown => ConstArg::Unknown,
                 HirConstArg::Error => ConstArg::Error,
             }),
-            HirTypeRef::Function { params, ret } => type_checker::Type::Fn(
-                params
+            HirTypeRef::Function {
+                is_unsafe,
+                params,
+                ret,
+            } => type_checker::Type::Fn {
+                is_unsafe: *is_unsafe,
+                params: params
                     .iter()
                     .map(|param| self.lower_hir_type_for_pattern(param, subst))
                     .collect(),
-                Box::new(self.lower_hir_type_for_pattern(ret, subst)),
-            ),
+                ret: Box::new(self.lower_hir_type_for_pattern(ret, subst)),
+            },
             HirTypeRef::Unknown => type_checker::Type::Unknown,
             HirTypeRef::Error => type_checker::Type::Error,
         }
@@ -2498,7 +2503,7 @@ impl<'a> LowerCtx<'a> {
                     ret: Box::new(ret),
                 })
             }
-            TcType::Fn(params, ret) => closure_value_type(FnPtrType {
+            TcType::Fn { params, ret, .. } => closure_value_type(FnPtrType {
                 params: params
                     .iter()
                     .map(|param| self.convert_type(param))
@@ -2584,13 +2589,15 @@ impl<'a> LowerCtx<'a> {
                 self.hir_const_arg_to_usize(len, &HashMap::new()),
             ),
             hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
-            hir::item_tree::HirTypeRef::Function { params, ret } => closure_value_type(FnPtrType {
-                params: params
-                    .iter()
-                    .map(|param| self.convert_hir_type(param))
-                    .collect(),
-                ret: Box::new(self.convert_hir_type(ret)),
-            }),
+            hir::item_tree::HirTypeRef::Function { params, ret, .. } => {
+                closure_value_type(FnPtrType {
+                    params: params
+                        .iter()
+                        .map(|param| self.convert_hir_type(param))
+                        .collect(),
+                    ret: Box::new(self.convert_hir_type(ret)),
+                })
+            }
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
@@ -3275,13 +3282,15 @@ impl<'a> LowerCtx<'a> {
                 self.hir_const_arg_to_usize(len, const_subst),
             ),
             hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
-            hir::item_tree::HirTypeRef::Function { params, ret } => closure_value_type(FnPtrType {
-                params: params
-                    .iter()
-                    .map(|param| self.convert_hir_type_with_substs(param, subst, const_subst))
-                    .collect(),
-                ret: Box::new(self.convert_hir_type_with_substs(ret, subst, const_subst)),
-            }),
+            hir::item_tree::HirTypeRef::Function { params, ret, .. } => {
+                closure_value_type(FnPtrType {
+                    params: params
+                        .iter()
+                        .map(|param| self.convert_hir_type_with_substs(param, subst, const_subst))
+                        .collect(),
+                    ret: Box::new(self.convert_hir_type_with_substs(ret, subst, const_subst)),
+                })
+            }
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }

@@ -64,15 +64,17 @@ impl TypeChecker<'_> {
             }
             HirTypeRef::Const(value) => Type::Const(self.lower_const_arg(value, params)),
             HirTypeRef::Function {
+                is_unsafe,
                 params: fn_params,
                 ret,
-            } => Type::Fn(
-                fn_params
+            } => Type::Fn {
+                is_unsafe: *is_unsafe,
+                params: fn_params
                     .iter()
                     .map(|param| self.lower_type_ref_with_params_at(param, params, span))
                     .collect(),
-                Box::new(self.lower_type_ref_with_params_at(ret, params, span)),
-            ),
+                ret: Box::new(self.lower_type_ref_with_params_at(ret, params, span)),
+            },
             HirTypeRef::Unknown => Type::Unknown,
             HirTypeRef::Error => Type::Error,
         }
@@ -107,13 +109,18 @@ impl TypeChecker<'_> {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
             HirTypeRef::Const(value) => value.display(),
-            HirTypeRef::Function { params, ret } => {
+            HirTypeRef::Function {
+                is_unsafe,
+                params,
+                ret,
+            } => {
                 let params = params
                     .iter()
                     .map(Self::type_text)
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("fun({params}) -> {}", Self::type_text(ret))
+                let prefix = if *is_unsafe { "unsafe " } else { "" };
+                format!("{prefix}fun({params}) -> {}", Self::type_text(ret))
             }
         }
     }

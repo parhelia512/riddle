@@ -148,6 +148,37 @@ fn incremental_trait_impl_edit_updates_contract_diagnostics() {
 }
 
 #[test]
+fn incremental_function_safety_edit_invalidates_callers() {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(
+        r#"
+        fun operation() {}
+
+        fun main() {
+            operation();
+        }
+        "#,
+    );
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let mut checker = IncrementalTypeChecker::new();
+    let hir = lower_and_resolve(parse);
+    let first = checker.check(&hir);
+    assert!(diagnostics_with_code(&first.result, "E0046").is_empty());
+
+    let offset = parser.source().find("fun operation").unwrap();
+    parser.apply_edit(offset, 0, "unsafe ");
+    let parse = parser.current_parse().unwrap();
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let hir = lower_and_resolve(parse);
+    let second = checker.check(&hir);
+    assert_eq!(second.stats.checked_bodies, 2);
+    assert_eq!(second.stats.reused_bodies, 0);
+    assert_eq!(diagnostics_with_code(&second.result, "E0046").len(), 1);
+}
+
+#[test]
 fn incremental_generic_recursion_matches_full_check_before_and_after_reuse() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(

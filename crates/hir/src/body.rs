@@ -797,13 +797,18 @@ impl BodyPrinter<'_> {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
             HirTypeRef::Const(value) => value.display(),
-            HirTypeRef::Function { params, ret } => {
+            HirTypeRef::Function {
+                is_unsafe,
+                params,
+                ret,
+            } => {
                 let params = params
                     .iter()
                     .map(Self::type_text)
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("fun({params}) -> {}", Self::type_text(ret))
+                let prefix = if *is_unsafe { "unsafe " } else { "" };
+                format!("{prefix}fun({params}) -> {}", Self::type_text(ret))
             }
         }
     }

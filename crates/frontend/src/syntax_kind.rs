@@ -68,6 +68,8 @@ pub enum SyntaxKind {
     Extern,
     #[token("unsafe")]
     Unsafe,
+    #[token("safe")]
+    Safe,
     #[token("for")]
     For,
     #[token("in")]

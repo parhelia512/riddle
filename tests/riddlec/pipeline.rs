@@ -513,6 +513,76 @@ fn std_string_and_vector_compile() {
 }
 
 #[test]
+fn vector_mutation_is_rejected_while_element_reference_is_live() {
+    let result = compile(
+        r#"
+            fun main() {
+                let mut values: Vector<i32> = Vector::new();
+                values.push(1);
+                let mut fallback = 0;
+                let reference = values.get_mut(0usize).unwrap_or(&mut fallback);
+                values.push(2);
+                *reference = 3;
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(result.mir_module.is_none());
+    assert!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0302"),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn vector_mutation_is_rejected_while_shared_element_reference_is_live() {
+    let result = compile(
+        r#"
+            fun main() {
+                let mut values: Vector<i32> = Vector::new();
+                values.push(1);
+                let fallback = 0;
+                let reference = values.get(0usize).unwrap_or(&fallback);
+                values.push(2);
+                *reference;
+            }
+            "#,
+    );
+
+    assert!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0300"),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn vector_mutation_is_allowed_after_element_reference_last_use() {
+    let result = compile(
+        r#"
+            fun main() {
+                let mut values: Vector<i32> = Vector::new();
+                values.push(1);
+                let mut fallback = 0;
+                let reference = values.get_mut(0usize).unwrap_or(&mut fallback);
+                *reference = 3;
+                values.push(2);
+            }
+            "#,
+    );
+
+    assert!(result.success(), "{:#?}", result.analysis_diagnostics);
+}
+
+#[test]
 fn std_clone_and_comparison_methods_are_callable() {
     let result = compile(
         r#"

@@ -1196,7 +1196,7 @@ fn all_reference_forms_promote_their_source_local() {
 
         fun escaping_call() {
             let local = Data { value: 1 };
-            store({ &local });
+            unsafe { store({ &local }); }
         }
 
         fun loop_call_sink(flag: bool) {
@@ -1204,7 +1204,7 @@ fn all_reference_forms_promote_their_source_local() {
             let later = Data { value: 2 };
             let mut reference = &first;
             while flag {
-                store(reference);
+                unsafe { store(reference); }
                 reference = &later;
             }
         }

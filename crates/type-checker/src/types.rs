@@ -27,7 +27,11 @@ pub enum Type {
     Param(String),
     Const(ConstArg),
     Function(FunctionId),
-    Fn(Vec<Type>, Box<Type>),
+    Fn {
+        is_unsafe: bool,
+        params: Vec<Type>,
+        ret: Box<Type>,
+    },
     InferVar(u32),
     Unknown,
     Error,
@@ -122,15 +126,21 @@ impl Type {
             }
             Type::Function(id) => {
                 let function = &hir.item_tree.functions[*id];
-                format!("fun {}", function.name.0)
+                let prefix = if function.is_unsafe { "unsafe " } else { "" };
+                format!("{prefix}fun {}", function.name.0)
             }
-            Type::Fn(params, ret) => {
+            Type::Fn {
+                is_unsafe,
+                params,
+                ret,
+            } => {
                 let params = params
                     .iter()
                     .map(|param| param.display(hir))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("fun({params}) -> {}", ret.display(hir))
+                let prefix = if *is_unsafe { "unsafe " } else { "" };
+                format!("{prefix}fun({params}) -> {}", ret.display(hir))
             }
             Type::InferVar(_) => "_".to_string(),
             Type::Param(name) => name.clone(),
@@ -175,7 +185,7 @@ impl Type {
             Type::Tuple(elements) => elements.iter().all(Type::is_sized),
             Type::Array(inner, _) => inner.is_sized(),
             Type::Struct(_, args) | Type::Enum(_, args) => args.iter().all(Type::is_sized),
-            Type::Fn(params, ret) => params.iter().all(Type::is_sized) && ret.is_sized(),
+            Type::Fn { params, ret, .. } => params.iter().all(Type::is_sized) && ret.is_sized(),
             _ => true,
         }
     }
@@ -191,7 +201,7 @@ impl Type {
             Type::Struct(_, args) | Type::Enum(_, args) => {
                 args.iter().all(Type::is_valid_value_type)
             }
-            Type::Fn(params, ret) => {
+            Type::Fn { params, ret, .. } => {
                 params.iter().all(Type::is_valid_value_type) && ret.is_valid_value_type()
             }
             _ => true,
@@ -214,7 +224,7 @@ impl Type {
                 | Type::Ref(_, false)
                 | Type::Ptr { .. }
                 | Type::Function(_)
-                | Type::Fn(_, _)
+                | Type::Fn { .. }
                 | Type::InferVar(_)
                 | Type::Unknown
                 | Type::Error

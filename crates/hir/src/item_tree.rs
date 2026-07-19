@@ -66,6 +66,7 @@ pub struct HirFunction {
     pub name: Name,
     pub name_range: TextRange,
     pub visibility: Visibility,
+    pub is_unsafe: bool,
     pub generics: Vec<Name>,
     pub const_generics: Vec<Name>,
     pub generic_bounds: Vec<HirGenericBound>,
@@ -263,6 +264,7 @@ pub enum HirTypeRef {
     Array(Box<HirTypeRef>, HirConstArg),
     Const(HirConstArg),
     Function {
+        is_unsafe: bool,
         params: Vec<HirTypeRef>,
         ret: Box<HirTypeRef>,
     },
@@ -345,13 +347,18 @@ impl HirTypeRef {
             }
             HirTypeRef::Array(inner, len) => format!("[{}; {}]", inner.display(), len.display()),
             HirTypeRef::Const(value) => value.display(),
-            HirTypeRef::Function { params, ret } => {
+            HirTypeRef::Function {
+                is_unsafe,
+                params,
+                ret,
+            } => {
                 let params = params
                     .iter()
                     .map(HirTypeRef::display)
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("fun({params}) -> {}", ret.display())
+                let prefix = if *is_unsafe { "unsafe " } else { "" };
+                format!("{prefix}fun({params}) -> {}", ret.display())
             }
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),

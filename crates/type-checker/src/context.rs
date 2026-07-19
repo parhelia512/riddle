@@ -22,6 +22,7 @@ pub(crate) struct BodyCtx<'a> {
     pub(crate) local_closures: HashMap<StmtId, ClosureKind>,
     pub(crate) bindings: ScopedBindings,
     pub(crate) loop_depth: usize,
+    pub(crate) unsafe_depth: usize,
     pub(crate) lambdas: Vec<LambdaCtx>,
     source_map: &'a SourceMap,
 }
@@ -46,6 +47,7 @@ impl<'a> BodyCtx<'a> {
             local_closures: HashMap::new(),
             bindings: ScopedBindings::default(),
             loop_depth: 0,
+            unsafe_depth: 0,
             lambdas: Vec::new(),
             source_map: &body.source_map,
         }

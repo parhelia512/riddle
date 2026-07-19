@@ -600,6 +600,232 @@ fn taking_reference_does_not_move() {
 }
 
 #[test]
+fn mutable_references_move_instead_of_copying() {
+    let result = analyze(
+        r#"
+        fun f() {
+            let mut value: i32 = 1;
+            let first: &mut i32 = &mut value;
+            let second = first;
+            *first = 2;
+            *second = 3;
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0100" && diagnostic.message.contains("first"))
+    );
+}
+
+#[test]
+fn mutable_reference_arguments_are_automatically_reborrowed() {
+    let result = analyze(
+        r#"
+        fun touch(value: &mut i32) {
+            *value += 1;
+        }
+
+        fun f() {
+            let mut value: i32 = 1;
+            let reference: &mut i32 = &mut value;
+            touch(reference);
+            touch(reference);
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn shared_reborrow_freezes_the_parent_mutable_reference() {
+    let result = analyze(
+        r#"
+        fun touch(value: &mut i32) {
+            *value += 1;
+        }
+
+        fun f() {
+            let mut value: i32 = 1;
+            let reference: &mut i32 = &mut value;
+            let shared: &i32 = &*reference;
+            touch(reference);
+            *shared;
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0300")
+    );
+}
+
+#[test]
+fn mutable_borrow_ends_after_the_last_use() {
+    let result = analyze(
+        r#"
+        struct Boxed { value: i32 }
+
+        impl Boxed {
+            fun set(&mut self) {
+                self.value = 4;
+            }
+        }
+
+        fun f() {
+            let mut boxed = Boxed { value: 1 };
+            let reference: &mut i32 = &mut boxed.value;
+            *reference = 2;
+            boxed.set();
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn method_return_reference_keeps_receiver_borrowed() {
+    let result = analyze(
+        r#"
+        struct Boxed { value: i32 }
+
+        impl Boxed {
+            fun get_mut(&mut self) -> &mut i32 {
+                &mut self.value
+            }
+
+            fun set(&mut self) {
+                self.value = 4;
+            }
+        }
+
+        fun f() {
+            let mut boxed = Boxed { value: 1 };
+            let reference = boxed.get_mut();
+            boxed.set();
+            *reference = 2;
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0302")
+    );
+}
+
+#[test]
+fn wrapped_method_return_preserves_receiver_provenance() {
+    let result = analyze(
+        r#"
+        enum Maybe<T> { Some(T), None }
+
+        impl<T> Maybe<T> {
+            fun unwrap_or(self, fallback: T) -> T {
+                match self {
+                    Maybe::Some(value) => value,
+                    Maybe::None => fallback,
+                }
+            }
+        }
+
+        struct Boxed { value: i32 }
+
+        impl Boxed {
+            fun get_mut(&mut self) -> Maybe<&mut i32> {
+                Maybe::Some(&mut self.value)
+            }
+
+            fun set(&mut self) {
+                self.value = 4;
+            }
+        }
+
+        fun f() {
+            let mut boxed = Boxed { value: 1 };
+            let mut fallback = 0;
+            let reference = boxed.get_mut().unwrap_or(&mut fallback);
+            boxed.set();
+            *reference = 2;
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0302")
+    );
+}
+
+#[test]
+fn non_generic_enum_preserves_reference_provenance() {
+    let result = analyze(
+        r#"
+        enum Slot { Some(&mut i32), None }
+
+        impl Slot {
+            fun unwrap_or(self, fallback: &mut i32) -> &mut i32 {
+                match self {
+                    Slot::Some(value) => value,
+                    Slot::None => fallback,
+                }
+            }
+        }
+
+        struct Boxed { value: i32 }
+
+        impl Boxed {
+            fun get_mut(&mut self) -> Slot {
+                Slot::Some(&mut self.value)
+            }
+
+            fun set(&mut self) {
+                self.value = 4;
+            }
+        }
+
+        fun f() {
+            let mut boxed = Boxed { value: 1 };
+            let mut fallback = 0;
+            let reference = boxed.get_mut().unwrap_or(&mut fallback);
+            boxed.set();
+            *reference = 2;
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0302")
+    );
+}
+
+#[test]
+fn mutable_borrows_of_disjoint_fields_can_coexist() {
+    let result = analyze(
+        r#"
+        struct Pair { left: i32, right: i32 }
+
+        fun f() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let left: &mut i32 = &mut pair.left;
+            let right: &mut i32 = &mut pair.right;
+            *left = 3;
+            *right = 4;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
 fn move_while_borrowed_is_error() {
     // Moving p while a shared borrow exists is E0304.
     let result = analyze(

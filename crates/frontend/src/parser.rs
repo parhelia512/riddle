@@ -386,6 +386,9 @@ impl<'s> Parser<'s> {
         if self.at(SyntaxKind::Fun) && self.nth(1) == SyntaxKind::LParen {
             return false;
         }
+        if self.at(SyntaxKind::Unsafe) {
+            return matches!(self.nth(1), SyntaxKind::Fun | SyntaxKind::Extern);
+        }
         matches!(
             self.current(),
             SyntaxKind::Hash
@@ -461,6 +464,8 @@ impl<'s> Parser<'s> {
             SyntaxKind::Let => self.var_decl(),
             SyntaxKind::Fun if self.nth(1) == SyntaxKind::LParen => self.expr_stmt(),
             SyntaxKind::Fun => self.func_decl(),
+            SyntaxKind::Unsafe if self.nth(1) == SyntaxKind::Fun => self.func_decl(),
+            SyntaxKind::Unsafe if self.nth(1) == SyntaxKind::Extern => self.extern_decl(),
             SyntaxKind::Struct => self.struct_decl(),
             SyntaxKind::Mod => self.mod_decl(),
             SyntaxKind::Use => self.use_decl(),
@@ -481,6 +486,14 @@ impl<'s> Parser<'s> {
     fn pub_item(&mut self) {
         match self.nth(1) {
             SyntaxKind::Fun => self.func_decl(),
+            SyntaxKind::Unsafe => match self.nth(2) {
+                SyntaxKind::Fun => self.func_decl(),
+                SyntaxKind::Extern => self.extern_decl(),
+                _ => self.error(format!(
+                    "expected 'fun' or 'extern' after 'pub unsafe', found {:?}",
+                    self.nth(2)
+                )),
+            },
             SyntaxKind::Struct => self.struct_decl(),
             SyntaxKind::Mod => self.mod_decl(),
             SyntaxKind::Use => self.use_decl(),
@@ -498,6 +511,12 @@ impl<'s> Parser<'s> {
 
     fn optional_pub(&mut self) {
         if self.at(SyntaxKind::Pub) {
+            self.bump();
+        }
+    }
+
+    fn optional_unsafe(&mut self) {
+        if self.at(SyntaxKind::Unsafe) {
             self.bump();
         }
     }
@@ -696,6 +715,7 @@ impl<'s> Parser<'s> {
         let m = self.start();
 
         self.optional_pub();
+        self.optional_unsafe();
         self.expect(SyntaxKind::Fun);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
@@ -1545,9 +1565,10 @@ impl<'s> Parser<'s> {
                 self.bump();
                 m.complete(self, SyntaxKind::ConstType);
             }
-            SyntaxKind::Fun => {
+            SyntaxKind::Fun | SyntaxKind::Unsafe => {
                 let m = self.start();
-                self.bump();
+                self.optional_unsafe();
+                self.expect(SyntaxKind::Fun);
                 self.expect(SyntaxKind::LParen);
                 if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
                     self.ty();
@@ -1662,11 +1683,11 @@ impl<'s> Parser<'s> {
         self.attrs();
         match self.current() {
             SyntaxKind::Pub => match self.nth(1) {
-                SyntaxKind::Fun => self.func_sig(),
+                SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_sig(false),
                 SyntaxKind::TypeKw => self.type_alias_decl(),
                 _ => self.error(format!("expected trait item, found {:?}", self.current())),
             },
-            SyntaxKind::Fun => self.func_sig(),
+            SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_sig(false),
             SyntaxKind::TypeKw => self.type_alias_decl(),
             _ => {
                 self.error(format!("expected trait item, found {:?}", self.current()));
@@ -1674,10 +1695,15 @@ impl<'s> Parser<'s> {
         }
     }
 
-    fn func_sig(&mut self) {
+    fn func_sig(&mut self, allow_safe: bool) {
         let m = self.start();
 
         self.optional_pub();
+        if allow_safe && self.at(SyntaxKind::Safe) {
+            self.bump();
+        } else {
+            self.optional_unsafe();
+        }
         self.expect(SyntaxKind::Fun);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
@@ -1734,12 +1760,12 @@ impl<'s> Parser<'s> {
         self.attrs();
         match self.current() {
             SyntaxKind::Pub => match self.nth(1) {
-                SyntaxKind::Fun => self.func_decl(),
+                SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_decl(),
                 SyntaxKind::TypeKw => self.type_alias_decl(),
                 SyntaxKind::Const => self.const_decl(),
                 _ => self.error(format!("expected impl item, found {:?}", self.current())),
             },
-            SyntaxKind::Fun => self.func_decl(),
+            SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_decl(),
             SyntaxKind::TypeKw => self.type_alias_decl(),
             SyntaxKind::Const => self.const_decl(),
             _ => {
@@ -1902,6 +1928,7 @@ impl<'s> Parser<'s> {
         self.attrs();
         let m = self.start();
         self.optional_pub();
+        self.optional_unsafe();
         self.expect(SyntaxKind::Extern);
         let _abi = self.expect(SyntaxKind::String); // "C"
 
@@ -1914,8 +1941,11 @@ impl<'s> Parser<'s> {
             self.expect(SyntaxKind::LBrace);
             while !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
                 self.attrs();
-                if self.at(SyntaxKind::Fun) {
-                    self.func_sig();
+                if matches!(
+                    self.current(),
+                    SyntaxKind::Fun | SyntaxKind::Safe | SyntaxKind::Unsafe
+                ) {
+                    self.func_sig(true);
                 } else {
                     self.error(format!(
                         "expected 'fun' in extern block, found {:?}",
@@ -1950,6 +1980,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::LBracket
                 | SyntaxKind::Number
                 | SyntaxKind::Fun
+                | SyntaxKind::Unsafe
         )
     }
 

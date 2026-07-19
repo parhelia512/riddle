@@ -6,6 +6,8 @@ mod errors;
 mod incremental;
 mod structs;
 mod traits;
+#[path = "unsafe.rs"]
+mod unsafe_test;
 
 use ast::{self, support::AstNode};
 use frontend::{incremental::IncrementalParser, tree_builder::Parse};

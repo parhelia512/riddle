@@ -354,10 +354,15 @@ impl TypeChecker<'_> {
                 expected,
             ),
             Expr::FieldAccess { base, field } => self.check_field_access(ctx, *base, field, span),
-            Expr::Unsafe { body } => match expected {
-                Some(expected) => self.check_expr_expected(ctx, *body, expected),
-                None => self.check_expr(ctx, *body),
-            },
+            Expr::Unsafe { body } => {
+                ctx.unsafe_depth += 1;
+                let ty = match expected {
+                    Some(expected) => self.check_expr_expected(ctx, *body, expected),
+                    None => self.check_expr(ctx, *body),
+                };
+                ctx.unsafe_depth -= 1;
+                ty
+            }
             Expr::IndexAccess { base, index } => {
                 let base_ty = self.check_expr(ctx, *base);
                 let index_ty = self.check_expr(ctx, *index);
@@ -371,7 +376,11 @@ impl TypeChecker<'_> {
                 }
                 // Extract element type from array / pointer base.
                 match &base_ty {
-                    Type::Array(inner, _) | Type::Ptr { inner, .. } => *inner.clone(),
+                    Type::Array(inner, _) => *inner.clone(),
+                    Type::Ptr { inner, .. } => {
+                        self.require_unsafe(ctx, "indexing a raw pointer", span);
+                        *inner.clone()
+                    }
                     _ => Type::Unknown,
                 }
             }
@@ -522,7 +531,7 @@ impl TypeChecker<'_> {
     ) -> Type {
         let expected = expected.map(|ty| self.callable_type(ty));
         let expected_fn = match expected.as_ref() {
-            Some(Type::Fn(params, ret)) => Some((params.as_slice(), ret.as_ref())),
+            Some(Type::Fn { params, ret, .. }) => Some((params.as_slice(), ret.as_ref())),
             _ => None,
         };
         if let Some((expected_params, _)) = expected_fn
@@ -636,7 +645,11 @@ impl TypeChecker<'_> {
                 })
                 .collect(),
         );
-        Type::Fn(param_types, Box::new(return_ty))
+        Type::Fn {
+            is_unsafe: false,
+            params: param_types,
+            ret: Box::new(return_ty),
+        }
     }
 
     fn capture_source(
@@ -914,6 +927,9 @@ impl TypeChecker<'_> {
             return Some(ty);
         }
         let method = self.find_trait_impl_method(lhs_ty, trait_id, "add")?;
+        if method.function.is_unsafe {
+            self.require_unsafe(ctx, "calling an unsafe function", span);
+        }
 
         let receiver = method.function.params.first()?;
         let expected_receiver = self.lower_type_ref_with_params_at(
@@ -999,6 +1015,15 @@ impl TypeChecker<'_> {
                     && self.resolve_trait_ref(&bound.trait_ty) == Some(trait_id)
             })?
             .clone();
+
+        if self.hir.item_tree.traits[trait_id]
+            .methods
+            .iter()
+            .find(|method| method.name.0 == "add")
+            .is_some_and(|method| method.is_unsafe)
+        {
+            self.require_unsafe(ctx, "calling an unsafe function", ctx.expr_range(rhs));
+        }
 
         let actual_rhs = self.check_expr_expected(ctx, rhs, lhs_ty);
         self.expect_assignable(lhs_ty, &actual_rhs, "right operand", ctx.expr_range(rhs));
@@ -1182,7 +1207,7 @@ impl TypeChecker<'_> {
         operand: ExprId,
         op: UnaryOp,
         expected: Option<&Type>,
-        _span: Option<rowan::TextRange>,
+        span: Option<rowan::TextRange>,
     ) -> Type {
         let operand_ty = match (op, expected) {
             (UnaryOp::Ref | UnaryOp::MutRef, _) => self.check_place_expr(ctx, operand),
@@ -1218,7 +1243,10 @@ impl TypeChecker<'_> {
             }
             UnaryOp::Deref => match &operand_ty {
                 Type::Ref(inner, _) => *inner.clone(),
-                Type::Ptr { inner, .. } => *inner.clone(),
+                Type::Ptr { inner, .. } => {
+                    self.require_unsafe(ctx, "dereferencing a raw pointer", span);
+                    *inner.clone()
+                }
                 Type::Unknown | Type::Error => operand_ty,
                 other => {
                     self.diagnostic(
@@ -1588,6 +1616,19 @@ impl TypeChecker<'_> {
                 && !item_ty.is_unknown_like()
                 && !into_iter_ty.is_unknown_like()
             {
+                if self.hir.item_tree.traits[into_iter_trait]
+                    .methods
+                    .iter()
+                    .find(|method| method.name.0 == "into_iter")
+                    .is_some_and(|method| method.is_unsafe)
+                    || self.hir.item_tree.traits[iterator_trait]
+                        .methods
+                        .iter()
+                        .find(|method| method.name.0 == "next")
+                        .is_some_and(|method| method.is_unsafe)
+                {
+                    self.require_unsafe(ctx, "calling an unsafe function", span);
+                }
                 self.result.for_loops.insert(
                     (ctx.body_id, expr_id),
                     ForLoopInfo {
@@ -1881,7 +1922,15 @@ impl TypeChecker<'_> {
             self.check_mutable_closure_binding(ctx, callee);
         }
         let resolved_callee = self.resolve_type(&callee_ty);
-        if let Type::Fn(params, ret) = resolved_callee {
+        if let Type::Fn {
+            is_unsafe,
+            params,
+            ret,
+        } = resolved_callee
+        {
+            if is_unsafe {
+                self.require_unsafe(ctx, "calling an unsafe function", span);
+            }
             if args.len() != params.len() {
                 self.diagnostic(
                     "E0005",
@@ -1923,6 +1972,9 @@ impl TypeChecker<'_> {
         };
 
         let function = &self.hir.item_tree.functions[fid];
+        if function.is_unsafe {
+            self.require_unsafe(ctx, "calling an unsafe function", span);
+        }
         let impl_generics = self.impl_generic_names(fid);
         let impl_const_generics = self.impl_const_generic_names(fid);
         let params = generic_param_map_with_consts(
@@ -2231,7 +2283,7 @@ impl TypeChecker<'_> {
                     self.check_type_bounds_inner(ctx, element, span);
                 }
             }
-            Type::Fn(params, ret) => {
+            Type::Fn { params, ret, .. } => {
                 for param in params {
                     self.check_type_bounds_inner(ctx, param, span);
                 }
@@ -2561,6 +2613,10 @@ impl TypeChecker<'_> {
             }
             return Type::Error;
         };
+
+        if method.function.is_unsafe {
+            self.require_unsafe(ctx, "calling an unsafe function", span);
+        }
 
         self.result
             .expr_types
@@ -3379,7 +3435,9 @@ fn expected_has_param(ty: &Type) -> bool {
         Type::Tuple(elements) => elements.iter().any(expected_has_param),
         Type::Array(inner, len) => expected_has_param(inner) || const_has_param(len),
         Type::Struct(_, args) | Type::Enum(_, args) => args.iter().any(expected_has_param),
-        Type::Fn(params, ret) => params.iter().any(expected_has_param) || expected_has_param(ret),
+        Type::Fn { params, ret, .. } => {
+            params.iter().any(expected_has_param) || expected_has_param(ret)
+        }
         _ => false,
     }
 }
@@ -3442,7 +3500,11 @@ fn type_contains_unresolved_const_param(ty: &Type, params: &HashMap<String, Type
         Type::Struct(_, args) | Type::Enum(_, args) => args
             .iter()
             .any(|arg| type_contains_unresolved_const_param(arg, params)),
-        Type::Fn(fn_params, ret) => {
+        Type::Fn {
+            params: fn_params,
+            ret,
+            ..
+        } => {
             fn_params
                 .iter()
                 .any(|arg| type_contains_unresolved_const_param(arg, params))
@@ -3463,7 +3525,7 @@ fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
         HirTypeRef::Tuple(elements) => elements.iter().any(type_ref_contains_error),
         HirTypeRef::Named(path) => path.type_args.iter().any(type_ref_contains_error),
         HirTypeRef::Const(value) => matches!(value, hir::item_tree::HirConstArg::Error),
-        HirTypeRef::Function { params, ret } => {
+        HirTypeRef::Function { params, ret, .. } => {
             params.iter().any(type_ref_contains_error) || type_ref_contains_error(ret)
         }
         HirTypeRef::Unknown => false,

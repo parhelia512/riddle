@@ -1,8 +1,8 @@
 use crate::std::iter::{IntoIterator, Iterator};
 use crate::std::option::Option;
 
-extern "C" {
-    fun size_of_ptr<T>(value: *const T) -> usize;
+unsafe extern "C" {
+    safe fun size_of_ptr<T>(value: *const T) -> usize;
     fun vector_grow(
         data: *mut u8,
         len: usize,
@@ -46,19 +46,21 @@ impl<T> Vector<T> {
 
     pub fun push(&mut self, value: T) {
         if self.len == self.capacity {
-            self.data = vector_grow(
-                self.data as *mut u8,
-                self.len,
-                self.capacity,
-                size_of_ptr(self.data as *const T)
-            ) as *mut T;
+            self.data = unsafe {
+                vector_grow(
+                    self.data as *mut u8,
+                    self.len,
+                    self.capacity,
+                    size_of_ptr(self.data as *const T)
+                ) as *mut T
+            };
             if self.capacity == 0usize {
                 self.capacity = 4usize;
             } else {
                 self.capacity *= 2usize;
             }
         }
-        self.data[self.len] = value;
+        unsafe { self.data[self.len] = value; }
         self.len += 1usize;
     }
 
@@ -67,13 +69,13 @@ impl<T> Vector<T> {
             Option::None
         } else {
             self.len -= 1usize;
-            Option::Some(self.data[self.len])
+            Option::Some(unsafe { self.data[self.len] })
         }
     }
 
     pub fun get(&self, index: usize) -> Option<&T> {
         if index < self.len {
-            Option::Some(&self.data[index])
+            Option::Some(unsafe { &self.data[index] })
         } else {
             Option::None
         }
@@ -81,7 +83,7 @@ impl<T> Vector<T> {
 
     pub fun get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index < self.len {
-            Option::Some(&mut self.data[index])
+            Option::Some(unsafe { &mut self.data[index] })
         } else {
             Option::None
         }
@@ -101,7 +103,7 @@ impl<T> Iterator for VectorIntoIter<T> {
 
     fun next(&mut self) -> Option<Self::Item> {
         if self.index < self.len {
-            let value = self.data[self.index];
+            let value = unsafe { self.data[self.index] };
             self.index += 1usize;
             Option::Some(value)
         } else {

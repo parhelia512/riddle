@@ -531,8 +531,8 @@ fn run_pipeline_with_state(
     // 5. Escape analysis (determines which locals need heap allocation)
     let escape_result = escape_analysis::analyze_escapes(&hir, &type_result);
 
-    // 6. Move check (uses escape results to skip borrow checks for heap locals)
-    let analysis = move_checker::analyze(&hir, &type_result, &escape_result);
+    // 6. Move and borrow checking is independent of storage placement.
+    let analysis = move_checker::analyze(&hir, &type_result);
     let analysis_diagnostics = analysis.diagnostics.clone();
 
     // Only Error-severity diagnostics block compilation.

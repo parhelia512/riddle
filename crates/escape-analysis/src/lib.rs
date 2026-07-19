@@ -773,7 +773,7 @@ fn type_may_carry_reference(ty: &Type) -> bool {
         | Type::InferVar(..)
         | Type::Unknown
         | Type::Error => true,
-        Type::Fn(params, ret) => {
+        Type::Fn { params, ret, .. } => {
             params.iter().any(type_may_carry_reference) || type_may_carry_reference(ret)
         }
         Type::Function(..) => true,

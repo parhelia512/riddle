@@ -221,10 +221,12 @@ impl AstLower for FuncDecl {
         let has_body = self.body().is_some();
         let attrs = lower_attrs(self.syntax());
         let visibility = lower_visibility(self.is_pub());
+        let is_unsafe = self.is_unsafe();
         arena.alloc(HirFunction {
             name,
             name_range,
             visibility,
+            is_unsafe,
             generics,
             const_generics,
             generic_bounds,
@@ -241,9 +243,14 @@ impl AstLower for ExternFnDecl {
     type Id = FunctionId;
     type Item = HirFunction;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
-        self.func_decl()
-            .expect("ExternFnDecl must contain FuncDecl")
-            .lower(arena)
+        let explicitly_unsafe = self.is_unsafe();
+        let func = self
+            .func_decl()
+            .expect("ExternFnDecl must contain FuncDecl");
+        let is_import = func.body().is_none();
+        let id = func.lower(arena);
+        arena[id].is_unsafe |= explicitly_unsafe || is_import;
+        id
     }
 }
 
@@ -385,6 +392,7 @@ impl AstLower for ast::TraitDecl {
                     name: mname,
                     name_range: method_name_range,
                     visibility: lower_visibility(m.is_pub()),
+                    is_unsafe: m.is_unsafe(),
                     generics: lower_generic_params(generic_params.clone()),
                     const_generics: lower_const_generic_params(generic_params.clone()),
                     generic_bounds: lower_generic_bounds(generic_params, m.where_clause()),
@@ -564,6 +572,7 @@ impl Lower for Type {
                 .map(|value| HirTypeRef::Const(HirConstArg::Value(value)))
                 .unwrap_or(HirTypeRef::Error),
             Type::Function(function) => HirTypeRef::Function {
+                is_unsafe: function.is_unsafe(),
                 params: function.param_types().map(Lower::lower).collect(),
                 ret: Box::new(
                     function

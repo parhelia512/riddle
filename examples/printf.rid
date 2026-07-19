@@ -1,6 +1,0 @@
-extern "C" fun puts(s: &str) -> i32;
-
-fun main() {
-    let t: &str = "hello";
-    puts("hello from riddle via FFI!");
-}

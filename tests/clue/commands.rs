@@ -112,7 +112,9 @@ fn generated_c_with_gc_and_loop_control_compiles_and_runs() {
         r#"struct Data { value: i32 }
 struct Token { value: i32 }
 
-extern "C" fun rgc_collect();
+unsafe extern "C" {
+    safe fun rgc_collect();
+}
 
 fun escaped(value: i32) -> &Data {
     let local = Data { value };

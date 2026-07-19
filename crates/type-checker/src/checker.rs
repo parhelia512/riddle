@@ -461,13 +461,18 @@ impl<'a> TypeChecker<'a> {
             Type::Enum(id, args) => {
                 Type::Enum(*id, args.iter().map(|arg| self.resolve_type(arg)).collect())
             }
-            Type::Fn(params, ret) => Type::Fn(
-                params
+            Type::Fn {
+                is_unsafe,
+                params,
+                ret,
+            } => Type::Fn {
+                is_unsafe: *is_unsafe,
+                params: params
                     .iter()
                     .map(|param| self.resolve_type(param))
                     .collect(),
-                Box::new(self.resolve_type(ret)),
-            ),
+                ret: Box::new(self.resolve_type(ret)),
+            },
             _ => ty.clone(),
         }
     }
@@ -478,8 +483,9 @@ impl<'a> TypeChecker<'a> {
             return ty;
         };
         let function = self.hir.item_tree.functions[fid].clone();
-        Type::Fn(
-            function
+        Type::Fn {
+            is_unsafe: function.is_unsafe,
+            params: function
                 .params
                 .iter()
                 .map(|param| {
@@ -490,7 +496,7 @@ impl<'a> TypeChecker<'a> {
                     )
                 })
                 .collect(),
-            Box::new(
+            ret: Box::new(
                 function
                     .ret_type
                     .as_ref()
@@ -503,7 +509,7 @@ impl<'a> TypeChecker<'a> {
                     })
                     .unwrap_or(Type::Unit),
             ),
-        )
+        }
     }
 
     pub(crate) fn unify_types(&mut self, lhs: &Type, rhs: &Type) -> bool {
@@ -543,8 +549,20 @@ impl<'a> TypeChecker<'a> {
                     && aa.len() == ba.len()
                     && aa.iter().zip(ba).all(|(a, b)| self.unify_types(a, b))
             }
-            (Type::Fn(ap, ar), Type::Fn(bp, br)) => {
-                ap.len() == bp.len()
+            (
+                Type::Fn {
+                    is_unsafe: expected_unsafe,
+                    params: ap,
+                    ret: ar,
+                },
+                Type::Fn {
+                    is_unsafe: actual_unsafe,
+                    params: bp,
+                    ret: br,
+                },
+            ) => {
+                (!*actual_unsafe || *expected_unsafe)
+                    && ap.len() == bp.len()
                     && ap.iter().zip(bp).all(|(a, b)| self.unify_types(a, b))
                     && self.unify_types(ar, br)
             }
@@ -1067,6 +1085,7 @@ impl<'a> TypeChecker<'a> {
             "E0028" | "E0029" | "E0030" => vec!["the method signature must exactly match the trait declaration: check parameter count, types, and return type".into()],
             _ => Vec::new(),
         };
+        let help = (code == "E0046").then(|| "wrap this operation in `unsafe { ... }`".to_string());
         self.result.diagnostics.push(Diagnostic {
             code,
             severity: Severity::Error,
@@ -1076,7 +1095,7 @@ impl<'a> TypeChecker<'a> {
                 message: String::new(),
                 style: LabelStyle::Primary,
             }],
-            help: None,
+            help,
             notes,
         });
     }
@@ -1185,6 +1204,22 @@ impl<'a> TypeChecker<'a> {
             (Type::InferInt, Type::InferInt) => Some(Type::InferInt),
             (Type::InferFloat, Type::InferFloat) => Some(Type::InferFloat),
             _ => None,
+        }
+    }
+
+    /// If `ctx` is not inside `unsafe {}`, emit E0046.
+    pub(crate) fn require_unsafe(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        operation: &str,
+        span: Option<rowan::TextRange>,
+    ) {
+        if ctx.unsafe_depth == 0 {
+            self.diagnostic(
+                "E0046",
+                format!("{operation} requires an unsafe block"),
+                span,
+            );
         }
     }
 }

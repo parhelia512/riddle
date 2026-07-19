@@ -1,4 +1,5 @@
 mod basic;
+mod borrow;
 #[path = "../support/diagnostics.rs"]
 mod diagnostic_support;
 
@@ -23,8 +24,7 @@ fn analyze(source: &str) -> move_checker::AnalysisResult {
         type_result.diagnostics
     );
 
-    let escape_result = escape_analysis::analyze_escapes(&hir, &type_result);
-    let result = move_checker::analyze(&hir, &type_result, &escape_result);
+    let result = move_checker::analyze(&hir, &type_result);
     diagnostic_support::assert_type_diagnostics(source, &result.diagnostics);
     result
 }

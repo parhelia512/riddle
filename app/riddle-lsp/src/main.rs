@@ -388,7 +388,7 @@ const COMPLETION_MARKER: &str = "__riddle_completion";
 const COMPLETION_KEYWORDS: &[&str] = &[
     "let", "fun", "struct", "if", "else", "while", "break", "continue", "return", "as", "self",
     "mod", "use", "mut", "pub", "super", "crate", "enum", "trait", "impl", "match", "const",
-    "type", "extern", "unsafe", "for", "in", "where", "true", "false",
+    "type", "extern", "unsafe", "safe", "for", "in", "where", "true", "false",
 ];
 const COMPLETION_BUILTIN_TYPES: &[&str] = &[
     "bool", "char", "str", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64",
@@ -1743,6 +1743,7 @@ fn is_keyword(kind: SyntaxKind) -> bool {
             | SyntaxKind::TypeKw
             | SyntaxKind::Extern
             | SyntaxKind::Unsafe
+            | SyntaxKind::Safe
             | SyntaxKind::For
             | SyntaxKind::In
             | SyntaxKind::Where

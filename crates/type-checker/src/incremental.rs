@@ -525,6 +525,7 @@ fn type_context_fingerprint_with_ranges(tree: &ItemTree) -> u64 {
 fn hash_function(function: &HirFunction, hasher: &mut impl Hasher) {
     function.name.hash(hasher);
     function.visibility.is_public().hash(hasher);
+    function.is_unsafe.hash(hasher);
     function.generics.hash(hasher);
     function.const_generics.hash(hasher);
     hash_bounds(&function.generic_bounds, hasher);

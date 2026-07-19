@@ -418,6 +418,20 @@ impl TypeChecker<'_> {
             self.lower_type_ref_with_params_at(&imp.self_ty, &params, Some(imp.self_ty_range));
         params.insert("Self".into(), self_ty);
 
+        if expected.is_unsafe != actual.is_unsafe {
+            self.diagnostic(
+                "E0028",
+                format!(
+                    "impl method `{}` for trait `{}` safety mismatch: expected {}, got {}",
+                    expected.name.0,
+                    trait_name,
+                    if expected.is_unsafe { "unsafe" } else { "safe" },
+                    if actual.is_unsafe { "unsafe" } else { "safe" }
+                ),
+                Some(actual.name_range),
+            );
+        }
+
         if expected.params.len() != actual.params.len() {
             self.diagnostic(
                 "E0028",
@@ -530,13 +544,21 @@ impl TypeChecker<'_> {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", self.type_ref_source_text(inner))
             }
-            HirTypeRef::Function { params, ret } => {
+            HirTypeRef::Function {
+                is_unsafe,
+                params,
+                ret,
+            } => {
                 let params = params
                     .iter()
                     .map(|param| self.type_ref_source_text(param))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("fun({params}) -> {}", self.type_ref_source_text(ret))
+                let prefix = if *is_unsafe { "unsafe " } else { "" };
+                format!(
+                    "{prefix}fun({params}) -> {}",
+                    self.type_ref_source_text(ret)
+                )
             }
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),

@@ -100,7 +100,7 @@
         },
         {
           "name": "keyword.other.riddle",
-          "match": "\\b(?:as|const|crate|extern|impl|mut|pub|self|super|unsafe|use|where)\\b"
+          "match": "\\b(?:as|const|crate|extern|impl|mut|pub|safe|self|super|unsafe|use|where)\\b"
         },
         {
           "name": "constant.language.boolean.riddle",

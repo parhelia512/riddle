@@ -1,8 +1,8 @@
 use crate::std::option::Option;
 use crate::std::vector::Vector;
 
-extern "C" {
-    fun str_len(value: &str) -> usize;
+unsafe extern "C" {
+    safe fun str_len(value: &str) -> usize;
     fun str_byte(value: &str, index: usize) -> u8;
     fun str_from_raw(data: *const u8, len: usize) -> &str;
 }
@@ -25,7 +25,7 @@ impl String {
     }
 
     pub fun as_str(&self) -> &str {
-        str_from_raw(self.bytes.as_ptr(), self.bytes.len())
+        unsafe { str_from_raw(self.bytes.as_ptr(), self.bytes.len()) }
     }
 
     pub fun len(&self) -> usize {
@@ -43,7 +43,7 @@ impl String {
     pub fun push_str(&mut self, value: &str) {
         let mut index = 0usize;
         while index < value.len() {
-            self.bytes.push(str_byte(value, index));
+            self.bytes.push(unsafe { str_byte(value, index) });
             index += 1usize;
         }
     }
@@ -64,7 +64,7 @@ impl str {
 
     pub fun byte_at(&self, index: usize) -> Option<u8> {
         if index < self.len() {
-            Option::Some(str_byte(self, index))
+            Option::Some(unsafe { str_byte(self, index) })
         } else {
             Option::None
         }

@@ -111,7 +111,7 @@ fn accepts_mutable_str_reference_from_mutable_sources() {
         r#"
         fun valid(reference: &mut str, pointer: *mut str) {
             let from_reference: &mut str = &mut *reference;
-            let from_pointer: &mut str = &mut *pointer;
+            let from_pointer: &mut str = unsafe { &mut *pointer };
         }
         "#,
     );

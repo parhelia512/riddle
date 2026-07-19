@@ -307,6 +307,14 @@ impl FuncDecl {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    pub fn is_unsafe(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Unsafe).is_some()
+    }
+
+    pub fn is_safe(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Safe).is_some()
+    }
+
     pub fn generic_params(&self) -> Option<GenericParams> {
         support::child(&self.syntax)
     }
@@ -1162,6 +1170,10 @@ impl ConstType {
 }
 
 impl FnType {
+    pub fn is_unsafe(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Unsafe).is_some()
+    }
+
     pub fn param_types(&self) -> impl Iterator<Item = Type> + '_ {
         let arrow = support::token_of(&self.syntax, SyntaxKind::Arrow)
             .map(|token| token.text_range().start());
@@ -1300,6 +1312,10 @@ impl ExternBlock {
 }
 
 impl ExternFnDecl {
+    pub fn is_unsafe(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Unsafe).is_some()
+    }
+
     pub fn func_decl(&self) -> Option<FuncDecl> {
         support::child(&self.syntax)
     }

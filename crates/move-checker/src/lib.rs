@@ -2,17 +2,91 @@ use std::collections::{HashMap, HashSet};
 
 use rowan::TextRange;
 
-use escape_analysis::EscapeResult;
 use hir::{
     HirFile,
     body::{Body, BodyId, Expr, ExprId, ResolvedName, SourceMap, Stmt, StmtId, UnaryOp},
-    item_tree::FunctionId,
+    item_tree::{FunctionId, HirTypeRef},
     place::Place,
 };
 use type_checker::{
     CaptureMode, CaptureSource, ClosureKind, Diagnostic, LabelStyle, LambdaInfo, Severity,
     SourceLabel, TraitEnv, Type, TypeCheckResult,
 };
+
+mod reference_flow;
+
+use reference_flow::{FlowKind, ReferenceFlow, type_may_carry_reference};
+
+type LoanId = usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BorrowKind {
+    Shared,
+    Mutable,
+}
+
+impl BorrowKind {
+    fn from_flow(kind: FlowKind, inherited: Self) -> Self {
+        match kind {
+            FlowKind::Inherit => inherited,
+            FlowKind::Shared => Self::Shared,
+            FlowKind::Mutable => Self::Mutable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AccessRoot {
+    Local(StmtId),
+    Param(usize),
+    LambdaParam { lambda: ExprId, index: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AccessProjection {
+    Field(usize),
+    Index(Option<usize>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AccessPlace {
+    root: AccessRoot,
+    projections: Vec<AccessProjection>,
+}
+
+impl AccessPlace {
+    fn new(root: AccessRoot) -> Self {
+        Self {
+            root,
+            projections: Vec::new(),
+        }
+    }
+
+    fn field(mut self, index: usize) -> Self {
+        self.projections.push(AccessProjection::Field(index));
+        self
+    }
+
+    fn index(mut self, index: Option<usize>) -> Self {
+        self.projections.push(AccessProjection::Index(index));
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Origin {
+    place: AccessPlace,
+    kind: BorrowKind,
+    loan: LoanId,
+}
+
+type Origins = HashSet<Origin>;
+
+#[derive(Debug, Clone)]
+struct AccessTarget {
+    place: AccessPlace,
+    parents: HashSet<LoanId>,
+}
 
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
@@ -21,16 +95,13 @@ pub struct AnalysisResult {
 
 /// Run move/borrow checking. Escape analysis identifies storage duration only;
 /// heap allocation does not relax move or borrow rules.
-pub fn analyze(
-    hir: &HirFile,
-    type_result: &TypeCheckResult,
-    escape_result: &EscapeResult,
-) -> AnalysisResult {
+pub fn analyze(hir: &HirFile, type_result: &TypeCheckResult) -> AnalysisResult {
+    let reference_flow = ReferenceFlow::build(hir, type_result);
     let mut a = Analyzer {
         hir,
         type_result,
         trait_env: &type_result.trait_env,
-        escape_result,
+        reference_flow: &reference_flow,
         result: AnalysisResult::default(),
     };
     a.analyze_all_bodies();
@@ -41,7 +112,7 @@ struct Analyzer<'a> {
     hir: &'a HirFile,
     type_result: &'a TypeCheckResult,
     trait_env: &'a TraitEnv,
-    escape_result: &'a EscapeResult,
+    reference_flow: &'a ReferenceFlow,
     result: AnalysisResult,
 }
 
@@ -56,20 +127,18 @@ impl<'a> Analyzer<'a> {
 
     fn analyze_body(&mut self, function_id: FunctionId, body_id: BodyId) {
         let body = &self.hir.bodies[body_id];
-        // Build per-body escaping set from global escape result
-        let escaping_locals: HashSet<StmtId> = self
-            .escape_result
-            .escaping_locals
-            .iter()
-            .filter(|(bid, _)| *bid == body_id)
-            .map(|(_, stmt)| *stmt)
-            .collect();
-        let mut ctx = BodyCtx::new(body_id, body, escaping_locals);
+        let mut ctx = BodyCtx::new(body_id, body);
         ctx.seed_params(
             self.hir.item_tree.functions[function_id]
                 .params
                 .iter()
                 .map(|param| param.name.0.as_str()),
+        );
+        ctx.seed_reference_params(
+            self.hir.item_tree.functions[function_id]
+                .params
+                .iter()
+                .enumerate(),
         );
         self.move_check_body(&mut ctx);
     }
@@ -99,6 +168,16 @@ impl<'a> Analyzer<'a> {
             | Expr::BoolLiteral { .. } => {}
 
             Expr::Path { path, resolved } => {
+                let origins = match resolved {
+                    Some(ResolvedName::Local(stmt)) => {
+                        ctx.local_origins.get(stmt).cloned().unwrap_or_default()
+                    }
+                    Some(ResolvedName::Param(index)) => {
+                        ctx.param_origins.get(index).cloned().unwrap_or_default()
+                    }
+                    _ => Origins::new(),
+                };
+                ctx.expr_origins.insert(expr_id, origins);
                 if let Some(name) = path.as_single_name()
                     && let Some(moved) = ctx.bindings.get(&name.0)
                 {
@@ -121,6 +200,9 @@ impl<'a> Analyzer<'a> {
                             &extra,
                         );
                     }
+                    if let Some(ResolvedName::Local(stmt)) = resolved {
+                        ctx.release_local_if_dead(*stmt);
+                    }
                     return;
                 }
                 if let Some(ResolvedName::Local(stmt)) = resolved {
@@ -136,13 +218,32 @@ impl<'a> Analyzer<'a> {
                         );
                     }
                 }
+                if let Some(ResolvedName::Local(stmt)) = resolved {
+                    ctx.release_local_if_dead(*stmt);
+                }
             }
 
             Expr::Struct { fields, .. } => {
+                let mut origins = Origins::new();
                 for field in fields {
                     self.move_check_expr(ctx, field.value);
                     self.consume_if_local(ctx, field.value);
+                    origins.extend(
+                        ctx.expr_origins
+                            .get(&field.value)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
                 }
+                let origins = if self.expr_may_carry_reference(ctx, expr_id) {
+                    origins
+                } else {
+                    for field in fields {
+                        self.deactivate_unretained(ctx, field.value, &HashSet::new());
+                    }
+                    Origins::new()
+                };
+                ctx.expr_origins.insert(expr_id, origins);
             }
 
             Expr::Binary { lhs, rhs, op } => {
@@ -159,59 +260,39 @@ impl<'a> Analyzer<'a> {
                             "E0303",
                         );
                     }
+                    if let Some(stmt) = self.direct_local_root(ctx, *lhs) {
+                        ctx.bind_origins(
+                            stmt,
+                            ctx.expr_origins.get(rhs).cloned().unwrap_or_default(),
+                        );
+                    }
                     self.consume_if_local(ctx, *rhs);
                 }
+                let origins = if op.is_assignment() {
+                    ctx.expr_origins.get(rhs).cloned().unwrap_or_default()
+                } else {
+                    self.deactivate_unretained(ctx, *lhs, &HashSet::new());
+                    self.deactivate_unretained(ctx, *rhs, &HashSet::new());
+                    Origins::new()
+                };
+                ctx.expr_origins.insert(expr_id, origins);
             }
 
             Expr::Unary { operand, op } => {
                 self.move_check_expr(ctx, *operand);
-                match op {
-                    UnaryOp::Ref | UnaryOp::MutRef => {
-                        if let Some(place) = self.place_from_expr(ctx, *operand) {
-                            if *op == UnaryOp::Ref {
-                                if self.has_mut_borrow(ctx, &place) {
-                                    let name = self.expr_name(ctx, *operand);
-                                    self.diag(
-                                        format!("cannot borrow `{}` as immutable because it is also borrowed as mutable", name),
-                                        span,
-                                        "E0301",
-                                    );
-                                } else {
-                                    ctx.shared_borrows.entry(place).or_default().push(
-                                        BorrowRecord {
-                                            scope_depth: ctx.scope_depth,
-                                        },
-                                    );
-                                }
-                            } else if self.has_shared_borrow(ctx, &place) {
-                                let name = self.expr_name(ctx, *operand);
-                                self.diag(
-                                    format!("cannot borrow `{}` as mutable because it is also borrowed as immutable", name),
-                                    span,
-                                    "E0300",
-                                );
-                            } else if self.has_mut_borrow(ctx, &place) {
-                                let name = self.expr_name(ctx, *operand);
-                                self.diag(
-                                    format!(
-                                        "cannot borrow `{}` as mutable more than once at a time",
-                                        name
-                                    ),
-                                    span,
-                                    "E0302",
-                                );
-                            } else {
-                                ctx.mutable_borrows
-                                    .entry(place)
-                                    .or_default()
-                                    .push(BorrowRecord {
-                                        scope_depth: ctx.scope_depth,
-                                    });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                let origins = match op {
+                    UnaryOp::Ref => self.create_borrow(ctx, *operand, BorrowKind::Shared, span),
+                    UnaryOp::MutRef => self.create_borrow(ctx, *operand, BorrowKind::Mutable, span),
+                    UnaryOp::Deref => ctx.expr_origins.get(operand).cloned().unwrap_or_default(),
+                    _ => Origins::new(),
+                };
+                let origins = if self.expr_may_carry_reference(ctx, expr_id) {
+                    origins
+                } else {
+                    self.deactivate_unretained(ctx, *operand, &HashSet::new());
+                    Origins::new()
+                };
+                ctx.expr_origins.insert(expr_id, origins);
             }
 
             Expr::Block { stmts, tail } => {
@@ -221,6 +302,10 @@ impl<'a> Analyzer<'a> {
                 }
                 if let Some(tail) = tail {
                     self.move_check_expr(ctx, *tail);
+                    ctx.expr_origins.insert(
+                        expr_id,
+                        ctx.expr_origins.get(tail).cloned().unwrap_or_default(),
+                    );
                     self.consume_if_local(ctx, *tail);
                 }
                 ctx.pop_scope();
@@ -236,6 +321,15 @@ impl<'a> Analyzer<'a> {
                 if let Some(e) = else_branch {
                     self.move_check_expr(ctx, *e);
                 }
+                let mut origins = ctx
+                    .expr_origins
+                    .get(then_branch)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(e) = else_branch {
+                    origins.extend(ctx.expr_origins.get(e).cloned().unwrap_or_default());
+                }
+                ctx.expr_origins.insert(expr_id, origins);
             }
 
             Expr::While { condition, body } => {
@@ -268,19 +362,31 @@ impl<'a> Analyzer<'a> {
                     self.move_check_expr(ctx, arm.body);
                     ctx.pop_scope();
                 }
+                let mut origins = Origins::new();
+                for arm in arms {
+                    origins.extend(ctx.expr_origins.get(&arm.body).cloned().unwrap_or_default());
+                }
+                ctx.expr_origins.insert(expr_id, origins);
             }
 
             Expr::Array { elements } => {
+                let mut origins = Origins::new();
                 for el in elements {
                     self.move_check_expr(ctx, *el);
                     self.consume_if_local(ctx, *el);
+                    origins.extend(ctx.expr_origins.get(el).cloned().unwrap_or_default());
                 }
+                ctx.expr_origins.insert(expr_id, origins);
             }
 
             Expr::ArrayRepeat { value, len } => {
                 self.move_check_expr(ctx, *value);
                 self.consume_if_local(ctx, *value);
                 self.move_check_expr(ctx, *len);
+                ctx.expr_origins.insert(
+                    expr_id,
+                    ctx.expr_origins.get(value).cloned().unwrap_or_default(),
+                );
             }
 
             Expr::Call { callee, args } => {
@@ -300,7 +406,14 @@ impl<'a> Analyzer<'a> {
                 self.move_check_expr(ctx, *callee);
                 for arg in args {
                     self.move_check_expr(ctx, *arg);
-                    self.consume_if_local(ctx, *arg);
+                }
+                let (inputs, modes, fid) = self.call_signature(ctx, *callee, args);
+                let origins = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, span);
+                ctx.expr_origins.insert(expr_id, origins);
+                for (index, input) in inputs.iter().enumerate() {
+                    if modes.get(index).copied().flatten().is_none() {
+                        self.consume_if_local(ctx, *input);
+                    }
                 }
                 if self
                     .type_result
@@ -326,10 +439,18 @@ impl<'a> Analyzer<'a> {
 
             Expr::Unsafe { body } => {
                 self.move_check_expr(ctx, *body);
+                ctx.expr_origins.insert(
+                    expr_id,
+                    ctx.expr_origins.get(body).cloned().unwrap_or_default(),
+                );
             }
 
             Expr::Cast { base, .. } => {
                 self.move_check_expr(ctx, *base);
+                ctx.expr_origins.insert(
+                    expr_id,
+                    ctx.expr_origins.get(base).cloned().unwrap_or_default(),
+                );
             }
 
             Expr::FieldAccess { base, field } => {
@@ -353,6 +474,12 @@ impl<'a> Analyzer<'a> {
                         &extra,
                     );
                 }
+                let origins = if self.expr_may_carry_reference(ctx, expr_id) {
+                    ctx.expr_origins.get(base).cloned().unwrap_or_default()
+                } else {
+                    Origins::new()
+                };
+                ctx.expr_origins.insert(expr_id, origins);
             }
 
             Expr::IndexAccess { base, index } => {
@@ -369,6 +496,12 @@ impl<'a> Analyzer<'a> {
                         &extra,
                     );
                 }
+                let origins = if self.expr_may_carry_reference(ctx, expr_id) {
+                    ctx.expr_origins.get(base).cloned().unwrap_or_default()
+                } else {
+                    Origins::new()
+                };
+                ctx.expr_origins.insert(expr_id, origins);
             }
         }
     }
@@ -379,6 +512,8 @@ impl<'a> Analyzer<'a> {
             Stmt::Let { init, .. } => {
                 if let Some(init) = init {
                     self.move_check_expr(ctx, *init);
+                    let origins = ctx.expr_origins.get(init).cloned().unwrap_or_default();
+                    ctx.bind_origins(stmt_id, origins);
                     self.consume_if_local(ctx, *init);
                 }
             }
@@ -494,12 +629,12 @@ impl<'a> Analyzer<'a> {
                                 "E0301",
                             );
                         } else {
-                            ctx.shared_borrows
-                                .entry(place)
-                                .or_default()
-                                .push(BorrowRecord {
-                                    scope_depth: ctx.scope_depth,
-                                });
+                            ctx.new_loan(
+                                access_place_from_move_place(&place),
+                                BorrowKind::Shared,
+                                span,
+                                false,
+                            );
                         }
                     }
                 }
@@ -521,12 +656,12 @@ impl<'a> Analyzer<'a> {
                                 "E0302",
                             );
                         } else {
-                            ctx.mutable_borrows
-                                .entry(place)
-                                .or_default()
-                                .push(BorrowRecord {
-                                    scope_depth: ctx.scope_depth,
-                                });
+                            ctx.new_loan(
+                                access_place_from_move_place(&place),
+                                BorrowKind::Mutable,
+                                span,
+                                false,
+                            );
                         }
                     }
                 }
@@ -563,7 +698,7 @@ impl<'a> Analyzer<'a> {
         body: ExprId,
         info: &LambdaInfo,
     ) {
-        let mut ctx = BodyCtx::new(outer.body_id, outer.body, outer.escaping_locals.clone());
+        let mut ctx = BodyCtx::new(outer.body_id, outer.body);
         ctx.seed_params(
             params
                 .iter()
@@ -616,19 +751,384 @@ impl<'a> Analyzer<'a> {
     }
 
     fn has_any_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
-        self.has_shared_borrow(ctx, place) || self.has_mut_borrow(ctx, place)
+        let place = access_place_from_move_place(place);
+        ctx.loans
+            .values()
+            .any(|loan| loan.active && access_places_overlap(&loan.place, &place))
+    }
+
+    fn access_targets(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Vec<AccessTarget> {
+        match &ctx.body.exprs[expr_id] {
+            Expr::Path {
+                resolved: Some(ResolvedName::Local(stmt)),
+                ..
+            } => vec![AccessTarget {
+                place: AccessPlace::new(AccessRoot::Local(*stmt)),
+                parents: HashSet::new(),
+            }],
+            Expr::Path {
+                resolved: Some(ResolvedName::Param(index)),
+                ..
+            } => vec![AccessTarget {
+                place: AccessPlace::new(AccessRoot::Param(*index)),
+                parents: HashSet::new(),
+            }],
+            Expr::Path {
+                resolved: Some(ResolvedName::LambdaParam { lambda, index }),
+                ..
+            } => vec![AccessTarget {
+                place: AccessPlace::new(AccessRoot::LambdaParam {
+                    lambda: *lambda,
+                    index: *index,
+                }),
+                parents: HashSet::new(),
+            }],
+            Expr::FieldAccess { base, field } => {
+                let index = self.resolve_field_index(ctx.body_id, *base, field);
+                let mut targets = if self.expr_is_reference(ctx, *base) {
+                    self.origin_targets(ctx, *base)
+                } else {
+                    self.access_targets(ctx, *base)
+                };
+                let Some(index) = index else {
+                    return targets;
+                };
+                for target in &mut targets {
+                    target.place = target.place.clone().field(index);
+                }
+                targets
+            }
+            Expr::IndexAccess { base, index } => {
+                let mut targets = if self.expr_is_reference(ctx, *base) {
+                    self.origin_targets(ctx, *base)
+                } else {
+                    self.access_targets(ctx, *base)
+                };
+                let index = match &ctx.body.exprs[*index] {
+                    Expr::IntLiteral { value, .. } => Some(*value as usize),
+                    _ => None,
+                };
+                for target in &mut targets {
+                    target.place = target.place.clone().index(index);
+                }
+                targets
+            }
+            Expr::Unary {
+                operand,
+                op: UnaryOp::Deref,
+            } => self.origin_targets(ctx, *operand),
+            _ => Vec::new(),
+        }
+    }
+
+    fn direct_local_root(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<StmtId> {
+        match &ctx.body.exprs[expr_id] {
+            Expr::Path {
+                resolved: Some(ResolvedName::Local(stmt)),
+                ..
+            } => Some(*stmt),
+            Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
+                self.direct_local_root(ctx, *base)
+            }
+            _ => None,
+        }
+    }
+
+    fn origin_targets(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Vec<AccessTarget> {
+        let mut targets: HashMap<AccessPlace, HashSet<LoanId>> = HashMap::new();
+        for origin in ctx.expr_origins.get(&expr_id).into_iter().flatten() {
+            targets
+                .entry(origin.place.clone())
+                .or_default()
+                .extend(ctx.loan_family(origin.loan));
+        }
+        targets
+            .into_iter()
+            .map(|(place, parents)| AccessTarget { place, parents })
+            .collect()
+    }
+
+    fn expr_is_reference(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> bool {
+        matches!(
+            self.type_result.expr_types.get(&(ctx.body_id, expr_id)),
+            Some(Type::Ref(..))
+        )
+    }
+
+    fn call_signature(
+        &self,
+        ctx: &BodyCtx<'_>,
+        callee: ExprId,
+        args: &[ExprId],
+    ) -> (Vec<ExprId>, Vec<Option<BorrowKind>>, Option<FunctionId>) {
+        let fid = match self.type_result.expr_types.get(&(ctx.body_id, callee)) {
+            Some(Type::Function(fid)) => Some(*fid),
+            _ => None,
+        };
+        if let Some(fid) = fid {
+            let function = &self.hir.item_tree.functions[fid];
+            let is_method = matches!(ctx.body.exprs[callee], Expr::FieldAccess { .. })
+                && !function.params.is_empty();
+            let mut inputs = Vec::new();
+            if is_method && let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee] {
+                inputs.push(*base);
+            }
+            inputs.extend(args.iter().copied());
+            let modes = function
+                .params
+                .iter()
+                .take(inputs.len())
+                .map(|param| hir_ref_kind(&param.ty))
+                .collect();
+            return (inputs, modes, Some(fid));
+        }
+
+        let inputs = args.to_vec();
+        let modes = match self.type_result.expr_types.get(&(ctx.body_id, callee)) {
+            Some(Type::Fn { params, .. }) => params.iter().map(type_ref_kind).collect(),
+            _ => vec![None; inputs.len()],
+        };
+        (inputs, modes, None)
+    }
+
+    fn check_call_borrows(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        call: ExprId,
+        inputs: &[ExprId],
+        modes: &[Option<BorrowKind>],
+        fid: Option<FunctionId>,
+        span: Option<TextRange>,
+    ) -> Origins {
+        let mut prepared = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let Some(kind) = modes.get(index).copied().flatten() else {
+                prepared.push(ctx.expr_origins.get(input).cloned().unwrap_or_default());
+                continue;
+            };
+
+            let targets = if self.expr_is_reference(ctx, *input) {
+                self.origin_targets(ctx, *input)
+            } else {
+                self.access_targets(ctx, *input)
+            };
+            let mut origins = Origins::new();
+            for target in targets {
+                if self.borrow_conflicts(ctx, &target.place, kind, &target.parents, span, *input) {
+                    continue;
+                }
+                let loan = ctx.new_loan_with_parents(
+                    target.place.clone(),
+                    kind,
+                    span,
+                    false,
+                    target.parents,
+                );
+                origins.insert(Origin {
+                    place: target.place,
+                    kind,
+                    loan,
+                });
+            }
+            prepared.push(origins);
+        }
+
+        let may_carry_reference = self.expr_may_carry_reference(ctx, call);
+        let summary = may_carry_reference
+            .then(|| fid.and_then(|fid| self.reference_flow.summary(fid)))
+            .flatten();
+        let mut result = Origins::new();
+        if let Some(summary) = summary {
+            for source in &summary.origins {
+                let Some(input_origins) = prepared.get(source.param) else {
+                    continue;
+                };
+                for origin in input_origins {
+                    let kind = BorrowKind::from_flow(source.kind, origin.kind);
+                    if kind == origin.kind {
+                        result.insert(origin.clone());
+                        continue;
+                    }
+                    let parents = ctx.loan_family(origin.loan);
+                    if self.borrow_conflicts(
+                        ctx,
+                        &origin.place,
+                        kind,
+                        &parents,
+                        span,
+                        inputs[source.param],
+                    ) {
+                        continue;
+                    }
+                    let loan =
+                        ctx.new_loan_with_parents(origin.place.clone(), kind, span, false, parents);
+                    result.insert(Origin {
+                        place: origin.place.clone(),
+                        kind,
+                        loan,
+                    });
+                }
+            }
+        } else if may_carry_reference {
+            for origins in &prepared {
+                result.extend(origins.iter().cloned());
+            }
+        }
+
+        let retained = result
+            .iter()
+            .map(|origin| origin.loan)
+            .collect::<HashSet<_>>();
+        for (index, origins) in prepared.iter().enumerate() {
+            if modes.get(index).copied().flatten().is_none() {
+                continue;
+            }
+            for origin in origins {
+                if !retained.contains(&origin.loan)
+                    && let Some(loan) = ctx.loans.get_mut(&origin.loan)
+                {
+                    loan.active = false;
+                }
+            }
+        }
+
+        for input in inputs {
+            self.deactivate_unretained(ctx, *input, &retained);
+        }
+
+        result
+    }
+
+    fn expr_may_carry_reference(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> bool {
+        self.type_result
+            .expr_types
+            .get(&(ctx.body_id, expr_id))
+            .is_none_or(|ty| type_may_carry_reference(self.hir, ty))
+    }
+
+    fn deactivate_unretained(
+        &self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        retained: &HashSet<LoanId>,
+    ) {
+        let origins = ctx.expr_origins.get(&expr_id).cloned().unwrap_or_default();
+        for origin in origins {
+            if retained.contains(&origin.loan) {
+                continue;
+            }
+            if let Some(loan) = ctx.loans.get_mut(&origin.loan)
+                && loan.holders.is_empty()
+                && !loan.permanent
+            {
+                loan.active = false;
+            }
+        }
+    }
+
+    fn create_borrow(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        operand: ExprId,
+        kind: BorrowKind,
+        span: Option<TextRange>,
+    ) -> Origins {
+        let mut origins = Origins::new();
+        for target in self.access_targets(ctx, operand) {
+            if self.borrow_conflicts(ctx, &target.place, kind, &target.parents, span, operand) {
+                continue;
+            }
+            let loan = ctx.new_loan_with_parents(
+                target.place.clone(),
+                kind,
+                span,
+                false,
+                target.parents.clone(),
+            );
+            origins.insert(Origin {
+                place: target.place,
+                kind,
+                loan,
+            });
+        }
+        origins
+    }
+
+    fn borrow_conflicts(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        place: &AccessPlace,
+        kind: BorrowKind,
+        parents: &HashSet<LoanId>,
+        span: Option<TextRange>,
+        expr_id: ExprId,
+    ) -> bool {
+        let conflict = ctx.loans.iter().find_map(|(id, loan)| {
+            (loan.active
+                && !parents.contains(id)
+                && access_places_overlap(&loan.place, place)
+                && !(loan.kind == BorrowKind::Shared && kind == BorrowKind::Shared))
+                .then(|| loan.clone())
+        });
+        let Some(conflict) = conflict else {
+            return false;
+        };
+
+        let name = self.expr_name(ctx, expr_id);
+        let (code, message) = match (kind, conflict.kind) {
+            (BorrowKind::Mutable, BorrowKind::Shared) => (
+                "E0300",
+                format!(
+                    "cannot borrow `{}` as mutable because it is also borrowed as immutable",
+                    name
+                ),
+            ),
+            (BorrowKind::Shared, BorrowKind::Mutable) => (
+                "E0301",
+                format!(
+                    "cannot borrow `{}` as immutable because it is also borrowed as mutable",
+                    name
+                ),
+            ),
+            (BorrowKind::Mutable, BorrowKind::Mutable) => (
+                "E0302",
+                format!(
+                    "cannot borrow `{}` as mutable more than once at a time",
+                    name
+                ),
+            ),
+            (BorrowKind::Shared, BorrowKind::Shared) => unreachable!(),
+        };
+        let labels = conflict
+            .issued_at
+            .map(|range| {
+                vec![(
+                    range,
+                    "first borrow occurs here".into(),
+                    LabelStyle::Secondary,
+                )]
+            })
+            .unwrap_or_default();
+        self.diag_with_labels(message, span, code, &labels);
+        true
     }
 
     fn has_shared_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
-        ctx.shared_borrows
-            .keys()
-            .any(|b| b.is_prefix_of(place) || place.is_prefix_of(b))
+        let place = access_place_from_move_place(place);
+        ctx.loans.values().any(|loan| {
+            loan.active
+                && loan.kind == BorrowKind::Shared
+                && access_places_overlap(&loan.place, &place)
+        })
     }
 
     fn has_mut_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
-        ctx.mutable_borrows
-            .keys()
-            .any(|b| b.is_prefix_of(place) || place.is_prefix_of(b))
+        let place = access_place_from_move_place(place);
+        ctx.loans.values().any(|loan| {
+            loan.active
+                && loan.kind == BorrowKind::Mutable
+                && access_places_overlap(&loan.place, &place)
+        })
     }
 
     fn expr_name(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> String {
@@ -749,8 +1249,14 @@ impl<'a> Analyzer<'a> {
 
 #[derive(Debug, Clone)]
 struct BorrowRecord {
-    /// The block scope depth at which this borrow was created.
+    place: AccessPlace,
+    kind: BorrowKind,
     scope_depth: usize,
+    issued_at: Option<TextRange>,
+    active: bool,
+    permanent: bool,
+    holders: HashSet<StmtId>,
+    parents: HashSet<LoanId>,
 }
 
 struct BodyCtx<'a> {
@@ -764,17 +1270,18 @@ struct BodyCtx<'a> {
     /// Where each place was moved — (span, description) for secondary labels.
     moved_sites: HashMap<Place, (Option<TextRange>, String)>,
 
-    // Borrow tracking
-    shared_borrows: HashMap<Place, Vec<BorrowRecord>>,
-    mutable_borrows: HashMap<Place, Vec<BorrowRecord>>,
+    // Borrow and reference provenance tracking
+    loans: HashMap<LoanId, BorrowRecord>,
+    next_loan: LoanId,
+    expr_origins: HashMap<ExprId, Origins>,
+    local_origins: HashMap<StmtId, Origins>,
+    param_origins: HashMap<usize, Origins>,
+    remaining_uses: HashMap<StmtId, usize>,
     scope_depth: usize,
-
-    // Escape results from escape-analysis pass (read-only)
-    escaping_locals: HashSet<StmtId>,
 }
 
 impl<'a> BodyCtx<'a> {
-    fn new(body_id: BodyId, body: &'a Body, escaping_locals: HashSet<StmtId>) -> Self {
+    fn new(body_id: BodyId, body: &'a Body) -> Self {
         Self {
             body_id,
             body,
@@ -782,10 +1289,13 @@ impl<'a> BodyCtx<'a> {
             bindings: MoveBindings::default(),
             moved_places: HashSet::new(),
             moved_sites: HashMap::new(),
-            shared_borrows: HashMap::new(),
-            mutable_borrows: HashMap::new(),
+            loans: HashMap::new(),
+            next_loan: 0,
+            expr_origins: HashMap::new(),
+            local_origins: HashMap::new(),
+            param_origins: HashMap::new(),
+            remaining_uses: collect_local_uses(body),
             scope_depth: 0,
-            escaping_locals,
         }
     }
 
@@ -805,17 +1315,124 @@ impl<'a> BodyCtx<'a> {
             self.scope_depth -= 1;
         }
         let current = self.scope_depth;
-        self.shared_borrows.retain(|_, records| {
-            records.retain(|r| r.scope_depth <= current);
-            !records.is_empty()
-        });
-        self.mutable_borrows.retain(|_, records| {
-            records.retain(|r| r.scope_depth <= current);
-            !records.is_empty()
-        });
+        for loan in self.loans.values_mut() {
+            if loan.scope_depth > current && !loan.permanent {
+                loan.active = false;
+            }
+        }
+    }
+
+    fn seed_reference_params<'b>(
+        &mut self,
+        params: impl IntoIterator<Item = (usize, &'b hir::item_tree::HirParam)>,
+    ) {
+        for (index, param) in params {
+            let kind = match &param.ty {
+                HirTypeRef::Ref(_, true) => BorrowKind::Mutable,
+                HirTypeRef::Ref(_, false) => BorrowKind::Shared,
+                _ => continue,
+            };
+            let place = AccessPlace::new(AccessRoot::Param(index));
+            let loan = self.new_loan(place.clone(), kind, Some(param.name_range), true);
+            self.param_origins
+                .insert(index, [Origin { place, kind, loan }].into_iter().collect());
+        }
     }
     fn expr_range(&self, id: ExprId) -> Option<TextRange> {
         self.source_map.expr_ranges.get(&id).copied()
+    }
+
+    fn new_loan(
+        &mut self,
+        place: AccessPlace,
+        kind: BorrowKind,
+        issued_at: Option<TextRange>,
+        permanent: bool,
+    ) -> LoanId {
+        self.new_loan_with_parents(place, kind, issued_at, permanent, HashSet::new())
+    }
+
+    fn new_loan_with_parents(
+        &mut self,
+        place: AccessPlace,
+        kind: BorrowKind,
+        issued_at: Option<TextRange>,
+        permanent: bool,
+        parents: HashSet<LoanId>,
+    ) -> LoanId {
+        let id = self.next_loan;
+        self.next_loan += 1;
+        self.loans.insert(
+            id,
+            BorrowRecord {
+                place,
+                kind,
+                scope_depth: self.scope_depth,
+                issued_at,
+                active: true,
+                permanent,
+                holders: HashSet::new(),
+                parents,
+            },
+        );
+        id
+    }
+
+    fn loan_family(&self, id: LoanId) -> HashSet<LoanId> {
+        let mut family = HashSet::from([id]);
+        let mut pending = vec![id];
+        while let Some(current) = pending.pop() {
+            let Some(loan) = self.loans.get(&current) else {
+                continue;
+            };
+            for parent in &loan.parents {
+                if family.insert(*parent) {
+                    pending.push(*parent);
+                }
+            }
+        }
+        family
+    }
+
+    fn bind_origins(&mut self, stmt: StmtId, origins: Origins) {
+        if let Some(previous) = self.local_origins.insert(stmt, origins.clone()) {
+            for origin in previous {
+                if let Some(loan) = self.loans.get_mut(&origin.loan) {
+                    loan.holders.remove(&stmt);
+                    if loan.holders.is_empty() && !loan.permanent {
+                        loan.active = false;
+                    }
+                }
+            }
+        }
+        for origin in origins {
+            if let Some(loan) = self.loans.get_mut(&origin.loan) {
+                loan.holders.insert(stmt);
+                loan.scope_depth = loan.scope_depth.min(self.scope_depth);
+                loan.active = true;
+            }
+        }
+    }
+
+    fn release_local_if_dead(&mut self, stmt: StmtId) {
+        let Some(remaining) = self.remaining_uses.get_mut(&stmt) else {
+            return;
+        };
+        *remaining = remaining.saturating_sub(1);
+        if *remaining != 0 {
+            return;
+        }
+        let Some(origins) = self.local_origins.get(&stmt) else {
+            return;
+        };
+        for origin in origins {
+            if let Some(loan) = self.loans.get_mut(&origin.loan) {
+                loan.holders.remove(&stmt);
+                if loan.holders.is_empty() && !loan.permanent {
+                    loan.active = false;
+                }
+            }
+        }
     }
 }
 
@@ -855,4 +1472,166 @@ impl MoveBindings {
 
 fn place_overlaps(a: &Place, b: &Place) -> bool {
     a.is_prefix_of(b) || b.is_prefix_of(a)
+}
+
+fn access_places_overlap(a: &AccessPlace, b: &AccessPlace) -> bool {
+    if a.root != b.root {
+        return false;
+    }
+    for (left, right) in a.projections.iter().zip(&b.projections) {
+        match (left, right) {
+            (AccessProjection::Field(left), AccessProjection::Field(right)) if left != right => {
+                return false;
+            }
+            (AccessProjection::Index(Some(left)), AccessProjection::Index(Some(right)))
+                if left != right =>
+            {
+                return false;
+            }
+            (AccessProjection::Field(_), AccessProjection::Index(_))
+            | (AccessProjection::Index(_), AccessProjection::Field(_)) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn access_place_from_move_place(place: &Place) -> AccessPlace {
+    let mut result = AccessPlace::new(AccessRoot::Local(place.local));
+    for projection in &place.projections {
+        result = match projection {
+            hir::place::Projection::Field(index) => result.field(*index),
+            hir::place::Projection::Index(index) => result.index(Some(*index)),
+        };
+    }
+    result
+}
+
+fn hir_ref_kind(ty: &HirTypeRef) -> Option<BorrowKind> {
+    match ty {
+        HirTypeRef::Ref(_, true) => Some(BorrowKind::Mutable),
+        HirTypeRef::Ref(_, false) => Some(BorrowKind::Shared),
+        _ => None,
+    }
+}
+
+fn type_ref_kind(ty: &Type) -> Option<BorrowKind> {
+    match ty {
+        Type::Ref(_, true) => Some(BorrowKind::Mutable),
+        Type::Ref(_, false) => Some(BorrowKind::Shared),
+        _ => None,
+    }
+}
+
+fn collect_local_uses(body: &Body) -> HashMap<StmtId, usize> {
+    fn expr(body: &Body, id: ExprId, uses: &mut HashMap<StmtId, usize>) {
+        match &body.exprs[id] {
+            Expr::Path {
+                resolved: Some(ResolvedName::Local(stmt)),
+                ..
+            } => *uses.entry(*stmt).or_default() += 1,
+            Expr::Binary { lhs, rhs, .. } => {
+                expr(body, *lhs, uses);
+                expr(body, *rhs, uses);
+            }
+            Expr::Unary { operand, .. }
+            | Expr::FieldAccess { base: operand, .. }
+            | Expr::Unsafe { body: operand }
+            | Expr::Cast { base: operand, .. } => expr(body, *operand, uses),
+            Expr::Block { stmts, tail } => {
+                for stmt_id in stmts {
+                    match &body.stmts[*stmt_id] {
+                        Stmt::Let { init, .. } => {
+                            if let Some(init) = init {
+                                expr(body, *init, uses);
+                            }
+                        }
+                        Stmt::Expr { expr: value } => expr(body, *value, uses),
+                        Stmt::Return { value } => {
+                            if let Some(value) = value {
+                                expr(body, *value, uses);
+                            }
+                        }
+                        Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
+                    }
+                }
+                if let Some(tail) = tail {
+                    expr(body, *tail, uses);
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                expr(body, *cond, uses);
+                expr(body, *then_branch, uses);
+                if let Some(branch) = else_branch {
+                    expr(body, *branch, uses);
+                }
+            }
+            Expr::While {
+                condition,
+                body: loop_body,
+            } => {
+                expr(body, *condition, uses);
+                expr(body, *loop_body, uses);
+            }
+            Expr::For {
+                iterable,
+                body: loop_body,
+                ..
+            } => {
+                expr(body, *iterable, uses);
+                expr(body, *loop_body, uses);
+            }
+            Expr::Match { scrutinee, arms } => {
+                expr(body, *scrutinee, uses);
+                for arm in arms {
+                    if let Some(guard) = arm.guard {
+                        expr(body, guard, uses);
+                    }
+                    expr(body, arm.body, uses);
+                }
+            }
+            Expr::Array { elements } => {
+                for element in elements {
+                    expr(body, *element, uses);
+                }
+            }
+            Expr::ArrayRepeat { value, len } => {
+                expr(body, *value, uses);
+                expr(body, *len, uses);
+            }
+            Expr::Struct { fields, .. } => {
+                for field in fields {
+                    expr(body, field.value, uses);
+                }
+            }
+            Expr::Call { callee, args } => {
+                expr(body, *callee, uses);
+                for arg in args {
+                    expr(body, *arg, uses);
+                }
+            }
+            Expr::Lambda {
+                body: lambda_body, ..
+            } => expr(body, *lambda_body, uses),
+            Expr::IndexAccess { base, index } => {
+                expr(body, *base, uses);
+                expr(body, *index, uses);
+            }
+            Expr::Missing
+            | Expr::IntLiteral { .. }
+            | Expr::FloatLiteral { .. }
+            | Expr::StringLiteral { .. }
+            | Expr::CharLiteral { .. }
+            | Expr::BoolLiteral { .. }
+            | Expr::Path { .. } => {}
+        }
+    }
+
+    let mut uses = HashMap::new();
+    expr(body, body.root_block, &mut uses);
+    uses
 }

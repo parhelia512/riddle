@@ -93,16 +93,21 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
 
             ast::Stmt::ExternBlock(block) => {
                 for func in block.functions() {
+                    let is_safe = func.is_safe();
                     let fid = func.lower(&mut hir.item_tree.functions);
+                    hir.item_tree.functions[fid].is_unsafe = !is_safe;
                     items.push(TopLevelItem::Function(fid));
                     hir.item_tree.extern_function_ids.push(fid);
                 }
             }
 
             ast::Stmt::ExternFnDecl(decl) => {
+                let explicitly_unsafe = decl.is_unsafe();
                 if let Some(func) = decl.func_decl() {
                     let body_ast = func.body();
+                    let is_import = body_ast.is_none();
                     let fid = func.lower(&mut hir.item_tree.functions);
+                    hir.item_tree.functions[fid].is_unsafe |= explicitly_unsafe || is_import;
                     items.push(TopLevelItem::Function(fid));
                     hir.item_tree.extern_function_ids.push(fid);
                     if let Some(block) = body_ast {
