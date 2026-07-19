@@ -57,6 +57,7 @@ pub fn lower_hir(
         current_function: None,
         scope_map: HashMap::new(),
         storage_bindings: HashSet::new(),
+        parameter_storage: HashMap::new(),
         pattern_bindings: Vec::new(),
         generic_subst: HashMap::new(),
         generic_tc_subst: HashMap::new(),
@@ -134,6 +135,7 @@ struct LowerCtx<'a> {
     scope_map: HashMap<StmtId, Value>,
     /// StmtIds backed by storage rather than a direct SSA value.
     storage_bindings: HashSet<StmtId>,
+    parameter_storage: HashMap<CaptureSource, Value>,
     pattern_bindings: Vec<HashMap<String, Value>>,
     generic_subst: HashMap<String, Type>,
     generic_tc_subst: HashMap<String, type_checker::Type>,
@@ -187,6 +189,7 @@ impl<'a> LowerCtx<'a> {
         self.expr_cache.clear();
         self.scope_map.clear();
         self.storage_bindings.clear();
+        self.parameter_storage.clear();
         self.pattern_bindings.clear();
         self.capture_access.clear();
         self.current_lambda = None;
@@ -227,6 +230,14 @@ impl<'a> LowerCtx<'a> {
         let is_unit_ret = func.ret_type == Type::Unit || func.ret_type == Type::Never;
         {
             let mut builder = Builder::new(&mut func);
+            for (index, (param, value)) in func_item.params.iter().zip(&param_values).enumerate() {
+                if self.analysis.param_escapes(body_id, index) {
+                    let storage = builder.heap_alloc(self.convert_hir_type(&param.ty));
+                    builder.store(*value, storage);
+                    self.parameter_storage
+                        .insert(CaptureSource::Param(index), storage);
+                }
+            }
             let root_result = self.lower_expr(&mut builder, &param_values, body, body.root_block);
 
             // Set the implicit return only when lowering did not terminate the block.
@@ -362,6 +373,7 @@ impl<'a> LowerCtx<'a> {
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
         let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
+        let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
         let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
         let old_loop_targets = std::mem::take(&mut self.loop_targets);
         let old_capture_access = std::mem::take(&mut self.capture_access);
@@ -379,6 +391,20 @@ impl<'a> LowerCtx<'a> {
         let is_unit = matches!(function.ret_type, Type::Unit | Type::Never);
         {
             let mut lambda_builder = Builder::new(&mut function);
+            for (index, value) in param_values.iter().enumerate() {
+                if self.analysis.lambda_param_escapes(body_id, expr_id, index) {
+                    let ty = call_signature.params[index + 1].clone();
+                    let storage = lambda_builder.heap_alloc(ty);
+                    lambda_builder.store(*value, storage);
+                    self.parameter_storage.insert(
+                        CaptureSource::LambdaParam {
+                            lambda: expr_id,
+                            index,
+                        },
+                        storage,
+                    );
+                }
+            }
             if !info.captures.is_empty() {
                 let env_ptr_ty = Type::Ptr(Box::new(Type::Struct(env_struct.clone())));
                 let env_ptr = lambda_builder.cast(CastOp::PtrToPtr, env_param, env_ptr_ty.clone());
@@ -412,6 +438,7 @@ impl<'a> LowerCtx<'a> {
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
         self.storage_bindings = old_storage_bindings;
+        self.parameter_storage = old_parameter_storage;
         self.pattern_bindings = old_pattern_bindings;
         self.loop_targets = old_loop_targets;
         self.capture_access = old_capture_access;
@@ -442,16 +469,21 @@ impl<'a> LowerCtx<'a> {
                     value
                 }
             }
-            CaptureSource::Param(index) => params
-                .get(*index)
+            CaptureSource::Param(index) => self
+                .parameter_storage
+                .get(&CaptureSource::Param(*index))
                 .copied()
+                .map(|place| builder.load(place, ty.clone()))
+                .or_else(|| params.get(*index).copied())
                 .unwrap_or_else(|| builder.unit_const()),
             CaptureSource::LambdaParam { lambda, index }
                 if self.current_lambda == Some(*lambda) =>
             {
-                params
-                    .get(*index)
+                self.parameter_storage
+                    .get(source)
                     .copied()
+                    .map(|place| builder.load(place, ty.clone()))
+                    .or_else(|| params.get(*index).copied())
                     .unwrap_or_else(|| builder.unit_const())
             }
             CaptureSource::LambdaParam { .. } => builder.unit_const(),
@@ -471,6 +503,16 @@ impl<'a> LowerCtx<'a> {
         if let CaptureSource::Local(stmt) = source
             && self.storage_bindings.contains(stmt)
             && let Some(place) = self.scope_map.get(stmt)
+        {
+            return *place;
+        }
+        if let CaptureSource::Param(index) = source
+            && let Some(place) = self.parameter_storage.get(&CaptureSource::Param(*index))
+        {
+            return *place;
+        }
+        if matches!(source, CaptureSource::LambdaParam { .. })
+            && let Some(place) = self.parameter_storage.get(source)
         {
             return *place;
         }
@@ -609,26 +651,37 @@ impl<'a> LowerCtx<'a> {
                         storage
                     }
                 }
-                Some(ResolvedName::Param(idx)) => self
-                    .capture_access
-                    .get(&CaptureSource::Param(*idx))
-                    .cloned()
-                    .map(|access| builder.load(access.place, access.ty))
-                    .unwrap_or_else(|| {
+                Some(ResolvedName::Param(idx)) => {
+                    if let Some(access) = self
+                        .capture_access
+                        .get(&CaptureSource::Param(*idx))
+                        .cloned()
+                    {
+                        builder.load(access.place, access.ty)
+                    } else if let Some(storage) = self
+                        .parameter_storage
+                        .get(&CaptureSource::Param(*idx))
+                        .copied()
+                    {
+                        builder.load(storage, mir_type.clone())
+                    } else {
                         param_values
                             .get(*idx)
                             .copied()
                             .unwrap_or_else(|| builder.unit_const())
-                    }),
+                    }
+                }
                 Some(ResolvedName::LambdaParam { lambda, index }) => {
                     let source = CaptureSource::LambdaParam {
                         lambda: *lambda,
                         index: *index,
                     };
                     if self.current_lambda == Some(*lambda) {
-                        param_values
-                            .get(*index)
+                        self.parameter_storage
+                            .get(&source)
                             .copied()
+                            .map(|place| builder.load(place, mir_type.clone()))
+                            .or_else(|| param_values.get(*index).copied())
                             .unwrap_or_else(|| builder.unit_const())
                     } else if let Some(access) = self.capture_access.get(&source).cloned() {
                         builder.load(access.place, access.ty)
@@ -2125,7 +2178,7 @@ impl<'a> LowerCtx<'a> {
                 )
             }
             hir::item_tree::HirTypeRef::Ref(_, mutable) => {
-                let base_val = self.lower_expr(builder, param_values, body, base);
+                let base_val = self.lower_lvalue(builder, param_values, body, base);
                 let expected_ty = Type::Ref(Box::new(base_ty), *mutable);
                 builder.unop(convert_unop(&HirUnOp::Ref), base_val, expected_ty)
             }
@@ -2164,6 +2217,11 @@ impl<'a> LowerCtx<'a> {
                     .capture_access
                     .get(&CaptureSource::Param(*idx))
                     .map(|access| access.place)
+                    .or_else(|| {
+                        self.parameter_storage
+                            .get(&CaptureSource::Param(*idx))
+                            .copied()
+                    })
                     .or_else(|| param_values.get(*idx).copied())
                     .unwrap_or_else(|| builder.unit_const()),
                 Some(ResolvedName::LambdaParam { lambda, index }) => {
@@ -2174,6 +2232,7 @@ impl<'a> LowerCtx<'a> {
                     self.capture_access
                         .get(&source)
                         .map(|access| access.place)
+                        .or_else(|| self.parameter_storage.get(&source).copied())
                         .or_else(|| {
                             (self.current_lambda == Some(*lambda))
                                 .then(|| param_values.get(*index).copied())
@@ -2184,7 +2243,7 @@ impl<'a> LowerCtx<'a> {
                 _ => builder.unit_const(),
             },
             Expr::IndexAccess { base, index } => {
-                let base_val = self.lower_expr(builder, param_values, body, *base);
+                let base_val = self.lower_place_base(builder, param_values, body, *base);
                 let index_val = self.lower_expr(builder, param_values, body, *index);
                 let mir_type = self
                     .current_body
@@ -2194,7 +2253,7 @@ impl<'a> LowerCtx<'a> {
                 builder.index_ptr(base_val, index_val, mir_type)
             }
             Expr::FieldAccess { base, field } => {
-                let base_val = self.lower_lvalue(builder, param_values, body, *base);
+                let base_val = self.lower_place_base(builder, param_values, body, *base);
                 let field_idx = self.resolve_field_index(*base, field);
                 let field_ty = self
                     .current_body
@@ -2203,7 +2262,34 @@ impl<'a> LowerCtx<'a> {
                     .unwrap_or(Type::Unit);
                 builder.field_ptr(base_val, field_idx, field_ty)
             }
+            Expr::Unary {
+                operand,
+                op: HirUnOp::Deref,
+            } => self.lower_expr(builder, param_values, body, *operand),
             _ => self.lower_expr(builder, param_values, body, expr_id),
+        }
+    }
+
+    fn lower_place_base(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        base: ExprId,
+    ) -> Value {
+        let indirect = self
+            .current_body
+            .and_then(|body_id| self.type_result.expr_types.get(&(body_id, base)))
+            .is_some_and(|ty| {
+                matches!(
+                    ty,
+                    type_checker::Type::Ref(..) | type_checker::Type::Ptr { .. }
+                )
+            });
+        if indirect {
+            self.lower_expr(builder, param_values, body, base)
+        } else {
+            self.lower_lvalue(builder, param_values, body, base)
         }
     }
 
@@ -2757,6 +2843,7 @@ impl<'a> LowerCtx<'a> {
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
         let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
+        let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
         let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
         let old_capture_access = std::mem::take(&mut self.capture_access);
         let old_current_lambda = self.current_lambda;
@@ -2766,6 +2853,7 @@ impl<'a> LowerCtx<'a> {
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
         self.storage_bindings = old_storage_bindings;
+        self.parameter_storage = old_parameter_storage;
         self.pattern_bindings = old_pattern_bindings;
         self.capture_access = old_capture_access;
         self.current_lambda = old_current_lambda;
@@ -2867,6 +2955,7 @@ impl<'a> LowerCtx<'a> {
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
         let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
+        let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
         let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
         let old_capture_access = std::mem::take(&mut self.capture_access);
         let old_current_lambda = self.current_lambda;
@@ -2876,6 +2965,7 @@ impl<'a> LowerCtx<'a> {
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
         self.storage_bindings = old_storage_bindings;
+        self.parameter_storage = old_parameter_storage;
         self.pattern_bindings = old_pattern_bindings;
         self.capture_access = old_capture_access;
         self.current_lambda = old_current_lambda;

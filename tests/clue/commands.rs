@@ -206,6 +206,114 @@ fun main() -> i32 {
 }
 
 #[test]
+fn generated_c_array_and_by_value_param_refs_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping C runtime test: no cc, gcc, or clang found");
+        return;
+    }
+    let root = temp_root("native-escaping-places");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let project = root.join("app");
+    fs::write(
+        project.join("src/main.rid"),
+        r#"
+struct Data { value: i32 }
+
+struct Boxed { items: [Data; 2] }
+
+struct Grid { items: [[Data; 3]; 2] }
+
+fun array_ref() -> &Data {
+    let items = [Data { value: 9 }, Data { value: 10 }];
+    &items[0]
+}
+
+fun nested_array_ref() -> &Data {
+    let items = [
+        [Data { value: 13 }, Data { value: 14 }, Data { value: 15 }],
+        [Data { value: 16 }, Data { value: 17 }, Data { value: 18 }],
+    ];
+    &items[1][2]
+}
+
+fun parameter_array_ref(items: [Data; 2]) -> &Data {
+    &items[1]
+}
+
+fun copy_parameter(items: [Data; 2]) -> i32 {
+    let mut copied = items;
+    copied[0].value
+}
+
+fun field_array_ref() -> &Data {
+    let boxed = Boxed {
+        items: [Data { value: 19 }, Data { value: 20 }],
+    };
+    &boxed.items[1]
+}
+
+fun nested_field_array_ref() -> &Data {
+    let grid = Grid {
+        items: [
+            [Data { value: 21 }, Data { value: 22 }, Data { value: 23 }],
+            [Data { value: 24 }, Data { value: 25 }, Data { value: 26 }],
+        ],
+    };
+    &grid.items[1][2]
+}
+
+fun param_ref(value: Data) -> &Data { &value }
+
+fun lambda_ref() -> fun(Data) -> &Data {
+    fun(value: Data) -> &Data { &value }
+}
+
+fun main() -> i32 {
+    let array = array_ref();
+    let nested_array = nested_array_ref();
+    let parameter_array = parameter_array_ref([
+        Data { value: 17 }, Data { value: 18 },
+    ]);
+    let copied = copy_parameter([Data { value: 27 }, Data { value: 28 }]);
+    let field_array = field_array_ref();
+    let nested_field_array = nested_field_array_ref();
+    let param = param_ref(Data { value: 11 });
+    let lambda = lambda_ref();
+    let lambda_param = lambda(Data { value: 12 });
+    if (*array).value == 9 && (*nested_array).value == 18
+        && (*parameter_array).value == 18 && (*field_array).value == 20
+        && (*nested_field_array).value == 26 && copied == 27
+        && (*param).value == 11 && (*lambda_param).value == 12 {
+        0
+    } else {
+        1
+    }
+}
+"#,
+    )
+    .unwrap();
+    let build = clue(&["build", "app"], &root);
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let executable = project.join(if cfg!(windows) {
+        ".clue/build/app.exe"
+    } else {
+        ".clue/build/app"
+    });
+    let run = Command::new(&executable).output().unwrap();
+    assert!(
+        run.status.success(),
+        "native program exited with {}",
+        run.status
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn init_refuses_to_overwrite_source() {
     let root = temp_root("no-overwrite");
     fs::create_dir_all(root.join("hello/src")).unwrap();

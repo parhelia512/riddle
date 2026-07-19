@@ -870,3 +870,77 @@ fn c_backend_lowers_non_copy_array_into_iterator() {
         result
     );
 }
+
+#[test]
+fn c_backend_heap_allocates_an_escaping_array() {
+    let module = lower(
+        r#"
+        struct Data { value: i32 }
+
+        fun index_ref() -> &Data {
+            let items = [Data { value: 1 }, Data { value: 2 }];
+            &items[0]
+        }
+
+        fun nested_index_ref() -> &Data {
+            let items = [
+                [Data { value: 3 }, Data { value: 4 }, Data { value: 5 }],
+                [Data { value: 6 }, Data { value: 7 }, Data { value: 8 }],
+            ];
+            &items[1][2]
+        }
+
+        fun parameter_index_ref(items: [Data; 2]) -> &Data {
+            &items[1]
+        }
+
+        fun copy_parameter(items: [Data; 2]) -> i32 {
+            let mut copied = items;
+            copied[0].value
+        }
+
+        struct Boxed { items: [Data; 2] }
+
+        fun field_index_ref() -> &Data {
+            let boxed = Boxed {
+                items: [Data { value: 9 }, Data { value: 10 }],
+            };
+            &boxed.items[1]
+        }
+
+        struct Grid { items: [[Data; 3]; 2] }
+
+        fun nested_field_index_ref() -> &Data {
+            let grid = Grid {
+                items: [
+                    [Data { value: 11 }, Data { value: 12 }, Data { value: 13 }],
+                    [Data { value: 14 }, Data { value: 15 }, Data { value: 16 }],
+                ],
+            };
+            &grid.items[1][2]
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("rgc_alloc(sizeof(Data[2]))"),
+        "{generated}"
+    );
+    assert!(generated.contains("memcpy(h"), "{generated}");
+    assert!(generated.contains("(&h"), "{generated}");
+    assert!(
+        generated.contains("rgc_alloc(sizeof(Data[2][3]))"),
+        "{generated}"
+    );
+    assert!(generated.contains("* 3)"), "{generated}");
+    assert!(!generated.contains("[3]*"), "{generated}");
+    assert!(
+        generated.contains(", items, sizeof(Data[2]))"),
+        "{generated}"
+    );
+    assert!(!generated.contains("sizeof(items)"), "{generated}");
+    assert!(!generated.contains("&items"), "{generated}");
+    assert!(generated.contains("->items[0]"), "{generated}");
+    assert!(generated.contains("->items[0][0]"), "{generated}");
+}

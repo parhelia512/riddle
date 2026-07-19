@@ -1,8 +1,12 @@
-use std::String;
-
-struct Foo{}
+struct Foo{x: i32}
 
 fun main(){
-    let mut a: Vector<i32> = Vector::new();
-    a.push(1);
+
+    let mut t = Foo{x: 1};
+    let mut x: &mut Foo = &mut t;
+    {
+        let mut y = Foo{x: 2};
+        x = &mut y;
+    }
+    let v = x.x;
 }

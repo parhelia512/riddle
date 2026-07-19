@@ -1,4 +1,4 @@
-use crate::lower;
+use crate::{compile, lower};
 
 #[test]
 fn simple_function_no_params() {
@@ -1034,6 +1034,471 @@ fn non_escaping_local_no_heap_alloc() {
         !has_heap_alloc,
         "non-escaping local should NOT produce HeapAlloc"
     );
+}
+
+#[test]
+fn all_reference_forms_promote_their_source_local() {
+    let (_, type_result, _, module) = compile(
+        r#"
+        struct Data { value: i32 }
+        struct Receiver { value: i32 }
+        struct Other { value: i64 }
+        struct Slot { value: &Data }
+        struct Holder { value: &Data }
+
+        fun direct_mut() -> &mut Data {
+            let mut local = Data { value: 1 };
+            &mut local
+        }
+
+        fun field_ref() -> &i32 {
+            let local = Data { value: 1 };
+            &local.value
+        }
+
+        fun param_field_ref(value: &Data) -> &i32 { &value.value }
+
+        fun alias_field_ref() -> &i32 {
+            let local = Data { value: 1 };
+            let alias = &local;
+            &alias.value
+        }
+
+        fun mutable_alias_field_ref() -> &i32 {
+            let local = Data { value: 1 };
+            let mut alias = &local;
+            &alias.value
+        }
+
+        fun index_ref() -> &Data {
+            let items = [Data { value: 1 }, Data { value: 2 }];
+            &items[0]
+        }
+
+        fun mutable_alias_index_ref() -> &Data {
+            let items = [Data { value: 1 }, Data { value: 2 }];
+            let mut alias = &items;
+            &(*alias)[0]
+        }
+
+        fun mutable_alias_deref_ref() -> &Data {
+            let local = Data { value: 1 };
+            let mut alias = &local;
+            &*alias
+        }
+
+        fun block_ref() -> &Data {
+            let local = Data { value: 1 };
+            { &local }
+        }
+
+        fun by_value_param_ref(value: Data) -> &Data { &value }
+
+        fun identity<T>(value: T) -> T { value }
+
+        fun generic_before_param_ref(value: Data) -> &Data {
+            let ignored = identity(1);
+            &value
+        }
+
+        fun branch_refs(flag: bool) -> &Data {
+            let left = Data { value: 1 };
+            let right = Data { value: 2 };
+            if flag { &left } else { &right }
+        }
+
+        struct Pair {
+            left: &Data,
+            right: &Data,
+        }
+
+        fun aggregate_refs() -> Pair {
+            let left = Data { value: 1 };
+            let right = Data { value: 2 };
+            Pair { left: &left, right: &right }
+        }
+
+        fun reassigned_ref(flag: bool) -> &Data {
+            let left = Data { value: 1 };
+            let right = Data { value: 2 };
+            let mut reference = &left;
+            if flag { reference = &right; }
+            reference
+        }
+
+        impl Data {
+            fun value_ref(&self) -> &i32 { &self.value }
+        }
+
+        impl Receiver {
+            fun choose(receiver: &Receiver, other: &Other) -> &Other { other }
+        }
+
+        fun method_ref() -> &i32 {
+            let local = Data { value: 1 };
+            local.value_ref()
+        }
+
+        fun method_alias_ref() -> &i32 {
+            let local = Data { value: 1 };
+            let alias = &local;
+            alias.value_ref()
+        }
+
+        fun method_arg_ref() -> &Other {
+            let receiver = Receiver { value: 1 };
+            let other = Other { value: 2 };
+            receiver.choose(&other)
+        }
+
+        fun loop_backedge(flag: bool) -> &Data {
+            let first = Data { value: 1 };
+            let later = Data { value: 2 };
+            let mut current = &first;
+            let mut escaped = current;
+            while flag {
+                escaped = current;
+                current = &later;
+            }
+            escaped
+        }
+
+        fun indirect_store(slot: &mut Slot) {
+            let local = Data { value: 1 };
+            slot.value = &local;
+        }
+
+        fun deref_store(slot: &mut &Data) {
+            let local = Data { value: 1 };
+            *slot = &local;
+        }
+
+        fun consume_holder(holder: Holder) -> i32 { holder.value.value }
+
+        fun value_capture() -> fun() -> i32 {
+            let local = Data { value: 1 };
+            let holder = Holder { value: &local };
+            fun() { consume_holder(holder) }
+        }
+
+        fun lambda_param_ref() -> fun(Data) -> &Data {
+            fun(value: Data) -> &Data { &value }
+        }
+
+        fun read(value: &Data) -> i32 { value.value }
+
+        fun nonescaping_call() -> i32 {
+            let local = Data { value: 1 };
+            read(&local)
+        }
+
+        extern "C" fun store(value: &Data);
+
+        fun escaping_call() {
+            let local = Data { value: 1 };
+            store({ &local });
+        }
+
+        fun loop_call_sink(flag: bool) {
+            let first = Data { value: 1 };
+            let later = Data { value: 2 };
+            let mut reference = &first;
+            while flag {
+                store(reference);
+                reference = &later;
+            }
+        }
+        "#,
+    );
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    let find_function = |name: &str| {
+        module
+            .function_order
+            .iter()
+            .map(|id| &module.functions[*id])
+            .find(|function| function.name == name)
+            .unwrap()
+    };
+
+    for (name, expected_allocations) in [
+        ("direct_mut", 1),
+        ("field_ref", 1),
+        ("param_field_ref", 0),
+        ("alias_field_ref", 1),
+        ("mutable_alias_field_ref", 1),
+        ("index_ref", 1),
+        ("mutable_alias_index_ref", 1),
+        ("mutable_alias_deref_ref", 1),
+        ("block_ref", 1),
+        ("by_value_param_ref", 1),
+        ("generic_before_param_ref", 1),
+        ("branch_refs", 2),
+        ("aggregate_refs", 2),
+        ("reassigned_ref", 2),
+        ("method_ref", 1),
+        ("loop_backedge", 2),
+        ("indirect_store", 1),
+        ("deref_store", 1),
+        ("nonescaping_call", 0),
+        ("escaping_call", 1),
+        ("loop_call_sink", 2),
+        ("method_alias_ref", 1),
+    ] {
+        let function = find_function(name);
+        let allocations = function
+            .blocks
+            .iter()
+            .flat_map(|(_, block)| &block.insts)
+            .filter(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+            .count();
+        assert_eq!(
+            allocations, expected_allocations,
+            "{name} should heap-allocate every escaping local"
+        );
+    }
+
+    let method = find_function("method_arg_ref");
+    let allocated_structs: Vec<_> = method
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter_map(|inst| match &inst.kind {
+            mir::instr::InstKind::HeapAlloc(mir::types::Type::Ptr(ty)) => match ty.as_ref() {
+                mir::types::Type::Struct(ty) => Some(ty.name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(allocated_structs, ["Other"]);
+
+    let method_ref = find_function("method_ref");
+    let find_inst = |value: mir::Value| {
+        method_ref.blocks.iter().find_map(|(_, block)| {
+            let index = value.0.checked_sub(block.start_value)? as usize;
+            block.insts.get(index)
+        })
+    };
+    let receiver = method_ref
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .find_map(|inst| match &inst.kind {
+            mir::instr::InstKind::Call(_, args) => args.first().copied(),
+            _ => None,
+        })
+        .unwrap();
+    let receiver_place = match &find_inst(receiver).unwrap().kind {
+        mir::instr::InstKind::UnOp(mir::instr::UnOp::Ref, place) => *place,
+        inst => panic!("method receiver should be borrowed from a place, got {inst:?}"),
+    };
+    assert!(matches!(
+        find_inst(receiver_place).unwrap().kind,
+        mir::instr::InstKind::HeapAlloc(_)
+    ));
+
+    let index_ref = find_function("index_ref");
+    let index_base = index_ref
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .find_map(|inst| match inst.kind {
+            mir::instr::InstKind::IndexPtr(base, _) => Some(base),
+            _ => None,
+        })
+        .unwrap();
+    let index_base_inst = index_ref
+        .blocks
+        .iter()
+        .find_map(|(_, block)| {
+            let index = index_base.0.checked_sub(block.start_value)? as usize;
+            block.insts.get(index)
+        })
+        .unwrap();
+    assert!(matches!(
+        index_base_inst.kind,
+        mir::instr::InstKind::HeapAlloc(_)
+    ));
+
+    let closure = find_function("value_capture");
+    assert!(
+        closure
+            .blocks
+            .iter()
+            .flat_map(|(_, block)| &block.insts)
+            .any(|inst| matches!(
+                &inst.kind,
+                mir::instr::InstKind::HeapAlloc(mir::types::Type::Ptr(ty))
+                    if matches!(ty.as_ref(), mir::types::Type::Struct(ty) if ty.name == "Data")
+            )),
+        "a value-captured aggregate must keep its referenced local alive"
+    );
+
+    let lambda = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| {
+            function.name.starts_with("__riddle_lambda_")
+                && matches!(
+                    &function.ret_type,
+                    mir::types::Type::Ref(ty, _)
+                        if matches!(ty.as_ref(), mir::types::Type::Struct(ty) if ty.name == "Data")
+                )
+        })
+        .unwrap();
+    assert!(
+        lambda
+            .blocks
+            .iter()
+            .flat_map(|(_, block)| &block.insts)
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+    );
+
+    let generic_caller = find_function("generic_before_param_ref");
+    let borrowed = generic_caller
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .find_map(|inst| match inst.kind {
+            mir::instr::InstKind::UnOp(mir::instr::UnOp::Ref, place) => Some(place),
+            _ => None,
+        })
+        .unwrap();
+    assert!(generic_caller.blocks.iter().any(|(_, block)| {
+        let index = borrowed
+            .0
+            .checked_sub(block.start_value)
+            .map(|index| index as usize);
+        index
+            .and_then(|index| block.insts.get(index))
+            .is_some_and(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+    }));
+}
+
+#[test]
+fn overloaded_operator_uses_parameter_escape_summary() {
+    let (_, type_result, _, module) = compile(
+        r#"
+        struct LeftData { value: i32 }
+        struct RightData { value: i32 }
+        struct Left { value: &LeftData }
+        struct Right { value: &RightData }
+
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Right) -> Self::Output;
+        }
+
+        impl Add for Left {
+            type Output = &RightData;
+
+            fun add(self, rhs: Right) -> Self::Output {
+                rhs.value
+            }
+        }
+
+        fun overloaded_add_ref() -> &RightData {
+            let left_data = LeftData { value: 1 };
+            let right_data = RightData { value: 2 };
+            let left = Left { value: &left_data };
+            let right = Right { value: &right_data };
+            left + right
+        }
+        "#,
+    );
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    assert_eq!(type_result.operator_calls.len(), 1);
+
+    let function = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "overloaded_add_ref")
+        .unwrap();
+    let allocated_structs = function
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter_map(|inst| match &inst.kind {
+            mir::instr::InstKind::HeapAlloc(mir::types::Type::Ptr(ty)) => match ty.as_ref() {
+                mir::types::Type::Struct(ty) => Some(ty.name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(allocated_structs, ["RightData"]);
+}
+
+#[test]
+fn pattern_bindings_preserve_reference_sources() {
+    let (_, type_result, _, module) = compile(
+        r#"
+        struct Data { value: i32 }
+        struct Holder { value: &Data }
+
+        fun match_pattern_ref() -> &Data {
+            let local = Data { value: 1 };
+            match &local {
+                value => value
+            }
+        }
+
+        fun for_pattern_ref(fallback: &Data) -> &Data {
+            let local = Data { value: 2 };
+            for item in [&local] {
+                return item;
+            }
+            fallback
+        }
+
+        fun shorthand_pattern_ref() -> &Data {
+            let local = Data { value: 3 };
+            let holder = Holder { value: &local };
+            match holder {
+                Holder { value } => value
+            }
+        }
+        "#,
+    );
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+
+    for name in [
+        "match_pattern_ref",
+        "for_pattern_ref",
+        "shorthand_pattern_ref",
+    ] {
+        let function = module
+            .function_order
+            .iter()
+            .map(|id| &module.functions[*id])
+            .find(|function| function.name == name)
+            .unwrap();
+        assert_eq!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|(_, block)| &block.insts)
+                .filter(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+                .count(),
+            1,
+            "{name} should heap-allocate the referenced local"
+        );
+    }
 }
 
 #[test]

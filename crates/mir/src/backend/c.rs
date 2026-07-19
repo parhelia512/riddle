@@ -20,6 +20,8 @@ pub struct CBackend {
     use_counts: HashMap<u32, u32>,
     /// Expression text for values inlined at use sites (no variable emitted).
     inline_of: HashMap<u32, String>,
+    /// Alloca values name their C storage directly, even when that storage holds a pointer.
+    direct_storage: HashSet<u32>,
     needs_gc: bool,
 }
 
@@ -63,6 +65,9 @@ impl CBackend {
     }
 
     fn is_indirect(&self, v: Value) -> bool {
+        if self.direct_storage.contains(&v.0) {
+            return false;
+        }
         self.ctypes
             .get(v.0 as usize)
             .map(|ct| ct.ends_with('*'))
@@ -301,6 +306,7 @@ impl CBackend {
         self.ctypes.clear();
         self.struct_types.clear();
         self.inline_of.clear();
+        self.direct_storage.clear();
         self.counter = 0;
         self.use_counts = count_uses(func);
 
@@ -452,6 +458,7 @@ impl CBackend {
                 let name = fresh_c(&mut self.counter, "a");
                 let ct = format!("{}{}", decl_pre, decl_suf);
                 self.set(v, name.clone(), ct);
+                self.direct_storage.insert(v.0);
                 writeln!(out, "  {} {}{}; // stack", decl_pre, name, decl_suf).unwrap();
             }
 
@@ -463,9 +470,26 @@ impl CBackend {
                     .get(ptr.0 as usize)
                     .map(|s| s.as_str())
                     .unwrap_or("");
+                let value_ct = self
+                    .ctypes
+                    .get(value.0 as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
                 if pt_ct.ends_with(']') {
                     // Array storage — C doesn't support array assignment, use memcpy
-                    writeln!(out, "  memcpy(&{}, &{}, sizeof({}));", pn, vn, pn).unwrap();
+                    writeln!(out, "  memcpy({}, {}, sizeof({}));", pn, vn, pt_ct).unwrap();
+                } else if value_ct.ends_with(']') {
+                    let destination = if self.is_indirect(*ptr) {
+                        pn
+                    } else {
+                        format!("&{}", pn)
+                    };
+                    writeln!(
+                        out,
+                        "  memcpy({}, {}, sizeof({}));",
+                        destination, vn, value_ct
+                    )
+                    .unwrap();
                 } else if self.is_indirect(*ptr) {
                     // ponytail: cancel *& when ptr is an inlined &-expression
                     if let Some(inner) = strip_addr_of(&pn) {
@@ -685,22 +709,39 @@ impl CBackend {
 
             InstKind::ArrayValue(elements) => {
                 let name = fresh_c(&mut self.counter, "arr");
-                let inner_ct = match &inst.ty {
-                    Type::Array(inner, _) => ctype_of(inner),
-                    _ => ctype_of(&inst.ty),
-                };
-                let ct = format!("{}[{}]", inner_ct, elements.len());
+                let (decl_pre, decl_suf) = c_decl_parts(&inst.ty);
+                let ct = format!("{}{}", decl_pre, decl_suf);
                 self.set(v, name.clone(), ct.clone());
-                let els: Vec<String> = elements.iter().map(|e| self.name(*e).to_owned()).collect();
-                writeln!(
-                    out,
-                    "  {} {}[{}] = {{ {} }};",
-                    inner_ct,
-                    name,
-                    elements.len(),
-                    els.join(", ")
-                )
-                .unwrap();
+                let nested = matches!(&inst.ty, Type::Array(inner, _) if matches!(inner.as_ref(), Type::Array(..)));
+                if nested {
+                    writeln!(out, "  {} {}{} = {{0}};", decl_pre, name, decl_suf).unwrap();
+                    for (index, element) in elements.iter().enumerate() {
+                        writeln!(
+                            out,
+                            "  memcpy({}[{}], {}, sizeof({}[{}]));",
+                            name,
+                            index,
+                            self.name(*element),
+                            name,
+                            index
+                        )
+                        .unwrap();
+                    }
+                } else {
+                    let values = elements
+                        .iter()
+                        .map(|element| self.name(*element).to_owned())
+                        .collect::<Vec<_>>();
+                    writeln!(
+                        out,
+                        "  {} {}{} = {{ {} }};",
+                        decl_pre,
+                        name,
+                        decl_suf,
+                        values.join(", ")
+                    )
+                    .unwrap();
+                }
             }
 
             InstKind::TupleValue(elements) => {
@@ -733,16 +774,19 @@ impl CBackend {
             InstKind::FieldPtr(base, index) => {
                 let ct = ctype_of(&inst.ty);
                 let base_name = self.name(*base).to_owned();
-                let field = self
+                let (field, field_ty) = self
                     .struct_types
                     .get(&base.0)
                     .and_then(|st| st.fields.get(*index))
-                    .map(|(fname, _)| sanitize(fname))
-                    .unwrap_or_else(|| format!("f{}", index));
-                let expr = format!(
-                    "(&{})",
-                    field_expr(&base_name, &field, self.is_indirect(*base))
-                );
+                    .map(|(fname, ty)| (sanitize(fname), Some(ty)))
+                    .unwrap_or_else(|| (format!("f{}", index), None));
+                let mut field = field_expr(&base_name, &field, self.is_indirect(*base));
+                let mut ty = field_ty;
+                while let Some(Type::Array(inner, _)) = ty {
+                    field.push_str("[0]");
+                    ty = Some(inner);
+                }
+                let expr = format!("(&{})", field);
                 if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
                     self.set_inline(v, expr, ct);
                 } else {
@@ -756,7 +800,21 @@ impl CBackend {
                 let ct = ctype_of(&inst.ty);
                 let base_name = self.name(*base).to_owned();
                 let index_name = self.name(*index).to_owned();
-                let expr = format!("(&{}[{}])", base_name, index_name);
+                let element = match &inst.ty {
+                    Type::Ptr(element) | Type::Ref(element, _) => element.as_ref(),
+                    _ => &Type::Unit,
+                };
+                let expr = if !self.is_indirect(*base) && matches!(element, Type::Array(..)) {
+                    format!("({}[{}])", base_name, index_name)
+                } else {
+                    let stride = array_leaf_count(element);
+                    let index = if stride == 1 {
+                        index_name
+                    } else {
+                        format!("(({}) * {})", index_name, stride)
+                    };
+                    format!("(&{}[{}])", base_name, index)
+                };
                 if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
                     self.set_inline(v, expr, ct);
                 } else {
@@ -1136,16 +1194,19 @@ fn ctype_of(ty: &Type) -> String {
         Type::Bool => "bool".into(),
         Type::Char => "char".into(),
         Type::Str => "riddle_str".into(),
-        Type::Ptr(inner) => format!("{}*", ctype_of(inner)),
+        Type::Ptr(inner) => pointer_ctype(inner),
         Type::Ref(inner, _) => {
             if !inner.is_sized() {
                 "riddle_str".into()
             } else {
-                format!("{}*", ctype_of(inner))
+                pointer_ctype(inner)
             }
         }
         Type::Struct(s) => s.name.clone(),
-        Type::Array(inner, len) => format!("{}[{}]", ctype_of(inner), len),
+        Type::Array(..) => {
+            let (prefix, suffix) = c_decl_parts(ty);
+            format!("{}{}", prefix, suffix)
+        }
         Type::Tuple(elems) => {
             let fields: Vec<String> = elems
                 .iter()
@@ -1157,6 +1218,21 @@ fn ctype_of(ty: &Type) -> String {
         Type::Enum(e) => format!("enum_{}", e.name),
         Type::FnPtr(signature) => fn_ptr_name(signature),
         Type::Unit | Type::Never | Type::Void => "void".into(),
+    }
+}
+
+fn pointer_ctype(inner: &Type) -> String {
+    let mut pointee = inner;
+    while let Type::Array(element, _) = pointee {
+        pointee = element;
+    }
+    format!("{}*", ctype_of(pointee))
+}
+
+fn array_leaf_count(ty: &Type) -> usize {
+    match ty {
+        Type::Array(inner, len) => len.saturating_mul(array_leaf_count(inner)),
+        _ => 1,
     }
 }
 
@@ -1263,12 +1339,12 @@ fn pointee_ct(ty: &Type) -> String {
 }
 
 /// Split a MIR type into C declaration parts: (prefix, suffix_after_var_name).
-/// e.g. Array(Array(Foo, 3), 4) → ("Foo", "[3][4]")
+/// e.g. Array(Array(Foo, 3), 4) → ("Foo", "[4][3]")
 fn c_decl_parts(ty: &Type) -> (String, String) {
     match ty {
         Type::Array(inner, len) => {
             let (pre, suf) = c_decl_parts(inner);
-            (pre, format!("{}[{}]", suf, len))
+            (pre, format!("[{}]{}", len, suf))
         }
         _ => (ctype_of(ty), String::new()),
     }
