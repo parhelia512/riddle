@@ -145,15 +145,46 @@ jobs:
           name: release-zip-${{ matrix.platform }}-${{ matrix.arch }}
           path: riddle-*.zip
 
+  package-editors:
+    name: Package editor integrations
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: 安装 JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: 打包编辑器扩展
+        run: bash editors/package.sh
+
+      - name: 上传编辑器扩展
+        uses: actions/upload-artifact@v4
+        with:
+          name: editor-packages
+          path: editors/dist/*
+
   release:
     name: Publish Release
-    needs: build
+    needs: [build, package-editors]
     runs-on: ubuntu-latest
     steps:
       - name: 下载全部平台 zip
         uses: actions/download-artifact@v4
         with:
-          pattern: release-zip-*
+          pattern: "{release-zip-*,editor-packages}"
           path: .
           merge-multiple: true
 
@@ -161,7 +192,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" riddle-*.zip \
+          gh release create "${{ github.ref_name }}" riddle-*.zip riddle-vscode.vsix \
             --repo "${{ github.repository }}" \
             --title "Riddle ${{ github.ref_name }}" \
             --generate-notes

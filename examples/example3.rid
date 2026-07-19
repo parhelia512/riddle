@@ -3,8 +3,6 @@ use std::String;
 struct Foo{}
 
 fun main(){
-    let a = 1;
-    let b = 2;
-    let c = String::new();
-    let d = c.;
+    let mut a: Vector<i32> = Vector::new();
+    a.push(1);
 }
