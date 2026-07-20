@@ -238,7 +238,25 @@ fn reports_uninferred_generic_function_type_arg() {
 
 #[test]
 fn reports_growing_generic_recursion() {
-    let result = check(include_str!("../../examples/generic_wrap_recursion.rid"));
+    let result = check(
+        r#"
+        struct Wrap<T> {
+            inner: T,
+        }
+
+        fun f<T>(x: T) -> T {
+            return g(Wrap { inner: x });
+        }
+
+        fun g<T>(x: T) -> T {
+            return f(Wrap { inner: x });
+        }
+
+        fun main() -> i32 {
+            return f(0i32);
+        }
+        "#,
+    );
 
     assert!(result.diagnostics.iter().any(|diag| {
         diag.message

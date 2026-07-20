@@ -4,7 +4,7 @@
 
 # Riddle
 
-Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.1.0` 提供类型检查、move checker、逃逸分析、内置标准库、C 后端、项目工具和 LSP。
+Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.1.1` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。
 
 当前版本是技术预览：语言和工具链仍可能发生不兼容变化。教程与已实现能力见 [The Riddle Book](https://riddle-lang.github.io/docs/)。
 

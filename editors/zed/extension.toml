@@ -1,7 +1,7 @@
 id = "riddle"
 name = "Riddle"
 description = "Riddle language support."
-version = "0.1.0"
+version = "0.1.1"
 schema_version = 1
 authors = ["Riddle contributors"]
 repository = "https://github.com/riddle-lang/riddle"

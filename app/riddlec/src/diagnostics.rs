@@ -279,10 +279,10 @@ fn annotate_source<'a>(
     secondary_color: &str,
     reset: &str,
 ) -> (String, usize) {
-    let mut line_labels: std::collections::BTreeMap<
-        usize,
-        Vec<(usize, Option<usize>, &'a str, bool)>,
-    > = std::collections::BTreeMap::new();
+    type LineLabel<'a> = (usize, Option<usize>, &'a str, bool);
+
+    let mut line_labels: std::collections::BTreeMap<usize, Vec<LineLabel<'a>>> =
+        std::collections::BTreeMap::new();
 
     for label in labels {
         let (trim_start, trim_end) = trim_range(source, label.range.start(), label.range.end());

@@ -77,6 +77,8 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -99,7 +101,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          cargo test --workspace --target ${{ matrix.target }} 2>&1 | tee test.log
+          cargo test --workspace --locked --target ${{ matrix.target }} 2>&1 | tee test.log
           STATUS=${PIPESTATUS[0]}
           if [ "$STATUS" -ne 0 ]; then
             DETAILS=$(tail -n 80 test.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk '{printf "%s%%0A", $0}')
@@ -108,7 +110,7 @@ jobs:
           fi
 
       - name: Release 构建
-        run: cargo build --workspace --release --target ${{ matrix.target }}
+        run: cargo build --workspace --locked --release --target ${{ matrix.target }}
 
       - name: 打包平台构建产物
         shell: bash

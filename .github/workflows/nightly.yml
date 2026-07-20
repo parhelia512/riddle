@@ -111,6 +111,8 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -130,10 +132,10 @@ jobs:
 
       - name: 运行测试（仅原生目标）
         if: matrix.cross != true
-        run: cargo test --workspace --target ${{ matrix.target }}
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
 
       - name: Release 构建
-        run: cargo build --workspace --release --target ${{ matrix.target }}
+        run: cargo build --workspace --locked --release --target ${{ matrix.target }}
 
       - name: 打包平台构建产物
         shell: bash
