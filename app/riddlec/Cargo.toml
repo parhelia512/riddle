@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ast = { path = "../../crates/ast" }
+clap = { version = "4.6.1", features = ["derive"] }
 escape-analysis = { path = "../../crates/escape-analysis" }
 frontend = { path = "../../crates/frontend" }
 hir = { path = "../../crates/hir" }

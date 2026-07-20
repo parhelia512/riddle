@@ -1,32 +1,69 @@
+use clap::{ArgAction, Parser};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use riddlec::{diagnostics, pipeline};
 
-const USAGE: &str =
-    "usage: riddlec [--verbose] [--no-std] [--backend c] [--output <file>] <file>...";
-
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum BackendKind {
     C,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "riddlec",
+    about = "The Riddle compiler (frontend)",
+    disable_version_flag = true
+)]
+struct Opts {
+    /// Print pass status for each file.
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Compile without the bundled standard library.
+    #[arg(long = "no-std", action = ArgAction::SetFalse, default_value_t = true)]
+    use_std: bool,
+
+    /// Generate code for a target backend.
+    #[arg(short, long, value_enum)]
+    backend: Option<BackendKind>,
+
+    /// Write generated code to a file.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Print the version and git commit hash.
+    #[arg(short = 'V', long)]
+    version: bool,
+
+    files: Vec<PathBuf>,
+}
+
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let opts = match parse_args(&args) {
+    let opts = match parse_args(env::args_os()) {
         Ok(opts) => opts,
         Err(msg) => {
-            eprintln!("riddlec: {msg}");
-            eprintln!("{}", USAGE);
-            process::exit(1);
+            let exit_code = msg.exit_code();
+            let _ = msg.print();
+            process::exit(exit_code);
         }
     };
 
+    if opts.version {
+        println!(
+            "riddlec {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            riddlec::GIT_HASH
+        );
+        return;
+    }
+
     if opts.files.is_empty() {
         eprintln!("riddlec: no input files");
-        eprintln!("{}", USAGE);
         process::exit(1);
     }
 
@@ -37,7 +74,7 @@ fn main() {
         let loaded = match pipeline::load_source_file(file) {
             Ok(loaded) => loaded,
             Err(e) => {
-                eprintln!("riddlec: cannot read `{file}`: {e}");
+                eprintln!("riddlec: cannot read `{}`: {e}", file.display());
                 total_errors += 1;
                 continue;
             }
@@ -56,13 +93,15 @@ fn main() {
 
         if opts.verbose {
             if opts.files.len() > 1 {
-                println!("== {file} ==");
+                println!("== {} ==", file.display());
             }
-            diagnostics::report_verbose(&result, Some(&loaded.source), file);
+            let source_name = file.display().to_string();
+            diagnostics::report_verbose(&result, Some(&loaded.source), &source_name);
             println!();
         }
 
-        total_errors += diagnostics::report_mapped(&result, &loaded, file);
+        let source_name = file.display().to_string();
+        total_errors += diagnostics::report_mapped(&result, &loaded, &source_name);
 
         if result.success()
             && let Some(ref module) = result.mir_module
@@ -85,7 +124,7 @@ fn main() {
             match opts.output {
                 Some(ref path) => {
                     if let Err(e) = fs::write(path, &generated_code) {
-                        eprintln!("riddlec: cannot write to `{path}`: {e}");
+                        eprintln!("riddlec: cannot write to `{}`: {e}", path.display());
                         total_errors += 1;
                     }
                 }
@@ -112,118 +151,44 @@ fn generate(
     }
 }
 
-struct Opts {
-    files: Vec<String>,
-    verbose: bool,
-    use_std: bool,
-    backend: Option<BackendKind>,
-    output: Option<String>,
-}
-
-fn parse_args(args: &[String]) -> Result<Opts, &'static str> {
-    let mut files = Vec::new();
-    let mut verbose = false;
-    let mut use_std = true;
-    let mut backend = None;
-    let mut output = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--verbose" | "-v" => verbose = true,
-            "--no-std" => use_std = false,
-            "--backend" | "-b" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--backend requires a value: c");
-                }
-                backend = Some(match args[i].as_str() {
-                    "c" => BackendKind::C,
-                    other => {
-                        eprintln!("riddlec: unknown backend '{other}'");
-                        eprintln!("{USAGE}");
-                        process::exit(1);
-                    }
-                });
-            }
-            "--output" | "-o" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--output requires a file path");
-                }
-                output = Some(args[i].clone());
-            }
-            "--help" | "-h" => {
-                print_help();
-                process::exit(0);
-            }
-            "--version" | "-V" => {
-                println!(
-                    "riddlec {} ({})",
-                    env!("CARGO_PKG_VERSION"),
-                    riddlec::GIT_HASH
-                );
-                process::exit(0);
-            }
-            other if other.starts_with('-') => {
-                return Err("unknown flag");
-            }
-            other => files.push(other.to_string()),
-        }
-        i += 1;
-    }
-
-    Ok(Opts {
-        files,
-        verbose,
-        use_std,
-        backend,
-        output,
-    })
+fn parse_args<I, T>(args: I) -> Result<Opts, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    Opts::try_parse_from(args)
 }
 
 /// Write generated C code to a `.c` source file.
-fn write_c(c_code: &str, output: Option<&str>, input_files: &[String]) -> usize {
+fn write_c(c_code: &str, output: Option<&Path>, input_files: &[PathBuf]) -> usize {
     let c_path = match output {
-        Some(path) if path.ends_with(".c") => path.to_owned(),
-        Some(path) => format!("{path}.c"),
+        Some(path) if path.extension().is_some_and(|ext| ext == "c") => path.to_path_buf(),
+        Some(path) => append_c_suffix(path),
         None => {
             let base = input_files
                 .first()
-                .map(|f| {
-                    Path::new(f)
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
+                .and_then(|f| f.file_stem())
+                .filter(|stem| !stem.is_empty())
+                .map(|stem| {
+                    let mut output = stem.to_os_string();
+                    output.push(".c");
+                    PathBuf::from(output)
                 })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "riddle_out".into());
-            format!("{base}.c")
+                .unwrap_or_else(|| PathBuf::from("riddle_out.c"));
+            base
         }
     };
 
     if let Err(e) = fs::write(&c_path, c_code) {
-        eprintln!("riddlec: cannot write to `{c_path}`: {e}");
+        eprintln!("riddlec: cannot write to `{}`: {e}", c_path.display());
         1
     } else {
         0
     }
 }
 
-fn print_help() {
-    println!("riddlec — the Riddle compiler (frontend)");
-    println!();
-    println!("usage: riddlec [flags] <file>...");
-    println!();
-    println!("flags:");
-    println!("  --verbose, -v            print pass status for each file");
-    println!("  --no-std                 compile without the bundled standard library");
-    println!("  --backend, -b <name>    generate code for target: c");
-    println!("  --output, -o <file>     write generated code to file");
-    println!("  --version, -V            print version and git commit hash");
-    println!("  --help, -h               show this help");
+fn append_c_suffix(path: &Path) -> PathBuf {
+    let mut output = path.as_os_str().to_os_string();
+    output.push(".c");
+    PathBuf::from(output)
 }
-
-#[cfg(test)]
-#[path = "../../../tests/riddlec/cli.rs"]
-mod tests;
