@@ -51,14 +51,31 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
     let build_dir = root.join(".clue").join("build");
     fs::create_dir_all(&build_dir)?;
     let c_path = build_dir.join(format!("{}.c", analysis.package_name));
+    let custom_runtime_path = analysis.runtime_source.as_ref().map(|path| root.join(path));
+    let runtime_source = if compiler.is_some() {
+        Some(match &custom_runtime_path {
+            Some(path) => fs::read_to_string(path)
+                .with_context(|| format!("failed to read runtime source `{}`", path.display()))?,
+            None => gc::RUNTIME_C.to_owned(),
+        })
+    } else {
+        None
+    };
+    let runtime_path = compiler.as_ref().map(|_| {
+        custom_runtime_path
+            .clone()
+            .unwrap_or_else(|| build_dir.join(format!("{}.runtime.c", analysis.package_name)))
+    });
     let hash_path = build_dir.join(format!("{}.hash", analysis.package_name));
     let hash = fingerprint(
         &analysis.manifest_fingerprint,
         &analysis.source.source,
+        runtime_source.as_deref(),
         compiler.as_ref(),
     );
-    let source_is_fresh =
-        c_path.is_file() && fs::read_to_string(&hash_path).unwrap_or_default() == hash;
+    let source_is_fresh = c_path.is_file()
+        && runtime_path.as_ref().is_none_or(|path| path.is_file())
+        && fs::read_to_string(&hash_path).unwrap_or_default() == hash;
 
     if !source_is_fresh {
         let module = analysis
@@ -68,6 +85,11 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
             .context("successful compilation did not produce MIR")?;
         let c_code = pipeline::generate_c(module).map_err(anyhow::Error::msg)?;
         fs::write(&c_path, c_code)?;
+        if analysis.runtime_source.is_none()
+            && let (Some(path), Some(source)) = (&runtime_path, &runtime_source)
+        {
+            fs::write(path, source)?;
+        }
     }
 
     let Some(compiler) = compiler else {
@@ -86,16 +108,30 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
         return Ok(BuildArtifact::Executable(executable));
     }
 
-    compiler.compile(&c_path, &executable)?;
+    compiler.compile(
+        &[
+            c_path.as_path(),
+            runtime_path
+                .as_deref()
+                .context("binary build did not select a runtime")?,
+        ],
+        &executable,
+    )?;
     fs::write(&hash_path, hash)?;
     println!("clue: built {}", executable.display());
     Ok(BuildArtifact::Executable(executable))
 }
 
-fn fingerprint(manifest: &str, source: &str, compiler: Option<&CCompiler>) -> String {
+fn fingerprint(
+    manifest: &str,
+    source: &str,
+    runtime: Option<&str>,
+    compiler: Option<&CCompiler>,
+) -> String {
     let mut hasher = DefaultHasher::new();
     manifest.hash(&mut hasher);
     source.hash(&mut hasher);
+    runtime.hash(&mut hasher);
     riddlec::GIT_HASH.hash(&mut hasher);
     env::consts::OS.hash(&mut hasher);
     env::consts::ARCH.hash(&mut hasher);
@@ -149,24 +185,21 @@ impl CCompiler {
         command.output().is_ok_and(|output| output.status.success())
     }
 
-    fn compile(&self, c_path: &Path, executable: &Path) -> anyhow::Result<()> {
+    fn compile(&self, sources: &[&Path], executable: &Path) -> anyhow::Result<()> {
         let mut command = Command::new(&self.program);
         match self.flavor {
             Flavor::Unix => {
-                command
-                    .args(["-std=c11", "-O2"])
-                    .arg(c_path)
-                    .arg("-o")
-                    .arg(executable);
+                command.args(["-std=c11", "-O2"]);
+                command.args(sources).arg("-o").arg(executable);
             }
             Flavor::Msvc => {
+                command.args(["/nologo", "/std:c11", "/O2"]);
                 command
-                    .args(["/nologo", "/std:c11", "/O2"])
-                    .arg(c_path)
-                    .arg(format!("/Fe{}", executable.display()))
-                    .arg(format!("/Fo{}", executable.with_extension("obj").display()));
+                    .args(sources)
+                    .arg(format!("/Fe{}", executable.display()));
             }
         }
+        command.current_dir(executable.parent().unwrap_or_else(|| Path::new(".")));
         let status = command.status().with_context(|| {
             format!(
                 "failed to run C compiler `{}`",

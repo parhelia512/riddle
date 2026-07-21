@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 escape-analysis = { path = "../escape-analysis" }
-gc = { path = "../gc" }
 hir = { path = "../hir" }
 la-arena = "0.3"
 type-checker = { path = "../type-checker" }

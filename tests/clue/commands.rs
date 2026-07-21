@@ -81,6 +81,7 @@ fn init_creates_a_buildable_binary_project() {
         String::from_utf8_lossy(&build.stderr)
     );
     assert!(project.join(".clue/build/hello.c").is_file());
+    assert!(project.join(".clue/build/hello.runtime.c").is_file());
     assert!(
         project
             .join(if cfg!(windows) {
@@ -190,7 +191,10 @@ fun main() -> i32 {
     let source = project.join(".clue/build/app.c");
     let generated = fs::read_to_string(&source).unwrap();
     assert!(generated.contains("rgc_alloc"));
-    assert!(!generated.contains("GC_MALLOC") && !generated.contains("<gc.h>"));
+    assert!(!generated.contains("struct RgcHeader"));
+    let runtime = fs::read_to_string(project.join(".clue/build/app.runtime.c")).unwrap();
+    assert!(runtime.contains("struct RgcHeader"));
+    assert!(!runtime.contains("GC_MALLOC") && !runtime.contains("<gc.h>"));
 
     let executable = project.join(if cfg!(windows) {
         ".clue/build/app.exe"
@@ -203,6 +207,142 @@ fun main() -> i32 {
         run.status.success(),
         "native program exited with {}",
         run.status
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn custom_runtime_replaces_the_default_and_invalidates_the_build_cache() {
+    if c_compiler().is_none() {
+        eprintln!("skipping custom runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("custom-runtime");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let project = root.join("app");
+    fs::create_dir_all(project.join("runtime")).unwrap();
+    let runtime_path = project.join("runtime/custom.c");
+    let runtime = r#"#include <stddef.h>
+#include <stdlib.h>
+
+static size_t custom_allocations = 0;
+
+void rgc_init(void *stack_bottom) { (void)stack_bottom; }
+
+void *rgc_alloc(size_t size) {
+    void *pointer = malloc(size ? size : 1);
+    if (!pointer) abort();
+    custom_allocations += 1;
+    return pointer;
+}
+
+void rgc_collect(void) {}
+
+size_t custom_allocation_count(void) { return custom_allocations; }
+"#;
+    fs::write(&runtime_path, runtime).unwrap();
+    let manifest_path = project.join("Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\nsource = \"runtime/custom.c\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/main.rid"),
+        r#"struct Data { value: i32 }
+
+unsafe extern "C" {
+    safe fun custom_allocation_count() -> usize;
+}
+
+fun escaped() -> &Data {
+    let value = Data { value: 42 };
+    &value
+}
+
+fun main() -> i32 {
+    let value = escaped();
+    if (*value).value == 42 && custom_allocation_count() > 0 { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let build = clue(&["build", "app"], &root);
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(!project.join(".clue/build/app.runtime.c").exists());
+    let generated = fs::read_to_string(project.join(".clue/build/app.c")).unwrap();
+    assert!(generated.contains("void *rgc_alloc(size_t size);"));
+    assert!(!generated.contains("struct RgcHeader"));
+    let executable = project.join(if cfg!(windows) {
+        ".clue/build/app.exe"
+    } else {
+        ".clue/build/app"
+    });
+    let run = Command::new(&executable).output().unwrap();
+    assert!(
+        run.status.success(),
+        "native program exited with {}",
+        run.status
+    );
+
+    let fresh = clue(&["build", "app"], &root);
+    assert!(String::from_utf8_lossy(&fresh.stdout).contains("clue: fresh"));
+    fs::write(&runtime_path, format!("{runtime}\n")).unwrap();
+    let rebuilt = clue(&["build", "app"], &root);
+    assert!(rebuilt.status.success());
+    assert!(String::from_utf8_lossy(&rebuilt.stdout).contains("clue: built"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn runtime_source_must_exist() {
+    let root = temp_root("missing-runtime");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let manifest_path = root.join("app/Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\nsource = \"missing.c\"\n"),
+    )
+    .unwrap();
+
+    let check = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(!check.status.success());
+    assert!(
+        stderr.contains("runtime source") && stderr.contains("does not exist"),
+        "{stderr}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn library_packages_cannot_select_a_runtime() {
+    let root = temp_root("library-runtime");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "library", "--lib"], &root).status.success());
+    let manifest_path = root.join("library/Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\nsource = \"runtime.c\"\n"),
+    )
+    .unwrap();
+
+    let check = clue(&["check", "library"], &root);
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(!check.status.success());
+    assert!(
+        stderr.contains("only supported for binary packages"),
+        "{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }

@@ -15,6 +15,7 @@ pub struct ProjectAnalysis {
     pub source: riddlec::pipeline::LoadedSource,
     pub result: riddlec::pipeline::CompileResult,
     pub kind: ProjectKind,
+    runtime_source: Option<PathBuf>,
     package_name: String,
     manifest_fingerprint: String,
 }
@@ -68,6 +69,7 @@ pub fn check_project_with_session(
         source: package.source,
         result,
         kind: package.kind,
+        runtime_source: package.runtime_source,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
     })
@@ -90,6 +92,7 @@ fn analyze_project_impl(
         source: package.source,
         result,
         kind: package.kind,
+        runtime_source: package.runtime_source,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
     })

@@ -281,7 +281,7 @@ fn c_heap_alloc() {
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    // GC promotion: escaping local -> bundled Riddle GC.
+    // GC promotion: escaping local -> runtime allocation ABI.
     assert!(
         result.contains("rgc_alloc"),
         "missing rgc_alloc: {}",
@@ -289,12 +289,14 @@ fn c_heap_alloc() {
     );
     assert!(
         result.contains("void rgc_collect(void)"),
-        "missing bundled GC runtime: {}",
+        "missing runtime ABI declaration: {}",
         result
     );
     assert!(
-        !result.contains("GC_MALLOC") && !result.contains("#include <gc.h>"),
-        "Boehm GC should not be emitted: {}",
+        !result.contains("struct RgcHeader")
+            && !result.contains("GC_MALLOC")
+            && !result.contains("#include <gc.h>"),
+        "runtime implementation should not be emitted by the backend: {}",
         result
     );
 }

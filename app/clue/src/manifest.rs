@@ -45,6 +45,7 @@ pub struct Manifest {
     pub name: String,
     pub entry: PathBuf,
     pub kind: ProjectKind,
+    pub runtime_source: Option<PathBuf>,
     pub fingerprint: String,
     pub dependencies: Vec<Dependency>,
 }
@@ -83,14 +84,37 @@ pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
             format!("entry file `{}` does not exist", entry.display()),
         ));
     }
+    let runtime_source = runtime_source(root, &value, kind)?;
 
     Ok(Manifest {
         name,
         entry,
         kind,
+        runtime_source,
         fingerprint: value.to_string(),
         dependencies: dependencies(&value)?,
     })
+}
+
+fn runtime_source(root: &Path, value: &Value, kind: ProjectKind) -> io::Result<Option<PathBuf>> {
+    let Some(runtime) = table(value, "runtime") else {
+        return Ok(None);
+    };
+    if kind == ProjectKind::Library {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "[runtime] is only supported for binary packages",
+        ));
+    }
+    let source = PathBuf::from(string_field(runtime, "source", "runtime")?);
+    let resolved = root.join(&source);
+    if !resolved.is_file() {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!("runtime source `{}` does not exist", resolved.display()),
+        ));
+    }
+    Ok(Some(source))
 }
 
 pub(crate) fn validate_package_name(name: &str) -> anyhow::Result<()> {

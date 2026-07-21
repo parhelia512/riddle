@@ -29,6 +29,17 @@ Binary builds use `CC` when set, then try `cc`, `gcc`, `clang`, `clang-cl`, and
 `cl`. Library builds keep the generated `.clue/build/<package>.c` without linking
 an executable.
 
+Binary packages use the bundled GC by default. A package can replace it with one
+C source file implementing `rgc_init`, `rgc_alloc`, and `rgc_collect`:
+
+```toml
+[runtime]
+source = "runtime/custom_gc.c"
+```
+
+Runtime selection belongs to the final binary package; library packages cannot
+declare `[runtime]`.
+
 ## Library API
 
 The crate exposes project operations plus project analysis for tools such as the LSP:
