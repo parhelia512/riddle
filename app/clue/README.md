@@ -25,9 +25,11 @@ Diagnostics from external modules and path dependencies point to their original
 source files. The Riddle LSP uses the same project loader, includes unsaved files,
 and refreshes diagnostics for every open document after a change.
 
-Binary builds use `CC` when set, then try `cc`, `gcc`, `clang`, `clang-cl`, and
-`cl`. Library builds keep the generated `.clue/build/<package>.c` without linking
-an executable.
+Binary builds strictly use `CC` when set. Otherwise Clue tries `cc`, `gcc`,
+`clang`, version-suffixed GCC/Clang executables, and, on Windows, `clang-cl` and
+`cl`. A candidate must compile and link a C11 probe. Its resolved path and version
+participate in the build fingerprint. Library builds keep the generated
+`.clue/build/<package>.c` without linking an executable.
 
 Binary packages use the bundled GC by default. A package can replace it with one
 C source file implementing `rgc_init`, `rgc_alloc`, and `rgc_collect`:

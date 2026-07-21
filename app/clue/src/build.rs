@@ -25,6 +25,7 @@ enum Flavor {
 struct CCompiler {
     program: OsString,
     flavor: Flavor,
+    version: Vec<u8>,
 }
 
 pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
@@ -43,13 +44,13 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
         bail!("build failed");
     }
 
+    let build_dir = root.join(".clue").join("build");
+    fs::create_dir_all(&build_dir)?;
     let compiler = if analysis.kind == ProjectKind::Binary {
-        Some(CCompiler::detect()?)
+        Some(CCompiler::detect(&build_dir)?)
     } else {
         None
     };
-    let build_dir = root.join(".clue").join("build");
-    fs::create_dir_all(&build_dir)?;
     let c_path = build_dir.join(format!("{}.c", analysis.package_name));
     let custom_runtime_path = analysis.runtime_source.as_ref().map(|path| root.join(path));
     let runtime_source = if compiler.is_some() {
@@ -138,6 +139,7 @@ fn fingerprint(
     if let Some(compiler) = compiler {
         compiler.program.hash(&mut hasher);
         compiler.flavor.hash(&mut hasher);
+        compiler.version.hash(&mut hasher);
     }
     format!("{:016x}", hasher.finish())
 }
@@ -151,41 +153,119 @@ fn executable_path(c_path: &Path) -> PathBuf {
 }
 
 impl CCompiler {
-    fn detect() -> anyhow::Result<Self> {
-        let mut programs = Vec::new();
+    fn detect(build_dir: &Path) -> anyhow::Result<Self> {
         if let Some(program) = env::var_os("CC") {
-            programs.push(program);
+            let compiler = Self::new(program.clone()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "C compiler from CC `{}` could not report its version",
+                    program.to_string_lossy()
+                )
+            })?;
+            if compiler.probe(build_dir) {
+                return Ok(compiler);
+            }
+            bail!(
+                "C compiler from CC `{}` cannot compile and link C11",
+                program.to_string_lossy()
+            );
         }
-        programs.extend(["cc", "gcc", "clang"].into_iter().map(OsString::from));
+
+        let mut programs = ["cc", "gcc", "clang"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
         if cfg!(windows) {
             programs.extend(["clang-cl", "cl"].into_iter().map(OsString::from));
         }
+        programs.extend(versioned_compilers());
+        let tried = programs
+            .iter()
+            .map(|program| program.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ");
         programs
             .into_iter()
-            .map(Self::new)
-            .find(Self::probe)
+            .filter_map(Self::new)
+            .find(|compiler| compiler.probe(build_dir))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no C compiler found; set CC or install cc, gcc, clang, clang-cl, or cl"
+                    "no usable C11 compiler and linker found; tried {tried}; set CC to a compiler executable"
                 )
             })
     }
 
-    fn new(program: OsString) -> Self {
+    fn new(program: OsString) -> Option<Self> {
+        let program = resolve_program(&program);
         let flavor = flavor_for(&program);
-        Self { program, flavor }
+        let output = Command::new(&program)
+            .arg(match flavor {
+                Flavor::Unix => "--version",
+                Flavor::Msvc => "/?",
+            })
+            .output()
+            .ok()?;
+        let mut version = output.stdout;
+        version.extend(output.stderr);
+        (!version.is_empty()).then_some(Self {
+            program,
+            flavor,
+            version,
+        })
     }
 
-    fn probe(&self) -> bool {
-        let mut command = Command::new(&self.program);
-        command.arg(match self.flavor {
-            Flavor::Unix => "--version",
-            Flavor::Msvc => "/?",
-        });
-        command.output().is_ok_and(|output| output.status.success())
+    fn probe(&self, build_dir: &Path) -> bool {
+        let identity = self.identity();
+        let stamp = build_dir.join(format!(".cc-{identity:016x}"));
+        if stamp.is_file() {
+            return true;
+        }
+
+        let source = build_dir.join(format!(".cc-{identity:016x}.c"));
+        let executable = executable_path(&source);
+        if fs::write(&source, "int main(void) { return 0; }\n").is_err() {
+            return false;
+        }
+        let success = self
+            .command(&[source.as_path()], &executable)
+            .output()
+            .is_ok_and(|output| output.status.success() && executable.is_file());
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&executable);
+        let _ = fs::remove_file(source.with_extension("obj"));
+        if success {
+            let _ = fs::write(stamp, b"c11\n");
+        }
+        success
+    }
+
+    fn identity(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.program.hash(&mut hasher);
+        self.flavor.hash(&mut hasher);
+        self.version.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn compile(&self, sources: &[&Path], executable: &Path) -> anyhow::Result<()> {
+        let status = self
+            .command(sources, executable)
+            .status()
+            .with_context(|| {
+                format!(
+                    "failed to run C compiler `{}`",
+                    self.program.to_string_lossy()
+                )
+            })?;
+        if !status.success() {
+            bail!(
+                "C compiler `{}` exited with {status}",
+                self.program.to_string_lossy()
+            );
+        }
+        Ok(())
+    }
+
+    fn command(&self, sources: &[&Path], executable: &Path) -> Command {
         let mut command = Command::new(&self.program);
         match self.flavor {
             Flavor::Unix => {
@@ -200,20 +280,82 @@ impl CCompiler {
             }
         }
         command.current_dir(executable.parent().unwrap_or_else(|| Path::new(".")));
-        let status = command.status().with_context(|| {
-            format!(
-                "failed to run C compiler `{}`",
-                self.program.to_string_lossy()
-            )
-        })?;
-        if !status.success() {
-            bail!(
-                "C compiler `{}` exited with {status}",
-                self.program.to_string_lossy()
-            );
-        }
-        Ok(())
+        command
     }
+}
+
+fn resolve_program(program: &OsStr) -> OsString {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .into_os_string();
+    }
+    let Some(search_path) = env::var_os("PATH") else {
+        return program.to_owned();
+    };
+    for directory in env::split_paths(&search_path) {
+        let direct = directory.join(path);
+        if direct.is_file() {
+            return fs::canonicalize(&direct).unwrap_or(direct).into_os_string();
+        }
+        if cfg!(windows) {
+            let executable = directory.join(format!("{}.exe", program.to_string_lossy()));
+            if executable.is_file() {
+                return fs::canonicalize(&executable)
+                    .unwrap_or(executable)
+                    .into_os_string();
+            }
+        }
+    }
+    program.to_owned()
+}
+
+fn versioned_compilers() -> Vec<OsString> {
+    let Some(path) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let mut programs = env::split_paths(&path)
+        .enumerate()
+        .flat_map(|(path_index, directory)| {
+            fs::read_dir(directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(move |entry| {
+                    let version = versioned_compiler_name(&entry.file_name())?;
+                    entry
+                        .path()
+                        .is_file()
+                        .then_some((version, path_index, entry.path()))
+                })
+        })
+        .collect::<Vec<_>>();
+    programs.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+    programs
+        .into_iter()
+        .map(|(_, _, path)| path.into_os_string())
+        .collect()
+}
+
+fn versioned_compiler_name(name: &OsStr) -> Option<Vec<u32>> {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    let version = ["clang-cl-", "clang-", "gcc-"]
+        .into_iter()
+        .find_map(|prefix| name.strip_prefix(prefix))?;
+    (!version.is_empty() && version.chars().all(|ch| ch.is_ascii_digit() || ch == '.')).then(|| {
+        version
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect()
+    })
 }
 
 fn flavor_for(program: &OsStr) -> Flavor {
@@ -223,8 +365,36 @@ fn flavor_for(program: &OsStr) -> Flavor {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    match name.as_str() {
-        "cl" | "cl.exe" | "clang-cl" | "clang-cl.exe" => Flavor::Msvc,
-        _ => Flavor::Unix,
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    if name == "cl" || name == "clang-cl" || name.starts_with("clang-cl-") {
+        Flavor::Msvc
+    } else {
+        Flavor::Unix
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_versioned_compiler_names_and_flavors() {
+        assert_eq!(
+            versioned_compiler_name(OsStr::new("clang-18.1.exe")),
+            Some(vec![18, 1])
+        );
+        assert_eq!(
+            versioned_compiler_name(OsStr::new("gcc-13")),
+            Some(vec![13])
+        );
+        assert_eq!(
+            versioned_compiler_name(OsStr::new("clang-cl-19")),
+            Some(vec![19])
+        );
+        assert_eq!(versioned_compiler_name(OsStr::new("gcc-helper")), None);
+        assert!(matches!(
+            flavor_for(OsStr::new("C:\\LLVM\\clang-cl-18.exe")),
+            Flavor::Msvc
+        ));
     }
 }

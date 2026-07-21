@@ -48,7 +48,7 @@ clue build
 clue run
 ```
 
-`clue build` 会保留 `.clue/build/hello.c`，并调用 `CC` 或系统中的 `cc`、`gcc`、`clang` 生成同目录下的本机可执行文件。`clue run` 会先完成相同构建，再运行该程序。
+`clue build` 会保留 `.clue/build/hello.c`。设置 `CC` 时 Clue 会严格使用它；否则自动寻找系统中的 `cc`、`gcc`、`clang` 及其版本化命令，Windows 还支持 `clang-cl` 和 `cl`。候选必须能完成 C11 编译和链接。`clue run` 会先完成相同构建，再运行该程序。
 
 ## 许可证
 

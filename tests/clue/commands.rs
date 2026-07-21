@@ -23,6 +23,15 @@ fn clue(args: &[&str], root: &Path) -> Output {
         .unwrap()
 }
 
+fn clue_with_cc(args: &[&str], root: &Path, cc: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_clue"))
+        .args(args)
+        .current_dir(root)
+        .env("CC", cc)
+        .output()
+        .unwrap()
+}
+
 fn c_compiler() -> Option<OsString> {
     std::env::var_os("CC")
         .into_iter()
@@ -95,6 +104,23 @@ fn init_creates_a_buildable_binary_project() {
     let fresh = clue(&["build", "hello"], &root);
     assert!(fresh.status.success());
     assert!(String::from_utf8_lossy(&fresh.stdout).contains("clue: fresh"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_cc_is_strict_and_reports_an_unusable_compiler() {
+    let root = temp_root("invalid-cc");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+
+    let missing = root.join("missing-cc");
+    let build = clue_with_cc(&["build", "app"], &root, &missing);
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(!build.status.success());
+    assert!(
+        stderr.contains("C compiler from CC") && stderr.contains("could not report its version"),
+        "{stderr}"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
