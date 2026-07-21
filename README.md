@@ -2,7 +2,11 @@
   <img src="resources/logo.svg" alt="Riddle" width="180">
 </p>
 
-# Riddle
+<h1 align="center">Riddle</h1>
+
+<h3 align="center">
+    <a href="README-en.md">English</a> | <a href="README.md">中文</a>
+</h3>
 
 Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.1.1` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。
 
