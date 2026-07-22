@@ -5,4 +5,4 @@ edition.workspace = true
 
 [dependencies]
 logos = "0.16"
-rowan = "0.15"
+rowan = "0.16.1"

@@ -267,9 +267,16 @@ pub struct FieldPat {
     pub pat: Option<PatId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PatternBindingId {
+    pub pattern: PatId,
+    pub field: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ResolvedName {
     Local(StmtId),
+    PatternBinding(PatternBindingId),
     Param(usize),
     LambdaParam { lambda: ExprId, index: usize },
     Function(FunctionId),

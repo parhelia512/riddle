@@ -89,6 +89,17 @@ fn init_creates_a_buildable_binary_project() {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
+    assert!(
+        !String::from_utf8_lossy(&build.stdout)
+            .to_ascii_lowercase()
+            .contains("warning")
+            && !String::from_utf8_lossy(&build.stderr)
+                .to_ascii_lowercase()
+                .contains("warning"),
+        "unexpected compiler warning:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
     assert!(project.join(".clue/build/hello.c").is_file());
     assert!(project.join(".clue/build/hello.runtime.c").is_file());
     assert!(
@@ -176,6 +187,34 @@ fun nested(base: i32) -> fun(i32) -> fun(i32) -> i32 {
     }
 }
 
+fun match_capture() -> i32 {
+    let read = match 42 { value => fun() { value } };
+    read()
+}
+
+fun shadowed_pattern_capture() -> i32 {
+    match 1 {
+        value => {
+            let outer = fun() { value };
+            match 2 {
+                value => {
+                    let inner = fun() { value };
+                    outer() + inner()
+                }
+            }
+        }
+    }
+}
+
+fun for_capture() -> i32 {
+    let mut total = 0;
+    for value in [1, 2, 3] {
+        let read = fun() { value };
+        total += read();
+    }
+    total
+}
+
 fun main() -> i32 {
     let first = escaped(42);
     rgc_collect();
@@ -199,7 +238,8 @@ fun main() -> i32 {
     let inner = outer(20);
     if (*first).value == 42 && (*second).value == 7 && while_sum == 8 && for_sum == 8
         && add(2) == 42 && mutable_capture() == 3 && value_capture() == 7
-        && inner(12) == 42 {
+        && inner(12) == 42 && match_capture() == 42
+        && shadowed_pattern_capture() == 3 && for_capture() == 6 {
         0
     } else {
         1
@@ -549,6 +589,10 @@ fn standard_library_basics_compile_and_run() {
     let value: Option<i32> = Some(2);
     let error: Result<i32, bool> = Err(true);
     let text: &str = "abc";
+    print("value=");
+    print(-42);
+    print(",zero=");
+    print(0);
     if value.is_some() && value.unwrap_or(0) == 2
         && error.is_err() && error.err().is_some()
         && text.len() == 3usize && text.byte_at(1usize).unwrap_or(0u8) == 98u8
@@ -569,6 +613,7 @@ fn standard_library_basics_compile_and_run() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.stdout.ends_with(b"value=-42,zero=0"));
     let _ = fs::remove_dir_all(root);
 }
 

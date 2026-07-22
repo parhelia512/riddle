@@ -60,7 +60,7 @@ pub struct Dependency {
 pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
     let manifest_path = root.join(CLUE_PROJECT_FILE_NAME);
     let text = fs::read_to_string(&manifest_path)?;
-    let value = text.parse::<Value>().map_err(|error| {
+    let value = text.parse::<Table>().map(Value::Table).map_err(|error| {
         Error::new(
             ErrorKind::InvalidData,
             format!("invalid `{}`: {error}", manifest_path.display()),

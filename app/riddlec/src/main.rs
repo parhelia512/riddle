@@ -164,19 +164,16 @@ fn write_c(c_code: &str, output: Option<&Path>, input_files: &[PathBuf]) -> usiz
     let c_path = match output {
         Some(path) if path.extension().is_some_and(|ext| ext == "c") => path.to_path_buf(),
         Some(path) => append_c_suffix(path),
-        None => {
-            let base = input_files
-                .first()
-                .and_then(|f| f.file_stem())
-                .filter(|stem| !stem.is_empty())
-                .map(|stem| {
-                    let mut output = stem.to_os_string();
-                    output.push(".c");
-                    PathBuf::from(output)
-                })
-                .unwrap_or_else(|| PathBuf::from("riddle_out.c"));
-            base
-        }
+        None => input_files
+            .first()
+            .and_then(|f| f.file_stem())
+            .filter(|stem| !stem.is_empty())
+            .map(|stem| {
+                let mut output = stem.to_os_string();
+                output.push(".c");
+                PathBuf::from(output)
+            })
+            .unwrap_or_else(|| PathBuf::from("riddle_out.c")),
     };
 
     if let Err(e) = fs::write(&c_path, c_code) {

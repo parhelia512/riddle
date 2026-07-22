@@ -342,3 +342,20 @@ fn lowers_and_resolves_anonymous_function_parameters() {
         }
     )));
 }
+
+#[test]
+fn resolves_pattern_bindings_for_closure_capture() {
+    let (mut hir, sg) = build_hir_and_graph(
+        "fun main() -> i32 { match 1 { value => { let read = fun() { value }; read() } } }",
+    );
+    resolve_hir(&mut hir, &sg);
+
+    let body = &hir.bodies[*hir.function_bodies.values().next().unwrap()];
+    assert!(body.exprs.iter().any(|(_, expr)| matches!(
+        expr,
+        Expr::Path {
+            resolved: Some(ResolvedName::PatternBinding(_)),
+            ..
+        }
+    )));
+}

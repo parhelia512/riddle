@@ -1174,11 +1174,12 @@ fn all_reference_forms_promote_their_source_local() {
         }
 
         fun consume_holder(holder: Holder) -> i32 { holder.value.value }
+        fun read_holder(holder: &Holder) -> i32 { holder.value.value }
 
         fun value_capture() -> fun() -> i32 {
             let local = Data { value: 1 };
             let holder = Holder { value: &local };
-            fun() { consume_holder(holder) }
+            fun() { read_holder(&holder) }
         }
 
         fun lambda_param_ref() -> fun(Data) -> &Data {

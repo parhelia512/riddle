@@ -6,7 +6,7 @@ use hir::{
     HirFile,
     body::{
         BinaryOp as HirBinOp, Body, BodyId, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern,
-        ResolvedName, Stmt, StmtId, UnaryOp as HirUnOp,
+        PatternBindingId, ResolvedName, Stmt, StmtId, UnaryOp as HirUnOp,
     },
 };
 use type_checker::{CaptureMode, CaptureSource, LambdaInfo, TypeCheckResult};
@@ -136,7 +136,7 @@ struct LowerCtx<'a> {
     /// StmtIds backed by storage rather than a direct SSA value.
     storage_bindings: HashSet<StmtId>,
     parameter_storage: HashMap<CaptureSource, Value>,
-    pattern_bindings: Vec<HashMap<String, Value>>,
+    pattern_bindings: Vec<HashMap<PatternBindingId, PatternBindingValue>>,
     generic_subst: HashMap<String, Type>,
     generic_tc_subst: HashMap<String, type_checker::Type>,
     generic_const_subst: HashMap<String, usize>,
@@ -154,6 +154,23 @@ struct LowerCtx<'a> {
 struct CaptureAccess {
     place: Value,
     ty: Type,
+}
+
+#[derive(Clone)]
+struct PatternBindingValue {
+    value: Value,
+    ty: Type,
+    place: Option<Value>,
+}
+
+impl PatternBindingValue {
+    fn direct(value: Value, ty: Type) -> Self {
+        Self {
+            value,
+            ty,
+            place: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -469,6 +486,9 @@ impl<'a> LowerCtx<'a> {
                     value
                 }
             }
+            CaptureSource::Pattern(id) => self
+                .pattern_binding_value(builder, *id)
+                .unwrap_or_else(|| builder.unit_const()),
             CaptureSource::Param(index) => self
                 .parameter_storage
                 .get(&CaptureSource::Param(*index))
@@ -505,6 +525,11 @@ impl<'a> LowerCtx<'a> {
             && let Some(place) = self.scope_map.get(stmt)
         {
             return *place;
+        }
+        if let CaptureSource::Pattern(id) = source
+            && let Some(place) = self.pattern_binding_place(builder, *id)
+        {
+            return place;
         }
         if let CaptureSource::Param(index) = source
             && let Some(place) = self.parameter_storage.get(&CaptureSource::Param(*index))
@@ -689,6 +714,15 @@ impl<'a> LowerCtx<'a> {
                         builder.unit_const()
                     }
                 }
+                Some(ResolvedName::PatternBinding(id)) => {
+                    let source = CaptureSource::Pattern(*id);
+                    if let Some(access) = self.capture_access.get(&source).cloned() {
+                        builder.load(access.place, access.ty)
+                    } else {
+                        self.pattern_binding_value(builder, *id)
+                            .unwrap_or_else(|| builder.unit_const())
+                    }
+                }
                 Some(ResolvedName::Function(fid)) => {
                     self.lower_function_value(builder, *fid, &mir_type)
                 }
@@ -701,7 +735,6 @@ impl<'a> LowerCtx<'a> {
                         self.generic_const_subst
                             .get(&name.0)
                             .map(|value| builder.iconst(*value as i128, IntTy::Usize))
-                            .or_else(|| self.pattern_binding(&name.0))
                     })
                     .unwrap_or_else(|| builder.unit_const()),
             },
@@ -1149,8 +1182,8 @@ impl<'a> LowerCtx<'a> {
 
             builder.switch_to_block(body_block);
             let item_ptr = builder.index_ptr(iterable_value, current, item_ty.clone());
-            let item = builder.load(item_ptr, item_ty);
-            self.push_pattern_binding(body, pat, item);
+            let item = builder.load(item_ptr, item_ty.clone());
+            self.push_pattern_binding(body, pat, item, item_ty);
             self.loop_targets.push(LoopTargets {
                 break_block: exit_block,
                 continue_block: step_block,
@@ -1195,7 +1228,7 @@ impl<'a> LowerCtx<'a> {
         builder.set_cond_branch(keep_going, body_block, exit_block);
 
         builder.switch_to_block(body_block);
-        self.push_pattern_binding(body, pat, current);
+        self.push_pattern_binding(body, pat, current, i32_ty.clone());
         self.loop_targets.push(LoopTargets {
             break_block: exit_block,
             continue_block: step_block,
@@ -1311,8 +1344,8 @@ impl<'a> LowerCtx<'a> {
         };
         let payload_index =
             1 + self.enum_payload_offset(&self.hir.item_tree.enums[option_id], info.some_variant);
-        let item = builder.extract_value(next_value, payload_index, item_ty);
-        self.push_pattern_binding(body, pat, item);
+        let item = builder.extract_value(next_value, payload_index, item_ty.clone());
+        self.push_pattern_binding(body, pat, item, item_ty);
         self.loop_targets.push(LoopTargets {
             break_block: exit_block,
             continue_block: cond_block,
@@ -1393,7 +1426,6 @@ impl<'a> LowerCtx<'a> {
         builder.switch_to_block(merge_block);
         match phi_args.len() {
             0 => builder.unit_const(),
-            1 => phi_args[0].0,
             _ => {
                 let phi = Inst::new(InstKind::Phi(phi_args), result_ty);
                 builder.func.push_inst(merge_block, phi)
@@ -1630,7 +1662,7 @@ impl<'a> LowerCtx<'a> {
         pat: PatId,
         value: Value,
         value_ty: &type_checker::Type,
-        scope: &mut HashMap<String, Value>,
+        scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
     ) {
         match body.pats[pat].clone() {
             Pattern::Binding { name } => {
@@ -1638,7 +1670,13 @@ impl<'a> LowerCtx<'a> {
                     self.classify_type_pattern(value_ty, Some(&name.0)),
                     TypePattern::EnumVariant { .. }
                 ) {
-                    scope.insert(name.0, value);
+                    scope.insert(
+                        PatternBindingId {
+                            pattern: pat,
+                            field: None,
+                        },
+                        PatternBindingValue::direct(value, self.convert_type(value_ty)),
+                    );
                 }
             }
             Pattern::Tuple { elements } => {
@@ -1696,7 +1734,7 @@ impl<'a> LowerCtx<'a> {
             Pattern::Struct { path, fields } => {
                 if let type_checker::Type::Struct(struct_id, args) = value_ty {
                     let field_types = self.struct_pattern_field_types(*struct_id, args);
-                    for field in fields {
+                    for (binding_index, field) in fields.into_iter().enumerate() {
                         let Some((index, (_, child_ty))) = field_types
                             .iter()
                             .enumerate()
@@ -1716,7 +1754,16 @@ impl<'a> LowerCtx<'a> {
                                 scope,
                             );
                         } else {
-                            scope.insert(field.name.0, child_value);
+                            scope.insert(
+                                PatternBindingId {
+                                    pattern: pat,
+                                    field: Some(binding_index),
+                                },
+                                PatternBindingValue::direct(
+                                    child_value,
+                                    self.convert_type(child_ty),
+                                ),
+                            );
                         }
                     }
                     return;
@@ -1733,7 +1780,7 @@ impl<'a> LowerCtx<'a> {
                 let payloads = self.enum_variant_payload_types(enum_id, &args, variant_index);
                 let offset =
                     self.enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
-                for field in fields {
+                for (binding_index, field) in fields.into_iter().enumerate() {
                     let Some((index, (_, child_ty))) = payloads
                         .iter()
                         .enumerate()
@@ -1756,7 +1803,13 @@ impl<'a> LowerCtx<'a> {
                             scope,
                         );
                     } else {
-                        scope.insert(field.name.0, child_value);
+                        scope.insert(
+                            PatternBindingId {
+                                pattern: pat,
+                                field: Some(binding_index),
+                            },
+                            PatternBindingValue::direct(child_value, self.convert_type(child_ty)),
+                        );
                     }
                 }
             }
@@ -1950,6 +2003,7 @@ impl<'a> LowerCtx<'a> {
                 ret,
             } => type_checker::Type::Fn {
                 is_unsafe: *is_unsafe,
+                kind: type_checker::ClosureKind::Fn,
                 params: params
                     .iter()
                     .map(|param| self.lower_hir_type_for_pattern(param, subst))
@@ -1997,17 +2051,51 @@ impl<'a> LowerCtx<'a> {
             .sum()
     }
 
-    fn pattern_binding(&self, name: &str) -> Option<Value> {
-        self.pattern_bindings
+    fn pattern_binding_value(
+        &mut self,
+        builder: &mut Builder,
+        id: PatternBindingId,
+    ) -> Option<Value> {
+        let binding = self
+            .pattern_bindings
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).copied())
+            .find_map(|scope| scope.get(&id).cloned())?;
+        Some(match binding.place {
+            Some(place) => builder.load(place, binding.ty),
+            None => binding.value,
+        })
     }
 
-    fn push_pattern_binding(&mut self, body: &Body, pat: PatId, value: Value) {
+    fn pattern_binding_place(
+        &mut self,
+        builder: &mut Builder,
+        id: PatternBindingId,
+    ) -> Option<Value> {
+        let binding = self
+            .pattern_bindings
+            .iter_mut()
+            .rev()
+            .find_map(|scope| scope.get_mut(&id))?;
+        if let Some(place) = binding.place {
+            return Some(place);
+        }
+        let place = builder.heap_alloc(binding.ty.clone());
+        builder.store(binding.value, place);
+        binding.place = Some(place);
+        Some(place)
+    }
+
+    fn push_pattern_binding(&mut self, body: &Body, pat: PatId, value: Value, ty: Type) {
         let mut scope = HashMap::new();
-        if let Pattern::Binding { name } = &body.pats[pat] {
-            scope.insert(name.0.clone(), value);
+        if matches!(body.pats[pat], Pattern::Binding { .. }) {
+            scope.insert(
+                PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                },
+                PatternBindingValue::direct(value, ty),
+            );
         }
         self.pattern_bindings.push(scope);
     }
@@ -2244,6 +2332,14 @@ impl<'a> LowerCtx<'a> {
                                 .flatten()
                         })
                         .unwrap_or_else(|| builder.unit_const())
+                }
+                Some(ResolvedName::PatternBinding(id)) => {
+                    if let Some(access) = self.capture_access.get(&CaptureSource::Pattern(*id)) {
+                        access.place
+                    } else {
+                        self.pattern_binding_place(builder, *id)
+                            .unwrap_or_else(|| builder.unit_const())
+                    }
                 }
                 _ => builder.unit_const(),
             },

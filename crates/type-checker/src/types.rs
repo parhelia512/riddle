@@ -29,6 +29,7 @@ pub enum Type {
     Function(FunctionId),
     Fn {
         is_unsafe: bool,
+        kind: ClosureKind,
         params: Vec<Type>,
         ret: Box<Type>,
     },
@@ -67,6 +68,30 @@ pub enum FloatTy {
     F32,
     F64,
     F128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureKind {
+    Fn,
+    FnMut,
+    FnOnce,
+}
+
+impl ClosureKind {
+    pub(crate) fn accepts(self, actual: Self) -> bool {
+        matches!(
+            (self, actual),
+            (Self::FnOnce, _) | (Self::FnMut, Self::Fn | Self::FnMut) | (Self::Fn, Self::Fn)
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fn => "Fn",
+            Self::FnMut => "FnMut",
+            Self::FnOnce => "FnOnce",
+        }
+    }
 }
 
 impl Type {
@@ -131,6 +156,7 @@ impl Type {
             }
             Type::Fn {
                 is_unsafe,
+                kind,
                 params,
                 ret,
             } => {
@@ -140,7 +166,12 @@ impl Type {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let prefix = if *is_unsafe { "unsafe " } else { "" };
-                format!("{prefix}fun({params}) -> {}", ret.display(hir))
+                let capability = match kind {
+                    ClosureKind::Fn => "",
+                    ClosureKind::FnMut => "FnMut ",
+                    ClosureKind::FnOnce => "FnOnce ",
+                };
+                format!("{capability}{prefix}fun({params}) -> {}", ret.display(hir))
             }
             Type::InferVar(_) => "_".to_string(),
             Type::Param(name) => name.clone(),
@@ -224,11 +255,23 @@ impl Type {
                 | Type::Ref(_, false)
                 | Type::Ptr { .. }
                 | Type::Function(_)
-                | Type::Fn { .. }
                 | Type::InferVar(_)
                 | Type::Unknown
                 | Type::Error
+        ) || matches!(
+            self,
+            Type::Fn {
+                kind: ClosureKind::Fn,
+                ..
+            }
         )
+    }
+
+    pub fn closure_kind(&self) -> Option<ClosureKind> {
+        match self {
+            Type::Fn { kind, .. } => Some(*kind),
+            _ => None,
+        }
     }
 
     pub(crate) fn or(self, fallback: Type) -> Type {

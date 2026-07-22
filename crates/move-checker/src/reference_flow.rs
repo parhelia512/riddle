@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use hir::{
     HirFile,
     body::{
-        BinaryOp, Body, BodyId, Expr, ExprId, PatId, Pattern, ResolvedName, Stmt, StmtId, UnaryOp,
+        BinaryOp, Body, BodyId, Expr, ExprId, PatId, Pattern, PatternBindingId, ResolvedName, Stmt,
+        StmtId, UnaryOp,
     },
     item_tree::FunctionId,
 };
@@ -106,7 +107,7 @@ struct SummaryAnalyzer<'a> {
     body_id: BodyId,
     body: &'a Body,
     locals: HashMap<StmtId, FlowValue>,
-    pattern_sources: Vec<HashMap<String, FlowValue>>,
+    pattern_sources: Vec<HashMap<PatternBindingId, FlowValue>>,
     returned: FlowValue,
 }
 
@@ -152,19 +153,16 @@ impl<'a> SummaryAnalyzer<'a> {
             | Expr::CharLiteral { .. }
             | Expr::BoolLiteral { .. } => FlowValue::default(),
 
-            Expr::Path { path, resolved } => match resolved {
+            Expr::Path { resolved, .. } => match resolved {
                 Some(ResolvedName::Param(index)) => FlowValue::from_param(*index),
                 Some(ResolvedName::Local(stmt)) => {
                     self.locals.get(stmt).cloned().unwrap_or_default()
                 }
-                Some(ResolvedName::Unresolved) | None => path
-                    .as_single_name()
-                    .and_then(|name| {
-                        self.pattern_sources
-                            .iter()
-                            .rev()
-                            .find_map(|scope| scope.get(&name.0).cloned())
-                    })
+                Some(ResolvedName::PatternBinding(id)) => self
+                    .pattern_sources
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(id).cloned())
                     .unwrap_or_default(),
                 _ => FlowValue::default(),
             },
@@ -304,6 +302,13 @@ impl<'a> SummaryAnalyzer<'a> {
                             CaptureSource::Param(index) => {
                                 result.merge(FlowValue::from_param(index));
                             }
+                            CaptureSource::Pattern(id) => result.merge(
+                                self.pattern_sources
+                                    .iter()
+                                    .rev()
+                                    .find_map(|scope| scope.get(&id).cloned())
+                                    .unwrap_or_default(),
+                            ),
                             CaptureSource::LambdaParam { .. } => result.opaque = true,
                         }
                     }
@@ -412,14 +417,14 @@ impl<'a> SummaryAnalyzer<'a> {
                 resolved: Some(ResolvedName::Local(stmt)),
                 ..
             } => self.locals.get(stmt).cloned().unwrap_or_default(),
-            Expr::Path { path, .. } => path
-                .as_single_name()
-                .and_then(|name| {
-                    self.pattern_sources
-                        .iter()
-                        .rev()
-                        .find_map(|scope| scope.get(&name.0).cloned())
-                })
+            Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                ..
+            } => self
+                .pattern_sources
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(id).cloned())
                 .unwrap_or_default(),
             Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
                 self.place_value(*base)
@@ -453,14 +458,10 @@ impl<'a> SummaryAnalyzer<'a> {
     }
 
     fn push_pattern_sources(&mut self, pat: PatId, value: &FlowValue) {
-        let mut names = HashSet::new();
-        collect_pattern_bindings(self.body, pat, &mut names);
-        self.pattern_sources.push(
-            names
-                .into_iter()
-                .map(|name| (name, value.clone()))
-                .collect(),
-        );
+        let mut bindings = HashSet::new();
+        collect_pattern_bindings(self.body, pat, &mut bindings);
+        self.pattern_sources
+            .push(bindings.into_iter().map(|id| (id, value.clone())).collect());
     }
 }
 
@@ -477,22 +478,28 @@ impl OpaqueReference for FlowValue {
     }
 }
 
-fn collect_pattern_bindings(body: &Body, pat: PatId, names: &mut HashSet<String>) {
+fn collect_pattern_bindings(body: &Body, pat: PatId, bindings: &mut HashSet<PatternBindingId>) {
     match &body.pats[pat] {
-        Pattern::Binding { name } => {
-            names.insert(name.0.clone());
+        Pattern::Binding { .. } => {
+            bindings.insert(PatternBindingId {
+                pattern: pat,
+                field: None,
+            });
         }
         Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
             for element in elements {
-                collect_pattern_bindings(body, *element, names);
+                collect_pattern_bindings(body, *element, bindings);
             }
         }
         Pattern::Struct { fields, .. } => {
-            for field in fields {
-                if let Some(pat) = field.pat {
-                    collect_pattern_bindings(body, pat, names);
+            for (index, field) in fields.iter().enumerate() {
+                if let Some(field_pat) = field.pat {
+                    collect_pattern_bindings(body, field_pat, bindings);
                 } else {
-                    names.insert(field.name.0.clone());
+                    bindings.insert(PatternBindingId {
+                        pattern: pat,
+                        field: Some(index),
+                    });
                 }
             }
         }

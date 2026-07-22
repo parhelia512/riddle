@@ -1079,6 +1079,66 @@ fn once_closure_cannot_be_called_twice() {
 }
 
 #[test]
+fn once_closure_stays_once_after_branch_join() {
+    let result = analyze(
+        r#"
+        struct Token { value: i32 }
+        fun consume(value: Token) {}
+
+        fun main() {
+            let left = Token { value: 1 };
+            let right = Token { value: 2 };
+            let once = if true {
+                fun() { consume(left); }
+            } else {
+                fun() { consume(right); }
+            };
+            once();
+            once();
+        }
+        "#,
+    );
+
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|message| message.contains("use of moved value") && message.contains("once"))
+    );
+}
+
+#[test]
+fn shared_pattern_capture_blocks_later_move() {
+    let result = analyze(
+        r#"
+        struct Token { value: i32 }
+        fun consume(value: Token) {}
+        fun inspect(value: &Token) -> i32 { value.value }
+
+        fun main() {
+            let source = Token { value: 1 };
+            match source {
+                token => {
+                    let read = fun() { inspect(&token) };
+                    consume(token);
+                    read();
+                }
+            }
+        }
+        "#,
+    );
+
+    let diagnostics = messages(&result);
+    assert!(
+        diagnostics.iter().any(|message| {
+            message.contains("cannot move")
+                && message.contains("token")
+                && message.contains("borrowed")
+        }),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
 fn shared_capture_blocks_assignment_while_closure_is_live() {
     let result = analyze(
         r#"

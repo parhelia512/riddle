@@ -5,4 +5,4 @@ edition.workspace = true
 
 [dependencies]
 frontend = { path = "../frontend" }
-rowan = "0.15"
+rowan = "0.16.1"

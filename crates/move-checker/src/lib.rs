@@ -4,7 +4,10 @@ use rowan::TextRange;
 
 use hir::{
     HirFile,
-    body::{Body, BodyId, Expr, ExprId, ResolvedName, SourceMap, Stmt, StmtId, UnaryOp},
+    body::{
+        Body, BodyId, Expr, ExprId, PatternBindingId, ResolvedName, SourceMap, Stmt, StmtId,
+        UnaryOp,
+    },
     item_tree::{FunctionId, HirTypeRef},
     place::Place,
 };
@@ -38,6 +41,7 @@ impl BorrowKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AccessRoot {
     Local(StmtId),
+    Pattern(PatternBindingId),
     Param(usize),
     LambdaParam { lambda: ExprId, index: usize },
 }
@@ -417,9 +421,10 @@ impl<'a> Analyzer<'a> {
                 }
                 if self
                     .type_result
-                    .closure_kinds
+                    .expr_types
                     .get(&(ctx.body_id, *callee))
-                    .is_some_and(|kind| *kind == ClosureKind::FnOnce)
+                    .and_then(Type::closure_kind)
+                    == Some(ClosureKind::FnOnce)
                 {
                     self.consume_if_local(ctx, *callee);
                 }
@@ -540,15 +545,32 @@ impl<'a> Analyzer<'a> {
                 .get(&(ctx.body_id, expr_id))
                 .cloned()
                 .unwrap_or(Type::Unknown);
-            let closure_kind = self.type_result.closure_kinds.get(&(ctx.body_id, expr_id));
+            let closure_kind = self
+                .type_result
+                .expr_types
+                .get(&(ctx.body_id, expr_id))
+                .and_then(Type::closure_kind);
             if !self.trait_env.type_is_copy(&ty)
                 || matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
             {
+                let access_place = resolved.as_ref().and_then(access_place_from_resolved_name);
+                if access_place
+                    .as_ref()
+                    .is_some_and(|place| self.has_any_access_borrow(ctx, place))
+                {
+                    self.diag(
+                        format!("cannot move `{}` while borrowed", name.0),
+                        ctx.expr_range(expr_id),
+                        "E0304",
+                    );
+                    return;
+                }
                 ctx.bindings.mark_moved(&name.0);
                 // Record move site for secondary label.
                 let span = ctx.expr_range(expr_id);
                 if let Some(ResolvedName::Local(stmt)) = resolved {
                     let p = Place::root(*stmt);
+                    ctx.moved_places.insert(p.clone());
                     ctx.moved_sites.insert(p, (span, "value moved here".into()));
                 }
             }
@@ -564,7 +586,11 @@ impl<'a> Analyzer<'a> {
             .get(&(ctx.body_id, expr_id))
             .cloned()
             .unwrap_or(Type::Unknown);
-        let closure_kind = self.type_result.closure_kinds.get(&(ctx.body_id, expr_id));
+        let closure_kind = self
+            .type_result
+            .expr_types
+            .get(&(ctx.body_id, expr_id))
+            .and_then(Type::closure_kind);
         if self.trait_env.type_is_copy(&ty)
             && !matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
         {
@@ -596,11 +622,14 @@ impl<'a> Analyzer<'a> {
                 );
                 continue;
             }
-            let place = match capture.source {
+            let move_place = match capture.source {
                 CaptureSource::Local(stmt) => Some(Place::root(stmt)),
-                CaptureSource::Param(_) | CaptureSource::LambdaParam { .. } => None,
+                CaptureSource::Pattern(_)
+                | CaptureSource::Param(_)
+                | CaptureSource::LambdaParam { .. } => None,
             };
-            if let Some(place) = &place
+            let access_place = access_place_from_capture_source(&capture.source);
+            if let Some(place) = &move_place
                 && ctx
                     .moved_places
                     .iter()
@@ -618,69 +647,52 @@ impl<'a> Analyzer<'a> {
 
             match capture.mode {
                 CaptureMode::Shared => {
-                    if let Some(place) = place {
-                        if self.has_mut_borrow(ctx, &place) {
-                            self.diag(
-                                format!(
-                                    "cannot capture `{}` by shared reference while mutably borrowed",
-                                    capture.name
-                                ),
-                                span,
-                                "E0301",
-                            );
-                        } else {
-                            ctx.new_loan(
-                                access_place_from_move_place(&place),
-                                BorrowKind::Shared,
-                                span,
-                                false,
-                            );
-                        }
+                    if self.has_mut_access_borrow(ctx, &access_place) {
+                        self.diag(
+                            format!(
+                                "cannot capture `{}` by shared reference while mutably borrowed",
+                                capture.name
+                            ),
+                            span,
+                            "E0301",
+                        );
+                    } else {
+                        ctx.new_loan(access_place.clone(), BorrowKind::Shared, span, false);
                     }
                 }
                 CaptureMode::Mutable => {
-                    if let Some(place) = place {
-                        if self.has_shared_borrow(ctx, &place) {
-                            self.diag(
-                                format!(
-                                    "cannot capture `{}` mutably while shared-borrowed",
-                                    capture.name
-                                ),
-                                span,
-                                "E0300",
-                            );
-                        } else if self.has_mut_borrow(ctx, &place) {
-                            self.diag(
-                                format!("cannot capture `{}` mutably more than once", capture.name),
-                                span,
-                                "E0302",
-                            );
-                        } else {
-                            ctx.new_loan(
-                                access_place_from_move_place(&place),
-                                BorrowKind::Mutable,
-                                span,
-                                false,
-                            );
-                        }
+                    if self.has_shared_access_borrow(ctx, &access_place) {
+                        self.diag(
+                            format!(
+                                "cannot capture `{}` mutably while shared-borrowed",
+                                capture.name
+                            ),
+                            span,
+                            "E0300",
+                        );
+                    } else if self.has_mut_access_borrow(ctx, &access_place) {
+                        self.diag(
+                            format!("cannot capture `{}` mutably more than once", capture.name),
+                            span,
+                            "E0302",
+                        );
+                    } else {
+                        ctx.new_loan(access_place.clone(), BorrowKind::Mutable, span, false);
                     }
                 }
                 CaptureMode::Value => {
                     if self.trait_env.type_is_copy(&capture.ty) {
                         continue;
                     }
-                    if let Some(place) = place {
-                        if self.has_any_borrow(ctx, &place) {
-                            self.diag(
-                                format!(
-                                    "cannot move `{}` into closure while borrowed",
-                                    capture.name
-                                ),
-                                span,
-                                "E0304",
-                            );
-                            continue;
-                        }
+                    if self.has_any_access_borrow(ctx, &access_place) {
+                        self.diag(
+                            format!("cannot move `{}` into closure while borrowed", capture.name),
+                            span,
+                            "E0304",
+                        );
+                        continue;
+                    }
+                    if let Some(place) = move_place {
                         ctx.moved_places.insert(place.clone());
                         ctx.moved_sites
                             .insert(place, (span, "value moved into closure here".into()));
@@ -752,9 +764,13 @@ impl<'a> Analyzer<'a> {
 
     fn has_any_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
         let place = access_place_from_move_place(place);
+        self.has_any_access_borrow(ctx, &place)
+    }
+
+    fn has_any_access_borrow(&self, ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
         ctx.loans
             .values()
-            .any(|loan| loan.active && access_places_overlap(&loan.place, &place))
+            .any(|loan| loan.active && access_places_overlap(&loan.place, place))
     }
 
     fn access_targets(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Vec<AccessTarget> {
@@ -764,6 +780,13 @@ impl<'a> Analyzer<'a> {
                 ..
             } => vec![AccessTarget {
                 place: AccessPlace::new(AccessRoot::Local(*stmt)),
+                parents: HashSet::new(),
+            }],
+            Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                ..
+            } => vec![AccessTarget {
+                place: AccessPlace::new(AccessRoot::Pattern(*id)),
                 parents: HashSet::new(),
             }],
             Expr::Path {
@@ -1113,21 +1136,19 @@ impl<'a> Analyzer<'a> {
         true
     }
 
-    fn has_shared_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
-        let place = access_place_from_move_place(place);
+    fn has_shared_access_borrow(&self, ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
         ctx.loans.values().any(|loan| {
             loan.active
                 && loan.kind == BorrowKind::Shared
-                && access_places_overlap(&loan.place, &place)
+                && access_places_overlap(&loan.place, place)
         })
     }
 
-    fn has_mut_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
-        let place = access_place_from_move_place(place);
+    fn has_mut_access_borrow(&self, ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
         ctx.loans.values().any(|loan| {
             loan.active
                 && loan.kind == BorrowKind::Mutable
-                && access_places_overlap(&loan.place, &place)
+                && access_places_overlap(&loan.place, place)
         })
     }
 
@@ -1505,6 +1526,33 @@ fn access_place_from_move_place(place: &Place) -> AccessPlace {
         };
     }
     result
+}
+
+fn access_place_from_resolved_name(name: &ResolvedName) -> Option<AccessPlace> {
+    let root = match name {
+        ResolvedName::Local(stmt) => AccessRoot::Local(*stmt),
+        ResolvedName::PatternBinding(id) => AccessRoot::Pattern(*id),
+        ResolvedName::Param(index) => AccessRoot::Param(*index),
+        ResolvedName::LambdaParam { lambda, index } => AccessRoot::LambdaParam {
+            lambda: *lambda,
+            index: *index,
+        },
+        _ => return None,
+    };
+    Some(AccessPlace::new(root))
+}
+
+fn access_place_from_capture_source(source: &CaptureSource) -> AccessPlace {
+    let root = match source {
+        CaptureSource::Local(stmt) => AccessRoot::Local(*stmt),
+        CaptureSource::Pattern(id) => AccessRoot::Pattern(*id),
+        CaptureSource::Param(index) => AccessRoot::Param(*index),
+        CaptureSource::LambdaParam { lambda, index } => AccessRoot::LambdaParam {
+            lambda: *lambda,
+            index: *index,
+        },
+    };
+    AccessPlace::new(root)
 }
 
 fn hir_ref_kind(ty: &HirTypeRef) -> Option<BorrowKind> {

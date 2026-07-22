@@ -1,15 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
 use hir::{
-    body::{Body, BodyId, ExprId, SourceMap, StmtId},
+    body::{Body, BodyId, ExprId, PatternBindingId, SourceMap, StmtId},
     item_tree::{FunctionId, HirFunction},
 };
 use rowan::TextRange;
 
-use crate::{
-    result::{ClosureKind, LambdaCapture},
-    types::Type,
-};
+use crate::{result::LambdaCapture, types::Type};
 
 pub(crate) struct BodyCtx<'a> {
     pub(crate) body_id: BodyId,
@@ -19,7 +16,6 @@ pub(crate) struct BodyCtx<'a> {
     pub(crate) return_ty: Type,
     pub(crate) generic_params: HashMap<String, Type>,
     pub(crate) locals: HashMap<StmtId, (Type, bool)>,
-    pub(crate) local_closures: HashMap<StmtId, ClosureKind>,
     pub(crate) bindings: ScopedBindings,
     pub(crate) loop_depth: usize,
     pub(crate) unsafe_depth: usize,
@@ -44,7 +40,6 @@ impl<'a> BodyCtx<'a> {
             return_ty,
             generic_params,
             locals: HashMap::new(),
-            local_closures: HashMap::new(),
             bindings: ScopedBindings::default(),
             loop_depth: 0,
             unsafe_depth: 0,
@@ -78,14 +73,14 @@ pub(crate) struct LambdaCtx {
     pub(crate) expr: ExprId,
     pub(crate) params: Vec<Type>,
     pub(crate) outer_locals: HashSet<StmtId>,
-    pub(crate) binding_depth: usize,
+    pub(crate) outer_patterns: HashSet<PatternBindingId>,
     pub(crate) captures: Vec<LambdaCapture>,
 }
 
 /// Scoped name → type bindings (from `match` patterns, `if let`, etc.).
 #[derive(Debug, Default)]
 pub(crate) struct ScopedBindings {
-    scopes: Vec<HashMap<String, Type>>,
+    scopes: Vec<HashMap<String, (Type, PatternBindingId)>>,
 }
 
 impl ScopedBindings {
@@ -97,27 +92,24 @@ impl ScopedBindings {
         self.scopes.pop();
     }
 
-    pub(crate) fn insert(&mut self, name: String, ty: Type) {
+    pub(crate) fn insert(&mut self, name: String, ty: Type, id: PatternBindingId) {
         if self.scopes.is_empty() {
             self.push_scope();
         }
-        self.scopes.last_mut().unwrap().insert(name, ty);
+        self.scopes.last_mut().unwrap().insert(name, (ty, id));
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&Type> {
-        self.scopes.iter().rev().find_map(|scope| scope.get(name))
-    }
-
-    pub(crate) fn depth(&self) -> usize {
-        self.scopes.len()
-    }
-
-    pub(crate) fn is_before(&self, name: &str, depth: usize) -> bool {
         self.scopes
             .iter()
-            .enumerate()
             .rev()
-            .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
-            .is_some_and(|index| index < depth)
+            .find_map(|scope| scope.get(name).map(|(ty, _)| ty))
+    }
+
+    pub(crate) fn ids(&self) -> HashSet<PatternBindingId> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.values().map(|(_, id)| *id))
+            .collect()
     }
 }

@@ -1,5 +1,5 @@
 use crate::check;
-use type_checker::{CaptureMode, ClosureKind, FloatTy, IntTy, Type};
+use type_checker::{CaptureMode, CaptureSource, ClosureKind, FloatTy, IntTy, Type};
 
 #[test]
 fn accepts_basic_function_body() {
@@ -317,6 +317,28 @@ fn infers_shared_closure_capture() {
 }
 
 #[test]
+fn captures_pattern_bindings() {
+    let result = check(
+        r#"
+        fun main() -> i32 {
+            match 1 {
+                base => {
+                    let read = fun() { base };
+                    read()
+                }
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    let capture = &result.lambda_infos.values().next().unwrap().captures[0];
+    assert_eq!(capture.name, "base");
+    assert!(matches!(capture.source, CaptureSource::Pattern(_)));
+    assert_eq!(capture.mode, CaptureMode::Shared);
+}
+
+#[test]
 fn infers_mutable_closure_capture() {
     let result = check(
         r#"
@@ -385,6 +407,51 @@ fn infers_once_closure_capture() {
     let info = result.lambda_infos.values().next().unwrap();
     assert_eq!(info.kind, ClosureKind::FnOnce);
     assert_eq!(info.captures[0].mode, CaptureMode::Value);
+}
+
+#[test]
+fn by_value_method_receiver_makes_once_closure() {
+    let result = check(
+        r#"
+        struct Token { value: i32 }
+        impl Token {
+            fun consume(self) -> i32 { self.value }
+        }
+        fun main() {
+            let token = Token { value: 1 };
+            let once = fun() { token.consume() };
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    let info = result.lambda_infos.values().next().unwrap();
+    assert_eq!(info.kind, ClosureKind::FnOnce);
+    assert_eq!(info.captures[0].mode, CaptureMode::Value);
+}
+
+#[test]
+fn once_closure_is_rejected_at_fn_type_boundary() {
+    let result = check(
+        r#"
+        struct Token { value: i32 }
+        fun consume(value: Token) {}
+        fun call(callback: fun()) { callback(); }
+        fun main() {
+            let token = Token { value: 1 };
+            let once = fun() { consume(token); };
+            call(once);
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0001"
+            && diagnostic
+                .message
+                .contains("function argument type mismatch")
+            && diagnostic.message.contains("FnOnce")
+    }));
 }
 
 #[test]

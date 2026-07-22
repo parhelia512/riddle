@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use hir::{
     HirFile,
     body::{
-        BinaryOp, Body, BodyId, Expr, ExprId, PatId, Pattern, ResolvedName, Stmt, StmtId, UnaryOp,
+        BinaryOp, Body, BodyId, Expr, ExprId, PatId, Pattern, PatternBindingId, ResolvedName, Stmt,
+        StmtId, UnaryOp,
     },
     item_tree::{FunctionId, HirTypeRef},
 };
@@ -208,7 +209,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 ctx.escaping_exprs.contains(value)
             }
 
-            Expr::Path { path, resolved } => match resolved {
+            Expr::Path { resolved, .. } => match resolved {
                 Some(ResolvedName::Local(stmt)) => {
                     ctx.expr_sources
                         .entry(expr_id)
@@ -231,8 +232,8 @@ impl<'a> EscapeAnalyzer<'a> {
                     ctx.escaping_lambda_param_places
                         .contains(&(*lambda, *index))
                 }
-                Some(ResolvedName::Unresolved) | None => {
-                    if let Some(sources) = self.pattern_sources(ctx, path) {
+                Some(ResolvedName::PatternBinding(id)) => {
+                    if let Some(sources) = self.pattern_sources(ctx, *id) {
                         ctx.expr_sources.entry(expr_id).or_default().extend(sources);
                     }
                     false
@@ -291,6 +292,11 @@ impl<'a> EscapeAnalyzer<'a> {
                                 CaptureSource::Local(stmt) => {
                                     ctx.escaping_locals.insert(stmt);
                                 }
+                                CaptureSource::Pattern(id) => {
+                                    if let Some(sources) = self.pattern_sources(ctx, id) {
+                                        Self::mark_source_sink(ctx, &sources);
+                                    }
+                                }
                                 CaptureSource::Param(idx) => {
                                     ctx.escaping_params.insert(idx);
                                 }
@@ -309,6 +315,11 @@ impl<'a> EscapeAnalyzer<'a> {
                                     let sources =
                                         std::iter::once(RefSource::LocalValue(stmt)).collect();
                                     Self::mark_source_sink(ctx, &sources);
+                                }
+                                CaptureSource::Pattern(id) => {
+                                    if let Some(sources) = self.pattern_sources(ctx, id) {
+                                        Self::mark_source_sink(ctx, &sources);
+                                    }
                                 }
                                 CaptureSource::Param(idx) => {
                                     ctx.escaping_params.insert(idx);
@@ -605,32 +616,38 @@ impl<'a> EscapeAnalyzer<'a> {
     }
 
     fn push_pattern_sources(&self, ctx: &mut EscapeCtx<'_>, pat: PatId, sources: &RefSources) {
-        let mut names = HashSet::new();
-        Self::collect_pattern_binding_names(ctx.body, pat, &mut names);
+        let mut bindings = HashSet::new();
+        Self::collect_pattern_bindings(ctx.body, pat, &mut bindings);
         ctx.pattern_sources.push(
-            names
+            bindings
                 .into_iter()
-                .map(|name| (name, sources.clone()))
+                .map(|id| (id, sources.clone()))
                 .collect(),
         );
     }
 
-    fn collect_pattern_binding_names(body: &Body, pat: PatId, names: &mut HashSet<String>) {
+    fn collect_pattern_bindings(body: &Body, pat: PatId, bindings: &mut HashSet<PatternBindingId>) {
         match &body.pats[pat] {
-            Pattern::Binding { name } => {
-                names.insert(name.0.clone());
+            Pattern::Binding { .. } => {
+                bindings.insert(PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                });
             }
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 for element in elements {
-                    Self::collect_pattern_binding_names(body, *element, names);
+                    Self::collect_pattern_bindings(body, *element, bindings);
                 }
             }
             Pattern::Struct { fields, .. } => {
-                for field in fields {
-                    if let Some(pat) = field.pat {
-                        Self::collect_pattern_binding_names(body, pat, names);
+                for (index, field) in fields.iter().enumerate() {
+                    if let Some(field_pat) = field.pat {
+                        Self::collect_pattern_bindings(body, field_pat, bindings);
                     } else {
-                        names.insert(field.name.0.clone());
+                        bindings.insert(PatternBindingId {
+                            pattern: pat,
+                            field: Some(index),
+                        });
                     }
                 }
             }
@@ -638,16 +655,11 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    fn pattern_sources(
-        &self,
-        ctx: &EscapeCtx<'_>,
-        path: &hir::item_tree::HirPath,
-    ) -> Option<RefSources> {
-        let name = path.as_single_name()?.0.as_str();
+    fn pattern_sources(&self, ctx: &EscapeCtx<'_>, id: PatternBindingId) -> Option<RefSources> {
         ctx.pattern_sources
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).cloned())
+            .find_map(|scope| scope.get(&id).cloned())
     }
 
     fn place_sources(&self, ctx: &EscapeCtx<'_>, expr_id: ExprId) -> RefSources {
@@ -674,9 +686,9 @@ impl<'a> EscapeAnalyzer<'a> {
             .into_iter()
             .collect(),
             Expr::Path {
-                path,
-                resolved: Some(ResolvedName::Unresolved) | None,
-            } => self.pattern_sources(ctx, path).unwrap_or_default(),
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                ..
+            } => self.pattern_sources(ctx, *id).unwrap_or_default(),
             Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
                 let indirect = self
                     .type_result
@@ -803,7 +815,7 @@ struct EscapeCtx<'a> {
     escaping_sources: RefSources,
     expr_sources: HashMap<ExprId, RefSources>,
     stmt_sources: HashMap<StmtId, RefSources>,
-    pattern_sources: Vec<HashMap<String, RefSources>>,
+    pattern_sources: Vec<HashMap<PatternBindingId, RefSources>>,
 }
 
 impl<'a> EscapeCtx<'a> {

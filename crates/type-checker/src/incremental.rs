@@ -18,10 +18,7 @@ use rowan::{TextRange, TextSize};
 use crate::{
     TypeCheckResult,
     checker::{GenericEdge, TypeChecker},
-    result::{
-        ClosureKind, Diagnostic, ForLoopInfo, GenericCall, LambdaInfo, OperatorCall,
-        TraitMethodCall,
-    },
+    result::{Diagnostic, ForLoopInfo, GenericCall, LambdaInfo, OperatorCall, TraitMethodCall},
     types::Type,
 };
 
@@ -68,7 +65,6 @@ struct CachedBody {
     operator_calls: Vec<(ExprId, OperatorCall)>,
     for_loops: Vec<(ExprId, ForLoopInfo)>,
     lambda_infos: Vec<(ExprId, LambdaInfo)>,
-    closure_kinds: Vec<(ExprId, ClosureKind)>,
     generic_edges: Vec<GenericEdge>,
 }
 
@@ -259,14 +255,6 @@ impl IncrementalTypeChecker {
                 .filter(|((checked_body, _), _)| *checked_body == body_id)
                 .map(|((_, expr), info)| (*expr, info.clone()))
                 .collect();
-            let closure_kinds = checker
-                .result
-                .closure_kinds
-                .iter()
-                .filter(|((checked_body, _), _)| *checked_body == body_id)
-                .map(|((_, expr), kind)| (*expr, *kind))
-                .collect();
-
             self.bodies.insert(
                 fid,
                 CachedBody {
@@ -279,7 +267,6 @@ impl IncrementalTypeChecker {
                     operator_calls,
                     for_loops,
                     lambda_infos,
-                    closure_kinds,
                     generic_edges,
                 },
             );
@@ -352,9 +339,6 @@ fn replay_cached_body(
             .result
             .lambda_infos
             .insert((body_id, *expr), info.clone());
-    }
-    for (expr, kind) in &cached.closure_kinds {
-        checker.result.closure_kinds.insert((body_id, *expr), *kind);
     }
     checker.generic_edges.extend(generic_edges);
     true

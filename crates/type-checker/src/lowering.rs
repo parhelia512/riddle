@@ -5,7 +5,7 @@ use rowan::TextRange;
 
 use crate::{
     checker::TypeChecker,
-    types::{ConstArg, FloatTy, IntTy, Type},
+    types::{ClosureKind, ConstArg, FloatTy, IntTy, Type},
 };
 
 impl TypeChecker<'_> {
@@ -69,6 +69,7 @@ impl TypeChecker<'_> {
                 ret,
             } => Type::Fn {
                 is_unsafe: *is_unsafe,
+                kind: ClosureKind::Fn,
                 params: fn_params
                     .iter()
                     .map(|param| self.lower_type_ref_with_params_at(param, params, span))

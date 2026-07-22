@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use frontend::syntax_kind::RiddleLang;
 use hir::{
     Name,
-    body::{BodyId, ExprId, StmtId},
+    body::{BodyId, ExprId, PatternBindingId, StmtId},
     item_tree::{ConstId, EnumId, FunctionId, ModuleId, StructId, TraitId, TypeAliasId},
 };
 
@@ -106,6 +106,7 @@ pub enum DefRef {
     /// Binding introduced by a match-arm pattern, e.g. `x` in `x => ...`.
     PatternBinding {
         name: Name,
+        id: PatternBindingId,
     },
     Param {
         fn_id: FunctionId,

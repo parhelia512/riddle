@@ -7,4 +7,4 @@ edition.workspace = true
 frontend = { path = "../frontend" }
 hir = { path = "../hir" }
 la-arena = "0.3"
-rowan = "0.15"
+rowan = "0.16.1"

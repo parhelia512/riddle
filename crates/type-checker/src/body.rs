@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use hir::{
     Name,
     body::{
-        BinaryOp, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern, ResolvedName, Stmt,
-        StmtId, UnaryOp,
+        BinaryOp, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern, PatternBindingId,
+        ResolvedName, Stmt, StmtId, UnaryOp,
     },
     item_tree::{
         FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound, HirTypeRef,
@@ -17,10 +17,10 @@ use crate::{
     context::{BodyCtx, LambdaCtx},
     lowering::{collect_subst, generic_param_map_with_consts, substitute_type},
     result::{
-        CaptureMode, CaptureSource, ClosureKind, ForLoopInfo, LabelStyle, LambdaCapture,
-        LambdaInfo, OperatorCall, SourceLabel, TraitMethodCall,
+        CaptureMode, CaptureSource, ForLoopInfo, LabelStyle, LambdaCapture, LambdaInfo,
+        OperatorCall, SourceLabel, TraitMethodCall,
     },
-    types::{ConstArg, IntTy, Type},
+    types::{ClosureKind, ConstArg, IntTy, Type},
 };
 
 impl TypeChecker<'_> {
@@ -109,15 +109,6 @@ impl TypeChecker<'_> {
                     ctx.locals.insert(stmt_id, (local_ty, *is_mut));
                 } else {
                     ctx.locals.insert(stmt_id, (declared, *is_mut));
-                }
-                if let Some(init) = init
-                    && let Some(kind) = self
-                        .result
-                        .closure_kinds
-                        .get(&(ctx.body_id, *init))
-                        .copied()
-                {
-                    ctx.local_closures.insert(stmt_id, kind);
                 }
             }
             Stmt::Expr { expr } => {
@@ -211,27 +202,6 @@ impl TypeChecker<'_> {
             Expr::CharLiteral { .. } => Type::Char,
             Expr::BoolLiteral { .. } => Type::Bool,
             Expr::Path { path, resolved } => {
-                if let Some(lambda) = ctx.lambdas.last() {
-                    let binding_capture = path
-                        .as_single_name()
-                        .is_some_and(|name| ctx.bindings.is_before(&name.0, lambda.binding_depth));
-                    let resolved_capture = match resolved {
-                        Some(ResolvedName::Local(stmt)) => lambda.outer_locals.contains(stmt),
-                        Some(ResolvedName::Param(_)) => true,
-                        Some(ResolvedName::LambdaParam { lambda: owner, .. }) => {
-                            *owner != lambda.expr
-                        }
-                        _ => false,
-                    };
-                    if binding_capture && !resolved_capture {
-                        self.diagnostic(
-                            "E0044",
-                            format!("anonymous function cannot capture `{}`", path.display()),
-                            span,
-                        );
-                        return Type::Error;
-                    }
-                }
                 let ty = if let Some(binding_ty) = path
                     .as_single_name()
                     .and_then(|name| ctx.bindings.get(&name.0))
@@ -257,13 +227,6 @@ impl TypeChecker<'_> {
                         ty.clone(),
                         CaptureMode::Shared,
                     );
-                }
-                if let Some(ResolvedName::Local(stmt)) = resolved
-                    && let Some(kind) = ctx.local_closures.get(stmt).copied()
-                {
-                    self.result
-                        .closure_kinds
-                        .insert((ctx.body_id, expr_id), kind);
                 }
                 ty
             }
@@ -586,7 +549,7 @@ impl TypeChecker<'_> {
             expr: expr_id,
             params: param_types.clone(),
             outer_locals: ctx.locals.keys().copied().collect(),
-            binding_depth: ctx.bindings.depth(),
+            outer_patterns: ctx.bindings.ids(),
             captures: Vec::new(),
         });
         let actual = self.check_expr_expected(ctx, body, &return_ty);
@@ -623,10 +586,6 @@ impl TypeChecker<'_> {
                 kind,
             },
         );
-        self.result
-            .closure_kinds
-            .insert((ctx.body_id, expr_id), kind);
-
         self.record_lambda(
             ctx.body_id,
             expr_id,
@@ -647,6 +606,7 @@ impl TypeChecker<'_> {
         );
         Type::Fn {
             is_unsafe: false,
+            kind,
             params: param_types,
             ret: Box::new(return_ty),
         }
@@ -661,6 +621,9 @@ impl TypeChecker<'_> {
         match resolved? {
             ResolvedName::Local(stmt) if lambda.outer_locals.contains(stmt) => {
                 Some(CaptureSource::Local(*stmt))
+            }
+            ResolvedName::PatternBinding(id) if lambda.outer_patterns.contains(id) => {
+                Some(CaptureSource::Pattern(*id))
             }
             ResolvedName::Param(index) => Some(CaptureSource::Param(*index)),
             ResolvedName::LambdaParam {
@@ -824,7 +787,12 @@ impl TypeChecker<'_> {
                 self.infer_capture_uses(ctx, len, CaptureMode::Shared);
             }
             Expr::Call { callee, args } => {
-                let callee_mode = match self.result.closure_kinds.get(&(ctx.body_id, callee)) {
+                let callee_mode = match self
+                    .result
+                    .expr_types
+                    .get(&(ctx.body_id, callee))
+                    .and_then(Type::closure_kind)
+                {
                     Some(ClosureKind::FnOnce) => CaptureMode::Value,
                     Some(ClosureKind::FnMut) => CaptureMode::Mutable,
                     _ => CaptureMode::Shared,
@@ -843,9 +811,11 @@ impl TypeChecker<'_> {
                 if let (Some(nested), Some(outer)) = (nested, ctx.lambdas.last()) {
                     let outer_expr = outer.expr;
                     let outer_locals = outer.outer_locals.clone();
+                    let outer_patterns = outer.outer_patterns.clone();
                     for capture in nested.captures {
                         let comes_from_outside = match &capture.source {
                             CaptureSource::Local(stmt) => outer_locals.contains(stmt),
+                            CaptureSource::Pattern(id) => outer_patterns.contains(id),
                             CaptureSource::Param(_) => true,
                             CaptureSource::LambdaParam { lambda, .. } => *lambda != outer_expr,
                         };
@@ -1913,12 +1883,7 @@ impl TypeChecker<'_> {
         }
 
         let callee_ty = self.check_expr(ctx, callee);
-        if self
-            .result
-            .closure_kinds
-            .get(&(ctx.body_id, callee))
-            .is_some_and(|kind| *kind == ClosureKind::FnMut)
-        {
+        if callee_ty.closure_kind() == Some(ClosureKind::FnMut) {
             self.check_mutable_closure_binding(ctx, callee);
         }
         let resolved_callee = self.resolve_type(&callee_ty);
@@ -1926,6 +1891,7 @@ impl TypeChecker<'_> {
             is_unsafe,
             params,
             ret,
+            ..
         } = resolved_callee
         {
             if is_unsafe {
@@ -2409,14 +2375,19 @@ impl TypeChecker<'_> {
         assoc_constraints: &[HirAssocTypeConstraint],
         subst: &HashMap<String, Type>,
     ) -> bool {
+        let actual = match actual {
+            Type::InferInt => Type::Int(IntTy::I32),
+            Type::InferFloat => Type::Float(crate::types::FloatTy::F64),
+            actual => actual.clone(),
+        };
         if actual.is_unknown_like() {
             return true;
         }
-        if let Type::Param(param) = actual {
+        if let Type::Param(param) = &actual {
             return self.param_has_trait_bound(ctx, param, trait_id, assoc_constraints, subst);
         }
-        self.result.trait_env.type_implements(actual, trait_id)
-            && self.assoc_constraints_match(actual, trait_id, assoc_constraints, subst)
+        self.result.trait_env.type_implements(&actual, trait_id)
+            && self.assoc_constraints_match(&actual, trait_id, assoc_constraints, subst)
     }
 
     fn type_has_lang_trait(&mut self, ctx: &BodyCtx<'_>, ty: &Type, lang: &str) -> bool {
@@ -2655,6 +2626,10 @@ impl TypeChecker<'_> {
             let actual = self.receiver_argument_type(&base_ty, &expected);
             if matches!(expected, Type::Ref(_, true)) {
                 self.check_assign_mut(ctx, base, ctx.expr_range(base));
+            } else if !matches!(expected, Type::Ref(_, false))
+                && !self.result.trait_env.type_is_copy(&base_ty)
+            {
+                self.record_capture_use(ctx, base, CaptureMode::Value);
             }
             self.expect_assignable(&expected, &actual, "method receiver", ctx.expr_range(base));
         }
@@ -3060,7 +3035,14 @@ impl TypeChecker<'_> {
                         );
                     }
                 } else {
-                    ctx.bindings.insert(name.0, expected.clone());
+                    ctx.bindings.insert(
+                        name.0,
+                        expected.clone(),
+                        PatternBindingId {
+                            pattern: pat,
+                            field: None,
+                        },
+                    );
                 }
             }
             Pattern::Tuple { elements } => {
@@ -3104,7 +3086,7 @@ impl TypeChecker<'_> {
                 self.bind_tuple_variant_pattern(ctx, expected, &path, &elements, span);
             }
             Pattern::Struct { path, fields } => {
-                self.bind_struct_variant_pattern(ctx, expected, &path, &fields, span);
+                self.bind_struct_variant_pattern(ctx, pat, expected, &path, &fields, span);
             }
         }
     }
@@ -3249,6 +3231,7 @@ impl TypeChecker<'_> {
     fn bind_struct_variant_pattern(
         &mut self,
         ctx: &mut BodyCtx<'_>,
+        binding_pat: PatId,
         expected: &Type,
         path: &hir::item_tree::HirPath,
         fields: &[hir::body::FieldPat],
@@ -3276,7 +3259,7 @@ impl TypeChecker<'_> {
                 .map(|(name, ty)| (name.0.clone(), ty.clone()))
                 .collect::<HashMap<_, _>>();
             let mut seen = HashSet::new();
-            for field in fields {
+            for (field_index, field) in fields.iter().enumerate() {
                 if !seen.insert(field.name.0.clone()) {
                     self.diagnostic(
                         "E0038",
@@ -3301,7 +3284,14 @@ impl TypeChecker<'_> {
                 if let Some(pat) = field.pat {
                     self.bind_pattern(ctx, pat, &ty);
                 } else {
-                    ctx.bindings.insert(field.name.0.clone(), ty);
+                    ctx.bindings.insert(
+                        field.name.0.clone(),
+                        ty,
+                        PatternBindingId {
+                            pattern: binding_pat,
+                            field: Some(field_index),
+                        },
+                    );
                 }
             }
             return;
@@ -3345,7 +3335,7 @@ impl TypeChecker<'_> {
             .map(|(name, ty)| (name.0.clone(), ty.clone()))
             .collect::<HashMap<_, _>>();
         let mut seen = HashSet::new();
-        for field in fields {
+        for (field_index, field) in fields.iter().enumerate() {
             if !seen.insert(field.name.0.clone()) {
                 self.diagnostic(
                     "E0038",
@@ -3369,7 +3359,14 @@ impl TypeChecker<'_> {
             if let Some(pat) = field.pat {
                 self.bind_pattern(ctx, pat, &ty);
             } else {
-                ctx.bindings.insert(field.name.0.clone(), ty);
+                ctx.bindings.insert(
+                    field.name.0.clone(),
+                    ty,
+                    PatternBindingId {
+                        pattern: binding_pat,
+                        field: Some(field_index),
+                    },
+                );
             }
         }
     }
@@ -3413,6 +3410,7 @@ impl TypeChecker<'_> {
             }
             Some(ResolvedName::TypeAlias(tid)) => self.lower_type_alias(*tid),
             Some(ResolvedName::Unresolved) | None => Type::Unknown,
+            Some(ResolvedName::PatternBinding(_)) => Type::Unknown,
             Some(ResolvedName::Enum(eid)) => Type::Enum(*eid, Vec::new()),
             Some(ResolvedName::EnumVariant(eid, _)) => Type::Enum(*eid, Vec::new()),
             Some(ResolvedName::Trait(_)) | Some(ResolvedName::Module(_)) => Type::Unknown,

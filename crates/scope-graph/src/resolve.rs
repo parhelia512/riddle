@@ -40,8 +40,8 @@ pub fn resolve_hir(hir: &mut HirFile, sg: &ScopeGraph) {
             .unwrap_or(ResolvedName::Unresolved);
 
         // Only emit E0050 when genuinely unresolved (no candidates).
-        // `def_to_resolved_name` may map some DefRef variants (PatternBinding,
-        // UseAlias) to Unresolved internally; those are not user-visible errors.
+        // `def_to_resolved_name` may map some DefRef variants (UseAlias) to
+        // Unresolved internally; those are not user-visible errors.
         if candidates.is_empty() {
             let RefOrigin::Expr { body, expr } = origin;
             let path_text = match &hir.bodies[*body].exprs[*expr] {
@@ -93,7 +93,7 @@ fn def_to_resolved_name(def: &DefRef) -> ResolvedName {
         DefRef::TypeAlias(tid) => ResolvedName::TypeAlias(*tid),
         DefRef::Module { id, .. } => ResolvedName::Module(*id),
         DefRef::Local { stmt } => ResolvedName::Local(*stmt),
-        DefRef::PatternBinding { .. } => ResolvedName::Unresolved,
+        DefRef::PatternBinding { id, .. } => ResolvedName::PatternBinding(*id),
         DefRef::Param { index, .. } => ResolvedName::Param(*index),
         DefRef::LambdaParam { lambda, index, .. } => ResolvedName::LambdaParam {
             lambda: *lambda,

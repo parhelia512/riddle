@@ -41,14 +41,14 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.4", features = ["derive"] }
 clue = { path = "app/clue" }
 frontend = { path = "crates/frontend" }
 hir = { path = "crates/hir" }
 lsp-types = "0.94.1"
 mir = { path = "crates/mir" }
 riddlec = { path = "app/riddlec" }
-rowan = "0.15"
+rowan = "0.16.1"
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sync", "time"] }
 tower-lsp = "0.20.0"
 type-checker = { path = "crates/type-checker" }

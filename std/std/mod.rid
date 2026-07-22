@@ -3,6 +3,7 @@ pub mod result;
 pub mod string;
 pub mod vector;
 pub mod iter;
+pub mod io;
 pub mod array;
 pub mod marker;
 pub mod clone;

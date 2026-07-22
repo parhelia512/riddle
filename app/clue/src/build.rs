@@ -133,6 +133,7 @@ fn fingerprint(
     manifest.hash(&mut hasher);
     source.hash(&mut hasher);
     runtime.hash(&mut hasher);
+    "c11".hash(&mut hasher);
     riddlec::GIT_HASH.hash(&mut hasher);
     env::consts::OS.hash(&mut hasher);
     env::consts::ARCH.hash(&mut hasher);
@@ -287,9 +288,7 @@ impl CCompiler {
 fn resolve_program(program: &OsStr) -> OsString {
     let path = Path::new(program);
     if path.components().count() > 1 {
-        return fs::canonicalize(path)
-            .unwrap_or_else(|_| path.to_path_buf())
-            .into_os_string();
+        return ordinary_absolute(path).into_os_string();
     }
     let Some(search_path) = env::var_os("PATH") else {
         return program.to_owned();
@@ -297,18 +296,26 @@ fn resolve_program(program: &OsStr) -> OsString {
     for directory in env::split_paths(&search_path) {
         let direct = directory.join(path);
         if direct.is_file() {
-            return fs::canonicalize(&direct).unwrap_or(direct).into_os_string();
+            return ordinary_absolute(&direct).into_os_string();
         }
         if cfg!(windows) {
             let executable = directory.join(format!("{}.exe", program.to_string_lossy()));
             if executable.is_file() {
-                return fs::canonicalize(&executable)
-                    .unwrap_or(executable)
-                    .into_os_string();
+                return ordinary_absolute(&executable).into_os_string();
             }
         }
     }
     program.to_owned()
+}
+
+fn ordinary_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map(|current| current.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
 }
 
 fn versioned_compilers() -> Vec<OsString> {

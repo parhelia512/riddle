@@ -442,6 +442,18 @@ fn c_backend_preserves_returning_branches_and_mut_locals() {
         result
     );
     assert!(!result.contains("if ()"), "empty condition:\n{}", result);
+    assert!(
+        !result.contains("if (("),
+        "condition has redundant parentheses:\n{}",
+        result
+    );
+    assert!(
+        !result
+            .lines()
+            .any(|line| line.starts_with("block_") && line.ends_with(':')),
+        "block label is not followed by a C11 statement:\n{}",
+        result
+    );
     assert!(!result.contains("= ;"), "empty assignment rhs:\n{}", result);
     assert!(
         !result.contains("0 = false"),

@@ -14,7 +14,7 @@ use crate::{
     context::BodyCtx,
     result::{Diagnostic, LabelStyle, Severity, SourceLabel, TypeCheckResult},
     trait_env::{TraitAssocConstraint, TraitBound},
-    types::{FloatTy, IntTy, Type},
+    types::{ClosureKind, FloatTy, IntTy, Type},
 };
 
 pub struct TypeChecker<'a> {
@@ -463,10 +463,12 @@ impl<'a> TypeChecker<'a> {
             }
             Type::Fn {
                 is_unsafe,
+                kind,
                 params,
                 ret,
             } => Type::Fn {
                 is_unsafe: *is_unsafe,
+                kind: *kind,
                 params: params
                     .iter()
                     .map(|param| self.resolve_type(param))
@@ -485,6 +487,7 @@ impl<'a> TypeChecker<'a> {
         let function = self.hir.item_tree.functions[fid].clone();
         Type::Fn {
             is_unsafe: function.is_unsafe,
+            kind: ClosureKind::Fn,
             params: function
                 .params
                 .iter()
@@ -552,16 +555,19 @@ impl<'a> TypeChecker<'a> {
             (
                 Type::Fn {
                     is_unsafe: expected_unsafe,
+                    kind: expected_kind,
                     params: ap,
                     ret: ar,
                 },
                 Type::Fn {
                     is_unsafe: actual_unsafe,
+                    kind: actual_kind,
                     params: bp,
                     ret: br,
                 },
             ) => {
                 (!*actual_unsafe || *expected_unsafe)
+                    && expected_kind.accepts(*actual_kind)
                     && ap.len() == bp.len()
                     && ap.iter().zip(bp).all(|(a, b)| self.unify_types(a, b))
                     && self.unify_types(ar, br)
@@ -947,6 +953,11 @@ impl<'a> TypeChecker<'a> {
         if self.unify_types(&lhs, &rhs) {
             return self.resolve_type(&lhs);
         }
+        if matches!((&lhs, &rhs), (Type::Fn { .. }, Type::Fn { .. }))
+            && self.unify_types(&rhs, &lhs)
+        {
+            return self.resolve_type(&rhs);
+        }
         if lhs.is_never() {
             return rhs;
         }
@@ -1074,7 +1085,6 @@ impl<'a> TypeChecker<'a> {
             "E0041" => vec!["every field must implement `Copy`; add the required generic bounds or remove the impl".into()],
             "E0042" => vec!["move this statement inside a `while` or `for` loop".into()],
             "E0043" => vec!["use `&str` or a raw pointer; unsized `str` must be behind a reference or pointer".into()],
-            "E0044" => vec!["pass the value as an explicit anonymous function parameter".into()],
             "E0045" => vec!["add an explicit parameter type or use the function where its signature is known".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
             "E0021" => vec!["trait method declarations should not have a body".into()],

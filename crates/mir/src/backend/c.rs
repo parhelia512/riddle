@@ -353,7 +353,7 @@ impl CBackend {
         for (bid, block) in func.blocks.iter() {
             let bid_raw = bid.into_raw();
             if let Some(ref label) = block.label {
-                writeln!(out, "block_{}_{}:", label, bid_raw).unwrap();
+                writeln!(out, "block_{}_{}:;", label, bid_raw).unwrap();
             }
 
             for (i, inst) in block.insts.iter().enumerate() {
@@ -381,7 +381,12 @@ impl CBackend {
                     let tid = then_block.into_raw();
                     let el = func.blocks[*else_block].label.as_deref().unwrap_or("?");
                     let eid = else_block.into_raw();
-                    writeln!(out, "  if ({}) {{", self.name(*cond)).unwrap();
+                    let cond = self.name(*cond);
+                    if cond.starts_with('(') && cond.ends_with(')') {
+                        writeln!(out, "  if {} {{", cond).unwrap();
+                    } else {
+                        writeln!(out, "  if ({}) {{", cond).unwrap();
+                    }
                     self.emit_phi_assignments(func, *then_block, bid, out, "    ");
                     writeln!(out, "    goto block_{}_{};", tl, tid).unwrap();
                     writeln!(out, "  }} else {{").unwrap();

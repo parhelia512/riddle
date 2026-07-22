@@ -5,7 +5,7 @@ use rowan::ast::SyntaxNodePtr;
 use frontend::syntax_kind::{RiddleLang, SyntaxNode};
 use hir::{
     HirFile, Name,
-    body::{Body, BodyId, BodyItem, Expr, ExprId, PatId, Pattern, Stmt, StmtId},
+    body::{Body, BodyId, BodyItem, Expr, ExprId, PatId, Pattern, PatternBindingId, Stmt, StmtId},
     item_tree::{
         EnumId, FunctionId, HirPath, HirTypeRef, HirUseTree, HirUseTreeKind, ModuleId, PathAnchor,
         StructId, TopLevelItem,
@@ -1085,7 +1085,13 @@ impl<'a> ScopeGraphBuilder<'a> {
 
                 let pop = self.sg.alloc_node(Node::PopSymbol {
                     name: name.clone(),
-                    define: DefRef::PatternBinding { name: name.clone() },
+                    define: DefRef::PatternBinding {
+                        name: name.clone(),
+                        id: PatternBindingId {
+                            pattern: pat,
+                            field: None,
+                        },
+                    },
                 });
                 nodes.push(pop);
                 let e = self.sg.add_edge(next, pop, EdgeKind::Def, 0);
@@ -1105,7 +1111,7 @@ impl<'a> ScopeGraphBuilder<'a> {
                 }
             }
             Pattern::Struct { fields, .. } => {
-                for fp in fields {
+                for (index, fp) in fields.iter().enumerate() {
                     if let Some(sub) = fp.pat {
                         self.emit_pat_bindings(body, sub, current, nodes, edges);
                     } else {
@@ -1117,6 +1123,10 @@ impl<'a> ScopeGraphBuilder<'a> {
                             name: fp.name.clone(),
                             define: DefRef::PatternBinding {
                                 name: fp.name.clone(),
+                                id: PatternBindingId {
+                                    pattern: pat,
+                                    field: Some(index),
+                                },
                             },
                         });
                         nodes.push(pop);

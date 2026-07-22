@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
 use hir::{
-    body::{BodyId, ExprId, StmtId},
+    body::{BodyId, ExprId, PatternBindingId, StmtId},
     item_tree::{FunctionId, TraitId},
 };
 use rowan::TextRange;
 
-use crate::{TraitEnv, types::Type};
+use crate::{
+    TraitEnv,
+    types::{ClosureKind, Type},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -48,7 +51,6 @@ pub struct TypeCheckResult {
     pub operator_calls: HashMap<(BodyId, ExprId), OperatorCall>,
     pub for_loops: HashMap<(BodyId, ExprId), ForLoopInfo>,
     pub lambda_infos: HashMap<(BodyId, ExprId), LambdaInfo>,
-    pub closure_kinds: HashMap<(BodyId, ExprId), ClosureKind>,
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,
@@ -75,15 +77,9 @@ impl CaptureMode {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CaptureSource {
     Local(StmtId),
+    Pattern(PatternBindingId),
     Param(usize),
     LambdaParam { lambda: ExprId, index: usize },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ClosureKind {
-    Fn,
-    FnMut,
-    FnOnce,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -6,5 +6,5 @@ publish = false
 
 [dependencies]
 hir = { path = "../hir" }
-rowan = "0.15"
+rowan = "0.16.1"
 type-checker = { path = "../type-checker" }

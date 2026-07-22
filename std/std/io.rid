@@ -1,0 +1,39 @@
+unsafe extern "C" {
+    safe fun putchar(value: i32) -> i32;
+}
+
+pub trait Display {
+    fun write(self);
+}
+
+impl Display for &str {
+    fun write(self) {
+        let mut index = 0usize;
+        while index < self.len() {
+            putchar(self.byte_at(index).unwrap_or(0u8) as i32);
+            index += 1usize;
+        }
+    }
+}
+
+impl Display for i32 {
+    fun write(self) {
+        let mut value = self as i64;
+        if value < 0i64 {
+            putchar(45);
+            value = -value;
+        }
+        print_positive(value);
+    }
+}
+
+fun print_positive(value: i64) {
+    if value >= 10i64 {
+        print_positive(value / 10i64);
+    }
+    putchar((value % 10i64) as i32 + 48);
+}
+
+pub fun print<T: Display>(value: T) {
+    value.write();
+}
