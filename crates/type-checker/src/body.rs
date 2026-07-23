@@ -2681,15 +2681,26 @@ impl TypeChecker<'_> {
     }
 
     fn trait_implies(&self, actual: TraitId, required: TraitId) -> bool {
+        self.supertrait_reaches(actual, required, &mut HashSet::new())
+    }
+
+    pub(crate) fn supertrait_reaches(
+        &self,
+        actual: TraitId,
+        required: TraitId,
+        visited: &mut HashSet<TraitId>,
+    ) -> bool {
         if actual == required {
             return true;
         }
-        matches!(
-            (self.trait_lang(actual), self.trait_lang(required)),
-            (Some("eq"), Some("partial_eq"))
-                | (Some("partial_ord"), Some("partial_eq"))
-                | (Some("ord"), Some("partial_eq" | "eq" | "partial_ord"))
-        )
+        if !visited.insert(actual) {
+            return false;
+        }
+        self.hir.item_tree.traits[actual]
+            .supertraits
+            .iter()
+            .filter_map(|bound| self.resolve_trait_ref(&bound.trait_ty))
+            .any(|supertrait| self.supertrait_reaches(supertrait, required, visited))
     }
 
     fn bound_types_match(&self, expected: &Type, actual: &Type) -> bool {
@@ -2908,14 +2919,13 @@ impl TypeChecker<'_> {
                 continue;
             }
             subst.insert("Self".into(), receiver_ty.clone());
-            let Some(fid) = imp
+            let fid = imp
                 .methods
                 .iter()
                 .copied()
                 .find(|fid| self.hir.item_tree.functions[*fid].name == *method_name)
-            else {
-                continue;
-            };
+                .or_else(|| self.default_method(trait_id, &method_name.0));
+            let Some(fid) = fid else { continue };
             return Some(ResolvedMethod {
                 fid,
                 function: self.hir.item_tree.functions[fid].clone(),
@@ -2955,14 +2965,13 @@ impl TypeChecker<'_> {
                 continue;
             }
             subst.insert("Self".into(), receiver_ty.clone());
-            let Some(fid) = imp
+            let fid = imp
                 .methods
                 .iter()
                 .copied()
                 .find(|fid| self.hir.item_tree.functions[*fid].name.0 == method_name)
-            else {
-                continue;
-            };
+                .or_else(|| self.default_method(trait_id, method_name));
+            let Some(fid) = fid else { continue };
             return Some(ResolvedMethod {
                 fid,
                 function: self.hir.item_tree.functions[fid].clone(),
@@ -2974,15 +2983,29 @@ impl TypeChecker<'_> {
         None
     }
 
+    fn default_method(&self, trait_id: TraitId, method_name: &str) -> Option<FunctionId> {
+        self.hir.item_tree.traits[trait_id]
+            .default_methods
+            .iter()
+            .copied()
+            .find(|fid| self.hir.item_tree.functions[*fid].name.0 == method_name)
+    }
+
     fn find_trait_bound_method(
         &mut self,
         ctx: &BodyCtx<'_>,
         receiver_ty: &Type,
         method_name: &Name,
     ) -> Option<ResolvedMethod> {
-        let Type::Param(param) = receiver_ty else {
-            return None;
+        let receiver_param = match receiver_ty {
+            Type::Param(param) => param,
+            Type::Ref(inner, _) => match inner.as_ref() {
+                Type::Param(param) => param,
+                _ => return None,
+            },
+            _ => return None,
         };
+        let param = receiver_param;
         let bounds = self
             .current_generic_bounds(ctx)
             .into_iter()
@@ -2993,11 +3016,8 @@ impl TypeChecker<'_> {
             let Some(trait_id) = self.resolve_trait_ref(&bound.trait_ty) else {
                 continue;
             };
-            let Some(function) = self.hir.item_tree.traits[trait_id]
-                .methods
-                .iter()
-                .find(|method| method.name == *method_name)
-                .cloned()
+            let Some((method_trait_id, function)) =
+                self.find_supertrait_method(trait_id, method_name, &mut HashSet::new())
             else {
                 continue;
             };
@@ -3010,10 +3030,34 @@ impl TypeChecker<'_> {
                 fid: ctx.function_id,
                 function,
                 subst,
-                trait_id: Some(trait_id),
+                trait_id: Some(method_trait_id),
             });
         }
         None
+    }
+
+    fn find_supertrait_method(
+        &self,
+        trait_id: TraitId,
+        method_name: &Name,
+        visited: &mut HashSet<TraitId>,
+    ) -> Option<(TraitId, HirFunction)> {
+        if !visited.insert(trait_id) {
+            return None;
+        }
+        if let Some(method) = self.hir.item_tree.traits[trait_id]
+            .methods
+            .iter()
+            .find(|method| method.name == *method_name)
+            .cloned()
+        {
+            return Some((trait_id, method));
+        }
+        self.hir.item_tree.traits[trait_id]
+            .supertraits
+            .iter()
+            .filter_map(|bound| self.resolve_trait_ref(&bound.trait_ty))
+            .find_map(|supertrait| self.find_supertrait_method(supertrait, method_name, visited))
     }
 
     fn receiver_argument_type(&self, base_ty: &Type, expected: &Type) -> Type {

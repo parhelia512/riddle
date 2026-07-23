@@ -5,8 +5,8 @@ import com.intellij.lang.Language
 import com.intellij.openapi.fileTypes.LanguageFileType
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
-import com.intellij.platform.lsp.api.LspIntegrationProvider
-import com.intellij.platform.lsp.api.ProjectWideLspClientDescriptor
+import com.intellij.platform.lsp.api.LspServerSupportProvider
+import com.intellij.platform.lsp.api.ProjectWideLspServerDescriptor
 import javax.swing.Icon
 
 object RiddleLanguage : Language("Riddle") {
@@ -20,20 +20,20 @@ object RiddleFileType : LanguageFileType(RiddleLanguage) {
     override fun getIcon(): Icon? = null
 }
 
-class RiddleLspIntegrationProvider : LspIntegrationProvider {
+class RiddleLspServerSupportProvider : LspServerSupportProvider {
     override fun fileOpened(
         project: Project,
         file: VirtualFile,
-        clientStarter: LspIntegrationProvider.LspClientStarter,
+        serverStarter: LspServerSupportProvider.LspServerStarter,
     ) {
         if (file.fileType === RiddleFileType) {
-            clientStarter.ensureClientStarted(RiddleLspClientDescriptor(project))
+            serverStarter.ensureServerStarted(RiddleLspServerDescriptor(project))
         }
     }
 }
 
-private class RiddleLspClientDescriptor(project: Project) :
-    ProjectWideLspClientDescriptor(project, "Riddle") {
+private class RiddleLspServerDescriptor(project: Project) :
+    ProjectWideLspServerDescriptor(project, "Riddle") {
     override fun isSupportedFile(file: VirtualFile) = file.fileType === RiddleFileType
     override fun createCommandLine() = GeneralCommandLine("riddle-lsp")
 }

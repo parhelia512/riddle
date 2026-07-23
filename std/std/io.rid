@@ -37,3 +37,8 @@ fun print_positive(value: i64) {
 pub fun print<T: Display>(value: T) {
     value.write();
 }
+
+pub fun println<T: Display>(value: T) {
+    value.write();
+    putchar(10);
+}

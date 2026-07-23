@@ -357,6 +357,36 @@ impl AstLower for ast::TraitDecl {
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
         let name = lower_name(self.name());
         let visibility = lower_visibility(self.is_pub());
+        let supertraits = self
+            .supertraits()
+            .into_iter()
+            .map(|bound| {
+                let trait_range = trimmed_range(bound.trait_path.syntax());
+                HirGenericBound {
+                    param: Name("Self".into()),
+                    target_ty: HirTypeRef::Named(HirPath {
+                        anchor: PathAnchor::Plain,
+                        segments: vec![Name("Self".into())],
+                        type_args: Vec::new(),
+                    }),
+                    target_range: trait_range,
+                    trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                    trait_range,
+                    assoc_constraints: bound
+                        .assoc_constraints
+                        .into_iter()
+                        .map(|constraint| {
+                            let range = trimmed_range(constraint.ty.syntax());
+                            HirAssocTypeConstraint {
+                                name: Name(constraint.name),
+                                ty: constraint.ty.lower(),
+                                range,
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
         let methods = self
             .methods()
             .map(|m| {
@@ -429,7 +459,9 @@ impl AstLower for ast::TraitDecl {
         arena.alloc(HirTrait {
             name,
             visibility,
+            supertraits,
             methods,
+            default_methods: Vec::new(),
             type_aliases,
             attrs,
         })

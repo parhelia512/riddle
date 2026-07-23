@@ -11,11 +11,11 @@ impl TypeChecker<'_> {
             .item_tree
             .traits
             .iter()
-            .map(|(_, tr)| tr.clone())
+            .map(|(id, tr)| (id, tr.clone()))
             .collect::<Vec<_>>();
 
-        for tr in traits {
-            self.check_trait_decl(&tr);
+        for (id, tr) in traits {
+            self.check_trait_decl(id, &tr);
         }
     }
 
@@ -179,7 +179,29 @@ impl TypeChecker<'_> {
         }
     }
 
-    fn check_trait_decl(&mut self, tr: &HirTrait) {
+    fn check_trait_decl(&mut self, trait_id: hir::item_tree::TraitId, tr: &HirTrait) {
+        for supertrait in &tr.supertraits {
+            let Some(supertrait_id) = self.resolve_trait_ref(&supertrait.trait_ty) else {
+                self.diagnostic(
+                    "E0044",
+                    format!(
+                        "trait `{}` references unknown supertrait `{}`",
+                        tr.name.0,
+                        self.type_ref_source_text(&supertrait.trait_ty)
+                    ),
+                    Some(supertrait.trait_range),
+                );
+                continue;
+            };
+            if self.supertrait_reaches(supertrait_id, trait_id, &mut HashSet::new()) {
+                self.diagnostic(
+                    "E0044",
+                    format!("supertrait cycle involving `{}`", tr.name.0),
+                    Some(supertrait.trait_range),
+                );
+            }
+        }
+
         let mut methods = HashSet::new();
         for method in &tr.methods {
             if !methods.insert(method.name.0.clone()) {
@@ -187,17 +209,6 @@ impl TypeChecker<'_> {
                     "E0020",
                     format!(
                         "trait `{}` has duplicate method `{}`",
-                        tr.name.0, method.name.0
-                    ),
-                    Some(method.name_range),
-                );
-            }
-
-            if method.has_body {
-                self.diagnostic(
-                    "E0021",
-                    format!(
-                        "trait method `{}::{}` must not have a body",
                         tr.name.0, method.name.0
                     ),
                     Some(method.name_range),
@@ -244,7 +255,7 @@ impl TypeChecker<'_> {
         let tr = self.hir.item_tree.traits[trait_id].clone();
         self.check_impl_paterson(imp, &self_ty_text);
         self.check_trait_impl(&self_ty_text, &tr, imp);
-        self.check_lang_trait_dependencies(&self_ty_text, trait_id, imp.self_ty_range);
+        self.check_supertrait_dependencies(&self_ty_text, trait_id, imp.self_ty_range);
     }
 
     fn check_impl_paterson(&mut self, imp: &HirImpl, self_ty_text: &str) {
@@ -315,6 +326,9 @@ impl TypeChecker<'_> {
 
         for required in &tr.methods {
             let Some(actual) = methods.get(&required.name.0) else {
+                if required.has_body {
+                    continue;
+                }
                 self.diagnostic(
                     "E0026",
                     format!(
@@ -353,29 +367,25 @@ impl TypeChecker<'_> {
         }
     }
 
-    fn check_lang_trait_dependencies(
+    fn check_supertrait_dependencies(
         &mut self,
         self_ty_text: &str,
         trait_id: hir::item_tree::TraitId,
         span: rowan::TextRange,
     ) {
-        let Some(lang) = self.trait_lang(trait_id).map(str::to_string) else {
-            return;
-        };
-        let deps: &[(&str, &str)] = match lang.as_str() {
-            "eq" => &[("partial_eq", "PartialEq")],
-            "partial_ord" => &[("partial_eq", "PartialEq")],
-            "ord" => &[("eq", "Eq"), ("partial_ord", "PartialOrd")],
-            _ => &[],
-        };
-
-        for (required_lang, required_name) in deps {
-            if !self.impl_exists_for_lang_trait(required_lang, self_ty_text) {
+        let supertraits = self.hir.item_tree.traits[trait_id].supertraits.clone();
+        for supertrait in supertraits {
+            let Some(required_trait) = self.resolve_trait_ref(&supertrait.trait_ty) else {
+                continue;
+            };
+            if !self.impl_exists_for_trait(required_trait, self_ty_text) {
                 self.diagnostic(
                     "E0036",
                     format!(
                         "impl `{}` for `{}` requires `{}`",
-                        self.hir.item_tree.traits[trait_id].name.0, self_ty_text, required_name
+                        self.hir.item_tree.traits[trait_id].name.0,
+                        self_ty_text,
+                        self.hir.item_tree.traits[required_trait].name.0
                     ),
                     Some(span),
                 );
@@ -383,10 +393,11 @@ impl TypeChecker<'_> {
         }
     }
 
-    fn impl_exists_for_lang_trait(&mut self, lang: &str, self_ty_text: &str) -> bool {
-        let Some(required_trait) = self.find_lang_trait(lang) else {
-            return false;
-        };
+    fn impl_exists_for_trait(
+        &mut self,
+        required_trait: hir::item_tree::TraitId,
+        self_ty_text: &str,
+    ) -> bool {
         let impls = self
             .hir
             .item_tree

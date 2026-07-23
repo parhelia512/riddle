@@ -764,6 +764,22 @@ fn wrapped_method_return_preserves_receiver_provenance() {
 }
 
 #[test]
+fn generic_supertrait_shared_methods_do_not_move_receiver() {
+    let result = analyze(
+        r#"
+        trait Named { fun name(&self) -> i32; }
+        trait Tagged: Named { fun tag(&self) -> i32; }
+
+        fun describe<T: Tagged>(value: T) -> i32 {
+            value.name() + value.tag()
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
 fn non_generic_enum_preserves_reference_provenance() {
     let result = analyze(
         r#"

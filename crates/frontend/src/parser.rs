@@ -1676,6 +1676,14 @@ impl<'s> Parser<'s> {
         self.optional_pub();
         self.expect(SyntaxKind::Trait);
         self.expect(SyntaxKind::Ident);
+        if self.at(SyntaxKind::Colon) {
+            self.bump();
+            self.generic_bound();
+            while self.at(SyntaxKind::Plus) {
+                self.bump();
+                self.generic_bound();
+            }
+        }
         self.expect(SyntaxKind::LBrace);
 
         while !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
@@ -1690,11 +1698,11 @@ impl<'s> Parser<'s> {
         self.attrs();
         match self.current() {
             SyntaxKind::Pub => match self.nth(1) {
-                SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_sig(false),
+                SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_decl(),
                 SyntaxKind::TypeKw => self.type_alias_decl(),
                 _ => self.error(format!("expected trait item, found {:?}", self.current())),
             },
-            SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_sig(false),
+            SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_decl(),
             SyntaxKind::TypeKw => self.type_alias_decl(),
             _ => {
                 self.error(format!("expected trait item, found {:?}", self.current()));
@@ -1935,6 +1943,7 @@ impl<'s> Parser<'s> {
         self.attrs();
         let m = self.start();
         self.optional_pub();
+        let is_unsafe = self.at(SyntaxKind::Unsafe);
         self.optional_unsafe();
         self.expect(SyntaxKind::Extern);
         let _abi = self.expect(SyntaxKind::String); // "C"
@@ -1945,6 +1954,9 @@ impl<'s> Parser<'s> {
             m.complete(self, SyntaxKind::ExternFnDecl);
         } else if self.at(SyntaxKind::LBrace) {
             // extern "C" { fun ...; fun ...; }
+            if !is_unsafe {
+                self.error_no_bump("extern blocks must use `unsafe extern`".into());
+            }
             self.expect(SyntaxKind::LBrace);
             while !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
                 self.attrs();

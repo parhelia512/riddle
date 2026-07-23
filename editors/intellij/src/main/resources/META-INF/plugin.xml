@@ -14,7 +14,7 @@
             fieldName="INSTANCE"
             language="Riddle"
             extensions="rid" />
-        <platform.lsp.integrationProvider
-            implementation="org.riddlelang.intellij.RiddleLspIntegrationProvider" />
+        <platform.lsp.serverSupportProvider
+            implementation="org.riddlelang.intellij.RiddleLspServerSupportProvider" />
     </extensions>
 </idea-plugin>

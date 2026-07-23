@@ -158,6 +158,8 @@ impl<'a> TypeChecker<'a> {
                 let self_ty =
                     self.lower_type_ref_with_params_at(&self_ty_ref, &params, Some(range));
                 params.insert("Self".into(), self_ty);
+            } else if self.trait_for_default_method(id).is_some() {
+                params.insert("Self".into(), Type::Param("Self".into()));
             }
             self.check_function_value_types(&function, &params);
         }
@@ -384,6 +386,8 @@ impl<'a> TypeChecker<'a> {
             let self_ty =
                 self.lower_type_ref_with_params_at(&self_ty_ref, &params, Some(self_ty_range));
             params.insert("Self".into(), self_ty);
+        } else if self.trait_for_default_method(function_id).is_some() {
+            params.insert("Self".into(), Type::Param("Self".into()));
         }
         let return_ty = function
             .ret_type
@@ -681,6 +685,17 @@ impl<'a> TypeChecker<'a> {
             .find_map(|(_, imp)| imp.methods.contains(&function_id).then_some(&imp.self_ty))
     }
 
+    pub(crate) fn trait_for_default_method(
+        &self,
+        function_id: FunctionId,
+    ) -> Option<hir::item_tree::TraitId> {
+        self.hir.item_tree.traits.iter().find_map(|(trait_id, tr)| {
+            tr.default_methods
+                .contains(&function_id)
+                .then_some(trait_id)
+        })
+    }
+
     pub(crate) fn impl_self_ty_range(&self, function_id: FunctionId) -> Option<TextRange> {
         self.hir.item_tree.impls.iter().find_map(|(_, imp)| {
             imp.methods
@@ -696,17 +711,6 @@ impl<'a> TypeChecker<'a> {
                 .any(|attr| attr.name.0 == "lang" && attr.value.as_deref() == Some(lang))
                 .then_some(id)
         })
-    }
-
-    pub(crate) fn trait_lang(&self, trait_id: hir::item_tree::TraitId) -> Option<&str> {
-        self.hir.item_tree.traits[trait_id]
-            .attrs
-            .iter()
-            .find_map(|attr| {
-                (attr.name.0 == "lang")
-                    .then_some(attr.value.as_deref())
-                    .flatten()
-            })
     }
 
     pub(crate) fn check_type_layouts(&mut self) {
@@ -1078,16 +1082,16 @@ impl<'a> TypeChecker<'a> {
             "E0031" => vec!["add `mut` to the `let` binding if reassignment is intended".into()],
             "E0033" => vec!["recursive generic calls must reuse the same type arguments; wrapping them requires infinitely many instantiations".into()],
             "E0035" => vec!["the inferred type must implement every trait bound on the generic parameter".into()],
-            "E0036" => vec!["add the required comparison trait impl for this type".into()],
+            "E0036" => vec!["add the required trait impl for this type".into()],
             "E0037" => vec!["make impl where-clause bounds structurally smaller than the implemented type".into()],
             "E0038" => vec!["use a variant pattern whose shape and fields match the enum declaration".into()],
             "E0039" => vec!["cover every possible case or add a wildcard arm".into()],
             "E0041" => vec!["every field must implement `Copy`; add the required generic bounds or remove the impl".into()],
             "E0042" => vec!["move this statement inside a `while` or `for` loop".into()],
             "E0043" => vec!["use `&str` or a raw pointer; unsized `str` must be behind a reference or pointer".into()],
+            "E0044" => vec!["define every supertrait and remove cycles from the trait hierarchy".into()],
             "E0045" => vec!["add an explicit parameter type or use the function where its signature is known".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
-            "E0021" => vec!["trait method declarations should not have a body".into()],
             "E0022" | "E0025" => vec!["remove the duplicate associated type".into()],
             "E0023" => vec!["define the trait or import it into scope".into()],
             "E0026" => vec!["add an implementation for the required method".into()],

@@ -415,6 +415,22 @@ impl TraitDecl {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    pub fn supertraits(&self) -> Vec<GenericBound> {
+        let elements = self.syntax.children_with_tokens().collect::<Vec<_>>();
+        let Some(colon) = elements.iter().position(
+            |element| matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::Colon),
+        ) else {
+            return Vec::new();
+        };
+        let end = elements
+            .iter()
+            .position(
+                |element| matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::LBrace),
+            )
+            .unwrap_or(elements.len());
+        parse_generic_bounds(&elements[colon + 1..end])
+    }
+
     pub fn methods(&self) -> impl Iterator<Item = FuncDecl> + '_ {
         support::children(&self.syntax)
     }

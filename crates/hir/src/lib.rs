@@ -124,7 +124,7 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
             }
 
             ast::Stmt::TraitDecl(t) => {
-                let tid = t.lower(&mut hir.item_tree.traits);
+                let tid = lower_trait_decl(hir, t);
                 items.push(TopLevelItem::Trait(tid));
             }
 
@@ -151,6 +151,57 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
         }
     }
     items
+}
+
+pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tree::TraitId {
+    use item_tree::{HirGenericBound, HirPath, HirTypeRef, PathAnchor};
+
+    let default_methods = t
+        .methods()
+        .filter_map(|method| method.body().map(|body| (method, body)))
+        .collect::<Vec<_>>();
+    let tid = t.lower(&mut hir.item_tree.traits);
+    let trait_name = hir.item_tree.traits[tid].name.clone();
+
+    for (method, body_ast) in default_methods {
+        let receivers = method
+            .param_list()
+            .map(|params| {
+                params
+                    .params()
+                    .map(|param| (param.is_self_receiver(), param.is_ref(), param.is_mut()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let fid = method.lower(&mut hir.item_tree.functions);
+        let self_ty = HirTypeRef::Named(HirPath {
+            anchor: PathAnchor::Plain,
+            segments: vec![Name("Self".into())],
+            type_args: Vec::new(),
+        });
+        apply_self_receiver_types(&mut hir.item_tree.functions[fid], &receivers, &self_ty);
+        let range = hir.item_tree.functions[fid].name_range;
+        hir.item_tree.functions[fid]
+            .generic_bounds
+            .push(HirGenericBound {
+                param: Name("Self".into()),
+                target_ty: self_ty,
+                target_range: range,
+                trait_ty: HirTypeRef::Named(HirPath {
+                    anchor: PathAnchor::Plain,
+                    segments: vec![trait_name.clone()],
+                    type_args: Vec::new(),
+                }),
+                trait_range: range,
+                assoc_constraints: Vec::new(),
+            });
+        let body = BodyLower::lower(hir, body_ast);
+        let body_id = hir.bodies.alloc(body);
+        hir.function_bodies.insert(fid, body_id);
+        hir.item_tree.traits[tid].default_methods.push(fid);
+    }
+
+    tid
 }
 
 /// Lowers `mod foo { ... }` or `mod foo;` into the item tree.

@@ -884,6 +884,28 @@ impl<'a> Analyzer<'a> {
         callee: ExprId,
         args: &[ExprId],
     ) -> (Vec<ExprId>, Vec<Option<BorrowKind>>, Option<FunctionId>) {
+        if let Some(call) = self
+            .type_result
+            .trait_method_calls
+            .get(&(ctx.body_id, callee))
+            && let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee]
+            && let Some(function) = self.hir.item_tree.traits[call.trait_id]
+                .methods
+                .iter()
+                .find(|method| method.name.0 == call.method)
+        {
+            let inputs = std::iter::once(*base)
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>();
+            let modes = function
+                .params
+                .iter()
+                .take(inputs.len())
+                .map(|param| hir_ref_kind(&param.ty))
+                .collect();
+            return (inputs, modes, None);
+        }
+
         let fid = match self.type_result.expr_types.get(&(ctx.body_id, callee)) {
             Some(Type::Function(fid)) => Some(*fid),
             _ => None,

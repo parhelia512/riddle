@@ -447,13 +447,13 @@ fn checks_eq_marker_dependencies() {
         trait PartialEq {}
 
         #[lang = "eq"]
-        trait Eq {}
+        trait Eq: PartialEq {}
 
         #[lang = "partial_ord"]
-        trait PartialOrd {}
+        trait PartialOrd: PartialEq {}
 
         #[lang = "ord"]
-        trait Ord {}
+        trait Ord: Eq + PartialOrd {}
 
         struct MissingEq {}
         struct MissingPartialOrd {}
@@ -1073,6 +1073,104 @@ fn accepts_outer_attributes_on_common_ast_nodes() {
             match x {
                 #[arm] #[pat] other => other,
             }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn supertrait_bound_exposes_parent_methods() {
+    let result = check(
+        r#"
+        trait Named {
+            fun name(&self) -> i32;
+        }
+
+        trait Tagged: Named {
+            fun tag(&self) -> i32;
+        }
+
+        struct Item { value: i32 }
+
+        impl Named for Item {
+            fun name(&self) -> i32 { self.value }
+        }
+
+        impl Tagged for Item {
+            fun tag(&self) -> i32 { self.value }
+        }
+
+        fun describe<T: Tagged>(value: T) -> i32 {
+            value.name() + value.tag()
+        }
+
+        fun main() {
+            let value = describe(Item { value: 1 });
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn supertrait_impl_requires_parent_impl() {
+    let result = check(
+        r#"
+        trait Parent {}
+        trait Child: Parent {}
+
+        struct Item {}
+        impl Child for Item {}
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("impl `Child` for `Item` requires `Parent`")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn reports_invalid_supertraits() {
+    let result = check(
+        r#"
+        trait MissingParent: Unknown {}
+        trait First: Second {}
+        trait Second: First {}
+        "#,
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("unknown supertrait `Unknown`")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|msg| msg.contains("supertrait cycle")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn trait_default_method_can_call_required_method() {
+    let result = check(
+        r#"
+        trait Value {
+            fun base(&self) -> i32;
+            fun value(&self) -> i32 {
+                self.base() + 1
+            }
+        }
+
+        struct Item {}
+        impl Value for Item {
+            fun base(&self) -> i32 { 6 }
         }
         "#,
     );

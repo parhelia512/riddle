@@ -150,6 +150,9 @@ impl<'a> ScopeGraphBuilder<'a> {
                         frag_nodes,
                         frag_edges,
                     );
+                    for fid in self.hir.item_tree.traits[*tid].default_methods.clone() {
+                        self.encode_function_body(fid, parent_scope, frag_nodes, frag_edges);
+                    }
                 }
                 TopLevelItem::Const(cid) => {
                     let name = self.hir.item_tree.consts[*cid].name.clone();

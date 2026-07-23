@@ -606,10 +606,12 @@ fn hash_variant(variant: &HirEnumVariant, hasher: &mut impl Hasher) {
 fn hash_trait(trait_item: &HirTrait, hasher: &mut impl Hasher) {
     trait_item.name.hash(hasher);
     trait_item.visibility.is_public().hash(hasher);
+    hash_bounds(&trait_item.supertraits, hasher);
     trait_item.methods.len().hash(hasher);
     for method in &trait_item.methods {
         hash_function(method, hasher);
     }
+    format!("{:?}", trait_item.default_methods).hash(hasher);
     trait_item.type_aliases.len().hash(hasher);
     for alias in &trait_item.type_aliases {
         hash_type_alias(alias, hasher);

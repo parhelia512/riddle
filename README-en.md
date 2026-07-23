@@ -24,7 +24,7 @@ available in [The Riddle Book](https://riddle-lang.github.io/docs/).
 - `riddle-lsp`: provides editor diagnostics and semantic highlighting.
 
 The [`editors`](./editors) directory contains `riddle-lsp` integrations for
-Helix, VS Code, Zed, and IntelliJ IDEA 2026.2+.
+Helix, VS Code, Zed, and IntelliJ IDEA 2026.1+.
 
 ## Installation
 

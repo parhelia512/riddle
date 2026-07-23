@@ -2,7 +2,7 @@ pub use crate::std::array::IntoIter as ArrayIter;
 pub use crate::std::clone::Clone;
 pub use crate::std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 pub use crate::std::iter::{IntoIterator, Iterator};
-pub use crate::std::io::{print, Display};
+pub use crate::std::io::{print, println, Display};
 pub use crate::std::marker::Copy;
 pub use crate::std::ops::{range, Range};
 pub use crate::std::option::Option;

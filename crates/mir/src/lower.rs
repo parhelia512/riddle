@@ -46,12 +46,24 @@ pub fn lower_hir(
                 .map(move |function_id| (function_id, impl_id))
         })
         .collect();
+    let default_methods = hir
+        .item_tree
+        .traits
+        .iter()
+        .flat_map(|(trait_id, tr)| {
+            tr.default_methods
+                .iter()
+                .copied()
+                .map(move |function_id| (function_id, trait_id))
+        })
+        .collect();
     let mut ctx = LowerCtx {
         hir,
         type_result,
         analysis: escape_result,
         module: Module::new("main"),
         method_impls,
+        default_methods,
         expr_cache: HashMap::new(),
         current_body: None,
         current_function: None,
@@ -75,6 +87,7 @@ pub fn lower_hir(
     // 遍历所有有函数体的函数
     for (fid, func) in hir.item_tree.functions.iter() {
         if ctx.builtin_operator_for_method(fid).is_some()
+            || ctx.default_methods.contains_key(&fid)
             || !func.generics.is_empty()
             || ctx
                 .impl_for_method(fid)
@@ -127,6 +140,7 @@ struct LowerCtx<'a> {
     analysis: &'a EscapeResult,
     module: Module,
     method_impls: HashMap<hir::item_tree::FunctionId, hir::item_tree::ImplId>,
+    default_methods: HashMap<hir::item_tree::FunctionId, hir::item_tree::TraitId>,
     expr_cache: HashMap<ExprId, Value>,
     /// The BodyId currently being lowered, used to look up expr_types.
     current_body: Option<BodyId>,
@@ -2273,15 +2287,43 @@ impl<'a> LowerCtx<'a> {
         receiver_ty: &type_checker::Type,
     ) -> Option<hir::item_tree::FunctionId> {
         let receiver_ty = self.substitute_tc_type(receiver_ty);
-        self.hir.item_tree.impls.iter().find_map(|(_, candidate)| {
-            let candidate_trait = candidate.trait_ty.as_ref()?;
-            (self.resolve_trait_ref(candidate_trait) == Some(trait_id)).then_some(())?;
-            self.impl_type_matches(candidate, &receiver_ty)
-                .then_some(())?;
-            candidate.methods.iter().copied().find(|candidate_fid| {
-                self.hir.item_tree.functions[*candidate_fid].name.0 == method_name
-            })
-        })
+        let dereferenced = match &receiver_ty {
+            type_checker::Type::Ref(inner, _) => Some(inner.as_ref()),
+            _ => None,
+        };
+        for receiver_ty in std::iter::once(&receiver_ty).chain(dereferenced) {
+            for (_, candidate) in self.hir.item_tree.impls.iter() {
+                let Some(candidate_trait) = candidate.trait_ty.as_ref() else {
+                    continue;
+                };
+                if self.resolve_trait_ref(candidate_trait) != Some(trait_id)
+                    || !self.impl_type_matches(candidate, receiver_ty)
+                {
+                    continue;
+                }
+                return candidate
+                    .methods
+                    .iter()
+                    .copied()
+                    .find(|candidate_fid| {
+                        self.hir.item_tree.functions[*candidate_fid].name.0 == method_name
+                    })
+                    .or_else(|| self.default_method(trait_id, method_name));
+            }
+        }
+        None
+    }
+
+    fn default_method(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        method_name: &str,
+    ) -> Option<hir::item_tree::FunctionId> {
+        self.hir.item_tree.traits[trait_id]
+            .default_methods
+            .iter()
+            .copied()
+            .find(|fid| self.hir.item_tree.functions[*fid].name.0 == method_name)
     }
 
     fn lower_receiver_arg(
@@ -2965,6 +3007,47 @@ impl<'a> LowerCtx<'a> {
         receiver_ty: &type_checker::Type,
     ) -> Option<String> {
         let receiver_ty = self.substitute_tc_type(receiver_ty);
+        if self.default_methods.contains_key(&fid) {
+            let receiver_mir_ty = self.convert_type(&receiver_ty);
+            let suffix = mono_type_name(&receiver_mir_ty);
+            let key = (fid, suffix.clone());
+            if let Some(name) = self.mono_methods.get(&key) {
+                return Some(name.clone());
+            }
+
+            let mono_name = format!("{}__{}", self.hir.item_tree.functions[fid].name.0, suffix);
+            self.mono_methods.insert(key, mono_name.clone());
+            let old_subst = std::mem::replace(
+                &mut self.generic_subst,
+                HashMap::from([("Self".into(), receiver_mir_ty)]),
+            );
+            let old_tc_subst = std::mem::replace(
+                &mut self.generic_tc_subst,
+                HashMap::from([("Self".into(), receiver_ty)]),
+            );
+            let old_expr_cache = std::mem::take(&mut self.expr_cache);
+            let old_scope_map = std::mem::take(&mut self.scope_map);
+            let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
+            let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
+            let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
+            let old_capture_access = std::mem::take(&mut self.capture_access);
+            let old_current_lambda = self.current_lambda;
+            let old_current_body = self.current_body;
+            let body_id = *self.hir.function_bodies.get(&fid)?;
+            let func = self.lower_function(fid, mono_name.clone(), body_id);
+            self.expr_cache = old_expr_cache;
+            self.scope_map = old_scope_map;
+            self.storage_bindings = old_storage_bindings;
+            self.parameter_storage = old_parameter_storage;
+            self.pattern_bindings = old_pattern_bindings;
+            self.capture_access = old_capture_access;
+            self.current_lambda = old_current_lambda;
+            self.current_body = old_current_body;
+            self.generic_subst = old_subst;
+            self.generic_tc_subst = old_tc_subst;
+            self.module.add_function(func);
+            return Some(mono_name);
+        }
         let imp = self.impl_for_method(fid)?.clone();
         if imp.generics.is_empty() && imp.const_generics.is_empty() {
             return None;

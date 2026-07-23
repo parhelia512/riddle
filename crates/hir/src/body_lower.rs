@@ -249,8 +249,7 @@ impl<'a> BodyLower<'a> {
             }
 
             ast::Stmt::TraitDecl(t) => {
-                use crate::lower::AstLower;
-                let _tid = t.lower(&mut self.hir.item_tree.traits);
+                let _tid = crate::lower_trait_decl(self.hir, t);
                 None
             }
 

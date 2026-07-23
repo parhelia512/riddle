@@ -578,7 +578,7 @@ fn inner_block_returned_borrow_does_escape() {
 fn unknown_external_reference_return_is_conservative() {
     let result = analyze(
         r#"
-        extern "C" {
+        unsafe extern "C" {
             fun choose(value: &mut i32) -> &mut i32;
         }
         fun update(value: &mut i32) { *value += 1; }

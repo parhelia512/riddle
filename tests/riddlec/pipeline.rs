@@ -241,6 +241,26 @@ fn syntax_error_at_eof_stays_in_user_source_with_std_enabled() {
 }
 
 #[test]
+fn extern_blocks_require_unsafe_modifier() {
+    let result = compile_with_options(
+        r#"
+            extern "C" { fun external(); }
+            fun main() {}
+        "#,
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        result
+            .parse_errors
+            .iter()
+            .any(|error| error.message.contains("unsafe extern")),
+        "{:#?}",
+        result.parse_errors
+    );
+}
+
+#[test]
 fn pipeline_stops_at_the_requested_stage() {
     let source = "fun main() { let value = 1; value; }";
     let options = CompileOptions { use_std: false };

@@ -818,6 +818,49 @@ fn c_backend_dispatches_trait_bound_method_in_generic_function() {
 }
 
 #[test]
+fn c_backend_uses_trait_default_method_unless_overridden() {
+    let module = lower(
+        r#"
+        trait Value {
+            fun base(&self) -> i32;
+
+            fun value(&self) -> i32 {
+                self.base() + 1
+            }
+        }
+
+        struct Defaulted {}
+        struct Overridden {}
+
+        impl Value for Defaulted {
+            fun base(&self) -> i32 {
+                6
+            }
+        }
+        impl Value for Overridden {
+            fun base(&self) -> i32 {
+                0
+            }
+
+            fun value(&self) -> i32 {
+                9
+            }
+        }
+
+        fun main() -> i32 {
+            let defaulted = Defaulted {};
+            let overridden = Overridden {};
+            defaulted.value() + overridden.value()
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("value__Defaulted("), "{generated}");
+    assert!(generated.contains("value__Overridden("), "{generated}");
+}
+
+#[test]
 fn c_backend_lowers_non_copy_array_into_iterator() {
     let module = lower(
         r#"
