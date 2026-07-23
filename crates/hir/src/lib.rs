@@ -5,6 +5,7 @@ use body::{Body, BodyId};
 use item_tree::{FunctionId, HirModule, HirUse, ItemTree, ModuleId, TopLevelItem};
 use la_arena::Arena;
 use lower::{AstLower, Lower};
+use rowan::TextRange;
 
 use ast::{
     self, Root,
@@ -25,9 +26,12 @@ pub struct HirFile {
     pub item_tree: ItemTree,
     pub bodies: Arena<Body>,
     pub function_bodies: HashMap<FunctionId, BodyId>,
+    /// Disjoint source ranges owned by packages participating in this compilation.
+    pub package_ranges: Vec<TextRange>,
 }
 
 pub fn lower_root(root: Root) -> HirFile {
+    let package_range = root.syntax().text_range();
     let mut hir = HirFile {
         item_tree: ItemTree {
             functions: Arena::new(),
@@ -44,11 +48,20 @@ pub fn lower_root(root: Root) -> HirFile {
         },
         bodies: Arena::new(),
         function_bodies: HashMap::new(),
+        package_ranges: vec![package_range],
     };
 
     let top = lower_items(&mut hir, root.stmts().collect());
     hir.item_tree.top_level = top;
     hir
+}
+
+impl HirFile {
+    pub fn package_for_range(&self, range: TextRange) -> Option<usize> {
+        self.package_ranges
+            .iter()
+            .position(|package| package.start() <= range.start() && range.end() <= package.end())
+    }
 }
 
 pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLevelItem> {

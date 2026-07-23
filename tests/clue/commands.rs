@@ -854,3 +854,71 @@ math = { path = "../math" }
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn check_enforces_orphan_rules_inside_dependencies() {
+    let root = temp_root("dependency-orphan-rule");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "base", "--lib"], &root).status.success());
+    assert!(clue(&["new", "middle", "--lib"], &root).status.success());
+    assert!(clue(&["new", "app"], &root).status.success());
+
+    fs::write(
+        root.join("base/src/lib.rid"),
+        "pub trait Foreign {}\npub struct External {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("middle/Clue.toml"),
+        r#"[package]
+name = "middle"
+
+[lib]
+path = "src/lib.rid"
+
+[dependencies]
+base = { path = "../base" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("middle/src/lib.rid"),
+        "use base::{Foreign, External};\nimpl Foreign for External {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+middle = { path = "../middle" }
+"#,
+    )
+    .unwrap();
+
+    let rejected = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(!rejected.status.success());
+    assert!(stderr.contains("E0048"), "{stderr}");
+    assert!(
+        stderr.contains("middle\\src\\lib.rid:2") || stderr.contains("middle/src/lib.rid:2"),
+        "{stderr}"
+    );
+
+    fs::write(
+        root.join("middle/src/lib.rid"),
+        "use base::Foreign;\npub struct Local {}\nimpl Foreign for Local {}\n",
+    )
+    .unwrap();
+    let accepted = clue(&["check", "app"], &root);
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}

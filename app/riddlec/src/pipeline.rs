@@ -136,8 +136,21 @@ impl CheckSession {
     }
 
     pub fn check_with_options(&mut self, source: &str, options: CompileOptions) -> CompileResult {
+        // Single-package compile: one range spanning the whole source, not a
+        // collectible range of indices.
+        #[allow(clippy::single_range_in_vec_init)]
+        self.check_package_with_options(source, &[0..source.len()], options)
+    }
+
+    pub fn check_package_with_options(
+        &mut self,
+        source: &str,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+    ) -> CompileResult {
         run_pipeline_with_state(
             source,
+            package_ranges,
             options,
             PipelineDepth::Check,
             &mut self.parser,
@@ -416,6 +429,36 @@ pub fn check_with_options(source: &str, options: CompileOptions) -> CompileResul
     run_pipeline(source, options, PipelineDepth::Check)
 }
 
+pub fn compile_package_with_options(
+    source: &str,
+    package_ranges: &[Range<usize>],
+    options: CompileOptions,
+) -> CompileResult {
+    run_pipeline_with_state(
+        source,
+        package_ranges,
+        options,
+        PipelineDepth::Build,
+        &mut IncrementalParser::new(),
+        None,
+    )
+}
+
+pub fn check_package_with_options(
+    source: &str,
+    package_ranges: &[Range<usize>],
+    options: CompileOptions,
+) -> CompileResult {
+    run_pipeline_with_state(
+        source,
+        package_ranges,
+        options,
+        PipelineDepth::Check,
+        &mut IncrementalParser::new(),
+        None,
+    )
+}
+
 pub fn resolve_with_options(source: &str, options: CompileOptions) -> CompileResult {
     run_pipeline(source, options, PipelineDepth::Resolve)
 }
@@ -428,12 +471,23 @@ enum PipelineDepth {
 }
 
 fn run_pipeline(source: &str, options: CompileOptions, depth: PipelineDepth) -> CompileResult {
-    let mut parser = IncrementalParser::new();
-    run_pipeline_with_state(source, options, depth, &mut parser, None)
+    // Single-package compile: one range spanning the whole source, not a
+    // collectible range of indices.
+    #[allow(clippy::single_range_in_vec_init)]
+    let package_ranges = [0..source.len()];
+    run_pipeline_with_state(
+        source,
+        &package_ranges,
+        options,
+        depth,
+        &mut IncrementalParser::new(),
+        None,
+    )
 }
 
 fn run_pipeline_with_state(
     source: &str,
+    package_ranges: &[Range<usize>],
     options: CompileOptions,
     depth: PipelineDepth,
     parser: &mut IncrementalParser,
@@ -469,6 +523,10 @@ fn run_pipeline_with_state(
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
     let mut hir = lower_root(root);
+    hir.package_ranges = package_ranges
+        .iter()
+        .map(|range| rowan::TextRange::new((range.start as u32).into(), (range.end as u32).into()))
+        .collect();
 
     // 3. Build scope graph + resolve names
     let (sg, scope_diagnostics) = build_scope_graph(&hir, &syntax);

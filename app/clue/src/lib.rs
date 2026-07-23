@@ -63,7 +63,11 @@ pub fn check_project_with_session(
     session: &mut riddlec::pipeline::CheckSession,
 ) -> anyhow::Result<ProjectAnalysis> {
     let package = project::load_with_overlays(path, overlays)?;
-    let result = session.check_with_options(&package.source.source, options);
+    let result = session.check_package_with_options(
+        &package.source.source,
+        &package.package_ranges,
+        options,
+    );
     Ok(ProjectAnalysis {
         entry: package.entry,
         source: package.source,
@@ -83,9 +87,17 @@ fn analyze_project_impl(
 ) -> anyhow::Result<ProjectAnalysis> {
     let package = project::load_with_overlays(path, overlays)?;
     let result = if build {
-        riddlec::pipeline::compile_with_options(&package.source.source, options)
+        riddlec::pipeline::compile_package_with_options(
+            &package.source.source,
+            &package.package_ranges,
+            options,
+        )
     } else {
-        riddlec::pipeline::check_with_options(&package.source.source, options)
+        riddlec::pipeline::check_package_with_options(
+            &package.source.source,
+            &package.package_ranges,
+            options,
+        )
     };
     Ok(ProjectAnalysis {
         entry: package.entry,

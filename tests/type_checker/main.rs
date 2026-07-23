@@ -12,15 +12,28 @@ mod unsafe_test;
 use ast::{self, support::AstNode};
 use frontend::{incremental::IncrementalParser, tree_builder::Parse};
 use hir::{HirFile, lower_root};
+use rowan::TextRange;
 use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
 use type_checker::{Diagnostic, TypeCheckResult, check_hir};
 
 fn check(source: &str) -> TypeCheckResult {
+    #[allow(clippy::single_range_in_vec_init)]
+    check_with_package_ranges(source, &[0..source.len()])
+}
+
+fn check_with_package_ranges(
+    source: &str,
+    package_ranges: &[std::ops::Range<usize>],
+) -> TypeCheckResult {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
-    let hir = lower_and_resolve(parse);
+    let mut hir = lower_and_resolve(parse);
+    hir.package_ranges = package_ranges
+        .iter()
+        .map(|range| TextRange::new((range.start as u32).into(), (range.end as u32).into()))
+        .collect();
     let result = check_hir(&hir);
     diagnostic_support::assert_type_diagnostics(source, &result.diagnostics);
     result

@@ -1,4 +1,4 @@
-use crate::{check, messages};
+use crate::{check, check_with_package_ranges, messages};
 
 #[test]
 fn accepts_matching_trait_impl_required_items() {
@@ -473,6 +473,55 @@ fn accepts_disjoint_impls_with_shared_generic_relationship() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "E0047")
+    );
+}
+
+#[test]
+fn enforces_orphan_rules_per_package() {
+    let foreign = r#"
+        trait Foreign<T = i32> {}
+        struct ForeignType {}
+        struct ForeignBox<T> { value: T }
+        #[fundamental]
+        struct FundBox<T> { value: T }
+    "#;
+    let local = r#"
+        struct Local<T> { value: T }
+        trait LocalTrait {}
+
+        impl Foreign for ForeignType {}
+        impl<T> Foreign<T> for Local<T> {}
+        impl LocalTrait for ForeignType {}
+        impl<T> Foreign<Local<T>> for T {}
+        impl Foreign for &Local<i32> {}
+        impl Foreign for ForeignBox<Local<i32>> {}
+        impl<T> Foreign<Local<i32>> for ForeignBox<T> {}
+        impl Foreign for FundBox<Local<i32>> {}
+    "#;
+    let source = format!("{foreign}{local}");
+    let result =
+        check_with_package_ranges(&source, &[0..foreign.len(), foreign.len()..source.len()]);
+    let orphan_errors = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0048")
+        .collect::<Vec<_>>();
+
+    assert_eq!(orphan_errors.len(), 4, "{:?}", result.diagnostics);
+    assert!(
+        orphan_errors
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("foreign type `ForeignType`"))
+    );
+    assert!(
+        orphan_errors
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("type parameter `T`"))
+    );
+    assert!(
+        orphan_errors
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("foreign type `ForeignBox"))
     );
 }
 

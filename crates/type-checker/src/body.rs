@@ -914,7 +914,7 @@ impl TypeChecker<'_> {
         }
         let receiver_ty = Self::default_inferred_numeric_type(lhs_ty);
         let method =
-            self.find_trait_impl_method(&receiver_ty, Some(&rhs_ty), trait_id, method_name)?;
+            self.find_trait_impl_method(&receiver_ty, Some(rhs_ty), trait_id, method_name)?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -949,7 +949,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(rhs_param.ty_range),
         );
-        let actual_rhs = self.receiver_argument_type(&rhs_ty, &expected_rhs);
+        let actual_rhs = self.receiver_argument_type(rhs_ty, &expected_rhs);
         self.expect_assignable(
             &expected_rhs,
             &actual_rhs,
@@ -1064,7 +1064,7 @@ impl TypeChecker<'_> {
         }
         let receiver_ty = Self::default_inferred_numeric_type(lhs_ty);
         let method =
-            self.find_trait_impl_method(&receiver_ty, Some(&rhs_ty), trait_id, method_name)?;
+            self.find_trait_impl_method(&receiver_ty, Some(rhs_ty), trait_id, method_name)?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -1087,7 +1087,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(rhs_param.ty_range),
         );
-        let actual_rhs = self.receiver_argument_type(&rhs_ty, &expected_rhs);
+        let actual_rhs = self.receiver_argument_type(rhs_ty, &expected_rhs);
         self.expect_assignable(
             &expected_rhs,
             &actual_rhs,

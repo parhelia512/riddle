@@ -371,7 +371,13 @@ impl AstLower for ast::TraitDecl {
     type Id = TraitId;
     type Item = HirTrait;
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
-        let name = lower_name(self.name());
+        let range = trimmed_range(self.syntax());
+        let name_token = self.name();
+        let name_range = name_token
+            .as_ref()
+            .map(|token| token.text_range())
+            .unwrap_or(range);
+        let name = lower_name(name_token);
         let visibility = lower_visibility(self.is_pub());
         let generic_params = self.generic_params();
         let generics = lower_generic_params(generic_params.clone());
@@ -480,6 +486,7 @@ impl AstLower for ast::TraitDecl {
         let attrs = lower_attrs(self.syntax());
         arena.alloc(HirTrait {
             name,
+            name_range,
             visibility,
             generics,
             generic_defaults,

@@ -1162,6 +1162,7 @@ impl<'a> TypeChecker<'a> {
             "E0044" => vec!["define every supertrait and remove cycles from the trait hierarchy".into()],
             "E0045" => vec!["add an explicit parameter type or use the function where its signature is known".into()],
             "E0047" => vec!["remove the duplicate or overlapping trait implementation".into()],
+            "E0048" => vec!["define the trait or a participating nominal type in the current package".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
             "E0022" | "E0025" => vec!["remove the duplicate associated type".into()],
             "E0023" => vec!["define the trait or import it into scope".into()],

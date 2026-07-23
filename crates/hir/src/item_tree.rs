@@ -157,6 +157,7 @@ pub enum HirVariantKind {
 #[derive(Debug, Clone)]
 pub struct HirTrait {
     pub name: Name,
+    pub name_range: TextRange,
     pub visibility: Visibility,
     pub generics: Vec<Name>,
     pub generic_defaults: Vec<Option<HirTypeRef>>,

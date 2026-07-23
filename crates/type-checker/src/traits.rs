@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use hir::item_tree::{HirFunction, HirImpl, HirTrait, HirTypeRef, TraitId, TypeAliasId};
+use hir::item_tree::{HirAttr, HirFunction, HirImpl, HirTrait, HirTypeRef, TraitId, TypeAliasId};
 use rowan::TextRange;
 
 use crate::{
@@ -122,7 +122,7 @@ impl TypeChecker<'_> {
                 continue;
             };
 
-            let params = coherence_param_map(imp, index);
+            let (param_prefix, params) = coherence_param_map(imp, index);
             let diagnostics_start = self.result.diagnostics.len();
             let self_ty =
                 self.lower_type_ref_with_params_at(&imp.self_ty, &params, Some(imp.self_ty_range));
@@ -135,6 +135,7 @@ impl TypeChecker<'_> {
             {
                 continue;
             }
+            self.check_impl_orphan_rule(imp, trait_id, &self_ty, &trait_args, &param_prefix);
             headers.push(CoherenceHeader {
                 trait_id,
                 self_ty,
@@ -167,6 +168,80 @@ impl TypeChecker<'_> {
                     });
                 }
             }
+        }
+    }
+
+    fn check_impl_orphan_rule(
+        &mut self,
+        imp: &HirImpl,
+        trait_id: TraitId,
+        self_ty: &Type,
+        trait_args: &[Type],
+        param_prefix: &str,
+    ) {
+        let Some(package) = self.hir.package_for_range(imp.self_ty_range) else {
+            return;
+        };
+        let tr = &self.hir.item_tree.traits[trait_id];
+        if self.hir.package_for_range(tr.name_range) == Some(package) {
+            return;
+        }
+
+        let types = std::iter::once(self_ty).chain(trait_args);
+        let Some(first_local) = types
+            .clone()
+            .position(|ty| self.orphan_type_is_local(ty, package))
+        else {
+            self.diagnostic(
+                "E0048",
+                format!(
+                    "cannot implement foreign trait `{}` for foreign type `{}`",
+                    tr.name.0,
+                    self_ty.display(self.hir)
+                ),
+                Some(imp.self_ty_range),
+            );
+            return;
+        };
+
+        if let Some(param) = types
+            .take(first_local)
+            .find_map(|ty| uncovered_orphan_param(ty, param_prefix))
+        {
+            self.diagnostic(
+                "E0048",
+                format!(
+                    "type parameter `{param}` must be covered by a local type before implementing foreign trait `{}`",
+                    tr.name.0
+                ),
+                Some(imp.self_ty_range),
+            );
+        }
+    }
+
+    fn orphan_type_is_local(&self, ty: &Type, package: usize) -> bool {
+        match ty {
+            // `&T`/`&mut T` are fundamental: locality is that of the pointee.
+            Type::Ref(inner, _) => self.orphan_type_is_local(inner, package),
+            Type::Struct(id, args) => {
+                let strukt = &self.hir.item_tree.structs[*id];
+                if self.hir.package_for_range(strukt.name_range) == Some(package) {
+                    return true;
+                }
+                // A `#[fundamental]` foreign type is transparent: it is local iff
+                // one of its arguments is (mirrors `Box<LocalType>` in Rust).
+                is_fundamental(&strukt.attrs)
+                    && args.iter().any(|arg| self.orphan_type_is_local(arg, package))
+            }
+            Type::Enum(id, args) => {
+                let enumeration = &self.hir.item_tree.enums[*id];
+                if self.hir.package_for_range(enumeration.name_range) == Some(package) {
+                    return true;
+                }
+                is_fundamental(&enumeration.attrs)
+                    && args.iter().any(|arg| self.orphan_type_is_local(arg, package))
+            }
+            _ => false,
         }
     }
 
@@ -782,9 +857,10 @@ fn collect_bound_trait_refs(
     );
 }
 
-fn coherence_param_map(imp: &HirImpl, index: usize) -> HashMap<String, Type> {
+fn coherence_param_map(imp: &HirImpl, index: usize) -> (String, HashMap<String, Type>) {
     let prefix = format!("__coherence_{index}_");
-    imp.generics
+    let params = imp
+        .generics
         .iter()
         .map(|name| (name.0.clone(), Type::Param(format!("{prefix}{}", name.0))))
         .chain(imp.const_generics.iter().map(|name| {
@@ -793,7 +869,41 @@ fn coherence_param_map(imp: &HirImpl, index: usize) -> HashMap<String, Type> {
                 Type::Const(ConstArg::Param(format!("{prefix}{}", name.0))),
             )
         }))
-        .collect()
+        .collect();
+    (prefix, params)
+}
+
+fn is_fundamental(attrs: &[HirAttr]) -> bool {
+    attrs.iter().any(|attr| attr.name.0 == "fundamental")
+}
+
+/// Finds a type parameter of the impl mentioned anywhere in `ty`.
+///
+/// Called only on types that appear *before* the first local type, so nothing
+/// nested here can be covered by a local constructor — any parameter reachable
+/// through any constructor is uncovered.
+///
+// ponytail: does not treat `#[fundamental]` foreign types as covering their
+// params, so an exotic impl like `impl<T> Foreign<Box<T>, Local> for Foreign2`
+// is rejected though Rust accepts it. Thread `hir` through here to lift that.
+fn uncovered_orphan_param(ty: &Type, prefix: &str) -> Option<String> {
+    match ty {
+        Type::Param(name) => name.strip_prefix(prefix).map(str::to_string),
+        Type::Const(ConstArg::Param(name)) => name.strip_prefix(prefix).map(str::to_string),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } => uncovered_orphan_param(inner, prefix),
+        Type::Array(inner, len) => uncovered_orphan_param(inner, prefix).or_else(|| {
+            let ConstArg::Param(name) = len else { return None };
+            name.strip_prefix(prefix).map(str::to_string)
+        }),
+        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => {
+            elements.iter().find_map(|ty| uncovered_orphan_param(ty, prefix))
+        }
+        Type::Fn { params, ret, .. } => params
+            .iter()
+            .chain(std::iter::once(ret.as_ref()))
+            .find_map(|ty| uncovered_orphan_param(ty, prefix)),
+        _ => None,
+    }
 }
 
 fn coherence_type_is_valid(ty: &Type) -> bool {

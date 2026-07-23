@@ -4,6 +4,7 @@ use riddlec::pipeline;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Error, ErrorKind, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_MAIN: &str = "fun main() {\n}\n";
@@ -97,6 +98,7 @@ pub(crate) struct LoadedPackage {
     pub runtime_source: Option<PathBuf>,
     pub manifest_fingerprint: String,
     pub source: pipeline::LoadedSource,
+    pub package_ranges: Vec<Range<usize>>,
 }
 
 pub(crate) fn load_with_overlays(
@@ -124,6 +126,7 @@ fn load_inner(
     let mut source = String::new();
     let mut files = Vec::new();
     let mut source_map = pipeline::SourceMap::default();
+    let mut package_ranges = Vec::new();
     let mut manifest_fingerprint = manifest.fingerprint.clone();
     for dependency in &manifest.dependencies {
         if !is_ident(&dependency.alias) {
@@ -153,6 +156,7 @@ fn load_inner(
         }
 
         manifest_fingerprint.push_str(&dependency_package.manifest_fingerprint);
+        let dependency_ranges = dependency_package.package_ranges;
         let pipeline::LoadedSource {
             source: dependency_source,
             files: dependency_files,
@@ -163,6 +167,11 @@ fn load_inner(
         let dependency_start = source.len();
         source.push_str(&dependency_source);
         source_map.extend(dependency_map, dependency_start);
+        package_ranges.extend(
+            dependency_ranges
+                .into_iter()
+                .map(|range| range.start + dependency_start..range.end + dependency_start),
+        );
         source.push_str("\n}\n\n");
     }
 
@@ -176,6 +185,7 @@ fn load_inner(
     let own_start = source.len();
     source.push_str(&own_text);
     source_map.extend(own_map, own_start);
+    package_ranges.push(own_start..source.len());
     stack.remove(&root);
     Ok(LoadedPackage {
         name: manifest.name,
@@ -188,6 +198,7 @@ fn load_inner(
             files,
             source_map,
         },
+        package_ranges,
     })
 }
 

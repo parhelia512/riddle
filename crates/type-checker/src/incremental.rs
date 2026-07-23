@@ -105,7 +105,7 @@ impl IncrementalTypeChecker {
             hir,
             |body| syntax_body_fingerprint(body, syntax),
             edit,
-            type_context_fingerprint(&hir.item_tree),
+            type_context_fingerprint_with_packages(hir),
         );
         self.last_source = Some(source);
         result
@@ -503,6 +503,24 @@ fn type_context_fingerprint_with_ranges(tree: &ItemTree) -> u64 {
     let mut hasher = DefaultHasher::new();
     type_context_fingerprint(tree).hash(&mut hasher);
     format!("{tree:?}").hash(&mut hasher);
+    hasher.finish()
+}
+
+fn type_context_fingerprint_with_packages(hir: &HirFile) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    type_context_fingerprint(&hir.item_tree).hash(&mut hasher);
+    for (_, item) in hir.item_tree.structs.iter() {
+        hir.package_for_range(item.name_range).hash(&mut hasher);
+    }
+    for (_, item) in hir.item_tree.enums.iter() {
+        hir.package_for_range(item.name_range).hash(&mut hasher);
+    }
+    for (_, item) in hir.item_tree.traits.iter() {
+        hir.package_for_range(item.name_range).hash(&mut hasher);
+    }
+    for (_, item) in hir.item_tree.impls.iter() {
+        hir.package_for_range(item.self_ty_range).hash(&mut hasher);
+    }
     hasher.finish()
 }
 
