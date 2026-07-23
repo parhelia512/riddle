@@ -606,6 +606,9 @@ fn hash_variant(variant: &HirEnumVariant, hasher: &mut impl Hasher) {
 fn hash_trait(trait_item: &HirTrait, hasher: &mut impl Hasher) {
     trait_item.name.hash(hasher);
     trait_item.visibility.is_public().hash(hasher);
+    trait_item.generics.hash(hasher);
+    trait_item.generic_defaults.hash(hasher);
+    hash_bounds(&trait_item.generic_bounds, hasher);
     hash_bounds(&trait_item.supertraits, hasher);
     trait_item.methods.len().hash(hasher);
     for method in &trait_item.methods {

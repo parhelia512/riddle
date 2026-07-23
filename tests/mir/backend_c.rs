@@ -45,6 +45,116 @@ fn c_tuple_types_are_named_and_reusable() {
 }
 
 #[test]
+fn c_tuple_comparison_is_lowered_elementwise() {
+    let module = lower(
+        r#"
+        #[lang = "partial_eq"]
+        trait PartialEq<Rhs = Self> {
+            fun eq(&self, other: &Rhs) -> bool;
+        }
+
+        impl PartialEq for i32 {
+            fun eq(&self, other: &i32) -> bool {
+                *self == *other
+            }
+        }
+
+        fun main() -> bool {
+            let left: (i32, i32) = (1, 2);
+            let right: (i32, i32) = (1, 2);
+            left == right
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains(".f0 =="), "{generated}");
+    assert!(generated.contains(".f1 =="), "{generated}");
+    assert!(
+        !generated.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("if (tup") && !line.contains(".f0") && !line.contains(".f1")
+        }),
+        "tuple values must not be compared as C structs:\n{generated}"
+    );
+}
+
+#[test]
+fn c_composite_comparison_dispatches_element_trait_impls() {
+    let module = lower(
+        r#"
+        #[lang = "partial_eq"]
+        trait PartialEq<Rhs = Self> {
+            fun eq(&self, other: &Rhs) -> bool;
+        }
+
+        struct Point { value: i32 }
+
+        impl PartialEq for Point {
+            fun eq(&self, other: &Point) -> bool {
+                self.value == other.value
+            }
+        }
+
+        impl PartialEq for i32 {
+            fun eq(&self, other: &i32) -> bool {
+                *self == *other
+            }
+        }
+
+        fun main() -> bool {
+            let left: (Point, i32) = (Point { value: 1 }, 2);
+            let right: (Point, i32) = (Point { value: 1 }, 2);
+            left == right
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("eq__Point"), "{generated}");
+    assert!(
+        !generated
+            .lines()
+            .any(|line| line.contains("Point") && line.contains("==")),
+        "user-defined elements must use PartialEq::eq:\n{generated}"
+    );
+}
+
+#[test]
+fn c_array_comparison_is_lowered_elementwise() {
+    let module = lower(
+        r#"
+        #[lang = "partial_eq"]
+        trait PartialEq<Rhs = Self> {
+            fun eq(&self, other: &Rhs) -> bool;
+        }
+
+        impl PartialEq for i32 {
+            fun eq(&self, other: &i32) -> bool {
+                *self == *other
+            }
+        }
+
+        fun main() -> bool {
+            let left: [i32; 2] = [1, 2];
+            let right: [i32; 2] = [1, 2];
+            left == right
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("arr2["), "{generated}");
+    assert!(generated.contains("arr3["), "{generated}");
+    assert!(
+        !generated
+            .lines()
+            .any(|line| line.trim_start().starts_with("if (arr") && line.contains("==")),
+        "arrays must not be compared by C pointer decay:\n{generated}"
+    );
+}
+
+#[test]
 fn c_anonymous_function_uses_typed_function_pointer() {
     let module = lower(
         r#"

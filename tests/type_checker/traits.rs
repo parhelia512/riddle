@@ -203,6 +203,373 @@ fn accepts_add_operator_impl_call() {
 }
 
 #[test]
+fn operator_traits_accept_defaulted_and_heterogeneous_rhs() {
+    let result = check(
+        r#"
+        #[lang = "add"]
+        trait Add<Rhs = Self> {
+            type Output;
+            fun add(self, rhs: Rhs) -> Self::Output;
+        }
+
+        struct Number { value: i32 }
+        struct Delta { value: i32 }
+
+        impl Add for Number {
+            type Output = Number;
+            fun add(self, rhs: Self) -> Self::Output {
+                Number { value: self.value + rhs.value }
+            }
+        }
+
+        impl Add<Delta> for Number {
+            type Output = i32;
+            fun add(self, rhs: Delta) -> Self::Output {
+                self.value + rhs.value
+            }
+        }
+
+        fun main() {
+            let same: Number = Number { value: 1 } + Number { value: 2 };
+            let mixed: i32 = Number { value: 3 } + Delta { value: 4 };
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert_eq!(result.operator_calls.len(), 2);
+}
+
+#[test]
+fn trait_type_arguments_respect_required_and_defaulted_parameters() {
+    let result = check(
+        r#"
+        trait Required<T> {}
+        trait Defaulted<T = i32> {}
+        struct Item {}
+
+        impl Required for Item {}
+        impl Required<i32, bool> for bool {}
+        impl Defaulted for Item {}
+        "#,
+    );
+
+    let arity_errors = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0032")
+        .collect::<Vec<_>>();
+    assert_eq!(arity_errors.len(), 2, "{:?}", result.diagnostics);
+    assert!(
+        arity_errors
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("got 0"))
+    );
+    assert!(
+        arity_errors
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("got 2"))
+    );
+}
+
+#[test]
+fn supertrait_impl_requires_matching_trait_arguments() {
+    let result = check(
+        r#"
+        trait Parent<Rhs = Self> {}
+        trait Child<Rhs = Self>: Parent<Rhs> {}
+
+        struct Left {}
+        struct Right {}
+        struct Other {}
+
+        impl Parent<Other> for Left {}
+        impl Child<Right> for Left {}
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0036"),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn generic_supertrait_bound_substitutes_parent_arguments() {
+    let result = check(
+        r#"
+        trait Parent<X> {
+            fun parent(&self, value: X) -> X;
+        }
+
+        trait Child<Y>: Parent<Y> {}
+
+        struct Item {}
+
+        impl Parent<i32> for Item {
+            fun parent(&self, value: i32) -> i32 { value }
+        }
+
+        impl Child<i32> for Item {}
+
+        fun use_parent<T: Child<i32>>(value: T) -> i32 {
+            value.parent(1)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn overloaded_operator_checks_rhs_once() {
+    let result = check(
+        r#"
+        #[lang = "add"]
+        trait Add<Rhs = Self> {
+            type Output;
+            fun add(self, rhs: Rhs) -> Self::Output;
+        }
+
+        struct Number { value: i32 }
+
+        impl Add for Number {
+            type Output = Number;
+            fun add(self, rhs: Self) -> Self::Output { self }
+        }
+
+        fun main() {
+            let value = Number { value: 1 } + 1();
+        }
+        "#,
+    );
+
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0004")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn rejects_duplicate_trait_impls() {
+    let result = check(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+
+        struct Number { value: i32 }
+
+        impl Add for Number {
+            type Output = Number;
+            fun add(self, rhs: Self) -> Self::Output { self }
+        }
+
+        impl Add for Number {
+            type Output = Number;
+            fun add(self, rhs: Self) -> Self::Output { rhs }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0047")
+    );
+}
+
+#[test]
+fn rejects_overlapping_trait_impls() {
+    let result = check(
+        r#"
+        #[lang = "add"]
+        trait Add<Rhs = Self> {
+            type Output;
+            fun add(self, rhs: Rhs) -> Self::Output;
+        }
+
+        struct Number { value: i32 }
+        struct Delta { value: i32 }
+
+        impl<R> Add<R> for Number {
+            type Output = Number;
+            fun add(self, rhs: R) -> Self::Output { self }
+        }
+
+        impl Add<Delta> for Number {
+            type Output = Number;
+            fun add(self, rhs: Delta) -> Self::Output { self }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0047")
+    );
+}
+
+#[test]
+fn accepts_disjoint_trait_impls() {
+    let result = check(
+        r#"
+        #[lang = "add"]
+        trait Add<Rhs = Self> {
+            type Output;
+            fun add(self, rhs: Rhs) -> Self::Output;
+        }
+
+        struct Number { value: i32 }
+        struct Delta { value: i32 }
+        struct Offset { value: i32 }
+
+        impl Add<Delta> for Number {
+            type Output = Number;
+            fun add(self, rhs: Delta) -> Self::Output { self }
+        }
+
+        impl Add<Offset> for Number {
+            type Output = Number;
+            fun add(self, rhs: Offset) -> Self::Output { self }
+        }
+        "#,
+    );
+
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0047")
+    );
+}
+
+#[test]
+fn accepts_disjoint_impls_with_shared_generic_relationship() {
+    let result = check(
+        r#"
+        trait Marker<A> {}
+
+        impl<T> Marker<T> for T {}
+        impl Marker<i32> for bool {}
+        "#,
+    );
+
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0047")
+    );
+}
+
+#[test]
+fn rejects_arbitrary_composite_trait_bound() {
+    let result = check(
+        r#"
+        trait Marker {}
+
+        impl Marker for i32 {}
+
+        fun accepts_marker<T: Marker>(value: T) {}
+
+        fun main() {
+            accepts_marker((1i32, 2i32));
+            accepts_marker([1i32, 2i32]);
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0035"),
+        "expected tuple to be rejected for Marker: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn comparison_traits_accept_heterogeneous_rhs() {
+    let result = check(
+        r#"
+        #[lang = "partial_eq"]
+        trait PartialEq<Rhs = Self> {
+            fun eq(&self, other: &Rhs) -> bool;
+            fun ne(&self, other: &Rhs) -> bool { !self.eq(other) }
+        }
+
+        struct Left { value: i32 }
+        struct Right { value: i32 }
+
+        impl PartialEq<Right> for Left {
+            fun eq(&self, other: &Right) -> bool {
+                self.value == other.value
+            }
+        }
+
+        fun main() {
+            let left = Left { value: 1 };
+            let right = Right { value: 1 };
+            let equal: bool = left == right;
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert_eq!(result.operator_calls.len(), 1);
+}
+
+#[test]
+fn composite_comparison_preserves_heterogeneous_rhs() {
+    let result = check(
+        r#"
+        #[lang = "partial_eq"]
+        trait PartialEq<Rhs = Self> {
+            fun eq(&self, other: &Rhs) -> bool;
+        }
+
+        struct Left { value: i32 }
+        struct Right { value: i32 }
+
+        impl PartialEq for i32 {
+            fun eq(&self, other: &i32) -> bool {
+                *self == *other
+            }
+        }
+
+        impl PartialEq<Right> for Left {
+            fun eq(&self, other: &Right) -> bool {
+                self.value == other.value
+            }
+        }
+
+        fun main() {
+            let left: (Left, i32) = (Left { value: 1 }, 2);
+            let right: (Right, i32) = (Right { value: 1 }, 2);
+            let equal: bool = left == right;
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn accepts_binary_unary_and_assign_operator_impls() {
     let result = check(
         r#"
@@ -313,7 +680,7 @@ fn accepts_generic_add_impl_with_output_bound() {
     );
 
     assert_eq!(result.diagnostics, vec![]);
-    assert_eq!(result.operator_calls.len(), 1);
+    assert_eq!(result.operator_calls.len(), 2);
 }
 
 #[test]

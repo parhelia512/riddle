@@ -618,6 +618,70 @@ fn standard_library_basics_compile_and_run() {
 }
 
 #[test]
+fn comparison_operators_dispatch_to_trait_methods() {
+    if c_compiler().is_none() {
+        eprintln!("skipping comparison operator runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("comparison-operators");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"use std::cmp::Ordering;
+
+struct Rank { value: i32 }
+
+impl PartialEq for Rank {
+    fun eq(&self, other: &Self) -> bool {
+        self.value + other.value == 3
+    }
+}
+
+impl PartialOrd for Rank {
+    fun partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.value == other.value {
+            Option::None
+        } else if self.value < other.value {
+            Option::Some(Ordering::Greater)
+        } else {
+            Option::Some(Ordering::Less)
+        }
+    }
+}
+
+fun main() -> i32 {
+    let low = Rank { value: 1 };
+    let high = Rank { value: 2 };
+    let same = Rank { value: 1 };
+    if !(low == high) { return 1; }
+    if low != high { return 2; }
+    if !(low > high) { return 3; }
+    if !(low >= high) { return 4; }
+    if low < high { return 5; }
+    if low <= high { return 6; }
+    if low < same { return 7; }
+    if low <= same { return 8; }
+    if low > same { return 9; }
+    if low >= same { return 10; }
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn string_and_vector_compile_and_run() {
     if c_compiler().is_none() {
         eprintln!("skipping String and Vector runtime test: no C compiler found");

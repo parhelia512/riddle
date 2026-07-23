@@ -68,6 +68,7 @@ impl<'a> TypeChecker<'a> {
         self.check_value_type_declarations();
         self.check_type_layouts();
         self.check_traits();
+        self.check_trait_ref_arities();
         self.check_impls();
         self.build_trait_env();
         self.validate_copy_impls();
@@ -157,7 +158,28 @@ impl<'a> TypeChecker<'a> {
                 let range = self.impl_self_ty_range(id).unwrap_or(function.name_range);
                 let self_ty =
                     self.lower_type_ref_with_params_at(&self_ty_ref, &params, Some(range));
-                params.insert("Self".into(), self_ty);
+                let owner = self
+                    .hir
+                    .item_tree
+                    .impls
+                    .iter()
+                    .find_map(|(_, imp)| imp.methods.contains(&id).then(|| imp.clone()));
+                if let Some((imp, trait_id)) = owner.as_ref().and_then(|imp| {
+                    imp.trait_ty
+                        .as_ref()
+                        .and_then(|trait_ty| self.resolve_trait_ref(trait_ty))
+                        .map(|trait_id| (imp, trait_id))
+                }) {
+                    params = self.trait_ref_subst(
+                        trait_id,
+                        imp.trait_ty.as_ref().unwrap(),
+                        &self_ty,
+                        &params,
+                        imp.trait_ty_range,
+                    );
+                } else {
+                    params.insert("Self".into(), self_ty);
+                }
             } else if self.trait_for_default_method(id).is_some() {
                 params.insert("Self".into(), Type::Param("Self".into()));
             }
@@ -174,7 +196,10 @@ impl<'a> TypeChecker<'a> {
         for item in traits {
             for method in item.methods {
                 let mut params = crate::lowering::generic_param_map_with_consts(
-                    method.generics.iter().map(|name| name.0.as_str()),
+                    item.generics
+                        .iter()
+                        .chain(method.generics.iter())
+                        .map(|name| name.0.as_str()),
                     method.const_generics.iter().map(|name| name.0.as_str()),
                 );
                 params.insert("Self".into(), Type::Param("Self".into()));
@@ -263,13 +288,19 @@ impl<'a> TypeChecker<'a> {
 
     pub(crate) fn build_trait_env(&mut self) {
         for (tid, tr) in self.hir.item_tree.traits.iter() {
-            if tr
-                .attrs
-                .iter()
-                .any(|attr| attr.name.0 == "lang" && attr.value.as_deref() == Some("copy"))
-            {
-                self.result.trait_env.set_copy_trait(tid);
-                break;
+            for attr in &tr.attrs {
+                if attr.name.0 != "lang" {
+                    continue;
+                }
+                let Some(lang) = attr.value.as_deref() else {
+                    continue;
+                };
+                if lang == "copy" {
+                    self.result.trait_env.set_copy_trait(tid);
+                }
+                self.result
+                    .trait_env
+                    .set_composite_trait(tid, lang, tr.generics.len());
             }
         }
         for (_, imp) in self.hir.item_tree.impls.iter() {
@@ -285,6 +316,8 @@ impl<'a> TypeChecker<'a> {
             );
             let self_ty =
                 self.lower_type_ref_with_params_at(&imp.self_ty, &params, Some(imp.self_ty_range));
+            let trait_args =
+                self.trait_ref_args(trait_id, trait_ty, &self_ty, &params, imp.trait_ty_range);
             let bounds = self.lower_trait_env_bounds(&imp.generic_bounds, &params);
             let assoc_types = imp
                 .type_aliases
@@ -305,7 +338,7 @@ impl<'a> TypeChecker<'a> {
                 .collect();
             self.result
                 .trait_env
-                .insert_impl(trait_id, self_ty, bounds, assoc_types);
+                .insert_impl(trait_id, self_ty, trait_args, bounds, assoc_types);
         }
     }
 
@@ -318,13 +351,22 @@ impl<'a> TypeChecker<'a> {
             .iter()
             .filter_map(|bound| {
                 let trait_id = self.resolve_trait_ref(&bound.trait_ty)?;
-                Some(TraitBound {
-                    ty: self.lower_type_ref_with_params_at(
-                        &bound.target_ty,
-                        params,
-                        Some(bound.target_range),
-                    ),
+                let ty = self.lower_type_ref_with_params_at(
+                    &bound.target_ty,
+                    params,
+                    Some(bound.target_range),
+                );
+                let trait_args = self.trait_ref_args(
                     trait_id,
+                    &bound.trait_ty,
+                    &ty,
+                    params,
+                    Some(bound.trait_range),
+                );
+                Some(TraitBound {
+                    ty,
+                    trait_id,
+                    trait_args,
                     assoc_constraints: bound
                         .assoc_constraints
                         .iter()
@@ -385,7 +427,28 @@ impl<'a> TypeChecker<'a> {
                 .unwrap_or(function.name_range);
             let self_ty =
                 self.lower_type_ref_with_params_at(&self_ty_ref, &params, Some(self_ty_range));
-            params.insert("Self".into(), self_ty);
+            let owner = self
+                .hir
+                .item_tree
+                .impls
+                .iter()
+                .find_map(|(_, imp)| imp.methods.contains(&function_id).then(|| imp.clone()));
+            if let Some((imp, trait_id)) = owner.as_ref().and_then(|imp| {
+                imp.trait_ty
+                    .as_ref()
+                    .and_then(|trait_ty| self.resolve_trait_ref(trait_ty))
+                    .map(|trait_id| (imp, trait_id))
+            }) {
+                params = self.trait_ref_subst(
+                    trait_id,
+                    imp.trait_ty.as_ref().unwrap(),
+                    &self_ty,
+                    &params,
+                    imp.trait_ty_range,
+                );
+            } else {
+                params.insert("Self".into(), self_ty);
+            }
         } else if self.trait_for_default_method(function_id).is_some() {
             params.insert("Self".into(), Type::Param("Self".into()));
         }
@@ -657,6 +720,13 @@ impl<'a> TypeChecker<'a> {
                 imp.methods
                     .contains(&function_id)
                     .then(|| imp.generics.iter().map(|name| name.0.clone()).collect())
+            })
+            .or_else(|| {
+                self.hir.item_tree.traits.iter().find_map(|(_, tr)| {
+                    tr.default_methods
+                        .contains(&function_id)
+                        .then(|| tr.generics.iter().map(|name| name.0.clone()).collect())
+                })
             })
             .unwrap_or_default()
     }
@@ -1091,6 +1161,7 @@ impl<'a> TypeChecker<'a> {
             "E0043" => vec!["use `&str` or a raw pointer; unsized `str` must be behind a reference or pointer".into()],
             "E0044" => vec!["define every supertrait and remove cycles from the trait hierarchy".into()],
             "E0045" => vec!["add an explicit parameter type or use the function where its signature is known".into()],
+            "E0047" => vec!["remove the duplicate or overlapping trait implementation".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
             "E0022" | "E0025" => vec!["remove the duplicate associated type".into()],
             "E0023" => vec!["define the trait or import it into scope".into()],

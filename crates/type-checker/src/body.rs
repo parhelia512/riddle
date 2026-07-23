@@ -20,7 +20,7 @@ use crate::{
         CaptureMode, CaptureSource, ForLoopInfo, LabelStyle, LambdaCapture, LambdaInfo,
         OperatorCall, SourceLabel, TraitMethodCall,
     },
-    types::{ClosureKind, ConstArg, IntTy, Type},
+    types::{ClosureKind, ConstArg, FloatTy, IntTy, Type},
 };
 
 impl TypeChecker<'_> {
@@ -423,30 +423,18 @@ impl TypeChecker<'_> {
 
         if let Some(base_op) = op.compound_base() {
             let lhs_ty = self.check_expr(ctx, lhs);
-            if !lhs_ty.is_numeric()
-                && !lhs_ty.is_bitwise_scalar()
+            let rhs_ty = self.check_expr(ctx, rhs);
+            if !self.is_builtin_binary_operator(base_op, &lhs_ty, &rhs_ty)
                 && !lhs_ty.is_unknown_like()
-                && let Some(()) =
-                    self.check_overloaded_assign(ctx, expr_id, lhs, rhs, base_op, &lhs_ty, span)
+                && self
+                    .check_overloaded_assign(
+                        ctx, expr_id, lhs, rhs, base_op, &lhs_ty, &rhs_ty, span,
+                    )
+                    .is_some()
             {
                 self.check_assign_mut(ctx, lhs, span);
                 return Type::Unit;
             }
-            let rhs_ty = match base_op {
-                BinaryOp::Add
-                | BinaryOp::Sub
-                | BinaryOp::Mul
-                | BinaryOp::Div
-                | BinaryOp::Mod
-                | BinaryOp::BitAnd
-                | BinaryOp::BitOr
-                | BinaryOp::BitXor
-                    if lhs_ty.is_numeric() || lhs_ty.is_bitwise_scalar() =>
-                {
-                    self.check_expr_expected(ctx, rhs, &lhs_ty)
-                }
-                _ => self.check_expr(ctx, rhs),
-            };
             let result_ty = self.check_binary_types(ctx, lhs, rhs, base_op, &lhs_ty, &rhs_ty, span);
             self.expect_assignable(&lhs_ty, &result_ty, "assignment", span);
             self.check_assign_mut(ctx, lhs, span);
@@ -461,43 +449,18 @@ impl TypeChecker<'_> {
             ) if expected.is_numeric() => self.check_expr_expected(ctx, lhs, expected),
             _ => self.check_expr(ctx, lhs),
         };
-        if matches!(
-            op,
-            BinaryOp::Add
-                | BinaryOp::Sub
-                | BinaryOp::Mul
-                | BinaryOp::Div
-                | BinaryOp::Mod
-                | BinaryOp::BitAnd
-                | BinaryOp::BitOr
-                | BinaryOp::BitXor
-                | BinaryOp::Shl
-                | BinaryOp::Shr
-        ) && !lhs_ty.is_numeric()
-            && !lhs_ty.is_bitwise_scalar()
+        let rhs_ty = match op {
+            BinaryOp::Eq | BinaryOp::Neq => self.check_place_expr(ctx, rhs),
+            _ => self.check_expr(ctx, rhs),
+        };
+        let is_overload_candidate = !self.is_builtin_binary_operator(op, &lhs_ty, &rhs_ty);
+        if is_overload_candidate
             && !lhs_ty.is_unknown_like()
             && let Some(ty) =
-                self.check_overloaded_binary(ctx, expr_id, lhs, rhs, op, &lhs_ty, span)
+                self.check_overloaded_binary(ctx, expr_id, lhs, rhs, op, &lhs_ty, &rhs_ty, span)
         {
             return ty;
         }
-        let rhs_ty = match op {
-            BinaryOp::Eq | BinaryOp::Neq => self.check_place_expr(ctx, rhs),
-            BinaryOp::Add
-            | BinaryOp::Sub
-            | BinaryOp::Mul
-            | BinaryOp::Div
-            | BinaryOp::Mod
-            | BinaryOp::Lt
-            | BinaryOp::Gt
-            | BinaryOp::LtEq
-            | BinaryOp::GtEq
-                if lhs_ty.is_numeric() =>
-            {
-                self.check_expr_expected(ctx, rhs, &lhs_ty)
-            }
-            _ => self.check_expr(ctx, rhs),
-        };
 
         if matches!(
             op,
@@ -934,14 +897,24 @@ impl TypeChecker<'_> {
         rhs: ExprId,
         op: BinaryOp,
         lhs_ty: &Type,
+        rhs_ty: &Type,
         span: Option<rowan::TextRange>,
     ) -> Option<Type> {
         let (lang, method_name) = binary_operator_trait(op)?;
         let trait_id = self.find_lang_trait(lang)?;
-        if let Some(ty) = self.check_trait_bound_operator(ctx, rhs, lhs_ty, trait_id, method_name) {
+        if let Some(ty) = self.check_trait_bound_operator(
+            ctx,
+            expr_id,
+            Some((rhs, rhs_ty)),
+            lhs_ty,
+            trait_id,
+            method_name,
+        ) {
             return Some(ty);
         }
-        let method = self.find_trait_impl_method(lhs_ty, trait_id, method_name)?;
+        let receiver_ty = Self::default_inferred_numeric_type(lhs_ty);
+        let method =
+            self.find_trait_impl_method(&receiver_ty, Some(&rhs_ty), trait_id, method_name)?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -952,7 +925,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(receiver.ty_range),
         );
-        let actual_receiver = self.receiver_argument_type(lhs_ty, &expected_receiver);
+        let actual_receiver = self.receiver_argument_type(&receiver_ty, &expected_receiver);
         self.expect_assignable(
             &expected_receiver,
             &actual_receiver,
@@ -961,7 +934,6 @@ impl TypeChecker<'_> {
         );
 
         let Some(rhs_param) = method.function.params.get(1) else {
-            self.check_expr(ctx, rhs);
             self.diagnostic(
                 "E0005",
                 format!(
@@ -977,7 +949,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(rhs_param.ty_range),
         );
-        let actual_rhs = self.check_expr_expected(ctx, rhs, &expected_rhs);
+        let actual_rhs = self.receiver_argument_type(&rhs_ty, &expected_rhs);
         self.expect_assignable(
             &expected_rhs,
             &actual_rhs,
@@ -985,12 +957,9 @@ impl TypeChecker<'_> {
             ctx.expr_range(rhs),
         );
 
-        self.result.operator_calls.insert(
-            (ctx.body_id, expr_id),
-            OperatorCall {
-                function: method.fid,
-            },
-        );
+        self.result
+            .operator_calls
+            .insert((ctx.body_id, expr_id), OperatorCall::Function(method.fid));
 
         Some(
             method
@@ -1023,11 +992,11 @@ impl TypeChecker<'_> {
         let (lang, method_name) = unary_operator_trait(op)?;
         let trait_id = self.find_lang_trait(lang)?;
         if let Some(ty) =
-            self.check_trait_bound_operator(ctx, operand, operand_ty, trait_id, method_name)
+            self.check_trait_bound_operator(ctx, expr_id, None, operand_ty, trait_id, method_name)
         {
             return Some(ty);
         }
-        let method = self.find_trait_impl_method(operand_ty, trait_id, method_name)?;
+        let method = self.find_trait_impl_method(operand_ty, None, trait_id, method_name)?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -1044,12 +1013,9 @@ impl TypeChecker<'_> {
             "operator receiver",
             ctx.expr_range(operand),
         );
-        self.result.operator_calls.insert(
-            (ctx.body_id, expr_id),
-            OperatorCall {
-                function: method.fid,
-            },
-        );
+        self.result
+            .operator_calls
+            .insert((ctx.body_id, expr_id), OperatorCall::Function(method.fid));
         Some(
             method
                 .function
@@ -1078,11 +1044,27 @@ impl TypeChecker<'_> {
         rhs: ExprId,
         op: BinaryOp,
         lhs_ty: &Type,
+        rhs_ty: &Type,
         span: Option<rowan::TextRange>,
     ) -> Option<()> {
         let (lang, method_name) = assign_operator_trait(op)?;
         let trait_id = self.find_lang_trait(lang)?;
-        let method = self.find_trait_impl_method(lhs_ty, trait_id, method_name)?;
+        if self
+            .check_trait_bound_operator(
+                ctx,
+                expr_id,
+                Some((rhs, rhs_ty)),
+                lhs_ty,
+                trait_id,
+                method_name,
+            )
+            .is_some()
+        {
+            return Some(());
+        }
+        let receiver_ty = Self::default_inferred_numeric_type(lhs_ty);
+        let method =
+            self.find_trait_impl_method(&receiver_ty, Some(&rhs_ty), trait_id, method_name)?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -1092,7 +1074,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(receiver.ty_range),
         );
-        let actual_receiver = self.receiver_argument_type(lhs_ty, &expected_receiver);
+        let actual_receiver = self.receiver_argument_type(&receiver_ty, &expected_receiver);
         self.expect_assignable(
             &expected_receiver,
             &actual_receiver,
@@ -1105,26 +1087,24 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(rhs_param.ty_range),
         );
-        let actual_rhs = self.check_expr_expected(ctx, rhs, &expected_rhs);
+        let actual_rhs = self.receiver_argument_type(&rhs_ty, &expected_rhs);
         self.expect_assignable(
             &expected_rhs,
             &actual_rhs,
             "right operand",
             ctx.expr_range(rhs),
         );
-        self.result.operator_calls.insert(
-            (ctx.body_id, expr_id),
-            OperatorCall {
-                function: method.fid,
-            },
-        );
+        self.result
+            .operator_calls
+            .insert((ctx.body_id, expr_id), OperatorCall::Function(method.fid));
         Some(())
     }
 
     fn check_trait_bound_operator(
         &mut self,
         ctx: &mut BodyCtx<'_>,
-        rhs: ExprId,
+        expr_id: ExprId,
+        rhs: Option<(ExprId, &Type)>,
         lhs_ty: &Type,
         trait_id: TraitId,
         method_name: &str,
@@ -1137,24 +1117,71 @@ impl TypeChecker<'_> {
             .iter()
             .find(|bound| {
                 bound_target_param(bound).is_some_and(|name| name == *param)
-                    && self.resolve_trait_ref(&bound.trait_ty) == Some(trait_id)
+                    && self
+                        .resolve_trait_ref(&bound.trait_ty)
+                        .is_some_and(|bound_trait| self.trait_implies(bound_trait, trait_id))
             })?
             .clone();
+        let bound_trait = self.resolve_trait_ref(&bound.trait_ty)?;
 
-        if self.hir.item_tree.traits[trait_id]
+        let method = self.hir.item_tree.traits[trait_id]
             .methods
             .iter()
             .find(|method| method.name.0 == method_name)
-            .is_some_and(|method| method.is_unsafe)
-        {
-            self.require_unsafe(ctx, "calling an unsafe function", ctx.expr_range(rhs));
+            .cloned()?;
+        if method.is_unsafe {
+            self.require_unsafe(
+                ctx,
+                "calling an unsafe function",
+                rhs.and_then(|(rhs, _)| ctx.expr_range(rhs)),
+            );
         }
 
-        let actual_rhs = self.check_expr_expected(ctx, rhs, lhs_ty);
-        self.expect_assignable(lhs_ty, &actual_rhs, "right operand", ctx.expr_range(rhs));
+        let bound_subst = self.trait_ref_subst(
+            bound_trait,
+            &bound.trait_ty,
+            lhs_ty,
+            &ctx.generic_params,
+            Some(bound.trait_range),
+        );
+        let subst = self.supertrait_subst(
+            bound_trait,
+            trait_id,
+            lhs_ty,
+            &bound_subst,
+            &mut HashSet::new(),
+        )?;
+        if let Some((rhs, rhs_ty)) = rhs {
+            let rhs_param = method.params.get(1)?;
+            let expected_rhs =
+                self.lower_type_ref_with_params_at(&rhs_param.ty, &subst, Some(rhs_param.ty_range));
+            let actual_rhs = self.receiver_argument_type(rhs_ty, &expected_rhs);
+            self.expect_assignable(
+                &expected_rhs,
+                &actual_rhs,
+                "right operand",
+                ctx.expr_range(rhs),
+            );
+        }
+        self.result.operator_calls.insert(
+            (ctx.body_id, expr_id),
+            OperatorCall::Trait(TraitMethodCall {
+                trait_id,
+                method: method_name.into(),
+            }),
+        );
         let output = self
             .bound_assoc_type(ctx, &bound, "Output")
-            .unwrap_or(Type::Unknown);
+            .or_else(|| {
+                method.ret_type.as_ref().map(|ret| {
+                    self.lower_type_ref_with_params_at(
+                        ret,
+                        &subst,
+                        method.ret_type_range.or(Some(method.name_range)),
+                    )
+                })
+            })
+            .unwrap_or(Type::Unit);
         Some(output)
     }
 
@@ -1264,13 +1291,20 @@ impl TypeChecker<'_> {
                 lhs_ty.clone()
             }
             BinaryOp::Eq | BinaryOp::Neq => {
-                if self.join_numeric_types(lhs_ty, rhs_ty).is_none() {
+                if self.is_builtin_equality(lhs_ty, rhs_ty)
+                    && self.join_numeric_types(lhs_ty, rhs_ty).is_none()
+                {
                     self.expect_assignable(lhs_ty, rhs_ty, "comparison", span);
                 }
                 if !self.is_builtin_equality(lhs_ty, rhs_ty)
                     && !lhs_ty.is_unknown_like()
                     && !rhs_ty.is_unknown_like()
-                    && !self.type_has_lang_trait(ctx, lhs_ty, "partial_eq")
+                    && !self.type_has_lang_trait_with_args(
+                        ctx,
+                        lhs_ty,
+                        std::slice::from_ref(rhs_ty),
+                        "partial_eq",
+                    )
                 {
                     self.diagnostic(
                         "E0036",
@@ -1290,10 +1324,13 @@ impl TypeChecker<'_> {
                     }
                 } else if !lhs_ty.is_unknown_like()
                     && !rhs_ty.is_unknown_like()
-                    && self.type_has_lang_trait(ctx, lhs_ty, "partial_ord")
+                    && !self.type_has_lang_trait_with_args(
+                        ctx,
+                        lhs_ty,
+                        std::slice::from_ref(rhs_ty),
+                        "partial_ord",
+                    )
                 {
-                    self.expect_assignable(lhs_ty, rhs_ty, "comparison", span);
-                } else if !lhs_ty.is_unknown_like() && !rhs_ty.is_unknown_like() {
                     self.diagnostic(
                         "E0003",
                         format!(
@@ -2373,7 +2410,14 @@ impl TypeChecker<'_> {
                 );
                 continue;
             };
-            if !self.type_satisfies_bound(ctx, &actual, trait_id, &bound.assoc_constraints, subst) {
+            if !self.type_satisfies_bound(
+                ctx,
+                &actual,
+                trait_id,
+                &bound.trait_ty,
+                &bound.assoc_constraints,
+                subst,
+            ) {
                 let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
                 self.diagnostic(
                     "E0035",
@@ -2500,7 +2544,14 @@ impl TypeChecker<'_> {
                 );
                 continue;
             };
-            if !self.type_satisfies_bound(ctx, &actual, trait_id, &bound.assoc_constraints, subst) {
+            if !self.type_satisfies_bound(
+                ctx,
+                &actual,
+                trait_id,
+                &bound.trait_ty,
+                &bound.assoc_constraints,
+                subst,
+            ) {
                 let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
                 self.diagnostic(
                     "E0035",
@@ -2537,6 +2588,7 @@ impl TypeChecker<'_> {
         ctx: &BodyCtx<'_>,
         actual: &Type,
         trait_id: TraitId,
+        trait_ref: &HirTypeRef,
         assoc_constraints: &[HirAssocTypeConstraint],
         subst: &HashMap<String, Type>,
     ) -> bool {
@@ -2548,28 +2600,71 @@ impl TypeChecker<'_> {
         if actual.is_unknown_like() {
             return true;
         }
+        let trait_args = self.trait_ref_args(trait_id, trait_ref, &actual, subst, None);
         if let Type::Param(param) = &actual {
-            return self.param_has_trait_bound(ctx, param, trait_id, assoc_constraints, subst);
+            return self.param_has_trait_bound(
+                ctx,
+                param,
+                trait_id,
+                &trait_args,
+                assoc_constraints,
+                subst,
+            );
         }
-        self.result.trait_env.type_implements(&actual, trait_id)
-            && self.assoc_constraints_match(&actual, trait_id, assoc_constraints, subst)
+        self.result
+            .trait_env
+            .type_implements_with_args(&actual, trait_id, &trait_args)
+            && self.assoc_constraints_match(
+                &actual,
+                trait_id,
+                &trait_args,
+                assoc_constraints,
+                subst,
+            )
     }
 
-    fn type_has_lang_trait(&mut self, ctx: &BodyCtx<'_>, ty: &Type, lang: &str) -> bool {
+    fn type_has_lang_trait_with_args(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        ty: &Type,
+        trait_args: &[Type],
+        lang: &str,
+    ) -> bool {
         let Some(trait_id) = self.find_lang_trait(lang) else {
             return false;
         };
-        self.type_has_trait_id(ctx, ty, trait_id)
+        let generic_count = self.hir.item_tree.traits[trait_id].generics.len();
+        let trait_args = &trait_args[..trait_args.len().min(generic_count)];
+        self.type_has_trait_id_with_args(ctx, ty, trait_id, trait_args)
     }
 
     fn type_has_trait_id(&mut self, ctx: &BodyCtx<'_>, ty: &Type, trait_id: TraitId) -> bool {
+        self.type_has_trait_id_with_args(ctx, ty, trait_id, &[])
+    }
+
+    fn type_has_trait_id_with_args(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        ty: &Type,
+        trait_id: TraitId,
+        trait_args: &[Type],
+    ) -> bool {
         if ty.is_unknown_like() {
             return true;
         }
         if let Type::Param(param) = ty {
-            return self.param_has_trait_bound(ctx, param, trait_id, &[], &ctx.generic_params);
+            return self.param_has_trait_bound(
+                ctx,
+                param,
+                trait_id,
+                trait_args,
+                &[],
+                &ctx.generic_params,
+            );
         }
-        self.result.trait_env.type_implements(ty, trait_id)
+        self.result
+            .trait_env
+            .type_implements_with_args(ty, trait_id, trait_args)
     }
 
     fn associated_type_for(
@@ -2601,6 +2696,7 @@ impl TypeChecker<'_> {
         ctx: &BodyCtx<'_>,
         param: &str,
         required_trait: TraitId,
+        required_args: &[Type],
         required_assoc: &[HirAssocTypeConstraint],
         subst: &HashMap<String, Type>,
     ) -> bool {
@@ -2613,6 +2709,24 @@ impl TypeChecker<'_> {
             };
             if !self.trait_implies(bound_trait, required_trait) {
                 return false;
+            }
+            if bound_trait == required_trait && !required_args.is_empty() {
+                let self_ty = Type::Param(param.to_string());
+                let bound_args = self.trait_ref_args(
+                    bound_trait,
+                    &bound.trait_ty,
+                    &self_ty,
+                    &ctx.generic_params,
+                    Some(bound.trait_range),
+                );
+                if bound_args.len() != required_args.len()
+                    || !bound_args
+                        .iter()
+                        .zip(required_args)
+                        .all(|(actual, required)| self.bound_types_match(required, actual))
+                {
+                    return false;
+                }
             }
             required_assoc.iter().all(|required| {
                 let expected =
@@ -2628,6 +2742,7 @@ impl TypeChecker<'_> {
         &mut self,
         actual: &Type,
         trait_id: TraitId,
+        trait_args: &[Type],
         assoc_constraints: &[HirAssocTypeConstraint],
         subst: &HashMap<String, Type>,
     ) -> bool {
@@ -2636,7 +2751,7 @@ impl TypeChecker<'_> {
                 self.lower_type_ref_with_params_at(&constraint.ty, subst, Some(constraint.range));
             self.result
                 .trait_env
-                .associated_type(actual, trait_id, &constraint.name.0)
+                .associated_type_with_args(actual, trait_id, trait_args, &constraint.name.0)
                 .map(|actual| self.bound_types_match(&expected, &actual))
                 .unwrap_or(false)
         })
@@ -2656,8 +2771,23 @@ impl TypeChecker<'_> {
             let Some(trait_id) = self.resolve_trait_ref(&bound.trait_ty) else {
                 return false;
             };
-            self.result.trait_env.type_implements(&actual, trait_id)
-                && self.assoc_constraints_match(&actual, trait_id, &bound.assoc_constraints, subst)
+            let trait_args = self.trait_ref_args(
+                trait_id,
+                &bound.trait_ty,
+                &actual,
+                subst,
+                Some(bound.trait_range),
+            );
+            self.result
+                .trait_env
+                .type_implements_with_args(&actual, trait_id, &trait_args)
+                && self.assoc_constraints_match(
+                    &actual,
+                    trait_id,
+                    &trait_args,
+                    &bound.assoc_constraints,
+                    subst,
+                )
         })
     }
 
@@ -2725,6 +2855,33 @@ impl TypeChecker<'_> {
                     if matches!(lhs.as_ref(), Type::Str)
                         && matches!(rhs.as_ref(), Type::Str)
             )
+    }
+
+    fn is_builtin_binary_operator(&self, op: BinaryOp, lhs_ty: &Type, rhs_ty: &Type) -> bool {
+        match op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                self.join_numeric_types(lhs_ty, rhs_ty).is_some()
+            }
+            BinaryOp::Mod => lhs_ty.is_integer() && rhs_ty.is_integer(),
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                (lhs_ty == &Type::Bool && rhs_ty == &Type::Bool)
+                    || self.join_numeric_types(lhs_ty, rhs_ty).is_some()
+            }
+            BinaryOp::Shl | BinaryOp::Shr => lhs_ty.is_integer() && rhs_ty.is_integer(),
+            BinaryOp::Eq | BinaryOp::Neq => self.is_builtin_equality(lhs_ty, rhs_ty),
+            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
+                self.is_builtin_ordering(lhs_ty, rhs_ty)
+            }
+            _ => false,
+        }
+    }
+
+    fn default_inferred_numeric_type(ty: &Type) -> Type {
+        match ty {
+            Type::InferInt => Type::Int(IntTy::I32),
+            Type::InferFloat => Type::Float(FloatTy::F64),
+            _ => ty.clone(),
+        }
     }
 
     fn is_builtin_ordering(&self, lhs_ty: &Type, rhs_ty: &Type) -> bool {
@@ -2940,6 +3097,7 @@ impl TypeChecker<'_> {
     fn find_trait_impl_method(
         &mut self,
         receiver_ty: &Type,
+        rhs_ty: Option<&Type>,
         trait_id: TraitId,
         method_name: &str,
     ) -> Option<ResolvedMethod> {
@@ -2964,7 +3122,6 @@ impl TypeChecker<'_> {
             if !self.impl_bounds_satisfied(&imp, &subst) {
                 continue;
             }
-            subst.insert("Self".into(), receiver_ty.clone());
             let fid = imp
                 .methods
                 .iter()
@@ -2972,6 +3129,23 @@ impl TypeChecker<'_> {
                 .find(|fid| self.hir.item_tree.functions[*fid].name.0 == method_name)
                 .or_else(|| self.default_method(trait_id, method_name));
             let Some(fid) = fid else { continue };
+            subst =
+                self.trait_ref_subst(trait_id, trait_ty, receiver_ty, &subst, imp.trait_ty_range);
+            if let Some(rhs_ty) = rhs_ty {
+                let function = &self.hir.item_tree.functions[fid];
+                let Some(rhs_param) = function.params.get(1) else {
+                    continue;
+                };
+                let expected = self.lower_type_ref_with_params_at(
+                    &rhs_param.ty,
+                    &subst,
+                    Some(rhs_param.ty_range),
+                );
+                let actual = self.receiver_argument_type(rhs_ty, &expected);
+                if !self.bound_types_match(&expected, &actual) {
+                    continue;
+                }
+            }
             return Some(ResolvedMethod {
                 fid,
                 function: self.hir.item_tree.functions[fid].clone(),
@@ -3025,7 +3199,23 @@ impl TypeChecker<'_> {
                 function.generics.iter().map(|name| name.0.as_str()),
                 function.const_generics.iter().map(|name| name.0.as_str()),
             );
-            subst.insert("Self".into(), receiver_ty.clone());
+            let bound_subst = self.trait_ref_subst(
+                trait_id,
+                &bound.trait_ty,
+                &Type::Param(param.clone()),
+                &ctx.generic_params,
+                Some(bound.trait_range),
+            );
+            let Some(supertrait_subst) = self.supertrait_subst(
+                trait_id,
+                method_trait_id,
+                &Type::Param(param.clone()),
+                &bound_subst,
+                &mut HashSet::new(),
+            ) else {
+                continue;
+            };
+            subst.extend(supertrait_subst);
             return Some(ResolvedMethod {
                 fid: ctx.function_id,
                 function,
@@ -3058,6 +3248,42 @@ impl TypeChecker<'_> {
             .iter()
             .filter_map(|bound| self.resolve_trait_ref(&bound.trait_ty))
             .find_map(|supertrait| self.find_supertrait_method(supertrait, method_name, visited))
+    }
+
+    fn supertrait_subst(
+        &mut self,
+        current_trait: TraitId,
+        target_trait: TraitId,
+        self_ty: &Type,
+        subst: &HashMap<String, Type>,
+        visited: &mut HashSet<TraitId>,
+    ) -> Option<HashMap<String, Type>> {
+        if current_trait == target_trait {
+            return Some(subst.clone());
+        }
+        if !visited.insert(current_trait) {
+            return None;
+        }
+
+        let supertraits = self.hir.item_tree.traits[current_trait].supertraits.clone();
+        for supertrait in supertraits {
+            let Some(supertrait_id) = self.resolve_trait_ref(&supertrait.trait_ty) else {
+                continue;
+            };
+            let next_subst = self.trait_ref_subst(
+                supertrait_id,
+                &supertrait.trait_ty,
+                self_ty,
+                subst,
+                Some(supertrait.trait_range),
+            );
+            if let Some(result) =
+                self.supertrait_subst(supertrait_id, target_trait, self_ty, &next_subst, visited)
+            {
+                return Some(result);
+            }
+        }
+        None
     }
 
     fn receiver_argument_type(&self, base_ty: &Type, expected: &Type) -> Type {
@@ -3791,6 +4017,12 @@ fn binary_operator_trait(op: BinaryOp) -> Option<(&'static str, &'static str)> {
         BinaryOp::BitXor => ("bitxor", "bitxor"),
         BinaryOp::Shl => ("shl", "shl"),
         BinaryOp::Shr => ("shr", "shr"),
+        BinaryOp::Eq => ("partial_eq", "eq"),
+        BinaryOp::Neq => ("partial_eq", "ne"),
+        BinaryOp::Lt => ("partial_ord", "lt"),
+        BinaryOp::Gt => ("partial_ord", "gt"),
+        BinaryOp::LtEq => ("partial_ord", "le"),
+        BinaryOp::GtEq => ("partial_ord", "ge"),
         _ => return None,
     })
 }

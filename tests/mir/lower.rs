@@ -120,6 +120,85 @@ fn tuple_expression_lowers_to_tuple_value() {
 }
 
 #[test]
+fn tuple_equality_lowers_to_element_comparisons() {
+    let module = lower(
+        r#"
+        #[lang = "partial_eq"]
+        trait PartialEq<Rhs = Self> {
+            fun eq(&self, other: &Rhs) -> bool;
+        }
+
+        fun main() -> bool {
+            let left: (i32, i32) = (1, 2);
+            let right: (i32, i32) = (1, 2);
+            left == right
+        }
+        "#,
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "main")
+        .unwrap();
+    let comparisons = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter(|inst| matches!(inst.kind, mir::instr::InstKind::Cmp(..)))
+        .count();
+
+    assert!(
+        comparisons >= 2,
+        "tuple equality should compare its elements: {main:#?}"
+    );
+}
+
+#[test]
+fn tuple_ordering_lowers_lexicographically() {
+    let module = lower(
+        r#"
+        #[lang = "partial_ord"]
+        trait PartialOrd<Rhs = Self> {
+            fun lt(&self, other: &Rhs) -> bool;
+        }
+
+        fun main() -> bool {
+            let left: (i32, i32) = (1, 2);
+            let right: (i32, i32) = (1, 3);
+            left < right
+        }
+        "#,
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "main")
+        .unwrap();
+    let comparisons = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter(|inst| matches!(inst.kind, mir::instr::InstKind::Cmp(..)))
+        .count();
+    let branches = main
+        .blocks
+        .iter()
+        .filter(|(_, block)| matches!(block.terminator, mir::instr::Terminator::CondBranch(..)))
+        .count();
+
+    assert!(
+        comparisons >= 4,
+        "tuple ordering should compare equality and order: {main:#?}"
+    );
+    assert!(
+        branches >= 2,
+        "tuple ordering should branch on equal prefixes: {main:#?}"
+    );
+}
+
+#[test]
 fn array_for_loop_lowers_to_indexed_loop() {
     let module = lower(
         r#"
@@ -327,6 +406,45 @@ fn if_expression_creates_blocks() {
 }
 
 #[test]
+fn nested_if_phi_uses_actual_predecessor_blocks() {
+    let module = lower(
+        r#"
+        enum Choice { First, Second, Third }
+
+        fun choose(first: bool, second: bool) -> Choice {
+            if first {
+                Choice::First
+            } else {
+                if second { Choice::Second } else { Choice::Third }
+            }
+        }
+        "#,
+    );
+    let func = &module.functions[module.function_order[0]];
+
+    for (block_id, block) in func.blocks.iter() {
+        for inst in &block.insts {
+            let mir::instr::InstKind::Phi(inputs) = &inst.kind else {
+                continue;
+            };
+            for (_, predecessor) in inputs {
+                let has_edge = match func.blocks[*predecessor].terminator {
+                    mir::instr::Terminator::Branch(target) => target == block_id,
+                    mir::instr::Terminator::CondBranch(_, then_block, else_block) => {
+                        then_block == block_id || else_block == block_id
+                    }
+                    _ => false,
+                };
+                assert!(
+                    has_edge,
+                    "phi in {block_id:?} names non-predecessor {predecessor:?}: {func:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn while_loop_creates_blocks() {
     let module = lower(
         r#"
@@ -455,9 +573,9 @@ fn primitive_lang_operator_methods_lower_without_wrapper_functions() {
     let module = lower(
         r#"
         #[lang = "add"]
-        trait Add {
+        trait Add<Rhs = Self> {
             type Output;
-            fun add(self, rhs: Self) -> Self::Output;
+            fun add(self, rhs: Rhs) -> Self::Output;
         }
 
         #[lang = "neg"]
@@ -467,8 +585,8 @@ fn primitive_lang_operator_methods_lower_without_wrapper_functions() {
         }
 
         #[lang = "add_assign"]
-        trait AddAssign {
-            fun add_assign(&mut self, rhs: Self);
+        trait AddAssign<Rhs = Self> {
+            fun add_assign(&mut self, rhs: Rhs);
         }
 
         impl Add for i32 {
@@ -674,6 +792,278 @@ fn generic_lang_operator_method_uses_builtin_after_monomorphization() {
 }
 
 #[test]
+fn generic_bound_operator_dispatches_after_monomorphization() {
+    let (_, type_result, _, module) = compile(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+
+        struct Number { value: i32 }
+
+        impl Add for Number {
+            type Output = Number;
+            fun add(self, rhs: Self) -> Self::Output {
+                Number { value: self.value + rhs.value }
+            }
+        }
+
+        fun sum<T: Add<Output = T>>(left: T, right: T) -> T {
+            left + right
+        }
+
+        fun main() -> i32 {
+            sum(Number { value: 1 }, Number { value: 2 }).value
+        }
+        "#,
+    );
+
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    let sum = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "sum__Number")
+        .unwrap();
+    assert!(sum.blocks.iter().any(|(_, block)| {
+        block.insts.iter().any(|instruction| matches!(
+            &instruction.kind,
+            mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name.starts_with("add__Number")
+        ))
+    }), "{sum:#?}");
+    assert!(
+        !sum.blocks.iter().any(|(_, block)| {
+            block.insts.iter().any(|instruction| {
+                matches!(
+                    instruction.kind,
+                    mir::instr::InstKind::BinOp(mir::instr::BinOp::Add, _, _)
+                )
+            })
+        }),
+        "{sum:#?}"
+    );
+}
+
+#[test]
+fn heterogeneous_generic_operator_selects_rhs_impl() {
+    let (_, type_result, _, module) = compile(
+        r#"
+        #[lang = "add"]
+        trait Add<Rhs = Self> {
+            type Output;
+            fun add(self, rhs: Rhs) -> Self::Output;
+        }
+
+        struct Number { value: i32 }
+        struct Delta { value: i32 }
+
+        impl Add for Number {
+            type Output = Number;
+            fun add(self, rhs: Self) -> Self::Output {
+                Number { value: self.value + rhs.value }
+            }
+        }
+
+        impl Add<Delta> for Number {
+            type Output = i32;
+            fun add(self, rhs: Delta) -> Self::Output {
+                self.value + rhs.value
+            }
+        }
+
+        fun sum<L, R>(left: L, right: R) -> i32
+        where L: Add<R, Output = i32> {
+            left + right
+        }
+
+        fun main() -> i32 {
+            sum(Number { value: 1 }, Delta { value: 2 })
+        }
+        "#,
+    );
+
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    let sum = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "sum__Number_Delta")
+        .unwrap();
+    assert!(
+        sum.blocks.iter().any(|(_, block)| {
+            block.insts.iter().any(|instruction| {
+                matches!(
+                    &instruction.kind,
+                    mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
+                        if name == "add__Number_Delta"
+                )
+            })
+        }),
+        "{sum:#?}"
+    );
+}
+
+#[test]
+fn heterogeneous_operator_selects_rhs_impl_for_primitive_lhs() {
+    let (_, type_result, _, module) = compile(
+        r#"
+        #[lang = "add"]
+        trait Add<Rhs = Self> {
+            type Output;
+            fun add(self, rhs: Rhs) -> Self::Output;
+        }
+
+        struct Delta { value: i32 }
+
+        impl Add<Delta> for i32 {
+            type Output = i32;
+
+            fun add(self, rhs: Delta) -> Self::Output {
+                self + rhs.value
+            }
+        }
+
+        fun main() -> i32 {
+            1 + Delta { value: 2 }
+        }
+        "#,
+    );
+
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    assert!(
+        main.blocks.iter().any(|(_, block)| {
+            block.insts.iter().any(|instruction| {
+                matches!(
+                    &instruction.kind,
+                    mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
+                        if name == "add__i32_Delta"
+                )
+            })
+        }),
+        "{main:#?}"
+    );
+}
+
+#[test]
+fn heterogeneous_comparison_selects_rhs_impl_for_primitive_lhs() {
+    let (_, type_result, _, module) = compile(
+        r#"
+        #[lang = "partial_eq"]
+        trait PartialEq<Rhs = Self> {
+            fun eq(&self, other: &Rhs) -> bool;
+            fun ne(&self, other: &Rhs) -> bool { !self.eq(other) }
+        }
+
+        struct Delta { value: i32 }
+
+        impl PartialEq<Delta> for i32 {
+            fun eq(&self, other: &Delta) -> bool {
+                *self == other.value
+            }
+        }
+
+        fun main() -> bool {
+            1 == Delta { value: 1 }
+        }
+        "#,
+    );
+
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    assert!(
+        main.blocks.iter().any(|(_, block)| {
+            block.insts.iter().any(|instruction| {
+                matches!(
+                    &instruction.kind,
+                    mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
+                        if name == "eq__i32_Delta"
+                )
+            })
+        }),
+        "{main:#?}"
+    );
+}
+
+#[test]
+fn heterogeneous_compound_assignment_selects_rhs_impl_for_primitive_lhs() {
+    let (_, type_result, _, module) = compile(
+        r#"
+        #[lang = "add_assign"]
+        trait AddAssign<Rhs = Self> {
+            fun add_assign(&mut self, rhs: Rhs);
+        }
+
+        struct Delta { value: i32 }
+
+        impl AddAssign<Delta> for i32 {
+            fun add_assign(&mut self, rhs: Delta) {
+                *self += rhs.value;
+            }
+        }
+
+        fun main() -> i32 {
+            let mut value = 1;
+            value += Delta { value: 2 };
+            value
+        }
+        "#,
+    );
+
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    assert!(
+        main.blocks.iter().any(|(_, block)| {
+            block.insts.iter().any(|instruction| {
+                matches!(
+                    &instruction.kind,
+                    mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
+                        if name == "add_assign__i32_Delta"
+                )
+            })
+        }),
+        "{main:#?}"
+    );
+}
+
+#[test]
 fn overloaded_add_lowers_to_method_call() {
     let module = lower(
         r#"
@@ -844,6 +1234,116 @@ fn compound_assignment_lowers_to_load_binop_store() {
             .insts
             .iter()
             .any(|i| matches!(i.kind, mir::instr::InstKind::Store(_, _)))
+    );
+}
+
+#[test]
+fn assignment_evaluates_rhs_before_lhs_place() {
+    let module = lower(
+        r#"
+        fun lhs_index() -> i32 { 0 }
+        fun rhs_value() -> i32 { 1 }
+
+        fun main() {
+            let mut values = [0];
+            values[lhs_index()] = rhs_value();
+        }
+        "#,
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    let calls = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter_map(|instruction| match &instruction.kind {
+            mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(calls, ["rhs_value", "lhs_index"]);
+}
+
+#[test]
+fn primitive_compound_assignment_evaluates_rhs_before_lhs_place() {
+    let module = lower(
+        r#"
+        fun lhs_index() -> i32 { 0 }
+        fun rhs_value() -> i32 { 1 }
+
+        fun main() {
+            let mut values = [0];
+            values[lhs_index()] += rhs_value();
+        }
+        "#,
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    let calls = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter_map(|instruction| match &instruction.kind {
+            mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(calls, ["rhs_value", "lhs_index"]);
+}
+
+#[test]
+fn overloaded_compound_assignment_evaluates_lhs_before_rhs() {
+    let module = lower(
+        r#"
+        #[lang = "add_assign"]
+        trait AddAssign { fun add_assign(&mut self, rhs: Self); }
+
+        struct Number { value: i32 }
+
+        impl AddAssign for Number {
+            fun add_assign(&mut self, rhs: Self) {
+                self.value += rhs.value;
+            }
+        }
+
+        fun lhs_index() -> i32 { 0 }
+        fun rhs_value() -> Number { Number { value: 1 } }
+
+        fun main() {
+            let mut values = [Number { value: 0 }];
+            values[lhs_index()] += rhs_value();
+        }
+        "#,
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    let calls = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter_map(|instruction| match &instruction.kind {
+            mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        calls[0] == "lhs_index" && calls[1] == "rhs_value",
+        "{calls:?}"
     );
 }
 

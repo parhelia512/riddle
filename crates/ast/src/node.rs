@@ -415,6 +415,10 @@ impl TraitDecl {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    pub fn generic_params(&self) -> Option<GenericParams> {
+        support::child(&self.syntax)
+    }
+
     pub fn supertraits(&self) -> Vec<GenericBound> {
         let elements = self.syntax.children_with_tokens().collect::<Vec<_>>();
         let Some(colon) = elements.iter().position(
@@ -571,6 +575,7 @@ pub struct GenericParam {
     pub name: String,
     pub is_const: bool,
     pub bounds: Vec<GenericBound>,
+    pub default: Option<Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -582,6 +587,7 @@ pub struct WherePredicate {
 #[derive(Debug, Clone)]
 pub struct GenericBound {
     pub trait_path: Path,
+    pub type_args: Vec<Type>,
     pub assoc_constraints: Vec<GenericAssocConstraint>,
 }
 
@@ -619,6 +625,7 @@ impl GenericParam {
                 name,
                 is_const,
                 bounds: Vec::new(),
+                default: None,
             });
         }
         let colon = elements
@@ -627,10 +634,16 @@ impl GenericParam {
         let bounds = colon
             .map(|index| parse_generic_bounds(&elements[index + 1..]))
             .unwrap_or_default();
+        let default = top_level_token(elements, SyntaxKind::Eq).and_then(|index| {
+            elements[index + 1..]
+                .iter()
+                .find_map(|element| element.as_node().and_then(|node| Type::cast(node.clone())))
+        });
         Some(Self {
             name,
             is_const,
             bounds,
+            default,
         })
     }
 }
@@ -642,13 +655,52 @@ fn parse_generic_bounds(elements: &[SyntaxElement]) -> Vec<GenericBound> {
             let trait_path = bound
                 .iter()
                 .find_map(|element| element.as_node().and_then(|node| Path::cast(node.clone())))?;
+            let type_args = parse_bound_type_args(&bound);
             let assoc_constraints = parse_assoc_constraints(&bound);
             Some(GenericBound {
                 trait_path,
+                type_args,
                 assoc_constraints,
             })
         })
         .collect()
+}
+
+fn parse_bound_type_args(elements: &[SyntaxElement]) -> Vec<Type> {
+    let Some(start) = elements.iter().position(
+        |element| matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::Less),
+    ) else {
+        return Vec::new();
+    };
+    let Some(end) = elements.iter().rposition(
+        |element| matches!(element.as_token(), Some(token) if token.kind() == SyntaxKind::Greater),
+    ) else {
+        return Vec::new();
+    };
+
+    split_elements(&elements[start + 1..end], SyntaxKind::Comma)
+        .into_iter()
+        .filter(|arg| top_level_token(arg, SyntaxKind::Eq).is_none())
+        .filter_map(|arg| {
+            arg.into_iter()
+                .find_map(|element| element.as_node().and_then(|node| Type::cast(node.clone())))
+        })
+        .collect()
+}
+
+fn top_level_token(elements: &[SyntaxElement], target: SyntaxKind) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, element) in elements.iter().enumerate() {
+        match element.as_token().map(|token| token.kind()) {
+            Some(SyntaxKind::Less | SyntaxKind::LParen | SyntaxKind::LBracket) => depth += 1,
+            Some(SyntaxKind::Greater | SyntaxKind::RParen | SyntaxKind::RBracket) => {
+                depth = depth.saturating_sub(1)
+            }
+            Some(kind) if kind == target && depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_assoc_constraints(elements: &[SyntaxElement]) -> Vec<GenericAssocConstraint> {

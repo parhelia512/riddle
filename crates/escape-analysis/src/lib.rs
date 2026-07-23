@@ -8,7 +8,7 @@ use hir::{
     },
     item_tree::{FunctionId, HirTypeRef},
 };
-use type_checker::{CaptureMode, CaptureSource, Type, TypeCheckResult};
+use type_checker::{CaptureMode, CaptureSource, OperatorCall, Type, TypeCheckResult};
 
 /// Result of escape analysis: which locals and parameter places need stable storage.
 #[derive(Debug, Default)]
@@ -179,7 +179,10 @@ impl<'a> EscapeAnalyzer<'a> {
                     .type_result
                     .operator_calls
                     .get(&(ctx.body_id, expr_id))
-                    .map(|call| call.function)
+                    .and_then(|call| match call {
+                        OperatorCall::Function(fid) => Some(*fid),
+                        OperatorCall::Trait(_) => None,
+                    })
                 {
                     let by_ref = self.hir.item_tree.functions[fid]
                         .params
@@ -276,7 +279,10 @@ impl<'a> EscapeAnalyzer<'a> {
                     .type_result
                     .operator_calls
                     .get(&(ctx.body_id, expr_id))
-                    .map(|call| call.function)
+                    .and_then(|call| match call {
+                        OperatorCall::Function(fid) => Some(*fid),
+                        OperatorCall::Trait(_) => None,
+                    })
                 {
                     self.handle_operator_args(ctx, fid, *lhs, *rhs);
                 } else {

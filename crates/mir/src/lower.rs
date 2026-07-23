@@ -9,7 +9,7 @@ use hir::{
         PatternBindingId, ResolvedName, Stmt, StmtId, UnaryOp as HirUnOp,
     },
 };
-use type_checker::{CaptureMode, CaptureSource, LambdaInfo, TypeCheckResult};
+use type_checker::{CaptureMode, CaptureSource, LambdaInfo, OperatorCall, TypeCheckResult};
 
 use crate::builder::Builder;
 use crate::func::Function;
@@ -759,60 +759,101 @@ impl<'a> LowerCtx<'a> {
                     .and_then(|bid| self.type_result.operator_calls.get(&(bid, expr_id)))
                     .cloned()
                 {
-                    let receiver_ty = self.hir.item_tree.functions[call.function]
+                    let function = match call {
+                        OperatorCall::Function(fid) => Some(fid),
+                        OperatorCall::Trait(call) => {
+                            let lhs_ty = self
+                                .current_body
+                                .and_then(|bid| self.type_result.expr_types.get(&(bid, *lhs)));
+                            let rhs_ty = self
+                                .current_body
+                                .and_then(|bid| self.type_result.expr_types.get(&(bid, *rhs)));
+                            lhs_ty.and_then(|lhs_ty| {
+                                self.find_trait_impl_method(
+                                    call.trait_id,
+                                    &call.method,
+                                    lhs_ty,
+                                    rhs_ty,
+                                )
+                            })
+                        }
+                    };
+                    let Some(function) = function else {
+                        return builder.unit_const();
+                    };
+                    let receiver_ty = self.hir.item_tree.functions[function]
                         .params
                         .first()
                         .map(|param| param.ty.clone());
-                    let lv = if let Some(receiver_ty) = receiver_ty
-                        && op.is_assignment()
-                    {
+                    let rhs_ty = self.hir.item_tree.functions[function]
+                        .params
+                        .get(1)
+                        .map(|param| param.ty.clone());
+                    let lv = if let Some(receiver_ty) = receiver_ty {
                         self.lower_receiver_arg(builder, param_values, body, *lhs, &receiver_ty)
                     } else {
                         self.lower_expr(builder, param_values, body, *lhs)
                     };
-                    let rv = self.lower_expr(builder, param_values, body, *rhs);
+                    let rv = if let Some(rhs_ty) = rhs_ty {
+                        self.lower_receiver_arg(builder, param_values, body, *rhs, &rhs_ty)
+                    } else {
+                        self.lower_expr(builder, param_values, body, *rhs)
+                    };
                     return self.lower_operator_call(
                         builder,
                         *lhs,
-                        call.function,
+                        Some(*rhs),
+                        function,
                         vec![lv, rv],
                         mir_type,
                     );
                 }
 
-                let lv = if op.is_assignment() {
-                    self.lower_lvalue(builder, param_values, body, *lhs)
-                } else {
-                    self.lower_expr(builder, param_values, body, *lhs)
-                };
+                if op.is_assignment() {
+                    let rv = self.lower_expr(builder, param_values, body, *rhs);
+                    let lv = self.lower_lvalue(builder, param_values, body, *lhs);
+                    return match op {
+                        HirBinOp::Assign => {
+                            builder.store(rv, lv);
+                            builder.unit_const()
+                        }
+                        _ => {
+                            let base_op = op.compound_base().unwrap();
+                            let value_ty = self
+                                .current_body
+                                .and_then(|bid| self.type_result.expr_types.get(&(bid, *lhs)))
+                                .map(|t| self.convert_type(t))
+                                .unwrap_or(mir_type);
+                            let current = builder.load(lv, value_ty.clone());
+                            let updated =
+                                builder.binop(convert_binop(&base_op), current, rv, value_ty);
+                            builder.store(updated, lv);
+                            builder.unit_const()
+                        }
+                    };
+                }
+
+                let lv = self.lower_expr(builder, param_values, body, *lhs);
                 let rv = self.lower_expr(builder, param_values, body, *rhs);
 
                 match op {
-                    HirBinOp::Assign => {
-                        // 赋值 = store rv -> lv 的地址
-                        builder.store(rv, lv);
-                        rv
-                    }
-                    _ if let Some(base_op) = op.compound_base() => {
-                        let value_ty = self
-                            .current_body
-                            .and_then(|bid| self.type_result.expr_types.get(&(bid, *lhs)))
-                            .map(|t| self.convert_type(t))
-                            .unwrap_or(mir_type);
-                        let current = builder.load(lv, value_ty.clone());
-                        let updated =
-                            builder.binop(convert_binop(&base_op), current, rv, value_ty.clone());
-                        builder.store(updated, lv);
-                        updated
-                    }
                     HirBinOp::Eq
                     | HirBinOp::Neq
                     | HirBinOp::Lt
                     | HirBinOp::Gt
                     | HirBinOp::LtEq
                     | HirBinOp::GtEq => {
-                        let cmp_op = convert_cmp_op(op);
-                        builder.cmp(cmp_op, lv, rv)
+                        let lhs_ty = self
+                            .current_body
+                            .and_then(|bid| self.type_result.expr_types.get(&(bid, *lhs)))
+                            .cloned()
+                            .unwrap_or(type_checker::Type::Error);
+                        let rhs_ty = self
+                            .current_body
+                            .and_then(|bid| self.type_result.expr_types.get(&(bid, *rhs)))
+                            .cloned()
+                            .unwrap_or(type_checker::Type::Error);
+                        self.lower_comparison(builder, op, lv, rv, &lhs_ty, &rhs_ty)
                     }
                     _ => {
                         let binop = convert_binop(op);
@@ -827,7 +868,24 @@ impl<'a> LowerCtx<'a> {
                     .and_then(|bid| self.type_result.operator_calls.get(&(bid, expr_id)))
                     .cloned()
                 {
-                    let receiver_ty = self.hir.item_tree.functions[call.function]
+                    let function = match call {
+                        OperatorCall::Function(fid) => Some(fid),
+                        OperatorCall::Trait(call) => self
+                            .current_body
+                            .and_then(|bid| self.type_result.expr_types.get(&(bid, *operand)))
+                            .and_then(|operand_ty| {
+                                self.find_trait_impl_method(
+                                    call.trait_id,
+                                    &call.method,
+                                    operand_ty,
+                                    None,
+                                )
+                            }),
+                    };
+                    let Some(function) = function else {
+                        return builder.unit_const();
+                    };
+                    let receiver_ty = self.hir.item_tree.functions[function]
                         .params
                         .first()
                         .map(|param| param.ty.clone());
@@ -839,7 +897,8 @@ impl<'a> LowerCtx<'a> {
                     return self.lower_operator_call(
                         builder,
                         *operand,
-                        call.function,
+                        None,
+                        function,
                         vec![value],
                         mir_type,
                     );
@@ -890,8 +949,11 @@ impl<'a> LowerCtx<'a> {
                 // then 分支
                 builder.switch_to_block(then_block);
                 let tv = self.lower_expr(builder, param_values, body, *then_branch);
+                let then_exit = builder.current_block;
+                let mut phi_args = Vec::new();
                 if builder.needs_return() {
                     builder.set_branch(merge_block);
+                    phi_args.push((tv, then_exit));
                 }
 
                 // else 分支
@@ -900,17 +962,21 @@ impl<'a> LowerCtx<'a> {
                     Some(eb) => self.lower_expr(builder, param_values, body, *eb),
                     None => builder.unit_const(),
                 };
+                let else_exit = builder.current_block;
                 if builder.needs_return() {
                     builder.set_branch(merge_block);
+                    phi_args.push((ev, else_exit));
                 }
 
                 // merge 块：用 phi 节点合并两条路径的值
                 builder.switch_to_block(merge_block);
-                let phi = Inst::new(
-                    InstKind::Phi(vec![(tv, then_block), (ev, else_block)]),
-                    mir_type.clone(),
-                );
-                builder.func.push_inst(merge_block, phi)
+                match phi_args.len() {
+                    0 => builder.unit_const(),
+                    _ => {
+                        let phi = Inst::new(InstKind::Phi(phi_args), mir_type.clone());
+                        builder.func.push_inst(merge_block, phi)
+                    }
+                }
             }
 
             Expr::While {
@@ -1083,7 +1149,7 @@ impl<'a> LowerCtx<'a> {
                     }
 
                     let name = if let Some((fid, base)) = method_target {
-                        self.mono_method_name(fid, base)
+                        self.mono_method_name(fid, base, args.first().copied())
                             .unwrap_or_else(|| self.function_name(fid))
                     } else {
                         target_fid
@@ -1335,16 +1401,17 @@ impl<'a> LowerCtx<'a> {
                 info.into_iter.trait_id,
                 &info.into_iter.method,
                 &iterable_ty,
+                None,
             )
             .expect("missing IntoIterator impl method for checked for loop");
         let next_fid = self
-            .find_trait_impl_method(info.next.trait_id, &info.next.method, &iter_tc_ty)
+            .find_trait_impl_method(info.next.trait_id, &info.next.method, &iter_tc_ty, None)
             .expect("missing Iterator impl method for checked for loop");
         let into_iter_name = self
-            .mono_method_name_for_receiver(into_iter_fid, &iterable_ty)
+            .mono_method_name_for_receiver(into_iter_fid, &iterable_ty, None)
             .unwrap_or_else(|| self.function_name(into_iter_fid));
         let next_name = self
-            .mono_method_name_for_receiver(next_fid, &iter_tc_ty)
+            .mono_method_name_for_receiver(next_fid, &iter_tc_ty, None)
             .unwrap_or_else(|| self.function_name(next_fid));
 
         let iter_value = builder.call(
@@ -2189,14 +2256,256 @@ impl<'a> LowerCtx<'a> {
         &mut self,
         builder: &mut Builder,
         lhs: ExprId,
+        rhs: Option<ExprId>,
         fid: hir::item_tree::FunctionId,
         args: Vec<Value>,
         ret_ty: Type,
     ) -> Value {
         let name = self
-            .mono_method_name(fid, lhs)
+            .mono_method_name(fid, lhs, rhs)
             .unwrap_or_else(|| self.function_name(fid));
         builder.call(FuncRef::Local(name), args, ret_ty)
+    }
+
+    fn lower_comparison(
+        &mut self,
+        builder: &mut Builder,
+        op: &HirBinOp,
+        lhs: Value,
+        rhs: Value,
+        lhs_ty: &type_checker::Type,
+        rhs_ty: &type_checker::Type,
+    ) -> Value {
+        let lhs_ty = self.substitute_tc_type(lhs_ty);
+        let rhs_ty = self.substitute_tc_type(rhs_ty);
+
+        match (&lhs_ty, &rhs_ty) {
+            (type_checker::Type::Tuple(lhs_elements), type_checker::Type::Tuple(rhs_elements))
+                if lhs_elements.len() == rhs_elements.len() =>
+            {
+                let elements = lhs_elements
+                    .iter()
+                    .zip(rhs_elements)
+                    .enumerate()
+                    .map(|(index, (lhs_ty, rhs_ty))| {
+                        (
+                            builder.extract_value(lhs, index, self.convert_type(lhs_ty)),
+                            builder.extract_value(rhs, index, self.convert_type(rhs_ty)),
+                            lhs_ty.clone(),
+                            rhs_ty.clone(),
+                        )
+                    })
+                    .collect();
+                return self.lower_aggregate_comparison(builder, op, elements);
+            }
+            (
+                type_checker::Type::Array(lhs_inner, lhs_len),
+                type_checker::Type::Array(rhs_inner, rhs_len),
+            ) if lhs_len == rhs_len => {
+                let Some(len) = lhs_len.as_usize() else {
+                    return self.lower_comparison_leaf(builder, op, lhs, rhs, &lhs_ty, &rhs_ty);
+                };
+                let lhs_mir_ty = self.convert_type(lhs_inner);
+                let rhs_mir_ty = self.convert_type(rhs_inner);
+                let elements = (0..len)
+                    .map(|index| {
+                        let index_value = builder.iconst(index as i128, IntTy::Usize);
+                        let lhs_ptr = builder.index_ptr(lhs, index_value, lhs_mir_ty.clone());
+                        let rhs_ptr = builder.index_ptr(rhs, index_value, rhs_mir_ty.clone());
+                        (
+                            builder.load(lhs_ptr, lhs_mir_ty.clone()),
+                            builder.load(rhs_ptr, rhs_mir_ty.clone()),
+                            lhs_inner.as_ref().clone(),
+                            rhs_inner.as_ref().clone(),
+                        )
+                    })
+                    .collect();
+                return self.lower_aggregate_comparison(builder, op, elements);
+            }
+            _ => {}
+        }
+
+        self.lower_comparison_leaf(builder, op, lhs, rhs, &lhs_ty, &rhs_ty)
+    }
+
+    fn lower_aggregate_comparison(
+        &mut self,
+        builder: &mut Builder,
+        op: &HirBinOp,
+        elements: Vec<(Value, Value, type_checker::Type, type_checker::Type)>,
+    ) -> Value {
+        match op {
+            HirBinOp::Eq => self.lower_aggregate_equality(builder, elements, false),
+            HirBinOp::Neq => self.lower_aggregate_equality(builder, elements, true),
+            HirBinOp::Lt | HirBinOp::Gt | HirBinOp::LtEq | HirBinOp::GtEq => {
+                self.lower_aggregate_ordering(builder, *op, elements)
+            }
+            _ => unreachable!("aggregate comparison called with non-comparison op"),
+        }
+    }
+
+    fn lower_aggregate_equality(
+        &mut self,
+        builder: &mut Builder,
+        elements: Vec<(Value, Value, type_checker::Type, type_checker::Type)>,
+        negate: bool,
+    ) -> Value {
+        if elements.is_empty() {
+            return builder.bconst(!negate);
+        }
+
+        let merge_block = builder.func.new_block_labeled("cmp_merge");
+        let mut phi_args = Vec::with_capacity(elements.len() + 1);
+        for (lhs, rhs, lhs_ty, rhs_ty) in elements {
+            let equal = self.lower_comparison(builder, &HirBinOp::Eq, lhs, rhs, &lhs_ty, &rhs_ty);
+            let next_block = builder.func.new_block_labeled("cmp_next");
+            let result_block = builder.func.new_block_labeled("cmp_result");
+            builder.set_cond_branch(equal, next_block, result_block);
+
+            builder.switch_to_block(result_block);
+            let result = builder.bconst(negate);
+            let result_exit = builder.current_block;
+            builder.set_branch(merge_block);
+            phi_args.push((result, result_exit));
+            builder.switch_to_block(next_block);
+        }
+
+        let result = builder.bconst(!negate);
+        let result_exit = builder.current_block;
+        builder.set_branch(merge_block);
+        phi_args.push((result, result_exit));
+
+        builder.switch_to_block(merge_block);
+        builder
+            .func
+            .push_inst(merge_block, Inst::new(InstKind::Phi(phi_args), Type::Bool))
+    }
+
+    fn lower_aggregate_ordering(
+        &mut self,
+        builder: &mut Builder,
+        op: HirBinOp,
+        elements: Vec<(Value, Value, type_checker::Type, type_checker::Type)>,
+    ) -> Value {
+        if elements.is_empty() {
+            return builder.bconst(matches!(op, HirBinOp::LtEq | HirBinOp::GtEq));
+        }
+
+        let merge_block = builder.func.new_block_labeled("cmp_merge");
+        let mut phi_args = Vec::with_capacity(elements.len() + 1);
+        for (lhs, rhs, lhs_ty, rhs_ty) in elements {
+            let equal = self.lower_comparison(builder, &HirBinOp::Eq, lhs, rhs, &lhs_ty, &rhs_ty);
+            let next_block = builder.func.new_block_labeled("cmp_next");
+            let result_block = builder.func.new_block_labeled("cmp_result");
+            builder.set_cond_branch(equal, next_block, result_block);
+
+            builder.switch_to_block(result_block);
+            let decision_op = match op {
+                HirBinOp::Lt | HirBinOp::LtEq => HirBinOp::Lt,
+                HirBinOp::Gt | HirBinOp::GtEq => HirBinOp::Gt,
+                _ => unreachable!("non-ordering op in aggregate ordering"),
+            };
+            let result = self.lower_comparison(builder, &decision_op, lhs, rhs, &lhs_ty, &rhs_ty);
+            let result_exit = builder.current_block;
+            if builder.needs_return() {
+                builder.set_branch(merge_block);
+                phi_args.push((result, result_exit));
+            }
+            builder.switch_to_block(next_block);
+        }
+
+        let result = builder.bconst(matches!(op, HirBinOp::LtEq | HirBinOp::GtEq));
+        let result_exit = builder.current_block;
+        builder.set_branch(merge_block);
+        phi_args.push((result, result_exit));
+
+        builder.switch_to_block(merge_block);
+        builder
+            .func
+            .push_inst(merge_block, Inst::new(InstKind::Phi(phi_args), Type::Bool))
+    }
+
+    fn lower_comparison_leaf(
+        &mut self,
+        builder: &mut Builder,
+        op: &HirBinOp,
+        lhs: Value,
+        rhs: Value,
+        lhs_ty: &type_checker::Type,
+        rhs_ty: &type_checker::Type,
+    ) -> Value {
+        if matches!(
+            (lhs_ty, rhs_ty),
+            (type_checker::Type::Unit, type_checker::Type::Unit)
+        ) {
+            return builder.bconst(matches!(op, HirBinOp::Eq | HirBinOp::LtEq | HirBinOp::GtEq));
+        }
+        if builtin_comparison_types(op, lhs_ty, rhs_ty) {
+            return builder.cmp(convert_cmp_op(op), lhs, rhs);
+        }
+
+        if let Some((lang, method)) = comparison_trait(op)
+            && let Some(trait_id) = self.lang_trait_id(lang)
+            && let Some(fid) = self.find_trait_impl_method(trait_id, method, lhs_ty, Some(rhs_ty))
+        {
+            let Some(receiver_ty) = self.hir.item_tree.functions[fid]
+                .params
+                .first()
+                .map(|param| param.ty.clone())
+            else {
+                return builder.cmp(convert_cmp_op(op), lhs, rhs);
+            };
+            let Some(rhs_param_ty) = self.hir.item_tree.functions[fid]
+                .params
+                .get(1)
+                .map(|param| param.ty.clone())
+            else {
+                return builder.cmp(convert_cmp_op(op), lhs, rhs);
+            };
+            let lhs_arg = self.lower_comparison_arg(builder, lhs, lhs_ty, &receiver_ty);
+            let rhs_arg = self.lower_comparison_arg(builder, rhs, rhs_ty, &rhs_param_ty);
+            let name = self
+                .mono_method_name_for_receiver(fid, lhs_ty, Some(rhs_ty))
+                .unwrap_or_else(|| self.function_name(fid));
+            return builder.call(FuncRef::Local(name), vec![lhs_arg, rhs_arg], Type::Bool);
+        }
+
+        builder.cmp(convert_cmp_op(op), lhs, rhs)
+    }
+
+    fn lower_comparison_arg(
+        &self,
+        builder: &mut Builder,
+        value: Value,
+        actual_ty: &type_checker::Type,
+        expected: &hir::item_tree::HirTypeRef,
+    ) -> Value {
+        let actual_mir_ty = self.convert_type(actual_ty);
+        match expected {
+            hir::item_tree::HirTypeRef::Ref(_, _) if matches!(actual_mir_ty, Type::Ref(_, _)) => {
+                value
+            }
+            hir::item_tree::HirTypeRef::Ref(_, mutable) => builder.unop(
+                if *mutable { UnOp::MutRef } else { UnOp::Ref },
+                value,
+                Type::Ref(Box::new(actual_mir_ty), *mutable),
+            ),
+            _ => value,
+        }
+    }
+
+    fn lang_trait_id(&self, lang: &str) -> Option<hir::item_tree::TraitId> {
+        self.hir
+            .item_tree
+            .traits
+            .iter()
+            .find_map(|(id, trait_item)| {
+                trait_item
+                    .attrs
+                    .iter()
+                    .any(|attr| attr.name.0 == "lang" && attr.value.as_deref() == Some(lang))
+                    .then_some(id)
+            })
     }
 
     fn lower_builtin_operator_method_call(
@@ -2260,7 +2569,7 @@ impl<'a> LowerCtx<'a> {
         };
         if let Some(call) = self.type_result.trait_method_calls.get(&(body_id, callee)) {
             return self
-                .find_trait_impl_method(call.trait_id, &call.method, receiver_ty)
+                .find_trait_impl_method(call.trait_id, &call.method, receiver_ty, None)
                 .unwrap_or(fid);
         }
         let Some(imp) = self.impl_for_method(fid) else {
@@ -2276,7 +2585,7 @@ impl<'a> LowerCtx<'a> {
             return fid;
         };
         let method_name = &self.hir.item_tree.functions[fid].name;
-        self.find_trait_impl_method(trait_id, &method_name.0, receiver_ty)
+        self.find_trait_impl_method(trait_id, &method_name.0, receiver_ty, None)
             .unwrap_or(fid)
     }
 
@@ -2285,6 +2594,7 @@ impl<'a> LowerCtx<'a> {
         trait_id: hir::item_tree::TraitId,
         method_name: &str,
         receiver_ty: &type_checker::Type,
+        rhs_ty: Option<&type_checker::Type>,
     ) -> Option<hir::item_tree::FunctionId> {
         let receiver_ty = self.substitute_tc_type(receiver_ty);
         let dereferenced = match &receiver_ty {
@@ -2298,6 +2608,7 @@ impl<'a> LowerCtx<'a> {
                 };
                 if self.resolve_trait_ref(candidate_trait) != Some(trait_id)
                     || !self.impl_type_matches(candidate, receiver_ty)
+                    || !self.impl_trait_args_match(candidate, receiver_ty, rhs_ty)
                 {
                     continue;
                 }
@@ -2995,21 +3306,45 @@ impl<'a> LowerCtx<'a> {
         &mut self,
         fid: hir::item_tree::FunctionId,
         base: ExprId,
+        rhs: Option<ExprId>,
     ) -> Option<String> {
         let body_id = self.current_body?;
         let receiver_ty = self.type_result.expr_types.get(&(body_id, base))?;
-        self.mono_method_name_for_receiver(fid, receiver_ty)
+        let rhs_ty = rhs.and_then(|rhs| self.type_result.expr_types.get(&(body_id, rhs)));
+        self.mono_method_name_for_receiver(fid, receiver_ty, rhs_ty)
     }
 
     fn mono_method_name_for_receiver(
         &mut self,
         fid: hir::item_tree::FunctionId,
         receiver_ty: &type_checker::Type,
+        rhs_ty: Option<&type_checker::Type>,
     ) -> Option<String> {
         let receiver_ty = self.substitute_tc_type(receiver_ty);
         if self.default_methods.contains_key(&fid) {
             let receiver_mir_ty = self.convert_type(&receiver_ty);
-            let suffix = mono_type_name(&receiver_mir_ty);
+            let trait_id = self.default_methods[&fid];
+            let trait_generics = self.hir.item_tree.traits[trait_id].generics.clone();
+            let rhs_ty = rhs_ty.map(|ty| self.substitute_tc_type(ty));
+            let trait_args = trait_generics
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    if index == 0 {
+                        rhs_ty.clone().unwrap_or_else(|| receiver_ty.clone())
+                    } else {
+                        receiver_ty.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let suffix = std::iter::once(mono_type_name(&receiver_mir_ty))
+                .chain(
+                    trait_args
+                        .iter()
+                        .map(|arg| mono_type_name(&self.convert_type(arg))),
+                )
+                .collect::<Vec<_>>()
+                .join("_");
             let key = (fid, suffix.clone());
             if let Some(name) = self.mono_methods.get(&key) {
                 return Some(name.clone());
@@ -3017,14 +3352,19 @@ impl<'a> LowerCtx<'a> {
 
             let mono_name = format!("{}__{}", self.hir.item_tree.functions[fid].name.0, suffix);
             self.mono_methods.insert(key, mono_name.clone());
-            let old_subst = std::mem::replace(
-                &mut self.generic_subst,
-                HashMap::from([("Self".into(), receiver_mir_ty)]),
+            let mut tc_subst = HashMap::from([("Self".into(), receiver_ty)]);
+            tc_subst.extend(
+                trait_generics
+                    .iter()
+                    .zip(trait_args)
+                    .map(|(name, ty)| (name.0.clone(), ty)),
             );
-            let old_tc_subst = std::mem::replace(
-                &mut self.generic_tc_subst,
-                HashMap::from([("Self".into(), receiver_ty)]),
-            );
+            let mir_subst = tc_subst
+                .iter()
+                .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
+                .collect();
+            let old_subst = std::mem::replace(&mut self.generic_subst, mir_subst);
+            let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
             let old_expr_cache = std::mem::take(&mut self.expr_cache);
             let old_scope_map = std::mem::take(&mut self.scope_map);
             let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
@@ -3053,13 +3393,39 @@ impl<'a> LowerCtx<'a> {
             return None;
         }
         let receiver_mir_ty = self.convert_type(&receiver_ty);
-        let suffix = mono_type_name(&receiver_mir_ty);
+        let subst = self.impl_mir_subst(&imp, &receiver_ty)?;
+        let type_subst = subst
+            .types
+            .iter()
+            .map(|(name, ty)| (name.as_str(), ty))
+            .collect::<HashMap<_, _>>();
+        let const_subst = subst
+            .consts
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect::<HashMap<_, _>>();
+        let trait_args = match imp.trait_ty.as_ref() {
+            Some(hir::item_tree::HirTypeRef::Named(path)) => path
+                .type_args
+                .iter()
+                .map(|arg| {
+                    mono_type_name(&self.convert_hir_type_with_substs(
+                        arg,
+                        &type_subst,
+                        &const_subst,
+                    ))
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let suffix = std::iter::once(mono_type_name(&receiver_mir_ty))
+            .chain(trait_args)
+            .collect::<Vec<_>>()
+            .join("_");
         let key = (fid, suffix.clone());
         if let Some(name) = self.mono_methods.get(&key) {
             return Some(name.clone());
         }
-
-        let subst = self.impl_mir_subst(&imp, &receiver_ty)?;
         let original_name = self.hir.item_tree.functions[fid].name.0.clone();
         let mono_name = format!("{}__{}", original_name, suffix);
         self.mono_methods.insert(key, mono_name.clone());
@@ -3277,10 +3643,21 @@ impl<'a> LowerCtx<'a> {
             return None;
         }
         let self_ty = self.convert_hir_type(&imp.self_ty);
+        let trait_args = match imp.trait_ty.as_ref() {
+            Some(hir::item_tree::HirTypeRef::Named(path)) => path
+                .type_args
+                .iter()
+                .map(|arg| mono_type_name(&self.convert_hir_type(arg)))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let suffix = std::iter::once(mono_type_name(&self_ty))
+            .chain(trait_args)
+            .collect::<Vec<_>>()
+            .join("_");
         Some(format!(
             "{}__{}",
-            self.hir.item_tree.functions[fid].name.0,
-            mono_type_name(&self_ty)
+            self.hir.item_tree.functions[fid].name.0, suffix
         ))
     }
 
@@ -3314,6 +3691,47 @@ impl<'a> LowerCtx<'a> {
                     == receiver_mir_ty
             })
             .unwrap_or(false)
+    }
+
+    fn impl_trait_args_match(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+        rhs_ty: Option<&type_checker::Type>,
+    ) -> bool {
+        let Some(rhs_ty) = rhs_ty else {
+            return true;
+        };
+        let Some(trait_ty) = imp.trait_ty.as_ref() else {
+            return false;
+        };
+        let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+            return false;
+        };
+        let tr = &self.hir.item_tree.traits[trait_id];
+        let Some(default) = tr.generic_defaults.first() else {
+            return true;
+        };
+        let explicit = match trait_ty {
+            hir::item_tree::HirTypeRef::Named(path) => path.type_args.first(),
+            _ => None,
+        };
+        let Some(expected) = explicit.or(default.as_ref()) else {
+            return false;
+        };
+
+        let receiver_ty = self.substitute_tc_type(receiver_ty);
+        let receiver_mir = self.convert_type(&receiver_ty);
+        let subst = self.impl_mir_subst(imp, &receiver_ty).unwrap_or_default();
+        let mut type_subst = subst
+            .types
+            .iter()
+            .map(|(name, ty)| (name.as_str(), ty))
+            .collect::<HashMap<_, _>>();
+        type_subst.insert("Self", &receiver_mir);
+        let expected = self.convert_hir_type_with_substs(expected, &type_subst, &HashMap::new());
+        let actual = self.convert_type(&self.substitute_tc_type(rhs_ty));
+        expected == actual
     }
 
     fn resolve_trait_ref(
@@ -3830,7 +4248,7 @@ fn trait_operator_contract(
         segments: vec![hir::Name("Self".into())],
         type_args: Vec::new(),
     });
-    if !operator_params_match(function, &self_ty, op) {
+    if !trait_operator_params_match(trait_item, function, &self_ty, op) {
         return false;
     }
     match op {
@@ -3842,6 +4260,53 @@ fn trait_operator_contract(
                 .any(|alias| alias.name.0 == "Output" && alias.ty.is_none())
                 && function.ret_type.as_ref().is_some_and(is_self_output)
         }
+    }
+}
+
+fn trait_operator_params_match(
+    trait_item: &hir::item_tree::HirTrait,
+    function: &hir::item_tree::HirFunction,
+    self_ty: &hir::item_tree::HirTypeRef,
+    op: BuiltinOperator,
+) -> bool {
+    if matches!(op, BuiltinOperator::Unary(_)) {
+        return operator_params_match(function, self_ty, op);
+    }
+    let Some(rhs_name) = trait_item.generics.first() else {
+        return operator_params_match(function, self_ty, op);
+    };
+    if trait_item.generics.len() != 1
+        || !trait_item
+            .generic_defaults
+            .first()
+            .and_then(Option::as_ref)
+            .is_some_and(|default| type_matches_self(default, self_ty))
+    {
+        return false;
+    }
+    let rhs_matches = function.params.get(1).is_some_and(|param| {
+        matches!(
+            &param.ty,
+            hir::item_tree::HirTypeRef::Named(path)
+                if path.as_single_name().is_some_and(|name| name == rhs_name)
+        )
+    });
+    match op {
+        BuiltinOperator::Binary(_) => {
+            function.params.len() == 2
+                && type_matches_self(&function.params[0].ty, self_ty)
+                && rhs_matches
+        }
+        BuiltinOperator::Assign(_) => {
+            function.params.len() == 2
+                && matches!(
+                    &function.params[0].ty,
+                    hir::item_tree::HirTypeRef::Ref(inner, true)
+                        if type_matches_self(inner, self_ty)
+                )
+                && rhs_matches
+        }
+        BuiltinOperator::Unary(_) => unreachable!(),
     }
 }
 
@@ -3927,6 +4392,75 @@ fn convert_cmp_op(op: &HirBinOp) -> CmpOp {
         | HirBinOp::ShrAssign => {
             unreachable!("convert_cmp_op called with non-comparison op: {op:?}")
         }
+    }
+}
+
+fn comparison_trait(op: &HirBinOp) -> Option<(&'static str, &'static str)> {
+    Some(match op {
+        HirBinOp::Eq => ("partial_eq", "eq"),
+        HirBinOp::Neq => ("partial_eq", "ne"),
+        HirBinOp::Lt => ("partial_ord", "lt"),
+        HirBinOp::Gt => ("partial_ord", "gt"),
+        HirBinOp::LtEq => ("partial_ord", "le"),
+        HirBinOp::GtEq => ("partial_ord", "ge"),
+        _ => return None,
+    })
+}
+
+fn builtin_comparison_types(
+    op: &HirBinOp,
+    lhs: &type_checker::Type,
+    rhs: &type_checker::Type,
+) -> bool {
+    let numeric = |ty: &type_checker::Type| {
+        matches!(
+            ty,
+            type_checker::Type::Int(_)
+                | type_checker::Type::Float(_)
+                | type_checker::Type::InferInt
+                | type_checker::Type::InferFloat
+        )
+    };
+    let same_numeric_kind = |lhs: &type_checker::Type, rhs: &type_checker::Type| {
+        matches!(
+            (lhs, rhs),
+            (type_checker::Type::Int(_), type_checker::Type::Int(_))
+                | (type_checker::Type::Float(_), type_checker::Type::Float(_))
+                | (type_checker::Type::InferInt, type_checker::Type::InferInt)
+                | (
+                    type_checker::Type::InferFloat,
+                    type_checker::Type::InferFloat
+                )
+        )
+    };
+    match op {
+        HirBinOp::Eq | HirBinOp::Neq => {
+            if numeric(lhs) && numeric(rhs) && same_numeric_kind(lhs, rhs) {
+                return true;
+            }
+            matches!(
+                (lhs, rhs),
+                (type_checker::Type::Bool, type_checker::Type::Bool)
+                    | (type_checker::Type::Char, type_checker::Type::Char)
+                    | (type_checker::Type::Str, type_checker::Type::Str)
+                    | (type_checker::Type::Unit, type_checker::Type::Unit)
+            ) || matches!(
+                (lhs, rhs),
+                (
+                    type_checker::Type::Ref(inner_lhs, false),
+                    type_checker::Type::Ref(inner_rhs, false)
+                ) if matches!(inner_lhs.as_ref(), type_checker::Type::Str)
+                    && matches!(inner_rhs.as_ref(), type_checker::Type::Str)
+            )
+        }
+        HirBinOp::Lt | HirBinOp::Gt | HirBinOp::LtEq | HirBinOp::GtEq => {
+            (numeric(lhs) && numeric(rhs) && same_numeric_kind(lhs, rhs))
+                || matches!(
+                    (lhs, rhs),
+                    (type_checker::Type::Char, type_checker::Type::Char)
+                )
+        }
+        _ => false,
     }
 }
 

@@ -134,6 +134,48 @@ impl TypeChecker<'_> {
         self.find_trait_by_name(name)
     }
 
+    pub(crate) fn trait_ref_subst(
+        &mut self,
+        trait_id: TraitId,
+        trait_ref: &HirTypeRef,
+        self_ty: &Type,
+        params: &HashMap<String, Type>,
+        span: Option<TextRange>,
+    ) -> HashMap<String, Type> {
+        let explicit = match trait_ref {
+            HirTypeRef::Named(path) => path.type_args.as_slice(),
+            _ => &[],
+        };
+        let tr = self.hir.item_tree.traits[trait_id].clone();
+        let mut subst = params.clone();
+        subst.insert("Self".into(), self_ty.clone());
+        for (index, name) in tr.generics.iter().enumerate() {
+            let ty = explicit
+                .get(index)
+                .or_else(|| tr.generic_defaults.get(index).and_then(Option::as_ref))
+                .map(|arg| self.lower_type_ref_with_params_at(arg, &subst, span))
+                .unwrap_or(Type::Unknown);
+            subst.insert(name.0.clone(), ty);
+        }
+        subst
+    }
+
+    pub(crate) fn trait_ref_args(
+        &mut self,
+        trait_id: TraitId,
+        trait_ref: &HirTypeRef,
+        self_ty: &Type,
+        params: &HashMap<String, Type>,
+        span: Option<TextRange>,
+    ) -> Vec<Type> {
+        let subst = self.trait_ref_subst(trait_id, trait_ref, self_ty, params, span);
+        self.hir.item_tree.traits[trait_id]
+            .generics
+            .iter()
+            .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+            .collect()
+    }
+
     fn lower_named_type(
         &mut self,
         path: &HirPath,
@@ -380,7 +422,25 @@ impl TypeChecker<'_> {
             let Some(mut subst) = self.impl_subst_from_self_ty(&imp, &self_ty) else {
                 continue;
             };
-            subst.insert("Self".into(), self_ty.clone());
+            if let Some(trait_ty) = &imp.trait_ty
+                && let Some(trait_id) = self.resolve_trait_ref(trait_ty)
+            {
+                subst =
+                    self.trait_ref_subst(trait_id, trait_ty, &self_ty, &subst, imp.trait_ty_range);
+                if self.hir.item_tree.traits[trait_id]
+                    .generics
+                    .iter()
+                    .any(|name| {
+                        params.get(&name.0).is_some_and(|expected| {
+                            subst.get(&name.0).is_none_or(|actual| expected != actual)
+                        })
+                    })
+                {
+                    continue;
+                }
+            } else {
+                subst.insert("Self".into(), self_ty.clone());
+            }
             let Some(alias_id) = imp
                 .type_aliases
                 .iter()

@@ -15,7 +15,7 @@ pub use incremental::{
 };
 pub use result::{
     CaptureMode, CaptureSource, Diagnostic, ForLoopInfo, LabelStyle, LambdaCapture, LambdaInfo,
-    Severity, SourceLabel, TraitMethodCall, TypeCheckResult,
+    OperatorCall, Severity, SourceLabel, TraitMethodCall, TypeCheckResult,
 };
 pub use trait_env::TraitEnv;
 pub use types::{ClosureKind, ConstArg, FloatTy, IntTy, Type};

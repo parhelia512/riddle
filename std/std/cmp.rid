@@ -9,16 +9,50 @@ pub enum Ordering {
 impl crate::std::marker::Copy for Ordering {}
 
 #[lang = "partial_eq"]
-pub trait PartialEq {
-    fun eq(&self, other: &Self) -> bool;
+pub trait PartialEq<Rhs = Self> {
+    fun eq(&self, other: &Rhs) -> bool;
+
+    fun ne(&self, other: &Rhs) -> bool {
+        !self.eq(other)
+    }
 }
 
 #[lang = "eq"]
 pub trait Eq: PartialEq {}
 
 #[lang = "partial_ord"]
-pub trait PartialOrd: PartialEq {
-    fun partial_cmp(&self, other: &Self) -> Option<Ordering>;
+pub trait PartialOrd<Rhs = Self>: PartialEq<Rhs> {
+    fun partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
+
+    fun lt(&self, other: &Rhs) -> bool {
+        match self.partial_cmp(other) {
+            Option::Some(Ordering::Less) => true,
+            _ => false,
+        }
+    }
+
+    fun le(&self, other: &Rhs) -> bool {
+        match self.partial_cmp(other) {
+            Option::Some(Ordering::Less) => true,
+            Option::Some(Ordering::Equal) => true,
+            _ => false,
+        }
+    }
+
+    fun gt(&self, other: &Rhs) -> bool {
+        match self.partial_cmp(other) {
+            Option::Some(Ordering::Greater) => true,
+            _ => false,
+        }
+    }
+
+    fun ge(&self, other: &Rhs) -> bool {
+        match self.partial_cmp(other) {
+            Option::Some(Ordering::Greater) => true,
+            Option::Some(Ordering::Equal) => true,
+            _ => false,
+        }
+    }
 }
 
 #[lang = "ord"]

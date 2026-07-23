@@ -719,7 +719,7 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Fun);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params(true);
+            self.generic_params(true, false);
         }
 
         self.param_list();
@@ -823,7 +823,7 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Struct);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params(false);
+            self.generic_params(false, false);
         }
         if self.at(SyntaxKind::Where) {
             self.where_clause();
@@ -1619,7 +1619,7 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Enum);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params(false);
+            self.generic_params(false, false);
         }
         if self.at(SyntaxKind::Where) {
             self.where_clause();
@@ -1676,6 +1676,9 @@ impl<'s> Parser<'s> {
         self.optional_pub();
         self.expect(SyntaxKind::Trait);
         self.expect(SyntaxKind::Ident);
+        if self.at(SyntaxKind::Less) {
+            self.generic_params(true, true);
+        }
         if self.at(SyntaxKind::Colon) {
             self.bump();
             self.generic_bound();
@@ -1722,7 +1725,7 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Fun);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params(true);
+            self.generic_params(true, false);
         }
         self.param_list();
 
@@ -1746,7 +1749,7 @@ impl<'s> Parser<'s> {
 
         // optional generic_params
         if self.at(SyntaxKind::Less) {
-            self.generic_params(true);
+            self.generic_params(true, false);
         }
 
         self.ty();
@@ -1823,21 +1826,21 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::TypeAliasDecl);
     }
 
-    fn generic_params(&mut self, allow_bounds: bool) {
+    fn generic_params(&mut self, allow_bounds: bool, allow_defaults: bool) {
         let m = self.start();
 
         self.expect(SyntaxKind::Less);
-        self.generic_param(allow_bounds);
+        self.generic_param(allow_bounds, allow_defaults);
         while self.at(SyntaxKind::Comma) {
             self.bump();
-            self.generic_param(allow_bounds);
+            self.generic_param(allow_bounds, allow_defaults);
         }
         self.expect(SyntaxKind::Greater);
 
         m.complete(self, SyntaxKind::GenericParams);
     }
 
-    fn generic_param(&mut self, allow_bounds: bool) {
+    fn generic_param(&mut self, allow_bounds: bool, allow_defaults: bool) {
         if self.at(SyntaxKind::Const) {
             self.bump();
             self.expect(SyntaxKind::Ident);
@@ -1854,6 +1857,10 @@ impl<'s> Parser<'s> {
                 self.bump();
                 self.generic_bound();
             }
+        }
+        if allow_defaults && self.at(SyntaxKind::Eq) {
+            self.bump();
+            self.ty();
         }
     }
 

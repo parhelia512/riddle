@@ -108,8 +108,9 @@ pub struct TraitMethodCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperatorCall {
-    pub function: FunctionId,
+pub enum OperatorCall {
+    Function(FunctionId),
+    Trait(TraitMethodCall),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

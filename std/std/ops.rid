@@ -40,52 +40,52 @@ impl IntoIterator for Range {
 }
 
 #[lang = "add"]
-pub trait Add {
+pub trait Add<Rhs = Self> {
     type Output;
-    fun add(self, rhs: Self) -> Self::Output;
+    fun add(self, rhs: Rhs) -> Self::Output;
 }
 #[lang = "sub"]
-pub trait Sub { type Output; fun sub(self, rhs: Self) -> Self::Output; }
+pub trait Sub<Rhs = Self> { type Output; fun sub(self, rhs: Rhs) -> Self::Output; }
 #[lang = "mul"]
-pub trait Mul { type Output; fun mul(self, rhs: Self) -> Self::Output; }
+pub trait Mul<Rhs = Self> { type Output; fun mul(self, rhs: Rhs) -> Self::Output; }
 #[lang = "div"]
-pub trait Div { type Output; fun div(self, rhs: Self) -> Self::Output; }
+pub trait Div<Rhs = Self> { type Output; fun div(self, rhs: Rhs) -> Self::Output; }
 #[lang = "rem"]
-pub trait Rem { type Output; fun rem(self, rhs: Self) -> Self::Output; }
+pub trait Rem<Rhs = Self> { type Output; fun rem(self, rhs: Rhs) -> Self::Output; }
 #[lang = "neg"]
 pub trait Neg { type Output; fun neg(self) -> Self::Output; }
 #[lang = "not"]
 pub trait Not { type Output; fun not(self) -> Self::Output; }
 #[lang = "bitand"]
-pub trait BitAnd { type Output; fun bitand(self, rhs: Self) -> Self::Output; }
+pub trait BitAnd<Rhs = Self> { type Output; fun bitand(self, rhs: Rhs) -> Self::Output; }
 #[lang = "bitor"]
-pub trait BitOr { type Output; fun bitor(self, rhs: Self) -> Self::Output; }
+pub trait BitOr<Rhs = Self> { type Output; fun bitor(self, rhs: Rhs) -> Self::Output; }
 #[lang = "bitxor"]
-pub trait BitXor { type Output; fun bitxor(self, rhs: Self) -> Self::Output; }
+pub trait BitXor<Rhs = Self> { type Output; fun bitxor(self, rhs: Rhs) -> Self::Output; }
 #[lang = "shl"]
-pub trait Shl { type Output; fun shl(self, rhs: Self) -> Self::Output; }
+pub trait Shl<Rhs = Self> { type Output; fun shl(self, rhs: Rhs) -> Self::Output; }
 #[lang = "shr"]
-pub trait Shr { type Output; fun shr(self, rhs: Self) -> Self::Output; }
+pub trait Shr<Rhs = Self> { type Output; fun shr(self, rhs: Rhs) -> Self::Output; }
 #[lang = "add_assign"]
-pub trait AddAssign { fun add_assign(&mut self, rhs: Self); }
+pub trait AddAssign<Rhs = Self> { fun add_assign(&mut self, rhs: Rhs); }
 #[lang = "sub_assign"]
-pub trait SubAssign { fun sub_assign(&mut self, rhs: Self); }
+pub trait SubAssign<Rhs = Self> { fun sub_assign(&mut self, rhs: Rhs); }
 #[lang = "mul_assign"]
-pub trait MulAssign { fun mul_assign(&mut self, rhs: Self); }
+pub trait MulAssign<Rhs = Self> { fun mul_assign(&mut self, rhs: Rhs); }
 #[lang = "div_assign"]
-pub trait DivAssign { fun div_assign(&mut self, rhs: Self); }
+pub trait DivAssign<Rhs = Self> { fun div_assign(&mut self, rhs: Rhs); }
 #[lang = "rem_assign"]
-pub trait RemAssign { fun rem_assign(&mut self, rhs: Self); }
+pub trait RemAssign<Rhs = Self> { fun rem_assign(&mut self, rhs: Rhs); }
 #[lang = "bitand_assign"]
-pub trait BitAndAssign { fun bitand_assign(&mut self, rhs: Self); }
+pub trait BitAndAssign<Rhs = Self> { fun bitand_assign(&mut self, rhs: Rhs); }
 #[lang = "bitor_assign"]
-pub trait BitOrAssign { fun bitor_assign(&mut self, rhs: Self); }
+pub trait BitOrAssign<Rhs = Self> { fun bitor_assign(&mut self, rhs: Rhs); }
 #[lang = "bitxor_assign"]
-pub trait BitXorAssign { fun bitxor_assign(&mut self, rhs: Self); }
+pub trait BitXorAssign<Rhs = Self> { fun bitxor_assign(&mut self, rhs: Rhs); }
 #[lang = "shl_assign"]
-pub trait ShlAssign { fun shl_assign(&mut self, rhs: Self); }
+pub trait ShlAssign<Rhs = Self> { fun shl_assign(&mut self, rhs: Rhs); }
 #[lang = "shr_assign"]
-pub trait ShrAssign { fun shr_assign(&mut self, rhs: Self); }
+pub trait ShrAssign<Rhs = Self> { fun shr_assign(&mut self, rhs: Rhs); }
 
 impl Add for i8 { type Output = i8; fun add(self, rhs: Self) -> Self::Output { self + rhs } }
 impl Add for i16 { type Output = i16; fun add(self, rhs: Self) -> Self::Output { self + rhs } }

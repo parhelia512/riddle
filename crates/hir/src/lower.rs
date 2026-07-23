@@ -54,6 +54,17 @@ pub fn lower_const_generic_params(params: Option<ast::GenericParams>) -> Vec<Nam
         .unwrap_or_default()
 }
 
+pub fn lower_generic_defaults(params: Option<ast::GenericParams>) -> Vec<Option<HirTypeRef>> {
+    params
+        .map(|g| {
+            g.params()
+                .filter(|param| !param.is_const)
+                .map(|param| param.default.map(Lower::lower))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn lower_generic_bounds(
     params: Option<ast::GenericParams>,
     where_clause: Option<ast::WhereClause>,
@@ -71,6 +82,9 @@ pub fn lower_generic_bounds(
                         .into_iter()
                         .map(move |bound| {
                             let trait_range = trimmed_range(bound.trait_path.syntax());
+                            let mut trait_path = bound.trait_path.lower();
+                            trait_path.type_args =
+                                bound.type_args.into_iter().map(Lower::lower).collect();
                             let assoc_constraints = bound
                                 .assoc_constraints
                                 .into_iter()
@@ -91,7 +105,7 @@ pub fn lower_generic_bounds(
                                     type_args: Vec::new(),
                                 }),
                                 target_range: trait_range,
-                                trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                                trait_ty: HirTypeRef::Named(trait_path),
                                 trait_range,
                                 assoc_constraints,
                             }
@@ -110,6 +124,8 @@ pub fn lower_generic_bounds(
             let param = generic_bound_param_name(&target_ty);
             predicate.bounds.into_iter().map(move |bound| {
                 let trait_range = trimmed_range(bound.trait_path.syntax());
+                let mut trait_path = bound.trait_path.lower();
+                trait_path.type_args = bound.type_args.into_iter().map(Lower::lower).collect();
                 let assoc_constraints = bound
                     .assoc_constraints
                     .into_iter()
@@ -126,7 +142,7 @@ pub fn lower_generic_bounds(
                     param: param.clone(),
                     target_ty: target_ty.clone(),
                     target_range,
-                    trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                    trait_ty: HirTypeRef::Named(trait_path),
                     trait_range,
                     assoc_constraints,
                 }
@@ -357,11 +373,17 @@ impl AstLower for ast::TraitDecl {
     fn lower(self, arena: &mut Arena<Self::Item>) -> Self::Id {
         let name = lower_name(self.name());
         let visibility = lower_visibility(self.is_pub());
+        let generic_params = self.generic_params();
+        let generics = lower_generic_params(generic_params.clone());
+        let generic_defaults = lower_generic_defaults(generic_params.clone());
+        let generic_bounds = lower_generic_bounds(generic_params, None);
         let supertraits = self
             .supertraits()
             .into_iter()
             .map(|bound| {
                 let trait_range = trimmed_range(bound.trait_path.syntax());
+                let mut trait_path = bound.trait_path.lower();
+                trait_path.type_args = bound.type_args.into_iter().map(Lower::lower).collect();
                 HirGenericBound {
                     param: Name("Self".into()),
                     target_ty: HirTypeRef::Named(HirPath {
@@ -370,7 +392,7 @@ impl AstLower for ast::TraitDecl {
                         type_args: Vec::new(),
                     }),
                     target_range: trait_range,
-                    trait_ty: HirTypeRef::Named(bound.trait_path.lower()),
+                    trait_ty: HirTypeRef::Named(trait_path),
                     trait_range,
                     assoc_constraints: bound
                         .assoc_constraints
@@ -459,6 +481,9 @@ impl AstLower for ast::TraitDecl {
         arena.alloc(HirTrait {
             name,
             visibility,
+            generics,
+            generic_defaults,
+            generic_bounds,
             supertraits,
             methods,
             default_methods: Vec::new(),

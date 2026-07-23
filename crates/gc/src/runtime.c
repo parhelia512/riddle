@@ -104,14 +104,15 @@ static void rgc_mark_push(RgcMarkStack *stack, const void *ptr) {
     stack->items[stack->len++] = object;
 }
 
-static void rgc_mark_roots(const void *a, const void *b) {
+static void rgc_mark_roots(
+    const void *a,
+    const void *b,
+    const void *registers,
+    size_t registers_size
+) {
     RgcMarkStack stack = {0};
-    jmp_buf registers;
 
-    memset(&registers, 0, sizeof(registers));
-    (void)setjmp(registers);
-
-    rgc_mark_range(&stack, &registers, (char *)&registers + sizeof(registers));
+    rgc_mark_range(&stack, registers, (const char *)registers + registers_size);
     rgc_mark_range(&stack, a, b);
     while (stack.len) {
         RgcHeader *object = stack.items[--stack.len];
@@ -165,7 +166,8 @@ RGC_NOINLINE void rgc_collect(void) {
         : "r"(registers)
         : "x9", "memory");
 #else
-    int stack_top = 0;
+    jmp_buf registers;
+    (void)setjmp(registers);
 #endif
 
     if (!rgc_stack_bottom) {
@@ -174,9 +176,9 @@ RGC_NOINLINE void rgc_collect(void) {
     }
 
 #if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
-    rgc_mark_roots(registers, rgc_stack_bottom);
+    rgc_mark_roots(registers, rgc_stack_bottom, registers, sizeof(registers));
 #else
-    rgc_mark_roots(&stack_top, rgc_stack_bottom);
+    rgc_mark_roots(&registers, rgc_stack_bottom, &registers, sizeof(registers));
 #endif
     rgc_sweep();
 }

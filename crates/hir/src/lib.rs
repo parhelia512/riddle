@@ -162,6 +162,7 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
         .collect::<Vec<_>>();
     let tid = t.lower(&mut hir.item_tree.traits);
     let trait_name = hir.item_tree.traits[tid].name.clone();
+    let trait_generics = hir.item_tree.traits[tid].generics.clone();
 
     for (method, body_ast) in default_methods {
         let receivers = method
@@ -190,7 +191,16 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
                 trait_ty: HirTypeRef::Named(HirPath {
                     anchor: PathAnchor::Plain,
                     segments: vec![trait_name.clone()],
-                    type_args: Vec::new(),
+                    type_args: trait_generics
+                        .iter()
+                        .map(|name| {
+                            HirTypeRef::Named(HirPath {
+                                anchor: PathAnchor::Plain,
+                                segments: vec![name.clone()],
+                                type_args: Vec::new(),
+                            })
+                        })
+                        .collect(),
                 }),
                 trait_range: range,
                 assoc_constraints: Vec::new(),

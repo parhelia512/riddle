@@ -158,6 +158,9 @@ pub enum HirVariantKind {
 pub struct HirTrait {
     pub name: Name,
     pub visibility: Visibility,
+    pub generics: Vec<Name>,
+    pub generic_defaults: Vec<Option<HirTypeRef>>,
+    pub generic_bounds: Vec<HirGenericBound>,
     pub supertraits: Vec<HirGenericBound>,
     pub methods: Vec<HirFunction>,
     pub default_methods: Vec<FunctionId>,
