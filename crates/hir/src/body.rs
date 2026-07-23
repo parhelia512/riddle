@@ -158,6 +158,9 @@ pub enum Expr {
     Array {
         elements: Vec<ExprId>,
     },
+    Tuple {
+        elements: Vec<ExprId>,
+    },
     ArrayRepeat {
         value: ExprId,
         len: ExprId,
@@ -621,6 +624,15 @@ impl BodyPrinter<'_> {
                     .join(", ");
                 format!("[{}]", items)
             }
+            Expr::Tuple { elements } => {
+                let items = elements
+                    .iter()
+                    .map(|e| self.print_expr(*e, 0, indent))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let trailing = if elements.len() == 1 { "," } else { "" };
+                format!("({}{})", items, trailing)
+            }
             Expr::ArrayRepeat { value, len } => {
                 format!(
                     "[{}; {}]",
@@ -692,6 +704,7 @@ impl BodyPrinter<'_> {
             | Expr::Path { .. }
             | Expr::Struct { .. }
             | Expr::Array { .. }
+            | Expr::Tuple { .. }
             | Expr::ArrayRepeat { .. } => 100,
             Expr::Call { .. } | Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => 90,
             Expr::Lambda { .. } => 70,

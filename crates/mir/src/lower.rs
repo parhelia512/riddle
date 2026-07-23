@@ -745,7 +745,17 @@ impl<'a> LowerCtx<'a> {
                     .and_then(|bid| self.type_result.operator_calls.get(&(bid, expr_id)))
                     .cloned()
                 {
-                    let lv = self.lower_expr(builder, param_values, body, *lhs);
+                    let receiver_ty = self.hir.item_tree.functions[call.function]
+                        .params
+                        .first()
+                        .map(|param| param.ty.clone());
+                    let lv = if let Some(receiver_ty) = receiver_ty
+                        && op.is_assignment()
+                    {
+                        self.lower_receiver_arg(builder, param_values, body, *lhs, &receiver_ty)
+                    } else {
+                        self.lower_expr(builder, param_values, body, *lhs)
+                    };
                     let rv = self.lower_expr(builder, param_values, body, *rhs);
                     return self.lower_operator_call(
                         builder,
@@ -798,6 +808,28 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::Unary { operand, op } => {
+                if let Some(call) = self
+                    .current_body
+                    .and_then(|bid| self.type_result.operator_calls.get(&(bid, expr_id)))
+                    .cloned()
+                {
+                    let receiver_ty = self.hir.item_tree.functions[call.function]
+                        .params
+                        .first()
+                        .map(|param| param.ty.clone());
+                    let value = if let Some(receiver_ty) = receiver_ty {
+                        self.lower_receiver_arg(builder, param_values, body, *operand, &receiver_ty)
+                    } else {
+                        self.lower_expr(builder, param_values, body, *operand)
+                    };
+                    return self.lower_operator_call(
+                        builder,
+                        *operand,
+                        call.function,
+                        vec![value],
+                        mir_type,
+                    );
+                }
                 let ov = if matches!(op, HirUnOp::Ref | HirUnOp::MutRef) {
                     self.lower_lvalue(builder, param_values, body, *operand)
                 } else {
@@ -924,6 +956,14 @@ impl<'a> LowerCtx<'a> {
                     .map(|e| self.lower_expr(builder, param_values, body, *e))
                     .collect();
                 builder.array_value(vals, mir_type)
+            }
+
+            Expr::Tuple { elements } => {
+                let values = elements
+                    .iter()
+                    .map(|element| self.lower_expr(builder, param_values, body, *element))
+                    .collect();
+                builder.tuple_value(values, mir_type)
             }
 
             Expr::ArrayRepeat { value, .. } => {

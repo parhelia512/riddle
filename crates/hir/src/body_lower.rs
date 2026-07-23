@@ -363,6 +363,10 @@ impl<'a> BodyLower<'a> {
                 )
             }
 
+            ast::Expr::ParenExpr(p) if p.is_tuple() => {
+                let elements = p.elements().map(|expr| self.lower_expr(expr)).collect();
+                self.alloc_expr(Expr::Tuple { elements }, range)
+            }
             ast::Expr::ParenExpr(p) => match p.inner() {
                 Some(inner) => self.lower_expr(inner),
                 None => self.alloc_expr(

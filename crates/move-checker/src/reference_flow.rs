@@ -191,7 +191,7 @@ impl<'a> SummaryAnalyzer<'a> {
                 result
             }
 
-            Expr::Array { elements } => {
+            Expr::Array { elements } | Expr::Tuple { elements } => {
                 let mut result = FlowValue::default();
                 for element in elements {
                     result.merge(self.analyze_expr(*element));

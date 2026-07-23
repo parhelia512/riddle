@@ -236,7 +236,9 @@ impl TypeChecker<'_> {
             Expr::Binary { lhs, rhs, op } => {
                 self.check_binary(ctx, expr_id, *lhs, *rhs, *op, expected, span)
             }
-            Expr::Unary { operand, op } => self.check_unary(ctx, *operand, *op, expected, span),
+            Expr::Unary { operand, op } => {
+                self.check_unary(ctx, expr_id, *operand, *op, expected, span)
+            }
             Expr::Block { stmts, tail } => {
                 ctx.push_scope();
                 for stmt in stmts {
@@ -298,6 +300,24 @@ impl TypeChecker<'_> {
                 self.check_match(ctx, *scrutinee, arms, expected, span)
             }
             Expr::Array { elements } => self.check_array(ctx, elements, expected, span),
+            Expr::Tuple { elements } => {
+                let expected = match expected {
+                    Some(Type::Tuple(elements)) => Some(elements.as_slice()),
+                    _ => None,
+                };
+                Type::Tuple(
+                    elements
+                        .iter()
+                        .enumerate()
+                        .map(
+                            |(index, expr)| match expected.and_then(|types| types.get(index)) {
+                                Some(expected) => self.check_expr_expected(ctx, *expr, expected),
+                                None => self.check_expr(ctx, *expr),
+                            },
+                        )
+                        .collect(),
+                )
+            }
             Expr::ArrayRepeat { value, len } => {
                 self.check_array_repeat(ctx, *value, *len, expected, span)
             }
@@ -403,6 +423,15 @@ impl TypeChecker<'_> {
 
         if let Some(base_op) = op.compound_base() {
             let lhs_ty = self.check_expr(ctx, lhs);
+            if !lhs_ty.is_numeric()
+                && !lhs_ty.is_bitwise_scalar()
+                && !lhs_ty.is_unknown_like()
+                && let Some(()) =
+                    self.check_overloaded_assign(ctx, expr_id, lhs, rhs, base_op, &lhs_ty, span)
+            {
+                self.check_assign_mut(ctx, lhs, span);
+                return Type::Unit;
+            }
             let rhs_ty = match base_op {
                 BinaryOp::Add
                 | BinaryOp::Sub
@@ -432,10 +461,23 @@ impl TypeChecker<'_> {
             ) if expected.is_numeric() => self.check_expr_expected(ctx, lhs, expected),
             _ => self.check_expr(ctx, lhs),
         };
-        if op == BinaryOp::Add
-            && !lhs_ty.is_numeric()
+        if matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+        ) && !lhs_ty.is_numeric()
+            && !lhs_ty.is_bitwise_scalar()
             && !lhs_ty.is_unknown_like()
-            && let Some(ty) = self.check_overloaded_add(ctx, expr_id, lhs, rhs, &lhs_ty, span)
+            && let Some(ty) =
+                self.check_overloaded_binary(ctx, expr_id, lhs, rhs, op, &lhs_ty, span)
         {
             return ty;
         }
@@ -777,7 +819,7 @@ impl TypeChecker<'_> {
                     self.infer_capture_uses(ctx, arm.body, mode);
                 }
             }
-            Expr::Array { elements } => {
+            Expr::Array { elements } | Expr::Tuple { elements } => {
                 for element in elements {
                     self.infer_capture_uses(ctx, element, CaptureMode::Value);
                 }
@@ -883,20 +925,23 @@ impl TypeChecker<'_> {
         }
     }
 
-    fn check_overloaded_add(
+    #[allow(clippy::too_many_arguments)]
+    fn check_overloaded_binary(
         &mut self,
         ctx: &mut BodyCtx<'_>,
         expr_id: ExprId,
         lhs: ExprId,
         rhs: ExprId,
+        op: BinaryOp,
         lhs_ty: &Type,
         span: Option<rowan::TextRange>,
     ) -> Option<Type> {
-        let trait_id = self.find_lang_trait("add")?;
-        if let Some(ty) = self.check_trait_bound_add(ctx, lhs, rhs, lhs_ty, trait_id) {
+        let (lang, method_name) = binary_operator_trait(op)?;
+        let trait_id = self.find_lang_trait(lang)?;
+        if let Some(ty) = self.check_trait_bound_operator(ctx, rhs, lhs_ty, trait_id, method_name) {
             return Some(ty);
         }
-        let method = self.find_trait_impl_method(lhs_ty, trait_id, "add")?;
+        let method = self.find_trait_impl_method(lhs_ty, trait_id, method_name)?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -920,7 +965,7 @@ impl TypeChecker<'_> {
             self.diagnostic(
                 "E0005",
                 format!(
-                    "operator `+` method `{}` needs a rhs parameter",
+                    "operator method `{}` needs a rhs parameter",
                     method.function.name.0
                 ),
                 span,
@@ -966,13 +1011,123 @@ impl TypeChecker<'_> {
         )
     }
 
-    fn check_trait_bound_add(
+    fn check_overloaded_unary(
         &mut self,
         ctx: &mut BodyCtx<'_>,
-        _lhs: ExprId,
+        expr_id: ExprId,
+        operand: ExprId,
+        op: UnaryOp,
+        operand_ty: &Type,
+        span: Option<rowan::TextRange>,
+    ) -> Option<Type> {
+        let (lang, method_name) = unary_operator_trait(op)?;
+        let trait_id = self.find_lang_trait(lang)?;
+        if let Some(ty) =
+            self.check_trait_bound_operator(ctx, operand, operand_ty, trait_id, method_name)
+        {
+            return Some(ty);
+        }
+        let method = self.find_trait_impl_method(operand_ty, trait_id, method_name)?;
+        if method.function.is_unsafe {
+            self.require_unsafe(ctx, "calling an unsafe function", span);
+        }
+        let receiver = method.function.params.first()?;
+        let expected_receiver = self.lower_type_ref_with_params_at(
+            &receiver.ty,
+            &method.subst,
+            Some(receiver.ty_range),
+        );
+        let actual_receiver = self.receiver_argument_type(operand_ty, &expected_receiver);
+        self.expect_assignable(
+            &expected_receiver,
+            &actual_receiver,
+            "operator receiver",
+            ctx.expr_range(operand),
+        );
+        self.result.operator_calls.insert(
+            (ctx.body_id, expr_id),
+            OperatorCall {
+                function: method.fid,
+            },
+        );
+        Some(
+            method
+                .function
+                .ret_type
+                .as_ref()
+                .map(|ty| {
+                    self.lower_type_ref_with_params_at(
+                        ty,
+                        &method.subst,
+                        method
+                            .function
+                            .ret_type_range
+                            .or(Some(method.function.name_range)),
+                    )
+                })
+                .unwrap_or(Type::Unit),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_overloaded_assign(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        lhs: ExprId,
+        rhs: ExprId,
+        op: BinaryOp,
+        lhs_ty: &Type,
+        span: Option<rowan::TextRange>,
+    ) -> Option<()> {
+        let (lang, method_name) = assign_operator_trait(op)?;
+        let trait_id = self.find_lang_trait(lang)?;
+        let method = self.find_trait_impl_method(lhs_ty, trait_id, method_name)?;
+        if method.function.is_unsafe {
+            self.require_unsafe(ctx, "calling an unsafe function", span);
+        }
+        let receiver = method.function.params.first()?;
+        let expected_receiver = self.lower_type_ref_with_params_at(
+            &receiver.ty,
+            &method.subst,
+            Some(receiver.ty_range),
+        );
+        let actual_receiver = self.receiver_argument_type(lhs_ty, &expected_receiver);
+        self.expect_assignable(
+            &expected_receiver,
+            &actual_receiver,
+            "operator receiver",
+            ctx.expr_range(lhs),
+        );
+        let rhs_param = method.function.params.get(1)?;
+        let expected_rhs = self.lower_type_ref_with_params_at(
+            &rhs_param.ty,
+            &method.subst,
+            Some(rhs_param.ty_range),
+        );
+        let actual_rhs = self.check_expr_expected(ctx, rhs, &expected_rhs);
+        self.expect_assignable(
+            &expected_rhs,
+            &actual_rhs,
+            "right operand",
+            ctx.expr_range(rhs),
+        );
+        self.result.operator_calls.insert(
+            (ctx.body_id, expr_id),
+            OperatorCall {
+                function: method.fid,
+            },
+        );
+        Some(())
+    }
+
+    fn check_trait_bound_operator(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
         rhs: ExprId,
         lhs_ty: &Type,
         trait_id: TraitId,
+        method_name: &str,
     ) -> Option<Type> {
         let Type::Param(param) = lhs_ty else {
             return None;
@@ -989,7 +1144,7 @@ impl TypeChecker<'_> {
         if self.hir.item_tree.traits[trait_id]
             .methods
             .iter()
-            .find(|method| method.name.0 == "add")
+            .find(|method| method.name.0 == method_name)
             .is_some_and(|method| method.is_unsafe)
         {
             self.require_unsafe(ctx, "calling an unsafe function", ctx.expr_range(rhs));
@@ -1174,6 +1329,7 @@ impl TypeChecker<'_> {
     fn check_unary(
         &mut self,
         ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
         operand: ExprId,
         op: UnaryOp,
         expected: Option<&Type>,
@@ -1186,6 +1342,15 @@ impl TypeChecker<'_> {
             }
             _ => self.check_expr(ctx, operand),
         };
+        if matches!(op, UnaryOp::Neg | UnaryOp::Not)
+            && !operand_ty.is_numeric()
+            && !operand_ty.is_bitwise_scalar()
+            && !operand_ty.is_unknown_like()
+            && let Some(ty) =
+                self.check_overloaded_unary(ctx, expr_id, operand, op, &operand_ty, span)
+        {
+            return ty;
+        }
         match op {
             UnaryOp::Neg | UnaryOp::Pos => {
                 self.expect_numeric(&operand_ty, "unary operand", ctx.expr_range(operand));
@@ -3568,4 +3733,44 @@ fn contains_current_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
 
 fn const_contains_current_param(value: &ConstArg, params: &HashMap<String, Type>) -> bool {
     matches!(value, ConstArg::Param(name) if params.contains_key(name))
+}
+
+fn binary_operator_trait(op: BinaryOp) -> Option<(&'static str, &'static str)> {
+    Some(match op {
+        BinaryOp::Add => ("add", "add"),
+        BinaryOp::Sub => ("sub", "sub"),
+        BinaryOp::Mul => ("mul", "mul"),
+        BinaryOp::Div => ("div", "div"),
+        BinaryOp::Mod => ("rem", "rem"),
+        BinaryOp::BitAnd => ("bitand", "bitand"),
+        BinaryOp::BitOr => ("bitor", "bitor"),
+        BinaryOp::BitXor => ("bitxor", "bitxor"),
+        BinaryOp::Shl => ("shl", "shl"),
+        BinaryOp::Shr => ("shr", "shr"),
+        _ => return None,
+    })
+}
+
+fn unary_operator_trait(op: UnaryOp) -> Option<(&'static str, &'static str)> {
+    Some(match op {
+        UnaryOp::Neg => ("neg", "neg"),
+        UnaryOp::Not => ("not", "not"),
+        _ => return None,
+    })
+}
+
+fn assign_operator_trait(op: BinaryOp) -> Option<(&'static str, &'static str)> {
+    Some(match op {
+        BinaryOp::Add => ("add_assign", "add_assign"),
+        BinaryOp::Sub => ("sub_assign", "sub_assign"),
+        BinaryOp::Mul => ("mul_assign", "mul_assign"),
+        BinaryOp::Div => ("div_assign", "div_assign"),
+        BinaryOp::Mod => ("rem_assign", "rem_assign"),
+        BinaryOp::BitAnd => ("bitand_assign", "bitand_assign"),
+        BinaryOp::BitOr => ("bitor_assign", "bitor_assign"),
+        BinaryOp::BitXor => ("bitxor_assign", "bitxor_assign"),
+        BinaryOp::Shl => ("shl_assign", "shl_assign"),
+        BinaryOp::Shr => ("shr_assign", "shr_assign"),
+        _ => return None,
+    })
 }

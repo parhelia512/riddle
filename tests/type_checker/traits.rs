@@ -203,6 +203,52 @@ fn accepts_add_operator_impl_call() {
 }
 
 #[test]
+fn accepts_binary_unary_and_assign_operator_impls() {
+    let result = check(
+        r#"
+        #[lang = "sub"]
+        trait Sub { type Output; fun sub(self, rhs: Self) -> Self::Output; }
+        #[lang = "neg"]
+        trait Neg { type Output; fun neg(self) -> Self::Output; }
+        #[lang = "add_assign"]
+        trait AddAssign { fun add_assign(&mut self, rhs: Self); }
+
+        struct Number { value: i32 }
+
+        impl Sub for Number {
+            type Output = Number;
+            fun sub(self, rhs: Self) -> Self::Output {
+                Number { value: self.value - rhs.value }
+            }
+        }
+        impl Neg for Number {
+            type Output = Number;
+            fun neg(self) -> Self::Output {
+                Number { value: -self.value }
+            }
+        }
+        impl AddAssign for Number {
+            fun add_assign(&mut self, rhs: Self) {
+                self.value += rhs.value;
+            }
+        }
+
+        fun main() {
+            let left = Number { value: 7 };
+            let right = Number { value: 2 };
+            let difference = left - right;
+            let negated = -difference;
+            let mut total = Number { value: 10 };
+            total += negated;
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert_eq!(result.operator_calls.len(), 3);
+}
+
+#[test]
 fn rejects_add_impl_missing_add_method() {
     let result = check(
         r#"

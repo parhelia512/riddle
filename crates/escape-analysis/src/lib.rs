@@ -175,7 +175,20 @@ impl<'a> EscapeAnalyzer<'a> {
             }
 
             Expr::Unary { operand, op } => {
-                self.mark_escaping_exprs(ctx, *operand);
+                if let Some(fid) = self
+                    .type_result
+                    .operator_calls
+                    .get(&(ctx.body_id, expr_id))
+                    .map(|call| call.function)
+                {
+                    let by_ref = self.hir.item_tree.functions[fid]
+                        .params
+                        .first()
+                        .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
+                    self.handle_call_operand(ctx, Some(fid), 0, *operand, by_ref);
+                } else {
+                    self.mark_escaping_exprs(ctx, *operand);
+                }
                 if *op == UnaryOp::Deref && self.expr_may_carry_reference(ctx, expr_id) {
                     self.record_ref_chain(ctx, expr_id, *operand);
                 }
@@ -192,7 +205,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 fields.iter().any(|f| ctx.escaping_exprs.contains(&f.value))
             }
 
-            Expr::Array { elements } => {
+            Expr::Array { elements } | Expr::Tuple { elements } => {
                 for el in elements {
                     self.mark_escaping_exprs(ctx, *el);
                 }

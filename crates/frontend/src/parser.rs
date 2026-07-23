@@ -1452,6 +1452,13 @@ impl<'s> Parser<'s> {
                 self.bump();
                 if !self.at(SyntaxKind::RParen) {
                     self.expr_bp_restricted(0, restrictions);
+                    while self.at(SyntaxKind::Comma) {
+                        self.bump();
+                        if self.at(SyntaxKind::RParen) {
+                            break;
+                        }
+                        self.expr_bp_restricted(0, restrictions);
+                    }
                 }
                 self.expect(SyntaxKind::RParen);
                 Some(m.complete(self, SyntaxKind::ParenExpr))

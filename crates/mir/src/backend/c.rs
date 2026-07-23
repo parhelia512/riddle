@@ -1081,9 +1081,13 @@ fn collect_struct_type(ty: &Type, seen: &mut HashMap<String, StructType>) {
         Type::Ptr(inner) | Type::Ref(inner, _) | Type::Array(inner, _) => {
             collect_struct_type(inner, seen)
         }
-        Type::Tuple(elems) => {
-            for elem in elems {
-                collect_struct_type(elem, seen);
+        Type::Tuple(elements) => {
+            let tuple = tuple_struct_type(elements);
+            if seen.insert(tuple.name.clone(), tuple).is_some() {
+                return;
+            }
+            for element in elements {
+                collect_struct_type(element, seen);
             }
         }
         Type::FnPtr(signature) => {
@@ -1109,7 +1113,7 @@ fn type_struct_depth(ty: &Type) -> usize {
     match ty {
         Type::Struct(st) => struct_depth(st),
         Type::Ptr(inner) | Type::Ref(inner, _) | Type::Array(inner, _) => type_struct_depth(inner),
-        Type::Tuple(elems) => elems.iter().map(type_struct_depth).max().unwrap_or(0),
+        Type::Tuple(elements) => struct_depth(&tuple_struct_type(elements)),
         _ => 0,
     }
 }
@@ -1219,14 +1223,7 @@ fn ctype_of(ty: &Type) -> String {
             let (prefix, suffix) = c_decl_parts(ty);
             format!("{}{}", prefix, suffix)
         }
-        Type::Tuple(elems) => {
-            let fields: Vec<String> = elems
-                .iter()
-                .enumerate()
-                .map(|(i, t)| format!("{} f{};", ctype_of(t), i))
-                .collect();
-            format!("struct {{ {} }}", fields.join(" "))
-        }
+        Type::Tuple(elements) => tuple_name(elements),
         Type::Enum(e) => format!("enum_{}", e.name),
         Type::FnPtr(signature) => fn_ptr_name(signature),
         Type::Unit | Type::Never | Type::Void => "void".into(),
@@ -1239,6 +1236,23 @@ fn pointer_ctype(inner: &Type) -> String {
         pointee = element;
     }
     format!("{}*", ctype_of(pointee))
+}
+
+fn tuple_struct_type(elements: &[Type]) -> StructType {
+    StructType {
+        name: tuple_name(elements),
+        fields: elements
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (format!("f{index}"), ty.clone()))
+            .collect(),
+    }
+}
+
+fn tuple_name(elements: &[Type]) -> String {
+    let mut hasher = DefaultHasher::new();
+    elements.hash(&mut hasher);
+    format!("riddle_tuple_{:016x}", hasher.finish())
 }
 
 fn array_leaf_count(ty: &Type) -> usize {

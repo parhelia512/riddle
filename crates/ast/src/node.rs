@@ -874,6 +874,14 @@ impl ParenExpr {
     pub fn inner(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
+
+    pub fn elements(&self) -> impl Iterator<Item = Expr> + '_ {
+        support::children(&self.syntax)
+    }
+
+    pub fn is_tuple(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Comma).is_some()
+    }
 }
 
 impl CallExpr {

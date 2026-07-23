@@ -977,7 +977,7 @@ impl<'a> ScopeGraphBuilder<'a> {
             Expr::Cast { base, .. } => {
                 self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
             }
-            Expr::Array { elements } => {
+            Expr::Array { elements } | Expr::Tuple { elements } => {
                 for e in elements {
                     self.walk_expr_for_refs(body_id, body, *e, current_scope, nodes, edges);
                 }

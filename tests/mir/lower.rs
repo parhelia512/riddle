@@ -99,6 +99,27 @@ fn array_repeat_lowers_to_array_value() {
 }
 
 #[test]
+fn tuple_expression_lowers_to_tuple_value() {
+    let module = lower(
+        r#"
+        fun pair() -> (i32, i32) {
+            (2, 3)
+        }
+        "#,
+    );
+    let pair = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "pair")
+        .unwrap();
+
+    assert!(pair.blocks.iter().any(|(_, block)| block.insts.iter().any(
+        |instruction| matches!(instruction.kind, mir::instr::InstKind::TupleValue(ref values) if values.len() == 2)
+    )));
+}
+
+#[test]
 fn array_for_loop_lowers_to_indexed_loop() {
     let module = lower(
         r#"
@@ -708,6 +729,63 @@ fn overloaded_add_lowers_to_method_call() {
         "overloaded add should call Add::add, got {:?}",
         entry.insts.iter().map(|i| &i.kind).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn overloaded_binary_unary_and_assign_lower_to_method_calls() {
+    let module = lower(
+        r#"
+        #[lang = "sub"]
+        trait Sub { type Output; fun sub(self, rhs: Self) -> Self::Output; }
+        #[lang = "neg"]
+        trait Neg { type Output; fun neg(self) -> Self::Output; }
+        #[lang = "add_assign"]
+        trait AddAssign { fun add_assign(&mut self, rhs: Self); }
+
+        struct Number { value: i32 }
+
+        impl Sub for Number {
+            type Output = Number;
+            fun sub(self, rhs: Self) -> Self::Output {
+                Number { value: self.value - rhs.value }
+            }
+        }
+        impl Neg for Number {
+            type Output = Number;
+            fun neg(self) -> Self::Output {
+                Number { value: -self.value }
+            }
+        }
+        impl AddAssign for Number {
+            fun add_assign(&mut self, rhs: Self) {
+                self.value += rhs.value;
+            }
+        }
+
+        fun main() {
+            let left = Number { value: 7 };
+            let right = Number { value: 2 };
+            let difference = left - right;
+            let negated = -difference;
+            let mut total = Number { value: 10 };
+            total += negated;
+        }
+        "#,
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|fid| &module.functions[*fid])
+        .find(|function| function.name == "main")
+        .unwrap();
+    let calls = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter(|instruction| matches!(instruction.kind, mir::instr::InstKind::Call(_, _)))
+        .count();
+
+    assert_eq!(calls, 3);
 }
 
 #[test]

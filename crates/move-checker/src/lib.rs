@@ -373,7 +373,7 @@ impl<'a> Analyzer<'a> {
                 ctx.expr_origins.insert(expr_id, origins);
             }
 
-            Expr::Array { elements } => {
+            Expr::Array { elements } | Expr::Tuple { elements } => {
                 let mut origins = Origins::new();
                 for el in elements {
                     self.move_check_expr(ctx, *el);
@@ -1642,7 +1642,7 @@ fn collect_local_uses(body: &Body) -> HashMap<StmtId, usize> {
                     expr(body, arm.body, uses);
                 }
             }
-            Expr::Array { elements } => {
+            Expr::Array { elements } | Expr::Tuple { elements } => {
                 for element in elements {
                     expr(body, *element, uses);
                 }

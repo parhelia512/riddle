@@ -19,6 +19,32 @@ fn c_simple_function() {
 }
 
 #[test]
+fn c_tuple_types_are_named_and_reusable() {
+    let module = lower(
+        r#"
+        enum Foo { A(i32, (i64, i32)) }
+
+        fun main() {
+            let value = match Foo::A(1, (2, 3)) {
+                Foo::A(_, pair) => pair,
+            };
+            let sink = value;
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("typedef struct riddle_tuple_"),
+        "{generated}"
+    );
+    assert!(
+        !generated.contains("struct { int64_t f0; int32_t f1; }"),
+        "{generated}"
+    );
+}
+
+#[test]
 fn c_anonymous_function_uses_typed_function_pointer() {
     let module = lower(
         r#"
