@@ -135,6 +135,12 @@ impl TraitEnv {
         }
     }
 
+    pub fn type_has_explicit_drop(&self, ty: &Type) -> bool {
+        self.lang_items
+            .get(LangItem::Drop)
+            .is_some_and(|trait_id| self.type_implements(ty, trait_id))
+    }
+
     pub fn associated_type(&self, ty: &Type, trait_id: TraitId, name: &str) -> Option<Type> {
         self.associated_type_with_args(ty, trait_id, &[], name)
     }

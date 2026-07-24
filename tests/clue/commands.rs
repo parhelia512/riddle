@@ -618,6 +618,313 @@ fn standard_library_basics_compile_and_run() {
 }
 
 #[test]
+fn deterministic_drop_runs_in_native_binary() {
+    if c_compiler().is_none() {
+        eprintln!("skipping Drop runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("drop-runtime");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Guard { id: i32 }
+
+impl Drop for Guard {
+    fun drop(&mut self) {
+        print(self.id);
+    }
+}
+
+fun main() -> i32 {
+    let first = Guard { id: 1 };
+    {
+        let second = Guard { id: 2 };
+    }
+    print(0);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"201"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn match_pattern_binding_drops_at_arm_end() {
+    if c_compiler().is_none() {
+        eprintln!("skipping match Drop runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("match-pattern-drop");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Guard { id: i32 }
+
+enum MaybeGuard {
+    Some(Guard),
+    None,
+}
+
+impl Drop for Guard {
+    fun drop(&mut self) {
+        print(self.id);
+    }
+}
+
+fun main() -> i32 {
+    let value = MaybeGuard::Some(Guard { id: 1 });
+    match value {
+        MaybeGuard::Some(guard) => {},
+        MaybeGuard::None => {},
+    }
+    print(0);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"10"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn moved_match_binding_is_not_dropped_twice() {
+    if c_compiler().is_none() {
+        eprintln!("skipping moved match binding Drop test: no C compiler found");
+        return;
+    }
+    let root = temp_root("moved-match-pattern-drop");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Guard { id: i32 }
+
+enum MaybeGuard {
+    Some(Guard),
+    None,
+}
+
+impl Drop for Guard {
+    fun drop(&mut self) {
+        print(self.id);
+    }
+}
+
+fun consume(guard: Guard) {}
+
+fun main() -> i32 {
+    let value = MaybeGuard::Some(Guard { id: 1 });
+    match value {
+        MaybeGuard::Some(guard) => { consume(guard); },
+        MaybeGuard::None => {},
+    }
+    print(0);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"10"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn match_partial_move_drops_each_field_once() {
+    if c_compiler().is_none() {
+        eprintln!("skipping match partial-move Drop test: no C compiler found");
+        return;
+    }
+    let root = temp_root("match-partial-move-drop");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Guard { id: i32 }
+
+struct Pair { left: Guard, right: Guard }
+
+impl Drop for Guard {
+    fun drop(&mut self) {
+        print(self.id);
+    }
+}
+
+fun main() -> i32 {
+    let pair = Pair {
+        left: Guard { id: 1 },
+        right: Guard { id: 2 },
+    };
+    match pair {
+        Pair { left } => {}
+    }
+    print(pair.right.id);
+    print(0);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"1202"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn array_for_break_drops_current_and_remaining_items_once() {
+    if c_compiler().is_none() {
+        eprintln!("skipping for Drop runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("array-for-drop");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Guard { id: i32 }
+
+impl Drop for Guard {
+    fun drop(&mut self) {
+        print(self.id);
+    }
+}
+
+fun main() -> i32 {
+    let values = [
+        Guard { id: 1 },
+        Guard { id: 2 },
+        Guard { id: 3 },
+    ];
+    for guard in values {
+        if guard.id == 2 {
+            break;
+        }
+    }
+    print(0);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"1230"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn generic_for_break_drops_item_before_iterator() {
+    if c_compiler().is_none() {
+        eprintln!("skipping generic for Drop runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("generic-for-drop");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Guard { id: i32 }
+struct Once { yielded: bool }
+
+impl Drop for Guard {
+    fun drop(&mut self) {
+        print(self.id);
+    }
+}
+
+impl Drop for Once {
+    fun drop(&mut self) {
+        print(9);
+    }
+}
+
+impl Iterator for Once {
+    type Item = Guard;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.yielded {
+            Option::None
+        } else {
+            self.yielded = true;
+            Option::Some(Guard { id: 1 })
+        }
+    }
+}
+
+impl IntoIterator for Once {
+    type Item = Guard;
+    type IntoIter = Once;
+
+    fun into_iter(self) -> Self::IntoIter {
+        self
+    }
+}
+
+fun main() -> i32 {
+    let once = Once { yielded: false };
+    for guard in once {
+        break;
+    }
+    print(0);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"190"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn unsigned_ordering_and_unicode_chars_compile_and_run() {
     if c_compiler().is_none() {
         eprintln!("skipping scalar semantics runtime test: no C compiler found");

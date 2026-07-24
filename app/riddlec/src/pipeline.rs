@@ -610,7 +610,7 @@ fn run_pipeline_with_state(
 
     // 7. Lower HIR → MIR
     let mir_module = (success && depth == PipelineDepth::Build)
-        .then(|| mir::lower_hir(&hir, &type_result, &escape_result));
+        .then(|| mir::lower_hir(&hir, &type_result, &escape_result, &analysis.moved_exprs));
 
     CompileResult {
         hir: Some(hir),

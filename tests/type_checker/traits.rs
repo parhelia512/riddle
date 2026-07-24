@@ -1,6 +1,101 @@
 use crate::{check, check_with_package_ranges, messages};
 
 #[test]
+fn accepts_drop_lang_item_contract() {
+    let result = check(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn rejects_invalid_drop_lang_item_contracts() {
+    for source in [
+        r#"#[lang = "drop"] trait Drop<T> { fun drop(&mut self); }"#,
+        r#"#[lang = "drop"] trait Drop { fun drop(&self); }"#,
+        r#"#[lang = "drop"] trait Drop { fun drop(&mut self) -> i32; }"#,
+        r#"#[lang = "drop"] trait Drop { fun drop(&mut self); fun extra(); }"#,
+    ] {
+        let result = check(source);
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "E0053"),
+            "expected invalid Drop contract diagnostic for {source:?}, got {:?}",
+            result.diagnostics
+        );
+    }
+}
+
+#[test]
+fn rejects_direct_drop_call() {
+    let result = check(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun consume() {
+            let mut guard = Guard {};
+            guard.drop();
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0056"),
+        "expected direct Drop call diagnostic, got {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn rejects_copy_for_drop_type() {
+    let result = check(
+        r#"
+        #[lang = "copy"]
+        trait Copy {}
+
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Copy for Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0055"),
+        "expected Copy + Drop conflict, got {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn accepts_matching_trait_impl_required_items() {
     let result = check(
         r#"

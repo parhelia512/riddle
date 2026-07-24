@@ -9,6 +9,9 @@ use hir::item_tree::TraitId;
 /// ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LangItem {
+    // Deterministic destruction
+    Drop,
+
     // Copy semantics
     Copy,
 
@@ -58,6 +61,7 @@ impl LangItem {
     /// Parses the string value of a `#[lang = "..."]` attribute.
     pub fn from_name(s: &str) -> Option<Self> {
         Some(match s {
+            "drop" => Self::Drop,
             "copy" => Self::Copy,
             "clone" => Self::Clone,
             "partial_eq" => Self::PartialEq,
@@ -93,6 +97,7 @@ impl LangItem {
     /// The canonical string form used in `#[lang = "..."]`.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Drop => "drop",
             Self::Copy => "copy",
             Self::Clone => "clone",
             Self::PartialEq => "partial_eq",

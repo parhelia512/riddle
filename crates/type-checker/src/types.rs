@@ -254,12 +254,6 @@ impl Type {
                 | Type::InferVar(_)
                 | Type::Unknown
                 | Type::Error
-        ) || matches!(
-            self,
-            Type::Fn {
-                kind: ClosureKind::Fn,
-                ..
-            }
         )
     }
 

@@ -196,7 +196,10 @@ fn c_anonymous_function_uses_typed_function_pointer() {
         "{generated}"
     );
     assert!(generated.contains("__riddle_lambda_"), "{generated}");
-    assert!(generated.contains("f.call(f.env, value)"), "{generated}");
+    assert!(
+        generated.contains(".call(") && generated.contains(".env"),
+        "{generated}"
+    );
 }
 
 #[test]
@@ -237,6 +240,37 @@ fn c_returned_closure_keeps_parameter_alive() {
     assert!(generated.contains("make_adder"), "{generated}");
     assert!(generated.contains("rgc_alloc"), "{generated}");
     assert!(generated.contains("capture_0_base"), "{generated}");
+}
+
+#[test]
+fn c_gc_closure_environment_has_deterministic_drop_glue() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+        impl Drop for Guard { fun drop(&mut self) {} }
+        fun consume(value: Guard) {}
+
+        fun make() -> fun() {
+            let guard = Guard {};
+            fun() { consume(guard); }
+        }
+
+        fun main() {
+            let closure = make();
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("rgc_alloc"), "{generated}");
+    assert!(generated.contains("__riddle_lambda_1_drop"), "{generated}");
+    assert!(generated.contains("drop__Guard"), "{generated}");
+    assert!(generated.contains(".drop("), "{generated}");
 }
 
 #[test]

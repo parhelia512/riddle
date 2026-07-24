@@ -466,7 +466,7 @@ fn assignment_moves_rhs_struct() {
 // == Match scrutinee ==
 
 #[test]
-fn match_scrutinee_is_moved() {
+fn match_copy_fields_keep_scrutinee_available() {
     let result = analyze(
         r#"
         struct Point { x: i32, y: i32 }
@@ -480,10 +480,52 @@ fn match_scrutinee_is_moved() {
         }
         "#,
     );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn match_move_keeps_unbound_sibling_field_available() {
+    let result = analyze(
+        r#"
+        struct Token {}
+        struct Pair { left: Token, right: Token }
+        fun consume(value: Token) {}
+
+        fun f() {
+            let pair = Pair { left: Token {}, right: Token {} };
+            match pair {
+                Pair { left } => { consume(left); }
+            }
+            consume(pair.right);
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn match_moved_field_remains_unavailable() {
+    let result = analyze(
+        r#"
+        struct Token {}
+        struct Pair { left: Token, right: Token }
+        fun consume(value: Token) {}
+
+        fun f() {
+            let pair = Pair { left: Token {}, right: Token {} };
+            match pair {
+                Pair { left } => {}
+            }
+            consume(pair.left);
+        }
+        "#,
+    );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|message| message.contains("use of moved field") && message.contains("left")),
+        "{:#?}",
+        result.diagnostics
     );
 }
 
@@ -501,6 +543,95 @@ fn match_int_scrutinee_is_not_moved() {
         "#,
     );
     assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn cannot_move_field_out_of_drop_type_with_pattern() {
+    let result = analyze(
+        r#"
+        #[lang = "drop"]
+        trait Drop { fun drop(&mut self); }
+
+        struct Guard {}
+        struct Owner { guard: Guard }
+        impl Drop for Owner { fun drop(&mut self) {} }
+
+        fun main() {
+            let owner = Owner { guard: Guard {} };
+            match owner {
+                Owner { guard } => {}
+            }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0305"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn cannot_move_nested_field_out_of_drop_type_with_pattern() {
+    let result = analyze(
+        r#"
+        #[lang = "drop"]
+        trait Drop { fun drop(&mut self); }
+
+        struct Guard {}
+        struct Inner { guard: Guard }
+        struct Outer { inner: Inner }
+        impl Drop for Inner { fun drop(&mut self) {} }
+
+        fun main() {
+            let outer = Outer { inner: Inner { guard: Guard {} } };
+            match outer {
+                Outer { inner: Inner { guard } } => {}
+            }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0305"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn cannot_move_pattern_binding_in_match_guard() {
+    let result = analyze(
+        r#"
+        struct Token {}
+        enum MaybeToken { Some(Token), None }
+        fun consume(value: Token) -> bool { true }
+
+        fun main(value: MaybeToken) {
+            match value {
+                MaybeToken::Some(token) if consume(token) => {},
+                MaybeToken::Some(token) => {},
+                MaybeToken::None => {},
+            }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0307"),
+        "{:#?}",
+        result.diagnostics
+    );
 }
 
 // == Struct literal fields ==
@@ -545,6 +676,29 @@ fn array_moves_elements() {
         messages(&result)
             .iter()
             .any(|m| m.contains("use of moved value") && m.contains("p"))
+    );
+}
+
+#[test]
+fn dynamic_array_element_move_is_tracked() {
+    let source = r#"
+        struct Guard {}
+        fun consume(value: Guard) {}
+
+        fun test(index: usize) {
+            let values = [Guard {}, Guard {}];
+            consume(values[index]);
+            consume(values[index]);
+        }
+    "#;
+    let result = analyze(source);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0100"),
+        "expected repeated dynamic element move to be rejected: {:#?}",
+        result.diagnostics
     );
 }
 
@@ -863,6 +1017,38 @@ fn move_while_borrowed_is_error() {
     );
 }
 
+#[test]
+fn rejects_moving_a_field_out_of_explicit_drop_type() {
+    let result = analyze(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Token {}
+        struct Guard { value: Token }
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun take(value: Token) {}
+
+        fun f() {
+            let guard = Guard { value: Token {} };
+            take(guard.value);
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0305"),
+        "expected move-out-of-Drop diagnostic, got {:?}",
+        result.diagnostics
+    );
+}
+
 // == Explicit Copy impl ==
 
 #[test]
@@ -1091,6 +1277,28 @@ fn once_closure_cannot_be_called_twice() {
         messages(&result)
             .iter()
             .any(|message| message.contains("use of moved value") && message.contains("once"))
+    );
+}
+
+#[test]
+fn closure_value_moves_when_passed_by_value() {
+    let result = analyze(
+        r#"
+        fun consume(f: fun(i32) -> i32) {}
+
+        fun test() {
+            let add_one = fun(value: i32) { value + 1 };
+            consume(add_one);
+            consume(add_one);
+        }
+        "#,
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|message| message.contains("use of moved value") && message.contains("add_one")),
+        "closure values own their environment and must move by value: {:#?}",
+        result.diagnostics
     );
 }
 

@@ -628,6 +628,7 @@ impl Lower for StructField {
         let attrs = lower_attrs(self.syntax());
         HirStructField {
             name,
+            visibility: lower_visibility(self.is_pub()),
             ty,
             ty_range,
             attrs,

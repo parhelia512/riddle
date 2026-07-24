@@ -107,6 +107,49 @@ fn incremental_type_checker_reuses_unchanged_bodies() {
 }
 
 #[test]
+fn incremental_replay_preserves_pattern_types() {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(
+        r#"
+        struct Token {}
+        enum MaybeToken { Some(Token), None }
+
+        fun stable(value: MaybeToken) {
+            match value {
+                MaybeToken::Some(token) => {},
+                MaybeToken::None => {},
+            }
+        }
+
+        fun edited() { 0; }
+        "#,
+    );
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let mut checker = IncrementalTypeChecker::new();
+    let hir = lower_and_resolve(parse);
+    let first = checker.check(&hir);
+    assert_eq!(first.result.pattern_types.len(), 3);
+    assert_eq!(first.result.pattern_binding_types.len(), 1);
+
+    let offset = parser.source().find("0;").unwrap();
+    parser.apply_edit(offset, 1, "1");
+    let parse = parser.current_parse().unwrap();
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+    let hir = lower_and_resolve(parse);
+    let second = checker.check(&hir);
+
+    assert_eq!(second.stats.reused_bodies, 1);
+    assert_eq!(second.result.pattern_types.len(), 3);
+    assert_eq!(second.result.pattern_binding_types.len(), 1);
+    assert_eq!(second.result.pattern_types, check_hir(&hir).pattern_types);
+    assert_eq!(
+        second.result.pattern_binding_types,
+        check_hir(&hir).pattern_binding_types
+    );
+}
+
+#[test]
 fn incremental_trait_impl_edit_updates_contract_diagnostics() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
@@ -176,6 +219,40 @@ fn incremental_function_safety_edit_invalidates_callers() {
     assert_eq!(second.stats.checked_bodies, 2);
     assert_eq!(second.stats.reused_bodies, 0);
     assert_eq!(diagnostics_with_code(&second.result, "E0046").len(), 1);
+}
+
+#[test]
+fn incremental_field_visibility_edit_invalidates_callers() {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(
+        r#"
+        mod model {
+            pub struct Point { pub value: i32 }
+            pub fun make() -> Point { Point { value: 1 } }
+        }
+
+        fun main() -> i32 { model::make().value }
+        "#,
+    );
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let mut checker = IncrementalTypeChecker::new();
+    let hir = lower_and_resolve(parse);
+    let first = checker.check_with_syntax(&hir, &parse.syntax());
+    assert!(diagnostics_with_code(&first.result, "E0054").is_empty());
+
+    let offset = parser.source().find("pub value: i32").unwrap();
+    parser.apply_edit(offset, "pub ".len(), "    ");
+    let parse = parser.current_parse().unwrap();
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let hir = lower_and_resolve(parse);
+    let second = checker.check_with_syntax(&hir, &parse.syntax());
+    assert_eq!(diagnostics_with_code(&second.result, "E0054").len(), 1);
+    assert_eq!(
+        diagnostics_with_code(&second.result, "E0054"),
+        diagnostics_with_code(&check_hir(&hir), "E0054")
+    );
 }
 
 #[test]

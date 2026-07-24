@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use hir::{
-    body::{BodyId, ExprId, PatternBindingId, StmtId},
+    body::{BodyId, ExprId, PatId, PatternBindingId, StmtId},
     item_tree::{FunctionId, TraitId},
 };
 use rowan::TextRange;
@@ -51,6 +51,8 @@ pub struct TypeCheckResult {
     pub operator_calls: HashMap<(BodyId, ExprId), OperatorCall>,
     pub for_loops: HashMap<(BodyId, ExprId), ForLoopInfo>,
     pub lambda_infos: HashMap<(BodyId, ExprId), LambdaInfo>,
+    pub pattern_types: HashMap<(BodyId, PatId), Type>,
+    pub pattern_binding_types: HashMap<(BodyId, PatternBindingId), Type>,
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,

@@ -7,8 +7,9 @@ use hir::{
         ResolvedName, Stmt, StmtId, UnaryOp,
     },
     item_tree::{
-        FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound, HirTypeRef,
-        HirVariantKind, TraitId,
+        FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound, HirStructField,
+        HirTypeRef, HirVariantKind, ItemTree, ModuleId, StructId, TopLevelItem, TraitId,
+        Visibility,
     },
 };
 
@@ -25,6 +26,63 @@ use crate::{
 };
 
 impl TypeChecker<'_> {
+    fn struct_field_is_visible(
+        &self,
+        ctx: &BodyCtx<'_>,
+        struct_id: StructId,
+        visibility: &Visibility,
+    ) -> bool {
+        if visibility.is_public() {
+            return true;
+        }
+
+        let strukt = &self.hir.item_tree.structs[struct_id];
+        if self.hir.package_for_range(strukt.name_range)
+            != self.hir.package_for_range(ctx.function.name_range)
+        {
+            return false;
+        }
+
+        let Some(owner) = containing_module(
+            &self.hir.item_tree,
+            &self.hir.item_tree.top_level,
+            &|item| matches!(item, TopLevelItem::Struct(id) if id == struct_id),
+        )
+        .flatten() else {
+            return true;
+        };
+        let Some(current) = containing_module(
+            &self.hir.item_tree,
+            &self.hir.item_tree.top_level,
+            &|item| item_contains_function(&self.hir.item_tree, item, ctx.function_id),
+        )
+        .flatten() else {
+            return false;
+        };
+
+        module_contains(&self.hir.item_tree, owner, current)
+    }
+
+    fn check_struct_field_visibility(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        struct_id: StructId,
+        field: &HirStructField,
+        span: Option<rowan::TextRange>,
+    ) {
+        if self.struct_field_is_visible(ctx, struct_id, &field.visibility) {
+            return;
+        }
+        self.diagnostic(
+            "E0054",
+            format!(
+                "field `{}` of struct `{}` is private",
+                field.name.0, self.hir.item_tree.structs[struct_id].name.0
+            ),
+            span,
+        );
+    }
+
     pub(crate) fn expr_always_returns(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> bool {
         match &ctx.body.exprs[expr_id] {
             Expr::Block { stmts, tail } => {
@@ -1584,6 +1642,7 @@ impl TypeChecker<'_> {
             };
 
             seen.push(field.name.0.as_str());
+            self.check_struct_field_visibility(ctx, *struct_id, expected_field, span);
             let pattern = self.lower_type_ref_with_params_at(
                 &expected_field.ty,
                 &generic_param_map_with_consts(
@@ -3053,6 +3112,16 @@ impl TypeChecker<'_> {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
 
+        if method.trait_id.is_some_and(|trait_id| {
+            self.result.trait_env.lang_items.get(LangItem::Drop) == Some(trait_id)
+        }) {
+            self.diagnostic(
+                "E0056",
+                "explicit destructor calls are not allowed; use `drop(value)` instead",
+                span,
+            );
+        }
+
         self.result
             .expr_types
             .insert((ctx.body_id, callee), Type::Function(method.fid));
@@ -3158,6 +3227,9 @@ impl TypeChecker<'_> {
             .collect::<Vec<_>>();
 
         for imp in impls {
+            if imp.trait_ty.is_some() {
+                continue;
+            }
             let Some(mut subst) = self.impl_subst_from_self_ty(&imp, receiver_self_ty) else {
                 continue;
             };
@@ -3185,6 +3257,10 @@ impl TypeChecker<'_> {
         receiver_ty: &Type,
         method_name: &Name,
     ) -> Option<ResolvedMethod> {
+        let receiver_self_ty = match receiver_ty {
+            Type::Ref(inner, _) => inner.as_ref(),
+            other => other,
+        };
         let impls = self
             .hir
             .item_tree
@@ -3200,13 +3276,13 @@ impl TypeChecker<'_> {
             let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
                 continue;
             };
-            let Some(mut subst) = self.impl_subst_from_self_ty(&imp, receiver_ty) else {
+            let Some(mut subst) = self.impl_subst_from_self_ty(&imp, receiver_self_ty) else {
                 continue;
             };
             if !self.impl_bounds_satisfied(&imp, &subst) {
                 continue;
             }
-            subst.insert("Self".into(), receiver_ty.clone());
+            subst.insert("Self".into(), receiver_self_ty.clone());
             let fid = imp
                 .methods
                 .iter()
@@ -3460,13 +3536,10 @@ impl TypeChecker<'_> {
 
         let strukt = self.hir.item_tree.structs[struct_id].clone();
         let subst = self.struct_subst(struct_id, args);
-        let Some(field_ty) = strukt
+        let Some(field) = strukt
             .fields
             .iter()
             .find(|candidate| candidate.name == *field)
-            .map(|candidate| {
-                self.lower_type_ref_with_params_at(&candidate.ty, &subst, Some(candidate.ty_range))
-            })
         else {
             self.diagnostic(
                 "E0006",
@@ -3475,8 +3548,9 @@ impl TypeChecker<'_> {
             );
             return Type::Error;
         };
+        self.check_struct_field_visibility(ctx, struct_id, field, span);
 
-        field_ty
+        self.lower_type_ref_with_params_at(&field.ty, &subst, Some(field.ty_range))
     }
 
     /// Check that the LHS of an assignment targets a mutable binding.
@@ -3565,6 +3639,9 @@ impl TypeChecker<'_> {
     }
 
     fn bind_pattern(&mut self, ctx: &mut BodyCtx<'_>, pat: PatId, expected: &Type) {
+        self.result
+            .pattern_types
+            .insert((ctx.body_id, pat), expected.clone());
         let span = ctx.pat_range(pat);
         let pattern = ctx.body.pats[pat].clone();
         match pattern {
@@ -3601,7 +3678,8 @@ impl TypeChecker<'_> {
                         );
                     }
                 } else {
-                    ctx.bindings.insert(
+                    self.record_pattern_binding(
+                        ctx,
                         name.0,
                         expected.clone(),
                         PatternBindingId {
@@ -3846,11 +3924,13 @@ impl TypeChecker<'_> {
                     );
                     continue;
                 };
+                self.check_struct_field_visibility(ctx, *struct_id, item, span);
                 let ty = self.lower_type_ref_with_params_at(&item.ty, &subst, Some(item.ty_range));
                 if let Some(pat) = field.pat {
                     self.bind_pattern(ctx, pat, &ty);
                 } else {
-                    ctx.bindings.insert(
+                    self.record_pattern_binding(
+                        ctx,
                         field.name.0.clone(),
                         ty,
                         PatternBindingId {
@@ -3925,7 +4005,8 @@ impl TypeChecker<'_> {
             if let Some(pat) = field.pat {
                 self.bind_pattern(ctx, pat, &ty);
             } else {
-                ctx.bindings.insert(
+                self.record_pattern_binding(
+                    ctx,
                     field.name.0.clone(),
                     ty,
                     PatternBindingId {
@@ -3935,6 +4016,19 @@ impl TypeChecker<'_> {
                 );
             }
         }
+    }
+
+    fn record_pattern_binding(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        name: String,
+        ty: Type,
+        id: PatternBindingId,
+    ) {
+        self.result
+            .pattern_binding_types
+            .insert((ctx.body_id, id), ty.clone());
+        ctx.bindings.insert(name, ty, id);
     }
 
     fn type_of_resolved_name(
@@ -3982,6 +4076,43 @@ impl TypeChecker<'_> {
             Some(ResolvedName::Trait(_)) | Some(ResolvedName::Module(_)) => Type::Unknown,
         }
     }
+}
+
+fn containing_module(
+    tree: &ItemTree,
+    items: &[TopLevelItem],
+    target: &impl Fn(TopLevelItem) -> bool,
+) -> Option<Option<ModuleId>> {
+    for &item in items {
+        if target(item) {
+            return Some(None);
+        }
+        if let TopLevelItem::Module(module) = item
+            && let Some(children) = &tree.modules[module].items
+            && let Some(owner) = containing_module(tree, children, target)
+        {
+            return Some(Some(owner.unwrap_or(module)));
+        }
+    }
+    None
+}
+
+fn item_contains_function(tree: &ItemTree, item: TopLevelItem, target: FunctionId) -> bool {
+    match item {
+        TopLevelItem::Function(function) => function == target,
+        TopLevelItem::Impl(imp) => tree.impls[imp].methods.contains(&target),
+        TopLevelItem::Trait(trait_id) => tree.traits[trait_id].default_methods.contains(&target),
+        _ => false,
+    }
+}
+
+fn module_contains(tree: &ItemTree, ancestor: ModuleId, target: ModuleId) -> bool {
+    ancestor == target
+        || tree.modules[ancestor].items.as_ref().is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(item, TopLevelItem::Module(module) if module_contains(tree, *module, target))
+            })
+        })
 }
 
 struct ResolvedMethod {

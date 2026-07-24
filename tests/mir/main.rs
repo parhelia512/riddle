@@ -35,7 +35,7 @@ fn compile(
     let escape_result = escape_analysis::analyze_escapes(&hir, &type_result);
     let analysis = move_checker::analyze(&hir, &type_result);
 
-    let mir_module = mir::lower_hir(&hir, &type_result, &escape_result);
+    let mir_module = mir::lower_hir(&hir, &type_result, &escape_result, &analysis.moved_exprs);
 
     (hir, type_result, analysis, mir_module)
 }

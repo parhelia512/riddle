@@ -132,6 +132,7 @@ pub struct HirStruct {
 #[derive(Debug, Clone)]
 pub struct HirStructField {
     pub name: Name,
+    pub visibility: Visibility,
     pub ty: HirTypeRef,
     pub ty_range: TextRange,
     pub attrs: Vec<HirAttr>,

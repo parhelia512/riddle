@@ -5,8 +5,8 @@ use crate::body::StmtId;
 pub enum Projection {
     /// Struct field by index in the struct definition.
     Field(usize),
-    /// Array/tuple element by literal index.
-    Index(usize),
+    /// Array/tuple element; `None` is a runtime index and overlaps every element.
+    Index(Option<usize>),
 }
 
 /// A path to a memory location: `local.field[0].subfield`.
@@ -34,7 +34,7 @@ impl Place {
     }
 
     /// Push an index projection.
-    pub fn index(mut self, idx: usize) -> Self {
+    pub fn index(mut self, idx: Option<usize>) -> Self {
         self.projections.push(Projection::Index(idx));
         self
     }
@@ -52,6 +52,10 @@ impl Place {
                 .projections
                 .iter()
                 .zip(&other.projections)
-                .all(|(a, b)| a == b)
+                .all(|(a, b)| match (a, b) {
+                    (Projection::Index(None), Projection::Index(_))
+                    | (Projection::Index(_), Projection::Index(None)) => true,
+                    _ => a == b,
+                })
     }
 }

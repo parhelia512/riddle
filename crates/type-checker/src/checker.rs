@@ -316,7 +316,7 @@ impl<'a> TypeChecker<'a> {
                             style: LabelStyle::Primary,
                         }],
                         help: Some(
-                            "recognized lang items: copy, clone, partial_eq, eq, partial_ord, ord, \
+                            "recognized lang items: drop, copy, clone, partial_eq, eq, partial_ord, ord, \
                              add, sub, mul, div, rem, neg, not, bitand, bitor, bitxor, \
                              shl, shr, and the *_assign variants"
                                 .to_string(),
@@ -820,6 +820,26 @@ impl<'a> TypeChecker<'a> {
             .collect::<Vec<_>>();
         for (key, info) in lambdas {
             self.result.lambda_infos.insert(key, info);
+        }
+        let patterns = self
+            .result
+            .pattern_types
+            .iter()
+            .filter(|((checked_body, _), _)| *checked_body == body_id)
+            .map(|(key, ty)| (*key, self.resolve_type(ty)))
+            .collect::<Vec<_>>();
+        for (key, ty) in patterns {
+            self.result.pattern_types.insert(key, ty);
+        }
+        let pattern_bindings = self
+            .result
+            .pattern_binding_types
+            .iter()
+            .filter(|((checked_body, _), _)| *checked_body == body_id)
+            .map(|(key, ty)| (*key, self.resolve_type(ty)))
+            .collect::<Vec<_>>();
+        for (key, ty) in pattern_bindings {
+            self.result.pattern_binding_types.insert(key, ty);
         }
         let pending = self
             .pending_lambdas
@@ -1457,6 +1477,28 @@ pub(crate) fn validate_lang_item_signature(
     });
 
     match item {
+        LangItem::Drop => {
+            if !tr.generics.is_empty() {
+                return Some("`Drop` trait must not be generic".into());
+            }
+            if !tr.supertraits.is_empty() || tr.methods.len() != 1 || !tr.type_aliases.is_empty() {
+                return Some("`Drop` must contain only `drop(&mut self)`".into());
+            }
+            let method = &tr.methods[0];
+            if method.name.0 != "drop"
+                || method.has_body
+                || !method.generics.is_empty()
+                || !method.const_generics.is_empty()
+                || method.params.len() != 1
+                || !matches!(&method.params[0].ty,
+                    HirTypeRef::Ref(inner, true) if lang_type_is_self(inner, &self_ty))
+                || method.ret_type.is_some()
+            {
+                return Some("method must have signature `fun drop(&mut self)`".into());
+            }
+            None
+        }
+
         // Marker traits — no method/assoc-type contract required.
         LangItem::Copy | LangItem::Eq => {
             (!tr.generics.is_empty()).then(|| "marker trait must not be generic".into())

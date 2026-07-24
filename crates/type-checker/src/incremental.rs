@@ -6,7 +6,7 @@ use std::{
 use frontend::syntax_kind::SyntaxNode;
 use hir::{
     HirFile,
-    body::{Body, BodyId, ExprId},
+    body::{Body, BodyId, ExprId, PatId, PatternBindingId},
     item_tree::{
         FunctionId, HirAttr, HirConst, HirEnum, HirEnumVariant, HirFunction, HirGenericBound,
         HirImpl, HirModule, HirStruct, HirStructField, HirTrait, HirTypeAlias, HirUse, HirUseTree,
@@ -65,6 +65,8 @@ struct CachedBody {
     operator_calls: Vec<(ExprId, OperatorCall)>,
     for_loops: Vec<(ExprId, ForLoopInfo)>,
     lambda_infos: Vec<(ExprId, LambdaInfo)>,
+    pattern_types: Vec<(PatId, Type)>,
+    pattern_binding_types: Vec<(PatternBindingId, Type)>,
     generic_edges: Vec<GenericEdge>,
 }
 
@@ -255,6 +257,20 @@ impl IncrementalTypeChecker {
                 .filter(|((checked_body, _), _)| *checked_body == body_id)
                 .map(|((_, expr), info)| (*expr, info.clone()))
                 .collect();
+            let pattern_types = checker
+                .result
+                .pattern_types
+                .iter()
+                .filter(|((checked_body, _), _)| *checked_body == body_id)
+                .map(|((_, pattern), ty)| (*pattern, ty.clone()))
+                .collect();
+            let pattern_binding_types = checker
+                .result
+                .pattern_binding_types
+                .iter()
+                .filter(|((checked_body, _), _)| *checked_body == body_id)
+                .map(|((_, binding), ty)| (*binding, ty.clone()))
+                .collect();
             self.bodies.insert(
                 fid,
                 CachedBody {
@@ -267,6 +283,8 @@ impl IncrementalTypeChecker {
                     operator_calls,
                     for_loops,
                     lambda_infos,
+                    pattern_types,
+                    pattern_binding_types,
                     generic_edges,
                 },
             );
@@ -339,6 +357,18 @@ fn replay_cached_body(
             .result
             .lambda_infos
             .insert((body_id, *expr), info.clone());
+    }
+    for (pattern, ty) in &cached.pattern_types {
+        checker
+            .result
+            .pattern_types
+            .insert((body_id, *pattern), ty.clone());
+    }
+    for (binding, ty) in &cached.pattern_binding_types {
+        checker
+            .result
+            .pattern_binding_types
+            .insert((body_id, *binding), ty.clone());
     }
     checker.generic_edges.extend(generic_edges);
     true
@@ -562,6 +592,7 @@ fn hash_fields(fields: &[HirStructField], hasher: &mut impl Hasher) {
     fields.len().hash(hasher);
     for field in fields {
         field.name.hash(hasher);
+        field.visibility.is_public().hash(hasher);
         field.ty.hash(hasher);
         hash_attrs(&field.attrs, hasher);
     }

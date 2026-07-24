@@ -283,6 +283,14 @@ impl TypeChecker<'_> {
                 self.lower_type_ref_with_params_at(&imp.self_ty, &params, Some(imp.self_ty_range));
             let bounds = self.lower_trait_env_bounds(&imp.generic_bounds, &params);
             let self_ty_text = self_ty.display(self.hir);
+            if self.result.trait_env.type_has_explicit_drop(&self_ty) {
+                self.diagnostic(
+                    "E0055",
+                    format!("`Copy` cannot be implemented for `{self_ty_text}` because it implements `Drop`"),
+                    Some(imp.self_ty_range),
+                );
+                continue;
+            }
             let Some(fields) = self.copy_impl_fields(&self_ty) else {
                 self.diagnostic(
                     "E0041",

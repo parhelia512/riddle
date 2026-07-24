@@ -5,8 +5,8 @@ use rowan::TextRange;
 use hir::{
     HirFile,
     body::{
-        Body, BodyId, Expr, ExprId, PatternBindingId, ResolvedName, SourceMap, Stmt, StmtId,
-        UnaryOp,
+        Body, BodyId, Expr, ExprId, PatId, Pattern, PatternBindingId, ResolvedName, SourceMap,
+        Stmt, StmtId, UnaryOp,
     },
     item_tree::{FunctionId, HirTypeRef},
     place::Place,
@@ -95,6 +95,7 @@ struct AccessTarget {
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
     pub diagnostics: Vec<Diagnostic>,
+    pub moved_exprs: HashSet<(BodyId, ExprId)>,
 }
 
 /// Run move/borrow checking. Escape analysis identifies storage duration only;
@@ -157,6 +158,7 @@ impl<'a> Analyzer<'a> {
             tail: Some(tail), ..
         } = &ctx.body.exprs[ctx.body.root_block]
         {
+            self.check_returned_drop_borrow(ctx, *tail);
             self.consume_if_local(ctx, *tail);
         }
     }
@@ -348,6 +350,23 @@ impl<'a> Analyzer<'a> {
             } => {
                 self.move_check_expr(ctx, *iterable);
                 self.consume_if_local(ctx, *iterable);
+                let item_ty = self
+                    .type_result
+                    .for_loops
+                    .get(&(ctx.body_id, expr_id))
+                    .map(|info| info.item_ty.clone())
+                    .or_else(|| {
+                        self.type_result
+                            .expr_types
+                            .get(&(ctx.body_id, *iterable))
+                            .and_then(|ty| match ty {
+                                Type::Array(item, _) => Some((**item).clone()),
+                                _ => None,
+                            })
+                    });
+                if let Some(item_ty) = item_ty {
+                    self.check_pattern_move_from_drop(ctx, *pat, &item_ty);
+                }
                 ctx.push_scope();
                 self.bind_pattern_names(ctx, *pat);
                 self.move_check_expr(ctx, *body);
@@ -356,16 +375,60 @@ impl<'a> Analyzer<'a> {
 
             Expr::Match { scrutinee, arms } => {
                 self.move_check_expr(ctx, *scrutinee);
-                self.consume_if_local(ctx, *scrutinee);
+                let scrutinee_ty = self
+                    .type_result
+                    .expr_types
+                    .get(&(ctx.body_id, *scrutinee))
+                    .cloned()
+                    .unwrap_or(Type::Unknown);
+                let scrutinee_place = self.place_from_expr(ctx, *scrutinee);
+                let base_bindings = ctx.bindings.clone();
+                let base_moved_places = ctx.moved_places.clone();
+                let base_moved_sites = ctx.moved_sites.clone();
+                let mut merged_bindings = base_bindings.clone();
+                let mut merged_moved_places = base_moved_places.clone();
+                let mut merged_moved_sites = base_moved_sites.clone();
                 for arm in arms {
+                    ctx.bindings = base_bindings.clone();
+                    ctx.moved_places = base_moved_places.clone();
+                    ctx.moved_sites = base_moved_sites.clone();
+                    self.check_pattern_move_from_drop(ctx, arm.pat, &scrutinee_ty);
                     ctx.push_scope();
                     self.bind_pattern_names(ctx, arm.pat);
                     if let Some(g) = arm.guard {
+                        let old_guard = std::mem::replace(&mut ctx.in_match_guard, true);
                         self.move_check_expr(ctx, g);
+                        ctx.in_match_guard = old_guard;
+                    }
+                    if let Some(root) = &scrutinee_place {
+                        for place in self.pattern_move_places(ctx, arm.pat, root) {
+                            if self.has_any_borrow(ctx, &place) {
+                                self.diag(
+                                    "cannot move a pattern field while borrowed".into(),
+                                    ctx.source_map.pat_ranges.get(&arm.pat).copied(),
+                                    "E0304",
+                                );
+                                continue;
+                            }
+                            ctx.moved_places.insert(place.clone());
+                            ctx.moved_sites.insert(
+                                place,
+                                (
+                                    ctx.source_map.pat_ranges.get(&arm.pat).copied(),
+                                    "field moved by pattern here".into(),
+                                ),
+                            );
+                        }
                     }
                     self.move_check_expr(ctx, arm.body);
                     ctx.pop_scope();
+                    merged_bindings.merge_moved_from(&ctx.bindings);
+                    merged_moved_places.extend(ctx.moved_places.iter().cloned());
+                    merged_moved_sites.extend(ctx.moved_sites.clone());
                 }
+                ctx.bindings = merged_bindings;
+                ctx.moved_places = merged_moved_places;
+                ctx.moved_sites = merged_moved_sites;
                 let mut origins = Origins::new();
                 for arm in arms {
                     origins.extend(ctx.expr_origins.get(&arm.body).cloned().unwrap_or_default());
@@ -526,6 +589,7 @@ impl<'a> Analyzer<'a> {
             Stmt::Return { value } => {
                 if let Some(v) = value {
                     self.move_check_expr(ctx, *v);
+                    self.check_returned_drop_borrow(ctx, *v);
                     self.consume_if_local(ctx, *v);
                 }
             }
@@ -553,6 +617,14 @@ impl<'a> Analyzer<'a> {
             if !self.trait_env.type_is_copy(&ty)
                 || matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
             {
+                if ctx.in_match_guard && matches!(resolved, Some(ResolvedName::PatternBinding(_))) {
+                    self.diag(
+                        format!("cannot move pattern binding `{}` in a match guard", name.0),
+                        ctx.expr_range(expr_id),
+                        "E0307",
+                    );
+                    return;
+                }
                 let access_place = resolved.as_ref().and_then(access_place_from_resolved_name);
                 if access_place
                     .as_ref()
@@ -566,6 +638,7 @@ impl<'a> Analyzer<'a> {
                     return;
                 }
                 ctx.bindings.mark_moved(&name.0);
+                self.result.moved_exprs.insert((ctx.body_id, expr_id));
                 // Record move site for secondary label.
                 let span = ctx.expr_range(expr_id);
                 if let Some(ResolvedName::Local(stmt)) = resolved {
@@ -596,6 +669,18 @@ impl<'a> Analyzer<'a> {
         {
             return;
         }
+        if !place.projections.is_empty()
+            && self
+                .root_type_from_expr(ctx, expr_id)
+                .is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty))
+        {
+            self.diag(
+                "cannot move out of a field of a type that implements `Drop`".into(),
+                ctx.expr_range(expr_id),
+                "E0305",
+            );
+            return;
+        }
         if self.has_any_borrow(ctx, &place) {
             let name = self.expr_name(ctx, expr_id);
             self.diag(
@@ -606,9 +691,84 @@ impl<'a> Analyzer<'a> {
             return;
         }
         ctx.moved_places.insert(place.clone());
+        self.result.moved_exprs.insert((ctx.body_id, expr_id));
         let span = ctx.expr_range(expr_id);
         let desc = "value moved here".to_string();
         ctx.moved_sites.insert(place, (span, desc));
+    }
+
+    fn root_type_from_expr<'b>(&'b self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<&'b Type> {
+        let mut root = expr_id;
+        loop {
+            root = match &ctx.body.exprs[root] {
+                Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => *base,
+                _ => break,
+            };
+        }
+        self.type_result.expr_types.get(&(ctx.body_id, root))
+    }
+
+    fn check_returned_drop_borrow(&mut self, ctx: &BodyCtx<'_>, expr_id: ExprId) {
+        let captured_owner = self
+            .type_result
+            .lambda_infos
+            .get(&(ctx.body_id, expr_id))
+            .into_iter()
+            .flat_map(|info| &info.captures)
+            .find_map(|capture| match capture.source {
+                CaptureSource::Local(stmt)
+                    if capture.mode != CaptureMode::Value
+                        && self.local_has_explicit_drop(ctx, stmt) =>
+                {
+                    Some(stmt)
+                }
+                _ => None,
+            });
+        let owner = captured_owner.or_else(|| {
+            ctx.expr_origins
+                .get(&expr_id)
+                .into_iter()
+                .flatten()
+                .find_map(|origin| match origin.place.root {
+                    AccessRoot::Local(stmt) if self.local_has_explicit_drop(ctx, stmt) => {
+                        Some(stmt)
+                    }
+                    _ => None,
+                })
+        });
+        let Some(owner) = owner else { return };
+        let labels = ctx
+            .source_map
+            .stmt_ranges
+            .get(&owner)
+            .copied()
+            .map(|range| {
+                vec![(
+                    range,
+                    "value that owns the destructor is declared here".into(),
+                    LabelStyle::Secondary,
+                )]
+            })
+            .unwrap_or_default();
+        self.diag_with_labels(
+            "borrow of a value that implements `Drop` cannot outlive its owner".into(),
+            ctx.expr_range(expr_id),
+            "E0306",
+            &labels,
+        );
+    }
+
+    fn local_has_explicit_drop(&self, ctx: &BodyCtx<'_>, stmt: StmtId) -> bool {
+        let Stmt::Let {
+            init: Some(init), ..
+        } = &ctx.body.stmts[stmt]
+        else {
+            return false;
+        };
+        self.type_result
+            .expr_types
+            .get(&(ctx.body_id, *init))
+            .is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty))
     }
 
     fn apply_capture_effects(&mut self, ctx: &mut BodyCtx<'_>, lambda: ExprId, info: &LambdaInfo) {
@@ -684,6 +844,17 @@ impl<'a> Analyzer<'a> {
                     if self.trait_env.type_is_copy(&capture.ty) {
                         continue;
                     }
+                    if ctx.in_match_guard && matches!(capture.source, CaptureSource::Pattern(_)) {
+                        self.diag(
+                            format!(
+                                "cannot move pattern binding `{}` in a match guard",
+                                capture.name
+                            ),
+                            span,
+                            "E0307",
+                        );
+                        continue;
+                    }
                     if self.has_any_access_borrow(ctx, &access_place) {
                         self.diag(
                             format!("cannot move `{}` into closure while borrowed", capture.name),
@@ -734,8 +905,8 @@ impl<'a> Analyzer<'a> {
             Expr::IndexAccess { base, index } => {
                 let base_place = self.place_from_expr(ctx, *base)?;
                 let idx = match &ctx.body.exprs[*index] {
-                    Expr::IntLiteral { value, .. } => usize::try_from(*value).ok()?,
-                    _ => return None,
+                    Expr::IntLiteral { value, .. } => usize::try_from(*value).ok(),
+                    _ => None,
                 };
                 Some(base_place.index(idx))
             }
@@ -1213,6 +1384,155 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn pattern_move_places(&self, ctx: &BodyCtx<'_>, pat: PatId, root: &Place) -> Vec<Place> {
+        let mut places = Vec::new();
+        self.collect_pattern_move_places(ctx, pat, root, &mut places);
+        places
+    }
+
+    fn collect_pattern_move_places(
+        &self,
+        ctx: &BodyCtx<'_>,
+        pat: PatId,
+        root: &Place,
+        places: &mut Vec<Place>,
+    ) {
+        let binding_moves = |id| {
+            self.type_result
+                .pattern_binding_types
+                .get(&(ctx.body_id, id))
+                .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
+        };
+        match &ctx.body.pats[pat] {
+            Pattern::Binding { .. } => {
+                if binding_moves(PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                }) {
+                    places.push(root.clone());
+                }
+            }
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
+                for (index, element) in elements.iter().enumerate() {
+                    self.collect_pattern_move_places(
+                        ctx,
+                        *element,
+                        &root.clone().field(index),
+                        places,
+                    );
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for (binding_index, field) in fields.iter().enumerate() {
+                    let Some(index) = self.pattern_field_index(ctx, pat, &field.name) else {
+                        continue;
+                    };
+                    let field_place = root.clone().field(index);
+                    if let Some(field_pat) = field.pat {
+                        self.collect_pattern_move_places(ctx, field_pat, &field_place, places);
+                    } else if binding_moves(PatternBindingId {
+                        pattern: pat,
+                        field: Some(binding_index),
+                    }) {
+                        places.push(field_place);
+                    }
+                }
+            }
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+        }
+    }
+
+    fn pattern_field_index(
+        &self,
+        ctx: &BodyCtx<'_>,
+        pat: PatId,
+        field: &hir::Name,
+    ) -> Option<usize> {
+        let ty = self.type_result.pattern_types.get(&(ctx.body_id, pat))?;
+        match ty {
+            Type::Struct(id, _) => self.hir.item_tree.structs[*id]
+                .fields
+                .iter()
+                .position(|item| item.name == *field),
+            Type::Enum(id, _) => {
+                let Pattern::Struct { path, .. } = &ctx.body.pats[pat] else {
+                    return None;
+                };
+                let name = path.segments.last()?;
+                let variant = self.hir.item_tree.enums[*id]
+                    .variants
+                    .iter()
+                    .find(|variant| variant.name == *name)?;
+                let hir::item_tree::HirVariantKind::Struct(fields) = &variant.kind else {
+                    return None;
+                };
+                fields.iter().position(|item| item.name == *field)
+            }
+            _ => None,
+        }
+    }
+
+    fn check_pattern_move_from_drop(&mut self, ctx: &BodyCtx<'_>, pat: PatId, ty: &Type) {
+        let Some(pat) = self.pattern_move_from_drop(ctx, pat, ty) else {
+            return;
+        };
+        self.diag(
+            "cannot move out of a field of a type that implements `Drop`".into(),
+            ctx.source_map.pat_ranges.get(&pat).copied(),
+            "E0305",
+        );
+    }
+
+    fn pattern_move_from_drop(&self, ctx: &BodyCtx<'_>, pat: PatId, ty: &Type) -> Option<PatId> {
+        if self.trait_env.type_has_explicit_drop(ty)
+            && matches!(
+                ctx.body.pats[pat],
+                Pattern::Tuple { .. } | Pattern::TupleStruct { .. } | Pattern::Struct { .. }
+            )
+            && self.pattern_moves_non_copy(ctx, pat)
+        {
+            return Some(pat);
+        }
+        let children = match &ctx.body.pats[pat] {
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => elements.clone(),
+            Pattern::Struct { fields, .. } => fields.iter().filter_map(|field| field.pat).collect(),
+            _ => Vec::new(),
+        };
+        children.into_iter().find_map(|child| {
+            let child_ty = self.type_result.pattern_types.get(&(ctx.body_id, child))?;
+            self.pattern_move_from_drop(ctx, child, child_ty)
+        })
+    }
+
+    fn pattern_moves_non_copy(&self, ctx: &BodyCtx<'_>, pat: PatId) -> bool {
+        let binding_moves = |id| {
+            self.type_result
+                .pattern_binding_types
+                .get(&(ctx.body_id, id))
+                .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
+        };
+        match &ctx.body.pats[pat] {
+            Pattern::Binding { .. } => binding_moves(PatternBindingId {
+                pattern: pat,
+                field: None,
+            }),
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => elements
+                .iter()
+                .any(|element| self.pattern_moves_non_copy(ctx, *element)),
+            Pattern::Struct { fields, .. } => fields.iter().enumerate().any(|(index, field)| {
+                field
+                    .pat
+                    .is_some_and(|pat| self.pattern_moves_non_copy(ctx, pat))
+                    || (field.pat.is_none()
+                        && binding_moves(PatternBindingId {
+                            pattern: pat,
+                            field: Some(index),
+                        }))
+            }),
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => false,
+        }
+    }
+
     fn diag(&mut self, message: String, span: Option<TextRange>, code: &'static str) {
         self.diag_with_labels(message, span, code, &[])
     }
@@ -1261,6 +1581,10 @@ impl<'a> Analyzer<'a> {
             "E0302" => vec!["only one mutable borrow of a place may be active at a time".into()],
             "E0303" => vec!["the borrow must end before assigning to the value".into()],
             "E0304" => vec!["the borrow must end before moving the value".into()],
+            "E0307" => vec![
+                "borrow the pattern binding in the guard or move it from the selected arm body"
+                    .into(),
+            ],
             _ => Vec::new(),
         };
         let mut labels = vec![SourceLabel {
@@ -1321,6 +1645,7 @@ struct BodyCtx<'a> {
     param_origins: HashMap<usize, Origins>,
     remaining_uses: HashMap<StmtId, usize>,
     scope_depth: usize,
+    in_match_guard: bool,
 }
 
 impl<'a> BodyCtx<'a> {
@@ -1339,6 +1664,7 @@ impl<'a> BodyCtx<'a> {
             param_origins: HashMap::new(),
             remaining_uses: collect_local_uses(body),
             scope_depth: 0,
+            in_match_guard: false,
         }
     }
 
@@ -1479,7 +1805,7 @@ impl<'a> BodyCtx<'a> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct MoveBindings {
     scopes: Vec<HashMap<String, bool>>,
 }
@@ -1508,6 +1834,16 @@ impl MoveBindings {
             if let Some(m) = s.get_mut(name) {
                 *m = true;
                 return;
+            }
+        }
+    }
+
+    fn merge_moved_from(&mut self, other: &Self) {
+        for (scope, other_scope) in self.scopes.iter_mut().zip(&other.scopes) {
+            for (name, moved) in other_scope {
+                if *moved && let Some(current) = scope.get_mut(name) {
+                    *current = true;
+                }
             }
         }
     }
@@ -1544,7 +1880,7 @@ fn access_place_from_move_place(place: &Place) -> AccessPlace {
     for projection in &place.projections {
         result = match projection {
             hir::place::Projection::Field(index) => result.field(*index),
-            hir::place::Projection::Index(index) => result.index(Some(*index)),
+            hir::place::Projection::Index(index) => result.index(*index),
         };
     }
     result

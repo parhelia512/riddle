@@ -9,6 +9,7 @@ pub mod marker;
 pub mod clone;
 pub mod cmp;
 pub mod ops;
+pub mod mem;
 pub mod prelude;
 
 pub use crate::std::string::String;

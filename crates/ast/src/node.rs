@@ -1387,6 +1387,10 @@ impl StructFieldList {
 }
 
 impl StructField {
+    pub fn is_pub(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
+    }
+
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }

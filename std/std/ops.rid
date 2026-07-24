@@ -1,6 +1,11 @@
 use crate::std::iter::{IntoIterator, Iterator};
 use crate::std::option::Option;
 
+#[lang = "drop"]
+pub trait Drop {
+    fun drop(&mut self);
+}
+
 pub struct Range {
     start: i32,
     end: i32,

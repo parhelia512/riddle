@@ -1,5 +1,61 @@
 use crate::analyze;
 
+#[test]
+fn rejects_reference_escaping_a_drop_owner() {
+    let result = analyze(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard { value: i32 }
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun leak() -> &i32 {
+            let guard = Guard { value: 1 };
+            &guard.value
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0306"),
+        "expected escaping Drop borrow diagnostic, got {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn rejects_returned_closure_borrowing_a_drop_owner() {
+    let result = analyze(
+        r#"
+        #[lang = "drop"]
+        trait Drop { fun drop(&mut self); }
+
+        struct Guard { value: i32 }
+        impl Drop for Guard { fun drop(&mut self) {} }
+        fun inspect(value: &Guard) {}
+
+        fun leak() -> fun() {
+            let guard = Guard { value: 1 };
+            fun() { inspect(&guard); }
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0306"),
+        "expected escaping closure borrow of Drop owner to be rejected: {:#?}",
+        result.diagnostics
+    );
+}
+
 fn has_code(source: &str, code: &str) -> bool {
     analyze(source)
         .diagnostics

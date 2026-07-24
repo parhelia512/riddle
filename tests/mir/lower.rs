@@ -1,6 +1,735 @@
 use crate::{compile, lower};
 
 #[test]
+fn drop_locals_in_reverse_declaration_order() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard { id: i32 }
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun main() {
+            let first = Guard { id: 1 };
+            let second = Guard { id: 2 };
+        }
+        "#,
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let mut references = std::collections::HashMap::new();
+    let mut drop_places = Vec::new();
+    for (_, block) in main.blocks.iter() {
+        for (index, inst) in block.insts.iter().enumerate() {
+            let value = mir::value::Value(block.start_value + index as u32);
+            match &inst.kind {
+                mir::instr::InstKind::UnOp(mir::instr::UnOp::MutRef, place) => {
+                    references.insert(value, *place);
+                }
+                mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), args)
+                    if name.contains("drop") =>
+                {
+                    drop_places.push(references[&args[0]]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(drop_places.len(), 2, "expected two Drop calls: {main:#?}");
+    assert_ne!(drop_places[0], drop_places[1]);
+    assert!(
+        drop_places[0].0 > drop_places[1].0,
+        "second local must drop before first: {drop_places:?}"
+    );
+}
+
+#[test]
+fn drop_glue_runs_user_drop_before_fields_in_declaration_order() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct First {}
+        struct Second {}
+        struct Owner { first: First, second: Second }
+
+        impl Drop for First { fun drop(&mut self) {} }
+        impl Drop for Second { fun drop(&mut self) {} }
+        impl Drop for Owner { fun drop(&mut self) {} }
+
+        fun main() {
+            let owner = Owner { first: First {}, second: Second {} };
+        }
+        "#,
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let calls = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter_map(|inst| match &inst.kind {
+            mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                if name.contains("drop") =>
+            {
+                Some(name.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(calls, ["drop__Owner", "drop__First", "drop__Second"]);
+}
+
+#[test]
+fn aggregate_without_user_drop_still_drops_its_fields() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+        struct Wrapper { guard: Guard }
+
+        impl Drop for Guard { fun drop(&mut self) {} }
+
+        fun main() {
+            let wrapper = Wrapper { guard: Guard {} };
+        }
+        "#,
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    assert!(
+        main.blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name == "drop__Guard"
+                )
+            })),
+        "field drop glue is missing: {main:#?}"
+    );
+}
+
+#[test]
+fn partial_move_clears_only_the_moved_fields_drop_flag() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct First {}
+        struct Second {}
+        struct Pair { first: First, second: Second }
+        impl Drop for First { fun drop(&mut self) {} }
+        impl Drop for Second { fun drop(&mut self) {} }
+
+        fun consume(value: First) {}
+
+        fun main() {
+            let pair = Pair { first: First {}, second: Second {} };
+            consume(pair.first);
+        }
+        "#,
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let bool_allocas = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter(|inst| {
+            matches!(
+                inst.kind,
+                mir::instr::InstKind::Alloca(mir::types::Type::Ptr(ref inner))
+                    if **inner == mir::types::Type::Bool
+            )
+        })
+        .count();
+    let mut false_values = std::collections::HashSet::new();
+    let mut false_stores = 0;
+    for (_, block) in main.blocks.iter() {
+        for (index, inst) in block.insts.iter().enumerate() {
+            let value = mir::value::Value(block.start_value + index as u32);
+            match &inst.kind {
+                mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
+                    false_values.insert(value);
+                }
+                mir::instr::InstKind::Store(value, _) if false_values.contains(value) => {
+                    false_stores += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        bool_allocas, 2,
+        "each droppable field needs its own flag: {main:#?}"
+    );
+    assert_eq!(
+        false_stores, 1,
+        "only the moved field becomes inactive: {main:#?}"
+    );
+}
+
+#[test]
+fn dynamic_array_move_clears_only_the_selected_elements_drop_flag() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+        impl Drop for Guard { fun drop(&mut self) {} }
+        fun consume(value: Guard) {}
+
+        fun main(index: usize) {
+            let values = [Guard {}, Guard {}];
+            consume(values[index]);
+        }
+        "#,
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    assert!(
+        main.blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| {
+                matches!(
+                    inst.kind,
+                    mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false))
+                )
+            })),
+        "dynamic element move must clear a runtime-selected flag: {main:#?}"
+    );
+}
+
+#[test]
+fn array_and_enum_drop_glue_cover_elements_and_active_variant() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct First {}
+        struct Second {}
+        impl Drop for First { fun drop(&mut self) {} }
+        impl Drop for Second { fun drop(&mut self) {} }
+
+        enum Choice { First(First), Second(Second) }
+
+        fun drop_array() {
+            let values = [First {}, First {}];
+        }
+
+        fun drop_choice() {
+            let choice = Choice::Second(Second {});
+        }
+        "#,
+    );
+
+    let calls = |function_name: &str| {
+        let function = module
+            .functions
+            .values()
+            .find(|function| function.name == function_name)
+            .unwrap_or_else(|| panic!("missing {function_name}"));
+        function
+            .blocks
+            .iter()
+            .flat_map(|(_, block)| &block.insts)
+            .filter(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name.contains("drop")
+                )
+            })
+            .count()
+    };
+
+    assert_eq!(calls("drop_array"), 2);
+    assert_eq!(
+        calls("drop_choice"),
+        2,
+        "both variant glue paths must be emitted"
+    );
+    let choice = module
+        .functions
+        .values()
+        .find(|function| function.name == "drop_choice")
+        .unwrap();
+    assert!(
+        choice.blocks.iter().any(|(_, block)| {
+            matches!(block.terminator, mir::instr::Terminator::CondBranch(..))
+        }),
+        "enum drop glue must dispatch on the active variant: {choice:#?}"
+    );
+}
+
+#[test]
+fn return_drops_live_local_before_terminating() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun answer() -> i32 {
+            let guard = Guard {};
+            return 42;
+        }
+        "#,
+    );
+
+    let answer = module
+        .functions
+        .values()
+        .find(|function| function.name == "answer")
+        .expect("missing answer");
+    let has_drop = answer.blocks.iter().any(|(_, block)| {
+        block.insts.iter().any(|inst| {
+            matches!(
+                &inst.kind,
+                mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                    if name.contains("drop")
+            )
+        })
+    });
+
+    assert!(has_drop, "return path must run Drop: {answer:#?}");
+}
+
+#[test]
+fn moving_return_value_clears_its_drop_flag() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun take() -> Guard {
+            let guard = Guard {};
+            return guard;
+        }
+        "#,
+    );
+
+    let take = module
+        .functions
+        .values()
+        .find(|function| function.name == "take")
+        .expect("missing take");
+    let mut false_values = std::collections::HashSet::new();
+    let mut cleared_flag = false;
+    for (_, block) in take.blocks.iter() {
+        for (index, inst) in block.insts.iter().enumerate() {
+            let value = mir::value::Value(block.start_value + index as u32);
+            match &inst.kind {
+                mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
+                    false_values.insert(value);
+                }
+                mir::instr::InstKind::Store(value, _place) if false_values.contains(value) => {
+                    cleared_flag = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        cleared_flag,
+        "moving a Drop local must clear its drop flag: {take:#?}"
+    );
+}
+
+#[test]
+fn drop_parameters_in_declaration_order() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun consume(first: Guard, second: Guard) {}
+        "#,
+    );
+
+    let consume = module
+        .functions
+        .values()
+        .find(|function| function.name == "consume")
+        .expect("missing consume");
+    let mut references = std::collections::HashMap::new();
+    let mut drop_places = Vec::new();
+    for (_, block) in consume.blocks.iter() {
+        for (index, inst) in block.insts.iter().enumerate() {
+            let value = mir::value::Value(block.start_value + index as u32);
+            match &inst.kind {
+                mir::instr::InstKind::UnOp(mir::instr::UnOp::MutRef, place) => {
+                    references.insert(value, *place);
+                }
+                mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), args)
+                    if name.contains("drop") =>
+                {
+                    drop_places.push(references[&args[0]]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        drop_places.len(),
+        2,
+        "expected two parameter drops: {consume:#?}"
+    );
+    assert!(
+        drop_places[0].0 < drop_places[1].0,
+        "parameters must drop in declaration order: {drop_places:?}"
+    );
+}
+
+#[test]
+fn moving_parameter_clears_its_drop_flag() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun take(guard: Guard) -> Guard {
+            return guard;
+        }
+        "#,
+    );
+
+    let take = module
+        .functions
+        .values()
+        .find(|function| function.name == "take")
+        .expect("missing take");
+    assert!(
+        take.blocks.iter().any(|(_, block)| {
+            let mut false_values = std::collections::HashSet::new();
+            block.insts.iter().enumerate().any(|(index, inst)| {
+                let value = mir::value::Value(block.start_value + index as u32);
+                match &inst.kind {
+                    mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
+                        false_values.insert(value);
+                        false
+                    }
+                    mir::instr::InstKind::Store(value, _) => false_values.contains(value),
+                    _ => false,
+                }
+            })
+        }),
+        "moving a Drop parameter must clear its drop flag: {take:#?}"
+    );
+}
+
+#[test]
+fn assignment_drops_old_value_and_rearms_drop_flag() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard { id: i32 }
+        impl Drop for Guard { fun drop(&mut self) {} }
+
+        fun main() {
+            let mut guard = Guard { id: 1 };
+            guard = Guard { id: 2 };
+        }
+        "#,
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let drop_calls = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter(|inst| {
+            matches!(
+                &inst.kind,
+                mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                    if name == "drop__Guard"
+            )
+        })
+        .count();
+    let true_values = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter(|inst| {
+            matches!(
+                inst.kind,
+                mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(true))
+            )
+        })
+        .count();
+
+    assert_eq!(
+        drop_calls, 2,
+        "old and final values must both be dropped: {main:#?}"
+    );
+    assert!(
+        true_values >= 2,
+        "assignment must reactivate the drop flag: {main:#?}"
+    );
+}
+
+#[test]
+fn returned_closure_drops_value_captures_through_its_drop_function() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+        impl Drop for Guard { fun drop(&mut self) {} }
+        fun consume(value: Guard) {}
+
+        fun make() -> fun() {
+            let guard = Guard {};
+            fun() { consume(guard); }
+        }
+
+        fun main() {
+            let closure = make();
+        }
+        "#,
+    );
+
+    let closure_drop = module
+        .functions
+        .values()
+        .find(|function| function.name.contains("lambda") && function.name.ends_with("_drop"))
+        .expect("missing closure drop function");
+    assert!(
+        closure_drop
+            .blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name == "drop__Guard"
+                )
+            })),
+        "closure drop function must drop its value captures: {closure_drop:#?}"
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    assert!(
+        main.blocks.iter().any(|(_, block)| block
+            .insts
+            .iter()
+            .any(|inst| { matches!(inst.kind, mir::instr::InstKind::CallIndirect(_, _)) })),
+        "closure owner must invoke its dynamic drop function: {main:#?}"
+    );
+}
+
+#[test]
+fn lambda_drops_its_by_value_parameters() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+        impl Drop for Guard { fun drop(&mut self) {} }
+
+        fun main() {
+            let consume = fun(guard: Guard) {};
+            consume(Guard {});
+        }
+        "#,
+    );
+
+    let lambda = module
+        .functions
+        .values()
+        .find(|function| function.name.contains("lambda") && !function.name.ends_with("_drop"))
+        .expect("missing lambda function");
+    assert!(
+        lambda
+            .blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name == "drop__Guard"
+                )
+            })),
+        "lambda parameter must be dropped by the lambda body: {lambda:#?}"
+    );
+}
+
+#[test]
+fn monomorphized_generic_parameter_runs_drop() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+        impl Drop for Guard { fun drop(&mut self) {} }
+
+        fun drop_value<T>(value: T) {}
+
+        fun main() {
+            drop_value(Guard {});
+        }
+        "#,
+    );
+
+    let drop_value = module
+        .functions
+        .values()
+        .find(|function| function.name.starts_with("drop_value__"))
+        .expect("missing monomorphized drop_value");
+    assert!(
+        drop_value
+            .blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name == "drop__Guard"
+                )
+            })),
+        "generic by-value parameter must be dropped after monomorphization: {drop_value:#?}"
+    );
+}
+
+#[test]
+fn monomorphization_preserves_callers_drop_scope() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop { fun drop(&mut self); }
+
+        struct Guard {}
+        impl Drop for Guard { fun drop(&mut self) {} }
+        fun identity<T>(value: T) -> T { value }
+
+        fun main() {
+            let guard = Guard {};
+            let value = identity(1);
+        }
+        "#,
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    assert!(
+        main.blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name == "drop__Guard"
+                )
+            })),
+        "generic lowering must restore the caller's drop scope: {main:#?}"
+    );
+}
+
+#[test]
 fn simple_function_no_params() {
     let module = lower(
         r#"
@@ -523,6 +1252,59 @@ fn break_and_continue_lower_to_loop_targets_and_skip_dead_code() {
             matches!(&inst.kind, mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name == "dead")
         })
     }));
+}
+
+#[test]
+fn break_and_continue_drop_locals_before_branching() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun on_break() {
+            while true {
+                let guard = Guard {};
+                break;
+            }
+        }
+
+        fun on_continue() {
+            while true {
+                let guard = Guard {};
+                continue;
+            }
+        }
+        "#,
+    );
+
+    for name in ["on_break", "on_continue"] {
+        let function = module
+            .functions
+            .values()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let has_drop = function.blocks.iter().any(|(_, block)| {
+            block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name.contains("drop")
+                )
+            })
+        });
+        assert!(
+            has_drop,
+            "{name} must drop locals before jumping: {function:#?}"
+        );
+    }
 }
 
 #[test]

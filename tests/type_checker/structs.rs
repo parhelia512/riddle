@@ -178,6 +178,117 @@ fn reports_invalid_field_access() {
 }
 
 #[test]
+fn rejects_private_field_access_outside_its_module() {
+    let result = check(
+        r#"
+        mod model {
+            pub struct Point {
+                x: i32,
+                pub y: i32,
+            }
+
+            pub fun make() -> Point {
+                Point { x: 1, y: 2 }
+            }
+
+            pub fun read(point: &Point) -> i32 {
+                point.x
+            }
+
+            pub mod nested {
+                pub fun read(point: &super::Point) -> i32 {
+                    point.x
+                }
+            }
+        }
+
+        fun main() -> i32 {
+            let point = model::make();
+            point.x + point.y + model::read(&point) + model::nested::read(&point)
+        }
+        "#,
+    );
+
+    let private = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0054")
+        .collect::<Vec<_>>();
+    assert_eq!(private.len(), 1, "diagnostics: {:?}", result.diagnostics);
+    assert!(
+        private[0]
+            .message
+            .contains("field `x` of struct `Point` is private")
+    );
+}
+
+#[test]
+fn rejects_private_field_in_struct_literal_outside_its_module() {
+    let result = check(
+        r#"
+        mod model {
+            pub struct Point {
+                x: i32,
+                pub y: i32,
+            }
+        }
+
+        fun main() {
+            model::Point { x: 1, y: 2 };
+        }
+        "#,
+    );
+
+    let private = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0054")
+        .collect::<Vec<_>>();
+    assert_eq!(private.len(), 1, "diagnostics: {:?}", result.diagnostics);
+    assert!(
+        private[0]
+            .message
+            .contains("field `x` of struct `Point` is private")
+    );
+}
+
+#[test]
+fn rejects_private_field_in_struct_pattern_outside_its_module() {
+    let result = check(
+        r#"
+        mod model {
+            pub struct Point {
+                x: i32,
+                pub y: i32,
+            }
+
+            pub fun make() -> Point {
+                Point { x: 1, y: 2 }
+            }
+        }
+
+        fun main() -> i32 {
+            match model::make() {
+                model::Point { x, y } => x + y,
+            }
+        }
+        "#,
+    );
+
+    let private = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0054")
+        .collect::<Vec<_>>();
+    assert_eq!(private.len(), 1, "diagnostics: {:?}", result.diagnostics);
+    assert!(
+        private[0]
+            .message
+            .contains("field `x` of struct `Point` is private")
+    );
+}
+
+#[test]
 fn reports_generic_type_arg_count_mismatch() {
     let result = check(
         r#"

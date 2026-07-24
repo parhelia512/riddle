@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use escape_analysis::EscapeResult;
@@ -35,6 +35,7 @@ pub fn lower_hir(
     hir: &HirFile,
     type_result: &TypeCheckResult,
     escape_result: &EscapeResult,
+    moved_exprs: &HashSet<(BodyId, ExprId)>,
 ) -> Module {
     let method_impls = hir
         .item_tree
@@ -62,6 +63,7 @@ pub fn lower_hir(
         hir,
         type_result,
         analysis: escape_result,
+        moved_exprs,
         module: Module::new("main"),
         method_impls,
         default_methods,
@@ -69,6 +71,8 @@ pub fn lower_hir(
         current_body: None,
         current_function: None,
         scope_map: HashMap::new(),
+        drop_scopes: Vec::new(),
+        drop_slots: HashMap::new(),
         storage_bindings: HashSet::new(),
         parameter_storage: HashMap::new(),
         pattern_bindings: Vec::new(),
@@ -139,6 +143,7 @@ struct LowerCtx<'a> {
     hir: &'a HirFile,
     type_result: &'a TypeCheckResult,
     analysis: &'a EscapeResult,
+    moved_exprs: &'a HashSet<(BodyId, ExprId)>,
     module: Module,
     method_impls: HashMap<hir::item_tree::FunctionId, hir::item_tree::ImplId>,
     default_methods: HashMap<hir::item_tree::FunctionId, hir::item_tree::TraitId>,
@@ -148,6 +153,8 @@ struct LowerCtx<'a> {
     current_function: Option<hir::item_tree::FunctionId>,
     /// Maps let-bound StmtId → Value for local variable resolution.
     scope_map: HashMap<StmtId, Value>,
+    drop_scopes: Vec<Vec<DropSlot>>,
+    drop_slots: HashMap<CaptureSource, Vec<DropSlot>>,
     /// StmtIds backed by storage rather than a direct SSA value.
     storage_bindings: HashSet<StmtId>,
     parameter_storage: HashMap<CaptureSource, Value>,
@@ -172,18 +179,42 @@ struct CaptureAccess {
 }
 
 #[derive(Clone)]
+struct DropSlot {
+    place: Value,
+    flag: Value,
+    ty: type_checker::Type,
+    projection: Vec<DropProjection>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum DropProjection {
+    Field(usize),
+    Index(usize),
+}
+
+#[derive(Clone)]
 struct PatternBindingValue {
     value: Value,
     ty: Type,
+    tc_ty: type_checker::Type,
     place: Option<Value>,
+    projection: Vec<DropProjection>,
 }
 
 impl PatternBindingValue {
-    fn direct(value: Value, ty: Type) -> Self {
+    fn direct(
+        value: Value,
+        ty: Type,
+        tc_ty: type_checker::Type,
+        place: Option<Value>,
+        projection: Vec<DropProjection>,
+    ) -> Self {
         Self {
             value,
             ty,
-            place: None,
+            tc_ty,
+            place,
+            projection,
         }
     }
 }
@@ -192,6 +223,7 @@ impl PatternBindingValue {
 struct LoopTargets {
     break_block: BlockId,
     continue_block: BlockId,
+    drop_depth: usize,
 }
 
 #[derive(Default)]
@@ -220,6 +252,8 @@ impl<'a> LowerCtx<'a> {
         let body = &self.hir.bodies[body_id];
         self.expr_cache.clear();
         self.scope_map.clear();
+        self.drop_scopes.clear();
+        self.drop_slots.clear();
         self.storage_bindings.clear();
         self.parameter_storage.clear();
         self.pattern_bindings.clear();
@@ -262,10 +296,13 @@ impl<'a> LowerCtx<'a> {
         let is_unit_ret = func.ret_type == Type::Unit || func.ret_type == Type::Never;
         {
             let mut builder = Builder::new(&mut func);
+            self.drop_scopes.push(Vec::new());
             for (index, (param, value)) in func_item.params.iter().zip(&param_values).enumerate() {
+                let tc_ty = self.lower_hir_type_for_pattern(&param.ty, &self.generic_tc_subst);
+                let needs_drop = self.type_needs_drop(&tc_ty, 0);
                 let storage = if self.analysis.param_escapes(body_id, index) {
                     Some(builder.heap_alloc(self.convert_hir_type(&param.ty)))
-                } else if self.analysis.param_needs_address(body_id, index) {
+                } else if self.analysis.param_needs_address(body_id, index) || needs_drop {
                     Some(builder.alloca(self.convert_hir_type(&param.ty)))
                 } else {
                     None
@@ -275,8 +312,19 @@ impl<'a> LowerCtx<'a> {
                     self.parameter_storage
                         .insert(CaptureSource::Param(index), storage);
                 }
+                if needs_drop {
+                    let place = storage.expect("Drop parameter has storage");
+                    let source = CaptureSource::Param(index);
+                    let slots = self.create_drop_slots(&mut builder, place, &tc_ty, Vec::new());
+                    self.register_drop_slots(source, &slots);
+                    self.drop_scopes[0].splice(0..0, slots.into_iter().rev());
+                }
             }
             let root_result = self.lower_expr(&mut builder, &param_values, body, body.root_block);
+            if builder.needs_return() {
+                self.emit_current_drop_scope(&mut builder);
+            }
+            self.drop_scopes.pop();
 
             // Set the implicit return only when lowering did not terminate the block.
             if is_unit_ret && builder.needs_return() {
@@ -374,6 +422,9 @@ impl<'a> LowerCtx<'a> {
                 };
                 let field = builder.field_ptr(env_ptr, index, field_ty);
                 builder.store(value, field);
+                if capture.mode == CaptureMode::Value && self.type_needs_drop(&capture.ty, 0) {
+                    self.clear_drop_slots_for_source(builder, &capture.source);
+                }
             }
             builder.cast(CastOp::PtrToPtr, env_ptr, closure_env_type())
         };
@@ -390,10 +441,20 @@ impl<'a> LowerCtx<'a> {
                 &capture_types,
                 &env_struct,
             );
+            self.lower_lambda_drop_function(
+                &format!("{}_drop", name),
+                &info,
+                &capture_types,
+                &env_struct,
+            );
         }
 
-        let call = builder.function_ref(FuncRef::Local(name), Type::FnPtr(call_signature));
-        builder.struct_value(vec![call, env_value], ty.clone())
+        let call = builder.function_ref(FuncRef::Local(name.clone()), Type::FnPtr(call_signature));
+        let drop = builder.function_ref(
+            FuncRef::Local(format!("{}_drop", name)),
+            closure_drop_function_type(),
+        );
+        builder.struct_value(vec![call, env_value, drop], ty.clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -412,6 +473,8 @@ impl<'a> LowerCtx<'a> {
         let body = &self.hir.bodies[body_id];
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
+        let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
+        let old_drop_slots = std::mem::take(&mut self.drop_slots);
         let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
         let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
         let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
@@ -431,13 +494,18 @@ impl<'a> LowerCtx<'a> {
         let is_unit = matches!(function.ret_type, Type::Unit | Type::Never);
         {
             let mut lambda_builder = Builder::new(&mut function);
+            self.drop_scopes.push(Vec::new());
             for (index, value) in param_values.iter().enumerate() {
                 let ty = call_signature.params[index + 1].clone();
+                let tc_ty =
+                    self.lower_hir_type_for_pattern(&params[index].ty, &self.generic_tc_subst);
+                let needs_drop = self.type_needs_drop(&tc_ty, 0);
                 let storage = if self.analysis.lambda_param_escapes(body_id, expr_id, index) {
-                    Some(lambda_builder.heap_alloc(ty))
+                    Some(lambda_builder.heap_alloc(ty.clone()))
                 } else if self
                     .analysis
                     .lambda_param_needs_address(body_id, expr_id, index)
+                    || needs_drop
                 {
                     Some(lambda_builder.alloca(ty))
                 } else {
@@ -452,6 +520,17 @@ impl<'a> LowerCtx<'a> {
                         },
                         storage,
                     );
+                }
+                if needs_drop {
+                    let place = storage.expect("Drop lambda parameter has storage");
+                    let source = CaptureSource::LambdaParam {
+                        lambda: expr_id,
+                        index,
+                    };
+                    let slots =
+                        self.create_drop_slots(&mut lambda_builder, place, &tc_ty, Vec::new());
+                    self.register_drop_slots(source, &slots);
+                    self.drop_scopes[0].splice(0..0, slots.into_iter().rev());
                 }
             }
             if !info.captures.is_empty() {
@@ -479,6 +558,10 @@ impl<'a> LowerCtx<'a> {
             }
             let result = self.lower_expr(&mut lambda_builder, &param_values, body, lambda_body);
             if lambda_builder.needs_return() {
+                self.emit_current_drop_scope(&mut lambda_builder);
+            }
+            self.drop_scopes.pop();
+            if lambda_builder.needs_return() {
                 lambda_builder.set_return((!is_unit).then_some(result));
             }
         }
@@ -486,6 +569,8 @@ impl<'a> LowerCtx<'a> {
 
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
+        self.drop_scopes = old_drop_scopes;
+        self.drop_slots = old_drop_slots;
         self.storage_bindings = old_storage_bindings;
         self.parameter_storage = old_parameter_storage;
         self.pattern_bindings = old_pattern_bindings;
@@ -493,6 +578,35 @@ impl<'a> LowerCtx<'a> {
         self.capture_access = old_capture_access;
         self.current_lambda = old_current_lambda;
         self.current_body = old_current_body;
+    }
+
+    fn lower_lambda_drop_function(
+        &mut self,
+        name: &str,
+        info: &LambdaInfo,
+        capture_types: &[Type],
+        env_struct: &StructType,
+    ) {
+        let mut function = Function::new(name.to_string(), Type::Unit);
+        let env = function.add_param("__env".into(), closure_env_type());
+        function.blocks[function.entry].start_value = function.next_value;
+        {
+            let mut builder = Builder::new(&mut function);
+            let env_ptr_ty = Type::Ptr(Box::new(Type::Struct(env_struct.clone())));
+            let env_ptr = builder.cast(CastOp::PtrToPtr, env, env_ptr_ty);
+            for (index, (capture, capture_ty)) in
+                info.captures.iter().zip(capture_types).enumerate()
+            {
+                if capture.mode == CaptureMode::Value && self.type_needs_drop(&capture.ty, 0) {
+                    let field = builder.field_ptr(env_ptr, index, capture_ty.clone());
+                    self.emit_drop_glue(&mut builder, field, &capture.ty);
+                }
+            }
+            if builder.needs_return() {
+                builder.set_return(None);
+            }
+        }
+        self.module.add_function(function);
     }
 
     fn capture_value(
@@ -641,7 +755,26 @@ impl<'a> LowerCtx<'a> {
 
         let call = builder.function_ref(FuncRef::Local(adapter), Type::FnPtr(signature));
         let env = self.null_env(builder);
-        builder.struct_value(vec![call, env], ty.clone())
+        let drop_name = self.ensure_noop_closure_drop();
+        let drop = builder.function_ref(FuncRef::Local(drop_name), closure_drop_function_type());
+        builder.struct_value(vec![call, env, drop], ty.clone())
+    }
+
+    fn ensure_noop_closure_drop(&mut self) -> String {
+        let name = "__riddle_closure_drop_noop".to_string();
+        if self
+            .module
+            .functions
+            .values()
+            .all(|function| function.name != name)
+        {
+            let mut function = Function::new(name.clone(), Type::Unit);
+            function.add_param("__env".into(), closure_env_type());
+            function.blocks[function.entry].start_value = function.next_value;
+            Builder::new(&mut function).set_return(None);
+            self.module.add_function(function);
+        }
+        name
     }
 
     // 表达式降级
@@ -689,27 +822,29 @@ impl<'a> LowerCtx<'a> {
 
             Expr::Path { path, resolved } => match resolved {
                 Some(ResolvedName::Local(stmt)) => {
-                    if let Some(access) = self
+                    let value = if let Some(access) = self
                         .capture_access
                         .get(&CaptureSource::Local(*stmt))
                         .cloned()
                     {
-                        return builder.load(access.place, access.ty);
-                    }
-                    let storage = self
-                        .scope_map
-                        .get(stmt)
-                        .copied()
-                        .unwrap_or_else(|| builder.unit_const());
-                    if self.storage_bindings.contains(stmt) {
-                        // mut binding: need to Load from storage to get current value
-                        builder.load(storage, mir_type.clone())
+                        builder.load(access.place, access.ty)
                     } else {
-                        storage
-                    }
+                        let storage = self
+                            .scope_map
+                            .get(stmt)
+                            .copied()
+                            .unwrap_or_else(|| builder.unit_const());
+                        if self.storage_bindings.contains(stmt) {
+                            builder.load(storage, mir_type.clone())
+                        } else {
+                            storage
+                        }
+                    };
+                    self.clear_drop_flags_if_moved(builder, body, expr_id);
+                    value
                 }
                 Some(ResolvedName::Param(idx)) => {
-                    if let Some(access) = self
+                    let value = if let Some(access) = self
                         .capture_access
                         .get(&CaptureSource::Param(*idx))
                         .cloned()
@@ -726,14 +861,16 @@ impl<'a> LowerCtx<'a> {
                             .get(*idx)
                             .copied()
                             .unwrap_or_else(|| builder.unit_const())
-                    }
+                    };
+                    self.clear_drop_flags_if_moved(builder, body, expr_id);
+                    value
                 }
                 Some(ResolvedName::LambdaParam { lambda, index }) => {
                     let source = CaptureSource::LambdaParam {
                         lambda: *lambda,
                         index: *index,
                     };
-                    if self.current_lambda == Some(*lambda) {
+                    let value = if self.current_lambda == Some(*lambda) {
                         self.parameter_storage
                             .get(&source)
                             .copied()
@@ -744,16 +881,20 @@ impl<'a> LowerCtx<'a> {
                         builder.load(access.place, access.ty)
                     } else {
                         builder.unit_const()
-                    }
+                    };
+                    self.clear_drop_flags_if_moved(builder, body, expr_id);
+                    value
                 }
                 Some(ResolvedName::PatternBinding(id)) => {
                     let source = CaptureSource::Pattern(*id);
-                    if let Some(access) = self.capture_access.get(&source).cloned() {
+                    let value = if let Some(access) = self.capture_access.get(&source).cloned() {
                         builder.load(access.place, access.ty)
                     } else {
                         self.pattern_binding_value(builder, *id)
                             .unwrap_or_else(|| builder.unit_const())
-                    }
+                    };
+                    self.clear_drop_flags_if_moved(builder, body, expr_id);
+                    value
                 }
                 Some(ResolvedName::Function(fid)) => {
                     self.lower_function_value(builder, *fid, &mir_type)
@@ -832,7 +973,45 @@ impl<'a> LowerCtx<'a> {
                     let lv = self.lower_lvalue(builder, param_values, body, *lhs);
                     return match op {
                         HirBinOp::Assign => {
+                            let lhs_ty = self
+                                .current_body
+                                .and_then(|body_id| {
+                                    self.type_result.expr_types.get(&(body_id, *lhs))
+                                })
+                                .cloned();
+                            let assignment_slots = self
+                                .drop_place_from_expr(body, *lhs)
+                                .and_then(|(source, projection)| {
+                                    self.drop_slots.get(&source).map(|slots| {
+                                        slots
+                                            .iter()
+                                            .filter(|slot| {
+                                                projection.is_empty()
+                                                    || slot
+                                                        .projection
+                                                        .starts_with(projection.as_slice())
+                                            })
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                    })
+                                })
+                                .unwrap_or_default();
+                            if let Some(ty) = lhs_ty.as_ref()
+                                && self.type_needs_drop(ty, 0)
+                            {
+                                if assignment_slots.is_empty() {
+                                    self.emit_drop_glue(builder, lv, ty);
+                                } else {
+                                    for slot in &assignment_slots {
+                                        self.emit_drop_slot(builder, slot);
+                                    }
+                                }
+                            }
                             builder.store(rv, lv);
+                            for slot in &assignment_slots {
+                                let active = builder.bconst(true);
+                                builder.store(active, slot.flag);
+                            }
                             builder.unit_const()
                         }
                         _ => {
@@ -941,6 +1120,7 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::Block { stmts, tail } => {
+                self.drop_scopes.push(Vec::new());
                 // 块：顺序执行语句，尾表达式返回值
                 for &stmt in stmts {
                     self.lower_stmt(builder, param_values, body, stmt);
@@ -948,14 +1128,19 @@ impl<'a> LowerCtx<'a> {
                         break;
                     }
                 }
-                if !builder.needs_return() {
+                let result = if !builder.needs_return() {
                     builder.unit_const()
                 } else {
                     match tail {
                         Some(tail_expr) => self.lower_expr(builder, param_values, body, *tail_expr),
                         None => builder.unit_const(),
                     }
+                };
+                if builder.needs_return() {
+                    self.emit_current_drop_scope(builder);
                 }
+                self.drop_scopes.pop();
+                result
             }
 
             Expr::If {
@@ -1024,6 +1209,7 @@ impl<'a> LowerCtx<'a> {
                 self.loop_targets.push(LoopTargets {
                     break_block: exit_block,
                     continue_block: cond_block,
+                    drop_depth: self.drop_scopes.len(),
                 });
                 self.lower_expr(builder, param_values, body, *while_body);
                 self.loop_targets.pop();
@@ -1236,14 +1422,21 @@ impl<'a> LowerCtx<'a> {
             Expr::FieldAccess { base, field } => {
                 let bv = self.lower_expr(builder, param_values, body, *base);
                 let field_idx = self.resolve_field_index(*base, field);
-                builder.extract_value(bv, field_idx, mir_type)
+                let value = builder.extract_value(bv, field_idx, mir_type);
+                self.clear_drop_flags_if_moved(builder, body, expr_id);
+                value
             }
 
             Expr::IndexAccess { base, index } => {
                 let base_val = self.lower_expr(builder, param_values, body, *base);
                 let index_val = self.lower_expr(builder, param_values, body, *index);
                 let ptr = builder.index_ptr(base_val, index_val, mir_type.clone());
-                builder.load(ptr, mir_type)
+                let value = builder.load(ptr, mir_type);
+                self.clear_drop_flags_if_moved(builder, body, expr_id);
+                self.clear_dynamic_index_drop_flags_if_moved(
+                    builder, body, expr_id, *base, *index, index_val,
+                );
+                value
             }
 
             Expr::Unsafe { body: body_expr } => {
@@ -1307,51 +1500,20 @@ impl<'a> LowerCtx<'a> {
             );
         }
 
-        let iterable_value = self.lower_expr(builder, param_values, body, iterable);
         if let Some((item_ty, len)) = self.array_iter_info(iterable) {
-            let index_ty = Type::Int(IntTy::I32);
-            let zero = builder.iconst(0, IntTy::I32);
-            let end = builder.iconst(len as u64, IntTy::I32);
-            let cursor = builder.alloca(index_ty.clone());
-            builder.store(zero, cursor);
-
-            let cond_block = builder.func.new_block_labeled("for_array_cond");
-            let body_block = builder.func.new_block_labeled("for_array_body");
-            let step_block = builder.func.new_block_labeled("for_array_step");
-            let exit_block = builder.func.new_block_labeled("for_array_exit");
-
-            builder.set_branch(cond_block);
-
-            builder.switch_to_block(cond_block);
-            let current = builder.load(cursor, index_ty.clone());
-            let keep_going = builder.cmp(CmpOp::Lt, current, end);
-            builder.set_cond_branch(keep_going, body_block, exit_block);
-
-            builder.switch_to_block(body_block);
-            let item_ptr = builder.index_ptr(iterable_value, current, item_ty.clone());
-            let item = builder.load(item_ptr, item_ty.clone());
-            self.push_pattern_binding(body, pat, item, item_ty);
-            self.loop_targets.push(LoopTargets {
-                break_block: exit_block,
-                continue_block: step_block,
-            });
-            self.lower_expr(builder, param_values, body, for_body);
-            self.loop_targets.pop();
-            self.pattern_bindings.pop();
-            if builder.needs_return() {
-                builder.set_branch(step_block);
-            }
-
-            builder.switch_to_block(step_block);
-            let one = builder.iconst(1, IntTy::I32);
-            let next = builder.binop(BinOp::Add, current, one, index_ty);
-            builder.store(next, cursor);
-            builder.set_branch(cond_block);
-
-            builder.switch_to_block(exit_block);
-            return builder.unit_const();
+            return self.lower_array_for_expr(
+                builder,
+                param_values,
+                body,
+                pat,
+                iterable,
+                for_body,
+                item_ty,
+                len,
+            );
         }
 
+        let iterable_value = self.lower_expr(builder, param_values, body, iterable);
         if !self.is_std_range_expr(iterable) {
             return builder.unit_const();
         }
@@ -1379,6 +1541,7 @@ impl<'a> LowerCtx<'a> {
         self.loop_targets.push(LoopTargets {
             break_block: exit_block,
             continue_block: step_block,
+            drop_depth: self.drop_scopes.len(),
         });
         self.lower_expr(builder, param_values, body, for_body);
         self.loop_targets.pop();
@@ -1394,6 +1557,98 @@ impl<'a> LowerCtx<'a> {
         builder.set_branch(cond_block);
 
         builder.switch_to_block(exit_block);
+        builder.unit_const()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_array_for_expr(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        pat: PatId,
+        iterable: ExprId,
+        for_body: ExprId,
+        item_ty: Type,
+        len: usize,
+    ) -> Value {
+        let body_id = self.current_body.expect("for loop outside a function body");
+        let item_tc_ty = match self
+            .type_result
+            .expr_types
+            .get(&(body_id, iterable))
+            .map(|ty| self.substitute_tc_type(ty))
+        {
+            Some(type_checker::Type::Array(item, _)) => *item,
+            _ => type_checker::Type::Unknown,
+        };
+        let array_tc_ty = type_checker::Type::Array(
+            Box::new(item_tc_ty.clone()),
+            type_checker::ConstArg::Value(len),
+        );
+        let array_ty = Type::Array(Box::new(item_ty.clone()), len);
+        let iterable_value = self.lower_expr(builder, param_values, body, iterable);
+        let iterable_place = builder.alloca(array_ty);
+        builder.store(iterable_value, iterable_place);
+
+        let owner_slots = self.create_drop_slots(builder, iterable_place, &array_tc_ty, Vec::new());
+        self.drop_scopes
+            .push(owner_slots.iter().cloned().rev().collect());
+
+        let index_ty = Type::Int(IntTy::I32);
+        let zero = builder.iconst(0, IntTy::I32);
+        let end = builder.iconst(len as u64, IntTy::I32);
+        let cursor = builder.alloca(index_ty.clone());
+        builder.store(zero, cursor);
+
+        let cond_block = builder.func.new_block_labeled("for_array_cond");
+        let body_block = builder.func.new_block_labeled("for_array_body");
+        let step_block = builder.func.new_block_labeled("for_array_step");
+        let exit_block = builder.func.new_block_labeled("for_array_exit");
+
+        builder.set_branch(cond_block);
+
+        builder.switch_to_block(cond_block);
+        let current = builder.load(cursor, index_ty.clone());
+        let keep_going = builder.cmp(CmpOp::Lt, current, end);
+        builder.set_cond_branch(keep_going, body_block, exit_block);
+
+        builder.switch_to_block(body_block);
+        let item_ptr = builder.index_ptr(iterable_place, current, item_ty.clone());
+        let item = builder.load(item_ptr, item_ty.clone());
+        self.clear_indexed_drop_slots(builder, &owner_slots, current, IntTy::I32);
+        let item_place = self.type_needs_drop(&item_tc_ty, 0).then(|| {
+            let place = builder.alloca(item_ty.clone());
+            builder.store(item, place);
+            place
+        });
+        self.push_match_pattern_bindings(builder, body, pat, item, item_place, &item_tc_ty);
+        let pattern_sources =
+            self.push_pattern_drop_scope(builder, body, pat, item_place, &item_tc_ty, true);
+        let item_drop_depth = self.drop_scopes.len() - 1;
+        self.loop_targets.push(LoopTargets {
+            break_block: exit_block,
+            continue_block: step_block,
+            drop_depth: item_drop_depth,
+        });
+        self.lower_expr(builder, param_values, body, for_body);
+        self.loop_targets.pop();
+        if builder.needs_return() {
+            self.emit_current_drop_scope(builder);
+            builder.set_branch(step_block);
+        }
+        self.pop_pattern_drop_scope(pattern_sources);
+        self.pattern_bindings.pop();
+
+        builder.switch_to_block(step_block);
+        let one = builder.iconst(1, IntTy::I32);
+        let next = builder.binop(BinOp::Add, current, one, index_ty);
+        builder.store(next, cursor);
+        builder.set_branch(cond_block);
+
+        builder.switch_to_block(exit_block);
+        self.emit_current_drop_scope(builder);
+        self.drop_scopes.pop();
         builder.unit_const()
     }
 
@@ -1448,6 +1703,17 @@ impl<'a> LowerCtx<'a> {
         );
         let iter_slot = builder.alloca(iter_ty.clone());
         builder.store(iter_value, iter_slot);
+        let iter_owner_slots = self.create_drop_slots(builder, iter_slot, &iter_tc_ty, Vec::new());
+        self.drop_scopes
+            .push(iter_owner_slots.iter().cloned().rev().collect());
+        // ponytail: array IntoIterator is sequential; add ManuallyDrop-like storage before
+        // permitting custom array iterators that yield elements out of order.
+        let array_cursor = matches!(iterable_ty, type_checker::Type::Array(..)).then(|| {
+            let cursor = builder.alloca(Type::Int(IntTy::Usize));
+            let zero = builder.iconst(0, IntTy::Usize);
+            builder.store(zero, cursor);
+            cursor
+        });
 
         let cond_block = builder.func.new_block_labeled("for_iter_cond");
         let body_block = builder.func.new_block_labeled("for_iter_body");
@@ -1493,19 +1759,39 @@ impl<'a> LowerCtx<'a> {
         let payload_index =
             1 + self.enum_payload_offset(&self.hir.item_tree.enums[option_id], info.some_variant);
         let item = builder.extract_value(next_value, payload_index, item_ty.clone());
-        self.push_pattern_binding(body, pat, item, item_ty);
+        if let Some(cursor) = array_cursor {
+            let current = builder.load(cursor, Type::Int(IntTy::Usize));
+            self.clear_indexed_drop_slots(builder, &iter_owner_slots, current, IntTy::Usize);
+            let one = builder.iconst(1, IntTy::Usize);
+            let next = builder.binop(BinOp::Add, current, one, Type::Int(IntTy::Usize));
+            builder.store(next, cursor);
+        }
+        let item_place = self.type_needs_drop(&info.item_ty, 0).then(|| {
+            let place = builder.alloca(item_ty.clone());
+            builder.store(item, place);
+            place
+        });
+        self.push_match_pattern_bindings(builder, body, pat, item, item_place, &info.item_ty);
+        let pattern_sources =
+            self.push_pattern_drop_scope(builder, body, pat, item_place, &info.item_ty, true);
+        let item_drop_depth = self.drop_scopes.len() - 1;
         self.loop_targets.push(LoopTargets {
             break_block: exit_block,
             continue_block: cond_block,
+            drop_depth: item_drop_depth,
         });
         self.lower_expr(builder, param_values, body, for_body);
         self.loop_targets.pop();
-        self.pattern_bindings.pop();
         if builder.needs_return() {
+            self.emit_current_drop_scope(builder);
             builder.set_branch(cond_block);
         }
+        self.pop_pattern_drop_scope(pattern_sources);
+        self.pattern_bindings.pop();
 
         builder.switch_to_block(exit_block);
+        self.emit_current_drop_scope(builder);
+        self.drop_scopes.pop();
         builder.unit_const()
     }
 
@@ -1524,6 +1810,12 @@ impl<'a> LowerCtx<'a> {
             .and_then(|body_id| self.type_result.expr_types.get(&(body_id, scrutinee)))
             .cloned()
             .unwrap_or(type_checker::Type::Unknown);
+        let scrutinee_place = self.type_needs_drop(&scrutinee_ty, 0).then(|| {
+            let place = builder.alloca(self.convert_type(&scrutinee_ty));
+            builder.store(scrutinee_value, place);
+            place
+        });
+        let scrutinee_source = self.drop_place_from_expr(body, scrutinee);
         let merge_block = builder.func.new_block_labeled("match_merge");
         let mut next_test = builder.current_block;
         let mut phi_args = Vec::new();
@@ -1549,6 +1841,7 @@ impl<'a> LowerCtx<'a> {
                 body,
                 arm.pat,
                 scrutinee_value,
+                scrutinee_place,
                 &scrutinee_ty,
             );
 
@@ -1559,13 +1852,27 @@ impl<'a> LowerCtx<'a> {
                 builder.switch_to_block(guarded_body);
             }
 
+            if let Some((source, projection)) = &scrutinee_source {
+                self.transfer_pattern_drop_flags(builder, source, projection);
+            }
+
+            let pattern_sources = self.push_pattern_drop_scope(
+                builder,
+                body,
+                arm.pat,
+                scrutinee_place,
+                &scrutinee_ty,
+                scrutinee_source.is_none() || matches!(scrutinee_ty, type_checker::Type::Enum(..)),
+            );
             let arm_value = self.lower_expr(builder, param_values, body, arm.body);
-            self.pattern_bindings.pop();
-            let arm_exit = builder.current_block;
             if builder.needs_return() {
+                self.emit_current_drop_scope(builder);
+                let arm_exit = builder.current_block;
                 builder.set_branch(merge_block);
                 phi_args.push((arm_value, arm_exit));
             }
+            self.pop_pattern_drop_scope(pattern_sources);
+            self.pattern_bindings.pop();
             next_test = miss_block;
         }
 
@@ -1796,20 +2103,33 @@ impl<'a> LowerCtx<'a> {
         body: &Body,
         pat: PatId,
         value: Value,
+        place: Option<Value>,
         value_ty: &type_checker::Type,
     ) {
         let mut scope = HashMap::new();
-        self.collect_match_pattern_bindings(builder, body, pat, value, value_ty, &mut scope);
+        self.collect_match_pattern_bindings(
+            builder,
+            body,
+            pat,
+            value,
+            place,
+            value_ty,
+            Vec::new(),
+            &mut scope,
+        );
         self.pattern_bindings.push(scope);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_match_pattern_bindings(
         &mut self,
         builder: &mut Builder,
         body: &Body,
         pat: PatId,
         value: Value,
+        place: Option<Value>,
         value_ty: &type_checker::Type,
+        projection: Vec<DropProjection>,
         scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
     ) {
         match body.pats[pat].clone() {
@@ -1823,7 +2143,13 @@ impl<'a> LowerCtx<'a> {
                             pattern: pat,
                             field: None,
                         },
-                        PatternBindingValue::direct(value, self.convert_type(value_ty)),
+                        PatternBindingValue::direct(
+                            value,
+                            self.convert_type(value_ty),
+                            value_ty.clone(),
+                            place,
+                            projection,
+                        ),
                     );
                 }
             }
@@ -1837,12 +2163,18 @@ impl<'a> LowerCtx<'a> {
                     };
                     let child_value =
                         builder.extract_value(value, index, self.convert_type(child_ty));
+                    let child_place = place
+                        .map(|place| builder.field_ptr(place, index, self.convert_type(child_ty)));
+                    let mut child_projection = projection.clone();
+                    child_projection.push(DropProjection::Field(index));
                     self.collect_match_pattern_bindings(
                         builder,
                         body,
                         child,
                         child_value,
+                        child_place,
                         child_ty,
+                        child_projection,
                         scope,
                     );
                 }
@@ -1869,12 +2201,20 @@ impl<'a> LowerCtx<'a> {
                         1 + offset + index,
                         self.convert_type(child_ty),
                     );
+                    let field_index = 1 + offset + index;
+                    let child_place = place.map(|place| {
+                        builder.field_ptr(place, field_index, self.convert_type(child_ty))
+                    });
+                    let mut child_projection = projection.clone();
+                    child_projection.push(DropProjection::Field(field_index));
                     self.collect_match_pattern_bindings(
                         builder,
                         body,
                         child,
                         child_value,
+                        child_place,
                         child_ty,
+                        child_projection,
                         scope,
                     );
                 }
@@ -1892,13 +2232,20 @@ impl<'a> LowerCtx<'a> {
                         };
                         let child_value =
                             builder.extract_value(value, index, self.convert_type(child_ty));
+                        let child_place = place.map(|place| {
+                            builder.field_ptr(place, index, self.convert_type(child_ty))
+                        });
+                        let mut child_projection = projection.clone();
+                        child_projection.push(DropProjection::Field(index));
                         if let Some(child) = field.pat {
                             self.collect_match_pattern_bindings(
                                 builder,
                                 body,
                                 child,
                                 child_value,
+                                child_place,
                                 child_ty,
+                                child_projection,
                                 scope,
                             );
                         } else {
@@ -1910,6 +2257,9 @@ impl<'a> LowerCtx<'a> {
                                 PatternBindingValue::direct(
                                     child_value,
                                     self.convert_type(child_ty),
+                                    child_ty.clone(),
+                                    child_place,
+                                    child_projection,
                                 ),
                             );
                         }
@@ -1941,13 +2291,21 @@ impl<'a> LowerCtx<'a> {
                         1 + offset + index,
                         self.convert_type(child_ty),
                     );
+                    let field_index = 1 + offset + index;
+                    let child_place = place.map(|place| {
+                        builder.field_ptr(place, field_index, self.convert_type(child_ty))
+                    });
+                    let mut child_projection = projection.clone();
+                    child_projection.push(DropProjection::Field(field_index));
                     if let Some(child) = field.pat {
                         self.collect_match_pattern_bindings(
                             builder,
                             body,
                             child,
                             child_value,
+                            child_place,
                             child_ty,
+                            child_projection,
                             scope,
                         );
                     } else {
@@ -1956,13 +2314,157 @@ impl<'a> LowerCtx<'a> {
                                 pattern: pat,
                                 field: Some(binding_index),
                             },
-                            PatternBindingValue::direct(child_value, self.convert_type(child_ty)),
+                            PatternBindingValue::direct(
+                                child_value,
+                                self.convert_type(child_ty),
+                                child_ty.clone(),
+                                child_place,
+                                child_projection,
+                            ),
                         );
                     }
                 }
             }
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
         }
+    }
+
+    fn push_pattern_drop_scope(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        pat: PatId,
+        place: Option<Value>,
+        value_ty: &type_checker::Type,
+        owns_whole_value: bool,
+    ) -> Vec<CaptureSource> {
+        let mut slots = place
+            .map(|place| self.create_pattern_owner_slots(builder, body, pat, place, value_ty))
+            .unwrap_or_default();
+        if !owns_whole_value {
+            let moved = self.moved_pattern_projections();
+            slots.retain(|slot| {
+                moved.iter().any(|projection| {
+                    slot.projection.starts_with(projection)
+                        || projection.starts_with(&slot.projection)
+                })
+            });
+        }
+        let mut sources = Vec::new();
+        if let Some(bindings) = self.pattern_bindings.last() {
+            for (id, binding) in bindings {
+                if !self.type_needs_drop(&binding.tc_ty, 0) {
+                    continue;
+                }
+                let binding_slots = slots
+                    .iter()
+                    .filter(|slot| slot.projection.starts_with(&binding.projection))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !binding_slots.is_empty() {
+                    let source = CaptureSource::Pattern(*id);
+                    self.drop_slots.insert(source.clone(), binding_slots);
+                    sources.push(source);
+                }
+            }
+        }
+        self.drop_scopes
+            .push(slots.into_iter().rev().collect::<Vec<_>>());
+        sources
+    }
+
+    fn moved_pattern_projections(&self) -> Vec<Vec<DropProjection>> {
+        self.pattern_bindings
+            .last()
+            .into_iter()
+            .flat_map(|bindings| bindings.values())
+            .filter(|binding| !self.type_result.trait_env.type_is_copy(&binding.tc_ty))
+            .map(|binding| binding.projection.clone())
+            .collect()
+    }
+
+    fn transfer_pattern_drop_flags(
+        &self,
+        builder: &mut Builder,
+        source: &CaptureSource,
+        base_projection: &[DropProjection],
+    ) {
+        let moved = self.moved_pattern_projections();
+        let flags = self
+            .drop_slots
+            .get(source)
+            .into_iter()
+            .flatten()
+            .filter(|slot| {
+                moved.iter().any(|projection| {
+                    let mut full = base_projection.to_vec();
+                    full.extend(projection.iter().cloned());
+                    slot.projection.starts_with(&full) || full.starts_with(&slot.projection)
+                })
+            })
+            .map(|slot| slot.flag)
+            .collect::<HashSet<_>>();
+        for flag in flags {
+            let inactive = builder.bconst(false);
+            builder.store(inactive, flag);
+        }
+    }
+
+    fn pop_pattern_drop_scope(&mut self, sources: Vec<CaptureSource>) {
+        self.drop_scopes.pop();
+        for source in sources {
+            self.drop_slots.remove(&source);
+        }
+    }
+
+    fn create_pattern_owner_slots(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        pat: PatId,
+        place: Value,
+        value_ty: &type_checker::Type,
+    ) -> Vec<DropSlot> {
+        let value_ty = self.substitute_tc_type(value_ty);
+        if self.type_result.trait_env.type_has_explicit_drop(&value_ty) {
+            return self.create_drop_slots(builder, place, &value_ty, Vec::new());
+        }
+        let variant = match &body.pats[pat] {
+            Pattern::TupleStruct { path, .. } | Pattern::Struct { path, .. } => {
+                path.segments.last().and_then(|name| {
+                    match self.classify_type_pattern(&value_ty, Some(&name.0)) {
+                        TypePattern::EnumVariant {
+                            enum_id,
+                            variant_index,
+                            args,
+                        } => Some((enum_id, variant_index, args)),
+                        TypePattern::Other => None,
+                    }
+                })
+            }
+            _ => None,
+        };
+        let Some((enum_id, variant_index, args)) = variant else {
+            return self.create_drop_slots(builder, place, &value_ty, Vec::new());
+        };
+
+        let fields = self.enum_variant_payload_types(enum_id, &args, variant_index);
+        let offset = self.enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
+        let mut slots = Vec::new();
+        for (index, (_, field_ty)) in fields.into_iter().enumerate() {
+            if !self.type_needs_drop(&field_ty, 0) {
+                continue;
+            }
+            let field_index = 1 + offset + index;
+            let field_place = builder.field_ptr(place, field_index, self.convert_type(&field_ty));
+            slots.extend(self.create_drop_slots(
+                builder,
+                field_place,
+                &field_ty,
+                vec![DropProjection::Field(field_index)],
+            ));
+        }
+        slots
     }
 
     fn classify_type_pattern(
@@ -2239,7 +2741,13 @@ impl<'a> LowerCtx<'a> {
                     pattern: pat,
                     field: None,
                 },
-                PatternBindingValue::direct(value, ty),
+                PatternBindingValue::direct(
+                    value,
+                    ty,
+                    type_checker::Type::Int(type_checker::IntTy::I32),
+                    None,
+                    Vec::new(),
+                ),
             );
         }
         self.pattern_bindings.push(scope);
@@ -2828,6 +3336,14 @@ impl<'a> LowerCtx<'a> {
             Stmt::Let {
                 init, ty, is_mut, ..
             } => {
+                let inferred_ty = init.and_then(|init_expr| {
+                    self.current_body
+                        .and_then(|bid| self.type_result.expr_types.get(&(bid, init_expr)))
+                        .cloned()
+                });
+                let needs_drop = inferred_ty
+                    .as_ref()
+                    .is_some_and(|ty| self.type_needs_drop(ty, 0));
                 let escapes = self
                     .current_body
                     .map(|bid| self.analysis.escapes(bid, stmt_id))
@@ -2853,7 +3369,7 @@ impl<'a> LowerCtx<'a> {
                     }
                     self.storage_bindings.insert(stmt_id);
                     ptr
-                } else if *is_mut || needs_address {
+                } else if *is_mut || needs_address || needs_drop {
                     // Mutable and captured-by-reference bindings need stable stack storage.
                     let alloc_ty = init
                         .and_then(|init_expr| {
@@ -2875,26 +3391,42 @@ impl<'a> LowerCtx<'a> {
                     builder.unit_const()
                 };
                 self.scope_map.insert(stmt_id, val);
+                if needs_drop && init.is_some() {
+                    let source = CaptureSource::Local(stmt_id);
+                    let slots = self.create_drop_slots(
+                        builder,
+                        val,
+                        &inferred_ty.expect("initialized Drop local has an inferred type"),
+                        Vec::new(),
+                    );
+                    self.register_drop_slots(source, &slots);
+                    if let Some(scope) = self.drop_scopes.last_mut() {
+                        scope.extend(slots.into_iter().rev());
+                    }
+                }
             }
             Stmt::Expr { expr } => {
                 self.lower_expr(builder, param_values, body, *expr);
             }
             Stmt::Return { value } => {
                 let rv = value.map(|v| self.lower_expr(builder, param_values, body, v));
+                self.emit_drop_scopes_since(builder, 0);
                 builder.set_return(rv);
             }
             Stmt::Break => {
-                let target = self
+                let target = *self
                     .loop_targets
                     .last()
                     .expect("break statement outside a checked loop");
+                self.emit_drop_scopes_since(builder, target.drop_depth);
                 builder.set_branch(target.break_block);
             }
             Stmt::Continue => {
-                let target = self
+                let target = *self
                     .loop_targets
                     .last()
                     .expect("continue statement outside a checked loop");
+                self.emit_drop_scopes_since(builder, target.drop_depth);
                 builder.set_branch(target.continue_block);
             }
             Stmt::Item { .. } => {}
@@ -2957,6 +3489,465 @@ impl<'a> LowerCtx<'a> {
                 .cloned()
                 .unwrap_or_else(|| ty.clone()),
             _ => ty.clone(),
+        }
+    }
+
+    fn emit_current_drop_scope(&mut self, builder: &mut Builder) {
+        if let Some(depth) = self.drop_scopes.len().checked_sub(1) {
+            self.emit_drop_scopes_since(builder, depth);
+        }
+    }
+
+    fn create_drop_slots(
+        &self,
+        builder: &mut Builder,
+        place: Value,
+        ty: &type_checker::Type,
+        projection: Vec<DropProjection>,
+    ) -> Vec<DropSlot> {
+        let ty = self.substitute_tc_type(ty);
+        if self.type_result.trait_env.type_has_explicit_drop(&ty)
+            || matches!(ty, type_checker::Type::Enum(..))
+            || matches!(
+                ty,
+                type_checker::Type::Function(_) | type_checker::Type::Fn { .. }
+            )
+        {
+            let flag = builder.alloca(Type::Bool);
+            let active = builder.bconst(true);
+            builder.store(active, flag);
+            return vec![DropSlot {
+                place,
+                flag,
+                ty,
+                projection,
+            }];
+        }
+
+        let mut slots = Vec::new();
+        match &ty {
+            type_checker::Type::Struct(id, args) => {
+                for (index, field_ty) in self.struct_field_types(*id, args).into_iter().enumerate()
+                {
+                    if self.type_needs_drop(&field_ty, 0) {
+                        let field = builder.field_ptr(place, index, self.convert_type(&field_ty));
+                        let mut field_projection = projection.clone();
+                        field_projection.push(DropProjection::Field(index));
+                        slots.extend(self.create_drop_slots(
+                            builder,
+                            field,
+                            &field_ty,
+                            field_projection,
+                        ));
+                    }
+                }
+            }
+            type_checker::Type::Tuple(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    if self.type_needs_drop(item, 0) {
+                        let field = builder.field_ptr(place, index, self.convert_type(item));
+                        let mut field_projection = projection.clone();
+                        field_projection.push(DropProjection::Field(index));
+                        slots.extend(self.create_drop_slots(
+                            builder,
+                            field,
+                            item,
+                            field_projection,
+                        ));
+                    }
+                }
+            }
+            type_checker::Type::Array(item, type_checker::ConstArg::Value(len)) => {
+                for index in 0..*len {
+                    let index_value = builder.iconst(index as u64, IntTy::Usize);
+                    let item_place = builder.index_ptr(place, index_value, self.convert_type(item));
+                    let mut item_projection = projection.clone();
+                    item_projection.push(DropProjection::Index(index));
+                    slots.extend(self.create_drop_slots(
+                        builder,
+                        item_place,
+                        item,
+                        item_projection,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        slots
+    }
+
+    fn register_drop_slots(&mut self, source: CaptureSource, slots: &[DropSlot]) {
+        self.drop_slots.insert(source, slots.to_vec());
+    }
+
+    fn emit_drop_scopes_since(&mut self, builder: &mut Builder, depth: usize) {
+        let scopes = self.drop_scopes[depth..].to_vec();
+        for scope in scopes.into_iter().rev() {
+            for slot in scope.into_iter().rev() {
+                self.emit_drop_slot(builder, &slot);
+            }
+        }
+    }
+
+    fn emit_drop_slot(&mut self, builder: &mut Builder, slot: &DropSlot) {
+        let ty = self.substitute_tc_type(&slot.ty);
+        let drop_block = builder.func.new_block_labeled("drop");
+        let continue_block = builder.func.new_block_labeled("drop_continue");
+        let active = builder.load(slot.flag, Type::Bool);
+        builder.set_cond_branch(active, drop_block, continue_block);
+        builder.switch_to_block(drop_block);
+        self.emit_drop_glue(builder, slot.place, &ty);
+        builder.set_branch(continue_block);
+        builder.switch_to_block(continue_block);
+    }
+
+    fn emit_drop_glue(&mut self, builder: &mut Builder, place: Value, ty: &type_checker::Type) {
+        let ty = self.substitute_tc_type(ty);
+        if matches!(
+            ty,
+            type_checker::Type::Function(_) | type_checker::Type::Fn { .. }
+        ) {
+            let closure = builder.load(place, self.convert_type(&ty));
+            let env = builder.extract_value(closure, 1, closure_env_type());
+            let drop = builder.extract_value(closure, 2, closure_drop_function_type());
+            builder.call_indirect(drop, vec![env], Type::Unit);
+            return;
+        }
+        if let Some(trait_id) = self
+            .type_result
+            .trait_env
+            .lang_items
+            .get(type_checker::lang_items::LangItem::Drop)
+            && let Some(function) = self.find_trait_impl_method(trait_id, "drop", &ty, None)
+        {
+            let mir_ty = self.convert_type(&ty);
+            let receiver = builder.unop(UnOp::MutRef, place, Type::Ref(Box::new(mir_ty), true));
+            builder.call(
+                FuncRef::Local(self.function_name(function)),
+                vec![receiver],
+                Type::Unit,
+            );
+        }
+
+        let fields = match &ty {
+            type_checker::Type::Struct(id, args) => self.struct_field_types(*id, args),
+            type_checker::Type::Tuple(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        for (index, field_ty) in fields.into_iter().enumerate() {
+            if self.type_needs_drop(&field_ty, 0) {
+                let field = builder.field_ptr(place, index, self.convert_type(&field_ty));
+                self.emit_drop_glue(builder, field, &field_ty);
+            }
+        }
+
+        if let type_checker::Type::Array(item, type_checker::ConstArg::Value(len)) = &ty
+            && self.type_needs_drop(item, 0)
+        {
+            for index in 0..*len {
+                let index = builder.iconst(index as u64, IntTy::Usize);
+                let item_place = builder.index_ptr(place, index, self.convert_type(item));
+                self.emit_drop_glue(builder, item_place, item);
+            }
+        }
+
+        if let type_checker::Type::Enum(id, args) = &ty {
+            let variants = self.enum_variant_field_types(*id, args);
+            let active = variants
+                .iter()
+                .enumerate()
+                .filter(|(_, fields)| fields.iter().any(|field| self.type_needs_drop(field, 0)))
+                .map(|(index, fields)| (index, fields.clone()))
+                .collect::<Vec<_>>();
+            if !active.is_empty() {
+                let tag_place = builder.field_ptr(place, 0, Type::Int(IntTy::U32));
+                let tag = builder.load(tag_place, Type::Int(IntTy::U32));
+                let done = builder.func.new_block_labeled("enum_drop_done");
+                for (position, (variant, fields)) in active.iter().enumerate() {
+                    let drop_variant = builder.func.new_block_labeled("enum_drop_variant");
+                    let next = if position + 1 == active.len() {
+                        done
+                    } else {
+                        builder.func.new_block_labeled("enum_drop_next")
+                    };
+                    let expected = builder.iconst(*variant as u64, IntTy::U32);
+                    let matches = builder.cmp(CmpOp::Eq, tag, expected);
+                    builder.set_cond_branch(matches, drop_variant, next);
+
+                    builder.switch_to_block(drop_variant);
+                    let offset = 1 + variants[..*variant].iter().map(Vec::len).sum::<usize>();
+                    for (field_index, field_ty) in fields.iter().enumerate() {
+                        if self.type_needs_drop(field_ty, 0) {
+                            let field = builder.field_ptr(
+                                place,
+                                offset + field_index,
+                                self.convert_type(field_ty),
+                            );
+                            self.emit_drop_glue(builder, field, field_ty);
+                        }
+                    }
+                    builder.set_branch(done);
+                    if next != done {
+                        builder.switch_to_block(next);
+                    }
+                }
+                builder.switch_to_block(done);
+            }
+        }
+    }
+
+    fn type_needs_drop(&self, ty: &type_checker::Type, depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        if self.type_result.trait_env.type_has_explicit_drop(ty)
+            || matches!(
+                ty,
+                type_checker::Type::Function(_) | type_checker::Type::Fn { .. }
+            )
+        {
+            return true;
+        }
+        match ty {
+            type_checker::Type::Struct(id, args) => self
+                .struct_field_types(*id, args)
+                .iter()
+                .any(|field| self.type_needs_drop(field, depth + 1)),
+            type_checker::Type::Enum(id, args) => self
+                .enum_variant_field_types(*id, args)
+                .iter()
+                .flatten()
+                .any(|field| self.type_needs_drop(field, depth + 1)),
+            type_checker::Type::Tuple(items) => items
+                .iter()
+                .any(|item| self.type_needs_drop(item, depth + 1)),
+            type_checker::Type::Array(item, _) => self.type_needs_drop(item, depth + 1),
+            _ => false,
+        }
+    }
+
+    fn struct_field_types(
+        &self,
+        id: hir::item_tree::StructId,
+        args: &[type_checker::Type],
+    ) -> Vec<type_checker::Type> {
+        let item = &self.hir.item_tree.structs[id];
+        let subst = item
+            .generics
+            .iter()
+            .chain(item.const_generics.iter())
+            .zip(args)
+            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .collect();
+        item.fields
+            .iter()
+            .map(|field| self.lower_hir_type_for_pattern(&field.ty, &subst))
+            .collect()
+    }
+
+    fn enum_variant_field_types(
+        &self,
+        id: hir::item_tree::EnumId,
+        args: &[type_checker::Type],
+    ) -> Vec<Vec<type_checker::Type>> {
+        let item = &self.hir.item_tree.enums[id];
+        let subst = item
+            .generics
+            .iter()
+            .chain(item.const_generics.iter())
+            .zip(args)
+            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .collect();
+        item.variants
+            .iter()
+            .map(|variant| match &variant.kind {
+                hir::item_tree::HirVariantKind::Unit => Vec::new(),
+                hir::item_tree::HirVariantKind::Tuple(fields) => fields
+                    .iter()
+                    .map(|field| self.lower_hir_type_for_pattern(field, &subst))
+                    .collect(),
+                hir::item_tree::HirVariantKind::Struct(fields) => fields
+                    .iter()
+                    .map(|field| self.lower_hir_type_for_pattern(&field.ty, &subst))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn clear_drop_flags_if_moved(&self, builder: &mut Builder, body: &Body, expr_id: ExprId) {
+        let Some(body_id) = self.current_body else {
+            return;
+        };
+        if !self.moved_exprs.contains(&(body_id, expr_id)) {
+            return;
+        }
+        let Some((source, projection)) = self.drop_place_from_expr(body, expr_id) else {
+            return;
+        };
+        let flags = self
+            .drop_slots
+            .get(&source)
+            .into_iter()
+            .flatten()
+            .filter(|slot| {
+                projection.is_empty() || slot.projection.starts_with(projection.as_slice())
+            })
+            .map(|slot| slot.flag)
+            .collect::<HashSet<_>>();
+        for flag in flags {
+            let inactive = builder.bconst(false);
+            builder.store(inactive, flag);
+        }
+    }
+
+    fn clear_drop_slots_for_source(&self, builder: &mut Builder, source: &CaptureSource) {
+        let flags = self
+            .drop_slots
+            .get(source)
+            .into_iter()
+            .flatten()
+            .map(|slot| slot.flag)
+            .collect::<HashSet<_>>();
+        for flag in flags {
+            let inactive = builder.bconst(false);
+            builder.store(inactive, flag);
+        }
+    }
+
+    fn drop_place_from_expr(
+        &self,
+        body: &Body,
+        expr_id: ExprId,
+    ) -> Option<(CaptureSource, Vec<DropProjection>)> {
+        match &body.exprs[expr_id] {
+            Expr::Path {
+                resolved: Some(ResolvedName::Local(stmt)),
+                ..
+            } => Some((CaptureSource::Local(*stmt), Vec::new())),
+            Expr::Path {
+                resolved: Some(ResolvedName::Param(index)),
+                ..
+            } => Some((CaptureSource::Param(*index), Vec::new())),
+            Expr::Path {
+                resolved: Some(ResolvedName::LambdaParam { lambda, index }),
+                ..
+            } => Some((
+                CaptureSource::LambdaParam {
+                    lambda: *lambda,
+                    index: *index,
+                },
+                Vec::new(),
+            )),
+            Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                ..
+            } => Some((CaptureSource::Pattern(*id), Vec::new())),
+            Expr::FieldAccess { base, field } => {
+                let (source, mut projection) = self.drop_place_from_expr(body, *base)?;
+                projection.push(DropProjection::Field(
+                    self.resolve_field_index(*base, field),
+                ));
+                Some((source, projection))
+            }
+            Expr::IndexAccess { base, index } => {
+                let Expr::IntLiteral { value, .. } = body.exprs[*index] else {
+                    return None;
+                };
+                let (source, mut projection) = self.drop_place_from_expr(body, *base)?;
+                projection.push(DropProjection::Index(value as usize));
+                Some((source, projection))
+            }
+            _ => None,
+        }
+    }
+
+    fn clear_dynamic_index_drop_flags_if_moved(
+        &self,
+        builder: &mut Builder,
+        body: &Body,
+        expr_id: ExprId,
+        base: ExprId,
+        index: ExprId,
+        index_value: Value,
+    ) {
+        let Some(body_id) = self.current_body else {
+            return;
+        };
+        if !self.moved_exprs.contains(&(body_id, expr_id))
+            || matches!(body.exprs[index], Expr::IntLiteral { .. })
+        {
+            return;
+        }
+        let Some((source, projection)) = self.drop_place_from_expr(body, base) else {
+            return;
+        };
+        let mut flags_by_index = BTreeMap::<usize, HashSet<Value>>::new();
+        for slot in self.drop_slots.get(&source).into_iter().flatten() {
+            if slot.projection.starts_with(projection.as_slice())
+                && let Some(DropProjection::Index(item)) = slot.projection.get(projection.len())
+            {
+                flags_by_index.entry(*item).or_default().insert(slot.flag);
+            }
+        }
+        let index_ty = self
+            .type_result
+            .expr_types
+            .get(&(body_id, index))
+            .map(|ty| self.convert_type(ty))
+            .and_then(|ty| match ty {
+                Type::Int(width) => Some(width),
+                _ => None,
+            })
+            .unwrap_or(IntTy::Usize);
+        for (item, flags) in flags_by_index {
+            let clear = builder.func.new_block_labeled("move_array_element");
+            let next = builder.func.new_block_labeled("move_array_continue");
+            let expected = builder.iconst(item as u64, index_ty);
+            let matches = builder.cmp(CmpOp::Eq, index_value, expected);
+            builder.set_cond_branch(matches, clear, next);
+            builder.switch_to_block(clear);
+            for flag in flags {
+                let inactive = builder.bconst(false);
+                builder.store(inactive, flag);
+            }
+            builder.set_branch(next);
+            builder.switch_to_block(next);
+        }
+    }
+
+    fn clear_indexed_drop_slots(
+        &self,
+        builder: &mut Builder,
+        slots: &[DropSlot],
+        index_value: Value,
+        index_ty: IntTy,
+    ) {
+        let mut flags_by_index = BTreeMap::<usize, HashSet<Value>>::new();
+        for slot in slots {
+            if let Some(index) = slot
+                .projection
+                .iter()
+                .find_map(|projection| match projection {
+                    DropProjection::Index(index) => Some(*index),
+                    DropProjection::Field(_) => None,
+                })
+            {
+                flags_by_index.entry(index).or_default().insert(slot.flag);
+            }
+        }
+        for (index, flags) in flags_by_index {
+            let clear = builder.func.new_block_labeled("move_array_element");
+            let next = builder.func.new_block_labeled("move_array_continue");
+            let expected = builder.iconst(index as u64, index_ty);
+            let matches = builder.cmp(CmpOp::Eq, index_value, expected);
+            builder.set_cond_branch(matches, clear, next);
+            builder.switch_to_block(clear);
+            for flag in flags {
+                let inactive = builder.bconst(false);
+                builder.store(inactive, flag);
+            }
+            builder.set_branch(next);
+            builder.switch_to_block(next);
         }
     }
 
@@ -3390,6 +4381,8 @@ impl<'a> LowerCtx<'a> {
             let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
             let old_expr_cache = std::mem::take(&mut self.expr_cache);
             let old_scope_map = std::mem::take(&mut self.scope_map);
+            let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
+            let old_drop_slots = std::mem::take(&mut self.drop_slots);
             let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
             let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
             let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
@@ -3400,6 +4393,8 @@ impl<'a> LowerCtx<'a> {
             let func = self.lower_function(fid, mono_name.clone(), body_id);
             self.expr_cache = old_expr_cache;
             self.scope_map = old_scope_map;
+            self.drop_scopes = old_drop_scopes;
+            self.drop_slots = old_drop_slots;
             self.storage_bindings = old_storage_bindings;
             self.parameter_storage = old_parameter_storage;
             self.pattern_bindings = old_pattern_bindings;
@@ -3457,6 +4452,8 @@ impl<'a> LowerCtx<'a> {
         let old_const_subst = std::mem::replace(&mut self.generic_const_subst, subst.consts);
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
+        let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
+        let old_drop_slots = std::mem::take(&mut self.drop_slots);
         let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
         let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
         let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
@@ -3467,6 +4464,8 @@ impl<'a> LowerCtx<'a> {
         let func = self.lower_function(fid, mono_name.clone(), body_id);
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
+        self.drop_scopes = old_drop_scopes;
+        self.drop_slots = old_drop_slots;
         self.storage_bindings = old_storage_bindings;
         self.parameter_storage = old_parameter_storage;
         self.pattern_bindings = old_pattern_bindings;
@@ -3569,6 +4568,8 @@ impl<'a> LowerCtx<'a> {
         let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
+        let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
+        let old_drop_slots = std::mem::take(&mut self.drop_slots);
         let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
         let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
         let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
@@ -3579,6 +4580,8 @@ impl<'a> LowerCtx<'a> {
         let func = self.lower_function(fid, mono_name.clone(), body_id);
         self.expr_cache = old_expr_cache;
         self.scope_map = old_scope_map;
+        self.drop_scopes = old_drop_scopes;
+        self.drop_slots = old_drop_slots;
         self.storage_bindings = old_storage_bindings;
         self.parameter_storage = old_parameter_storage;
         self.pattern_bindings = old_pattern_bindings;
@@ -4038,6 +5041,13 @@ fn closure_env_type() -> Type {
     Type::Ptr(Box::new(Type::Unit))
 }
 
+fn closure_drop_function_type() -> Type {
+    Type::FnPtr(FnPtrType {
+        params: vec![closure_env_type()],
+        ret: Box::new(Type::Unit),
+    })
+}
+
 fn closure_value_type(signature: FnPtrType) -> Type {
     let mut hasher = DefaultHasher::new();
     signature.hash(&mut hasher);
@@ -4050,7 +5060,11 @@ fn closure_value_type(signature: FnPtrType) -> Type {
     });
     Type::Struct(StructType {
         name: format!("riddle_closure_{:016x}", hasher.finish()),
-        fields: vec![("call".into(), call), ("env".into(), closure_env_type())],
+        fields: vec![
+            ("call".into(), call),
+            ("env".into(), closure_env_type()),
+            ("drop".into(), closure_drop_function_type()),
+        ],
     })
 }
 
