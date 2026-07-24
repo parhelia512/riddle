@@ -263,8 +263,14 @@ impl<'a> LowerCtx<'a> {
         {
             let mut builder = Builder::new(&mut func);
             for (index, (param, value)) in func_item.params.iter().zip(&param_values).enumerate() {
-                if self.analysis.param_escapes(body_id, index) {
-                    let storage = builder.heap_alloc(self.convert_hir_type(&param.ty));
+                let storage = if self.analysis.param_escapes(body_id, index) {
+                    Some(builder.heap_alloc(self.convert_hir_type(&param.ty)))
+                } else if self.analysis.param_needs_address(body_id, index) {
+                    Some(builder.alloca(self.convert_hir_type(&param.ty)))
+                } else {
+                    None
+                };
+                if let Some(storage) = storage {
                     builder.store(*value, storage);
                     self.parameter_storage
                         .insert(CaptureSource::Param(index), storage);
@@ -348,10 +354,12 @@ impl<'a> LowerCtx<'a> {
         let env_value = if info.captures.is_empty() {
             self.null_env(builder)
         } else {
-            // ponytail: closure environments always use the GC heap; add stack
-            // promotion only when escape-analysis data shows it matters.
             let env_ty = Type::Struct(env_struct.clone());
-            let env_ptr = builder.heap_alloc(env_ty);
+            let env_ptr = if self.analysis.lambda_escapes(body_id, expr_id) {
+                builder.heap_alloc(env_ty)
+            } else {
+                builder.alloca(env_ty)
+            };
             for (index, (capture, capture_ty)) in
                 info.captures.iter().zip(&capture_types).enumerate()
             {
@@ -424,9 +432,18 @@ impl<'a> LowerCtx<'a> {
         {
             let mut lambda_builder = Builder::new(&mut function);
             for (index, value) in param_values.iter().enumerate() {
-                if self.analysis.lambda_param_escapes(body_id, expr_id, index) {
-                    let ty = call_signature.params[index + 1].clone();
-                    let storage = lambda_builder.heap_alloc(ty);
+                let ty = call_signature.params[index + 1].clone();
+                let storage = if self.analysis.lambda_param_escapes(body_id, expr_id, index) {
+                    Some(lambda_builder.heap_alloc(ty))
+                } else if self
+                    .analysis
+                    .lambda_param_needs_address(body_id, expr_id, index)
+                {
+                    Some(lambda_builder.alloca(ty))
+                } else {
+                    None
+                };
+                if let Some(storage) = storage {
                     lambda_builder.store(*value, storage);
                     self.parameter_storage.insert(
                         CaptureSource::LambdaParam {
@@ -2815,6 +2832,9 @@ impl<'a> LowerCtx<'a> {
                     .current_body
                     .map(|bid| self.analysis.escapes(bid, stmt_id))
                     .unwrap_or(false);
+                let needs_address = self
+                    .current_body
+                    .is_some_and(|bid| self.analysis.local_needs_address(bid, stmt_id));
 
                 let val = if escapes {
                     // Use init expr's inferred type (from type checker) for allocation,
@@ -2833,8 +2853,8 @@ impl<'a> LowerCtx<'a> {
                     }
                     self.storage_bindings.insert(stmt_id);
                     ptr
-                } else if *is_mut {
-                    // mut bindings: always use Alloca for reassignable storage
+                } else if *is_mut || needs_address {
+                    // Mutable and captured-by-reference bindings need stable stack storage.
                     let alloc_ty = init
                         .and_then(|init_expr| {
                             self.current_body

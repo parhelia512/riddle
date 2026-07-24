@@ -58,6 +58,14 @@ impl CBackend {
             .unwrap_or("0")
     }
 
+    fn value_expr(&self, v: Value) -> String {
+        if self.direct_storage.contains(&v.0) {
+            format!("(&{})", self.name(v))
+        } else {
+            self.name(v).to_owned()
+        }
+    }
+
     fn set_inline(&mut self, v: Value, expr: String, ctype: String) {
         self.ensure(v);
         self.inline_of.insert(v.0, expr);
@@ -473,7 +481,7 @@ impl CBackend {
             }
 
             InstKind::Store(value, ptr) => {
-                let vn = self.name(*value).to_owned();
+                let vn = self.value_expr(*value);
                 let pn = self.name(*ptr).to_owned();
                 let pt_ct = self
                     .ctypes
@@ -637,7 +645,7 @@ impl CBackend {
 
             InstKind::Cast(_op, value, target_ty) => {
                 let ct = ctype_of(target_ty);
-                let src = self.name(*value).to_owned();
+                let src = self.value_expr(*value);
                 let expr = format!("(({}){})", ct, src);
                 if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
                     self.set_inline(v, expr, ct);

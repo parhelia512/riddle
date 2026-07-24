@@ -16,6 +16,10 @@ pub struct EscapeResult {
     pub escaping_locals: HashSet<(BodyId, StmtId)>,
     escaping_params: HashSet<(BodyId, usize)>,
     escaping_lambda_params: HashSet<(BodyId, ExprId, usize)>,
+    escaping_lambdas: HashSet<(BodyId, ExprId)>,
+    address_taken_locals: HashSet<(BodyId, StmtId)>,
+    address_taken_params: HashSet<(BodyId, usize)>,
+    address_taken_lambda_params: HashSet<(BodyId, ExprId, usize)>,
 }
 
 impl EscapeResult {
@@ -31,6 +35,28 @@ impl EscapeResult {
         self.escaping_lambda_params
             .contains(&(body_id, lambda, index))
     }
+
+    pub fn lambda_escapes(&self, body_id: BodyId, lambda: ExprId) -> bool {
+        self.escaping_lambdas.contains(&(body_id, lambda))
+    }
+
+    pub fn local_needs_address(&self, body_id: BodyId, stmt: StmtId) -> bool {
+        self.address_taken_locals.contains(&(body_id, stmt))
+    }
+
+    pub fn param_needs_address(&self, body_id: BodyId, index: usize) -> bool {
+        self.address_taken_params.contains(&(body_id, index))
+    }
+
+    pub fn lambda_param_needs_address(
+        &self,
+        body_id: BodyId,
+        lambda: ExprId,
+        index: usize,
+    ) -> bool {
+        self.address_taken_lambda_params
+            .contains(&(body_id, lambda, index))
+    }
 }
 
 /// Run escape analysis on all function bodies with inter-procedural
@@ -42,7 +68,13 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
     for (fid, func) in hir.item_tree.functions.iter() {
         let all_params: HashSet<usize> = (0..func.params.len()).collect();
         if !all_params.is_empty() {
-            initial.insert(fid, all_params);
+            initial.insert(
+                fid,
+                FnSummary {
+                    escaping: all_params,
+                    returned: HashSet::new(),
+                },
+            );
         }
     }
 
@@ -50,7 +82,7 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
         hir,
         type_result,
         result: EscapeResult::default(),
-        fn_param_escapes: initial,
+        fn_summaries: initial,
     };
 
     // Fixpoint: re-analyze until per-function param summaries stabilize.
@@ -59,6 +91,10 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
         analyzer.result.escaping_locals.clear();
         analyzer.result.escaping_params.clear();
         analyzer.result.escaping_lambda_params.clear();
+        analyzer.result.escaping_lambdas.clear();
+        analyzer.result.address_taken_locals.clear();
+        analyzer.result.address_taken_params.clear();
+        analyzer.result.address_taken_lambda_params.clear();
         let changed = analyzer.analyze_all_bodies();
         if !changed {
             break;
@@ -68,8 +104,13 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
     analyzer.result
 }
 
-/// Per-function summary: which parameter indices escape the function body.
-type FnSummary = HashSet<usize>;
+/// Per-function summary: parameters stored beyond the call and parameters
+/// whose reference provenance flows into the return value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FnSummary {
+    escaping: HashSet<usize>,
+    returned: HashSet<usize>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RefSource {
@@ -79,6 +120,7 @@ enum RefSource {
     ParamValue(usize),
     LambdaParamPlace(ExprId, usize),
     LambdaParamValue(ExprId, usize),
+    Lambda(ExprId),
 }
 
 type RefSources = HashSet<RefSource>;
@@ -88,7 +130,7 @@ struct EscapeAnalyzer<'a> {
     type_result: &'a TypeCheckResult,
     result: EscapeResult,
     /// Summaries from the previous fixpoint iteration, initialized with all params.
-    fn_param_escapes: HashMap<FunctionId, FnSummary>,
+    fn_summaries: HashMap<FunctionId, FnSummary>,
 }
 
 impl<'a> EscapeAnalyzer<'a> {
@@ -101,7 +143,7 @@ impl<'a> EscapeAnalyzer<'a> {
         for (fid, _) in self.hir.item_tree.functions.iter() {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
                 let escaped_params = self.analyze_one_body(body_id);
-                let prev = self.fn_param_escapes.get(&fid).cloned().unwrap_or_default();
+                let prev = self.fn_summaries.get(&fid).cloned().unwrap_or_default();
                 if escaped_params != prev {
                     changed = true;
                 }
@@ -109,7 +151,7 @@ impl<'a> EscapeAnalyzer<'a> {
             }
         }
 
-        self.fn_param_escapes = new_summaries;
+        self.fn_summaries = new_summaries;
         changed
     }
 
@@ -124,8 +166,7 @@ impl<'a> EscapeAnalyzer<'a> {
             tail: Some(tail), ..
         } = &body.exprs[body.root_block]
         {
-            ctx.escaping_exprs.insert(*tail);
-            self.mark_escaping_sources(&mut ctx, *tail);
+            self.mark_returning_sources(&mut ctx, *tail);
         }
         self.propagate_escaping_to_locals(&mut ctx);
 
@@ -141,8 +182,25 @@ impl<'a> EscapeAnalyzer<'a> {
                 .escaping_lambda_params
                 .insert((body_id, *lambda, *index));
         }
+        for lambda in &ctx.escaping_lambdas {
+            self.result.escaping_lambdas.insert((body_id, *lambda));
+        }
+        for stmt in &ctx.address_taken_locals {
+            self.result.address_taken_locals.insert((body_id, *stmt));
+        }
+        for index in &ctx.address_taken_params {
+            self.result.address_taken_params.insert((body_id, *index));
+        }
+        for (lambda, index) in &ctx.address_taken_lambda_params {
+            self.result
+                .address_taken_lambda_params
+                .insert((body_id, *lambda, *index));
+        }
 
-        ctx.escaping_params
+        FnSummary {
+            escaping: ctx.escaping_params,
+            returned: ctx.returned_params,
+        }
     }
 
     fn mark_escaping_exprs(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
@@ -188,7 +246,11 @@ impl<'a> EscapeAnalyzer<'a> {
                         .params
                         .first()
                         .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
-                    self.handle_call_operand(ctx, Some(fid), 0, *operand, by_ref);
+                    let returned = self.handle_call_operand(ctx, Some(fid), 0, *operand, by_ref);
+                    ctx.expr_sources
+                        .entry(expr_id)
+                        .or_default()
+                        .extend(returned);
                 } else {
                     self.mark_escaping_exprs(ctx, *operand);
                 }
@@ -284,7 +346,11 @@ impl<'a> EscapeAnalyzer<'a> {
                         OperatorCall::Trait(_) => None,
                     })
                 {
-                    self.handle_operator_args(ctx, fid, *lhs, *rhs);
+                    let returned = self.handle_operator_args(ctx, fid, *lhs, *rhs);
+                    ctx.expr_sources
+                        .entry(expr_id)
+                        .or_default()
+                        .extend(returned);
                 } else {
                     self.mark_escaping_exprs(ctx, *lhs);
                     self.mark_escaping_exprs(ctx, *rhs);
@@ -294,73 +360,35 @@ impl<'a> EscapeAnalyzer<'a> {
 
             Expr::Call { callee, args, .. } => {
                 self.mark_escaping_exprs(ctx, *callee);
-                self.handle_call_args(ctx, *callee, args);
-                args.iter().any(|arg| ctx.escaping_exprs.contains(arg))
-                    || args.iter().any(|arg| {
-                        ctx.expr_sources
-                            .get(arg)
-                            .is_some_and(|sources| !sources.is_empty())
-                    })
+                let returned = self.handle_call_args(ctx, *callee, args);
+                ctx.expr_sources
+                    .entry(expr_id)
+                    .or_default()
+                    .extend(returned);
+                false
             }
 
             Expr::Lambda { body, .. } => {
+                let mut sources: RefSources = std::iter::once(RefSource::Lambda(expr_id)).collect();
                 if let Some(info) = self.type_result.lambda_infos.get(&(ctx.body_id, expr_id)) {
                     for capture in &info.captures {
-                        match capture.mode {
-                            CaptureMode::Shared | CaptureMode::Mutable => match capture.source {
-                                CaptureSource::Local(stmt) => {
-                                    ctx.escaping_locals.insert(stmt);
-                                }
-                                CaptureSource::Pattern(id) => {
-                                    if let Some(sources) = self.pattern_sources(ctx, id) {
-                                        Self::mark_source_sink(ctx, &sources);
-                                    }
-                                }
-                                CaptureSource::Param(idx) => {
-                                    ctx.escaping_params.insert(idx);
-                                }
-                                CaptureSource::LambdaParam { lambda, index } => {
-                                    let sources = [
-                                        RefSource::LambdaParamPlace(lambda, index),
-                                        RefSource::LambdaParamValue(lambda, index),
-                                    ]
-                                    .into_iter()
-                                    .collect();
-                                    Self::mark_source_sink(ctx, &sources);
-                                }
-                            },
-                            CaptureMode::Value => match capture.source {
-                                CaptureSource::Local(stmt) => {
-                                    let sources =
-                                        std::iter::once(RefSource::LocalValue(stmt)).collect();
-                                    Self::mark_source_sink(ctx, &sources);
-                                }
-                                CaptureSource::Pattern(id) => {
-                                    if let Some(sources) = self.pattern_sources(ctx, id) {
-                                        Self::mark_source_sink(ctx, &sources);
-                                    }
-                                }
-                                CaptureSource::Param(idx) => {
-                                    ctx.escaping_params.insert(idx);
-                                }
-                                CaptureSource::LambdaParam { lambda, index } => {
-                                    let sources =
-                                        std::iter::once(RefSource::LambdaParamValue(lambda, index))
-                                            .collect();
-                                    Self::mark_source_sink(ctx, &sources);
-                                }
-                            },
+                        let captured = self.capture_sources(ctx, &capture.source, capture.mode);
+                        if matches!(capture.mode, CaptureMode::Shared | CaptureMode::Mutable) {
+                            Self::mark_address_taken(ctx, &captured);
                         }
+                        sources.extend(captured);
                     }
                 }
+                ctx.expr_sources.entry(expr_id).or_default().extend(sources);
+                ctx.lambda_stack.push(expr_id);
                 self.mark_escaping_exprs(ctx, *body);
                 if let Expr::Block {
                     tail: Some(tail), ..
                 } = &ctx.body.exprs[*body]
                 {
-                    ctx.escaping_exprs.insert(*tail);
-                    self.mark_escaping_sources(ctx, *tail);
+                    self.record_lambda_return_sources(ctx, expr_id, *tail);
                 }
+                ctx.lambda_stack.pop();
                 false
             }
 
@@ -465,8 +493,40 @@ impl<'a> EscapeAnalyzer<'a> {
 
     /// Handle call arguments for escape: a ref passed to a local function
     /// only forces heap allocation when the callee's param actually escapes.
-    fn handle_call_args(&mut self, ctx: &mut EscapeCtx<'_>, callee: ExprId, args: &[ExprId]) {
+    fn handle_call_args(
+        &mut self,
+        ctx: &mut EscapeCtx<'_>,
+        callee: ExprId,
+        args: &[ExprId],
+    ) -> RefSources {
         let callee_fid = self.resolve_callee(ctx, callee);
+        let mut returned = RefSources::new();
+        let mut pending = ctx
+            .expr_sources
+            .get(&callee)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut seen = RefSources::new();
+        while let Some(source) = pending.pop() {
+            if !seen.insert(source) {
+                continue;
+            }
+            match source {
+                RefSource::Lambda(lambda) => returned.extend(
+                    ctx.lambda_return_sources
+                        .get(&lambda)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                ),
+                RefSource::LocalValue(stmt) => {
+                    pending.extend(ctx.stmt_sources.get(&stmt).into_iter().flatten().copied())
+                }
+                _ => {}
+            }
+        }
         let receiver = callee_fid.and_then(|fid| {
             let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee] else {
                 return None;
@@ -476,14 +536,21 @@ impl<'a> EscapeAnalyzer<'a> {
         });
 
         if let Some((receiver, by_ref)) = receiver {
-            self.handle_call_operand(ctx, callee_fid, 0, receiver, by_ref);
+            returned.extend(self.handle_call_operand(ctx, callee_fid, 0, receiver, by_ref));
         }
 
         let param_offset = usize::from(receiver.is_some());
 
         for (i, arg) in args.iter().enumerate() {
-            self.handle_call_operand(ctx, callee_fid, i + param_offset, *arg, false);
+            returned.extend(self.handle_call_operand(
+                ctx,
+                callee_fid,
+                i + param_offset,
+                *arg,
+                false,
+            ));
         }
+        returned
     }
 
     fn handle_operator_args(
@@ -492,13 +559,14 @@ impl<'a> EscapeAnalyzer<'a> {
         fid: FunctionId,
         lhs: ExprId,
         rhs: ExprId,
-    ) {
+    ) -> RefSources {
         let receiver_by_ref = self.hir.item_tree.functions[fid]
             .params
             .first()
             .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
-        self.handle_call_operand(ctx, Some(fid), 0, lhs, receiver_by_ref);
-        self.handle_call_operand(ctx, Some(fid), 1, rhs, false);
+        let mut returned = self.handle_call_operand(ctx, Some(fid), 0, lhs, receiver_by_ref);
+        returned.extend(self.handle_call_operand(ctx, Some(fid), 1, rhs, false));
+        returned
     }
 
     fn handle_call_operand(
@@ -508,27 +576,30 @@ impl<'a> EscapeAnalyzer<'a> {
         param_index: usize,
         operand: ExprId,
         auto_borrow: bool,
-    ) {
+    ) -> RefSources {
         self.mark_escaping_exprs(ctx, operand);
-        let escapes = callee_fid
-            .and_then(|fid| self.fn_param_escapes.get(&fid))
-            .map(|summary| summary.contains(&param_index))
-            .unwrap_or(true); // extern / unknown -> conservative
-        if !escapes {
-            return;
-        }
-
-        if auto_borrow
+        let sources = if auto_borrow
             && !self
                 .type_result
                 .expr_types
                 .get(&(ctx.body_id, operand))
                 .is_some_and(|ty| matches!(ty, Type::Ref(..)))
         {
-            let sources = self.place_sources(ctx, operand);
-            Self::mark_source_sink(ctx, &sources);
+            self.place_sources(ctx, operand)
         } else {
-            self.mark_escaping_sources(ctx, operand);
+            ctx.expr_sources.get(&operand).cloned().unwrap_or_default()
+        };
+        let Some(summary) = callee_fid.and_then(|fid| self.fn_summaries.get(&fid)) else {
+            Self::mark_source_sink(ctx, &sources);
+            return RefSources::new();
+        };
+        if summary.escaping.contains(&param_index) {
+            Self::mark_source_sink(ctx, &sources);
+        }
+        if summary.returned.contains(&param_index) {
+            sources
+        } else {
+            RefSources::new()
         }
     }
 
@@ -549,6 +620,9 @@ impl<'a> EscapeAnalyzer<'a> {
         let s = &ctx.body.stmts[stmt_id];
         match s {
             Stmt::Let { init, .. } => {
+                if let Some(lambda) = ctx.lambda_stack.last().copied() {
+                    ctx.lambda_locals.entry(lambda).or_default().insert(stmt_id);
+                }
                 if let Some(init) = init {
                     self.mark_escaping_exprs(ctx, *init);
                     self.record_stmt_ref_chain(ctx, stmt_id, *init);
@@ -560,9 +634,11 @@ impl<'a> EscapeAnalyzer<'a> {
             Stmt::Return { value } => {
                 if let Some(v) = value {
                     self.mark_escaping_exprs(ctx, *v);
-                    ctx.escaping_exprs.insert(*v);
-                    // Every reference source carried by the result escapes.
-                    self.mark_escaping_sources(ctx, *v);
+                    if let Some(lambda) = ctx.lambda_stack.last().copied() {
+                        self.record_lambda_return_sources(ctx, lambda, *v);
+                    } else {
+                        self.mark_returning_sources(ctx, *v);
+                    }
                 }
             }
             Stmt::Break | Stmt::Continue => {}
@@ -577,10 +653,86 @@ impl<'a> EscapeAnalyzer<'a> {
             .is_none_or(type_may_carry_reference)
     }
 
-    fn mark_escaping_sources(&self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) {
-        if let Some(sources) = ctx.expr_sources.get(&expr_id).cloned() {
-            Self::mark_source_sink(ctx, &sources);
+    fn mark_returning_sources(&self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) {
+        let Some(sources) = ctx.expr_sources.get(&expr_id).cloned() else {
+            return;
+        };
+        let mut pending: Vec<RefSource> = sources.into_iter().collect();
+        let mut seen = HashSet::new();
+        while let Some(source) = pending.pop() {
+            if !seen.insert(source) {
+                continue;
+            }
+            match source {
+                RefSource::Local(stmt) => {
+                    ctx.escaping_locals.insert(stmt);
+                }
+                RefSource::LocalValue(stmt) => {
+                    if let Some(nested) = ctx.stmt_sources.get(&stmt) {
+                        pending.extend(nested.iter().copied());
+                    }
+                }
+                RefSource::ParamPlace(index) => {
+                    ctx.escaping_param_places.insert(index);
+                    ctx.returned_params.insert(index);
+                }
+                RefSource::ParamValue(index) => {
+                    ctx.returned_params.insert(index);
+                }
+                RefSource::LambdaParamPlace(lambda, index) => {
+                    ctx.escaping_lambda_param_places.insert((lambda, index));
+                }
+                RefSource::LambdaParamValue(..) => {}
+                RefSource::Lambda(lambda) => {
+                    ctx.escaping_lambdas.insert(lambda);
+                }
+            }
         }
+    }
+
+    fn record_lambda_return_sources(
+        &self,
+        ctx: &mut EscapeCtx<'_>,
+        lambda: ExprId,
+        expr_id: ExprId,
+    ) {
+        let Some(sources) = ctx.expr_sources.get(&expr_id).cloned() else {
+            return;
+        };
+        let locals = ctx.lambda_locals.get(&lambda).cloned().unwrap_or_default();
+        let mut returned = RefSources::new();
+        let mut pending: Vec<RefSource> = sources.into_iter().collect();
+        let mut seen = HashSet::new();
+        while let Some(source) = pending.pop() {
+            if !seen.insert(source) {
+                continue;
+            }
+            match source {
+                RefSource::Local(stmt) if locals.contains(&stmt) => {
+                    ctx.escaping_locals.insert(stmt);
+                }
+                RefSource::LocalValue(stmt) if locals.contains(&stmt) => {
+                    if let Some(nested) = ctx.stmt_sources.get(&stmt) {
+                        pending.extend(nested.iter().copied());
+                    }
+                }
+                RefSource::LambdaParamPlace(owner, index) if owner == lambda => {
+                    ctx.escaping_lambda_param_places.insert((owner, index));
+                }
+                RefSource::LambdaParamValue(owner, _) if owner == lambda => {}
+                RefSource::Lambda(inner) => {
+                    ctx.escaping_lambdas.insert(inner);
+                    returned.insert(source);
+                }
+                source => {
+                    returned.insert(source);
+                }
+            }
+        }
+        ctx.lambda_return_sources
+            .entry(lambda)
+            .or_default()
+            .extend(returned);
     }
 
     fn mark_source_sink(ctx: &mut EscapeCtx<'_>, sources: &RefSources) -> bool {
@@ -617,9 +769,65 @@ impl<'a> EscapeAnalyzer<'a> {
                     changed |= ctx.escaping_lambda_param_places.insert((lambda, index));
                 }
                 RefSource::LambdaParamValue(..) => {}
+                RefSource::Lambda(lambda) => {
+                    changed |= ctx.escaping_lambdas.insert(lambda);
+                }
             }
         }
         changed
+    }
+
+    fn capture_sources(
+        &self,
+        ctx: &EscapeCtx<'_>,
+        source: &CaptureSource,
+        mode: CaptureMode,
+    ) -> RefSources {
+        let by_ref = matches!(mode, CaptureMode::Shared | CaptureMode::Mutable);
+        match source {
+            CaptureSource::Local(stmt) if by_ref => {
+                [RefSource::Local(*stmt), RefSource::LocalValue(*stmt)]
+                    .into_iter()
+                    .collect()
+            }
+            CaptureSource::Local(stmt) => std::iter::once(RefSource::LocalValue(*stmt)).collect(),
+            CaptureSource::Pattern(id) => self.pattern_sources(ctx, *id).unwrap_or_default(),
+            CaptureSource::Param(index) if by_ref => {
+                [RefSource::ParamPlace(*index), RefSource::ParamValue(*index)]
+                    .into_iter()
+                    .collect()
+            }
+            CaptureSource::Param(index) => std::iter::once(RefSource::ParamValue(*index)).collect(),
+            CaptureSource::LambdaParam { lambda, index } if by_ref => [
+                RefSource::LambdaParamPlace(*lambda, *index),
+                RefSource::LambdaParamValue(*lambda, *index),
+            ]
+            .into_iter()
+            .collect(),
+            CaptureSource::LambdaParam { lambda, index } => {
+                std::iter::once(RefSource::LambdaParamValue(*lambda, *index)).collect()
+            }
+        }
+    }
+
+    fn mark_address_taken(ctx: &mut EscapeCtx<'_>, sources: &RefSources) {
+        for source in sources {
+            match source {
+                RefSource::Local(stmt) => {
+                    ctx.address_taken_locals.insert(*stmt);
+                }
+                RefSource::ParamPlace(index) => {
+                    ctx.address_taken_params.insert(*index);
+                }
+                RefSource::LambdaParamPlace(lambda, index) => {
+                    ctx.address_taken_lambda_params.insert((*lambda, *index));
+                }
+                RefSource::LocalValue(_)
+                | RefSource::ParamValue(_)
+                | RefSource::LambdaParamValue(..)
+                | RefSource::Lambda(_) => {}
+            }
+        }
     }
 
     /// Record that `ref_expr` (a `&...` expression) refers to the place/param
@@ -829,8 +1037,16 @@ struct EscapeCtx<'a> {
     escaping_exprs: HashSet<ExprId>,
     escaping_locals: HashSet<StmtId>,
     escaping_params: HashSet<usize>,
+    returned_params: HashSet<usize>,
     escaping_param_places: HashSet<usize>,
     escaping_lambda_param_places: HashSet<(ExprId, usize)>,
+    escaping_lambdas: HashSet<ExprId>,
+    address_taken_locals: HashSet<StmtId>,
+    address_taken_params: HashSet<usize>,
+    address_taken_lambda_params: HashSet<(ExprId, usize)>,
+    lambda_stack: Vec<ExprId>,
+    lambda_locals: HashMap<ExprId, HashSet<StmtId>>,
+    lambda_return_sources: HashMap<ExprId, RefSources>,
     escaping_sources: RefSources,
     expr_sources: HashMap<ExprId, RefSources>,
     stmt_sources: HashMap<StmtId, RefSources>,
@@ -845,8 +1061,16 @@ impl<'a> EscapeCtx<'a> {
             escaping_exprs: HashSet::new(),
             escaping_locals: HashSet::new(),
             escaping_params: HashSet::new(),
+            returned_params: HashSet::new(),
             escaping_param_places: HashSet::new(),
             escaping_lambda_param_places: HashSet::new(),
+            escaping_lambdas: HashSet::new(),
+            address_taken_locals: HashSet::new(),
+            address_taken_params: HashSet::new(),
+            address_taken_lambda_params: HashSet::new(),
+            lambda_stack: Vec::new(),
+            lambda_locals: HashMap::new(),
+            lambda_return_sources: HashMap::new(),
             escaping_sources: RefSources::new(),
             expr_sources: HashMap::new(),
             stmt_sources: HashMap::new(),

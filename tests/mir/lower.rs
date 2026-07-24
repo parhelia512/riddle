@@ -1620,6 +1620,110 @@ fn non_escaping_local_no_heap_alloc() {
 }
 
 #[test]
+fn returned_reference_consumed_by_caller_stays_on_stack() {
+    let module = lower(
+        r#"
+        struct Data { value: i32 }
+
+        fun forward(value: &Data) -> &Data { value }
+
+        fun read_forwarded() -> i32 {
+            let local = Data { value: 42 };
+            (*forward(&local)).value
+        }
+        "#,
+    );
+    let function = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "read_forwarded")
+        .unwrap();
+
+    assert!(
+        !function.blocks.iter().any(|(_, block)| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+        }),
+        "a returned reference consumed inside the caller must not promote its source"
+    );
+}
+
+#[test]
+fn lambda_return_does_not_leak_into_outer_function_summary() {
+    let module = lower(
+        r#"
+        struct Data { value: i32 }
+
+        fun read_in_lambda(value: &Data) -> i32 {
+            let read = fun() -> &Data { return value; };
+            (*read()).value
+        }
+
+        fun caller() -> i32 {
+            let local = Data { value: 42 };
+            read_in_lambda(&local)
+        }
+        "#,
+    );
+
+    for name in ["read_in_lambda", "caller"] {
+        let function = module
+            .function_order
+            .iter()
+            .map(|id| &module.functions[*id])
+            .find(|function| function.name == name)
+            .unwrap();
+        assert!(
+            !function.blocks.iter().any(|(_, block)| {
+                block
+                    .insts
+                    .iter()
+                    .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+            }),
+            "{name} should not inherit a nested lambda's return summary"
+        );
+    }
+}
+
+#[test]
+fn reference_returned_through_local_lambda_still_escapes() {
+    let module = lower(
+        r#"
+        struct Data { value: i32 }
+
+        fun relay(value: &Data) -> &Data {
+            let return_value = fun() -> &Data { value };
+            return_value()
+        }
+
+        fun caller() -> &Data {
+            let local = Data { value: 42 };
+            relay(&local)
+        }
+        "#,
+    );
+    let function = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "caller")
+        .unwrap();
+
+    assert!(
+        function.blocks.iter().any(|(_, block)| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+        }),
+        "a reference returned through a local lambda must keep its source alive"
+    );
+}
+
+#[test]
 fn all_reference_forms_promote_their_source_local() {
     let (_, type_result, _, module) = compile(
         r#"
@@ -2146,7 +2250,7 @@ fn anonymous_function_lowers_to_function_pointer_call() {
 }
 
 #[test]
-fn capturing_closure_lowers_environment_and_hidden_parameter() {
+fn non_escaping_closure_keeps_environment_and_capture_on_stack() {
     let module = lower(
         r#"
         fun main() -> i32 {
@@ -2170,10 +2274,53 @@ fn capturing_closure_lowers_environment_and_hidden_parameter() {
         .map(|id| &module.functions[*id])
         .find(|function| function.name == "main")
         .unwrap();
-    assert!(main.blocks.iter().any(|(_, block)| {
-        block
-            .insts
+    assert!(
+        !main.blocks.iter().any(|(_, block)| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+        }),
+        "a closure called within its defining frame should not allocate on the heap"
+    );
+    assert!(
+        main.blocks.iter().any(|(_, block)| {
+            block
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, mir::instr::InstKind::Alloca(_)))
+                .count()
+                >= 2
+        }),
+        "the captured local and closure environment need stack storage"
+    );
+}
+
+#[test]
+fn lambda_returned_from_lambda_uses_heap_environment() {
+    let module = lower(
+        r#"
+        fun nested(base: i32) -> fun(i32) -> fun(i32) -> i32 {
+            fun(first: i32) {
+                fun(second: i32) { base + first + second }
+            }
+        }
+        "#,
+    );
+
+    assert!(
+        module
+            .function_order
             .iter()
-            .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
-    }));
+            .map(|id| &module.functions[*id])
+            .filter(|function| function.name.starts_with("__riddle_lambda_"))
+            .any(|function| function.blocks.iter().any(|(_, block)| {
+                block.insts.iter().any(|inst| matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::HeapAlloc(mir::types::Type::Ptr(ty))
+                        if matches!(ty.as_ref(), mir::types::Type::Struct(ty) if ty.name.ends_with("_env"))
+                ))
+            })),
+        "an inner lambda returned across the outer lambda frame must escape"
+    );
 }

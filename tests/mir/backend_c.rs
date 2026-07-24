@@ -200,7 +200,7 @@ fn c_anonymous_function_uses_typed_function_pointer() {
 }
 
 #[test]
-fn c_closure_capture_uses_heap_environment() {
+fn c_non_escaping_closure_capture_uses_stack_environment() {
     let module = lower(
         r#"
         fun main() -> i32 {
@@ -212,7 +212,7 @@ fn c_closure_capture_uses_heap_environment() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains("rgc_alloc"), "{generated}");
+    assert!(!generated.contains("rgc_alloc"), "{generated}");
     assert!(generated.contains("__riddle_lambda_1_env"), "{generated}");
     assert!(generated.contains("capture_0_base"), "{generated}");
     assert!(generated.contains(".call("), "{generated}");
