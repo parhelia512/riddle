@@ -17,6 +17,22 @@ This is a technology preview. The language and toolchain may still change
 without compatibility guarantees. Tutorials and implemented capabilities are
 available in [The Riddle Book](https://riddle-lang.github.io/docs/).
 
+## Language Features
+
+- Values move by default, with `Copy`, borrow checking, and field-level partial
+  moves; after destructuring a struct in `match`, unmoved sibling fields remain
+  usable.
+- `std::ops::Drop` provides deterministic destruction for local variables,
+  parameters, pattern bindings, iteration items, aggregate fields, and closure
+  environments, with drop flags preventing double destruction after moves.
+- Non-escaping values stay on the stack when possible. Escape analysis promotes
+  values to a conservative, non-moving GC heap when references outlive the
+  current stack frame; storage location does not change move, borrow, or drop
+  semantics.
+- Generics and traits, closures, recursive pattern matching,
+  `IntoIterator` / `Iterator`-driven `for` loops, `unsafe`, C FFI, and C11 code
+  generation are supported.
+
 ## Tools
 
 - `riddlec`: checks Riddle source and generates C;
