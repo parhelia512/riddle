@@ -13,10 +13,10 @@ const DOCUMENTED_ERROR_CODES: &[&str] = &[
     "E0011", "E0012", "E0013", "E0020", "E0022", "E0023", "E0024", "E0025", "E0026", "E0027",
     "E0028", "E0029", "E0030", "E0031", "E0032", "E0033", "E0034", "E0035", "E0036", "E0037",
     "E0038", "E0039", "E0040", "E0041", "E0042", "E0043", "E0044", "E0045", "E0047", "E0048",
-    "E0050", "E0051", "E0052", "E0072", "E0100", "E0200", "E0300", "E0301", "E0302", "E0303",
-    "E0304",
+    "E0049", "E0050", "E0051", "E0052", "E0053", "E0072", "E0100", "E0200", "E0300", "E0301",
+    "E0302", "E0303", "E0304",
 ];
-const SOURCE_UNREACHABLE_CODES: &[&str] = &["E0048", "E0200"];
+const SOURCE_UNREACHABLE_CODES: &[&str] = &["E0048", "E0049", "E0200"];
 
 fn temp_root(name: &str) -> PathBuf {
     env::temp_dir().join(format!(
@@ -1212,6 +1212,13 @@ fn reachable_diagnostic_producers_have_exact_primary_and_lsp_spans() {
             "fun main() { missing; }",
             "missing",
             "missing",
+        ),
+        (
+            "E0053",
+            "unknown lang item",
+            "#[lang = \"unknown_item\"] trait Foo {}",
+            "Foo",
+            "#[lang = \"unknown_item\"] trait Foo",
         ),
         (
             "E0051",

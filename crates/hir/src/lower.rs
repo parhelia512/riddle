@@ -10,9 +10,9 @@ use super::{
     Name,
     item_tree::{
         ConstId, EnumId, FunctionId, HirAssocTypeConstraint, HirAttr, HirConst, HirConstArg,
-        HirEnum, HirEnumVariant, HirFunction, HirGenericBound, HirParam, HirPath, HirStruct,
-        HirStructField, HirTrait, HirTypeAlias, HirTypeRef, HirUseTree, HirUseTreeKind,
-        HirVariantKind, PathAnchor, StructId, TraitId, TypeAliasId, Visibility,
+        HirEnum, HirEnumVariant, HirFunction, HirGenericBound, HirInternalAttr, HirParam, HirPath,
+        HirStruct, HirStructField, HirTrait, HirTypeAlias, HirTypeRef, HirUseTree, HirUseTreeKind,
+        HirVariantKind, InternalAttrTarget, PathAnchor, StructId, TraitId, TypeAliasId, Visibility,
     },
 };
 
@@ -169,12 +169,46 @@ fn generic_bound_param_name(ty: &HirTypeRef) -> Name {
 pub fn lower_attrs(node: &frontend::syntax_kind::SyntaxNode) -> Vec<HirAttr> {
     ast::attrs_for_node(node)
         .into_iter()
-        .map(|attr| HirAttr {
-            name: lower_name(attr.name()),
-            value: attr.string_value(),
-            raw: attr.raw_text(),
+        .map(lower_attr)
+        .collect()
+}
+
+pub fn lower_internal_attrs(node: &frontend::syntax_kind::SyntaxNode) -> Vec<HirInternalAttr> {
+    node.descendants()
+        .filter_map(ast::Attribute::cast)
+        .filter_map(|attr| {
+            let lowered = lower_attr(attr.clone());
+            matches!(lowered.name.0.as_str(), "lang" | "fundamental").then(|| {
+                let mut target = attr.syntax().next_sibling();
+                while target
+                    .as_ref()
+                    .is_some_and(|node| node.kind() == SyntaxKind::Attribute)
+                {
+                    target = target.and_then(|node| node.next_sibling());
+                }
+                let target = match target.as_ref().map(|node| node.kind()) {
+                    Some(SyntaxKind::TraitDecl) => InternalAttrTarget::Trait,
+                    Some(SyntaxKind::StructDecl | SyntaxKind::EnumDecl) => {
+                        InternalAttrTarget::FundamentalType
+                    }
+                    _ => InternalAttrTarget::Other,
+                };
+                HirInternalAttr {
+                    attr: lowered,
+                    target,
+                }
+            })
         })
         .collect()
+}
+
+fn lower_attr(attr: ast::Attribute) -> HirAttr {
+    HirAttr {
+        name: lower_name(attr.name()),
+        value: attr.string_value(),
+        raw: attr.raw_text(),
+        range: attr.syntax().text_range(),
+    }
 }
 
 pub fn lower_visibility(is_pub: bool) -> Visibility {

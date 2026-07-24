@@ -15,6 +15,7 @@ use hir::{
 use crate::{
     checker::{GenericEdge, TypeChecker},
     context::{BodyCtx, LambdaCtx},
+    lang_items::LangItem,
     lowering::{collect_subst, generic_param_map_with_consts, substitute_type},
     result::{
         CaptureMode, CaptureSource, ForLoopInfo, LabelStyle, LambdaCapture, LambdaInfo,
@@ -231,8 +232,18 @@ impl TypeChecker<'_> {
                 ty
             }
             Expr::Struct {
-                resolved, fields, path, ..
-            } => self.check_struct_expr(ctx, resolved.as_ref(), fields, &path.type_args, expected, span),
+                resolved,
+                fields,
+                path,
+                ..
+            } => self.check_struct_expr(
+                ctx,
+                resolved.as_ref(),
+                fields,
+                &path.type_args,
+                expected,
+                span,
+            ),
             Expr::Binary { lhs, rhs, op } => {
                 self.check_binary(ctx, expr_id, *lhs, *rhs, *op, expected, span)
             }
@@ -321,7 +332,11 @@ impl TypeChecker<'_> {
             Expr::ArrayRepeat { value, len } => {
                 self.check_array_repeat(ctx, *value, *len, expected, span)
             }
-            Expr::Call { callee, args, type_args } => self.check_call(ctx, *callee, args, type_args, expected, span),
+            Expr::Call {
+                callee,
+                args,
+                type_args,
+            } => self.check_call(ctx, *callee, args, type_args, expected, span),
             Expr::Lambda {
                 params,
                 ret_type,
@@ -900,8 +915,8 @@ impl TypeChecker<'_> {
         rhs_ty: &Type,
         span: Option<rowan::TextRange>,
     ) -> Option<Type> {
-        let (lang, method_name) = binary_operator_trait(op)?;
-        let trait_id = self.find_lang_trait(lang)?;
+        let (item, method_name) = binary_operator_trait(op)?;
+        let trait_id = self.result.trait_env.lang_items.get(item)?;
         if let Some(ty) = self.check_trait_bound_operator(
             ctx,
             expr_id,
@@ -989,8 +1004,8 @@ impl TypeChecker<'_> {
         operand_ty: &Type,
         span: Option<rowan::TextRange>,
     ) -> Option<Type> {
-        let (lang, method_name) = unary_operator_trait(op)?;
-        let trait_id = self.find_lang_trait(lang)?;
+        let (item, method_name) = unary_operator_trait(op)?;
+        let trait_id = self.result.trait_env.lang_items.get(item)?;
         if let Some(ty) =
             self.check_trait_bound_operator(ctx, expr_id, None, operand_ty, trait_id, method_name)
         {
@@ -1047,8 +1062,8 @@ impl TypeChecker<'_> {
         rhs_ty: &Type,
         span: Option<rowan::TextRange>,
     ) -> Option<()> {
-        let (lang, method_name) = assign_operator_trait(op)?;
-        let trait_id = self.find_lang_trait(lang)?;
+        let (item, method_name) = assign_operator_trait(op)?;
+        let trait_id = self.result.trait_env.lang_items.get(item)?;
         if self
             .check_trait_bound_operator(
                 ctx,
@@ -1303,7 +1318,7 @@ impl TypeChecker<'_> {
                         ctx,
                         lhs_ty,
                         std::slice::from_ref(rhs_ty),
-                        "partial_eq",
+                        LangItem::PartialEq,
                     )
                 {
                     self.diagnostic(
@@ -1328,7 +1343,7 @@ impl TypeChecker<'_> {
                         ctx,
                         lhs_ty,
                         std::slice::from_ref(rhs_ty),
-                        "partial_ord",
+                        LangItem::PartialOrd,
                     )
                 {
                     self.diagnostic(
@@ -1471,11 +1486,8 @@ impl TypeChecker<'_> {
         };
 
         if !explicit_type_args.is_empty() {
-            let type_param_names: Vec<String> = strukt
-                .generics
-                .iter()
-                .map(|n| n.0.clone())
-                .collect();
+            let type_param_names: Vec<String> =
+                strukt.generics.iter().map(|n| n.0.clone()).collect();
             if explicit_type_args.len() != type_param_names.len() {
                 self.diagnostic(
                     "E0009",
@@ -2202,11 +2214,8 @@ impl TypeChecker<'_> {
                 );
             }
             for (param_name, type_arg) in type_param_names.iter().zip(type_args.iter()) {
-                let lowered = self.lower_type_ref_with_params_at(
-                    type_arg,
-                    &ctx.generic_params,
-                    span,
-                );
+                let lowered =
+                    self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
                 subst.insert((*param_name).clone(), lowered);
             }
         }
@@ -2683,9 +2692,9 @@ impl TypeChecker<'_> {
         ctx: &BodyCtx<'_>,
         ty: &Type,
         trait_args: &[Type],
-        lang: &str,
+        item: LangItem,
     ) -> bool {
-        let Some(trait_id) = self.find_lang_trait(lang) else {
+        let Some(trait_id) = self.result.trait_env.lang_items.get(item) else {
             return false;
         };
         let generic_count = self.hir.item_tree.traits[trait_id].generics.len();
@@ -4060,48 +4069,48 @@ fn const_contains_current_param(value: &ConstArg, params: &HashMap<String, Type>
     matches!(value, ConstArg::Param(name) if params.contains_key(name))
 }
 
-fn binary_operator_trait(op: BinaryOp) -> Option<(&'static str, &'static str)> {
+fn binary_operator_trait(op: BinaryOp) -> Option<(LangItem, &'static str)> {
     Some(match op {
-        BinaryOp::Add => ("add", "add"),
-        BinaryOp::Sub => ("sub", "sub"),
-        BinaryOp::Mul => ("mul", "mul"),
-        BinaryOp::Div => ("div", "div"),
-        BinaryOp::Mod => ("rem", "rem"),
-        BinaryOp::BitAnd => ("bitand", "bitand"),
-        BinaryOp::BitOr => ("bitor", "bitor"),
-        BinaryOp::BitXor => ("bitxor", "bitxor"),
-        BinaryOp::Shl => ("shl", "shl"),
-        BinaryOp::Shr => ("shr", "shr"),
-        BinaryOp::Eq => ("partial_eq", "eq"),
-        BinaryOp::Neq => ("partial_eq", "ne"),
-        BinaryOp::Lt => ("partial_ord", "lt"),
-        BinaryOp::Gt => ("partial_ord", "gt"),
-        BinaryOp::LtEq => ("partial_ord", "le"),
-        BinaryOp::GtEq => ("partial_ord", "ge"),
+        BinaryOp::Add => (LangItem::Add, "add"),
+        BinaryOp::Sub => (LangItem::Sub, "sub"),
+        BinaryOp::Mul => (LangItem::Mul, "mul"),
+        BinaryOp::Div => (LangItem::Div, "div"),
+        BinaryOp::Mod => (LangItem::Rem, "rem"),
+        BinaryOp::BitAnd => (LangItem::BitAnd, "bitand"),
+        BinaryOp::BitOr => (LangItem::BitOr, "bitor"),
+        BinaryOp::BitXor => (LangItem::BitXor, "bitxor"),
+        BinaryOp::Shl => (LangItem::Shl, "shl"),
+        BinaryOp::Shr => (LangItem::Shr, "shr"),
+        BinaryOp::Eq => (LangItem::PartialEq, "eq"),
+        BinaryOp::Neq => (LangItem::PartialEq, "ne"),
+        BinaryOp::Lt => (LangItem::PartialOrd, "lt"),
+        BinaryOp::Gt => (LangItem::PartialOrd, "gt"),
+        BinaryOp::LtEq => (LangItem::PartialOrd, "le"),
+        BinaryOp::GtEq => (LangItem::PartialOrd, "ge"),
         _ => return None,
     })
 }
 
-fn unary_operator_trait(op: UnaryOp) -> Option<(&'static str, &'static str)> {
+fn unary_operator_trait(op: UnaryOp) -> Option<(LangItem, &'static str)> {
     Some(match op {
-        UnaryOp::Neg => ("neg", "neg"),
-        UnaryOp::Not => ("not", "not"),
+        UnaryOp::Neg => (LangItem::Neg, "neg"),
+        UnaryOp::Not => (LangItem::Not, "not"),
         _ => return None,
     })
 }
 
-fn assign_operator_trait(op: BinaryOp) -> Option<(&'static str, &'static str)> {
+fn assign_operator_trait(op: BinaryOp) -> Option<(LangItem, &'static str)> {
     Some(match op {
-        BinaryOp::Add => ("add_assign", "add_assign"),
-        BinaryOp::Sub => ("sub_assign", "sub_assign"),
-        BinaryOp::Mul => ("mul_assign", "mul_assign"),
-        BinaryOp::Div => ("div_assign", "div_assign"),
-        BinaryOp::Mod => ("rem_assign", "rem_assign"),
-        BinaryOp::BitAnd => ("bitand_assign", "bitand_assign"),
-        BinaryOp::BitOr => ("bitor_assign", "bitor_assign"),
-        BinaryOp::BitXor => ("bitxor_assign", "bitxor_assign"),
-        BinaryOp::Shl => ("shl_assign", "shl_assign"),
-        BinaryOp::Shr => ("shr_assign", "shr_assign"),
+        BinaryOp::Add => (LangItem::AddAssign, "add_assign"),
+        BinaryOp::Sub => (LangItem::SubAssign, "sub_assign"),
+        BinaryOp::Mul => (LangItem::MulAssign, "mul_assign"),
+        BinaryOp::Div => (LangItem::DivAssign, "div_assign"),
+        BinaryOp::Mod => (LangItem::RemAssign, "rem_assign"),
+        BinaryOp::BitAnd => (LangItem::BitAndAssign, "bitand_assign"),
+        BinaryOp::BitOr => (LangItem::BitOrAssign, "bitor_assign"),
+        BinaryOp::BitXor => (LangItem::BitXorAssign, "bitxor_assign"),
+        BinaryOp::Shl => (LangItem::ShlAssign, "shl_assign"),
+        BinaryOp::Shr => (LangItem::ShrAssign, "shr_assign"),
         _ => return None,
     })
 }

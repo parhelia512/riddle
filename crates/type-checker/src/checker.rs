@@ -6,12 +6,14 @@ use hir::{
     HirFile,
     body::{BodyId, ExprId},
     item_tree::{
-        EnumId, FunctionId, HirConstArg, HirFunction, HirTypeRef, HirVariantKind, StructId,
+        EnumId, FunctionId, HirConstArg, HirFunction, HirPath, HirTrait, HirTypeAlias, HirTypeRef,
+        HirVariantKind, InternalAttrTarget, PathAnchor, StructId,
     },
 };
 
 use crate::{
     context::BodyCtx,
+    lang_items::{LangItem, RegisterResult},
     result::{Diagnostic, LabelStyle, Severity, SourceLabel, TypeCheckResult},
     trait_env::{TraitAssocConstraint, TraitBound},
     types::{ClosureKind, FloatTy, IntTy, Type},
@@ -287,22 +289,109 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub(crate) fn build_trait_env(&mut self) {
+        let invalid_internal_attrs = self.validate_internal_attrs();
+
+        // ── Validate and register #[lang] traits ──────────────────────────────
         for (tid, tr) in self.hir.item_tree.traits.iter() {
             for attr in &tr.attrs {
                 if attr.name.0 != "lang" {
                     continue;
                 }
+                if invalid_internal_attrs.contains(&attr.range) {
+                    continue;
+                }
                 let Some(lang) = attr.value.as_deref() else {
                     continue;
                 };
-                if lang == "copy" {
-                    self.result.trait_env.set_copy_trait(tid);
+
+                // Unknown lang name.
+                let Some(item) = LangItem::from_name(lang) else {
+                    self.result.diagnostics.push(Diagnostic {
+                        code: "E0053",
+                        severity: Severity::Error,
+                        message: format!("unknown lang item `{lang}`"),
+                        labels: vec![SourceLabel {
+                            range: tr.name_range,
+                            message: String::new(),
+                            style: LabelStyle::Primary,
+                        }],
+                        help: Some(
+                            "recognized lang items: copy, clone, partial_eq, eq, partial_ord, ord, \
+                             add, sub, mul, div, rem, neg, not, bitand, bitor, bitxor, \
+                             shl, shr, and the *_assign variants"
+                                .to_string(),
+                        ),
+                        notes: Vec::new(),
+                    });
+                    continue;
+                };
+
+                // Signature validation.
+                if let Some(reason) = validate_lang_item_signature(item, tr) {
+                    self.result.diagnostics.push(Diagnostic {
+                        code: "E0053",
+                        severity: Severity::Error,
+                        message: format!(
+                            "lang item `{}` has an invalid trait signature: {reason}",
+                            item.as_str()
+                        ),
+                        labels: vec![SourceLabel {
+                            range: tr.name_range,
+                            message: String::new(),
+                            style: LabelStyle::Primary,
+                        }],
+                        help: None,
+                        notes: Vec::new(),
+                    });
+                    continue;
                 }
-                self.result
+
+                // Duplicate lang item / duplicate trait annotation.
+                let generic_count = tr.generics.len();
+                match self
+                    .result
                     .trait_env
-                    .set_composite_trait(tid, lang, tr.generics.len());
+                    .register_lang_item(item, tid, generic_count)
+                {
+                    RegisterResult::Ok => {}
+                    RegisterResult::DuplicateItem => {
+                        let notes = vec!["first definition is elsewhere in the source".into()];
+                        self.result.diagnostics.push(Diagnostic {
+                            code: "E0053",
+                            severity: Severity::Error,
+                            message: format!(
+                                "lang item `{}` is defined more than once",
+                                item.as_str()
+                            ),
+                            labels: vec![SourceLabel {
+                                range: tr.name_range,
+                                message: "duplicate definition here".into(),
+                                style: LabelStyle::Primary,
+                            }],
+                            help: None,
+                            notes,
+                        });
+                    }
+                    RegisterResult::DuplicateTrait => {
+                        self.result.diagnostics.push(Diagnostic {
+                            code: "E0053",
+                            severity: Severity::Error,
+                            message: "a trait can carry at most one `#[lang]` attribute; \
+                                      this trait is already registered as a different lang item"
+                                .to_string(),
+                            labels: vec![SourceLabel {
+                                range: tr.name_range,
+                                message: "second `#[lang]` attribute here".into(),
+                                style: LabelStyle::Primary,
+                            }],
+                            help: None,
+                            notes: Vec::new(),
+                        });
+                    }
+                }
             }
         }
+
         for (_, imp) in self.hir.item_tree.impls.iter() {
             let Some(trait_ty) = &imp.trait_ty else {
                 continue;
@@ -340,6 +429,55 @@ impl<'a> TypeChecker<'a> {
                 .trait_env
                 .insert_impl(trait_id, self_ty, trait_args, bounds, assoc_types);
         }
+    }
+
+    fn validate_internal_attrs(&mut self) -> HashSet<TextRange> {
+        let mut invalid = HashSet::new();
+        for internal in &self.hir.internal_attrs {
+            let attr = &internal.attr;
+            let is_user_attr =
+                self.hir.std_loaded && self.hir.package_for_range(attr.range).is_some();
+            let (code, message) = if is_user_attr {
+                (
+                    "E0049",
+                    format!("`{}` is reserved for the standard library", attr.raw),
+                )
+            } else {
+                match attr.name.0.as_str() {
+                    "lang" if internal.target != InternalAttrTarget::Trait => (
+                        "E0053",
+                        "`#[lang]` can only be applied to a trait".to_string(),
+                    ),
+                    "lang" if attr.value.is_none() => (
+                        "E0053",
+                        "`#[lang]` requires a string value: write `#[lang = \"...\"]`".to_string(),
+                    ),
+                    "fundamental" if internal.target != InternalAttrTarget::FundamentalType => (
+                        "E0053",
+                        "`#[fundamental]` can only be applied to a struct or enum".to_string(),
+                    ),
+                    "fundamental" if attr.value.is_some() => (
+                        "E0053",
+                        "`#[fundamental]` does not accept a value".to_string(),
+                    ),
+                    _ => continue,
+                }
+            };
+            invalid.insert(attr.range);
+            self.result.diagnostics.push(Diagnostic {
+                code,
+                severity: Severity::Error,
+                message,
+                labels: vec![SourceLabel {
+                    range: attr.range,
+                    message: String::new(),
+                    style: LabelStyle::Primary,
+                }],
+                help: None,
+                notes: Vec::new(),
+            });
+        }
+        invalid
     }
 
     pub(crate) fn lower_trait_env_bounds(
@@ -771,15 +909,6 @@ impl<'a> TypeChecker<'a> {
             imp.methods
                 .contains(&function_id)
                 .then_some(imp.self_ty_range)
-        })
-    }
-
-    pub(crate) fn find_lang_trait(&self, lang: &str) -> Option<hir::item_tree::TraitId> {
-        self.hir.item_tree.traits.iter().find_map(|(id, tr)| {
-            tr.attrs
-                .iter()
-                .any(|attr| attr.name.0 == "lang" && attr.value.as_deref() == Some(lang))
-                .then_some(id)
         })
     }
 
@@ -1308,4 +1437,436 @@ impl<'a> TypeChecker<'a> {
             );
         }
     }
+}
+
+// ── Lang item signature validation ──────────────────────────────────────────
+//
+// Called from `build_trait_env` before a `#[lang = "..."]` trait is
+// registered.  Returns `None` when the trait satisfies the contract, or
+// `Some(reason)` when it does not.
+
+pub(crate) fn validate_lang_item_signature(
+    item: crate::lang_items::LangItem,
+    tr: &HirTrait,
+) -> Option<String> {
+    use crate::lang_items::LangItem;
+    let self_ty = HirTypeRef::Named(HirPath {
+        anchor: PathAnchor::Plain,
+        segments: vec![hir::Name("Self".into())],
+        type_args: Vec::new(),
+    });
+
+    match item {
+        // Marker traits — no method/assoc-type contract required.
+        LangItem::Copy | LangItem::Eq => {
+            (!tr.generics.is_empty()).then(|| "marker trait must not be generic".into())
+        }
+
+        // Clone — must have `clone(&self) -> Self`.
+        LangItem::Clone => {
+            if !tr.generics.is_empty() {
+                return Some("`Clone` trait must not be generic".into());
+            }
+            let Some(method) = tr.methods.iter().find(|m| m.name.0 == "clone") else {
+                return Some("must define a method named `clone`".into());
+            };
+            if !method.generics.is_empty() || !method.const_generics.is_empty() {
+                return Some("`clone` must not carry its own generic parameters".into());
+            }
+            if method.params.len() != 1 {
+                return Some("`clone` must take exactly one parameter (`&self`)".into());
+            }
+            if !matches!(&method.params[0].ty,
+                HirTypeRef::Ref(inner, false) if lang_type_is_self(inner, &self_ty))
+            {
+                return Some("first parameter of `clone` must be `&self`".into());
+            }
+            if !method
+                .ret_type
+                .as_ref()
+                .is_some_and(|ty| lang_type_is_self(ty, &self_ty))
+            {
+                return Some("`clone` must return `Self`".into());
+            }
+            None
+        }
+
+        // Comparison traits.
+        LangItem::PartialEq => {
+            if !lang_has_valid_rhs_generic(tr, &self_ty) {
+                return Some(
+                    "comparison trait must have at most one generic type \
+                     parameter `Rhs = Self`"
+                        .into(),
+                );
+            }
+            validate_comparison_method_sig(tr, "eq", &self_ty)
+        }
+
+        LangItem::PartialOrd => {
+            if !lang_has_valid_rhs_generic(tr, &self_ty) {
+                return Some(
+                    "comparison trait must have at most one generic type \
+                     parameter `Rhs = Self`"
+                        .into(),
+                );
+            }
+            let mut found = false;
+            for name in ["lt", "gt", "le", "ge"] {
+                if tr.methods.iter().any(|method| method.name.0 == name) {
+                    found = true;
+                    if let Some(reason) = validate_comparison_method_sig(tr, name, &self_ty) {
+                        return Some(reason);
+                    }
+                }
+            }
+            if tr
+                .methods
+                .iter()
+                .any(|method| method.name.0 == "partial_cmp")
+            {
+                found = true;
+                if let Some(reason) = validate_partial_cmp(tr, &self_ty) {
+                    return Some(reason);
+                }
+            }
+            (!found).then(|| {
+                "must define at least one ordering method \
+                 (`lt`, `gt`, `le`, `ge`, or `partial_cmp`)"
+                    .into()
+            })
+        }
+
+        LangItem::Ord => validate_ord_cmp(tr, &self_ty),
+
+        // Binary operators — (self, rhs) → Self::Output.
+        LangItem::Add
+        | LangItem::Sub
+        | LangItem::Mul
+        | LangItem::Div
+        | LangItem::Rem
+        | LangItem::BitAnd
+        | LangItem::BitOr
+        | LangItem::BitXor
+        | LangItem::Shl
+        | LangItem::Shr => validate_binary_operator_trait(tr, item.as_str(), &self_ty),
+
+        // Unary operators — (self) → Self::Output.
+        LangItem::Neg | LangItem::Not => validate_unary_operator_trait(tr, item.as_str(), &self_ty),
+
+        // Assign operators — (&mut self, rhs) → ().
+        LangItem::AddAssign
+        | LangItem::SubAssign
+        | LangItem::MulAssign
+        | LangItem::DivAssign
+        | LangItem::RemAssign
+        | LangItem::BitAndAssign
+        | LangItem::BitOrAssign
+        | LangItem::BitXorAssign
+        | LangItem::ShlAssign
+        | LangItem::ShrAssign => validate_assign_operator_trait(tr, item.as_str(), &self_ty),
+    }
+}
+
+fn lang_type_is_self(ty: &HirTypeRef, self_ty: &HirTypeRef) -> bool {
+    ty == self_ty
+        || matches!(
+            ty,
+            HirTypeRef::Named(path)
+                if path.as_single_name().is_some_and(|name| name.0 == "Self")
+        )
+}
+
+fn lang_is_self_output(ty: &HirTypeRef) -> bool {
+    let HirTypeRef::Named(path) = ty else {
+        return false;
+    };
+    matches!(path.anchor, PathAnchor::Plain)
+        && path.segments.len() == 2
+        && path.segments[0].0 == "Self"
+        && path.segments[1].0 == "Output"
+        && path.type_args.is_empty()
+}
+
+fn lang_has_output_assoc_type(tr: &HirTrait) -> bool {
+    tr.type_aliases
+        .iter()
+        .any(|alias: &HirTypeAlias| alias.name.0 == "Output" && alias.ty.is_none())
+}
+
+fn lang_returns_unit(function: &HirFunction) -> bool {
+    function
+        .ret_type
+        .as_ref()
+        .is_none_or(|ty| matches!(ty, HirTypeRef::Tuple(elements) if elements.is_empty()))
+}
+
+/// Returns None if the trait's RHS generic setup is valid for an operator
+/// lang item (0 or 1 type param, if 1 it must default to `Self`).
+fn lang_has_valid_rhs_generic(tr: &HirTrait, self_ty: &HirTypeRef) -> bool {
+    tr.generics.len() <= 1
+        && if tr.generics.is_empty() {
+            true
+        } else {
+            tr.generic_defaults
+                .first()
+                .and_then(Option::as_ref)
+                .is_some_and(|default| lang_type_is_self(default, self_ty))
+        }
+}
+
+fn lang_type_is_rhs(tr: &HirTrait, ty: &HirTypeRef) -> bool {
+    match tr.generics.first() {
+        Some(rhs) => matches!(
+            ty,
+            HirTypeRef::Named(path)
+                if path.as_single_name().is_some_and(|name| name == rhs)
+        ),
+        None => true,
+    }
+}
+
+fn lang_ref_is_rhs(tr: &HirTrait, ty: &HirTypeRef) -> bool {
+    matches!(ty, HirTypeRef::Ref(inner, false) if lang_type_is_rhs(tr, inner))
+}
+
+fn validate_binary_operator_trait(
+    tr: &HirTrait,
+    method_name: &str,
+    self_ty: &HirTypeRef,
+) -> Option<String> {
+    let Some(method) = tr.methods.iter().find(|m| m.name.0 == method_name) else {
+        return Some(format!("must define a method named `{method_name}`"));
+    };
+    if !method.generics.is_empty() || !method.const_generics.is_empty() {
+        return Some(format!(
+            "`{method_name}` must not carry its own generic parameters"
+        ));
+    }
+    if !lang_has_valid_rhs_generic(tr, self_ty) {
+        return Some(format!(
+            "`#[lang = \"{method_name}\"]` trait must have at most one \
+             generic type parameter `Rhs = Self`"
+        ));
+    }
+    if !lang_has_output_assoc_type(tr) {
+        return Some(format!(
+            "`#[lang = \"{method_name}\"]` trait must declare an \
+             associated type `Output` (without a default)"
+        ));
+    }
+    if method.params.len() != 2 {
+        return Some(format!(
+            "`{method_name}` must take exactly 2 parameters (`self` and `rhs`)"
+        ));
+    }
+    if !lang_type_is_self(&method.params[0].ty, self_ty) {
+        return Some(format!("first parameter of `{method_name}` must be `self`"));
+    }
+    if !lang_type_is_rhs(tr, &method.params[1].ty) {
+        return Some(format!(
+            "second parameter of `{method_name}` must match `Rhs`"
+        ));
+    }
+    if !method.ret_type.as_ref().is_some_and(lang_is_self_output) {
+        return Some(format!("`{method_name}` must return `Self::Output`"));
+    }
+    None
+}
+
+fn validate_unary_operator_trait(
+    tr: &HirTrait,
+    method_name: &str,
+    self_ty: &HirTypeRef,
+) -> Option<String> {
+    if !tr.generics.is_empty() {
+        return Some(format!(
+            "`#[lang = \"{method_name}\"]` trait must not be generic"
+        ));
+    }
+    let Some(method) = tr.methods.iter().find(|m| m.name.0 == method_name) else {
+        return Some(format!("must define a method named `{method_name}`"));
+    };
+    if !method.generics.is_empty() || !method.const_generics.is_empty() {
+        return Some(format!(
+            "`{method_name}` must not carry its own generic parameters"
+        ));
+    }
+    if !lang_has_output_assoc_type(tr) {
+        return Some(format!(
+            "`#[lang = \"{method_name}\"]` trait must declare an associated type `Output`"
+        ));
+    }
+    if method.params.len() != 1 {
+        return Some(format!(
+            "`{method_name}` must take exactly 1 parameter (`self`)"
+        ));
+    }
+    if !lang_type_is_self(&method.params[0].ty, self_ty) {
+        return Some(format!("first parameter of `{method_name}` must be `self`"));
+    }
+    if !method.ret_type.as_ref().is_some_and(lang_is_self_output) {
+        return Some(format!("`{method_name}` must return `Self::Output`"));
+    }
+    None
+}
+
+fn validate_assign_operator_trait(
+    tr: &HirTrait,
+    method_name: &str,
+    self_ty: &HirTypeRef,
+) -> Option<String> {
+    let Some(method) = tr.methods.iter().find(|m| m.name.0 == method_name) else {
+        return Some(format!("must define a method named `{method_name}`"));
+    };
+    if !method.generics.is_empty() || !method.const_generics.is_empty() {
+        return Some(format!(
+            "`{method_name}` must not carry its own generic parameters"
+        ));
+    }
+    if !lang_has_valid_rhs_generic(tr, self_ty) {
+        return Some(format!(
+            "`#[lang = \"{method_name}\"]` trait must have at most one \
+             generic type parameter `Rhs = Self`"
+        ));
+    }
+    if method.params.len() != 2 {
+        return Some(format!(
+            "`{method_name}` must take exactly 2 parameters (`&mut self` and `rhs`)"
+        ));
+    }
+    if !matches!(&method.params[0].ty,
+        HirTypeRef::Ref(inner, true) if lang_type_is_self(inner, self_ty))
+    {
+        return Some(format!(
+            "first parameter of `{method_name}` must be `&mut self`"
+        ));
+    }
+    if !lang_type_is_rhs(tr, &method.params[1].ty) {
+        return Some(format!(
+            "second parameter of `{method_name}` must match `Rhs`"
+        ));
+    }
+    if !lang_returns_unit(method) {
+        return Some(format!("`{method_name}` must return `()` (unit)"));
+    }
+    None
+}
+
+fn validate_comparison_method_sig(
+    tr: &HirTrait,
+    method_name: &str,
+    self_ty: &HirTypeRef,
+) -> Option<String> {
+    let Some(method) = tr.methods.iter().find(|m| m.name.0 == method_name) else {
+        return Some(format!("must define a method named `{method_name}`"));
+    };
+    if !method.generics.is_empty() || !method.const_generics.is_empty() {
+        return Some(format!(
+            "`{method_name}` must not carry its own generic parameters"
+        ));
+    }
+    if method.params.len() != 2 {
+        return Some(format!(
+            "`{method_name}` must take exactly 2 parameters (`&self` and `&Rhs`)"
+        ));
+    }
+    if !matches!(&method.params[0].ty,
+        HirTypeRef::Ref(inner, false) if lang_type_is_self(inner, self_ty))
+    {
+        return Some(format!(
+            "first parameter of `{method_name}` must be `&self`"
+        ));
+    }
+    if !lang_ref_is_rhs(tr, &method.params[1].ty) {
+        return Some(format!(
+            "second parameter of `{method_name}` must be `&Rhs`"
+        ));
+    }
+    let is_bool = |ty: &HirTypeRef| {
+        matches!(ty, HirTypeRef::Named(path)
+            if path.as_single_name().is_some_and(|n| n.0 == "bool")
+                && path.type_args.is_empty())
+    };
+    if !method.ret_type.as_ref().is_some_and(is_bool) {
+        return Some(format!("`{method_name}` must return `bool`"));
+    }
+    None
+}
+
+fn validate_partial_cmp(tr: &HirTrait, self_ty: &HirTypeRef) -> Option<String> {
+    let method = tr
+        .methods
+        .iter()
+        .find(|method| method.name.0 == "partial_cmp")?;
+    if !method.generics.is_empty() || !method.const_generics.is_empty() {
+        return Some("`partial_cmp` must not carry its own generic parameters".into());
+    }
+    if method.params.len() != 2 {
+        return Some("`partial_cmp` must take exactly 2 parameters (`&self` and `&Rhs`)".into());
+    }
+    if !matches!(&method.params[0].ty,
+        HirTypeRef::Ref(inner, false) if lang_type_is_self(inner, self_ty))
+    {
+        return Some("first parameter of `partial_cmp` must be `&self`".into());
+    }
+    if !lang_ref_is_rhs(tr, &method.params[1].ty) {
+        return Some("second parameter of `partial_cmp` must be `&Rhs`".into());
+    }
+    if !method
+        .ret_type
+        .as_ref()
+        .is_some_and(lang_is_option_ordering)
+    {
+        return Some("`partial_cmp` must return `Option<Ordering>`".into());
+    }
+    None
+}
+
+fn lang_is_ordering(ty: &HirTypeRef) -> bool {
+    matches!(
+        ty,
+        HirTypeRef::Named(path)
+            if path.segments.last().is_some_and(|name| name.0 == "Ordering")
+                && path.type_args.is_empty()
+    )
+}
+
+fn lang_is_option_ordering(ty: &HirTypeRef) -> bool {
+    matches!(
+        ty,
+        HirTypeRef::Named(path)
+            if path.segments.last().is_some_and(|name| name.0 == "Option")
+                && path.type_args.len() == 1
+                && lang_is_ordering(&path.type_args[0])
+    )
+}
+
+fn validate_ord_cmp(tr: &HirTrait, self_ty: &HirTypeRef) -> Option<String> {
+    if !tr.generics.is_empty() {
+        return Some("`Ord` trait must not be generic".into());
+    }
+    let Some(method) = tr.methods.iter().find(|m| m.name.0 == "cmp") else {
+        return Some("must define a method named `cmp`".into());
+    };
+    if !method.generics.is_empty() || !method.const_generics.is_empty() {
+        return Some("`cmp` must not carry its own generic parameters".into());
+    }
+    if method.params.len() != 2 {
+        return Some("`cmp` must take exactly 2 parameters (`&self` and `&Self`)".into());
+    }
+    if !matches!(&method.params[0].ty,
+        HirTypeRef::Ref(inner, false) if lang_type_is_self(inner, self_ty))
+    {
+        return Some("first parameter of `cmp` must be `&self`".into());
+    }
+    if !matches!(&method.params[1].ty,
+        HirTypeRef::Ref(inner, false) if lang_type_is_self(inner, self_ty))
+    {
+        return Some("second parameter of `cmp` must be `&Self`".into());
+    }
+    if !method.ret_type.as_ref().is_some_and(lang_is_ordering) {
+        return Some("`cmp` must return `Ordering`".into());
+    }
+    None
 }

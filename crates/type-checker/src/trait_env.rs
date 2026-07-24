@@ -2,7 +2,11 @@ use std::collections::HashMap;
 
 use hir::item_tree::TraitId;
 
-use crate::{Type, lowering::substitute_type};
+use crate::{
+    Type,
+    lang_items::{CompositeKind, LangItem, LangItemRegistry, RegisterResult},
+    lowering::substitute_type,
+};
 
 #[derive(Debug, Clone)]
 pub struct TraitBound {
@@ -52,6 +56,11 @@ pub struct TraitEnv {
 
     /// Language traits with compiler-provided tuple and array implementations.
     composite_traits: HashMap<TraitId, CompositeTraitKind>,
+
+    /// Registry of all recognized `#[lang = "..."]` trait items.
+    /// Built once during `build_trait_env`; all downstream passes query this
+    /// instead of scanning the item tree.
+    pub lang_items: LangItemRegistry,
 }
 
 impl TraitEnv {
@@ -165,20 +174,42 @@ impl TraitEnv {
             });
     }
 
-    pub(crate) fn set_copy_trait(&mut self, id: TraitId) {
-        self.copy_trait_id = Some(id);
-    }
-
-    pub(crate) fn set_composite_trait(&mut self, id: TraitId, lang: &str, generic_count: usize) {
-        let kind = match lang {
-            "copy" => CompositeTraitKind::Copy,
-            "partial_eq" => CompositeTraitKind::PartialEq(generic_count != 0),
-            "eq" => CompositeTraitKind::Eq,
-            "partial_ord" => CompositeTraitKind::PartialOrd(generic_count != 0),
-            "ord" => CompositeTraitKind::Ord,
-            _ => return,
-        };
-        self.composite_traits.insert(id, kind);
+    /// Registers a known lang item.
+    ///
+    /// Returns the registration result — callers are responsible for
+    /// emitting diagnostics when the result is not `Ok`.
+    pub(crate) fn register_lang_item(
+        &mut self,
+        item: LangItem,
+        id: TraitId,
+        generic_count: usize,
+    ) -> RegisterResult {
+        let result = self.lang_items.register(item, id);
+        if result != RegisterResult::Ok {
+            return result;
+        }
+        // Maintain the copy_trait_id fast-path.
+        if item == LangItem::Copy {
+            self.copy_trait_id = Some(id);
+        }
+        // Maintain composite_traits for structural tuple/array derivation.
+        if let Some(comp_kind) = item.composite_kind() {
+            let kind = match comp_kind {
+                CompositeKind::Same => match item {
+                    LangItem::Copy => CompositeTraitKind::Copy,
+                    LangItem::Eq => CompositeTraitKind::Eq,
+                    LangItem::Ord => CompositeTraitKind::Ord,
+                    _ => unreachable!(),
+                },
+                CompositeKind::Binary => match item {
+                    LangItem::PartialEq => CompositeTraitKind::PartialEq(generic_count != 0),
+                    LangItem::PartialOrd => CompositeTraitKind::PartialOrd(generic_count != 0),
+                    _ => unreachable!(),
+                },
+            };
+            self.composite_traits.insert(id, kind);
+        }
+        RegisterResult::Ok
     }
 
     fn has_builtin_impl(&self, ty: &Type, trait_id: TraitId, trait_args: &[Type]) -> bool {

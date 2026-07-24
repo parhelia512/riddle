@@ -141,7 +141,7 @@ impl Type {
                 }
             }
             Type::FnPtr(_) => 8,
-            Type::Str => panic!("cannot compute the size of unsized `str`"),
+            Type::Str => unreachable!("cannot compute the size of unsized `str`"),
             Type::Unit => 0,
             Type::Never => 0,
             _ => 8, // 聚合类型：降级为指针大小

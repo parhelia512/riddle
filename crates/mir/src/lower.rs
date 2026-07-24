@@ -1327,7 +1327,7 @@ impl<'a> LowerCtx<'a> {
         }
 
         if !self.is_std_range_expr(iterable) {
-            panic!("missing type-checker metadata for for loop");
+            return builder.unit_const();
         }
 
         let i32_ty = Type::Int(IntTy::I32);
@@ -2462,7 +2462,8 @@ impl<'a> LowerCtx<'a> {
         }
 
         if let Some((lang, method)) = comparison_trait(op)
-            && let Some(trait_id) = self.lang_trait_id(lang)
+            && let Some(lang_item) = type_checker::lang_items::LangItem::from_name(lang)
+            && let Some(trait_id) = self.type_result.trait_env.lang_items.get(lang_item)
             && let Some(fid) = self.find_trait_impl_method(trait_id, method, lhs_ty, Some(rhs_ty))
         {
             let Some(receiver_ty) = self.hir.item_tree.functions[fid]
@@ -2509,20 +2510,6 @@ impl<'a> LowerCtx<'a> {
             ),
             _ => value,
         }
-    }
-
-    fn lang_trait_id(&self, lang: &str) -> Option<hir::item_tree::TraitId> {
-        self.hir
-            .item_tree
-            .traits
-            .iter()
-            .find_map(|(id, trait_item)| {
-                trait_item
-                    .attrs
-                    .iter()
-                    .any(|attr| attr.name.0 == "lang" && attr.value.as_deref() == Some(lang))
-                    .then_some(id)
-            })
     }
 
     fn lower_builtin_operator_method_call(
@@ -3602,17 +3589,13 @@ impl<'a> LowerCtx<'a> {
         let scalar = primitive_scalar_name(&imp.self_ty)?;
         let trait_id = self.resolve_trait_ref(imp.trait_ty.as_ref()?)?;
         let trait_item = &self.hir.item_tree.traits[trait_id];
-        let lang = trait_item.attrs.iter().find_map(|attr| {
-            (attr.name.0 == "lang")
-                .then_some(attr.value.as_deref())
-                .flatten()
-        })?;
+        let lang_item = self.type_result.trait_env.lang_items.lang_of(trait_id)?;
         let function = &self.hir.item_tree.functions[fid];
         if !function.generics.is_empty() || !function.const_generics.is_empty() {
             return None;
         }
         let method = function.name.0.as_str();
-        let op = builtin_operator(lang, method)?;
+        let op = builtin_operator(lang_item.as_str(), method)?;
         builtin_operator_supports(op, scalar).then_some(())?;
         trait_operator_contract(trait_item, method, op).then_some(())?;
         self.impl_operator_contract(imp, function, op).then_some(op)

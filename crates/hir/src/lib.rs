@@ -2,7 +2,7 @@ use body_lower::BodyLower;
 use std::collections::HashMap;
 
 use body::{Body, BodyId};
-use item_tree::{FunctionId, HirModule, HirUse, ItemTree, ModuleId, TopLevelItem};
+use item_tree::{FunctionId, HirInternalAttr, HirModule, HirUse, ItemTree, ModuleId, TopLevelItem};
 use la_arena::Arena;
 use lower::{AstLower, Lower};
 use rowan::TextRange;
@@ -26,12 +26,17 @@ pub struct HirFile {
     pub item_tree: ItemTree,
     pub bodies: Arena<Body>,
     pub function_bodies: HashMap<FunctionId, BodyId>,
+    pub internal_attrs: Vec<HirInternalAttr>,
     /// Disjoint source ranges owned by packages participating in this compilation.
     pub package_ranges: Vec<TextRange>,
+    /// True when the standard library prelude was appended to the source.
+    /// Items outside `package_ranges` belong to the standard library.
+    pub std_loaded: bool,
 }
 
 pub fn lower_root(root: Root) -> HirFile {
     let package_range = root.syntax().text_range();
+    let internal_attrs = lower::lower_internal_attrs(root.syntax());
     let mut hir = HirFile {
         item_tree: ItemTree {
             functions: Arena::new(),
@@ -48,7 +53,9 @@ pub fn lower_root(root: Root) -> HirFile {
         },
         bodies: Arena::new(),
         function_bodies: HashMap::new(),
+        internal_attrs,
         package_ranges: vec![package_range],
+        std_loaded: false,
     };
 
     let top = lower_items(&mut hir, root.stmts().collect());

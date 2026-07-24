@@ -3,6 +3,7 @@ mod checker;
 mod context;
 mod coverage;
 pub mod incremental;
+pub mod lang_items;
 mod lowering;
 mod result;
 mod trait_env;

@@ -527,6 +527,7 @@ fn run_pipeline_with_state(
         .iter()
         .map(|range| rowan::TextRange::new((range.start as u32).into(), (range.end as u32).into()))
         .collect();
+    hir.std_loaded = options.use_std;
 
     // 3. Build scope graph + resolve names
     let (sg, scope_diagnostics) = build_scope_graph(&hir, &syntax);

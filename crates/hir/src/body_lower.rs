@@ -493,7 +493,14 @@ impl<'a> BodyLower<'a> {
                 let callee = self.lower_required_expr(c.callee(), "missing call callee", range);
                 let args = self.lower_arg_list(c.arg_list());
                 let type_args = c.type_args().into_iter().map(|ty| ty.lower()).collect();
-                self.alloc_expr(Expr::Call { callee, args, type_args }, range)
+                self.alloc_expr(
+                    Expr::Call {
+                        callee,
+                        args,
+                        type_args,
+                    },
+                    range,
+                )
             }
 
             ast::Expr::LambdaExpr(lambda) => {

@@ -231,7 +231,9 @@ impl TypeChecker<'_> {
                 // A `#[fundamental]` foreign type is transparent: it is local iff
                 // one of its arguments is (mirrors `Box<LocalType>` in Rust).
                 is_fundamental(&strukt.attrs)
-                    && args.iter().any(|arg| self.orphan_type_is_local(arg, package))
+                    && args
+                        .iter()
+                        .any(|arg| self.orphan_type_is_local(arg, package))
             }
             Type::Enum(id, args) => {
                 let enumeration = &self.hir.item_tree.enums[*id];
@@ -239,14 +241,21 @@ impl TypeChecker<'_> {
                     return true;
                 }
                 is_fundamental(&enumeration.attrs)
-                    && args.iter().any(|arg| self.orphan_type_is_local(arg, package))
+                    && args
+                        .iter()
+                        .any(|arg| self.orphan_type_is_local(arg, package))
             }
             _ => false,
         }
     }
 
     pub(crate) fn validate_copy_impls(&mut self) {
-        let Some(copy_trait) = self.find_lang_trait("copy") else {
+        let Some(copy_trait) = self
+            .result
+            .trait_env
+            .lang_items
+            .get(crate::lang_items::LangItem::Copy)
+        else {
             return;
         };
         let impls = self
@@ -892,12 +901,14 @@ fn uncovered_orphan_param(ty: &Type, prefix: &str) -> Option<String> {
         Type::Const(ConstArg::Param(name)) => name.strip_prefix(prefix).map(str::to_string),
         Type::Ref(inner, _) | Type::Ptr { inner, .. } => uncovered_orphan_param(inner, prefix),
         Type::Array(inner, len) => uncovered_orphan_param(inner, prefix).or_else(|| {
-            let ConstArg::Param(name) = len else { return None };
+            let ConstArg::Param(name) = len else {
+                return None;
+            };
             name.strip_prefix(prefix).map(str::to_string)
         }),
-        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => {
-            elements.iter().find_map(|ty| uncovered_orphan_param(ty, prefix))
-        }
+        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => elements
+            .iter()
+            .find_map(|ty| uncovered_orphan_param(ty, prefix)),
         Type::Fn { params, ret, .. } => params
             .iter()
             .chain(std::iter::once(ret.as_ref()))

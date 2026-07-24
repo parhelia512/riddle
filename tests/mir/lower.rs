@@ -711,8 +711,11 @@ fn primitive_operator_trait_without_lang_marker_keeps_ordinary_method() {
 }
 
 #[test]
-fn malformed_lang_operator_signature_keeps_ordinary_method() {
-    let module = lower(
+fn malformed_lang_operator_signature_is_rejected() {
+    // A `#[lang = "add"]` trait whose method has the wrong arity (missing rhs)
+    // and no `Output` associated type must be rejected at registration time with
+    // E0053, not silently accepted and degraded to an ordinary method.
+    let (_, type_result, _, _) = compile(
         r#"
         #[lang = "add"]
         trait Add {
@@ -731,10 +734,12 @@ fn malformed_lang_operator_signature_keeps_ordinary_method() {
     );
 
     assert!(
-        module
-            .function_order
+        type_result
+            .diagnostics
             .iter()
-            .any(|fid| module.functions[*fid].name == "add__i32")
+            .any(|d| d.code == "E0053" && d.message.contains("invalid trait signature")),
+        "expected E0053 for malformed lang trait signature, got: {:?}",
+        type_result.diagnostics,
     );
 }
 

@@ -59,6 +59,20 @@ pub struct HirAttr {
     pub name: Name,
     pub value: Option<String>,
     pub raw: String,
+    pub range: TextRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InternalAttrTarget {
+    Trait,
+    FundamentalType,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct HirInternalAttr {
+    pub attr: HirAttr,
+    pub target: InternalAttrTarget,
 }
 
 #[derive(Debug, Clone)]

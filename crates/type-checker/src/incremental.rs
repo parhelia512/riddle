@@ -521,6 +521,12 @@ fn type_context_fingerprint_with_packages(hir: &HirFile) -> u64 {
     for (_, item) in hir.item_tree.impls.iter() {
         hir.package_for_range(item.self_ty_range).hash(&mut hasher);
     }
+    for internal in &hir.internal_attrs {
+        internal.attr.name.hash(&mut hasher);
+        internal.attr.value.hash(&mut hasher);
+        internal.target.hash(&mut hasher);
+        hir.package_for_range(internal.attr.range).hash(&mut hasher);
+    }
     hasher.finish()
 }
 

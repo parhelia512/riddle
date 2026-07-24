@@ -70,9 +70,13 @@ fn accepts_inherent_method_call_with_self_receiver() {
         }
 
         #[lang = "partial_eq"]
-        trait PartialEq {}
+        trait PartialEq {
+            fun eq(&self, other: &Self) -> bool;
+        }
 
-        impl PartialEq for Foo {}
+        impl PartialEq for Foo {
+            fun eq(&self, other: &Self) -> bool { false }
+        }
 
         impl Foo {
             fun get(&self) -> &str {
@@ -810,7 +814,9 @@ fn checks_partial_eq_for_user_equality() {
     let result = check(
         r#"
         #[lang = "partial_eq"]
-        trait PartialEq {}
+        trait PartialEq {
+            fun eq(&self, other: &Self) -> bool;
+        }
 
         enum Foo {
             A,
@@ -835,14 +841,18 @@ fn checks_partial_eq_for_user_equality() {
     let result = check(
         r#"
         #[lang = "partial_eq"]
-        trait PartialEq {}
+        trait PartialEq {
+            fun eq(&self, other: &Self) -> bool;
+        }
 
         enum Foo {
             A,
             B,
         }
 
-        impl PartialEq for Foo {}
+        impl PartialEq for Foo {
+            fun eq(&self, other: &Self) -> bool { false }
+        }
 
         fun main() {
             let a = Foo::A;
@@ -860,16 +870,24 @@ fn checks_eq_marker_dependencies() {
     let result = check(
         r#"
         #[lang = "partial_eq"]
-        trait PartialEq {}
+        trait PartialEq {
+            fun eq(&self, other: &Self) -> bool;
+        }
 
         #[lang = "eq"]
         trait Eq: PartialEq {}
 
         #[lang = "partial_ord"]
-        trait PartialOrd: PartialEq {}
+        trait PartialOrd: PartialEq {
+            fun lt(&self, other: &Self) -> bool;
+        }
+
+        enum Ordering { Equal }
 
         #[lang = "ord"]
-        trait Ord: Eq + PartialOrd {}
+        trait Ord: Eq + PartialOrd {
+            fun cmp(&self, other: &Self) -> Ordering;
+        }
 
         struct MissingEq {}
         struct MissingPartialOrd {}
@@ -1592,4 +1610,265 @@ fn trait_default_method_can_call_required_method() {
     );
 
     assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn std_mode_rejects_user_defined_lang_copy_trait() {
+    let result = riddlec::pipeline::check_with_options(
+        r#"#[lang = "copy"] trait UserCopy {}"#,
+        riddlec::pipeline::CompileOptions::default(),
+    );
+    let e0049: Vec<_> = result
+        .type_result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "E0049")
+        .collect();
+    assert!(
+        !e0049.is_empty(),
+        "expected E0049 diagnostic, got: {:?}",
+        result.type_result.diagnostics
+    );
+    assert!(
+        e0049.iter().any(|d| d.message.contains("copy")),
+        "expected message to contain \"copy\": {:?}",
+        e0049
+    );
+}
+
+#[test]
+fn std_mode_rejects_user_defined_fundamental_struct() {
+    let result = riddlec::pipeline::check_with_options(
+        r#"#[fundamental] struct MyBox<T> { value: T }"#,
+        riddlec::pipeline::CompileOptions::default(),
+    );
+    let e0049: Vec<_> = result
+        .type_result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "E0049")
+        .collect();
+    assert!(
+        !e0049.is_empty(),
+        "expected E0049 diagnostic, got: {:?}",
+        result.type_result.diagnostics
+    );
+}
+
+#[test]
+fn no_std_mode_reports_unknown_lang_item() {
+    let result = riddlec::pipeline::check_with_options(
+        r#"#[lang = "unknown_item"] trait Foo {}"#,
+        riddlec::pipeline::CompileOptions { use_std: false },
+    );
+    let e0053: Vec<_> = result
+        .type_result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "E0053")
+        .collect();
+    assert!(
+        !e0053.is_empty(),
+        "expected E0053 diagnostic, got: {:?}",
+        result.type_result.diagnostics
+    );
+    assert!(
+        e0053
+            .iter()
+            .any(|d| d.message.contains("unknown lang item")),
+        "expected message to contain \"unknown lang item\": {:?}",
+        e0053
+    );
+}
+
+#[test]
+fn no_std_mode_reports_duplicate_lang_item() {
+    let result = riddlec::pipeline::check_with_options(
+        r#"
+        #[lang = "copy"] trait Copy1 {}
+        #[lang = "copy"] trait Copy2 {}
+        "#,
+        riddlec::pipeline::CompileOptions { use_std: false },
+    );
+    let e0053: Vec<_> = result
+        .type_result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "E0053")
+        .collect();
+    assert_eq!(
+        e0053.len(),
+        1,
+        "expected exactly 1 E0053 diagnostic, got: {:?}",
+        result.type_result.diagnostics
+    );
+    assert!(
+        e0053[0].message.contains("defined more than once"),
+        "expected message to contain \"defined more than once\": {:?}",
+        e0053[0].message
+    );
+}
+
+#[test]
+fn no_std_mode_reports_missing_lang_value() {
+    let result = riddlec::pipeline::check_with_options(
+        "#[lang] trait Copy {}",
+        riddlec::pipeline::CompileOptions { use_std: false },
+    );
+    assert!(result.type_result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0053" && diagnostic.message.contains("requires a string value")
+    }));
+}
+
+#[test]
+fn no_std_mode_rejects_multiple_lang_items_on_one_trait() {
+    let result = riddlec::pipeline::check_with_options(
+        r#"
+        #[lang = "copy"]
+        #[lang = "eq"]
+        trait Marker {}
+        "#,
+        riddlec::pipeline::CompileOptions { use_std: false },
+    );
+    assert!(result.type_result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0053"
+            && diagnostic
+                .message
+                .contains("at most one `#[lang]` attribute")
+    }));
+}
+
+#[test]
+fn std_mode_rejects_internal_attributes_before_validating_their_shape() {
+    let cases = [
+        r#"#[lang] trait UserCopy {}"#,
+        r#"#[lang = "copy"] struct UserCopy {}"#,
+        r#"#[fundamental] fun user_function() {}"#,
+    ];
+
+    for source in cases {
+        let result = riddlec::pipeline::check_with_options(
+            source,
+            riddlec::pipeline::CompileOptions::default(),
+        );
+        assert!(
+            result
+                .type_result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0049"),
+            "expected E0049 for {source:?}, got: {:?}",
+            result.type_result.diagnostics
+        );
+        assert!(
+            result
+                .type_result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "E0053"),
+            "source gating must precede shape validation for {source:?}: {:?}",
+            result.type_result.diagnostics
+        );
+    }
+}
+
+#[test]
+fn no_std_mode_rejects_lang_on_every_non_trait_target() {
+    let cases = [
+        r#"#[lang = "copy"] mod nested {}"#,
+        r#"mod nested {} #[lang = "copy"] use nested;"#,
+        r#"struct Item {} #[lang = "copy"] impl Item {}"#,
+        r#"#[lang = "copy"] const VALUE: i32 = 1;"#,
+        r#"#[lang = "copy"] type Value = i32;"#,
+        r#"struct Item { #[lang = "copy"] value: i32 }"#,
+        r#"fun take(#[lang = "copy"] value: i32) {}"#,
+        r#"enum State { #[lang = "copy"] Ready }"#,
+        r#"trait Value { #[lang = "copy"] fun get(&self); }"#,
+        r#"trait Value { #[lang = "copy"] type Item; }"#,
+        r#"fun take(value: #[lang = "copy"] i32) {}"#,
+        r#"fun main() { let value = #[lang = "copy"] 1; }"#,
+    ];
+
+    for source in cases {
+        let result = riddlec::pipeline::check_with_options(
+            source,
+            riddlec::pipeline::CompileOptions { use_std: false },
+        );
+        assert!(
+            result.type_result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "E0053"
+                    && diagnostic
+                        .message
+                        .contains("can only be applied to a trait")
+            }),
+            "expected invalid lang target diagnostic for {source:?}, got: {:?}",
+            result.type_result.diagnostics
+        );
+    }
+}
+
+#[test]
+fn no_std_mode_rejects_fundamental_on_non_type_targets() {
+    let cases = [
+        r#"#[fundamental] fun user_function() {}"#,
+        r#"#[fundamental] trait UserTrait {}"#,
+        r#"struct Item { #[fundamental] value: i32 }"#,
+        r#"#[fundamental] type Value = i32;"#,
+    ];
+
+    for source in cases {
+        let result = riddlec::pipeline::check_with_options(
+            source,
+            riddlec::pipeline::CompileOptions { use_std: false },
+        );
+        assert!(
+            result.type_result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "E0053"
+                    && diagnostic
+                        .message
+                        .contains("can only be applied to a struct or enum")
+            }),
+            "expected invalid fundamental target diagnostic for {source:?}, got: {:?}",
+            result.type_result.diagnostics
+        );
+    }
+}
+
+#[test]
+fn no_std_mode_rejects_fundamental_values() {
+    let result = riddlec::pipeline::check_with_options(
+        r#"#[fundamental = "ignored"] struct Wrapper<T> { value: T }"#,
+        riddlec::pipeline::CompileOptions { use_std: false },
+    );
+    assert!(result.type_result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0053" && diagnostic.message.contains("does not accept a value")
+    }));
+}
+
+#[test]
+fn no_std_mode_rejects_incomplete_lang_item_signatures() {
+    let cases = [
+        r#"#[lang = "copy"] trait Copy<T> {}"#,
+        r#"#[lang = "eq"] trait Eq<T> {}"#,
+        r#"#[lang = "clone"] trait Clone { fun clone<T>(&self) -> Self; }"#,
+        r#"#[lang = "partial_eq"] trait PartialEq { fun eq(&self, other: i32) -> bool; }"#,
+        r#"#[lang = "partial_ord"] trait PartialOrd { fun partial_cmp() -> bool; }"#,
+        r#"#[lang = "ord"] trait Ord { fun cmp(&self, other: i32) -> bool; }"#,
+        r#"#[lang = "add"] trait Add<Rhs = Self> { type Output; fun add(self, rhs: bool) -> Self::Output; }"#,
+        r#"#[lang = "add_assign"] trait AddAssign<Rhs = Self> { fun add_assign(&mut self, rhs: bool); }"#,
+    ];
+
+    for source in cases {
+        let result = riddlec::pipeline::check_with_options(
+            source,
+            riddlec::pipeline::CompileOptions { use_std: false },
+        );
+        assert!(
+            result.type_result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "E0053" && diagnostic.message.contains("invalid trait signature")
+            }),
+            "expected invalid lang signature diagnostic for {source:?}, got: {:?}",
+            result.type_result.diagnostics
+        );
+    }
 }
