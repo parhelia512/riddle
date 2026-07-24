@@ -288,7 +288,7 @@ impl<'a> SummaryAnalyzer<'a> {
                 result
             }
 
-            Expr::Call { callee, args } => self.analyze_call(*callee, args, expr_id),
+            Expr::Call { callee, args, .. } => self.analyze_call(*callee, args, expr_id),
 
             Expr::Lambda { body, .. } => {
                 self.analyze_expr(*body);

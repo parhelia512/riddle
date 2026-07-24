@@ -231,8 +231,8 @@ impl TypeChecker<'_> {
                 ty
             }
             Expr::Struct {
-                resolved, fields, ..
-            } => self.check_struct_expr(ctx, resolved.as_ref(), fields, expected, span),
+                resolved, fields, path, ..
+            } => self.check_struct_expr(ctx, resolved.as_ref(), fields, &path.type_args, expected, span),
             Expr::Binary { lhs, rhs, op } => {
                 self.check_binary(ctx, expr_id, *lhs, *rhs, *op, expected, span)
             }
@@ -321,7 +321,7 @@ impl TypeChecker<'_> {
             Expr::ArrayRepeat { value, len } => {
                 self.check_array_repeat(ctx, *value, *len, expected, span)
             }
-            Expr::Call { callee, args } => self.check_call(ctx, *callee, args, expected, span),
+            Expr::Call { callee, args, type_args } => self.check_call(ctx, *callee, args, type_args, expected, span),
             Expr::Lambda {
                 params,
                 ret_type,
@@ -791,7 +791,7 @@ impl TypeChecker<'_> {
                 self.infer_capture_uses(ctx, value, CaptureMode::Value);
                 self.infer_capture_uses(ctx, len, CaptureMode::Shared);
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 let callee_mode = match self
                     .result
                     .expr_types
@@ -1440,6 +1440,7 @@ impl TypeChecker<'_> {
         ctx: &mut BodyCtx<'_>,
         resolved: Option<&ResolvedName>,
         fields: &[hir::body::StructExprField],
+        explicit_type_args: &[HirTypeRef],
         expected: Option<&Type>,
         span: Option<rowan::TextRange>,
     ) -> Type {
@@ -1468,6 +1469,30 @@ impl TypeChecker<'_> {
             }
             _ => HashMap::new(),
         };
+
+        if !explicit_type_args.is_empty() {
+            let type_param_names: Vec<String> = strukt
+                .generics
+                .iter()
+                .map(|n| n.0.clone())
+                .collect();
+            if explicit_type_args.len() != type_param_names.len() {
+                self.diagnostic(
+                    "E0009",
+                    format!(
+                        "struct `{}` expects {} type argument(s), got {}",
+                        strukt.name.0,
+                        type_param_names.len(),
+                        explicit_type_args.len()
+                    ),
+                    span,
+                );
+            }
+            for (name, ty) in type_param_names.iter().zip(explicit_type_args.iter()) {
+                let lowered = self.lower_type_ref_with_params_at(ty, &ctx.generic_params, span);
+                subst.insert(name.clone(), lowered);
+            }
+        }
         let expected_fields = strukt
             .fields
             .iter()
@@ -2062,6 +2087,7 @@ impl TypeChecker<'_> {
         ctx: &mut BodyCtx<'_>,
         callee: ExprId,
         args: &[ExprId],
+        type_args: &[HirTypeRef],
         expected: Option<&Type>,
         span: Option<rowan::TextRange>,
     ) -> Type {
@@ -2156,6 +2182,35 @@ impl TypeChecker<'_> {
                 .chain(function.const_generics.iter().map(|name| name.0.as_str())),
         );
         let mut subst = HashMap::new();
+
+        // Seed substitution from explicit type arguments if provided
+        if !type_args.is_empty() {
+            let type_param_names: Vec<_> = impl_generics
+                .iter()
+                .chain(function.generics.iter().map(|n| &n.0))
+                .collect();
+            if type_args.len() != type_param_names.len() {
+                self.diagnostic(
+                    "E0005",
+                    format!(
+                        "function `{}` expects {} type argument(s), got {}",
+                        function.name.0,
+                        type_param_names.len(),
+                        type_args.len()
+                    ),
+                    span,
+                );
+            }
+            for (param_name, type_arg) in type_param_names.iter().zip(type_args.iter()) {
+                let lowered = self.lower_type_ref_with_params_at(
+                    type_arg,
+                    &ctx.generic_params,
+                    span,
+                );
+                subst.insert((*param_name).clone(), lowered);
+            }
+        }
+
         if args.len() != function.params.len() {
             self.diagnostic(
                 "E0005",

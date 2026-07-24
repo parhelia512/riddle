@@ -250,7 +250,7 @@ fn array_type_requires_rust_style_length() {
 }
 
 #[test]
-fn reports_unsupported_explicit_generic_exprs_without_cascading() {
+fn accepts_explicit_generic_call_and_struct_expr() {
     let source = r#"
         struct Wrap<T> {
             inner: T,
@@ -270,13 +270,7 @@ fn reports_unsupported_explicit_generic_exprs_without_cascading() {
         .map(|error| error.message.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        messages,
-        vec![
-            "explicit generic function calls are not supported; omit the type arguments",
-            "explicit generic struct literals are not supported; omit the type arguments",
-        ]
-    );
+    assert_eq!(messages, Vec::<&str>::new());
 }
 
 #[test]

@@ -492,7 +492,8 @@ impl<'a> BodyLower<'a> {
             ast::Expr::CallExpr(c) => {
                 let callee = self.lower_required_expr(c.callee(), "missing call callee", range);
                 let args = self.lower_arg_list(c.arg_list());
-                self.alloc_expr(Expr::Call { callee, args }, range)
+                let type_args = c.type_args().into_iter().map(|ty| ty.lower()).collect();
+                self.alloc_expr(Expr::Call { callee, args, type_args }, range)
             }
 
             ast::Expr::LambdaExpr(lambda) => {
@@ -591,7 +592,12 @@ impl<'a> BodyLower<'a> {
                         StructExprField { name, value }
                     })
                     .collect();
-                let path = s.path().lower();
+                let mut path = s.path().lower();
+                let explicit_type_args: Vec<HirTypeRef> =
+                    s.type_args().into_iter().map(|ty| ty.lower()).collect();
+                if !explicit_type_args.is_empty() {
+                    path.type_args = explicit_type_args;
+                }
                 self.alloc_expr(
                     Expr::Struct {
                         path,

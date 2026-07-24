@@ -957,6 +957,14 @@ impl CallExpr {
         support::child(&self.syntax)
     }
 
+    pub fn type_args(&self) -> Vec<Type> {
+        self.syntax
+            .children()
+            .find_map(TypeArgList::cast)
+            .map(|list| list.types().collect())
+            .unwrap_or_default()
+    }
+
     pub fn arg_list(&self) -> Option<ArgList> {
         support::child(&self.syntax)
     }
@@ -991,6 +999,14 @@ impl IndexExpr {
 impl StructExpr {
     pub fn path(&self) -> Option<Path> {
         support::child::<NameRefExpr>(&self.syntax)?.path()
+    }
+
+    pub fn type_args(&self) -> Vec<Type> {
+        self.syntax
+            .children()
+            .find_map(TypeArgList::cast)
+            .map(|list| list.types().collect())
+            .unwrap_or_default()
     }
 
     pub fn fields(&self) -> impl Iterator<Item = StructExprField> + '_ {

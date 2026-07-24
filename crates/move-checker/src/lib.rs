@@ -393,7 +393,7 @@ impl<'a> Analyzer<'a> {
                 );
             }
 
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 if let Expr::FieldAccess { base, .. } = &ctx.body.exprs[*callee]
                     && let Some(place) = self.place_from_expr(ctx, *base)
                     && ctx.moved_places.iter().any(|m| place_overlaps(m, &place))
@@ -1678,7 +1678,7 @@ fn collect_local_uses(body: &Body) -> HashMap<StmtId, usize> {
                     expr(body, field.value, uses);
                 }
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 expr(body, *callee, uses);
                 for arg in args {
                     expr(body, *arg, uses);

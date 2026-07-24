@@ -173,6 +173,7 @@ pub enum Expr {
     Call {
         callee: ExprId,
         args: Vec<ExprId>,
+        type_args: Vec<HirTypeRef>,
     },
     Lambda {
         params: Vec<LambdaParam>,
@@ -513,7 +514,7 @@ impl BodyPrinter<'_> {
                 let rhs = self.print_expr(*rhs, current_prec + 1, indent);
                 format!("({} {} {})", lhs, Self::binary_op_text(op), rhs)
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 let callee = self.print_expr(*callee, current_prec, indent);
                 let args = args
                     .iter()

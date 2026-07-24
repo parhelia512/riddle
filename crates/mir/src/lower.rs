@@ -8,6 +8,7 @@ use hir::{
         BinaryOp as HirBinOp, Body, BodyId, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern,
         PatternBindingId, ResolvedName, Stmt, StmtId, UnaryOp as HirUnOp,
     },
+    item_tree::{HirTypeRef, PathAnchor},
 };
 use type_checker::{CaptureMode, CaptureSource, LambdaInfo, OperatorCall, TypeCheckResult};
 
@@ -1090,7 +1091,7 @@ impl<'a> LowerCtx<'a> {
                 }
             }
 
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 if let Expr::Path {
                     resolved: Some(ResolvedName::EnumVariant(enum_id, variant_index)),
                     ..
@@ -2228,7 +2229,23 @@ impl<'a> LowerCtx<'a> {
                 type_checker::Type::Struct(sid, _) => Some(*sid),
                 _ => None,
             })
-            .map(|sid| self.hir.item_tree.structs[sid].name.0 == "Range")
+            .map(|sid| {
+                let s = &self.hir.item_tree.structs[sid];
+                if s.name.0 != "Range" || s.fields.len() != 2 {
+                    return false;
+                }
+                let is_i32 = |ty: &HirTypeRef| {
+                    matches!(ty, HirTypeRef::Named(p)
+                        if p.anchor == PathAnchor::Plain
+                            && p.segments.len() == 1
+                            && p.segments[0].0 == "i32"
+                            && p.type_args.is_empty())
+                };
+                s.fields[0].name.0 == "start"
+                    && s.fields[1].name.0 == "end"
+                    && is_i32(&s.fields[0].ty)
+                    && is_i32(&s.fields[1].ty)
+            })
             .unwrap_or(false)
     }
 

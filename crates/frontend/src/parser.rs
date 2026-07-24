@@ -1122,15 +1122,9 @@ impl<'s> Parser<'s> {
                 && self.type_arg_list_followed_by(0, SyntaxKind::LParen)
             {
                 let m = lhs.precede(self);
-                self.error_no_bump(
-                    "explicit generic function calls are not supported; omit the type arguments"
-                        .to_string(),
-                );
                 self.type_arg_list();
-                if self.at(SyntaxKind::LParen) {
-                    self.balanced_group(SyntaxKind::LParen, SyntaxKind::RParen);
-                }
-                lhs = m.complete(self, SyntaxKind::ErrorNode);
+                self.arg_list();
+                lhs = m.complete(self, SyntaxKind::CallExpr);
                 continue;
             }
 
@@ -1140,16 +1134,10 @@ impl<'s> Parser<'s> {
                 && self.type_arg_list_followed_by(1, SyntaxKind::LBrace)
             {
                 let m = lhs.precede(self);
-                self.error_no_bump(
-                    "explicit generic struct literals are not supported; omit the type arguments"
-                        .to_string(),
-                );
                 self.bump(); // ::
                 self.type_arg_list();
-                if self.at(SyntaxKind::LBrace) {
-                    self.balanced_group(SyntaxKind::LBrace, SyntaxKind::RBrace);
-                }
-                lhs = m.complete(self, SyntaxKind::ErrorNode);
+                self.struct_expr_field_list();
+                lhs = m.complete(self, SyntaxKind::StructExpr);
                 continue;
             }
 

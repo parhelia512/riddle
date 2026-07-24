@@ -881,7 +881,7 @@ impl<'a> ScopeGraphBuilder<'a> {
             Expr::Unary { operand, .. } => {
                 self.walk_expr_for_refs(body_id, body, *operand, current_scope, nodes, edges);
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 self.walk_expr_for_refs(body_id, body, *callee, current_scope, nodes, edges);
                 for a in args {
                     self.walk_expr_for_refs(body_id, body, *a, current_scope, nodes, edges);

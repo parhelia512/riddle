@@ -292,7 +292,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 ctx.escaping_exprs.contains(lhs) || ctx.escaping_exprs.contains(rhs)
             }
 
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 self.mark_escaping_exprs(ctx, *callee);
                 self.handle_call_args(ctx, *callee, args);
                 args.iter().any(|arg| ctx.escaping_exprs.contains(arg))
