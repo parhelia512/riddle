@@ -648,14 +648,14 @@ impl<'a> LowerCtx<'a> {
             .current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, expr_id)));
         let mir_type = tc_type.map(|t| self.convert_type(t)).unwrap_or(Type::Unit);
+        let diverges = matches!(mir_type, Type::Never);
 
         let value = match expr {
             Expr::Missing => builder.unit_const(),
 
             Expr::IntLiteral { value, suffix } => {
-                // HIR 中 value 已经是 i64，直接使用
                 let ty = parse_int_suffix(suffix.as_deref());
-                builder.iconst(*value as i128, ty)
+                builder.iconst(*value, ty)
             }
 
             Expr::FloatLiteral { value, suffix } => {
@@ -749,7 +749,7 @@ impl<'a> LowerCtx<'a> {
                     .and_then(|name| {
                         self.generic_const_subst
                             .get(&name.0)
-                            .map(|value| builder.iconst(*value as i128, IntTy::Usize))
+                            .map(|value| builder.iconst(*value as u64, IntTy::Usize))
                     })
                     .unwrap_or_else(|| builder.unit_const()),
             },
@@ -903,6 +903,12 @@ impl<'a> LowerCtx<'a> {
                         vec![value],
                         mir_type,
                     );
+                }
+                if matches!(op, HirUnOp::Neg)
+                    && let Expr::IntLiteral { value, .. } = &body.exprs[*operand]
+                    && let Type::Int(ty) = mir_type
+                {
+                    return builder.negative_iconst(*value, ty);
                 }
                 let ov = if matches!(op, HirUnOp::Ref | HirUnOp::MutRef) {
                     self.lower_lvalue(builder, param_values, body, *operand)
@@ -1250,6 +1256,9 @@ impl<'a> LowerCtx<'a> {
             }
         };
 
+        if diverges && builder.needs_return() {
+            builder.set_unreachable();
+        }
         self.expr_cache.insert(expr_id, value);
         value
     }
@@ -1285,7 +1294,7 @@ impl<'a> LowerCtx<'a> {
         if let Some((item_ty, len)) = self.array_iter_info(iterable) {
             let index_ty = Type::Int(IntTy::I32);
             let zero = builder.iconst(0, IntTy::I32);
-            let end = builder.iconst(len as i128, IntTy::I32);
+            let end = builder.iconst(len as u64, IntTy::I32);
             let cursor = builder.alloca(index_ty.clone());
             builder.store(zero, cursor);
 
@@ -1455,7 +1464,7 @@ impl<'a> LowerCtx<'a> {
             option_ty.clone(),
         );
         let tag = builder.extract_value(next_value, 0, Type::Int(IntTy::U32));
-        let some_tag = builder.iconst(info.some_variant as i128, IntTy::U32);
+        let some_tag = builder.iconst(info.some_variant as u64, IntTy::U32);
         let has_item = builder.cmp(CmpOp::Eq, tag, some_tag);
         builder.set_cond_branch(has_item, body_block, exit_block);
 
@@ -1720,7 +1729,7 @@ impl<'a> LowerCtx<'a> {
         _args: &[type_checker::Type],
     ) -> Value {
         let tag = builder.extract_value(value, 0, Type::Int(IntTy::U32));
-        let expected = builder.iconst(variant_index as i128, IntTy::U32);
+        let expected = builder.iconst(variant_index as u64, IntTy::U32);
         builder.cmp(CmpOp::Eq, tag, expected)
     }
 
@@ -1749,7 +1758,7 @@ impl<'a> LowerCtx<'a> {
                     Type::Int(ty) => ty,
                     _ => parse_int_suffix(suffix.as_deref()),
                 };
-                builder.iconst(*value as i128, ty)
+                builder.iconst(*value, ty)
             }
             LiteralPattern::Float { value, suffix, .. } => {
                 let ty = match self.convert_type(expected) {
@@ -2031,6 +2040,7 @@ impl<'a> LowerCtx<'a> {
         use type_checker::{ConstArg, FloatTy as TcFloatTy, IntTy as TcIntTy};
 
         match ty {
+            HirTypeRef::Never => type_checker::Type::Never,
             HirTypeRef::Named(path) => {
                 let Some(name) = path.as_single_name().map(|name| name.0.as_str()) else {
                     return type_checker::Type::Unknown;
@@ -2043,18 +2053,14 @@ impl<'a> LowerCtx<'a> {
                     "i16" => type_checker::Type::Int(TcIntTy::I16),
                     "i32" => type_checker::Type::Int(TcIntTy::I32),
                     "i64" => type_checker::Type::Int(TcIntTy::I64),
-                    "i128" => type_checker::Type::Int(TcIntTy::I128),
                     "isize" => type_checker::Type::Int(TcIntTy::Isize),
                     "u8" => type_checker::Type::Int(TcIntTy::U8),
                     "u16" => type_checker::Type::Int(TcIntTy::U16),
                     "u32" => type_checker::Type::Int(TcIntTy::U32),
                     "u64" => type_checker::Type::Int(TcIntTy::U64),
-                    "u128" => type_checker::Type::Int(TcIntTy::U128),
                     "usize" => type_checker::Type::Int(TcIntTy::Usize),
-                    "f16" => type_checker::Type::Float(TcFloatTy::F16),
                     "f32" => type_checker::Type::Float(TcFloatTy::F32),
                     "f64" => type_checker::Type::Float(TcFloatTy::F64),
-                    "f128" => type_checker::Type::Float(TcFloatTy::F128),
                     "bool" => type_checker::Type::Bool,
                     "str" => type_checker::Type::Str,
                     "char" => type_checker::Type::Char,
@@ -2145,7 +2151,7 @@ impl<'a> LowerCtx<'a> {
         args: Vec<Value>,
         ty: Type,
     ) -> Value {
-        let tag = builder.iconst(variant_index as i128, IntTy::U32);
+        let tag = builder.iconst(variant_index as u64, IntTy::U32);
         let offset = self.enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
         let mut fields = vec![(0, tag)];
         fields.extend(
@@ -2326,7 +2332,7 @@ impl<'a> LowerCtx<'a> {
                 let rhs_mir_ty = self.convert_type(rhs_inner);
                 let elements = (0..len)
                     .map(|index| {
-                        let index_value = builder.iconst(index as i128, IntTy::Usize);
+                        let index_value = builder.iconst(index as u64, IntTy::Usize);
                         let lhs_ptr = builder.index_ptr(lhs, index_value, lhs_mir_ty.clone());
                         let rhs_ptr = builder.index_ptr(rhs, index_value, rhs_mir_ty.clone());
                         (
@@ -2946,20 +2952,16 @@ impl<'a> LowerCtx<'a> {
                 TcInt::I16 => IntTy::I16,
                 TcInt::I32 => IntTy::I32,
                 TcInt::I64 => IntTy::I64,
-                TcInt::I128 => IntTy::I128,
                 TcInt::Isize => IntTy::Isize,
                 TcInt::U8 => IntTy::U8,
                 TcInt::U16 => IntTy::U16,
                 TcInt::U32 => IntTy::U32,
                 TcInt::U64 => IntTy::U64,
-                TcInt::U128 => IntTy::U128,
                 TcInt::Usize => IntTy::Usize,
             }),
             TcType::Float(fty) => Type::Float(match fty {
-                TcFloat::F16 => FloatTy::F16,
                 TcFloat::F32 => FloatTy::F32,
                 TcFloat::F64 => FloatTy::F64,
-                TcFloat::F128 => FloatTy::F128,
             }),
             TcType::InferInt => Type::Int(IntTy::I32),
             TcType::InferFloat => Type::Float(FloatTy::F64),
@@ -3012,6 +3014,7 @@ impl<'a> LowerCtx<'a> {
 
     fn convert_hir_type(&self, t: &hir::item_tree::HirTypeRef) -> Type {
         match t {
+            hir::item_tree::HirTypeRef::Never => Type::Never,
             hir::item_tree::HirTypeRef::Named(path) => {
                 if let Some(ty) = self.convert_self_associated_type(path) {
                     return ty;
@@ -3030,18 +3033,14 @@ impl<'a> LowerCtx<'a> {
                     Some("i16") => Type::Int(IntTy::I16),
                     Some("i32") => Type::Int(IntTy::I32),
                     Some("i64") => Type::Int(IntTy::I64),
-                    Some("i128") => Type::Int(IntTy::I128),
                     Some("u8") => Type::Int(IntTy::U8),
                     Some("u16") => Type::Int(IntTy::U16),
                     Some("u32") => Type::Int(IntTy::U32),
                     Some("u64") => Type::Int(IntTy::U64),
-                    Some("u128") => Type::Int(IntTy::U128),
                     Some("isize") => Type::Int(IntTy::Isize),
                     Some("usize") => Type::Int(IntTy::Usize),
-                    Some("f16") => Type::Float(FloatTy::F16),
                     Some("f32") => Type::Float(FloatTy::F32),
                     Some("f64") => Type::Float(FloatTy::F64),
-                    Some("f128") => Type::Float(FloatTy::F128),
                     Some("str") => Type::Str,
                     Some("char") => Type::Char,
                     Some(name) => {
@@ -3870,6 +3869,7 @@ impl<'a> LowerCtx<'a> {
         const_subst: &HashMap<&str, usize>,
     ) -> Type {
         match t {
+            hir::item_tree::HirTypeRef::Never => Type::Never,
             hir::item_tree::HirTypeRef::Named(path) => {
                 if let Some(name) = path.as_single_name().map(|name| name.0.as_str())
                     && let Some(ty) = subst.get(name)
@@ -4110,18 +4110,14 @@ fn primitive_scalar_name(ty: &hir::item_tree::HirTypeRef) -> Option<&str> {
                     | "i16"
                     | "i32"
                     | "i64"
-                    | "i128"
                     | "isize"
                     | "u8"
                     | "u16"
                     | "u32"
                     | "u64"
-                    | "u128"
                     | "usize"
-                    | "f16"
                     | "f32"
                     | "f64"
-                    | "f128"
             )
         })
 }
@@ -4158,20 +4154,10 @@ fn builtin_operator(lang: &str, method: &str) -> Option<BuiltinOperator> {
 fn builtin_operator_supports(op: BuiltinOperator, scalar: &str) -> bool {
     let integer = matches!(
         scalar,
-        "i8" | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
     );
-    let float = matches!(scalar, "f16" | "f32" | "f64" | "f128");
-    let signed = matches!(scalar, "i8" | "i16" | "i32" | "i64" | "i128" | "isize");
+    let float = matches!(scalar, "f32" | "f64");
+    let signed = matches!(scalar, "i8" | "i16" | "i32" | "i64" | "isize");
     match op {
         BuiltinOperator::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
         | BuiltinOperator::Assign(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => {
@@ -4482,13 +4468,11 @@ fn parse_int_suffix(suffix: Option<&str>) -> IntTy {
         Some("i16") => IntTy::I16,
         Some("i32") => IntTy::I32,
         Some("i64") => IntTy::I64,
-        Some("i128") => IntTy::I128,
         Some("isize") => IntTy::Isize,
         Some("u8") => IntTy::U8,
         Some("u16") => IntTy::U16,
         Some("u32") => IntTy::U32,
         Some("u64") => IntTy::U64,
-        Some("u128") => IntTy::U128,
         Some("usize") => IntTy::Usize,
         _ => IntTy::I32, // 默认 i32
     }
@@ -4496,10 +4480,8 @@ fn parse_int_suffix(suffix: Option<&str>) -> IntTy {
 
 fn parse_float_suffix(suffix: Option<&str>) -> FloatTy {
     match suffix {
-        Some("f16") => FloatTy::F16,
         Some("f32") => FloatTy::F32,
         Some("f64") => FloatTy::F64,
-        Some("f128") => FloatTy::F128,
         _ => FloatTy::F64, // 默认 f64
     }
 }

@@ -644,6 +644,7 @@ impl Lower for Type {
                 path.type_args = node.type_args().into_iter().map(|ty| ty.lower()).collect();
                 HirTypeRef::Named(path)
             }
+            Type::Never(_) => HirTypeRef::Never,
             Type::Ref(ref_ty) => match ref_ty.inner() {
                 Some(inner) => HirTypeRef::Ref(Box::new(inner.lower()), ref_ty.is_mut()),
                 None => HirTypeRef::Error,
@@ -687,7 +688,8 @@ fn lower_const_arg(expr: ast::Expr) -> HirConstArg {
     match expr {
         ast::Expr::Number(n) => n
             .value()
-            .map(|value| HirConstArg::Value(value as usize))
+            .and_then(|value| usize::try_from(value).ok())
+            .map(HirConstArg::Value)
             .unwrap_or(HirConstArg::Error),
         ast::Expr::NameRef(name_ref) => name_ref
             .path()

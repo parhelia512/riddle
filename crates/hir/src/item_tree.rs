@@ -274,6 +274,7 @@ pub enum PathAnchor {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HirTypeRef {
     Named(HirPath),
+    Never,
     Ref(Box<HirTypeRef>, bool), // (inner, mutable)
     /// Raw pointer type: `*const T` or `*mut T`.
     Ptr {
@@ -349,6 +350,7 @@ impl HirTypeRef {
     pub fn display(&self) -> String {
         match self {
             HirTypeRef::Named(path) => path.display(),
+            HirTypeRef::Never => "!".to_string(),
             HirTypeRef::Ref(inner, mutable) => {
                 let kw = if *mutable { "&mut " } else { "&" };
                 format!("{}{}", kw, inner.display())

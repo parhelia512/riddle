@@ -19,6 +19,27 @@ fn c_simple_function() {
 }
 
 #[test]
+fn c_backend_emits_abort_panic_runtime() {
+    let module = lower(
+        r#"
+        unsafe extern "C" {
+            safe fun panic(message: &str) -> !;
+        }
+
+        fun main() {
+            panic("boom");
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("riddle_panic"), "{generated}");
+    assert!(generated.contains("fwrite"), "{generated}");
+    assert!(generated.contains("abort()"), "{generated}");
+    assert!(!generated.contains("return 0;"), "{generated}");
+}
+
+#[test]
 fn c_tuple_types_are_named_and_reusable() {
     let module = lower(
         r#"
@@ -270,17 +291,51 @@ fn c_return_value() {
 }
 
 #[test]
-fn c_backend_uses_portable_f128_alias() {
-    let module = lower("fun identity(value: f128) -> f128 { value }");
-    let mut backend = CBackend::new();
-    let result = backend.compile(&module).unwrap();
-
-    assert!(result.contains("typedef _Float128 riddle_f128;"));
-    assert!(
-        result.contains("riddle_f128 identity (riddle_f128"),
-        "f128 signature should use the portable alias:\n{}",
-        result
+fn c_backend_preserves_unsigned_and_pointer_sized_types() {
+    let module = lower(
+        r#"
+        fun values(a: u8, b: u16, c: u32, d: u64, e: usize, f: isize) -> u64 {
+            a as u64 + b as u64 + c as u64 + d + e as u64 + f as u64
+        }
+        "#,
     );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("uint8_t a"), "{generated}");
+    assert!(generated.contains("uint16_t b"), "{generated}");
+    assert!(generated.contains("uint32_t c"), "{generated}");
+    assert!(generated.contains("uint64_t d"), "{generated}");
+    assert!(generated.contains("size_t e"), "{generated}");
+    assert!(generated.contains("ptrdiff_t f"), "{generated}");
+}
+
+#[test]
+fn c_backend_preserves_u64_max_literal() {
+    let module = lower("fun max() -> u64 { 18446744073709551615u64 }");
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("UINT64_C(18446744073709551615)"),
+        "{generated}"
+    );
+}
+
+#[test]
+fn c_backend_preserves_i64_min_literal() {
+    let module = lower("fun min() -> i64 { -9223372036854775808i64 }");
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("INT64_MIN"), "{generated}");
+}
+
+#[test]
+fn c_backend_emits_unicode_char_as_u32_code_point() {
+    let module = lower("fun ideograph() -> char { '\u{4e2d}' }");
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("uint32_t ideograph"), "{generated}");
+    assert!(generated.contains("UINT32_C(20013)"), "{generated}");
+    assert!(!generated.contains("'\u{4e2d}'"), "{generated}");
 }
 
 #[test]
@@ -573,7 +628,7 @@ fn c_backend_preserves_returning_branches_and_mut_locals() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains("'a'"),
+        result.contains("UINT32_C(97)"),
         "char literal lowered wrong:\n{}",
         result
     );

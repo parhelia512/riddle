@@ -220,6 +220,7 @@ impl fmt::Display for InstFmt<'_> {
 fn fmt_const(f: &mut fmt::Formatter<'_>, c: &ConstValue) -> fmt::Result {
     match c {
         ConstValue::Int(v, w) => write!(f, "iconst({:?}) {:?}", w, v),
+        ConstValue::NegativeInt(v, w) => write!(f, "iconst({:?}) -{:?}", w, v),
         ConstValue::Float(v, w) => write!(f, "fconst({:?}) {:?}", w, v),
         ConstValue::Bool(v) => write!(f, "bconst {}", v),
         ConstValue::String(v) => write!(f, "sconst {:?}", v),

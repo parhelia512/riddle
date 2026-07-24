@@ -813,6 +813,7 @@ impl TypeChecker<'_> {
     fn type_ref_source_text(&self, ty: &HirTypeRef) -> String {
         match ty {
             HirTypeRef::Named(path) => path.display(),
+            HirTypeRef::Never => "!".to_string(),
             HirTypeRef::Ref(inner, mutable) => {
                 let kw = if *mutable { "&mut " } else { "&" };
                 format!("{}{}", kw, self.type_ref_source_text(inner))
@@ -1160,6 +1161,6 @@ fn type_ref_size(ty: &HirTypeRef, generics: &HashSet<&str>) -> usize {
         }
         HirTypeRef::Array(inner, _) => 1 + type_ref_size(inner, generics),
         HirTypeRef::Function { .. } => 1,
-        HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => 0,
+        HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => 0,
     }
 }

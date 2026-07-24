@@ -52,22 +52,18 @@ pub enum IntTy {
     I16,
     I32,
     I64,
-    I128,
     Isize,
     U8,
     U16,
     U32,
     U64,
-    U128,
     Usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatTy {
-    F16,
     F32,
     F64,
-    F128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -312,13 +308,11 @@ impl IntTy {
             "i16" => Some(Self::I16),
             "i32" => Some(Self::I32),
             "i64" => Some(Self::I64),
-            "i128" => Some(Self::I128),
             "isize" => Some(Self::Isize),
             "u8" => Some(Self::U8),
             "u16" => Some(Self::U16),
             "u32" => Some(Self::U32),
             "u64" => Some(Self::U64),
-            "u128" => Some(Self::U128),
             "usize" => Some(Self::Usize),
             _ => None,
         }
@@ -330,27 +324,38 @@ impl IntTy {
             Self::I16 => "i16",
             Self::I32 => "i32",
             Self::I64 => "i64",
-            Self::I128 => "i128",
             Self::Isize => "isize",
             Self::U8 => "u8",
             Self::U16 => "u16",
             Self::U32 => "u32",
             Self::U64 => "u64",
-            Self::U128 => "u128",
             Self::Usize => "usize",
         }
     }
 
-    pub(crate) fn contains_i64(self, value: i64) -> bool {
+    pub(crate) fn contains_u64(self, value: u64) -> bool {
         match self {
-            Self::I8 => i8::try_from(value).is_ok(),
-            Self::I16 => i16::try_from(value).is_ok(),
-            Self::I32 => i32::try_from(value).is_ok(),
-            Self::I64 | Self::I128 | Self::Isize => true,
+            Self::I8 => value <= i8::MAX as u64,
+            Self::I16 => value <= i16::MAX as u64,
+            Self::I32 => value <= i32::MAX as u64,
+            Self::I64 => value <= i64::MAX as u64,
+            Self::Isize => value <= isize::MAX as u64,
             Self::U8 => u8::try_from(value).is_ok(),
             Self::U16 => u16::try_from(value).is_ok(),
             Self::U32 => u32::try_from(value).is_ok(),
-            Self::U64 | Self::U128 | Self::Usize => value >= 0,
+            Self::U64 => true,
+            Self::Usize => usize::try_from(value).is_ok(),
+        }
+    }
+
+    pub(crate) fn contains_negative_magnitude(self, value: u64) -> bool {
+        match self {
+            Self::I8 => value <= (i8::MAX as u64) + 1,
+            Self::I16 => value <= (i16::MAX as u64) + 1,
+            Self::I32 => value <= (i32::MAX as u64) + 1,
+            Self::I64 => value <= (i64::MAX as u64) + 1,
+            Self::Isize => value <= (isize::MAX as u64) + 1,
+            Self::U8 | Self::U16 | Self::U32 | Self::U64 | Self::Usize => false,
         }
     }
 }
@@ -358,20 +363,16 @@ impl IntTy {
 impl FloatTy {
     pub(crate) fn parse(text: &str) -> Option<Self> {
         match text {
-            "f16" => Some(Self::F16),
             "f32" => Some(Self::F32),
             "f64" => Some(Self::F64),
-            "f128" => Some(Self::F128),
             _ => None,
         }
     }
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::F16 => "f16",
             Self::F32 => "f32",
             Self::F64 => "f64",
-            Self::F128 => "f128",
         }
     }
 }

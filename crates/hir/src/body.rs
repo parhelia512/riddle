@@ -104,7 +104,7 @@ pub enum BodyItem {
 pub enum Expr {
     Missing,
     IntLiteral {
-        value: i64,
+        value: u64,
         suffix: Option<String>,
     },
     FloatLiteral {
@@ -251,7 +251,7 @@ pub enum Pattern {
 #[derive(Debug, Clone)]
 pub enum LiteralPattern {
     Int {
-        value: i64,
+        value: u64,
         suffix: Option<String>,
         valid: bool,
     },
@@ -795,6 +795,7 @@ impl BodyPrinter<'_> {
 
     fn type_text(ty: &HirTypeRef) -> String {
         match ty {
+            HirTypeRef::Never => "!".to_string(),
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
             HirTypeRef::Named(p) => p.display(),

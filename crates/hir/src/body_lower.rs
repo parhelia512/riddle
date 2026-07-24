@@ -305,7 +305,7 @@ impl<'a> BodyLower<'a> {
                     .map(|token| token.text().to_string())
                     .unwrap_or_default();
                 let (digits, radix, suffix) = split_int_literal(&text);
-                let value = i64::from_str_radix(&digits, radix).unwrap_or_else(|_| {
+                let value = u64::from_str_radix(&digits, radix).unwrap_or_else(|_| {
                     self.diagnostic("invalid integer literal", range);
                     0
                 });
@@ -652,7 +652,7 @@ impl<'a> BodyLower<'a> {
                 let literal = match token.map(|token| token.kind()) {
                     Some(SyntaxKind::Number) => {
                         let (digits, radix, suffix) = split_int_literal(&text);
-                        let (value, valid) = match i64::from_str_radix(&digits, radix) {
+                        let (value, valid) = match u64::from_str_radix(&digits, radix) {
                             Ok(value) => (value, true),
                             Err(_) => {
                                 self.diagnostic("invalid integer literal pattern", range);

@@ -229,6 +229,7 @@ pub enum SyntaxKind {
     StructExpr,
     StructExprField,
     NamedType,
+    NeverType,
     TypeArgList,
     RefType,
     TupleType,

@@ -27,10 +27,18 @@ impl<'f> Builder<'f> {
 
     // 常量
 
-    pub fn iconst(&mut self, value: i128, ty: IntTy) -> Value {
+    pub fn iconst(&mut self, value: u64, ty: IntTy) -> Value {
         let width = int_to_width(ty);
         self.emit(
             InstKind::Const(ConstValue::Int(value, width)),
+            Type::Int(ty),
+        )
+    }
+
+    pub fn negative_iconst(&mut self, magnitude: u64, ty: IntTy) -> Value {
+        let width = int_to_width(ty);
+        self.emit(
+            InstKind::Const(ConstValue::NegativeInt(magnitude, width)),
             Type::Int(ty),
         )
     }
@@ -199,15 +207,12 @@ fn int_to_width(ty: IntTy) -> IntWidth {
         IntTy::I16 | IntTy::U16 => IntWidth::I16,
         IntTy::I32 | IntTy::U32 => IntWidth::I32,
         IntTy::I64 | IntTy::U64 | IntTy::Isize | IntTy::Usize => IntWidth::I64,
-        IntTy::I128 | IntTy::U128 => IntWidth::I128,
     }
 }
 
 fn float_to_width(ty: FloatTy) -> FloatWidth {
     match ty {
-        FloatTy::F16 => FloatWidth::F16,
         FloatTy::F32 => FloatWidth::F32,
         FloatTy::F64 => FloatWidth::F64,
-        FloatTy::F128 => FloatWidth::F128,
     }
 }

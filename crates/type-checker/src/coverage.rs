@@ -22,7 +22,7 @@ enum Constructor {
     Array,
     Struct(StructId),
     Unit,
-    Int(i64),
+    Int(u64),
     Float(u64),
     String(String),
     Char(String),
@@ -648,7 +648,7 @@ fn literal_constructor(literal: LiteralPattern, expected: &Type) -> Option<Const
         } => {
             let ty = integer_type(expected)?;
             (valid
-                && ty.contains_i64(value)
+                && ty.contains_u64(value)
                 && suffix
                     .as_deref()
                     .is_none_or(|suffix| IntTy::parse(suffix) == Some(ty)))
@@ -687,7 +687,7 @@ fn integer_type(ty: &Type) -> Option<IntTy> {
     }
 }
 
-fn integer_literals(matrix: &[Vec<MatrixPat>], ty: IntTy) -> Vec<(u128, i64)> {
+fn integer_literals(matrix: &[Vec<MatrixPat>], ty: IntTy) -> Vec<(u128, u64)> {
     let mut literals = matrix
         .iter()
         .filter_map(|row| match row.first()? {
@@ -789,23 +789,16 @@ fn display_integer_range(ty: IntTy, range: IntegerRange) -> String {
     }
 }
 
-fn integer_ordinal(ty: IntTy, value: i64) -> Option<u128> {
+fn integer_ordinal(ty: IntTy, value: u64) -> Option<u128> {
     let (signed, bits) = integer_layout(ty);
     if !signed {
-        let value = u128::try_from(value).ok()?;
+        let value = u128::from(value);
         return (value <= integer_max_ordinal(ty)).then_some(value);
     }
 
-    let value = i128::from(value);
-    if bits == 128 {
-        return Some((value as u128) ^ (1u128 << 127));
-    }
-    let half = 1i128 << (bits - 1);
-    let min = -half;
-    let max = half - 1;
-    (min..=max)
-        .contains(&value)
-        .then_some((value - min) as u128)
+    let half = 1u128 << (bits - 1);
+    let value = u128::from(value);
+    (value < half).then_some(half + value)
 }
 
 fn integer_value(ty: IntTy, ordinal: u128) -> String {
@@ -813,20 +806,13 @@ fn integer_value(ty: IntTy, ordinal: u128) -> String {
     if !signed {
         return ordinal.to_string();
     }
-    if bits == 128 {
-        return ((ordinal ^ (1u128 << 127)) as i128).to_string();
-    }
     let min = -(1i128 << (bits - 1));
     (min + ordinal as i128).to_string()
 }
 
 fn integer_max_ordinal(ty: IntTy) -> u128 {
     let (_, bits) = integer_layout(ty);
-    if bits == 128 {
-        u128::MAX
-    } else {
-        (1u128 << bits) - 1
-    }
+    (1u128 << bits) - 1
 }
 
 fn integer_layout(ty: IntTy) -> (bool, u32) {
@@ -834,13 +820,13 @@ fn integer_layout(ty: IntTy) -> (bool, u32) {
         IntTy::I8 => (true, 8),
         IntTy::I16 => (true, 16),
         IntTy::I32 => (true, 32),
-        IntTy::I64 | IntTy::Isize => (true, 64),
-        IntTy::I128 => (true, 128),
+        IntTy::I64 => (true, 64),
+        IntTy::Isize => (true, usize::BITS),
         IntTy::U8 => (false, 8),
         IntTy::U16 => (false, 16),
         IntTy::U32 => (false, 32),
-        IntTy::U64 | IntTy::Usize => (false, 64),
-        IntTy::U128 => (false, 128),
+        IntTy::U64 => (false, 64),
+        IntTy::Usize => (false, usize::BITS),
     }
 }
 

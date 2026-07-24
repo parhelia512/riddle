@@ -618,6 +618,59 @@ fn standard_library_basics_compile_and_run() {
 }
 
 #[test]
+fn unsigned_ordering_and_unicode_chars_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping scalar semantics runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("scalar-semantics");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"fun main() -> i32 {
+    let high: u8 = 255u8;
+    if high > 127u8 && '中' > 'a' { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn panic_prints_message_and_aborts() {
+    if c_compiler().is_none() {
+        eprintln!("skipping panic runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("panic");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        "fun main() { panic(\"boom\"); }\n",
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(!output.status.success(), "{output:#?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("panicked: boom"),
+        "{output:#?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn comparison_operators_dispatch_to_trait_methods() {
     if c_compiler().is_none() {
         eprintln!("skipping comparison operator runtime test: no C compiler found");

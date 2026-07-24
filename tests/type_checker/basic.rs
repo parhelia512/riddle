@@ -22,6 +22,23 @@ fn accepts_basic_function_body() {
 }
 
 #[test]
+fn accepts_never_returning_panic_in_value_position() {
+    let result = check(
+        r#"
+        unsafe extern "C" {
+            safe fun panic(message: &str) -> !;
+        }
+
+        fun choose(flag: bool) -> i32 {
+            if flag { 1 } else { panic("bad") }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn supports_rust_style_scalar_numeric_types() {
     let result = check(
         r#"
@@ -30,40 +47,32 @@ fn supports_rust_style_scalar_numeric_types() {
             b: i16,
             c: i32,
             d: i64,
-            e: i128,
-            f: isize,
-            g: u8,
-            h: u16,
-            i: u32,
-            j: u64,
-            k: u128,
-            l: usize,
-            m: f16,
-            n: f32,
-            o: f64,
-            p: f128,
-            q: char,
-            r: &str
-        ) -> f128 {
+            e: isize,
+            f: u8,
+            g: u16,
+            h: u32,
+            i: u64,
+            j: usize,
+            k: f32,
+            l: f64,
+            m: char,
+            n: &str
+        ) -> f64 {
             let a2: i8 = 1i8;
             let b2: i16 = 1i16;
             let c2: i32 = 1i32;
             let d2: i64 = 1i64;
-            let e2: i128 = 1i128;
-            let f2: isize = 1isize;
-            let g2: u8 = 1u8;
-            let h2: u16 = 1u16;
-            let i2: u32 = 1u32;
-            let j2: u64 = 1u64;
-            let k2: u128 = 1u128;
-            let l2: usize = 1usize;
-            let m2: f16 = 1.0f16;
-            let n2: f32 = 1.0f32;
-            let o2: f64 = 1.0f64;
-            let p2: f128 = 1.0f128;
-            let q2: char = 'x';
-            let r2: &str = "text";
-            p2
+            let e2: isize = 1isize;
+            let f2: u8 = 1u8;
+            let g2: u16 = 1u16;
+            let h2: u32 = 1u32;
+            let i2: u64 = 1u64;
+            let j2: usize = 1usize;
+            let k2: f32 = 1.0f32;
+            let l2: f64 = 1.0f64;
+            let m2: char = 'x';
+            let n2: &str = "text";
+            l2
         }
         "#,
     );
@@ -73,7 +82,7 @@ fn supports_rust_style_scalar_numeric_types() {
         result
             .expr_types
             .values()
-            .any(|ty| matches!(ty, Type::Float(FloatTy::F128)))
+            .any(|ty| matches!(ty, Type::Float(FloatTy::F64)))
     );
 }
 

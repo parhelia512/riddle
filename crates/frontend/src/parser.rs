@@ -1493,6 +1493,11 @@ impl<'s> Parser<'s> {
     fn ty(&mut self) {
         self.attrs();
         match self.current() {
+            SyntaxKind::Bang => {
+                let m = self.start();
+                self.bump();
+                m.complete(self, SyntaxKind::NeverType);
+            }
             SyntaxKind::Amp => {
                 let m = self.start();
                 self.bump(); // &
@@ -1993,6 +1998,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::LParen
                 | SyntaxKind::LBracket
                 | SyntaxKind::Number
+                | SyntaxKind::Bang
                 | SyntaxKind::Fun
                 | SyntaxKind::Unsafe
         )

@@ -101,13 +101,6 @@ impl Backend for CBackend {
         writeln!(out, "#include <stdio.h>").unwrap();
         writeln!(out, "#include <stdlib.h>").unwrap();
         writeln!(out, "#include <string.h>").unwrap();
-        writeln!(out, "#if defined(__FLT128_MANT_DIG__)").unwrap();
-        writeln!(out, "typedef _Float128 riddle_f128;").unwrap();
-        writeln!(out, "#elif defined(__SIZEOF_FLOAT128__)").unwrap();
-        writeln!(out, "typedef __float128 riddle_f128;").unwrap();
-        writeln!(out, "#else").unwrap();
-        writeln!(out, "typedef long double riddle_f128;").unwrap();
-        writeln!(out, "#endif").unwrap();
         writeln!(out).unwrap();
         if self.needs_runtime {
             writeln!(out, "void rgc_init(void *stack_bottom);").unwrap();
@@ -162,6 +155,14 @@ impl Backend for CBackend {
             "typedef struct {{ const char* ptr; size_t len; }} riddle_str;"
         )
         .unwrap();
+        if has_extern(module, "panic") || has_extern(module, "riddle_panic") {
+            writeln!(out, "static void riddle_panic(riddle_str message) {{").unwrap();
+            writeln!(out, "  fputs(\"panicked: \", stderr);").unwrap();
+            writeln!(out, "  fwrite(message.ptr, 1, message.len, stderr);").unwrap();
+            writeln!(out, "  fputc('\\n', stderr);").unwrap();
+            writeln!(out, "  abort();").unwrap();
+            writeln!(out, "}}").unwrap();
+        }
         if has_extern(module, "str_len") {
             writeln!(
                 out,
@@ -179,39 +180,35 @@ impl Backend for CBackend {
         if has_extern(module, "str_from_raw") {
             writeln!(
                 out,
-                "static inline riddle_str str_from_raw(int8_t* data, int64_t len) {{ if (len < 0) abort(); return (riddle_str){{ data ? (const char*)data : \"\", (size_t)len }}; }}"
+                "static inline riddle_str str_from_raw(uint8_t* data, size_t len) {{ return (riddle_str){{ data ? (const char*)data : \"\", len }}; }}"
             )
             .unwrap();
         }
         if has_extern(module, "vector_grow") {
             writeln!(
                 out,
-                "static inline int8_t* vector_grow(int8_t* data, int64_t len, int64_t capacity, int64_t item_size) {{"
+                "static inline uint8_t* vector_grow(uint8_t* data, size_t len, size_t capacity, size_t item_size) {{"
             )
             .unwrap();
             writeln!(
                 out,
-                "  if (len < 0 || capacity < 0 || len > capacity || item_size <= 0 || capacity > INT64_MAX / 2) abort();"
+                "  if (len > capacity || item_size == 0 || capacity > SIZE_MAX / 2) abort();"
             )
             .unwrap();
             writeln!(
                 out,
-                "  int64_t next_capacity = capacity == 0 ? 4 : capacity * 2;"
+                "  size_t next_capacity = capacity == 0 ? 4 : capacity * 2;"
+            )
+            .unwrap();
+            writeln!(out, "  if (next_capacity > SIZE_MAX / item_size) abort();").unwrap();
+            writeln!(
+                out,
+                "  uint8_t* next = (uint8_t*)rgc_alloc(next_capacity * item_size);"
             )
             .unwrap();
             writeln!(
                 out,
-                "  if ((uint64_t)next_capacity > SIZE_MAX / (uint64_t)item_size) abort();"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "  int8_t* next = (int8_t*)rgc_alloc((size_t)next_capacity * (size_t)item_size);"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "  if (data && len) memcpy(next, data, (size_t)len * (size_t)item_size);"
+                "  if (data && len) memcpy(next, data, len * item_size);"
             )
             .unwrap();
             writeln!(out, "  return next;").unwrap();
@@ -227,7 +224,7 @@ impl Backend for CBackend {
             };
             writeln!(
                 out,
-                "static inline int64_t {}({}) {{ return (int64_t)sizeof(*value); }}",
+                "static inline size_t {}({}) {{ return sizeof(*value); }}",
                 external.name,
                 c_param_decl(parameter, "value")
             )
@@ -430,7 +427,8 @@ impl CBackend {
             InstKind::Const(c) => {
                 let ct = ctype_of(&inst.ty);
                 let expr = match c {
-                    ConstValue::Int(val, _) => format!("(({}){})", ct, val),
+                    ConstValue::Int(val, _) => c_int_literal(*val, &inst.ty),
+                    ConstValue::NegativeInt(val, _) => c_negative_int_literal(*val, &inst.ty),
                     ConstValue::Float(val, _) => format!("(({}){})", ct, val),
                     ConstValue::Bool(val) => val.to_string(),
                     ConstValue::String(val) => {
@@ -441,7 +439,7 @@ impl CBackend {
                             format!("\"{}\"", inner)
                         }
                     }
-                    ConstValue::Char(val) => format!("{:?}", val),
+                    ConstValue::Char(val) => format!("UINT32_C({})", u32::from(*val)),
                     ConstValue::Unit => String::new(),
                 };
                 self.set_inline(v, expr, ct);
@@ -852,6 +850,7 @@ impl CBackend {
                 let callee_name = match callee {
                     FuncRef::Local(n) => n.clone(),
                     FuncRef::Intrinsic(n) => n.clone(),
+                    FuncRef::Extern(n) if n == "panic" => "riddle_panic".into(),
                     FuncRef::Extern(n) => n.clone(),
                 };
                 // For extern calls, extract .ptr from fat pointer arguments
@@ -915,6 +914,7 @@ impl CBackend {
 
             InstKind::FunctionRef(function) => {
                 let name = match function {
+                    FuncRef::Extern(name) if name == "panic" => "riddle_panic".into(),
                     FuncRef::Local(name) | FuncRef::Intrinsic(name) | FuncRef::Extern(name) => {
                         sanitize(name)
                     }
@@ -1125,7 +1125,7 @@ fn has_extern(module: &Module, name: &str) -> bool {
 fn is_builtin_extern(name: &str) -> bool {
     matches!(
         name,
-        "str_len" | "str_byte" | "str_from_raw" | "vector_grow"
+        "panic" | "riddle_panic" | "str_len" | "str_byte" | "str_from_raw" | "vector_grow"
     ) || name.starts_with("size_of_ptr__")
 }
 
@@ -1194,21 +1194,23 @@ fn c_return_type(func: &Function) -> String {
 fn ctype_of(ty: &Type) -> String {
     match ty {
         Type::Int(ity) => match ity {
-            IntTy::I8 | IntTy::U8 => "int8_t".into(),
-            IntTy::I16 | IntTy::U16 => "int16_t".into(),
-            IntTy::I32 | IntTy::U32 => "int32_t".into(),
-            IntTy::I64 | IntTy::U64 | IntTy::Isize | IntTy::Usize => "int64_t".into(),
-            IntTy::I128 | IntTy::U128 => "__int128".into(),
+            IntTy::I8 => "int8_t".into(),
+            IntTy::I16 => "int16_t".into(),
+            IntTy::I32 => "int32_t".into(),
+            IntTy::I64 => "int64_t".into(),
+            IntTy::Isize => "ptrdiff_t".into(),
+            IntTy::U8 => "uint8_t".into(),
+            IntTy::U16 => "uint16_t".into(),
+            IntTy::U32 => "uint32_t".into(),
+            IntTy::U64 => "uint64_t".into(),
+            IntTy::Usize => "size_t".into(),
         },
         Type::Float(fty) => match fty {
-            // ponytail: F16 uses C23 _Float16; fall back to float on older compilers
-            FloatTy::F16 => "_Float16".into(),
             FloatTy::F32 => "float".into(),
             FloatTy::F64 => "double".into(),
-            FloatTy::F128 => "riddle_f128".into(),
         },
         Type::Bool => "bool".into(),
-        Type::Char => "char".into(),
+        Type::Char => "uint32_t".into(),
         Type::Str => "riddle_str".into(),
         Type::Ptr(inner) => pointer_ctype(inner),
         Type::Ref(inner, _) => {
@@ -1228,6 +1230,31 @@ fn ctype_of(ty: &Type) -> String {
         Type::FnPtr(signature) => fn_ptr_name(signature),
         Type::Unit | Type::Never | Type::Void => "void".into(),
     }
+}
+
+fn c_int_literal(value: u64, ty: &Type) -> String {
+    let ctype = ctype_of(ty);
+    match ty {
+        Type::Int(IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::U64 | IntTy::Usize) => {
+            format!("(({ctype})UINT64_C({value}))")
+        }
+        _ => format!("(({ctype}){value})"),
+    }
+}
+
+fn c_negative_int_literal(magnitude: u64, ty: &Type) -> String {
+    let minimum = match ty {
+        Type::Int(IntTy::I8) if magnitude == 1 << 7 => Some("INT8_MIN"),
+        Type::Int(IntTy::I16) if magnitude == 1 << 15 => Some("INT16_MIN"),
+        Type::Int(IntTy::I32) if magnitude == 1 << 31 => Some("INT32_MIN"),
+        Type::Int(IntTy::I64) if magnitude == 1 << 63 => Some("INT64_MIN"),
+        Type::Int(IntTy::Isize) if magnitude == 1 << (usize::BITS - 1) => Some("PTRDIFF_MIN"),
+        _ => None,
+    };
+    minimum.map(str::to_owned).unwrap_or_else(|| {
+        let ctype = ctype_of(ty);
+        format!("(({ctype})-INT64_C({magnitude}))")
+    })
 }
 
 fn pointer_ctype(inner: &Type) -> String {

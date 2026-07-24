@@ -193,8 +193,8 @@ impl TypeChecker<'_> {
         let span = ctx.expr_range(expr_id);
         let ty = match &ctx.body.exprs[expr_id] {
             Expr::Missing => Type::Error,
-            Expr::IntLiteral { suffix, .. } => {
-                self.int_literal_type(suffix.as_deref(), expected, span)
+            Expr::IntLiteral { value, suffix } => {
+                self.check_integer_literal(*value, suffix.as_deref(), expected, span, false)
             }
             Expr::FloatLiteral { suffix, .. } => {
                 self.float_literal_type(suffix.as_deref(), expected, span)
@@ -1387,12 +1387,32 @@ impl TypeChecker<'_> {
         expected: Option<&Type>,
         span: Option<rowan::TextRange>,
     ) -> Type {
-        let operand_ty = match (op, expected) {
-            (UnaryOp::Ref | UnaryOp::MutRef, _) => self.check_place_expr(ctx, operand),
-            (UnaryOp::Neg | UnaryOp::Pos, Some(expected)) if expected.is_numeric() => {
-                self.check_expr_expected(ctx, operand, expected)
+        let negated_literal = match &ctx.body.exprs[operand] {
+            Expr::IntLiteral { value, suffix } if op == UnaryOp::Neg => {
+                Some((*value, suffix.clone()))
             }
-            _ => self.check_expr(ctx, operand),
+            _ => None,
+        };
+        let operand_ty = if let Some((value, suffix)) = negated_literal {
+            let ty = self.check_integer_literal(
+                value,
+                suffix.as_deref(),
+                expected,
+                ctx.expr_range(operand),
+                true,
+            );
+            self.result
+                .expr_types
+                .insert((ctx.body_id, operand), ty.clone());
+            ty
+        } else {
+            match (op, expected) {
+                (UnaryOp::Ref | UnaryOp::MutRef, _) => self.check_place_expr(ctx, operand),
+                (UnaryOp::Neg | UnaryOp::Pos, Some(expected)) if expected.is_numeric() => {
+                    self.check_expr_expected(ctx, operand, expected)
+                }
+                _ => self.check_expr(ctx, operand),
+            }
         };
         if matches!(op, UnaryOp::Neg | UnaryOp::Not)
             && !operand_ty.is_numeric()
@@ -1448,6 +1468,43 @@ impl TypeChecker<'_> {
                 }
             },
         }
+    }
+
+    fn check_integer_literal(
+        &mut self,
+        value: u64,
+        suffix: Option<&str>,
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+        negative: bool,
+    ) -> Type {
+        let ty = self.int_literal_type(suffix, expected, span);
+        let int_ty = match ty {
+            Type::Int(ty) => ty,
+            Type::InferInt => IntTy::I32,
+            _ => return ty,
+        };
+        let valid = if negative {
+            int_ty.contains_negative_magnitude(value)
+        } else {
+            int_ty.contains_u64(value)
+        };
+        if !valid {
+            let value = if negative {
+                format!("-{value}")
+            } else {
+                value.to_string()
+            };
+            self.diagnostic(
+                "E0011",
+                format!(
+                    "integer literal `{value}` is out of range for `{}`",
+                    int_ty.as_str()
+                ),
+                span,
+            );
+        }
+        ty
     }
 
     fn check_struct_expr(
@@ -2058,11 +2115,21 @@ impl TypeChecker<'_> {
             );
         }
         let len_value = match &ctx.body.exprs[len] {
-            Expr::IntLiteral { value, .. } if *value >= 0 => *value as usize,
+            Expr::IntLiteral { value, .. } => match usize::try_from(*value) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.diagnostic(
+                        "E0002",
+                        "array repeat length must be an integer literal that fits `usize`",
+                        ctx.expr_range(len),
+                    );
+                    0
+                }
+            },
             _ => {
                 self.diagnostic(
                     "E0002",
-                    "array repeat length must be a non-negative integer literal",
+                    "array repeat length must be an integer literal that fits `usize`",
                     ctx.expr_range(len),
                 );
                 0
@@ -3509,7 +3576,7 @@ impl TypeChecker<'_> {
                     value, valid: true, ..
                 } = literal
                     && let Type::Int(ty) = literal_ty
-                    && !ty.contains_i64(value)
+                    && !ty.contains_u64(value)
                 {
                     self.diagnostic(
                         "E0011",
@@ -4025,7 +4092,7 @@ fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
         HirTypeRef::Function { params, ret, .. } => {
             params.iter().any(type_ref_contains_error) || type_ref_contains_error(ret)
         }
-        HirTypeRef::Unknown => false,
+        HirTypeRef::Never | HirTypeRef::Unknown => false,
     }
 }
 

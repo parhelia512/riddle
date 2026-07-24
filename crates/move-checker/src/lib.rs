@@ -734,7 +734,7 @@ impl<'a> Analyzer<'a> {
             Expr::IndexAccess { base, index } => {
                 let base_place = self.place_from_expr(ctx, *base)?;
                 let idx = match &ctx.body.exprs[*index] {
-                    Expr::IntLiteral { value, .. } => *value as usize,
+                    Expr::IntLiteral { value, .. } => usize::try_from(*value).ok()?,
                     _ => return None,
                 };
                 Some(base_place.index(idx))
@@ -828,7 +828,7 @@ impl<'a> Analyzer<'a> {
                     self.access_targets(ctx, *base)
                 };
                 let index = match &ctx.body.exprs[*index] {
-                    Expr::IntLiteral { value, .. } => Some(*value as usize),
+                    Expr::IntLiteral { value, .. } => usize::try_from(*value).ok(),
                     _ => None,
                 };
                 for target in &mut targets {

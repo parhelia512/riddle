@@ -32,6 +32,7 @@ impl TypeChecker<'_> {
     ) -> Type {
         match ty {
             HirTypeRef::Named(path) => self.lower_named_type(path, params, span),
+            HirTypeRef::Never => Type::Never,
             HirTypeRef::Ref(inner, mutable) => Type::Ref(
                 Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
                 *mutable,
@@ -87,6 +88,7 @@ impl TypeChecker<'_> {
 
     fn type_text(ty: &HirTypeRef) -> String {
         match ty {
+            HirTypeRef::Never => "!".to_string(),
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
             HirTypeRef::Named(p) => p.display(),
@@ -203,18 +205,14 @@ impl TypeChecker<'_> {
             "i16" => Type::Int(IntTy::I16),
             "i32" => Type::Int(IntTy::I32),
             "i64" => Type::Int(IntTy::I64),
-            "i128" => Type::Int(IntTy::I128),
             "isize" => Type::Int(IntTy::Isize),
             "u8" => Type::Int(IntTy::U8),
             "u16" => Type::Int(IntTy::U16),
             "u32" => Type::Int(IntTy::U32),
             "u64" => Type::Int(IntTy::U64),
-            "u128" => Type::Int(IntTy::U128),
             "usize" => Type::Int(IntTy::Usize),
-            "f16" => Type::Float(FloatTy::F16),
             "f32" => Type::Float(FloatTy::F32),
             "f64" => Type::Float(FloatTy::F64),
-            "f128" => Type::Float(FloatTy::F128),
             "bool" => Type::Bool,
             "str" => Type::Str,
             "char" => Type::Char,

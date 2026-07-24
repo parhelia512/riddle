@@ -89,6 +89,7 @@ ast_node!(PathSegment, PathSegment);
 
 // types
 ast_node!(NamedType, NamedType);
+ast_node!(NeverType, NeverType);
 ast_node!(TypeArgList, TypeArgList);
 ast_node!(RefType, RefType);
 ast_node!(PtrType, PtrType);
@@ -1073,7 +1074,7 @@ impl NumberExpr {
         support::token_of(&self.syntax, SyntaxKind::Number)
     }
 
-    pub fn value(&self) -> Option<i64> {
+    pub fn value(&self) -> Option<u64> {
         let text = self.value_token()?;
         let text = text.text();
         let text_no_underscores: String = text.chars().filter(|&c| c != '_').collect();
@@ -1094,7 +1095,7 @@ impl NumberExpr {
         let suffix_start = digits
             .find(|ch: char| !is_digit(ch))
             .unwrap_or(digits.len());
-        i64::from_str_radix(&digits[..suffix_start], radix).ok()
+        u64::from_str_radix(&digits[..suffix_start], radix).ok()
     }
 }
 
@@ -1626,6 +1627,7 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub enum Type {
     Named(NamedType),
+    Never(NeverType),
     Ref(RefType),
     Ptr(PtrType),
     Tuple(TupleType),
@@ -1637,6 +1639,7 @@ pub enum Type {
 impl AstNode for Type {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
+            SyntaxKind::NeverType => Some(Type::Never(NeverType { syntax: node })),
             SyntaxKind::RefType => Some(Type::Ref(RefType { syntax: node })),
             SyntaxKind::NamedType => Some(Type::Named(NamedType { syntax: node })),
             SyntaxKind::PtrType => Some(Type::Ptr(PtrType { syntax: node })),
@@ -1651,6 +1654,7 @@ impl AstNode for Type {
     fn syntax(&self) -> &SyntaxNode {
         match self {
             Type::Named(it) => it.syntax(),
+            Type::Never(it) => it.syntax(),
             Type::Ref(it) => it.syntax(),
             Type::Ptr(it) => it.syntax(),
             Type::Tuple(it) => it.syntax(),

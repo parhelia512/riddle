@@ -1038,7 +1038,7 @@ impl<'a> TypeChecker<'a> {
                 .any(|ty| self.type_ref_contains_inline_type(ty, target, seen)),
             HirTypeRef::Array(_, HirConstArg::Value(0)) => false,
             HirTypeRef::Array(inner, _) => self.type_ref_contains_inline_type(inner, target, seen),
-            HirTypeRef::Const(_) => false,
+            HirTypeRef::Never | HirTypeRef::Const(_) => false,
             HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
             HirTypeRef::Function { .. } => false,
             HirTypeRef::Unknown | HirTypeRef::Error => false,

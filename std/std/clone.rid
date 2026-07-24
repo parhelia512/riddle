@@ -10,15 +10,11 @@ impl Clone for i8 { fun clone(&self) -> Self { *self } }
 impl Clone for i16 { fun clone(&self) -> Self { *self } }
 impl Clone for i32 { fun clone(&self) -> Self { *self } }
 impl Clone for i64 { fun clone(&self) -> Self { *self } }
-impl Clone for i128 { fun clone(&self) -> Self { *self } }
 impl Clone for isize { fun clone(&self) -> Self { *self } }
 impl Clone for u8 { fun clone(&self) -> Self { *self } }
 impl Clone for u16 { fun clone(&self) -> Self { *self } }
 impl Clone for u32 { fun clone(&self) -> Self { *self } }
 impl Clone for u64 { fun clone(&self) -> Self { *self } }
-impl Clone for u128 { fun clone(&self) -> Self { *self } }
 impl Clone for usize { fun clone(&self) -> Self { *self } }
-impl Clone for f16 { fun clone(&self) -> Self { *self } }
 impl Clone for f32 { fun clone(&self) -> Self { *self } }
 impl Clone for f64 { fun clone(&self) -> Self { *self } }
-impl Clone for f128 { fun clone(&self) -> Self { *self } }

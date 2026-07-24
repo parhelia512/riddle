@@ -1160,9 +1160,9 @@ fn reachable_diagnostic_producers_have_exact_primary_and_lsp_spans() {
         (
             "E0040",
             "invalid integer literal",
-            "fun main() { let value = 9223372036854775808; }",
-            "9223372036854775808",
-            "9223372036854775808",
+            "fun main() { let value = 18446744073709551616; }",
+            "18446744073709551616",
+            "18446744073709551616",
         ),
         (
             "E0041",

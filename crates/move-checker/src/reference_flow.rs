@@ -598,7 +598,8 @@ fn hir_type_may_carry_reference(ty: &hir::item_tree::HirTypeRef) -> bool {
         hir::item_tree::HirTypeRef::Named(path) => {
             path.type_args.iter().any(hir_type_may_carry_reference)
         }
-        hir::item_tree::HirTypeRef::Const(_)
+        hir::item_tree::HirTypeRef::Never
+        | hir::item_tree::HirTypeRef::Const(_)
         | hir::item_tree::HirTypeRef::Unknown
         | hir::item_tree::HirTypeRef::Error => false,
     }

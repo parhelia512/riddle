@@ -5,7 +5,8 @@ use crate::value::{BlockId, FuncRef, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstValue {
-    Int(i128, IntWidth),
+    Int(u64, IntWidth),
+    NegativeInt(u64, IntWidth),
     Float(f64, FloatWidth),
     Bool(bool),
     String(String),
@@ -19,15 +20,12 @@ pub enum IntWidth {
     I16,
     I32,
     I64,
-    I128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloatWidth {
-    F16,
     F32,
     F64,
-    F128,
 }
 
 // 运算符

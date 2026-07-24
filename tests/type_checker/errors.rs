@@ -1,6 +1,57 @@
 use crate::{check, messages};
 
 #[test]
+fn rejects_out_of_range_integer_expression_literals() {
+    let result = check(
+        r#"
+        fun values() {
+            let too_large: u8 = 256u8;
+            let too_negative: i8 = -129i8;
+        }
+        "#,
+    );
+
+    let messages = messages(&result);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("integer literal `256` is out of range for `u8`")),
+        "{:#?}",
+        result.diagnostics
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("integer literal `-129` is out of range for `i8`")),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn rejects_scalar_types_without_portable_c11_representations() {
+    let result = check(
+        r#"
+        fun unsupported(a: i128, b: u128, c: f16, d: f128) {
+            let ai = 1i128;
+            let bu = 1u128;
+            let cf = 1.0f16;
+            let df = 1.0f128;
+        }
+        "#,
+    );
+
+    let messages = messages(&result);
+    for name in ["i128", "u128", "f16", "f128"] {
+        assert!(
+            messages.iter().any(|message| message.contains(name)),
+            "missing diagnostic for {name}: {:#?}",
+            result.diagnostics
+        );
+    }
+}
+
+#[test]
 fn reports_let_initializer_mismatch() {
     let result = check(
         r#"
@@ -389,14 +440,14 @@ fn accepts_fully_enumerated_u8_match() {
 }
 
 #[test]
-fn reports_wide_integer_range_boundaries() {
+fn reports_64_bit_integer_range_boundaries() {
     let result = check(
         r#"
-        fun signed(value: i128) -> i32 {
+        fun signed(value: i64) -> i32 {
             match value { 0 => 0 }
         }
 
-        fun unsigned(value: u128) -> i32 {
+        fun unsigned(value: u64) -> i32 {
             match value { 0 => 0 }
         }
         "#,
@@ -409,11 +460,11 @@ fn reports_wide_integer_range_boundaries() {
     assert_eq!(diagnostics.len(), 2, "{:#?}", result.diagnostics);
     assert_eq!(
         diagnostics[0].notes[0],
-        "uncovered i128 ranges for `_`: `-170141183460469231731687303715884105728..=-1`, `1..=170141183460469231731687303715884105727`"
+        "uncovered i64 ranges for `_`: `-9223372036854775808..=-1`, `1..=9223372036854775807`"
     );
     assert_eq!(
         diagnostics[1].notes[0],
-        "uncovered u128 ranges for `_`: `1..=340282366920938463463374607431768211455`"
+        "uncovered u64 ranges for `_`: `1..=18446744073709551615`"
     );
 }
 
@@ -955,7 +1006,7 @@ fn array_repeat_length_must_be_non_negative_literal() {
         messages(&result)
             .iter()
             .filter(|msg| {
-                msg.contains("array repeat length must be a non-negative integer literal")
+                msg.contains("array repeat length must be an integer literal that fits `usize`")
             })
             .count(),
         2

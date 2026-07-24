@@ -32,13 +32,11 @@ pub enum IntTy {
     I16,
     I32,
     I64,
-    I128,
     Isize,
     U8,
     U16,
     U32,
     U64,
-    U128,
     Usize,
 }
 
@@ -46,17 +44,15 @@ impl IntTy {
     pub fn is_signed(self) -> bool {
         matches!(
             self,
-            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128 | IntTy::Isize
+            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::Isize
         )
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatTy {
-    F16,
     F32,
     F64,
-    F128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -122,25 +118,22 @@ impl Type {
                 IntTy::I16 | IntTy::U16 => 2,
                 IntTy::I32 | IntTy::U32 => 4,
                 IntTy::I64 | IntTy::U64 => 8,
-                IntTy::I128 | IntTy::U128 => 16,
-                IntTy::Isize | IntTy::Usize => 8,
+                IntTy::Isize | IntTy::Usize => std::mem::size_of::<usize>(),
             },
             Type::Float(ty) => match ty {
-                FloatTy::F16 => 2,
                 FloatTy::F32 => 4,
                 FloatTy::F64 => 8,
-                FloatTy::F128 => 16,
             },
             Type::Bool => 1,
             Type::Char => 4,
             Type::Ref(inner, _) | Type::Ptr(inner) => {
                 if !inner.is_sized() {
-                    16
+                    2 * std::mem::size_of::<usize>()
                 } else {
-                    8
+                    std::mem::size_of::<usize>()
                 }
             }
-            Type::FnPtr(_) => 8,
+            Type::FnPtr(_) => 2 * std::mem::size_of::<usize>(),
             Type::Str => unreachable!("cannot compute the size of unsized `str`"),
             Type::Unit => 0,
             Type::Never => 0,
