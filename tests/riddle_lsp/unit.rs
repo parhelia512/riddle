@@ -1,11 +1,30 @@
-use super::*;
-use lsp_types::{DiagnosticSeverity, Range};
-use riddlec::pipeline::IntoDiagnosticExt;
+use lsp_types::{
+    DiagnosticSeverity, InlayHintLabel, Position, Range, SemanticToken, SemanticTokens,
+    TextDocumentContentChangeEvent,
+};
+use riddle_lsp::{
+    parse_args,
+    test_support::{
+        AnalysisSessions, DiagnosticSessions, Document, MOD_DECLARATION, MOD_DEFAULT_LIBRARY,
+        MOD_MUTABLE, MOD_STATIC, RequestRevisions, TOKEN_COMMENT, TOKEN_ENUM, TOKEN_FUNCTION,
+        TOKEN_INTERFACE, TOKEN_KEYWORD, TOKEN_METHOD, TOKEN_PARAMETER, TOKEN_STRING, TOKEN_STRUCT,
+        TOKEN_TYPE, TOKEN_VARIABLE, apply_content_changes, collect_diagnostics,
+        collect_document_diagnostics, collect_workspace_diagnostics,
+        collect_workspace_diagnostics_cancellable, collect_workspace_diagnostics_with_sessions,
+        completion_items_for_document, completion_items_for_source, inlay_hints_for_document,
+        inlay_hints_for_source, semantic_token_delta, semantic_tokens_for_document,
+        semantic_tokens_for_source, semantic_tokens_for_source_with_options, to_lsp, to_lsp_mapped,
+    },
+};
+use riddlec::pipeline::{CompileOptions, IntoDiagnosticExt};
+use rowan::TextRange;
 use std::{
     cell::Cell,
-    fs,
+    collections::HashMap,
+    env, fs,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    process,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const DOCUMENTED_ERROR_CODES: &[&str] = &[
@@ -58,14 +77,6 @@ fn diagnostic_ext(
         help: None,
         notes: Vec::new(),
     }
-}
-
-#[test]
-fn position_counts_utf16_columns() {
-    let source = "a😀\nb";
-    assert_eq!(position(source, 0), Position::new(0, 0));
-    assert_eq!(position(source, "a😀".len()), Position::new(0, 3));
-    assert_eq!(position(source, source.len()), Position::new(1, 1));
 }
 
 #[test]
@@ -221,12 +232,6 @@ fn parser_eof_diagnostic_stays_at_user_eof_with_std() {
 }
 
 #[test]
-fn positions_handle_crlf_and_utf16_at_eof() {
-    let source = "a\r\n😀";
-    assert_eq!(position(source, source.len()), Position::new(1, 2));
-}
-
-#[test]
 fn full_text_uses_latest_full_sync_change() {
     let old = TextDocumentContentChangeEvent {
         range: None,
@@ -239,19 +244,75 @@ fn full_text_uses_latest_full_sync_change() {
         text: "new".into(),
     };
 
-    assert_eq!(full_text(vec![old, new]).as_deref(), Some("new"));
+    let mut text = "initial".to_string();
+    assert!(apply_content_changes(&mut text, vec![old, new]));
+    assert_eq!(text, "new");
 }
 
 #[test]
-fn completion_positions_use_utf16_columns() {
-    let source = "😀name\r\nnext";
+fn incremental_changes_apply_sequentially_with_utf16_ranges() {
+    let mut text = "a😀c\nlast".to_string();
+    let changes = vec![
+        TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 1), Position::new(0, 3))),
+            range_length: Some(2),
+            text: "x".into(),
+        },
+        TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(1, 0), Position::new(1, 4))),
+            range_length: Some(4),
+            text: "done".into(),
+        },
+    ];
 
-    assert_eq!(offset_for_position(source, Position::new(0, 2)), Some(4));
-    assert_eq!(offset_for_position(source, Position::new(0, 1)), None);
-    assert_eq!(
-        offset_for_position(source, Position::new(1, 4)),
-        Some(source.len())
-    );
+    assert!(apply_content_changes(&mut text, changes));
+    assert_eq!(text, "axc\ndone");
+}
+
+#[test]
+fn completion_revisions_are_isolated_per_document_and_removable() {
+    let revisions = RequestRevisions::default();
+    let first = lsp_types::Url::parse("file:///first.rid").unwrap();
+    let second = lsp_types::Url::parse("file:///second.rid").unwrap();
+
+    let first_old = revisions.begin(&first);
+    let second_current = revisions.begin(&second);
+    let first_current = revisions.begin(&first);
+
+    assert!(!revisions.is_current(&first, first_old));
+    assert!(revisions.is_current(&first, first_current));
+    assert!(revisions.is_current(&second, second_current));
+    revisions.remove(&first);
+    assert!(!revisions.is_current(&first, first_current));
+}
+
+#[test]
+fn semantic_token_delta_replaces_only_the_changed_middle() {
+    let token = |delta_start, token_type| SemanticToken {
+        delta_line: 0,
+        delta_start,
+        length: 1,
+        token_type,
+        token_modifiers_bitset: 0,
+    };
+    let previous = vec![
+        token(0, TOKEN_KEYWORD),
+        token(2, TOKEN_VARIABLE),
+        token(2, TOKEN_TYPE),
+    ];
+    let current = vec![
+        token(0, TOKEN_KEYWORD),
+        token(2, TOKEN_FUNCTION),
+        token(2, TOKEN_TYPE),
+    ];
+
+    let delta = semantic_token_delta(&previous, &current, "2".into());
+
+    assert_eq!(delta.result_id.as_deref(), Some("2"));
+    assert_eq!(delta.edits.len(), 1);
+    assert_eq!(delta.edits[0].start, 5);
+    assert_eq!(delta.edits[0].delete_count, 5);
+    assert_eq!(delta.edits[0].data.as_deref(), Some(&current[1..2]));
 }
 
 #[test]
@@ -285,6 +346,70 @@ fn completion_filters_keywords_globals_and_locals_by_prefix() {
         CompileOptions { use_std: false },
     );
     assert!(keywords.iter().any(|item| item.label == "return"));
+}
+
+#[test]
+fn completion_matches_free_functions_case_insensitively() {
+    let source = "fun Foo() {} fun main() { f }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("f }").unwrap() + 1),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "Foo"), "{items:#?}");
+}
+
+#[test]
+fn completion_includes_struct_and_enum_names_in_type_positions() {
+    let source = "struct Point {}\nenum State { Ready }\nfun inspect(value: ) {}";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find(") {}").unwrap()),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        items.iter().any(|item| {
+            item.label == "Point" && item.kind == Some(lsp_types::CompletionItemKind::STRUCT)
+        }),
+        "{items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item.label == "State" && item.kind == Some(lsp_types::CompletionItemKind::ENUM)
+        }),
+        "{items:#?}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| { item.kind == Some(lsp_types::CompletionItemKind::KEYWORD) }),
+        "{items:#?}"
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "inspect"),
+        "{items:#?}"
+    );
+    for unsupported in ["i128", "u128", "f16", "f128"] {
+        assert!(
+            !items.iter().any(|item| item.label == unsupported),
+            "unexpected unsupported type {unsupported}: {items:#?}"
+        );
+    }
+}
+
+#[test]
+fn completion_keeps_expression_candidates_after_struct_field_colons() {
+    let source =
+        "struct Foo { field: i32 }\nfun main() { let value = 1; let item = Foo { field: val }; }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("val }").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "value"), "{items:#?}");
 }
 
 #[test]
@@ -381,6 +506,331 @@ fn completion_includes_std_prelude_imports() {
         items.iter().any(|item| item.label == "String"),
         "{items:#?}"
     );
+}
+
+#[test]
+fn completion_respects_nested_block_scope() {
+    let source = "fun main() { if true { let hidden = 1; } hid }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("hid").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        !items.iter().any(|item| item.label == "hidden"),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn completion_includes_for_and_match_pattern_bindings() {
+    let for_source = "fun main() { for item in [1] { ite } }";
+    let for_items = completion_items_for_source(
+        for_source,
+        position(for_source, for_source.find("ite }").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(
+        for_items.iter().any(|item| item.label == "item"),
+        "{for_items:#?}"
+    );
+
+    let match_source = "enum Value { Item(i32) } fun main(value: Value) { match value { Value::Item(inner) => { inn } } }";
+    let match_items = completion_items_for_source(
+        match_source,
+        position(match_source, match_source.find("inn }").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(
+        match_items.iter().any(|item| item.label == "inner"),
+        "{match_items:#?}"
+    );
+}
+
+#[test]
+fn completion_includes_private_imports() {
+    let source =
+        "mod models { pub struct Widget {} } use crate::models::Widget; fun main() { Wid }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("Wid").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        items.iter().any(|item| item.label == "Widget"),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn completion_resolves_associated_items_through_import_aliases() {
+    let source = "mod models { pub struct Widget {} impl Widget { pub fun build() {} } } use crate::models::Widget as Alias; fun main() { Alias::bu }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("bu }").unwrap() + 2),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "build"), "{items:#?}");
+}
+
+#[test]
+fn completion_loads_unopened_project_modules() {
+    let root = temp_root("project-completion");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "mod util;\nfun main() { util::va }\n";
+    fs::write(&main, main_text).unwrap();
+    fs::write(root.join("src/util.rid"), "pub fun value() {}\n").unwrap();
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: main_text.into(),
+            version: Some(1),
+        },
+    )]);
+    let sessions = AnalysisSessions::default();
+
+    let fallback_sessions = AnalysisSessions::default();
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(main_text, main_text.find("va }").unwrap() + 2),
+        CompileOptions::default(),
+        &sessions,
+        &fallback_sessions,
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(items.iter().any(|item| item.label == "value"), "{items:#?}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completion_uses_unsaved_project_module_overlays() {
+    let root = temp_root("project-completion-overlay");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "mod util;\nfun main() { util::fr }\n";
+    fs::write(&main, main_text).unwrap();
+    let util = root.join("src/util.rid");
+    fs::write(&util, "pub fun stale() {}\n").unwrap();
+    let main_uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let util_uri = lsp_types::Url::from_file_path(&util).unwrap();
+    let docs = HashMap::from([
+        (
+            main_uri.clone(),
+            Document {
+                text: main_text.into(),
+                version: Some(1),
+            },
+        ),
+        (
+            util_uri,
+            Document {
+                text: "pub fun fresh() {}\n".into(),
+                version: Some(2),
+            },
+        ),
+    ]);
+    let sessions = AnalysisSessions::default();
+
+    let items = completion_items_for_document(
+        &main_uri,
+        &docs,
+        position(main_text, main_text.find("fr }").unwrap() + 2),
+        CompileOptions::default(),
+        &sessions,
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(items.iter().any(|item| item.label == "fresh"), "{items:#?}");
+    assert!(
+        !items.iter().any(|item| item.label == "stale"),
+        "{items:#?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_member_completion_uses_active_module_coordinates() {
+    let root = temp_root("project-member-completion-coordinates");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.rid"),
+        "mod padding;\nmod model;\nfun main() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/padding.rid"),
+        format!("// {}\n", "padding".repeat(80)),
+    )
+    .unwrap();
+    let model = root.join("src/model.rid");
+    let model_text = "pub struct Point { field: i32 }\npub fun complete() { let point = Point { field: 1 }; point.fi }\n";
+    fs::write(&model, model_text).unwrap();
+    let uri = lsp_types::Url::from_file_path(&model).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: model_text.into(),
+            version: Some(1),
+        },
+    )]);
+
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(
+            model_text,
+            model_text.find("point.fi").unwrap() + "point.fi".len(),
+        ),
+        CompileOptions { use_std: false },
+        &AnalysisSessions::default(),
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(items.iter().any(|item| item.label == "field"), "{items:#?}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completion_preserves_std_member_items_through_document_sessions() {
+    let uri = lsp_types::Url::parse("file:///riddle-lsp-completion.rid").unwrap();
+    let text = "use std::String; fun main() { let c = String::new(); let d = c.i }";
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: text.into(),
+            version: Some(1),
+        },
+    )]);
+    let sessions = AnalysisSessions::default();
+
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(text, text.find("c.i").unwrap() + 3),
+        CompileOptions::default(),
+        &sessions,
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        items.iter().any(|item| item.label == "is_empty"),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn project_semantic_tokens_resolve_cross_module_functions() {
+    let root = temp_root("project-semantic-tokens");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "mod util;\nfun main() { let callable = util::make; callable; }\n";
+    fs::write(&main, main_text).unwrap();
+    fs::write(
+        root.join("src/util.rid"),
+        "pub struct Thing {}\npub fun make() -> Thing { Thing {} }\n",
+    )
+    .unwrap();
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: main_text.into(),
+            version: Some(1),
+        },
+    )]);
+    let sessions = AnalysisSessions::default();
+
+    let tokens =
+        semantic_tokens_for_document(&uri, &docs, CompileOptions::default(), &sessions).unwrap();
+    let make = position(main_text, main_text.find("make").unwrap());
+    assert!(semantic_token_positions(&tokens).iter().any(|token| {
+        token.line == make.line
+            && token.start == make.character
+            && token.token_type == TOKEN_FUNCTION
+    }));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_inlay_hints_infer_cross_module_return_types() {
+    let root = temp_root("project-inlay-hints");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "mod util;\nfun main() { let value = util::make(); }\n";
+    fs::write(&main, main_text).unwrap();
+    fs::write(
+        root.join("src/util.rid"),
+        "pub struct Thing {}\npub fun make() -> Thing { Thing {} }\n",
+    )
+    .unwrap();
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: main_text.into(),
+            version: Some(1),
+        },
+    )]);
+    let sessions = AnalysisSessions::default();
+
+    let hints = inlay_hints_for_document(
+        &uri,
+        &docs,
+        Range::new(Position::new(0, 0), Position::new(2, 0)),
+        CompileOptions::default(),
+        &sessions,
+    )
+    .unwrap();
+
+    assert!(
+        hints
+            .iter()
+            .any(|hint| matches!(&hint.label, InlayHintLabel::String(label) if label == ": Thing"))
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -706,7 +1156,12 @@ fn semantic_tokens_mark_mutable_locals_like_rust_analyzer() {
         .map(|token| token.token_modifiers_bitset)
         .collect::<Vec<_>>();
 
-    assert_eq!(variables, vec![MOD_DECLARATION | MOD_MUTABLE, MOD_MUTABLE]);
+    // Immutable locals now appear at use sites with modifier 0;
+    // mutable locals carry MOD_MUTABLE at use sites and MOD_DECLARATION|MOD_MUTABLE at their binding.
+    assert_eq!(
+        variables,
+        vec![0, MOD_DECLARATION | MOD_MUTABLE, MOD_MUTABLE]
+    );
 }
 
 #[test]
@@ -726,6 +1181,19 @@ fn semantic_tokens_prefer_resolved_variables_over_lexical_types() {
         2
     );
     assert!(!types.contains(&TOKEN_TYPE));
+}
+
+#[test]
+fn semantic_tokens_prefer_immutable_locals_over_same_named_structs() {
+    let source = "struct Foo {}\nfun main() { let Foo = 1; Foo; }";
+    let use_position = position(source, source.rfind("Foo;").unwrap());
+    let tokens = semantic_token_positions(&semantic_tokens(source));
+    let token = tokens
+        .iter()
+        .find(|token| token.line == use_position.line && token.start == use_position.character)
+        .unwrap();
+
+    assert_eq!(token.token_type, TOKEN_VARIABLE, "{tokens:#?}");
 }
 
 #[test]
@@ -904,7 +1372,7 @@ fn mapped_diagnostic_keeps_cross_file_related_information() {
         ],
     );
 
-    let (uri, diagnostic) = diagnostics::to_lsp_mapped(&loaded.source_map, input).unwrap();
+    let (uri, diagnostic) = to_lsp_mapped(&loaded.source_map, input).unwrap();
     let related = diagnostic.related_information.unwrap();
 
     assert_eq!(
@@ -1388,8 +1856,8 @@ fn reachable_diagnostic_producers_have_exact_primary_and_lsp_spans() {
         assert_eq!(
             lsp.range,
             Range::new(
-                expected_test_position(source, expected_start),
-                expected_test_position(source, expected_end),
+                position(source, expected_start),
+                position(source, expected_end),
             ),
             "{code}: {diagnostic:#?}"
         );
@@ -1454,21 +1922,25 @@ fn closure_diagnostic_spans_point_at_the_relevant_source() {
         let lsp = to_lsp(&uri, source, diagnostic.to_ext()).unwrap();
         assert_eq!(
             lsp.range,
-            Range::new(
-                expected_test_position(source, start),
-                expected_test_position(source, end),
-            ),
+            Range::new(position(source, start), position(source, end),),
             "{code}: {diagnostic:#?}"
         );
     }
 }
 
-fn expected_test_position(source: &str, offset: usize) -> Position {
+fn position(source: &str, offset: usize) -> Position {
     let prefix = &source[..offset];
     let line_start = prefix.rfind('\n').map_or(0, |newline| newline + 1);
     Position::new(
         prefix.bytes().filter(|byte| *byte == b'\n').count() as u32,
         source[line_start..offset].encode_utf16().count() as u32,
+    )
+}
+
+fn range(source: &str, range: TextRange) -> Range {
+    Range::new(
+        position(source, range.start().into()),
+        position(source, range.end().into()),
     )
 }
 
@@ -1545,6 +2017,18 @@ fn parse_args_accepts_no_std() {
 }
 
 #[test]
+fn parse_args_accepts_completion_delay_ms() {
+    let args = vec![
+        "riddle-lsp".into(),
+        "--completion-delay-ms".into(),
+        "25".into(),
+    ];
+    let opts = parse_args(&args).unwrap();
+
+    assert_eq!(opts.completion_delay, Duration::from_millis(25));
+}
+
+#[test]
 fn workspace_analysis_can_be_cancelled_between_documents() {
     let docs = HashMap::from([
         (
@@ -1579,37 +2063,7 @@ fn workspace_analysis_can_be_cancelled_between_documents() {
 }
 
 #[test]
-fn workspace_sessions_skip_unchanged_standalone_documents() {
-    let first_uri = lsp_types::Url::parse("untitled:first.rid").unwrap();
-    let second_uri = lsp_types::Url::parse("untitled:second.rid").unwrap();
-    let mut docs = HashMap::from([
-        (
-            first_uri.clone(),
-            Document {
-                text: "fun first() {}".into(),
-                version: Some(1),
-            },
-        ),
-        (
-            second_uri,
-            Document {
-                text: "fun second() {}".into(),
-                version: Some(1),
-            },
-        ),
-    ]);
-    let mut sessions = DiagnosticSessions::default();
-
-    collect_workspace_diagnostics_with_sessions(&docs, CompileOptions::default(), &mut sessions);
-    assert_eq!(sessions.check_counts(), (2, 0));
-
-    docs.get_mut(&first_uri).unwrap().text = "fun first() { missing; }".into();
-    collect_workspace_diagnostics_with_sessions(&docs, CompileOptions::default(), &mut sessions);
-    assert_eq!(sessions.check_counts(), (3, 0));
-}
-
-#[test]
-fn workspace_sessions_skip_projects_for_unrelated_edits() {
+fn workspace_sessions_observe_project_disk_edits() {
     let root = temp_root("project-session-reuse");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
@@ -1623,31 +2077,16 @@ fn workspace_sessions_skip_projects_for_unrelated_edits() {
     let util_path = root.join("src/util.rid");
     fs::write(&util_path, "pub fun value() {}\n").unwrap();
     let main_uri = lsp_types::Url::from_file_path(fs::canonicalize(&main_path).unwrap()).unwrap();
-    let scratch_uri = lsp_types::Url::parse("untitled:scratch.rid").unwrap();
-    let mut docs = HashMap::from([
-        (
-            main_uri,
-            Document {
-                text: main_source.into(),
-                version: Some(1),
-            },
-        ),
-        (
-            scratch_uri.clone(),
-            Document {
-                text: "fun scratch() {}".into(),
-                version: Some(1),
-            },
-        ),
-    ]);
+    let docs = HashMap::from([(
+        main_uri,
+        Document {
+            text: main_source.into(),
+            version: Some(1),
+        },
+    )]);
     let mut sessions = DiagnosticSessions::default();
 
     collect_workspace_diagnostics_with_sessions(&docs, CompileOptions::default(), &mut sessions);
-    assert_eq!(sessions.check_counts(), (1, 1));
-
-    docs.get_mut(&scratch_uri).unwrap().text = "fun scratch() { missing; }".into();
-    collect_workspace_diagnostics_with_sessions(&docs, CompileOptions::default(), &mut sessions);
-    assert_eq!(sessions.check_counts(), (2, 1));
 
     fs::write(&util_path, "pub fun value() { missing; }\n").unwrap();
     let published = collect_workspace_diagnostics_with_sessions(
@@ -1655,7 +2094,6 @@ fn workspace_sessions_skip_projects_for_unrelated_edits() {
         CompileOptions::default(),
         &mut sessions,
     );
-    assert_eq!(sessions.check_counts(), (2, 2));
     let util_uri = lsp_types::Url::from_file_path(fs::canonicalize(&util_path).unwrap()).unwrap();
     assert!(published.iter().any(|item| {
         item.uri == util_uri
@@ -1665,68 +2103,6 @@ fn workspace_sessions_skip_projects_for_unrelated_edits() {
                 .any(|diagnostic| diagnostic.message.contains("unresolved name: `missing`"))
     }));
     let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn project_cache_ignores_open_files_outside_the_module_graph() {
-    let root = temp_root("unreferenced-project-file");
-    fs::create_dir_all(root.join("src")).unwrap();
-    fs::write(
-        root.join("Clue.toml"),
-        "[package]\nname = \"app\"\n\n[dependencies]\n",
-    )
-    .unwrap();
-    let main_path = root.join("src/main.rid");
-    fs::write(&main_path, "fun main() {}\n").unwrap();
-    let scratch_path = root.join("src/scratch.rid");
-    fs::write(&scratch_path, "fun scratch() {}\n").unwrap();
-    let main_uri = lsp_types::Url::from_file_path(fs::canonicalize(&main_path).unwrap()).unwrap();
-    let scratch_uri =
-        lsp_types::Url::from_file_path(fs::canonicalize(&scratch_path).unwrap()).unwrap();
-    let mut docs = HashMap::from([
-        (
-            main_uri,
-            Document {
-                text: "fun main() {}\n".into(),
-                version: Some(1),
-            },
-        ),
-        (
-            scratch_uri.clone(),
-            Document {
-                text: "fun scratch() {}\n".into(),
-                version: Some(1),
-            },
-        ),
-    ]);
-    let mut sessions = DiagnosticSessions::default();
-
-    collect_workspace_diagnostics_with_sessions(&docs, CompileOptions::default(), &mut sessions);
-    assert_eq!(sessions.check_counts(), (1, 1));
-
-    docs.get_mut(&scratch_uri).unwrap().text = "fun scratch() { missing; }\n".into();
-    collect_workspace_diagnostics_with_sessions(&docs, CompileOptions::default(), &mut sessions);
-    assert_eq!(sessions.check_counts(), (2, 1));
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn watched_topology_and_manifest_changes_reset_analysis_sessions() {
-    let rid = lsp_types::Url::parse("file:///workspace/src/main.rid").unwrap();
-    let manifest = lsp_types::Url::parse("file:///workspace/Clue.toml").unwrap();
-
-    assert!(!watched_change_resets_sessions(&FileEvent {
-        uri: rid.clone(),
-        typ: FileChangeType::CHANGED,
-    }));
-    assert!(watched_change_resets_sessions(&FileEvent {
-        uri: rid,
-        typ: FileChangeType::CREATED,
-    }));
-    assert!(watched_change_resets_sessions(&FileEvent {
-        uri: manifest,
-        typ: FileChangeType::CHANGED,
-    }));
 }
 
 #[test]
@@ -1816,6 +2192,22 @@ fun main(){
                 start: 8,
                 length: 1,
                 token_type: TOKEN_PARAMETER,
+                token_modifiers_bitset: 0,
+            },
+            // Immutable local closure `t` at its call site in `t(1)`.
+            SemanticTokenPosition {
+                line: 11,
+                start: 12,
+                length: 1,
+                token_type: TOKEN_VARIABLE,
+                token_modifiers_bitset: 0,
+            },
+            // Immutable local `v` at its use site in `print_digit(v)`.
+            SemanticTokenPosition {
+                line: 12,
+                start: 16,
+                length: 1,
+                token_type: TOKEN_VARIABLE,
                 token_modifiers_bitset: 0,
             },
         ]

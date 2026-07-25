@@ -2,6 +2,30 @@ use crate::lower;
 use mir::Backend;
 use mir::backend::c::CBackend;
 
+fn c_symbol(kind: char, name: &str) -> String {
+    let suffix = name
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("riddle_{kind}_{suffix}")
+}
+
+fn c_function(name: &str) -> String {
+    c_symbol('f', name)
+}
+
+fn c_type(name: &str) -> String {
+    c_symbol('t', name)
+}
+
+fn c_member(name: &str) -> String {
+    c_symbol('m', name)
+}
+
+fn c_variable(name: &str) -> String {
+    c_symbol('v', name)
+}
+
 #[test]
 fn c_simple_function() {
     let module = lower(
@@ -56,7 +80,7 @@ fn c_tuple_types_are_named_and_reusable() {
     let generated = CBackend::new().compile(&module).unwrap();
 
     assert!(
-        generated.contains("typedef struct riddle_tuple_"),
+        generated.contains(&format!("typedef struct {}", c_type("riddle_tuple_"))),
         "{generated}"
     );
     assert!(
@@ -89,12 +113,16 @@ fn c_tuple_comparison_is_lowered_elementwise() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains(".f0 =="), "{generated}");
-    assert!(generated.contains(".f1 =="), "{generated}");
+    let f0 = c_member("f0");
+    let f1 = c_member("f1");
+    assert!(generated.contains(&format!(".{f0} ==")), "{generated}");
+    assert!(generated.contains(&format!(".{f1} ==")), "{generated}");
     assert!(
         !generated.lines().any(|line| {
             let line = line.trim_start();
-            line.starts_with("if (tup") && !line.contains(".f0") && !line.contains(".f1")
+            line.starts_with("if (tup")
+                && !line.contains(&format!(".{f0}"))
+                && !line.contains(&format!(".{f1}"))
         }),
         "tuple values must not be compared as C structs:\n{generated}"
     );
@@ -132,12 +160,9 @@ fn c_composite_comparison_dispatches_element_trait_impls() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains("eq__Point"), "{generated}");
     assert!(
-        !generated
-            .lines()
-            .any(|line| line.contains("Point") && line.contains("==")),
-        "user-defined elements must use PartialEq::eq:\n{generated}"
+        generated.matches(&c_function("eq__Point")).count() >= 3,
+        "user-defined elements must call PartialEq::eq:\n{generated}"
     );
 }
 
@@ -195,9 +220,13 @@ fn c_anonymous_function_uses_typed_function_pointer() {
         generated.contains("typedef int32_t (*riddle_fn_"),
         "{generated}"
     );
-    assert!(generated.contains("__riddle_lambda_"), "{generated}");
     assert!(
-        generated.contains(".call(") && generated.contains(".env"),
+        generated.contains(&c_function("__riddle_lambda_")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!(".{}(", c_member("call")))
+            && generated.contains(&format!(".{}", c_member("env"))),
         "{generated}"
     );
 }
@@ -216,9 +245,18 @@ fn c_non_escaping_closure_capture_uses_stack_environment() {
     let generated = CBackend::new().compile(&module).unwrap();
 
     assert!(!generated.contains("rgc_alloc"), "{generated}");
-    assert!(generated.contains("__riddle_lambda_1_env"), "{generated}");
-    assert!(generated.contains("capture_0_base"), "{generated}");
-    assert!(generated.contains(".call("), "{generated}");
+    assert!(
+        generated.contains(&c_type("__riddle_lambda_1_env")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&c_member("capture_0_base")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!(".{}(", c_member("call"))),
+        "{generated}"
+    );
 }
 
 #[test]
@@ -237,9 +275,12 @@ fn c_returned_closure_keeps_parameter_alive() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains("make_adder"), "{generated}");
+    assert!(generated.contains(&c_function("make_adder")), "{generated}");
     assert!(generated.contains("rgc_alloc"), "{generated}");
-    assert!(generated.contains("capture_0_base"), "{generated}");
+    assert!(
+        generated.contains(&c_member("capture_0_base")),
+        "{generated}"
+    );
 }
 
 #[test]
@@ -268,9 +309,18 @@ fn c_gc_closure_environment_has_deterministic_drop_glue() {
     let generated = CBackend::new().compile(&module).unwrap();
 
     assert!(generated.contains("rgc_alloc"), "{generated}");
-    assert!(generated.contains("__riddle_lambda_1_drop"), "{generated}");
-    assert!(generated.contains("drop__Guard"), "{generated}");
-    assert!(generated.contains(".drop("), "{generated}");
+    assert!(
+        generated.contains(&c_function("__riddle_lambda_1_drop")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&c_function("drop__Guard")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!(".{}(", c_member("drop"))),
+        "{generated}"
+    );
 }
 
 #[test]
@@ -284,8 +334,14 @@ fn c_named_function_value_uses_empty_environment_adapter() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains("__riddle_fn_adapter_inc"), "{generated}");
-    assert!(generated.contains("apply(s"), "{generated}");
+    assert!(
+        generated.contains(&c_function("__riddle_fn_adapter_inc")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("{}(s", c_function("apply"))),
+        "{generated}"
+    );
 }
 
 #[test]
@@ -335,12 +391,30 @@ fn c_backend_preserves_unsigned_and_pointer_sized_types() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains("uint8_t a"), "{generated}");
-    assert!(generated.contains("uint16_t b"), "{generated}");
-    assert!(generated.contains("uint32_t c"), "{generated}");
-    assert!(generated.contains("uint64_t d"), "{generated}");
-    assert!(generated.contains("size_t e"), "{generated}");
-    assert!(generated.contains("ptrdiff_t f"), "{generated}");
+    assert!(
+        generated.contains(&format!("uint8_t {}", c_variable("a"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("uint16_t {}", c_variable("b"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("uint32_t {}", c_variable("c"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("uint64_t {}", c_variable("d"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("size_t {}", c_variable("e"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("ptrdiff_t {}", c_variable("f"))),
+        "{generated}"
+    );
 }
 
 #[test]
@@ -367,7 +441,10 @@ fn c_backend_emits_unicode_char_as_u32_code_point() {
     let module = lower("fun ideograph() -> char { '\u{4e2d}' }");
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains("uint32_t ideograph"), "{generated}");
+    assert!(
+        generated.contains(&format!("uint32_t {}", c_function("ideograph"))),
+        "{generated}"
+    );
     assert!(generated.contains("UINT32_C(20013)"), "{generated}");
     assert!(!generated.contains("'\u{4e2d}'"), "{generated}");
 }
@@ -454,7 +531,11 @@ fn c_function_call() {
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains("square"), "missing callee: {}", result);
+    assert!(
+        result.contains(&c_function("square")),
+        "missing callee: {}",
+        result
+    );
 }
 
 #[test]
@@ -481,7 +562,7 @@ fn c_static_impl_method_call_uses_mangled_name() {
     let result = backend.compile(&module).unwrap();
 
     assert!(
-        result.contains("new__Point"),
+        result.contains(&c_function("new__Point")),
         "static impl method should be mangled:\n{}",
         result
     );
@@ -536,8 +617,16 @@ fn c_multiple_functions() {
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains(" a (void)"), "missing a: {}", result);
-    assert!(result.contains(" b (void)"), "missing b: {}", result);
+    assert!(
+        result.contains(&format!(" {} (void)", c_function("a"))),
+        "missing a: {}",
+        result
+    );
+    assert!(
+        result.contains(&format!(" {} (void)", c_function("b"))),
+        "missing b: {}",
+        result
+    );
 }
 
 #[test]
@@ -619,6 +708,60 @@ fn c_raw_string_return_escapes_content() {
         "raw string not escaped as C string:\n{}",
         result
     );
+}
+
+#[test]
+fn c_string_escape_length_uses_decoded_utf8_bytes() {
+    let module = lower(
+        r#"
+        fun text() -> &str {
+            "a\nb"
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("(riddle_str){ \"a\\nb\", 3 }"),
+        "{generated}"
+    );
+}
+
+#[test]
+fn c_source_names_use_prefixed_collision_free_encoding() {
+    use mir::instr::Terminator;
+    use mir::types::{IntTy, StructType, Type};
+
+    let mut module = mir::Module::new("identifiers");
+    for name in ["int", "a::b", "a_b"] {
+        let mut function = mir::Function::new(name.into(), Type::Unit);
+        function.set_terminator(function.entry, Terminator::Return(None));
+        module.add_function(function);
+    }
+    let mut typed = mir::Function::new("switch".into(), Type::Unit);
+    typed.add_param(
+        "auto".into(),
+        Type::Struct(StructType {
+            name: "union".into(),
+            fields: vec![("case".into(), Type::Int(IntTy::I32))],
+        }),
+    );
+    typed.set_terminator(typed.entry, Terminator::Return(None));
+    module.add_function(typed);
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    for encoded in [
+        "riddle_f_696e74",
+        "riddle_f_613a3a62",
+        "riddle_f_615f62",
+        "riddle_f_737769746368",
+        "riddle_t_756e696f6e",
+        "riddle_v_6175746f",
+        "riddle_m_63617365",
+    ] {
+        assert!(generated.contains(encoded), "{encoded}:\n{generated}");
+    }
+    assert!(!generated.contains("void int("), "{generated}");
 }
 
 #[test]
@@ -836,12 +979,12 @@ fn c_backend_assigns_struct_field_with_associated_type_cast() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains(".x ="),
+        result.contains(&format!(".{} =", c_member("x"))),
         "field store should use .x:\n{}",
         result
     );
     assert!(
-        !result.contains(".f0"),
+        !result.contains(&format!(".{}", c_member("f0"))),
         "field name fallback leaked:\n{}",
         result
     );
@@ -869,17 +1012,18 @@ fn c_backend_monomorphizes_generic_structs() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains("struct Box_i32 {"),
+        result.contains(&format!("struct {} {{", c_type("Box_i32"))),
         "missing i32 monomorph:\n{}",
         result
     );
     assert!(
-        result.contains("struct Box_bool {"),
+        result.contains(&format!("struct {} {{", c_type("Box_bool"))),
         "missing bool monomorph:\n{}",
         result
     );
     assert!(
-        result.contains("int32_t value;") && result.contains("bool value;"),
+        result.contains(&format!("int32_t {};", c_member("value")))
+            && result.contains(&format!("bool {};", c_member("value"))),
         "field types were not substituted:\n{}",
         result
     );
@@ -908,12 +1052,12 @@ fn c_backend_accepts_nested_generic_type_args_without_spaces() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains("Box_Box_i32"),
+        result.contains(&c_type("Box_Box_i32")),
         "missing nested monomorph:\n{}",
         result
     );
     assert!(
-        result.contains("get__Box_i32"),
+        result.contains(&c_function("get__Box_i32")),
         "missing monomorphized generic method:\n{}",
         result
     );
@@ -942,12 +1086,12 @@ fn c_backend_monomorphizes_generic_functions() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains("id__i32"),
+        result.contains(&c_function("id__i32")),
         "missing i32 instance:\n{}",
         result
     );
     assert!(
-        result.contains("id__bool"),
+        result.contains(&c_function("id__bool")),
         "missing bool instance:\n{}",
         result
     );
@@ -1000,17 +1144,17 @@ fn c_backend_dispatches_trait_bound_method_in_generic_function() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains("read__User"),
+        result.contains(&c_function("read__User")),
         "missing generic function monomorph:\n{}",
         result
     );
     assert!(
-        result.contains("name__User("),
+        result.contains(&format!("{}(", c_function("name__User"))),
         "generic body should call concrete Named impl method:\n{}",
         result
     );
     assert!(
-        result.contains("tag__User("),
+        result.contains(&format!("{}(", c_function("tag__User"))),
         "generic body should call concrete Tagged impl method:\n{}",
         result
     );
@@ -1055,8 +1199,14 @@ fn c_backend_uses_trait_default_method_unless_overridden() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains("value__Defaulted("), "{generated}");
-    assert!(generated.contains("value__Overridden("), "{generated}");
+    assert!(
+        generated.contains(&format!("{}(", c_function("value__Defaulted"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("{}(", c_function("value__Overridden"))),
+        "{generated}"
+    );
 }
 
 #[test]
@@ -1124,27 +1274,27 @@ fn c_backend_lowers_non_copy_array_into_iterator() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains("into_iter__arr2_Token"),
+        result.contains(&c_function("into_iter__arr2_Token")),
         "missing array IntoIterator monomorph:\n{}",
         result
     );
     assert!(
-        result.contains("next__ArrayIter_Token_2"),
+        result.contains(&c_function("next__ArrayIter_Token_2")),
         "missing ArrayIter::next monomorph:\n{}",
         result
     );
     assert!(
-        result.contains("  ArrayIter_Token_2 s"),
+        result.contains(&format!("  {} s", c_type("ArrayIter_Token_2"))),
         "array iterator construction lost its const argument:\n{}",
         result
     );
     assert!(
-        result.contains("next__ArrayIter_Token_2((&"),
+        result.contains(&format!("{}((&", c_function("next__ArrayIter_Token_2"))),
         "Iterator::next should receive the iterator slot by reference:\n{}",
         result
     );
     assert!(
-        result.contains("Token values[2];"),
+        result.contains(&format!("{} {}[2];", c_type("Token"), c_member("values"))),
         "array field should use C array declarator:\n{}",
         result
     );
@@ -1208,23 +1358,39 @@ fn c_backend_heap_allocates_an_escaping_array() {
     let generated = CBackend::new().compile(&module).unwrap();
 
     assert!(
-        generated.contains("rgc_alloc(sizeof(Data[2]))"),
+        generated.contains(&format!("rgc_alloc(sizeof({}[2]))", c_type("Data"))),
         "{generated}"
     );
     assert!(generated.contains("memcpy(h"), "{generated}");
     assert!(generated.contains("(&h"), "{generated}");
     assert!(
-        generated.contains("rgc_alloc(sizeof(Data[2][3]))"),
+        generated.contains(&format!("rgc_alloc(sizeof({}[2][3]))", c_type("Data"))),
         "{generated}"
     );
     assert!(generated.contains("* 3)"), "{generated}");
     assert!(!generated.contains("[3]*"), "{generated}");
     assert!(
-        generated.contains(", items, sizeof(Data[2]))"),
+        generated.contains(&format!(
+            ", {}, sizeof({}[2]))",
+            c_variable("items"),
+            c_type("Data")
+        )),
         "{generated}"
     );
-    assert!(!generated.contains("sizeof(items)"), "{generated}");
-    assert!(!generated.contains("&items"), "{generated}");
-    assert!(generated.contains("->items[0]"), "{generated}");
-    assert!(generated.contains("->items[0][0]"), "{generated}");
+    assert!(
+        !generated.contains(&format!("sizeof({})", c_variable("items"))),
+        "{generated}"
+    );
+    assert!(
+        !generated.contains(&format!("&{}", c_variable("items"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("->{}[0]", c_member("items"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("->{}[0][0]", c_member("items"))),
+        "{generated}"
+    );
 }

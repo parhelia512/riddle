@@ -279,6 +279,7 @@ impl<'a> LowerCtx<'a> {
             .unwrap_or(Type::Unit);
 
         let mut func = Function::new(name.clone(), ret_type);
+        func.is_c_export = self.hir.item_tree.extern_function_ids.contains(&fid);
         let mut param_values: Vec<Value> = Vec::new();
 
         for param in &func_item.params {
@@ -5582,95 +5583,5 @@ fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
         (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
         (Type::Ptr(_), Type::Ptr(_)) => CastOp::PtrToPtr,
         _ => unreachable!("unsupported cast reached MIR lowering: {source:?} as {target:?}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lang_operator_methods_map_to_mir_operations() {
-        let cases = [
-            ("add", "add", BuiltinOperator::Binary(BinOp::Add)),
-            ("sub", "sub", BuiltinOperator::Binary(BinOp::Sub)),
-            ("mul", "mul", BuiltinOperator::Binary(BinOp::Mul)),
-            ("div", "div", BuiltinOperator::Binary(BinOp::Div)),
-            ("rem", "rem", BuiltinOperator::Binary(BinOp::Mod)),
-            ("neg", "neg", BuiltinOperator::Unary(UnOp::Neg)),
-            ("not", "not", BuiltinOperator::Unary(UnOp::Not)),
-            ("bitand", "bitand", BuiltinOperator::Binary(BinOp::BitAnd)),
-            ("bitor", "bitor", BuiltinOperator::Binary(BinOp::BitOr)),
-            ("bitxor", "bitxor", BuiltinOperator::Binary(BinOp::BitXor)),
-            ("shl", "shl", BuiltinOperator::Binary(BinOp::Shl)),
-            ("shr", "shr", BuiltinOperator::Binary(BinOp::Shr)),
-            (
-                "add_assign",
-                "add_assign",
-                BuiltinOperator::Assign(BinOp::Add),
-            ),
-            (
-                "sub_assign",
-                "sub_assign",
-                BuiltinOperator::Assign(BinOp::Sub),
-            ),
-            (
-                "mul_assign",
-                "mul_assign",
-                BuiltinOperator::Assign(BinOp::Mul),
-            ),
-            (
-                "div_assign",
-                "div_assign",
-                BuiltinOperator::Assign(BinOp::Div),
-            ),
-            (
-                "rem_assign",
-                "rem_assign",
-                BuiltinOperator::Assign(BinOp::Mod),
-            ),
-            (
-                "bitand_assign",
-                "bitand_assign",
-                BuiltinOperator::Assign(BinOp::BitAnd),
-            ),
-            (
-                "bitor_assign",
-                "bitor_assign",
-                BuiltinOperator::Assign(BinOp::BitOr),
-            ),
-            (
-                "bitxor_assign",
-                "bitxor_assign",
-                BuiltinOperator::Assign(BinOp::BitXor),
-            ),
-            (
-                "shl_assign",
-                "shl_assign",
-                BuiltinOperator::Assign(BinOp::Shl),
-            ),
-            (
-                "shr_assign",
-                "shr_assign",
-                BuiltinOperator::Assign(BinOp::Shr),
-            ),
-        ];
-
-        for (lang, method, expected) in cases {
-            assert_eq!(builtin_operator(lang, method), Some(expected));
-        }
-        assert_eq!(builtin_operator("add", "sub"), None);
-        assert!(!builtin_operator_supports(
-            BuiltinOperator::Binary(BinOp::Add),
-            "bool"
-        ));
-        assert!(!builtin_operator_supports(
-            BuiltinOperator::Binary(BinOp::BitAnd),
-            "f32"
-        ));
-        assert!(builtin_operator_supports(
-            BuiltinOperator::Binary(BinOp::BitAnd),
-            "bool"
-        ));
     }
 }

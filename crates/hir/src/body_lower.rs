@@ -318,10 +318,11 @@ impl<'a> BodyLower<'a> {
                     .map(|token| token.text().to_string())
                     .unwrap_or_default();
                 let (number, suffix) = split_float_literal(&text);
-                let value = number.parse().unwrap_or_else(|_| {
-                    self.diagnostic("invalid float literal", range);
-                    0.0
-                });
+                let value =
+                    parse_float_literal(&number, suffix.as_deref()).unwrap_or_else(|error| {
+                        self.diagnostic(error, range);
+                        0.0
+                    });
                 self.alloc_expr(Expr::FloatLiteral { value, suffix }, range)
             }
 
@@ -667,10 +668,10 @@ impl<'a> BodyLower<'a> {
                     }
                     Some(SyntaxKind::Float) => {
                         let (number, suffix) = split_float_literal(&text);
-                        let (value, valid) = match number.parse() {
+                        let (value, valid) = match parse_float_literal(&number, suffix.as_deref()) {
                             Ok(value) => (value, true),
-                            Err(_) => {
-                                self.diagnostic("invalid float literal pattern", range);
+                            Err(error) => {
+                                self.diagnostic(error, range);
                                 (0.0, false)
                             }
                         };
@@ -831,4 +832,12 @@ fn split_float_literal(text: &str) -> (String, Option<String>) {
         }
     }
     (filtered, None)
+}
+
+fn parse_float_literal(number: &str, suffix: Option<&str>) -> Result<f64, &'static str> {
+    let value = number.parse::<f64>().map_err(|_| "invalid float literal")?;
+    if !value.is_finite() || (suffix == Some("f32") && !(value as f32).is_finite()) {
+        return Err("non-finite float literal");
+    }
+    Ok(value)
 }

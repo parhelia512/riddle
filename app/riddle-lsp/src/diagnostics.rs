@@ -16,13 +16,13 @@ use riddlec::pipeline::{
 use rowan::{TextRange, TextSize};
 use type_checker::{LabelStyle, SourceLabel};
 
-use super::Document;
+use crate::{server::Document, text::normalized_path};
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PublishedDiagnostics {
-    pub(crate) uri: Url,
-    pub(crate) version: Option<i32>,
-    pub(crate) diagnostics: Vec<Diagnostic>,
+pub struct PublishedDiagnostics {
+    pub uri: Url,
+    pub version: Option<i32>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 struct ResolvedLabel {
@@ -67,7 +67,7 @@ impl LineIndex {
 }
 
 #[derive(Default)]
-pub(crate) struct DiagnosticSessions {
+pub struct DiagnosticSessions {
     standalone: HashMap<Url, StandaloneDiagnosticSession>,
     projects: HashMap<PathBuf, ProjectDiagnosticSession>,
 }
@@ -76,8 +76,6 @@ pub(crate) struct DiagnosticSessions {
 struct StandaloneDiagnosticSession {
     checker: CheckSession,
     cached: Option<CachedStandaloneDiagnostics>,
-    #[cfg(test)]
-    checks: usize,
 }
 
 struct CachedStandaloneDiagnostics {
@@ -88,10 +86,8 @@ struct CachedStandaloneDiagnostics {
 
 #[derive(Default)]
 struct ProjectDiagnosticSession {
-    checker: CheckSession,
+    checker: clue::ProjectSession,
     cached: Option<CachedProjectDiagnostics>,
-    #[cfg(test)]
-    checks: usize,
 }
 
 struct CachedProjectDiagnostics {
@@ -112,26 +108,16 @@ struct ProjectInputs {
     disk: BTreeMap<PathBuf, Option<(u64, Option<SystemTime>)>>,
 }
 
-impl DiagnosticSessions {
-    #[cfg(test)]
-    pub(crate) fn check_counts(&self) -> (usize, usize) {
-        (
-            self.standalone.values().map(|session| session.checks).sum(),
-            self.projects.values().map(|session| session.checks).sum(),
-        )
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn collect_workspace_diagnostics(
+#[cfg(feature = "test-support")]
+pub fn collect_workspace_diagnostics(
     docs: &HashMap<Url, Document>,
     options: CompileOptions,
 ) -> Vec<PublishedDiagnostics> {
     collect_workspace_diagnostics_with_sessions(docs, options, &mut DiagnosticSessions::default())
 }
 
-#[cfg(test)]
-pub(crate) fn collect_workspace_diagnostics_with_sessions(
+#[cfg(feature = "test-support")]
+pub fn collect_workspace_diagnostics_with_sessions(
     docs: &HashMap<Url, Document>,
     options: CompileOptions,
     sessions: &mut DiagnosticSessions,
@@ -140,7 +126,7 @@ pub(crate) fn collect_workspace_diagnostics_with_sessions(
         .expect("non-cancellable analysis cannot be cancelled")
 }
 
-pub(crate) fn collect_workspace_diagnostics_cancellable(
+pub fn collect_workspace_diagnostics_cancellable(
     docs: &HashMap<Url, Document>,
     options: CompileOptions,
     sessions: &mut DiagnosticSessions,
@@ -247,9 +233,7 @@ pub(crate) fn collect_workspace_diagnostics_cancellable(
             let Ok(path) = uri.to_file_path() else {
                 continue;
             };
-            let Ok(path) = fs::canonicalize(path) else {
-                continue;
-            };
+            let path = normalized_path(path);
             if project_diagnostics.files.contains(&path) {
                 continue;
             }
@@ -306,10 +290,6 @@ fn standalone_diagnostics(
         source: document.text.clone(),
         diagnostics: diagnostics.clone(),
     });
-    #[cfg(test)]
-    {
-        session.checks += 1;
-    }
     diagnostics
 }
 
@@ -345,10 +325,6 @@ fn project_diagnostics(
         files: files.clone(),
         diagnostics: diagnostics.clone(),
     });
-    #[cfg(test)]
-    {
-        session.checks += 1;
-    }
     Ok(ProjectDiagnostics {
         by_uri: diagnostics,
         files,
@@ -387,12 +363,8 @@ fn project_inputs(
     ProjectInputs { overlays, disk }
 }
 
-fn normalized_path(path: PathBuf) -> PathBuf {
-    fs::canonicalize(&path).unwrap_or(path)
-}
-
-#[cfg(test)]
-pub(crate) fn collect_document_diagnostics(
+#[cfg(feature = "test-support")]
+pub fn collect_document_diagnostics(
     uri: &Url,
     _source: &str,
     docs: &HashMap<Url, Document>,
@@ -406,11 +378,7 @@ pub(crate) fn collect_document_diagnostics(
         .unwrap_or_default()
 }
 
-pub(crate) fn collect_diagnostics(
-    uri: &Url,
-    source: &str,
-    result: &CompileResult,
-) -> Vec<Diagnostic> {
+pub fn collect_diagnostics(uri: &Url, source: &str, result: &CompileResult) -> Vec<Diagnostic> {
     let line_index = LineIndex::new(source);
     let mut diagnostics = diagnostic_exts(result)
         .filter_map(|diagnostic| to_lsp_with_index(uri, source, &line_index, diagnostic))
@@ -460,8 +428,8 @@ fn diagnostic_exts(result: &CompileResult) -> impl Iterator<Item = DiagnosticExt
         )
 }
 
-#[cfg(test)]
-pub(crate) fn to_lsp(uri: &Url, source: &str, diagnostic: DiagnosticExt) -> Option<Diagnostic> {
+#[cfg(feature = "test-support")]
+pub fn to_lsp(uri: &Url, source: &str, diagnostic: DiagnosticExt) -> Option<Diagnostic> {
     to_lsp_with_index(uri, source, &LineIndex::new(source), diagnostic)
 }
 
@@ -480,8 +448,8 @@ fn to_lsp_with_index(
     .map(|(_, diagnostic)| diagnostic)
 }
 
-#[cfg(test)]
-pub(crate) fn to_lsp_mapped(
+#[cfg(feature = "test-support")]
+pub fn to_lsp_mapped(
     source_map: &SourceMap,
     diagnostic: DiagnosticExt,
 ) -> Option<(Url, Diagnostic)> {
@@ -639,12 +607,6 @@ fn try_range(source: &str, range: TextRange) -> Option<Range> {
     LineIndex::new(source).range(source, range)
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn range(source: &str, range: TextRange) -> Range {
-    try_range(source, normalize_range(source, range).unwrap_or(range)).unwrap_or_default()
-}
-
 fn try_position(source: &str, offset: usize) -> Option<Position> {
     LineIndex::new(source).position(source, offset)
 }
@@ -669,7 +631,7 @@ fn severity(severity: type_checker::Severity) -> DiagnosticSeverity {
 fn normalized_uri(uri: &Url) -> Url {
     uri.to_file_path()
         .ok()
-        .and_then(|path| fs::canonicalize(path).ok())
+        .map(normalized_path)
         .and_then(|path| Url::from_file_path(path).ok())
         .unwrap_or_else(|| uri.clone())
 }

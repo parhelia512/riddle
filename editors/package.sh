@@ -12,7 +12,7 @@ rm -f "$dist/riddle-vscode.vsix" "$dist/riddle-helix.zip" "$dist/riddle-intellij
     cd "$root/vscode"
     npm ci
     npm run check
-    npx --yes @vscode/vsce package --out "$dist/riddle-vscode.vsix"
+    npx --no-install vsce package --out "$dist/riddle-vscode.vsix"
 )
 
 (

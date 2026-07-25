@@ -66,6 +66,10 @@ fn main() {
         eprintln!("riddlec: no input files");
         process::exit(1);
     }
+    if matches!(opts.backend, Some(BackendKind::C)) && opts.files.len() != 1 {
+        eprintln!("riddlec: C backend accepts exactly one input file");
+        process::exit(1);
+    }
 
     let mut total_errors = 0;
     let mut generated_code = String::new();

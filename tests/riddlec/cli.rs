@@ -1,10 +1,105 @@
-use super::*;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+fn temp_root(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "riddlec-{name}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+fn run(args: &[&Path]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_riddlec"))
+        .args(args)
+        .output()
+        .unwrap()
+}
 
 #[test]
-fn parse_args_accepts_no_std() {
-    let args = vec!["riddlec".into(), "--no-std".into(), "main.rid".into()];
-    let opts = parse_args(&args).unwrap();
+fn accepts_no_std() {
+    let root = temp_root("no-std");
+    fs::create_dir_all(&root).unwrap();
+    let input = root.join("main.rid");
+    fs::write(&input, "fun main() {}\n").unwrap();
 
-    assert!(!opts.use_std);
-    assert_eq!(opts.files, vec!["main.rid"]);
+    let output = run(&[Path::new("--no-std"), &input]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn c_backend_rejects_multiple_inputs() {
+    let root = temp_root("multiple-inputs");
+    fs::create_dir_all(&root).unwrap();
+    let first = root.join("first.rid");
+    let second = root.join("second.rid");
+    let generated = root.join("combined.c");
+    fs::write(&first, "fun first() {}\n").unwrap();
+    fs::write(&second, "fun second() {}\n").unwrap();
+
+    let output = run(&[
+        Path::new("--backend"),
+        Path::new("c"),
+        Path::new("--output"),
+        &generated,
+        &first,
+        &second,
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("C backend accepts exactly one input file"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!generated.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn diagnostics_keep_rust_style_hierarchy() {
+    let root = temp_root("diagnostics");
+    fs::create_dir_all(&root).unwrap();
+    let input = root.join("main.rid");
+    fs::write(
+        &input,
+        "struct Foo {}\nfun main() {\n    let a = Foo {};\n    let b = a;\n    let c = a;\n}\n",
+    )
+    .unwrap();
+
+    let output = run(&[Path::new("--no-std"), &input]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.starts_with("error[E0100]: use of moved value: `a`\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(" 4 |     let b = a;\n   |             - value moved here\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(" 5 |     let c = a;\n   |             ^\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.ends_with("error: aborting due to 1 previous error\n"),
+        "{stderr}"
+    );
+    let _ = fs::remove_dir_all(root);
 }

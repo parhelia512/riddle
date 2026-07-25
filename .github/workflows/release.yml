@@ -18,6 +18,19 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 检查格式
+        run: cargo fmt --all -- --check
+
+      - name: 严格 Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: 校验标签与 Cargo 版本
         run: |
@@ -131,7 +144,7 @@ jobs:
             fi
           done
 
-          cp LICENSE README.md dist/
+          cp LICENSE README.md crates/gc/src/runtime.c dist/
 
           ZIPNAME="riddle-${{ github.ref_name }}-${SUFFIX}.zip"
           if [ "${{ matrix.platform }}" = "windows" ]; then

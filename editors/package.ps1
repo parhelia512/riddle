@@ -13,7 +13,7 @@ try {
     npm run check
     if ($LASTEXITCODE -ne 0) { throw "npm run check failed" }
 
-    npx --yes @vscode/vsce package --out (Join-Path $dist "riddle-vscode.vsix")
+    npx --no-install vsce package --out (Join-Path $dist "riddle-vscode.vsix")
     if ($LASTEXITCODE -ne 0) { throw "VS Code packaging failed" }
 } finally {
     Pop-Location

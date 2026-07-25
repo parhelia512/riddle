@@ -1,5 +1,5 @@
 // src/scope_graph/resolve.rs
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use hir::{
     HirFile, Name,
@@ -20,6 +20,91 @@ pub fn resolve_reference(sg: &ScopeGraph, reference: NodeId) -> Vec<DefRef> {
         return vec![];
     }
     resolve_from(sg, reference, Vec::new(), &mut HashSet::new(), 64)
+}
+
+/// Returns the definitions visible at a reference, with inner scopes shadowing outer scopes.
+pub fn visible_definitions(sg: &ScopeGraph, reference: NodeId) -> Vec<(Name, DefRef)> {
+    let Node::Reference { anchor, .. } = &sg.nodes[reference] else {
+        return Vec::new();
+    };
+    collect_definitions(sg, *anchor, true)
+}
+
+/// Resolves `segments` from the lexical anchor of an existing reference.
+pub fn resolve_path_at_reference(
+    sg: &ScopeGraph,
+    reference: NodeId,
+    segments: &[Name],
+) -> Vec<DefRef> {
+    let Node::Reference { anchor, .. } = &sg.nodes[reference] else {
+        return Vec::new();
+    };
+    let stack = segments.iter().rev().cloned().collect();
+    resolve_from(sg, *anchor, stack, &mut HashSet::new(), 64)
+}
+
+/// Returns definitions directly exported by a scope without leaking its lexical parent.
+pub fn exported_definitions(sg: &ScopeGraph, scope: NodeId) -> Vec<(Name, DefRef)> {
+    collect_definitions(sg, scope, false)
+}
+
+fn collect_definitions(
+    sg: &ScopeGraph,
+    start: NodeId,
+    follow_lexical_edges: bool,
+) -> Vec<(Name, DefRef)> {
+    let mut definitions = HashMap::<String, (Name, DefRef)>::new();
+    collect_definitions_from(
+        sg,
+        start,
+        follow_lexical_edges,
+        &mut HashSet::new(),
+        &mut definitions,
+        64,
+    );
+    definitions.into_values().collect()
+}
+
+fn collect_definitions_from(
+    sg: &ScopeGraph,
+    scope: NodeId,
+    follow_lexical_edges: bool,
+    visited: &mut HashSet<NodeId>,
+    definitions: &mut HashMap<String, (Name, DefRef)>,
+    fuel: u32,
+) {
+    if fuel == 0 || !visited.insert(scope) {
+        return;
+    }
+    let Some(out) = sg.out_edges.get(&scope) else {
+        return;
+    };
+    let mut edges = out.iter().map(|id| sg.edges[*id]).collect::<Vec<_>>();
+    edges.sort_by_key(|edge| -(edge.precedence as i32));
+
+    for edge in &edges {
+        if edge.kind != EdgeKind::Def {
+            continue;
+        }
+        let Node::PopSymbol { name, define } = &sg.nodes[edge.to] else {
+            continue;
+        };
+        definitions
+            .entry(name.0.clone())
+            .or_insert_with(|| (name.clone(), define.clone()));
+    }
+    for edge in edges {
+        if edge.kind == EdgeKind::Export || (follow_lexical_edges && edge.kind == EdgeKind::Lex) {
+            collect_definitions_from(
+                sg,
+                edge.to,
+                follow_lexical_edges,
+                visited,
+                definitions,
+                fuel - 1,
+            );
+        }
+    }
 }
 
 /// Resolves all expression references in `sg` and writes the selected result back to HIR.

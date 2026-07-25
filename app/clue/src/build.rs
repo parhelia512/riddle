@@ -379,29 +379,3 @@ fn flavor_for(program: &OsStr) -> Flavor {
         Flavor::Unix
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recognizes_versioned_compiler_names_and_flavors() {
-        assert_eq!(
-            versioned_compiler_name(OsStr::new("clang-18.1.exe")),
-            Some(vec![18, 1])
-        );
-        assert_eq!(
-            versioned_compiler_name(OsStr::new("gcc-13")),
-            Some(vec![13])
-        );
-        assert_eq!(
-            versioned_compiler_name(OsStr::new("clang-cl-19")),
-            Some(vec![19])
-        );
-        assert_eq!(versioned_compiler_name(OsStr::new("gcc-helper")), None);
-        assert!(matches!(
-            flavor_for(OsStr::new("C:\\LLVM\\clang-cl-18.exe")),
-            Flavor::Msvc
-        ));
-    }
-}

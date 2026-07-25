@@ -96,7 +96,7 @@
       "patterns": [
         {
           "name": "keyword.control.riddle",
-          "match": "\\b(?:if|else|while|for|match|break|continue|return)\\b"
+          "match": "\\b(?:if|else|while|for|in|match|break|continue|return)\\b"
         },
         {
           "name": "keyword.other.riddle",
@@ -112,7 +112,7 @@
       "patterns": [
         {
           "name": "support.type.primitive.riddle",
-          "match": "\\b(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|f16|f32|f64|f128|bool|str|char)\\b"
+          "match": "\\b(?:i8|i16|i32|i64|isize|u8|u16|u32|u64|usize|f32|f64|bool|str|char)\\b"
         },
         {
           "name": "entity.name.type.riddle",
@@ -124,7 +124,7 @@
       "patterns": [
         {
           "name": "constant.numeric.riddle",
-          "match": "\\b(?:[0-9]+(?:\\.[0-9]+)?)(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|f16|f32|f64|f128)?\\b"
+          "match": "\\b(?:[0-9]+\\.[0-9]*(?:[eE][+-]?[0-9]+)?(?:f32|f64)?|[0-9]+[eE][+-]?[0-9]+(?:f32|f64)?|[0-9]+(?:i8|i16|i32|i64|isize|u8|u16|u32|u64|usize)?)(?![A-Za-z0-9_])"
         }
       ]
     },
@@ -140,7 +140,7 @@
       "patterns": [
         {
           "name": "keyword.operator.riddle",
-          "match": "(?:->|=>|==|!=|<=|>=|&&|\\|\\||<<|>>|[+\\-*/%&|^!<>=])"
+          "match": "(?:<<=|>>=|->|=>|==|!=|<=|>=|&&|\\|\\||\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|[+\\-*/%&|^!<>=])"
         }
       ]
     }

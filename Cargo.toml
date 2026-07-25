@@ -41,17 +41,12 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "4.6.4", features = ["derive", "string"] }
 clue = { path = "app/clue" }
-frontend = { path = "crates/frontend" }
-hir = { path = "crates/hir" }
-lsp-types = "0.94.1"
 mir = { path = "crates/mir" }
 riddlec = { path = "app/riddlec" }
-rowan = "0.16.1"
+riddle-lsp = { path = "app/riddle-lsp" }
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sync", "time"] }
-tower-lsp = "0.20.0"
-type-checker = { path = "crates/type-checker" }
 
 [features]
 install-bins = []
@@ -76,7 +71,15 @@ ast = { path = "crates/ast" }
 escape-analysis = { path = "crates/escape-analysis" }
 frontend = { path = "crates/frontend" }
 hir = { path = "crates/hir" }
+lsp-types = "0.94.1"
 mir = { path = "crates/mir" }
 move-checker = { path = "crates/move-checker" }
+riddle-lsp = { path = "app/riddle-lsp", features = ["test-support"] }
+rowan = "0.16.1"
 scope-graph = { path = "crates/scope-graph" }
+tower-lsp = "0.20.0"
 type-checker = { path = "crates/type-checker" }
+
+[[test]]
+name = "riddle_lsp"
+path = "tests/riddle_lsp/unit.rs"

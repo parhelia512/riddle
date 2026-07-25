@@ -3,10 +3,11 @@ mod manifest;
 mod project;
 
 use anyhow::bail;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::SystemTime;
 
 pub use project::{ProjectKind, init, new};
 
@@ -20,17 +21,98 @@ pub struct ProjectAnalysis {
     manifest_fingerprint: String,
 }
 
+#[derive(Default)]
+pub struct ProjectSession {
+    checker: riddlec::pipeline::CheckSession,
+    cached: Option<CachedProject>,
+}
+
+struct CachedProject {
+    package: project::LoadedPackage,
+    overlays: BTreeMap<PathBuf, String>,
+    disk: BTreeMap<PathBuf, Option<(u64, Option<SystemTime>)>>,
+}
+
+impl ProjectSession {
+    fn load(
+        &mut self,
+        path: &Path,
+        overlays: &HashMap<PathBuf, String>,
+    ) -> anyhow::Result<project::LoadedPackage> {
+        let normalized_overlays = overlays
+            .iter()
+            .map(|(path, source)| (normalized_path(path), source.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut topology_changed = false;
+        if let Some(cached) = &self.cached {
+            let relevant_overlays =
+                relevant_overlays(&normalized_overlays, &cached.package.source.files);
+            if relevant_overlays == cached.overlays
+                && file_stamps(&cached.package.watched_files, &normalized_overlays) == cached.disk
+            {
+                return Ok(cached.package.clone());
+            }
+            topology_changed = relevant_overlays.keys().ne(cached.overlays.keys());
+        }
+
+        let package = project::load_with_overlays(path, overlays)?;
+        if topology_changed {
+            self.checker = riddlec::pipeline::CheckSession::default();
+        }
+        self.cached = Some(CachedProject {
+            overlays: relevant_overlays(&normalized_overlays, &package.source.files),
+            disk: file_stamps(&package.watched_files, &normalized_overlays),
+            package: package.clone(),
+        });
+        Ok(package)
+    }
+}
+
+fn relevant_overlays(
+    overlays: &HashMap<PathBuf, String>,
+    files: &[PathBuf],
+) -> BTreeMap<PathBuf, String> {
+    files
+        .iter()
+        .filter_map(|path| {
+            overlays
+                .get(path)
+                .map(|source| (path.clone(), source.clone()))
+        })
+        .collect()
+}
+
+fn file_stamps(
+    files: &[PathBuf],
+    overlays: &HashMap<PathBuf, String>,
+) -> BTreeMap<PathBuf, Option<(u64, Option<SystemTime>)>> {
+    files
+        .iter()
+        .filter(|path| !overlays.contains_key(*path))
+        .map(|path| {
+            let stamp = std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (metadata.len(), metadata.modified().ok()));
+            (path.clone(), stamp)
+        })
+        .collect()
+}
+
 pub fn find_project_root(path: &Path) -> Option<PathBuf> {
-    let path = std::fs::canonicalize(path).ok()?;
-    let start = if path.is_dir() {
-        path.as_path()
-    } else {
-        path.parent()?
-    };
+    let start = if path.is_dir() { path } else { path.parent()? };
     start
         .ancestors()
         .find(|path| path.join(manifest::CLUE_PROJECT_FILE_NAME).is_file())
-        .map(Path::to_path_buf)
+        .map(normalized_path)
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf())
+    })
 }
 
 pub fn analyze_project(
@@ -56,19 +138,39 @@ pub fn check_project_with_options(
     analyze_project_impl(path, overlays, options, false)
 }
 
-pub fn check_project_with_session(
+pub fn resolve_project_with_session(
     path: &Path,
     overlays: &HashMap<PathBuf, String>,
     options: riddlec::pipeline::CompileOptions,
-    session: &mut riddlec::pipeline::CheckSession,
+    session: &mut ProjectSession,
 ) -> anyhow::Result<ProjectAnalysis> {
-    let package = project::load_with_overlays(path, overlays)?;
-    let result = session.check_package_with_options(
+    resolve_project_with_session_cancellable(path, overlays, options, session, || false)?
+        .ok_or_else(|| anyhow::anyhow!("project analysis cancelled"))
+}
+
+pub fn resolve_project_with_session_cancellable(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String>,
+    options: riddlec::pipeline::CompileOptions,
+    session: &mut ProjectSession,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<Option<ProjectAnalysis>> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let package = session.load(path, overlays)?;
+    if cancelled() {
+        return Ok(None);
+    }
+    let Some(result) = session.checker.resolve_package_with_options_cancellable(
         &package.source.source,
         &package.package_ranges,
         options,
-    );
-    Ok(ProjectAnalysis {
+        cancelled,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(ProjectAnalysis {
         entry: package.entry,
         source: package.source,
         result,
@@ -76,7 +178,50 @@ pub fn check_project_with_session(
         runtime_source: package.runtime_source,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
-    })
+    }))
+}
+
+pub fn check_project_with_session(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String>,
+    options: riddlec::pipeline::CompileOptions,
+    session: &mut ProjectSession,
+) -> anyhow::Result<ProjectAnalysis> {
+    check_project_with_session_cancellable(path, overlays, options, session, || false)?
+        .ok_or_else(|| anyhow::anyhow!("project analysis cancelled"))
+}
+
+pub fn check_project_with_session_cancellable(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String>,
+    options: riddlec::pipeline::CompileOptions,
+    session: &mut ProjectSession,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<Option<ProjectAnalysis>> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let package = session.load(path, overlays)?;
+    if cancelled() {
+        return Ok(None);
+    }
+    let Some(result) = session.checker.check_package_with_options_cancellable(
+        &package.source.source,
+        &package.package_ranges,
+        options,
+        cancelled,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(ProjectAnalysis {
+        entry: package.entry,
+        source: package.source,
+        result,
+        kind: package.kind,
+        runtime_source: package.runtime_source,
+        package_name: package.name,
+        manifest_fingerprint: package.manifest_fingerprint,
+    }))
 }
 
 fn analyze_project_impl(

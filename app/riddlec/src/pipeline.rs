@@ -20,6 +20,7 @@ const STD_PRELUDE: &str = include_str!(concat!(env!("OUT_DIR"), "/std.rid"));
 
 pub struct CompileResult {
     pub hir: Option<hir::HirFile>,
+    pub scope_graph: Option<scope_graph::ScopeGraph>,
     pub type_result: TypeCheckResult,
     pub hir_diagnostics: Vec<type_checker::Diagnostic>,
     pub analysis_diagnostics: Vec<type_checker::Diagnostic>,
@@ -142,6 +143,70 @@ impl CheckSession {
         self.check_package_with_options(source, &[0..source.len()], options)
     }
 
+    pub fn check_with_options_cancellable(
+        &mut self,
+        source: &str,
+        options: CompileOptions,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
+        #[allow(clippy::single_range_in_vec_init)]
+        self.check_package_with_options_cancellable(source, &[0..source.len()], options, cancelled)
+    }
+
+    pub fn resolve_package_with_options(
+        &mut self,
+        source: &str,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+    ) -> CompileResult {
+        run_pipeline_with_state(
+            source,
+            package_ranges,
+            options,
+            PipelineDepth::Resolve,
+            &mut self.parser,
+            None,
+        )
+    }
+
+    pub fn resolve_package_with_options_cancellable(
+        &mut self,
+        source: &str,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
+        run_pipeline_with_state_cancellable(
+            source,
+            package_ranges,
+            options,
+            PipelineDepth::Resolve,
+            &mut self.parser,
+            None,
+            &cancelled,
+        )
+    }
+
+    pub fn resolve_with_options(&mut self, source: &str, options: CompileOptions) -> CompileResult {
+        #[allow(clippy::single_range_in_vec_init)]
+        self.resolve_package_with_options(source, &[0..source.len()], options)
+    }
+
+    pub fn resolve_with_options_cancellable(
+        &mut self,
+        source: &str,
+        options: CompileOptions,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
+        #[allow(clippy::single_range_in_vec_init)]
+        self.resolve_package_with_options_cancellable(
+            source,
+            &[0..source.len()],
+            options,
+            cancelled,
+        )
+    }
+
     pub fn check_package_with_options(
         &mut self,
         source: &str,
@@ -155,6 +220,24 @@ impl CheckSession {
             PipelineDepth::Check,
             &mut self.parser,
             Some(&mut self.type_checker),
+        )
+    }
+
+    pub fn check_package_with_options_cancellable(
+        &mut self,
+        source: &str,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
+        run_pipeline_with_state_cancellable(
+            source,
+            package_ranges,
+            options,
+            PipelineDepth::Check,
+            &mut self.parser,
+            Some(&mut self.type_checker),
+            &cancelled,
         )
     }
 }
@@ -218,13 +301,9 @@ pub fn load_source_file_with_overlays(
     let mut stack = HashSet::new();
     let overlays = overlays
         .iter()
-        .filter_map(|(path, source)| {
-            fs::canonicalize(path)
-                .ok()
-                .map(|path| (path, source.clone()))
-        })
+        .map(|(path, source)| (normalized_path(path), source.clone()))
         .collect::<HashMap<_, _>>();
-    let path = fs::canonicalize(path)?;
+    let path = normalized_path(path.as_ref());
     let module_dir = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -244,7 +323,7 @@ fn load_source_file_inner(
     stack: &mut HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
 ) -> io::Result<ExpandedSource> {
-    let path = fs::canonicalize(path)?;
+    let path = normalized_path(path);
     if !stack.insert(path.clone()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -288,7 +367,7 @@ fn expand_external_mods(
         let Some(name) = module.name().map(|token| token.text().to_string()) else {
             continue;
         };
-        let child = find_module_file(&module_dir, &name)?;
+        let child = find_module_file(&module_dir, &name, overlays)?;
         let child_dir = module_dir.join(&name);
         let child_source = load_source_file_inner(&child, &child_dir, overlays, stack, files)?;
         let range = module.syntax().text_range();
@@ -386,10 +465,16 @@ fn collect_external_mods(node: &SyntaxNode, module_dir: &Path, out: &mut Vec<Ext
     }
 }
 
-fn find_module_file(module_dir: &Path, name: &str) -> io::Result<PathBuf> {
+fn find_module_file(
+    module_dir: &Path,
+    name: &str,
+    overlays: &HashMap<PathBuf, String>,
+) -> io::Result<PathBuf> {
     let flat = module_dir.join(format!("{name}.rid"));
     let nested = module_dir.join(name).join("mod.rid");
-    match (flat.is_file(), nested.is_file()) {
+    let flat_exists = flat.is_file() || overlays.contains_key(&normalized_path(&flat));
+    let nested_exists = nested.is_file() || overlays.contains_key(&normalized_path(&nested));
+    match (flat_exists, nested_exists) {
         (true, false) => Ok(flat),
         (false, true) => Ok(nested),
         (true, true) => Err(io::Error::new(
@@ -409,6 +494,15 @@ fn find_module_file(module_dir: &Path, name: &str) -> io::Result<PathBuf> {
             ),
         )),
     }
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf())
+    })
 }
 
 pub fn generate_c(module: &Module) -> Result<String, String> {
@@ -493,6 +587,30 @@ fn run_pipeline_with_state(
     parser: &mut IncrementalParser,
     incremental_type_checker: Option<&mut IncrementalTypeChecker>,
 ) -> CompileResult {
+    run_pipeline_with_state_cancellable(
+        source,
+        package_ranges,
+        options,
+        depth,
+        parser,
+        incremental_type_checker,
+        &|| false,
+    )
+    .expect("non-cancellable pipeline cannot be cancelled")
+}
+
+fn run_pipeline_with_state_cancellable(
+    source: &str,
+    package_ranges: &[Range<usize>],
+    options: CompileOptions,
+    depth: PipelineDepth,
+    parser: &mut IncrementalParser,
+    incremental_type_checker: Option<&mut IncrementalTypeChecker>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<CompileResult> {
+    if cancelled() {
+        return None;
+    }
     let user_source = source;
     let owned_source = options
         .use_std
@@ -501,6 +619,9 @@ fn run_pipeline_with_state(
 
     // 1. Parse
     let parse = update_parse(parser, source);
+    if cancelled() {
+        return None;
+    }
 
     let mut parse_errors = parse.errors.clone();
     if options.use_std
@@ -516,13 +637,16 @@ fn run_pipeline_with_state(
     }
 
     if !parse_errors.is_empty() {
-        return parse_failure(parse_errors);
+        return Some(parse_failure(parse_errors));
     }
 
     // 2. Lower AST → HIR
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
     let mut hir = lower_root(root);
+    if cancelled() {
+        return None;
+    }
     hir.package_ranges = package_ranges
         .iter()
         .map(|range| rowan::TextRange::new((range.start as u32).into(), (range.end as u32).into()))
@@ -532,6 +656,9 @@ fn run_pipeline_with_state(
     // 3. Build scope graph + resolve names
     let (sg, scope_diagnostics) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
+    if cancelled() {
+        return None;
+    }
 
     /// Convert a `hir::body::Diagnostic` to a `type_checker::Diagnostic`.
     fn convert_hir_diag(d: &hir::body::Diagnostic) -> type_checker::Diagnostic {
@@ -571,27 +698,37 @@ fn run_pipeline_with_state(
         .collect();
 
     if depth == PipelineDepth::Resolve {
-        return CompileResult {
+        return Some(CompileResult {
             hir: Some(hir),
+            scope_graph: Some(sg),
             type_result: TypeCheckResult::default(),
             hir_diagnostics,
             analysis_diagnostics: Vec::new(),
             analysis: move_checker::AnalysisResult::default(),
             mir_module: None,
             parse_errors,
-        };
+        });
     }
 
     // 4. Type check
     let type_result = incremental_type_checker
         .map(|checker| checker.check_with_syntax(&hir, &syntax).result)
         .unwrap_or_else(|| check_hir(&hir));
+    if cancelled() {
+        return None;
+    }
 
     // 5. Escape analysis (determines which locals need heap allocation)
     let escape_result = escape_analysis::analyze_escapes(&hir, &type_result);
+    if cancelled() {
+        return None;
+    }
 
     // 6. Move and borrow checking is independent of storage placement.
     let analysis = move_checker::analyze(&hir, &type_result);
+    if cancelled() {
+        return None;
+    }
     let analysis_diagnostics = analysis.diagnostics.clone();
 
     // Only Error-severity diagnostics block compilation.
@@ -612,15 +749,16 @@ fn run_pipeline_with_state(
     let mir_module = (success && depth == PipelineDepth::Build)
         .then(|| mir::lower_hir(&hir, &type_result, &escape_result, &analysis.moved_exprs));
 
-    CompileResult {
+    Some(CompileResult {
         hir: Some(hir),
+        scope_graph: Some(sg),
         type_result,
         hir_diagnostics,
         analysis_diagnostics,
         analysis,
         mir_module,
         parse_errors,
-    }
+    })
 }
 
 fn update_parse<'a>(
@@ -669,6 +807,7 @@ fn replacement<'a>(old: &str, new: &'a str) -> (usize, usize, &'a str) {
 fn parse_failure(parse_errors: Vec<ParseError>) -> CompileResult {
     CompileResult {
         hir: None,
+        scope_graph: None,
         type_result: TypeCheckResult::default(),
         hir_diagnostics: Vec::new(),
         analysis_diagnostics: Vec::new(),
@@ -696,7 +835,3 @@ impl CompileResult {
                 .any(|d| d.severity == type_checker::Severity::Error)
     }
 }
-
-#[cfg(test)]
-#[path = "../../../tests/riddlec/pipeline.rs"]
-mod tests;

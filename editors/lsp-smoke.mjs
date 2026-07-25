@@ -1,11 +1,28 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const command = process.argv[2] ?? 'riddle-lsp';
 const uri = 'file:///riddle-lsp-smoke.rid';
 const stableUri = 'file:///riddle-lsp-stable.rid';
 const fixUri = 'file:///riddle-lsp-fix.rid';
 const completionUri = 'file:///riddle-lsp-completion.rid';
+const generalCompletionUri = 'file:///riddle-lsp-general-completion.rid';
+const projectRoot = mkdtempSync(join(tmpdir(), 'riddle-lsp-smoke-'));
+const projectMainText = 'mod util;\nfun main() { let callable = util::make; callable; }\n';
+const projectUtilText = 'pub fun make() -> i32 { 1 }\n';
+mkdirSync(join(projectRoot, 'src'), { recursive: true });
+writeFileSync(
+  join(projectRoot, 'Clue.toml'),
+  '[package]\nname = "smoke"\n\n[dependencies]\n',
+);
+writeFileSync(join(projectRoot, 'src', 'main.rid'), projectMainText);
+writeFileSync(join(projectRoot, 'src', 'util.rid'), projectUtilText);
+const projectMainUri = pathToFileURL(join(projectRoot, 'src', 'main.rid')).href;
+const projectUtilUri = pathToFileURL(join(projectRoot, 'src', 'util.rid')).href;
 const server = spawn(command, [], { stdio: ['pipe', 'pipe', 'inherit'] });
 let input = Buffer.alloc(0);
 const messages = [];
@@ -36,6 +53,18 @@ function read(predicate, timeout = 15_000) {
     const timer = setTimeout(() => reject(new Error('timed out waiting for LSP message')), timeout);
     waiters.push({ predicate, resolve, timer });
   });
+}
+
+function semanticTokenTypeAt(data, targetLine, targetCharacter) {
+  let line = 0;
+  let character = 0;
+  for (let index = 0; index < data.length; index += 5) {
+    const deltaLine = data[index];
+    line += deltaLine;
+    character = deltaLine === 0 ? character + data[index + 1] : data[index + 1];
+    if (line === targetLine && character === targetCharacter) return data[index + 3];
+  }
+  return undefined;
 }
 
 server.stdout.on('data', (chunk) => {
@@ -70,10 +99,14 @@ try {
   const initialized = await read((message) => message.id === 1);
   assert.equal(initialized.result.serverInfo.name, 'riddle-lsp');
   assert.equal(initialized.result.capabilities.positionEncoding, 'utf-16');
+  assert.equal(initialized.result.capabilities.textDocumentSync, 2);
   assert.equal(initialized.result.capabilities.codeActionProvider, true);
-  assert.deepEqual(initialized.result.capabilities.completionProvider.triggerCharacters, ['.', ':']);
+  const triggerCharacters = initialized.result.capabilities.completionProvider.triggerCharacters;
+  assert(triggerCharacters.includes('.'));
+  assert(triggerCharacters.includes(':'));
+  assert(triggerCharacters.includes('f'));
   assert.equal(initialized.result.capabilities.inlayHintProvider, true);
-  assert(initialized.result.capabilities.semanticTokensProvider);
+  assert.equal(initialized.result.capabilities.semanticTokensProvider.full.delta, true);
 
   send({ jsonrpc: '2.0', method: 'initialized', params: {} });
   send({
@@ -272,6 +305,7 @@ try {
       message.params.uri === completionUri &&
       message.params.version === 1,
   );
+  const memberCompletionStarted = performance.now();
   send({
     jsonrpc: '2.0',
     id: 4,
@@ -282,6 +316,7 @@ try {
     },
   });
   const completions = await read((message) => message.id === 4);
+  const memberCompletionMs = performance.now() - memberCompletionStarted;
   assert(
     completions.result.some(
       (item) =>
@@ -293,14 +328,165 @@ try {
     ),
   );
 
+  const generalCompletionText = 'fun Foo() {} fun main() { f }';
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: generalCompletionUri,
+        languageId: 'riddle',
+        version: 1,
+        text: generalCompletionText,
+      },
+    },
+  });
+  await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === generalCompletionUri &&
+      message.params.version === 1,
+  );
+  const generalCompletionStarted = performance.now();
   send({
     jsonrpc: '2.0',
     id: 5,
+    method: 'textDocument/completion',
+    params: {
+      textDocument: { uri: generalCompletionUri },
+      position: { line: 0, character: generalCompletionText.lastIndexOf('f') + 1 },
+    },
+  });
+  const generalCompletions = await read((message) => message.id === 5);
+  const generalCompletionMs = performance.now() - generalCompletionStarted;
+  assert(
+    generalCompletions.result.some(
+      (item) => item.label === 'Foo' && item.insertText === 'Foo' && item.kind === 3,
+    ),
+  );
+
+  send({
+    jsonrpc: '2.0',
+    id: 6,
     method: 'textDocument/semanticTokens/full',
     params: { textDocument: { uri } },
   });
-  const semanticTokens = await read((message) => message.id === 5);
+  const semanticTokens = await read((message) => message.id === 6);
   assert(semanticTokens.result.data.length > 0);
+  assert(semanticTokens.result.resultId);
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didChange',
+    params: {
+      textDocument: { uri, version: 15 },
+      contentChanges: [
+        {
+          range: {
+            start: { line: 0, character: 13 },
+            end: { line: 0, character: 23 },
+          },
+          rangeLength: 10,
+          text: 'true',
+        },
+      ],
+    },
+  });
+  const incrementallyFixed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === uri &&
+      message.params.version === 15,
+  );
+  assert.deepEqual(incrementallyFixed.params.diagnostics, []);
+  send({
+    jsonrpc: '2.0',
+    id: 7,
+    method: 'textDocument/semanticTokens/full/delta',
+    params: {
+      textDocument: { uri },
+      previousResultId: semanticTokens.result.resultId,
+    },
+  });
+  const semanticDelta = await read((message) => message.id === 7);
+  assert(semanticDelta.result.resultId);
+  assert(Array.isArray(semanticDelta.result.edits));
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: projectMainUri,
+        languageId: 'riddle',
+        version: 1,
+        text: projectMainText,
+      },
+    },
+  });
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: projectUtilUri,
+        languageId: 'riddle',
+        version: 1,
+        text: projectUtilText,
+      },
+    },
+  });
+  await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === projectMainUri &&
+      message.params.version === 1,
+  );
+  const tokenTypes = initialized.result.capabilities.semanticTokensProvider.legend.tokenTypes;
+  const functionTokenType = tokenTypes.indexOf('function');
+  const variableTokenType = tokenTypes.indexOf('variable');
+  const makeCharacter = projectMainText.split('\n')[1].indexOf('make');
+  send({
+    jsonrpc: '2.0',
+    id: 8,
+    method: 'textDocument/semanticTokens/full',
+    params: { textDocument: { uri: projectMainUri } },
+  });
+  const projectTokensBefore = await read((message) => message.id === 8);
+  assert.equal(
+    semanticTokenTypeAt(projectTokensBefore.result.data, 1, makeCharacter),
+    functionTokenType,
+  );
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didChange',
+    params: {
+      textDocument: { uri: projectUtilUri, version: 2 },
+      contentChanges: [{ text: 'pub const make: i32 = 1;\n' }],
+    },
+  });
+  send({
+    jsonrpc: '2.0',
+    id: 9,
+    method: 'textDocument/semanticTokens/full',
+    params: { textDocument: { uri: projectMainUri } },
+  });
+  const projectTokensAfter = await read((message) => message.id === 9);
+  assert.equal(
+    semanticTokenTypeAt(projectTokensAfter.result.data, 1, makeCharacter),
+    variableTokenType,
+  );
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: projectMainUri } },
+  });
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: projectUtilUri } },
+  });
 
   send({
     jsonrpc: '2.0',
@@ -354,10 +540,25 @@ try {
   );
   assert.deepEqual(completionClosed.params.diagnostics, []);
 
-  send({ jsonrpc: '2.0', id: 6, method: 'shutdown', params: null });
-  await read((message) => message.id === 6);
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: generalCompletionUri } },
+  });
+  const generalCompletionClosed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === generalCompletionUri &&
+      message.params.version == null,
+  );
+  assert.deepEqual(generalCompletionClosed.params.diagnostics, []);
+
+  send({ jsonrpc: '2.0', id: 10, method: 'shutdown', params: null });
+  await read((message) => message.id === 10);
   send({ jsonrpc: '2.0', method: 'exit' });
-  console.log('riddle-lsp stdio handshake passed');
+  console.log(
+    `riddle-lsp stdio handshake passed (member ${memberCompletionMs.toFixed(1)} ms, general ${generalCompletionMs.toFixed(1)} ms)`,
+  );
 } finally {
   server.stdin.end();
   const exited = await Promise.race([
@@ -365,4 +566,5 @@ try {
     new Promise((resolve) => setTimeout(resolve, 2_000)),
   ]);
   if (exited === undefined && server.exitCode === null) server.kill();
+  rmSync(projectRoot, { recursive: true, force: true });
 }

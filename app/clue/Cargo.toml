@@ -13,3 +13,7 @@ toml = "1"
 [[test]]
 name = "commands"
 path = "../../tests/clue/commands.rs"
+
+[[test]]
+name = "project_session"
+path = "../../tests/clue/project_session.rs"

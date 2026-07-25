@@ -2,3 +2,7 @@
 name = "gc"
 version.workspace = true
 edition.workspace = true
+
+[[test]]
+name = "runtime"
+path = "../../tests/gc/runtime.rs"

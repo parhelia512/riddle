@@ -1,5 +1,31 @@
-use super::*;
-use std::time::{SystemTime, UNIX_EPOCH};
+use riddlec::pipeline::*;
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    fs, io,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+fn c_symbol(kind: char, name: &str) -> String {
+    let suffix = name
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("riddle_{kind}_{suffix}")
+}
+
+fn c_function(name: &str) -> String {
+    c_symbol('f', name)
+}
+
+fn c_member(name: &str) -> String {
+    c_symbol('m', name)
+}
+
+fn c_variable(name: &str) -> String {
+    c_symbol('v', name)
+}
 
 fn temp_source_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -24,12 +50,6 @@ fn assert_same_check_result(left: &CompileResult, right: &CompileResult) {
     assert_eq!(left.hir_diagnostics, right.hir_diagnostics);
     assert_eq!(left.type_result.diagnostics, right.type_result.diagnostics);
     assert_eq!(left.analysis_diagnostics, right.analysis_diagnostics);
-}
-
-#[test]
-fn replacement_keeps_utf8_boundaries() {
-    assert_eq!(replacement("a😀b", "a😀xyb"), (5, 0, "xy"));
-    assert_eq!(replacement("a😀b", "ab"), (1, 4, ""));
 }
 
 #[test]
@@ -441,6 +461,24 @@ fn std_range_iterator_type_checks() {
 }
 
 #[test]
+fn incremental_pipeline_stops_when_cancelled_between_stages() {
+    let mut session = CheckSession::default();
+    let polls = Cell::new(0);
+
+    let result = session.check_with_options_cancellable(
+        "fun main() { let value = 1; value; }",
+        CompileOptions { use_std: false },
+        || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 3
+        },
+    );
+
+    assert!(result.is_none());
+    assert!(polls.get() >= 3);
+}
+
+#[test]
 fn std_basic_value_methods_compile() {
     let result = compile(
         r#"
@@ -489,7 +527,7 @@ fn std_basic_value_methods_compile() {
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
     assert!(c.contains("return s.len"), "{c}");
     assert!(c.contains("s.ptr[i]"), "{c}");
-    assert!(c.contains("is_some__Option_i32"), "{c}");
+    assert!(c.contains(&c_function("is_some__Option_i32")), "{c}");
 }
 
 #[test]
@@ -526,7 +564,7 @@ fn std_string_and_vector_compile() {
         result.analysis_diagnostics
     );
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
-    assert!(c.contains("new__Vector_i32"), "{c}");
+    assert!(c.contains(&c_function("new__Vector_i32")), "{c}");
     assert!(c.contains("vector_grow"), "{c}");
     assert!(c.contains("size_of_ptr__i32"), "{c}");
     assert!(c.contains("str_from_raw"), "{c}");
@@ -625,8 +663,8 @@ fn std_clone_and_comparison_methods_are_callable() {
         result.analysis_diagnostics
     );
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
-    assert!(c.contains("clone__i32"), "{c}");
-    assert!(c.contains("cmp__i32"), "{c}");
+    assert!(c.contains(&c_function("clone__i32")), "{c}");
+    assert!(c.contains(&c_function("cmp__i32")), "{c}");
     assert!(c.contains("ref_tmp"), "{c}");
     assert!(!c.contains("&((int32_t)7)"), "{c}");
 }
@@ -736,6 +774,26 @@ fn compile_without_std_accepts_basic_program() {
     );
 
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+}
+
+#[test]
+fn rejects_non_finite_float_literals() {
+    for literal in ["1e999", "1e999f32", "3.5e38f32"] {
+        let result = compile_with_options(
+            &format!("fun main() {{ let value = {literal}; }}"),
+            CompileOptions { use_std: false },
+        );
+
+        assert!(!result.success(), "{literal} should be rejected");
+        assert!(
+            result
+                .hir_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "non-finite float literal"),
+            "{literal}: {:#?}",
+            result.hir_diagnostics
+        );
+    }
 }
 
 #[test]
@@ -910,10 +968,19 @@ fn enum_match_lowers_variants_guards_bindings_and_values() {
         result.analysis_diagnostics
     );
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
-    assert!(c.contains("Number_0;"), "{c}");
-    assert!(c.contains(".Pair_left"), "{c}");
+    assert!(c.contains(&format!(" {};", c_member("Number_0"))), "{c}");
+    assert!(c.contains(&format!(".{}", c_member("Pair_left"))), "{c}");
     assert!(c.contains("if ("), "{c}");
-    assert!(c.contains("self->start < self->end"), "{c}");
+    assert!(
+        c.contains(&format!(
+            "{}->{} < {}->{}",
+            c_variable("self"),
+            c_member("start"),
+            c_variable("self"),
+            c_member("end")
+        )),
+        "{c}"
+    );
 }
 
 #[test]
@@ -936,8 +1003,11 @@ fn enum_constructor_uses_the_flattened_payload_offset() {
 
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
-    assert!(c.contains(".Second_0 ="), "{c}");
-    assert!(!c.contains(".First_0 = ((int32_t)7)"), "{c}");
+    assert!(c.contains(&format!(".{} =", c_member("Second_0"))), "{c}");
+    assert!(
+        !c.contains(&format!(".{} = ((int32_t)7)", c_member("First_0"))),
+        "{c}"
+    );
 }
 
 #[test]

@@ -1,0 +1,766 @@
+use std::collections::HashMap;
+
+use frontend::syntax_kind::SyntaxKind;
+use hir::body::{Expr, ResolvedName, Stmt};
+use hir::item_tree::FunctionId;
+use lsp_types::{
+    SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensDelta,
+    SemanticTokensEdit, SemanticTokensLegend,
+};
+use riddlec::pipeline::CompileOptions;
+use rowan::TextRange;
+
+use crate::{
+    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document},
+    completion::BUILTIN_TYPES,
+    server::Document,
+    session::AnalysisSessions,
+    text::{is_identifier_continue, ranges_overlap},
+};
+
+pub fn semantic_token_delta(
+    previous: &[SemanticToken],
+    current: &[SemanticToken],
+    result_id: String,
+) -> SemanticTokensDelta {
+    let prefix = previous
+        .iter()
+        .zip(current)
+        .take_while(|(left, right)| left == right)
+        .count();
+    // Nothing changed: return an empty edits list instead of a no-op edit.
+    if prefix == previous.len() && prefix == current.len() {
+        return SemanticTokensDelta {
+            result_id: Some(result_id),
+            edits: vec![],
+        };
+    }
+    let suffix = previous[prefix..]
+        .iter()
+        .rev()
+        .zip(current[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let replacement_end = current.len() - suffix;
+    SemanticTokensDelta {
+        result_id: Some(result_id),
+        edits: vec![SemanticTokensEdit {
+            start: (prefix * 5) as u32,
+            delete_count: ((previous.len() - prefix - suffix) * 5) as u32,
+            data: Some(current[prefix..replacement_end].to_vec()),
+        }],
+    }
+}
+
+pub const TOKEN_KEYWORD: u32 = 0;
+pub const TOKEN_COMMENT: u32 = 1;
+pub const TOKEN_STRING: u32 = 2;
+pub const TOKEN_NUMBER: u32 = 3;
+pub const TOKEN_OPERATOR: u32 = 4;
+pub const TOKEN_FUNCTION: u32 = 5;
+pub const TOKEN_METHOD: u32 = 6;
+pub const TOKEN_VARIABLE: u32 = 7;
+pub const TOKEN_TYPE: u32 = 8;
+pub const TOKEN_STRUCT: u32 = 9;
+pub const TOKEN_ENUM: u32 = 10;
+pub const TOKEN_INTERFACE: u32 = 11;
+pub const TOKEN_PROPERTY: u32 = 12;
+pub const TOKEN_NAMESPACE: u32 = 13;
+pub const TOKEN_PARAMETER: u32 = 14;
+pub const MOD_DECLARATION: u32 = 1 << 0;
+pub const MOD_MUTABLE: u32 = 1 << 1;
+pub const MOD_STATIC: u32 = 1 << 2;
+pub const MOD_DEFAULT_LIBRARY: u32 = 1 << 3;
+
+pub(crate) fn semantic_tokens_legend() -> SemanticTokensLegend {
+    SemanticTokensLegend {
+        token_types: vec![
+            SemanticTokenType::KEYWORD,
+            SemanticTokenType::COMMENT,
+            SemanticTokenType::STRING,
+            SemanticTokenType::NUMBER,
+            SemanticTokenType::OPERATOR,
+            SemanticTokenType::FUNCTION,
+            SemanticTokenType::METHOD,
+            SemanticTokenType::VARIABLE,
+            SemanticTokenType::TYPE,
+            SemanticTokenType::STRUCT,
+            SemanticTokenType::ENUM,
+            SemanticTokenType::INTERFACE,
+            SemanticTokenType::PROPERTY,
+            SemanticTokenType::NAMESPACE,
+            SemanticTokenType::PARAMETER,
+        ],
+        token_modifiers: vec![
+            SemanticTokenModifier::DECLARATION,
+            SemanticTokenModifier::new("mutable"),
+            SemanticTokenModifier::STATIC,
+            SemanticTokenModifier::DEFAULT_LIBRARY,
+        ],
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn semantic_tokens_for_source(source: &str) -> SemanticTokens {
+    semantic_tokens_for_source_with_options(source, CompileOptions { use_std: false }, false)
+}
+
+#[cfg(feature = "test-support")]
+pub fn semantic_tokens_for_source_with_options(
+    source: &str,
+    compile_options: CompileOptions,
+    default_library_source: bool,
+) -> SemanticTokens {
+    let result = riddlec::pipeline::resolve_with_options(source, compile_options);
+    semantic_tokens_from_analysis(
+        source,
+        &DocumentAnalysis {
+            result,
+            source: source.into(),
+            source_map: None,
+            path: None,
+        },
+        default_library_source,
+    )
+}
+
+pub fn semantic_tokens_for_document(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document>,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+) -> std::result::Result<SemanticTokens, String> {
+    let document = docs
+        .get(uri)
+        .ok_or_else(|| "document is not open".to_string())?;
+    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Resolve)?;
+    Ok(semantic_tokens_from_analysis(
+        &document.text,
+        &analysis,
+        is_standard_library_uri(uri),
+    ))
+}
+
+fn semantic_tokens_from_analysis(
+    document_source: &str,
+    analysis: &DocumentAnalysis,
+    default_library_source: bool,
+) -> SemanticTokens {
+    let tokens = frontend::lexer::lex(document_source);
+    let mut raw_tokens = Vec::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        let Some((token_type, token_modifiers_bitset)) =
+            semantic_token(&tokens, index, document_source)
+        else {
+            continue;
+        };
+        let text = token.text(document_source);
+        if text.contains('\n') {
+            continue;
+        }
+        raw_tokens.push(RawSemanticToken {
+            range: TextRange::new(
+                (token.span.start as u32).into(),
+                (token.span.end as u32).into(),
+            ),
+            token_type,
+            token_modifiers_bitset,
+            resolved: false,
+        });
+    }
+
+    if let Some(hir) = &analysis.result.hir {
+        collect_hir_symbol_tokens(
+            hir,
+            analysis,
+            document_source,
+            &tokens,
+            default_library_source,
+            &mut raw_tokens,
+        );
+    }
+
+    encode_semantic_tokens(document_source, remove_overlapping_tokens(raw_tokens))
+}
+
+fn is_standard_library_uri(uri: &lsp_types::Url) -> bool {
+    uri.path().contains("/std/std/") || uri.path().ends_with("/std/lib.rid")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawSemanticToken {
+    range: TextRange,
+    token_type: u32,
+    token_modifiers_bitset: u32,
+    resolved: bool,
+}
+
+fn collect_hir_symbol_tokens(
+    hir: &hir::HirFile,
+    analysis: &DocumentAnalysis,
+    document_source: &str,
+    tokens: &[frontend::lexer::Token],
+    default_library_source: bool,
+    out: &mut Vec<RawSemanticToken>,
+) {
+    let user_source_len = analysis.source.len();
+    let mut symbol_types = HashMap::new();
+    let mut method_modifiers = HashMap::new();
+    let mut function_modifiers = HashMap::new();
+
+    for (_, item) in hir.item_tree.structs.iter() {
+        let in_source = analysis.local_range(item.name_range).is_some();
+        let modifiers =
+            if default_library_source || usize::from(item.name_range.start()) >= user_source_len {
+                MOD_DEFAULT_LIBRARY
+            } else {
+                0
+            };
+        if in_source {
+            symbol_types.insert(item.name.0.as_str(), (TOKEN_STRUCT, modifiers));
+        } else {
+            symbol_types
+                .entry(item.name.0.as_str())
+                .or_insert((TOKEN_STRUCT, modifiers));
+        }
+    }
+    for (_, item) in hir.item_tree.enums.iter() {
+        let in_source = analysis.local_range(item.name_range).is_some();
+        let modifiers =
+            if default_library_source || usize::from(item.name_range.start()) >= user_source_len {
+                MOD_DEFAULT_LIBRARY
+            } else {
+                0
+            };
+        if in_source {
+            symbol_types.insert(item.name.0.as_str(), (TOKEN_ENUM, modifiers));
+        } else {
+            symbol_types
+                .entry(item.name.0.as_str())
+                .or_insert((TOKEN_ENUM, modifiers));
+        }
+        for variant in &item.variants {
+            let in_source = analysis.local_range(variant.name_range).is_some();
+            let modifiers = if default_library_source
+                || usize::from(variant.name_range.start()) >= user_source_len
+            {
+                MOD_DEFAULT_LIBRARY
+            } else {
+                0
+            };
+            if in_source {
+                symbol_types.insert(variant.name.0.as_str(), (TOKEN_ENUM, modifiers));
+            } else {
+                symbol_types
+                    .entry(variant.name.0.as_str())
+                    .or_insert((TOKEN_ENUM, modifiers));
+            }
+        }
+    }
+    for (_, item) in hir.item_tree.traits.iter() {
+        symbol_types.entry(item.name.0.as_str()).or_insert((
+            TOKEN_INTERFACE,
+            if default_library_source {
+                MOD_DEFAULT_LIBRARY
+            } else {
+                0
+            },
+        ));
+        for method in &item.methods {
+            if let Some(method_range) = analysis.local_range(method.name_range) {
+                let mut modifiers = MOD_DECLARATION;
+                if method
+                    .params
+                    .first()
+                    .is_none_or(|param| param.name.0 != "self")
+                {
+                    modifiers |= MOD_STATIC;
+                }
+                if default_library_source {
+                    modifiers |= MOD_DEFAULT_LIBRARY;
+                }
+                out.push(RawSemanticToken {
+                    range: method_range,
+                    token_type: TOKEN_METHOD,
+                    token_modifiers_bitset: modifiers,
+                    resolved: true,
+                });
+            }
+        }
+    }
+    for (_, item) in hir.item_tree.impls.iter() {
+        for method_id in &item.methods {
+            let method = &hir.item_tree.functions[*method_id];
+            let method_range = analysis.local_range(method.name_range);
+            let in_source = method_range.is_some();
+            let mut modifiers = 0;
+            if method
+                .params
+                .first()
+                .is_none_or(|param| param.name.0 != "self")
+            {
+                modifiers |= MOD_STATIC;
+            }
+            if default_library_source || usize::from(method.name_range.start()) >= user_source_len {
+                modifiers |= MOD_DEFAULT_LIBRARY;
+            }
+            method_modifiers.insert(*method_id, modifiers);
+            if in_source {
+                out.push(RawSemanticToken {
+                    range: method_range.unwrap(),
+                    token_type: TOKEN_METHOD,
+                    token_modifiers_bitset: MOD_DECLARATION | modifiers,
+                    resolved: true,
+                });
+            }
+        }
+    }
+    for token in tokens {
+        let Some(&(token_type, token_modifiers_bitset)) =
+            symbol_types.get(token.text(document_source))
+        else {
+            continue;
+        };
+        out.push(RawSemanticToken {
+            range: TextRange::new(
+                (token.span.start as u32).into(),
+                (token.span.end as u32).into(),
+            ),
+            token_type,
+            token_modifiers_bitset,
+            resolved: false,
+        });
+    }
+
+    for (function_id, function) in hir.item_tree.functions.iter() {
+        let function_range = analysis.local_range(function.name_range);
+        let in_source = function_range.is_some();
+        let modifiers = if default_library_source
+            || usize::from(function.name_range.start()) >= user_source_len
+        {
+            MOD_DEFAULT_LIBRARY
+        } else {
+            0
+        };
+        function_modifiers.insert(function_id, modifiers);
+        if in_source && !method_modifiers.contains_key(&function_id) {
+            out.push(RawSemanticToken {
+                range: function_range.unwrap(),
+                token_type: TOKEN_FUNCTION,
+                token_modifiers_bitset: MOD_DECLARATION | modifiers,
+                resolved: true,
+            });
+        }
+        for param in &function.params {
+            if param.name.0 != "self"
+                && let Some(param_range) = analysis.local_range(param.name_range)
+            {
+                out.push(RawSemanticToken {
+                    range: param_range,
+                    token_type: TOKEN_PARAMETER,
+                    token_modifiers_bitset: MOD_DECLARATION,
+                    resolved: true,
+                });
+            }
+        }
+    }
+
+    for (_, body) in hir.bodies.iter() {
+        for (_, stmt) in body.stmts.iter() {
+            if let Stmt::Let {
+                name_range, is_mut, ..
+            } = stmt
+            {
+                if !is_mut {
+                    continue;
+                }
+                let Some(range) = *name_range else {
+                    continue;
+                };
+                let Some(range) = analysis.local_range(range) else {
+                    continue;
+                };
+                out.push(RawSemanticToken {
+                    range,
+                    token_type: TOKEN_VARIABLE,
+                    token_modifiers_bitset: MOD_DECLARATION | MOD_MUTABLE,
+                    resolved: true,
+                });
+            }
+        }
+
+        for (expr_id, expr) in body.exprs.iter() {
+            if let Expr::Lambda { params, .. } = expr {
+                for param in params {
+                    let Some(range) = param.name_range else {
+                        continue;
+                    };
+                    if let Some(range) = analysis.local_range(range) {
+                        out.push(RawSemanticToken {
+                            range,
+                            token_type: TOKEN_PARAMETER,
+                            token_modifiers_bitset: MOD_DECLARATION,
+                            resolved: true,
+                        });
+                    }
+                }
+            }
+
+            let Expr::Path { path, resolved } = expr else {
+                continue;
+            };
+            let Some(name) = path.segments.last() else {
+                continue;
+            };
+            if path.as_single_name().is_some() && name.0 == "self" {
+                continue;
+            }
+
+            let Some(range) = body
+                .source_map
+                .expr_ranges
+                .get(&expr_id)
+                .and_then(|range| last_identifier_range(&analysis.source, *range))
+                .and_then(|range| analysis.local_range(range))
+            else {
+                continue;
+            };
+
+            let Some((token_type, token_modifiers_bitset)) = semantic_token_for_resolution(
+                body,
+                resolved.as_ref(),
+                &method_modifiers,
+                &function_modifiers,
+            ) else {
+                continue;
+            };
+            out.push(RawSemanticToken {
+                range,
+                token_type,
+                token_modifiers_bitset,
+                resolved: true,
+            });
+        }
+    }
+}
+
+fn semantic_token_for_resolution(
+    body: &hir::body::Body,
+    resolved: Option<&ResolvedName>,
+    method_modifiers: &HashMap<FunctionId, u32>,
+    function_modifiers: &HashMap<FunctionId, u32>,
+) -> Option<(u32, u32)> {
+    match resolved {
+        Some(ResolvedName::Local(stmt_id)) => match &body.stmts[*stmt_id] {
+            Stmt::Let { is_mut: true, .. } => Some((TOKEN_VARIABLE, MOD_MUTABLE)),
+            Stmt::Let { is_mut: false, .. } => Some((TOKEN_VARIABLE, 0)),
+            _ => None,
+        },
+        Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => {
+            Some((TOKEN_PARAMETER, 0))
+        }
+        Some(ResolvedName::Function(function_id)) => {
+            if let Some(modifiers) = method_modifiers.get(function_id) {
+                Some((TOKEN_METHOD, *modifiers))
+            } else {
+                Some((
+                    TOKEN_FUNCTION,
+                    function_modifiers.get(function_id).copied().unwrap_or(0),
+                ))
+            }
+        }
+        Some(ResolvedName::Struct(_)) => Some((TOKEN_STRUCT, 0)),
+        Some(ResolvedName::Enum(_) | ResolvedName::EnumVariant(_, _)) => Some((TOKEN_ENUM, 0)),
+        Some(ResolvedName::Trait(_)) => Some((TOKEN_INTERFACE, 0)),
+        Some(ResolvedName::TypeAlias(_)) => Some((TOKEN_TYPE, 0)),
+        Some(ResolvedName::Module(_)) => Some((TOKEN_NAMESPACE, 0)),
+        Some(ResolvedName::Const(_)) => Some((TOKEN_VARIABLE, 0)),
+        _ => None,
+    }
+}
+
+fn trim_source_range(source: &str, range: TextRange) -> Option<TextRange> {
+    let start = usize::from(range.start());
+    let end = usize::from(range.end());
+    let text = source.get(start..end)?;
+    let start = start + text.len() - text.trim_start().len();
+    let end = end - (text.len() - text.trim_end().len());
+
+    (start < end).then(|| TextRange::new((start as u32).into(), (end as u32).into()))
+}
+
+fn last_identifier_range(source: &str, range: TextRange) -> Option<TextRange> {
+    let range = trim_source_range(source, range)?;
+    let end = usize::from(range.end());
+    let text = source.get(usize::from(range.start())..end)?;
+    let length = text
+        .chars()
+        .rev()
+        .take_while(|ch| is_identifier_continue(*ch))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    (length > 0).then(|| TextRange::new(((end - length) as u32).into(), (end as u32).into()))
+}
+
+fn remove_overlapping_tokens(raw_tokens: Vec<RawSemanticToken>) -> Vec<RawSemanticToken> {
+    let (mut preferred, mut fallback): (Vec<_>, Vec<_>) =
+        raw_tokens.into_iter().partition(|token| {
+            matches!(
+                token.token_type,
+                TOKEN_FUNCTION
+                    | TOKEN_METHOD
+                    | TOKEN_VARIABLE
+                    | TOKEN_STRUCT
+                    | TOKEN_ENUM
+                    | TOKEN_INTERFACE
+                    | TOKEN_PARAMETER
+            )
+        });
+    preferred.sort_by_key(|token| {
+        (
+            token.range.start(),
+            token.range.end(),
+            std::cmp::Reverse(token.resolved),
+            std::cmp::Reverse(token.token_modifiers_bitset.count_ones()),
+        )
+    });
+    fallback.sort_by_key(|token| (token.range.start(), token.range.end()));
+
+    let mut kept_preferred: Vec<RawSemanticToken> = Vec::new();
+    for token in preferred {
+        if kept_preferred
+            .last()
+            .is_some_and(|kept| ranges_overlap(kept.range, token.range))
+        {
+            continue;
+        }
+        kept_preferred.push(token);
+    }
+
+    let mut preferred_index = 0;
+    let mut kept_fallback: Vec<RawSemanticToken> = Vec::new();
+    for token in fallback {
+        while kept_preferred
+            .get(preferred_index)
+            .is_some_and(|preferred| preferred.range.end() <= token.range.start())
+        {
+            preferred_index += 1;
+        }
+        if kept_preferred
+            .get(preferred_index)
+            .is_some_and(|preferred| ranges_overlap(preferred.range, token.range))
+            || kept_fallback
+                .last()
+                .is_some_and(|kept| ranges_overlap(kept.range, token.range))
+        {
+            continue;
+        }
+        kept_fallback.push(token);
+    }
+
+    kept_preferred.extend(kept_fallback);
+    kept_preferred.sort_by_key(|token| (token.range.start(), token.range.end()));
+    kept_preferred
+}
+
+fn encode_semantic_tokens(source: &str, raw_tokens: Vec<RawSemanticToken>) -> SemanticTokens {
+    let mut data = Vec::new();
+    let mut cursor = 0;
+    let mut line = 0;
+    let mut character = 0;
+    let mut prev_line = 0;
+    let mut prev_start = 0;
+
+    for token in raw_tokens {
+        let start_offset = usize::from(token.range.start());
+        let end_offset = usize::from(token.range.end());
+        let Some(text) = source.get(start_offset..end_offset) else {
+            continue;
+        };
+        if text.is_empty() || text.contains('\n') {
+            continue;
+        }
+
+        let Some(skipped) = source.get(cursor..start_offset) else {
+            continue;
+        };
+        for ch in skipped.chars() {
+            if ch == '\n' {
+                line += 1;
+                character = 0;
+            } else {
+                character += ch.len_utf16() as u32;
+            }
+        }
+        cursor = start_offset;
+
+        let length = text.chars().map(char::len_utf16).sum::<usize>() as u32;
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 {
+            character - prev_start
+        } else {
+            character
+        };
+
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length,
+            token_type: token.token_type,
+            token_modifiers_bitset: token.token_modifiers_bitset,
+        });
+        prev_line = line;
+        prev_start = character;
+    }
+
+    SemanticTokens {
+        result_id: None,
+        data,
+    }
+}
+
+fn semantic_token(
+    tokens: &[frontend::lexer::Token],
+    index: usize,
+    source: &str,
+) -> Option<(u32, u32)> {
+    let token = &tokens[index];
+    let token_type = match token.kind {
+        SyntaxKind::Whitespace | SyntaxKind::ErrorNode | SyntaxKind::Eof => None,
+        SyntaxKind::LineComment => Some(TOKEN_COMMENT),
+        SyntaxKind::String | SyntaxKind::Char => Some(TOKEN_STRING),
+        SyntaxKind::Number | SyntaxKind::Float => Some(TOKEN_NUMBER),
+        SyntaxKind::Ident => ident_token_type(tokens, index, source),
+        kind if is_keyword(kind) => Some(TOKEN_KEYWORD),
+        kind if is_operator(kind) => Some(TOKEN_OPERATOR),
+        _ => None,
+    }?;
+
+    Some((token_type, 0))
+}
+
+fn ident_token_type(tokens: &[frontend::lexer::Token], index: usize, source: &str) -> Option<u32> {
+    let text = tokens[index].text(source);
+    if BUILTIN_TYPES.contains(&text) {
+        return Some(TOKEN_KEYWORD);
+    }
+    let previous = previous_significant(tokens, index).map(|token| token.kind);
+    let next = next_significant(tokens, index).map(|token| token.kind);
+    match previous {
+        Some(SyntaxKind::Fun) => Some(TOKEN_FUNCTION),
+        Some(SyntaxKind::Struct) => Some(TOKEN_STRUCT),
+        Some(SyntaxKind::Enum) => Some(TOKEN_ENUM),
+        Some(SyntaxKind::Trait) => Some(TOKEN_INTERFACE),
+        Some(SyntaxKind::Mod) | Some(SyntaxKind::Use) => Some(TOKEN_NAMESPACE),
+        Some(SyntaxKind::TypeKw) | Some(SyntaxKind::Impl) => Some(TOKEN_TYPE),
+        Some(SyntaxKind::Dot) => {
+            if next == Some(SyntaxKind::LParen) {
+                Some(TOKEN_METHOD)
+            } else {
+                Some(TOKEN_PROPERTY)
+            }
+        }
+        _ if next == Some(SyntaxKind::LParen) => Some(TOKEN_FUNCTION),
+        _ if token_starts_uppercase(text) => Some(TOKEN_TYPE),
+        _ => None,
+    }
+}
+
+fn previous_significant(
+    tokens: &[frontend::lexer::Token],
+    index: usize,
+) -> Option<&frontend::lexer::Token> {
+    tokens[..index]
+        .iter()
+        .rev()
+        .find(|token| !token.kind.is_trivia())
+}
+
+fn next_significant(
+    tokens: &[frontend::lexer::Token],
+    index: usize,
+) -> Option<&frontend::lexer::Token> {
+    tokens[index + 1..]
+        .iter()
+        .find(|token| !token.kind.is_trivia())
+}
+
+fn token_starts_uppercase(text: &str) -> bool {
+    text.chars().next().map(char::is_uppercase).unwrap_or(false)
+}
+
+fn is_keyword(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Let
+            | SyntaxKind::Fun
+            | SyntaxKind::Struct
+            | SyntaxKind::If
+            | SyntaxKind::Else
+            | SyntaxKind::While
+            | SyntaxKind::Break
+            | SyntaxKind::Continue
+            | SyntaxKind::Return
+            | SyntaxKind::As
+            | SyntaxKind::SelfKw
+            | SyntaxKind::Mod
+            | SyntaxKind::Use
+            | SyntaxKind::Mut
+            | SyntaxKind::Pub
+            | SyntaxKind::SuperKw
+            | SyntaxKind::CrateKw
+            | SyntaxKind::Enum
+            | SyntaxKind::Trait
+            | SyntaxKind::Impl
+            | SyntaxKind::Match
+            | SyntaxKind::Const
+            | SyntaxKind::TypeKw
+            | SyntaxKind::Extern
+            | SyntaxKind::Unsafe
+            | SyntaxKind::Safe
+            | SyntaxKind::For
+            | SyntaxKind::In
+            | SyntaxKind::Where
+            | SyntaxKind::True
+            | SyntaxKind::False
+    )
+}
+
+fn is_operator(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Arrow
+            | SyntaxKind::EqEq
+            | SyntaxKind::BangEq
+            | SyntaxKind::LessEq
+            | SyntaxKind::GreaterEq
+            | SyntaxKind::AmpAmp
+            | SyntaxKind::PipePipe
+            | SyntaxKind::FatArrow
+            | SyntaxKind::PlusEq
+            | SyntaxKind::MinusEq
+            | SyntaxKind::StarEq
+            | SyntaxKind::SlashEq
+            | SyntaxKind::PercentEq
+            | SyntaxKind::AmpEq
+            | SyntaxKind::PipeEq
+            | SyntaxKind::CaretEq
+            | SyntaxKind::ShlEq
+            | SyntaxKind::ShrEq
+            | SyntaxKind::Shl
+            | SyntaxKind::Shr
+            | SyntaxKind::Plus
+            | SyntaxKind::Minus
+            | SyntaxKind::Star
+            | SyntaxKind::Slash
+            | SyntaxKind::Percent
+            | SyntaxKind::Amp
+            | SyntaxKind::Pipe
+            | SyntaxKind::Caret
+            | SyntaxKind::Less
+            | SyntaxKind::Greater
+            | SyntaxKind::Bang
+            | SyntaxKind::Eq
+    )
+}

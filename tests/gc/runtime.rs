@@ -1,4 +1,4 @@
-use super::RUNTIME_C;
+use gc::RUNTIME_C;
 
 #[test]
 fn exports_runtime_api() {
