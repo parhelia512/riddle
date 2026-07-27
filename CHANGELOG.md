@@ -13,7 +13,6 @@
 
 - The C backend and bundled conservative GC runtime now support the expanded language surface without an external GC dependency.
 - Release artifacts now include host toolchains, target runtime packages, an installation manifest, and editor extensions.
-- Playground deployment can be triggered after the Riddle `main` branch is updated.
 
 ### Fixed
 
