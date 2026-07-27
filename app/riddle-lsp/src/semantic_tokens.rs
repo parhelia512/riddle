@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
 use frontend::syntax_kind::SyntaxKind;
-use hir::body::{Expr, ResolvedName, Stmt};
+use hir::body::{Expr, ResolvedName};
 use hir::item_tree::FunctionId;
 use lsp_types::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensDelta,
     SemanticTokensEdit, SemanticTokensLegend,
 };
 use riddlec::pipeline::CompileOptions;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 use crate::{
     analysis::{AnalysisDepth, DocumentAnalysis, analyze_document},
@@ -367,27 +367,26 @@ fn collect_hir_symbol_tokens(
     }
 
     for (_, body) in hir.bodies.iter() {
-        for (_, stmt) in body.stmts.iter() {
-            if let Stmt::Let {
-                name_range, is_mut, ..
-            } = stmt
-            {
-                if !is_mut {
-                    continue;
-                }
-                let Some(range) = *name_range else {
-                    continue;
-                };
-                let Some(range) = analysis.local_range(range) else {
-                    continue;
-                };
-                out.push(RawSemanticToken {
-                    range,
-                    token_type: TOKEN_VARIABLE,
-                    token_modifiers_bitset: MOD_DECLARATION | MOD_MUTABLE,
-                    resolved: true,
-                });
-            }
+        for (pat_id, pat) in body.pats.iter() {
+            let hir::body::Pattern::Binding { name, is_mut: true } = pat else {
+                continue;
+            };
+            let Some(range) = body.source_map.pat_ranges.get(&pat_id).copied() else {
+                continue;
+            };
+            // The pattern range covers `mut x`; the token is just the name,
+            // which the parser always puts last.
+            let name_len = TextSize::of(name.0.as_str());
+            let range = TextRange::new(range.end() - name_len, range.end());
+            let Some(range) = analysis.local_range(range) else {
+                continue;
+            };
+            out.push(RawSemanticToken {
+                range,
+                token_type: TOKEN_VARIABLE,
+                token_modifiers_bitset: MOD_DECLARATION | MOD_MUTABLE,
+                resolved: true,
+            });
         }
 
         for (expr_id, expr) in body.exprs.iter() {
@@ -452,11 +451,13 @@ fn semantic_token_for_resolution(
     function_modifiers: &HashMap<FunctionId, u32>,
 ) -> Option<(u32, u32)> {
     match resolved {
-        Some(ResolvedName::Local(stmt_id)) => match &body.stmts[*stmt_id] {
-            Stmt::Let { is_mut: true, .. } => Some((TOKEN_VARIABLE, MOD_MUTABLE)),
-            Stmt::Let { is_mut: false, .. } => Some((TOKEN_VARIABLE, 0)),
-            _ => None,
-        },
+        Some(ResolvedName::PatternBinding(id)) => {
+            let is_mut = matches!(
+                body.pats[id.pattern],
+                hir::body::Pattern::Binding { is_mut: true, .. }
+            );
+            Some((TOKEN_VARIABLE, if is_mut { MOD_MUTABLE } else { 0 }))
+        }
         Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => {
             Some((TOKEN_PARAMETER, 0))
         }

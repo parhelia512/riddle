@@ -102,6 +102,7 @@ ast_node!(FnType, FnType);
 ast_node!(WildcardPat, WildcardPattern);
 ast_node!(LiteralPat, LiteralPattern);
 ast_node!(TuplePat, TuplePattern);
+ast_node!(BindingPat, BindingPattern);
 ast_node!(StructPattern, StructPattern);
 ast_node!(EnumPattern, EnumPattern);
 
@@ -279,15 +280,10 @@ fn raw_string_body(text: &str) -> Option<&str> {
 }
 
 impl VarDecl {
-    pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
-    }
-
-    pub fn is_mut(&self) -> bool {
-        self.syntax
-            .children_with_tokens()
-            .filter_map(|e| e.into_token())
-            .any(|t| t.kind() == SyntaxKind::Mut)
+    /// The bound pattern. `let x = 1` yields a binding pattern, so mutability
+    /// and destructuring both live here rather than on the statement.
+    pub fn pattern(&self) -> Option<Pattern> {
+        support::child(&self.syntax)
     }
 
     pub fn ty(&self) -> Option<Type> {
@@ -1431,6 +1427,7 @@ pub enum Pattern {
     Tuple(TuplePat),
     Struct(StructPattern),
     Enum(EnumPattern),
+    Binding(BindingPat),
 }
 
 impl AstNode for Pattern {
@@ -1441,6 +1438,7 @@ impl AstNode for Pattern {
             SyntaxKind::TuplePattern => Some(Pattern::Tuple(TuplePat { syntax: node })),
             SyntaxKind::StructPattern => Some(Pattern::Struct(StructPattern { syntax: node })),
             SyntaxKind::EnumPattern => Some(Pattern::Enum(EnumPattern { syntax: node })),
+            SyntaxKind::BindingPattern => Some(Pattern::Binding(BindingPat { syntax: node })),
             _ => None,
         }
     }
@@ -1452,7 +1450,21 @@ impl AstNode for Pattern {
             Pattern::Tuple(it) => it.syntax(),
             Pattern::Struct(it) => it.syntax(),
             Pattern::Enum(it) => it.syntax(),
+            Pattern::Binding(it) => it.syntax(),
         }
+    }
+}
+
+impl BindingPat {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token_of(&self.syntax, SyntaxKind::Ident)
+    }
+
+    pub fn is_mut(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .any(|token| token.kind() == SyntaxKind::Mut)
     }
 }
 

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use frontend::syntax_kind::RiddleLang;
 use hir::{
     Name,
-    body::{BodyId, ExprId, PatternBindingId, StmtId},
+    body::{BodyId, ExprId, PatternBindingId},
     item_tree::{ConstId, EnumId, FunctionId, ModuleId, StructId, TraitId, TypeAliasId},
 };
 
@@ -71,6 +71,7 @@ pub enum Node {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefOrigin {
     Expr { body: BodyId, expr: ExprId },
+    Type { range: rowan::TextRange },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,10 +101,7 @@ pub enum DefRef {
         /// Scope used when resolving the remaining path inside the module.
         enter: NodeId,
     },
-    Local {
-        stmt: StmtId,
-    },
-    /// Binding introduced by a match-arm pattern, e.g. `x` in `x => ...`.
+    /// Binding introduced by a pattern — a `let`, a `match` arm or a `for`.
     PatternBinding {
         name: Name,
         id: PatternBindingId,

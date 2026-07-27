@@ -5,6 +5,7 @@ pub mod vector;
 pub mod iter;
 pub mod io;
 pub mod array;
+pub mod slice;
 pub mod marker;
 pub mod clone;
 pub mod cmp;

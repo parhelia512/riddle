@@ -8,10 +8,8 @@ pub trait Display {
 
 impl Display for &str {
     fun write(self) {
-        let mut index = 0usize;
-        while index < self.len() {
-            putchar(self.byte_at(index).unwrap_or(0u8) as i32);
-            index += 1usize;
+        for byte in self.as_bytes() {
+            putchar(*byte as i32);
         }
     }
 }

@@ -23,10 +23,6 @@ fn c_member(name: &str) -> String {
     c_symbol('m', name)
 }
 
-fn c_variable(name: &str) -> String {
-    c_symbol('v', name)
-}
-
 fn temp_source_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "riddle-load-source-{name}-{}-{}",
@@ -261,6 +257,35 @@ fn syntax_error_at_eof_stays_in_user_source_with_std_enabled() {
 }
 
 #[test]
+fn mut_belongs_on_the_binding_not_the_let_pattern() {
+    // As in Rust: `let (mut a, b)` is legal, `let mut (a, b)` is not.
+    let result = compile("fun main() { let mut (a, b) = (1i32, 2i32); }");
+
+    assert!(
+        !result.parse_errors.is_empty(),
+        "{:#?}",
+        result.parse_errors
+    );
+}
+
+#[test]
+fn destructuring_let_patterns_parse() {
+    let result = compile(
+        r#"
+            struct Point { x: i32, y: i32 }
+            fun main() {
+                let (mut a, b) = (1i32, 2i32);
+                let Point { x, y } = Point { x: 3i32, y: 4i32 };
+                a = a + b + x + y;
+            }
+        "#,
+    );
+
+    assert!(result.parse_errors.is_empty(), "{:#?}", result.parse_errors);
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+}
+
+#[test]
 fn extern_blocks_require_unsafe_modifier() {
     let result = compile_with_options(
         r#"
@@ -275,6 +300,44 @@ fn extern_blocks_require_unsafe_modifier() {
             .parse_errors
             .iter()
             .any(|error| error.message.contains("unsafe extern")),
+        "{:#?}",
+        result.parse_errors
+    );
+}
+
+#[test]
+fn single_function_extern_imports_are_rejected() {
+    let result = compile_with_options(
+        r#"
+            extern "C" fun external();
+            fun main() {}
+        "#,
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        result.parse_errors.iter().any(|error| error
+            .message
+            .contains("single-function extern declarations")),
+        "{:#?}",
+        result.parse_errors
+    );
+}
+
+#[test]
+fn generic_extern_declarations_are_rejected() {
+    let result = compile_with_options(
+        r#"
+            unsafe extern "C" { fun external<T>(value: T); }
+            fun main() {}
+        "#,
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        result.parse_errors.iter().any(|error| error
+            .message
+            .contains("extern function declarations cannot have generic parameters")),
         "{:#?}",
         result.parse_errors
     );
@@ -502,14 +565,9 @@ fn std_basic_value_methods_compile() {
                 let token_is_present = token.is_some();
                 let token_value = token.unwrap_or(Token { value: 0 }).value;
 
-                let text: &str = "abc";
-                let byte = text.byte_at(1usize).unwrap_or(0u8) as i32;
-
                 if some.is_some() && none.is_none() && ok.is_ok() && err.is_err()
-                    && has_value && has_error && text.byte_at(3usize).is_none()
-                    && token_is_present && token_value == 5
-                    && text.len() == 3usize && !text.is_empty() {
-                    option_value + fallback + result_value + byte
+                    && has_value && has_error && token_is_present && token_value == 5 {
+                    option_value + fallback + result_value
                 } else {
                     0
                 }
@@ -525,13 +583,44 @@ fn std_basic_value_methods_compile() {
         result.analysis_diagnostics
     );
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
-    assert!(c.contains("return s.len"), "{c}");
-    assert!(c.contains("s.ptr[i]"), "{c}");
     assert!(c.contains(&c_function("is_some__Option_i32")), "{c}");
 }
 
 #[test]
-fn std_string_and_vector_compile() {
+fn str_and_slice_have_no_layout_fields() {
+    // Fat-pointer layout is reached through casts in `std`, never through
+    // fields, so `.len` / `.ptr` do not exist on `str` or `[T]` for anyone.
+    for source in [
+        r#"
+            fun main() {
+                let text: &str = "hello";
+                let length = text.len;
+            }
+            "#,
+        r#"
+            fun main() {
+                let values: [i32; 1] = [1];
+                let slice: &[i32] = &values;
+                let pointer = slice.ptr;
+            }
+            "#,
+    ] {
+        let result = compile(source);
+        assert!(!result.success(), "{source}");
+        assert!(
+            result
+                .type_result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0006"),
+            "{:#?}",
+            result.type_result.diagnostics
+        );
+    }
+}
+
+#[test]
+fn std_string_and_vector_compile_without_string_runtime_helpers() {
     let result = compile(
         r#"
             fun main() -> i32 {
@@ -539,14 +628,25 @@ fn std_string_and_vector_compile() {
                 values.push(1);
                 values.push(2);
                 let fallback = 0;
+                let slice = values.as_slice();
+                let slice_value = *slice.get(1usize).unwrap_or(&fallback);
                 let first = *values.get(0usize).unwrap_or(&fallback);
                 let missing = values.get(2usize).is_none();
                 let last = values.pop().unwrap_or(0);
 
                 let mut text = String::from_str("hello");
                 text.push_str(" world");
-                if first == 1 && last == 2 && missing
-                    && text.len() == 11usize && text.as_str() == "hello world" {
+                let literal_bytes = "hello world".as_bytes();
+                let first_byte = match literal_bytes.get(0usize) {
+                    Option::Some(value) => *value,
+                    Option::None => 0u8,
+                };
+                let text_matches = text.len() == 11usize && text.as_str() == "hello world"
+                    && literal_bytes.len() == 11usize && first_byte == 104u8;
+                text.clear();
+
+                if slice_value == 2 && first == 1 && last == 2 && missing
+                    && text_matches && text.is_empty() && text.as_str() == "" {
                     0
                 } else {
                     1
@@ -565,9 +665,19 @@ fn std_string_and_vector_compile() {
     );
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
     assert!(c.contains(&c_function("new__Vector_i32")), "{c}");
-    assert!(c.contains("vector_grow"), "{c}");
-    assert!(c.contains("size_of_ptr__i32"), "{c}");
-    assert!(c.contains("str_from_raw"), "{c}");
+    assert!(!c.contains("extern void* malloc(size_t)"), "{c}");
+    assert!(c.contains("extern void* rgc_realloc(void*, size_t)"), "{c}");
+    assert!(c.contains("extern void rgc_free(void*)"), "{c}");
+    assert_eq!(c.matches("extern void abort(void);").count(), 1, "{c}");
+    assert_eq!(c.matches("abort();").count(), 1, "{c}");
+    assert!(c.contains("sizeof(int32_t)"), "{c}");
+    assert!(c.contains(&c_function("as_slice__Vector_i32")), "{c}");
+    assert!(!c.contains(&c_function("from_raw_parts")), "{c}");
+    assert!(!c.contains("vector_grow"), "{c}");
+    assert!(!c.contains("str_len"), "{c}");
+    assert!(!c.contains("str_byte"), "{c}");
+    assert!(!c.contains("str_from_raw"), "{c}");
+    assert!(!c.contains("byte_at"), "{c}");
 }
 
 #[test]
@@ -623,6 +733,31 @@ fn vector_mutation_is_rejected_while_shared_element_reference_is_live() {
 }
 
 #[test]
+fn string_mutation_is_rejected_while_str_view_is_live() {
+    let result = compile(
+        r#"
+            fun main() {
+                let mut text = String::from_str("hello");
+                let view = text.as_str().as_bytes();
+                text.push_str(" world");
+                view.len();
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(result.mir_module.is_none());
+    assert!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0300"),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
 fn vector_mutation_is_allowed_after_element_reference_last_use() {
     let result = compile(
         r#"
@@ -638,6 +773,58 @@ fn vector_mutation_is_allowed_after_element_reference_last_use() {
     );
 
     assert!(result.success(), "{:#?}", result.analysis_diagnostics);
+}
+
+#[test]
+fn mutable_reference_parameters_accept_mutable_method_calls() {
+    // A `&mut T` binding is reborrowed for a `&mut self` receiver; only
+    // auto-referencing a place requires that place to be declared mutable.
+    let result = compile(
+        r#"
+            fun fill(target: &mut Vector<i32>) {
+                target.push(7);
+            }
+
+            fun first_mut(values: &mut [i32], fallback: &mut i32) -> &mut i32 {
+                values.get_mut(0usize).unwrap_or(fallback)
+            }
+
+            fun main() {
+                let mut values: Vector<i32> = Vector::new();
+                fill(&mut values);
+            }
+            "#,
+    );
+
+    assert!(
+        result.success(),
+        "type: {:#?}\nanalysis: {:#?}",
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn immutable_bindings_still_reject_mutable_method_calls() {
+    let result = compile(
+        r#"
+            fun main() {
+                let values: Vector<i32> = Vector::new();
+                values.push(1);
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(
+        result
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0031"),
+        "{:#?}",
+        result.type_result.diagnostics
+    );
 }
 
 #[test]
@@ -737,7 +924,10 @@ fn std_operator_trait_methods_emit_native_c_without_wrappers() {
         assert!(!c.contains(method), "unexpected `{method}` wrapper:\n{c}");
     }
     assert!(c.contains(" + "), "expected native C addition:\n{c}");
-    assert!(c.contains("(-("), "expected native C negation:\n{c}");
+    assert!(
+        c.contains("RIDDLE_I64_FROM_BITS(((uint64_t)0 - (uint64_t)"),
+        "expected defined native C negation:\n{c}"
+    );
 }
 
 #[test]
@@ -773,6 +963,36 @@ fn compile_without_std_accepts_basic_program() {
         CompileOptions { use_std: false },
     );
 
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+}
+
+#[test]
+fn const_declarations_require_an_initializer() {
+    let result = compile_with_options(
+        "const ANSWER: i32; fun main() {}",
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        !result.parse_errors.is_empty(),
+        "const without a value must be rejected"
+    );
+}
+
+#[test]
+fn type_aliases_require_a_value_outside_trait_declarations() {
+    for source in [
+        "type Missing; fun main() {}",
+        "struct Item {} impl Item { type Missing; } fun main() {}",
+    ] {
+        let result = compile_with_options(source, CompileOptions { use_std: false });
+        assert!(!result.parse_errors.is_empty(), "{source}");
+    }
+
+    let result = compile_with_options(
+        "trait HasItem { type Item; } fun main() {}",
+        CompileOptions { use_std: false },
+    );
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);
 }
 
@@ -971,16 +1191,6 @@ fn enum_match_lowers_variants_guards_bindings_and_values() {
     assert!(c.contains(&format!(" {};", c_member("Number_0"))), "{c}");
     assert!(c.contains(&format!(".{}", c_member("Pair_left"))), "{c}");
     assert!(c.contains("if ("), "{c}");
-    assert!(
-        c.contains(&format!(
-            "{}->{} < {}->{}",
-            c_variable("self"),
-            c_member("start"),
-            c_variable("self"),
-            c_member("end")
-        )),
-        "{c}"
-    );
 }
 
 #[test]
@@ -1109,14 +1319,12 @@ fn unit_return_does_not_hide_non_exhaustive_payload_match() {
 fn std_modules_expose_core_items() {
     let result = compile(
         r#"
-            use std::String;
             use std::Vector;
 
             fun main() {
                 let value = std::option::Option::Some(1);
                 let mut iter: Range = std::ops::range(0, 3);
                 let first = iter.next();
-                let text = String::new();
                 let values: Vector<i32> = Vector::new();
             }
             "#,

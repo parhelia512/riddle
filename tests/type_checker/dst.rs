@@ -39,6 +39,19 @@ fn accepts_str_slice_return() {
 }
 
 #[test]
+fn empty_array_literal_coerces_to_generic_slice() {
+    let result = check(
+        r#"
+        fun empty<T>() -> &[T] {
+            let value: &[T] = &[];
+            value
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn rejects_str_value_binding() {
     let result = check(
         r#"
@@ -130,7 +143,9 @@ fn rejects_bare_str_in_value_type_declarations() {
             type Item = str;
         }
 
-        extern "C" fun external(value: str) -> str;
+        unsafe extern "C" {
+            fun external(value: str) -> str;
+        }
 
         fun bad(value: (str, i32)) -> [str; 1] {
             return [""; 1];

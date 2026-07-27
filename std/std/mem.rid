@@ -1,1 +1,4 @@
 pub fun drop<T>(value: T) {}
+
+#[builtin = "size_of"]
+pub fun size_of<T>() -> usize { 0usize }

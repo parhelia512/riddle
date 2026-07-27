@@ -492,3 +492,308 @@ fn reports_uninferred_anonymous_parameter() {
         diagnostic.code == "E0045" && diagnostic.message.contains("parameter `x`")
     }));
 }
+
+#[test]
+fn destructuring_let_binds_every_element() {
+    let result = check(
+        r#"
+        struct Point { x: i32, y: bool }
+
+        fun main() {
+            let (a, b) = (1i32, true);
+            let Point { x, y } = Point { x: 2i32, y: false };
+            let flags: bool = b && y;
+            let sum: i32 = a + x;
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn destructuring_let_checks_element_types() {
+    let result = check(
+        r#"
+        fun main() {
+            let (a, b) = (1i32, true);
+            let wrong: i32 = b;
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0001"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn duplicate_bindings_in_one_pattern_are_rejected() {
+    let result = check(
+        r#"
+        fun main() {
+            let (value, value) = (1i32, 2i32);
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0058" && diagnostic.message.contains("bound more than once")
+        }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn duplicate_bindings_are_rejected_in_match_patterns() {
+    let result = check(
+        r#"
+        fun main() {
+            match (1i32, 2i32) {
+                (value, value) => {},
+            }
+        }
+        "#,
+    );
+
+    let duplicates = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0058")
+        .count();
+    assert_eq!(duplicates, 1, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn mut_on_a_destructured_binding_allows_reassignment() {
+    let result = check(
+        r#"
+        fun main() {
+            let (mut a, b) = (1i32, 2i32);
+            a = a + b;
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn immutable_destructured_binding_rejects_reassignment() {
+    let result = check(
+        r#"
+        fun main() {
+            let (a, b) = (1i32, 2i32);
+            a = b;
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0031"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn rejects_refutable_patterns_in_let_bindings() {
+    let result = check(
+        r#"
+        enum Opt { None, Some(i32) }
+
+        fun main() {
+            let value = Opt::Some(1i32);
+            let Opt::Some(inner) = value;
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0057" && diagnostic.message.contains("Opt::None")
+        }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn accepts_irrefutable_patterns_in_let_bindings() {
+    let result = check(
+        r#"
+        struct Wrapper { inner: i32 }
+
+        fun main() {
+            let ((a, b), c) = ((1i32, 2i32), 3i32);
+            let Wrapper { inner } = Wrapper { inner: a + b + c };
+            let total: i32 = inner;
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn wrong_tuple_arity_in_let_reports_only_the_shape_error() {
+    let result = check(
+        r#"
+        fun main() {
+            let (a, b, c) = (1i32, 2i32);
+        }
+        "#,
+    );
+
+    let codes = result
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code)
+        .collect::<Vec<_>>();
+    assert_eq!(codes, vec!["E0010"], "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn accepts_let_bindings_with_delayed_initialization() {
+    let result = check(
+        r#"
+        fun main() -> i32 {
+            let value: i32;
+            value = 7;
+            value
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![], "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn infers_delayed_binding_type_from_first_assignment() {
+    let result = check(
+        r#"
+        fun main() -> i32 {
+            let value;
+            value = 7;
+            value
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![], "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn delayed_binding_without_a_type_constraint_is_rejected() {
+    let result = check("fun main() { let value; }");
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0045" && diagnostic.message.contains("delayed `let`")
+    }));
+}
+
+#[test]
+fn checks_const_initializer_type() {
+    let result = check(
+        r#"
+        const ANSWER: i32 = true;
+        fun main() {}
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0001"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn rejects_non_constant_initializers_and_const_cycles() {
+    let impure = check(
+        r#"
+        fun make() -> i32 { 1 }
+        const BAD: i32 = make();
+        "#,
+    );
+    assert!(
+        impure
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0060"),
+        "{:#?}",
+        impure.diagnostics
+    );
+
+    let cycle = check(
+        r#"
+        const FIRST: i32 = SECOND;
+        const SECOND: i32 = FIRST;
+        "#,
+    );
+    assert!(
+        cycle.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0060" && diagnostic.message.contains("initialization cycle")
+        }),
+        "{:#?}",
+        cycle.diagnostics
+    );
+}
+
+#[test]
+fn resolves_top_level_aliases_qualified_types_and_imported_types() {
+    let result = check(
+        r#"
+        type Number = i32;
+
+        mod model {
+            pub struct Point { pub value: i32 }
+            pub type PublicPoint = Point;
+        }
+
+        use model::Point as ImportedPoint;
+
+        fun read(first: model::Point, second: model::PublicPoint, third: ImportedPoint) -> Number {
+            first.value + second.value + third.value
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn nested_private_types_do_not_leak_into_outer_type_scope() {
+    let result = check(
+        r#"
+        mod hidden {
+            struct Secret {}
+            pub fun make() -> Secret { Secret {} }
+        }
+
+        fun expose(value: Secret) {}
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0034"),
+        "{:#?}",
+        result.diagnostics
+    );
+}

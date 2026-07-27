@@ -1,0 +1,120 @@
+use crate::std::iter::{IntoIterator, Iterator};
+use crate::std::option::Option;
+
+pub struct SliceIter<T> {
+    values: &[T],
+    index: usize,
+}
+
+pub struct SliceIterMut<T> {
+    values: &mut [T],
+    index: usize,
+}
+
+impl<T> [T] {
+    pub fun len(&self) -> usize {
+        // SAFETY: `&[T]` is laid out as a `(pointer, length)` pair.
+        let (_, len) = unsafe { self as (*const T, usize) };
+        len
+    }
+
+    pub fun is_empty(&self) -> bool {
+        self.len() == 0usize
+    }
+
+    pub fun get(&self, index: usize) -> Option<&T> {
+        if index < self.len() {
+            // SAFETY: index is in bounds, so the element is initialized.
+            Option::Some(unsafe { &self.as_ptr()[index] })
+        } else {
+            Option::None
+        }
+    }
+
+    pub fun get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index < self.len() {
+            // SAFETY: index is in bounds, so the element is initialized.
+            Option::Some(unsafe { &mut self.as_mut_ptr()[index] })
+        } else {
+            Option::None
+        }
+    }
+
+    pub fun as_ptr(&self) -> *const T {
+        // SAFETY: `&[T]` is laid out as a `(pointer, length)` pair.
+        let (ptr, _) = unsafe { self as (*const T, usize) };
+        ptr
+    }
+
+    pub fun as_mut_ptr(&mut self) -> *mut T {
+        // SAFETY: `&mut [T]` is laid out as a `(pointer, length)` pair.
+        let (ptr, _) = unsafe { self as (*mut T, usize) };
+        ptr
+    }
+
+    pub fun iter(&self) -> SliceIter<T> {
+        SliceIter {
+            values: &*self,
+            index: 0usize,
+        }
+    }
+
+    pub fun iter_mut(&mut self) -> SliceIterMut<T> {
+        SliceIterMut {
+            values: &mut *self,
+            index: 0usize,
+        }
+    }
+}
+
+impl<T> Iterator for SliceIter<T> {
+    type Item = &T;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.index < self.values.len() {
+            let index = self.index;
+            self.index += 1usize;
+            self.values.get(index)
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl<T> IntoIterator for &[T] {
+    type Item = &T;
+    type IntoIter = SliceIter<T>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        SliceIter {
+            values: &*self,
+            index: 0usize,
+        }
+    }
+}
+
+impl<T> Iterator for SliceIterMut<T> {
+    type Item = &mut T;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.index < self.values.len() {
+            let index = self.index;
+            self.index += 1usize;
+            self.values.get_mut(index)
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl<T> IntoIterator for &mut [T] {
+    type Item = &mut T;
+    type IntoIter = SliceIterMut<T>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        SliceIterMut {
+            values: self,
+            index: 0usize,
+        }
+    }
+}

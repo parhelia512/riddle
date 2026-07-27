@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use hir::{
     body::{Body, BodyId, ExprId, PatternBindingId, SourceMap, StmtId},
-    item_tree::{FunctionId, HirFunction},
+    item_tree::{ConstId, FunctionId, HirConst, HirFunction},
 };
 use rowan::TextRange;
 
@@ -11,12 +11,17 @@ use crate::{result::LambdaCapture, types::Type};
 pub(crate) struct BodyCtx<'a> {
     pub(crate) body_id: BodyId,
     pub(crate) body: &'a Body,
-    pub(crate) function_id: FunctionId,
-    pub(crate) function: &'a HirFunction,
+    pub(crate) function_id: Option<FunctionId>,
+    pub(crate) function: Option<&'a HirFunction>,
+    pub(crate) const_id: Option<ConstId>,
+    owner_range: TextRange,
     pub(crate) return_ty: Type,
     pub(crate) generic_params: HashMap<String, Type>,
-    pub(crate) locals: HashMap<StmtId, (Type, bool)>,
     pub(crate) bindings: ScopedBindings,
+    /// Bindings declared without an initializer. Their first assignment is
+    /// allowed even when the binding is not `mut`; move checking enforces the
+    /// definite-initialization and reassignment rules afterwards.
+    pub(crate) delayed_bindings: HashSet<PatternBindingId>,
     pub(crate) loop_depth: usize,
     pub(crate) unsafe_depth: usize,
     pub(crate) lambdas: Vec<LambdaCtx>,
@@ -35,17 +40,49 @@ impl<'a> BodyCtx<'a> {
         Self {
             body_id,
             body,
-            function_id,
-            function,
+            function_id: Some(function_id),
+            function: Some(function),
+            const_id: None,
+            owner_range: function.name_range,
             return_ty,
             generic_params,
-            locals: HashMap::new(),
             bindings: ScopedBindings::default(),
+            delayed_bindings: HashSet::new(),
             loop_depth: 0,
             unsafe_depth: 0,
             lambdas: Vec::new(),
             source_map: &body.source_map,
         }
+    }
+
+    pub(crate) fn new_const(
+        body_id: BodyId,
+        body: &'a Body,
+        const_id: ConstId,
+        konst: &'a HirConst,
+        ty: Type,
+        generic_params: HashMap<String, Type>,
+    ) -> Self {
+        Self {
+            body_id,
+            body,
+            function_id: None,
+            function: None,
+            const_id: Some(const_id),
+            owner_range: konst.name_range,
+            return_ty: ty,
+            generic_params,
+            bindings: ScopedBindings::default(),
+            delayed_bindings: HashSet::new(),
+            loop_depth: 0,
+            unsafe_depth: 0,
+            lambdas: Vec::new(),
+            source_map: &body.source_map,
+        }
+    }
+
+    pub(crate) fn owner_range(&self) -> TextRange {
+        self.owner_range
     }
 
     pub(crate) fn push_scope(&mut self) {
@@ -54,6 +91,14 @@ impl<'a> BodyCtx<'a> {
 
     pub(crate) fn pop_scope(&mut self) {
         self.bindings.pop_scope();
+    }
+
+    pub(crate) fn mark_delayed_binding(&mut self, id: PatternBindingId) {
+        self.delayed_bindings.insert(id);
+    }
+
+    pub(crate) fn is_delayed_binding(&self, id: PatternBindingId) -> bool {
+        self.delayed_bindings.contains(&id)
     }
 
     pub(crate) fn expr_range(&self, id: ExprId) -> Option<TextRange> {
@@ -72,15 +117,24 @@ impl<'a> BodyCtx<'a> {
 pub(crate) struct LambdaCtx {
     pub(crate) expr: ExprId,
     pub(crate) params: Vec<Type>,
-    pub(crate) outer_locals: HashSet<StmtId>,
     pub(crate) outer_patterns: HashSet<PatternBindingId>,
     pub(crate) captures: Vec<LambdaCapture>,
 }
 
-/// Scoped name → type bindings (from `match` patterns, `if let`, etc.).
+/// One binding introduced by a pattern — from a `let`, a `match` arm, or a
+/// `for` loop. `is_mut` comes from `mut` on the binding itself.
+#[derive(Debug, Clone)]
+pub(crate) struct BindingInfo {
+    pub(crate) ty: Type,
+    pub(crate) id: PatternBindingId,
+    pub(crate) is_mut: bool,
+}
+
+/// Scoped name → binding info. Every local variable lives here, because `let`
+/// bindings are pattern bindings too.
 #[derive(Debug, Default)]
 pub(crate) struct ScopedBindings {
-    scopes: Vec<HashMap<String, (Type, PatternBindingId)>>,
+    scopes: Vec<HashMap<String, BindingInfo>>,
 }
 
 impl ScopedBindings {
@@ -92,24 +146,38 @@ impl ScopedBindings {
         self.scopes.pop();
     }
 
-    pub(crate) fn insert(&mut self, name: String, ty: Type, id: PatternBindingId) {
+    pub(crate) fn insert(&mut self, name: String, ty: Type, id: PatternBindingId, is_mut: bool) {
         if self.scopes.is_empty() {
             self.push_scope();
         }
-        self.scopes.last_mut().unwrap().insert(name, (ty, id));
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name, BindingInfo { ty, id, is_mut });
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&Type> {
+        self.lookup(name).map(|binding| &binding.ty)
+    }
+
+    pub(crate) fn lookup(&self, name: &str) -> Option<&BindingInfo> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    /// Whether `id` names a binding that was declared `mut`.
+    pub(crate) fn is_mut(&self, id: PatternBindingId) -> bool {
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).map(|(ty, _)| ty))
+            .flat_map(|scope| scope.values())
+            .find(|binding| binding.id == id)
+            .is_some_and(|binding| binding.is_mut)
     }
 
     pub(crate) fn ids(&self) -> HashSet<PatternBindingId> {
         self.scopes
             .iter()
-            .flat_map(|scope| scope.values().map(|(_, id)| *id))
+            .flat_map(|scope| scope.values().map(|binding| binding.id))
             .collect()
     }
 }

@@ -693,6 +693,54 @@ fn monomorphized_generic_parameter_runs_drop() {
 }
 
 #[test]
+fn monomorphized_generic_assignment_and_local_run_drop() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+        impl Drop for Guard { fun drop(&mut self) {} }
+
+        fun replace<T>(slot: &mut T, value: T, local: T) {
+            *slot = value;
+            let owned = local;
+        }
+
+        fun main() {
+            let mut guard = Guard {};
+            replace(&mut guard, Guard {}, Guard {});
+        }
+        "#,
+    );
+
+    let replace = module
+        .functions
+        .values()
+        .find(|function| function.name.starts_with("replace__"))
+        .expect("missing monomorphized replace");
+    let drop_calls = replace
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter(|inst| {
+            matches!(
+                &inst.kind,
+                mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                    if name == "drop__Guard"
+            )
+        })
+        .count();
+
+    assert!(
+        drop_calls >= 2,
+        "generic assignment and local must use the monomorphized type: {replace:#?}"
+    );
+}
+
+#[test]
 fn monomorphization_preserves_callers_drop_scope() {
     let module = lower(
         r#"
@@ -2317,17 +2365,32 @@ fn local_var_used_as_init() {
 }
 
 #[test]
-fn let_without_init_binds_unit() {
+fn delayed_let_allocates_storage_and_assignment_stores_value() {
     let module = lower(
         r#"
-        fun f() {
+        fun f() -> i32 {
             let x: i32;
+            x = 7;
+            return x;
         }
         "#,
     );
     let func = &module.functions[module.function_order[0]];
-    // Should not panic — let without init maps to unit_const
     assert_eq!(func.name, "f");
+    assert!(
+        func.blocks.iter().any(|(_, block)| block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::Alloca(_)))),
+        "delayed bindings need storage"
+    );
+    assert!(
+        func.blocks.iter().any(|(_, block)| block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::Store(_, _)))),
+        "the first assignment must initialize the storage"
+    );
 }
 
 #[test]
@@ -2374,6 +2437,108 @@ fn escaping_local_produces_heap_alloc_instruction() {
         has_heap_alloc,
         "escaping local should produce HeapAlloc, got: {:?}",
         entry.insts.iter().map(|i| &i.kind).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn escaping_destructured_binding_moves_the_whole_slot_to_the_heap() {
+    let module = lower(
+        r#"
+        struct Data { value: i32 }
+
+        fun escape() -> &Data {
+            let (first, second) = (Data { value: 1 }, Data { value: 2 });
+            return &first;
+        }
+        "#,
+    );
+    let func = &module.functions[module.function_order[0]];
+    let entry = &func.blocks[func.entry];
+    let has_heap_alloc = entry
+        .insts
+        .iter()
+        .any(|i| matches!(i.kind, mir::instr::InstKind::HeapAlloc(_)));
+    assert!(
+        has_heap_alloc,
+        "a reference to a destructured binding must keep its slot alive, got: {:?}",
+        entry.insts
+    );
+}
+
+#[test]
+fn tuple_destructuring_only_promotes_the_escaping_reference_source() {
+    let module = lower(
+        r#"
+        fun escape_second() -> &mut i32 {
+            let mut first = 1;
+            let mut second = 2;
+            let (first_ref, second_ref) = (&mut first, &mut second);
+            return second_ref;
+        }
+        "#,
+    );
+    let func = &module.functions[module.function_order[0]];
+    let heap_allocs = func
+        .blocks
+        .values()
+        .flat_map(|block| &block.insts)
+        .filter(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+        .count();
+    assert_eq!(heap_allocs, 1, "only `second` should escape: {:#?}", func);
+}
+
+#[test]
+fn returned_tuple_destructuring_only_promotes_the_escaping_reference_source() {
+    let module = lower(
+        r#"
+        fun pair(first: &mut i32, second: &mut i32) -> (&mut i32, &mut i32) {
+            (first, second)
+        }
+
+        fun escape_second() -> &mut i32 {
+            let mut first = 1;
+            let mut second = 2;
+            let (first_ref, second_ref) = pair(&mut first, &mut second);
+            return second_ref;
+        }
+        "#,
+    );
+    let func = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "escape_second")
+        .unwrap();
+    let heap_allocs = func
+        .blocks
+        .values()
+        .flat_map(|block| &block.insts)
+        .filter(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+        .count();
+    assert_eq!(heap_allocs, 1, "only `second` should escape: {:#?}", func);
+}
+
+#[test]
+fn non_escaping_destructured_bindings_stay_on_the_stack() {
+    let module = lower(
+        r#"
+        struct Data { value: i32 }
+
+        fun keep() -> i32 {
+            let (first, second) = (Data { value: 1 }, Data { value: 2 });
+            first.value + second.value
+        }
+        "#,
+    );
+    let func = &module.functions[module.function_order[0]];
+    let entry = &func.blocks[func.entry];
+    let has_heap_alloc = entry
+        .insts
+        .iter()
+        .any(|i| matches!(i.kind, mir::instr::InstKind::HeapAlloc(_)));
+    assert!(
+        !has_heap_alloc,
+        "destructuring alone must not force a heap allocation"
     );
 }
 
@@ -2662,7 +2827,9 @@ fn all_reference_forms_promote_their_source_local() {
             read(&local)
         }
 
-        extern "C" fun store(value: &Data);
+        unsafe extern "C" {
+            fun store(value: &Data);
+        }
 
         fun escaping_call() {
             let local = Data { value: 1 };
@@ -2777,7 +2944,8 @@ fn all_reference_forms_promote_their_source_local() {
         .iter()
         .flat_map(|(_, block)| &block.insts)
         .find_map(|inst| match inst.kind {
-            mir::instr::InstKind::IndexPtr(base, _) => Some(base),
+            mir::instr::InstKind::IndexPtr(base, _)
+            | mir::instr::InstKind::CheckedIndexPtr(base, _, _) => Some(base),
             _ => None,
         })
         .unwrap();

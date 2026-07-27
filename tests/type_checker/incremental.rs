@@ -35,6 +35,32 @@ fn incremental_reports_unsized_declarations() {
 }
 
 #[test]
+fn incremental_rechecks_const_initializers_when_functions_are_reused() {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(
+        r#"
+        const BAD: i32 = true;
+
+        fun stable() -> i32 { 1 }
+        "#,
+    );
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let mut checker = IncrementalTypeChecker::new();
+    let hir = lower_and_resolve(parse);
+    let first = checker.check_with_syntax(&hir, &parser.current_parse().unwrap().syntax());
+    assert_eq!(diagnostics_with_code(&first.result, "E0001").len(), 1);
+
+    let offset = parser.source().find("1 }").unwrap();
+    parser.apply_edit(offset, 1, "2");
+    let parse = parser.current_parse().unwrap();
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+    let hir = lower_and_resolve(parse);
+    let second = checker.check_with_syntax(&hir, &parser.current_parse().unwrap().syntax());
+    assert_eq!(diagnostics_with_code(&second.result, "E0001").len(), 1);
+}
+
+#[test]
 fn incremental_public_check_invalidates_moved_spans() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source("fun bad(value: str) {}");

@@ -37,8 +37,14 @@ static size_t rgc_live_bytes = 0;
 static size_t rgc_next_collect = RGC_MIN_HEAP;
 static void *rgc_stack_bottom = NULL;
 
+static void rgc_panic(void) {
+    exit(EXIT_FAILURE);
+}
+
 void rgc_init(void *stack_bottom);
 void *rgc_alloc(size_t size);
+void *rgc_realloc(void *ptr, size_t size);
+void rgc_free(void *ptr);
 RGC_NOINLINE void rgc_collect(void);
 
 static void *rgc_payload(RgcHeader *object) {
@@ -92,11 +98,11 @@ static void rgc_mark_push(RgcMarkStack *stack, const void *ptr) {
     if (stack->len == stack->cap) {
         size_t next_cap = stack->cap ? stack->cap * 2u : 64u;
         if (next_cap < stack->cap || next_cap > SIZE_MAX / sizeof(RgcHeader *)) {
-            abort();
+            rgc_panic();
         }
         RgcHeader **next = (RgcHeader **)realloc(stack->items, next_cap * sizeof(RgcHeader *));
         if (!next) {
-            abort();
+            rgc_panic();
         }
         stack->items = next;
         stack->cap = next_cap;
@@ -188,7 +194,7 @@ void *rgc_alloc(size_t size) {
         size = 1u;
     }
     if (size > SIZE_MAX - sizeof(RgcHeader)) {
-        abort();
+        rgc_panic();
     }
 
     if (rgc_stack_bottom
@@ -201,7 +207,7 @@ void *rgc_alloc(size_t size) {
         rgc_collect();
         object = (RgcHeader *)malloc(sizeof(RgcHeader) + size);
         if (!object) {
-            abort();
+            rgc_panic();
         }
     }
 
@@ -212,4 +218,36 @@ void *rgc_alloc(size_t size) {
     rgc_live_bytes += size;
 
     return rgc_payload(object);
+}
+
+void rgc_free(void *ptr) {
+    if (!ptr) {
+        return;
+    }
+
+    for (RgcHeader **link = &rgc_objects; *link; link = &(*link)->next) {
+        RgcHeader *object = *link;
+        if (rgc_payload(object) == ptr) {
+            *link = object->next;
+            rgc_live_bytes -= object->size;
+            free(object);
+            return;
+        }
+    }
+    // ponytail: pointers not owned by the GC are ignored; unlink walks the
+    // object list, switch to a doubly linked list if frees ever dominate.
+}
+
+void *rgc_realloc(void *ptr, size_t size) {
+    // rgc_alloc may trigger a collection; ptr stays reachable through this
+    // frame (conservative stack scan) and stays linked until rgc_free below.
+    void *next = rgc_alloc(size);
+
+    if (ptr) {
+        RgcHeader *object = (RgcHeader *)ptr - 1;
+        memcpy(next, ptr, object->size < size ? object->size : size);
+        rgc_free(ptr);
+    }
+
+    return next;
 }

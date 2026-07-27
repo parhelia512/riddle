@@ -15,6 +15,7 @@ pub enum Type {
     Ref(Box<Type>, bool), // (inner, mutable)
     Ptr(Box<Type>),
     Tuple(Vec<Type>),
+    Slice(Box<Type>),
     Array(Box<Type>, usize),
     Struct(StructType),
     Enum(EnumType),
@@ -103,10 +104,9 @@ impl Type {
     }
 
     /// Returns `true` if this type has a known size at compile time.
-    /// Unsized types (like `str`) can only exist behind a pointer/reference.
+    /// Unsized types (`str` and `[T]`) can only exist behind a pointer/reference.
     pub fn is_sized(&self) -> bool {
-        !matches!(self, Type::Str)
-        // ponytail: only str is unsized for now; [T] slices would also be unsized
+        !matches!(self, Type::Str | Type::Slice(_))
     }
 
     /// Rough size estimate in bytes (used for alloca sizing).
@@ -134,7 +134,9 @@ impl Type {
                 }
             }
             Type::FnPtr(_) => 2 * std::mem::size_of::<usize>(),
-            Type::Str => unreachable!("cannot compute the size of unsized `str`"),
+            Type::Str | Type::Slice(_) => {
+                unreachable!("cannot compute the size of an unsized type")
+            }
             Type::Unit => 0,
             Type::Never => 0,
             _ => 8, // 聚合类型：降级为指针大小

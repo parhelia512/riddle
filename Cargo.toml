@@ -83,3 +83,7 @@ type-checker = { path = "crates/type-checker" }
 [[test]]
 name = "riddle_lsp"
 path = "tests/riddle_lsp/unit.rs"
+
+[[test]]
+name = "mir"
+path = "tests/mir/main.rs"

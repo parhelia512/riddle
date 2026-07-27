@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use hir::{
     Name,
     body::{
-        BinaryOp, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern, PatternBindingId,
+        BinaryOp, Body, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern, PatternBindingId,
         ResolvedName, Stmt, StmtId, UnaryOp,
     },
     item_tree::{
@@ -38,7 +38,7 @@ impl TypeChecker<'_> {
 
         let strukt = &self.hir.item_tree.structs[struct_id];
         if self.hir.package_for_range(strukt.name_range)
-            != self.hir.package_for_range(ctx.function.name_range)
+            != self.hir.package_for_range(ctx.owner_range())
         {
             return false;
         }
@@ -54,7 +54,9 @@ impl TypeChecker<'_> {
         let Some(current) = containing_module(
             &self.hir.item_tree,
             &self.hir.item_tree.top_level,
-            &|item| item_contains_function(&self.hir.item_tree, item, ctx.function_id),
+            &|item| {
+                item_contains_body_owner(&self.hir.item_tree, item, ctx.function_id, ctx.const_id)
+            },
         )
         .flatten() else {
             return false;
@@ -124,14 +126,19 @@ impl TypeChecker<'_> {
     pub(crate) fn check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
         match &ctx.body.stmts[stmt_id] {
             Stmt::Let {
+                pat,
                 ty,
                 ty_range,
                 init,
-                is_mut,
-                ..
             } => {
-                let declared =
-                    self.lower_type_ref_with_params_at(ty, &ctx.generic_params, *ty_range);
+                let pat = *pat;
+                let declared = if init.is_none() && matches!(ty, HirTypeRef::Unknown) {
+                    // A delayed binding can infer its type from a later
+                    // assignment, just like Rust's `let value; value = ...`.
+                    self.fresh_infer()
+                } else {
+                    self.lower_type_ref_with_params_at(ty, &ctx.generic_params, *ty_range)
+                };
                 let explicit_error = type_ref_contains_error(ty)
                     || type_contains_unresolved_const_param(&declared, &ctx.generic_params);
                 if explicit_error {
@@ -165,9 +172,20 @@ impl TypeChecker<'_> {
                     if inferred {
                         self.expect_sized_value(&local_ty, ctx.stmt_range(stmt_id));
                     }
-                    ctx.locals.insert(stmt_id, (local_ty, *is_mut));
+                    self.bind_let_pattern(ctx, pat, &local_ty, stmt_id);
                 } else {
-                    ctx.locals.insert(stmt_id, (declared, *is_mut));
+                    let delayed_bindings = self.mark_delayed_pattern(ctx, pat);
+                    if matches!(ty, HirTypeRef::Unknown) {
+                        for binding in delayed_bindings {
+                            self.pending_delayed_bindings.push((
+                                ctx.body_id,
+                                binding,
+                                ctx.pat_range(binding.pattern)
+                                    .or_else(|| ctx.stmt_range(stmt_id)),
+                            ));
+                        }
+                    }
+                    self.bind_let_pattern(ctx, pat, &declared, stmt_id);
                 }
             }
             Stmt::Expr { expr } => {
@@ -214,7 +232,13 @@ impl TypeChecker<'_> {
         expected: &Type,
     ) -> Type {
         let ty = self.check_expr_inner(ctx, expr_id, Some(expected));
-        self.finish_value_expr(ctx, expr_id, ty)
+        let ty = self.finish_value_expr(ctx, expr_id, ty);
+        if self.is_slice_coercion(expected, &ty) {
+            self.result
+                .expr_coercions
+                .insert((ctx.body_id, expr_id), expected.clone());
+        }
+        ty
     }
 
     fn check_place_expr(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) -> Type {
@@ -430,8 +454,13 @@ impl TypeChecker<'_> {
                         ctx.expr_range(*index),
                     );
                 }
-                // Extract element type from array / pointer base.
-                match &base_ty {
+                // Extract element type from arrays / references / pointers.
+                let index_base = match &base_ty {
+                    Type::Ref(inner, _) => inner.as_ref(),
+                    _ => &base_ty,
+                };
+                match index_base {
+                    Type::Slice(inner) => *inner.clone(),
                     Type::Array(inner, _) => *inner.clone(),
                     Type::Ptr { inner, .. } => {
                         self.require_unsafe(ctx, "indexing a raw pointer", span);
@@ -444,6 +473,9 @@ impl TypeChecker<'_> {
                 let source_ty = self.check_expr(ctx, *base);
                 let target_ty =
                     self.lower_type_ref_with_params_at(target, &ctx.generic_params, span);
+                if is_unsafe_dst_layout_cast(&source_ty, &target_ty) {
+                    self.require_unsafe(ctx, "performing a DST layout cast", span);
+                }
                 if !source_ty.is_unknown_like()
                     && !matches!(target_ty, Type::Error)
                     && !is_supported_cast(&source_ty, &target_ty)
@@ -626,7 +658,6 @@ impl TypeChecker<'_> {
         ctx.lambdas.push(LambdaCtx {
             expr: expr_id,
             params: param_types.clone(),
-            outer_locals: ctx.locals.keys().copied().collect(),
             outer_patterns: ctx.bindings.ids(),
             captures: Vec::new(),
         });
@@ -697,9 +728,6 @@ impl TypeChecker<'_> {
     ) -> Option<CaptureSource> {
         let lambda = ctx.lambdas.last()?;
         match resolved? {
-            ResolvedName::Local(stmt) if lambda.outer_locals.contains(stmt) => {
-                Some(CaptureSource::Local(*stmt))
-            }
             ResolvedName::PatternBinding(id) if lambda.outer_patterns.contains(id) => {
                 Some(CaptureSource::Pattern(*id))
             }
@@ -888,11 +916,9 @@ impl TypeChecker<'_> {
                     .cloned();
                 if let (Some(nested), Some(outer)) = (nested, ctx.lambdas.last()) {
                     let outer_expr = outer.expr;
-                    let outer_locals = outer.outer_locals.clone();
                     let outer_patterns = outer.outer_patterns.clone();
                     for capture in nested.captures {
                         let comes_from_outside = match &capture.source {
-                            CaptureSource::Local(stmt) => outer_locals.contains(stmt),
                             CaptureSource::Pattern(id) => outer_patterns.contains(id),
                             CaptureSource::Param(_) => true,
                             CaptureSource::LambdaParam { lambda, .. } => *lambda != outer_expr,
@@ -924,23 +950,15 @@ impl TypeChecker<'_> {
     }
 
     fn check_mutable_closure_binding(&mut self, ctx: &BodyCtx<'_>, callee: ExprId) {
-        let Expr::Path { path, resolved } = &ctx.body.exprs[callee] else {
+        let Expr::Path { resolved, .. } = &ctx.body.exprs[callee] else {
             return;
         };
         let (immutable, binding_range) = match resolved {
-            Some(ResolvedName::Local(stmt)) => (
-                ctx.locals.get(stmt).is_some_and(|(_, mutable)| !mutable),
-                match &ctx.body.stmts[*stmt] {
-                    Stmt::Let { name_range, .. } => *name_range,
-                    _ => None,
-                },
-            ),
+            Some(ResolvedName::PatternBinding(id)) => {
+                (!ctx.bindings.is_mut(*id), ctx.pat_range(id.pattern))
+            }
             Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => (true, None),
-            _ => (
-                path.as_single_name()
-                    .is_some_and(|name| ctx.bindings.get(&name.0).is_some()),
-                None,
-            ),
+            _ => (false, None),
         };
         if immutable {
             let call_range = ctx.expr_range(callee);
@@ -1465,6 +1483,10 @@ impl TypeChecker<'_> {
             ty
         } else {
             match (op, expected) {
+                (UnaryOp::Ref, Some(Type::Ref(inner, false)))
+                | (UnaryOp::MutRef, Some(Type::Ref(inner, true))) => {
+                    self.check_expr_inner(ctx, operand, Some(inner))
+                }
                 (UnaryOp::Ref | UnaryOp::MutRef, _) => self.check_place_expr(ctx, operand),
                 (UnaryOp::Neg | UnaryOp::Pos, Some(expected)) if expected.is_numeric() => {
                     self.check_expr_expected(ctx, operand, expected)
@@ -1807,6 +1829,7 @@ impl TypeChecker<'_> {
         for arm in arms {
             ctx.push_scope();
             self.bind_pattern(ctx, arm.pat, &scrutinee_ty);
+            self.report_duplicate_pattern_bindings(ctx, arm.pat);
             if let Some(guard) = arm.guard {
                 let guard_ty = self.check_expr(ctx, guard);
                 self.expect_assignable(
@@ -2095,6 +2118,7 @@ impl TypeChecker<'_> {
     ) -> Type {
         let (expected_element, expected_len) = match expected {
             Some(Type::Array(inner, len)) => (Some(inner.as_ref()), len.as_usize()),
+            Some(Type::Slice(inner)) => (Some(inner.as_ref()), None),
             _ => (None, None),
         };
         let mut element_ty = None;
@@ -2229,8 +2253,8 @@ impl TypeChecker<'_> {
         expected: Option<&Type>,
         span: Option<rowan::TextRange>,
     ) -> Type {
-        if let Expr::FieldAccess { base, field } = &ctx.body.exprs[callee] {
-            return self.check_method_call(ctx, callee, *base, field.clone(), args, span);
+        if matches!(&ctx.body.exprs[callee], Expr::FieldAccess { .. }) {
+            return self.check_method_call(ctx, callee, args, type_args, span);
         }
 
         if let Expr::Path {
@@ -2425,14 +2449,16 @@ impl TypeChecker<'_> {
             for arg in &args {
                 self.expect_sized_value(arg, span);
             }
-            self.generic_edges.push(GenericEdge {
-                caller: ctx.function_id,
-                callee: fid,
-                grows: args
-                    .iter()
-                    .any(|arg| grows_generic_arg(arg, &ctx.generic_params)),
-                span,
-            });
+            if let Some(caller) = ctx.function_id {
+                self.generic_edges.push(GenericEdge {
+                    caller,
+                    callee: fid,
+                    grows: args
+                        .iter()
+                        .any(|arg| grows_generic_arg(arg, &ctx.generic_params)),
+                    span,
+                });
+            }
             self.result
                 .generic_calls
                 .insert((ctx.body_id, callee), crate::result::GenericCall { args });
@@ -2640,6 +2666,10 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) {
         match ty {
+            Type::Slice(inner) => {
+                self.expect_sized_value(inner, span);
+                self.check_type_bounds_inner(ctx, inner, span);
+            }
             Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
                 self.check_type_bounds_inner(ctx, inner, span)
             }
@@ -2764,12 +2794,17 @@ impl TypeChecker<'_> {
             .impls
             .iter()
             .find_map(|(_, imp)| {
-                imp.methods
-                    .contains(&ctx.function_id)
-                    .then(|| imp.generic_bounds.clone())
+                (ctx.function_id
+                    .is_some_and(|function| imp.methods.contains(&function))
+                    || ctx
+                        .const_id
+                        .is_some_and(|konst| imp.consts.contains(&konst)))
+                .then(|| imp.generic_bounds.clone())
             })
             .unwrap_or_default();
-        bounds.extend(ctx.function.generic_bounds.clone());
+        if let Some(function) = ctx.function {
+            bounds.extend(function.generic_bounds.clone());
+        }
         bounds
     }
 
@@ -3084,11 +3119,15 @@ impl TypeChecker<'_> {
         &mut self,
         ctx: &mut BodyCtx<'_>,
         callee: ExprId,
-        base: ExprId,
-        method_name: Name,
         args: &[ExprId],
+        type_args: &[HirTypeRef],
         span: Option<rowan::TextRange>,
     ) -> Type {
+        let Expr::FieldAccess { base, field } = &ctx.body.exprs[callee] else {
+            unreachable!("method call callee must be a field access");
+        };
+        let base = *base;
+        let method_name = field.clone();
         let base_ty = self.check_place_expr(ctx, base);
         let Some(method) = self.find_method(ctx, &base_ty, &method_name) else {
             for arg in args {
@@ -3110,6 +3149,38 @@ impl TypeChecker<'_> {
 
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
+        }
+
+        let impl_generics = self.impl_generic_names(method.fid);
+        let impl_const_generics = self.impl_const_generic_names(method.fid);
+        let mut subst = generic_param_map_with_consts(
+            method.function.generics.iter().map(|name| name.0.as_str()),
+            method
+                .function
+                .const_generics
+                .iter()
+                .map(|name| name.0.as_str()),
+        );
+        subst.extend(method.subst.clone());
+
+        if !type_args.is_empty() {
+            if type_args.len() != method.function.generics.len() {
+                self.diagnostic(
+                    "E0005",
+                    format!(
+                        "method `{}` expects {} type argument(s), got {}",
+                        method.function.name.0,
+                        method.function.generics.len(),
+                        type_args.len()
+                    ),
+                    span,
+                );
+            }
+            for (param_name, type_arg) in method.function.generics.iter().zip(type_args) {
+                let lowered =
+                    self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
+                subst.insert(param_name.0.clone(), lowered);
+            }
         }
 
         if method.trait_id.is_some_and(|trait_id| {
@@ -3151,13 +3222,13 @@ impl TypeChecker<'_> {
         }
 
         if let Some(receiver) = method.function.params.first() {
-            let expected = self.lower_type_ref_with_params_at(
-                &receiver.ty,
-                &method.subst,
-                Some(receiver.ty_range),
-            );
+            let expected =
+                self.lower_type_ref_with_params_at(&receiver.ty, &subst, Some(receiver.ty_range));
             let actual = self.receiver_argument_type(&base_ty, &expected);
-            if matches!(expected, Type::Ref(_, true)) {
+            // A `&mut self` receiver only constrains the *place* when the
+            // compiler has to auto-ref it; an already-mutable reference is
+            // reborrowed, so `target.push(..)` is fine for `target: &mut T`.
+            if matches!(expected, Type::Ref(_, true)) && !matches!(base_ty, Type::Ref(_, true)) {
                 self.check_assign_mut(ctx, base, ctx.expr_range(base));
             } else if !matches!(expected, Type::Ref(_, false))
                 && !self.result.trait_env.type_is_copy(&base_ty)
@@ -3169,16 +3240,69 @@ impl TypeChecker<'_> {
 
         for (index, arg) in args.iter().enumerate() {
             if let Some(param) = method.function.params.get(index + receiver_count) {
-                let expected = self.lower_type_ref_with_params_at(
-                    &param.ty,
-                    &method.subst,
-                    Some(param.ty_range),
-                );
-                let actual = self.check_expr_expected(ctx, *arg, &expected);
+                let pattern =
+                    self.lower_type_ref_with_params_at(&param.ty, &subst, Some(param.ty_range));
+                let expected = substitute_type(&pattern, &subst);
+                let actual = if expected_has_param(&expected) {
+                    self.check_expr(ctx, *arg)
+                } else {
+                    self.check_expr_expected(ctx, *arg, &expected)
+                };
+                collect_subst(&pattern, &actual, &mut subst);
+                let expected = substitute_type(&pattern, &subst);
                 self.expect_assignable(&expected, &actual, "method argument", ctx.expr_range(*arg));
             } else {
                 self.check_expr(ctx, *arg);
             }
+        }
+
+        if !impl_generics.is_empty()
+            || !impl_const_generics.is_empty()
+            || !method.function.generics.is_empty()
+            || !method.function.const_generics.is_empty()
+        {
+            let unresolved = impl_generics
+                .iter()
+                .map(String::as_str)
+                .chain(method.function.generics.iter().map(|name| name.0.as_str()))
+                .chain(impl_const_generics.iter().map(String::as_str))
+                .chain(
+                    method
+                        .function
+                        .const_generics
+                        .iter()
+                        .map(|name| name.0.as_str()),
+                )
+                .any(|name| subst.get(name).is_none_or(generic_arg_unknown));
+            if unresolved {
+                self.diagnostic(
+                    "E0005",
+                    format!(
+                        "cannot infer type argument(s) for method `{}`",
+                        method.function.name.0
+                    ),
+                    span,
+                );
+            }
+            self.check_generic_bounds(ctx, &method.function, &subst, span);
+            let generic_args = impl_generics
+                .iter()
+                .map(String::as_str)
+                .chain(method.function.generics.iter().map(|name| name.0.as_str()))
+                .chain(impl_const_generics.iter().map(String::as_str))
+                .chain(
+                    method
+                        .function
+                        .const_generics
+                        .iter()
+                        .map(|name| name.0.as_str()),
+                )
+                .map(|name| subst.get(name).cloned().unwrap_or(Type::Unknown))
+                .collect();
+            self.result.generic_calls.insert(
+                (ctx.body_id, callee),
+                crate::result::GenericCall { args: generic_args },
+            );
         }
 
         method
@@ -3188,7 +3312,7 @@ impl TypeChecker<'_> {
             .map(|ty| {
                 self.lower_type_ref_with_params_at(
                     ty,
-                    &method.subst,
+                    &subst,
                     method
                         .function
                         .ret_type_range
@@ -3424,7 +3548,7 @@ impl TypeChecker<'_> {
             };
             subst.extend(supertrait_subst);
             return Some(ResolvedMethod {
-                fid: ctx.function_id,
+                fid: ctx.function_id?,
                 function,
                 subst,
                 trait_id: Some(method_trait_id),
@@ -3494,8 +3618,11 @@ impl TypeChecker<'_> {
     }
 
     fn receiver_argument_type(&self, base_ty: &Type, expected: &Type) -> Type {
-        match expected {
-            Type::Ref(inner, mutable) if inner.as_ref() == base_ty => {
+        match (base_ty, expected) {
+            (Type::Ref(actual, true), Type::Ref(expected, false)) if actual == expected => {
+                Type::Ref(actual.clone(), false)
+            }
+            (base_ty, Type::Ref(inner, mutable)) if inner.as_ref() == base_ty => {
                 Type::Ref(Box::new(base_ty.clone()), *mutable)
             }
             _ => base_ty.clone(),
@@ -3578,30 +3705,13 @@ impl TypeChecker<'_> {
             return;
         }
         self.record_capture_use(ctx, lhs, CaptureMode::Mutable);
-        if let Expr::Path { path, .. } = &ctx.body.exprs[lhs]
-            && let Some(name) = path.as_single_name()
-            && ctx.bindings.get(&name.0).is_some()
+        if let Some((id, name)) = self.root_binding_of_expr(ctx, lhs)
+            && !ctx.bindings.is_mut(id)
+            && !ctx.is_delayed_binding(id)
         {
             self.diagnostic(
                 "E0031",
-                format!(
-                    "cannot assign to `{}`, as it is not declared as mutable",
-                    name.0
-                ),
-                span,
-            );
-            return;
-        }
-        if let Some(stmt_id) = self.root_local_of_expr(ctx, lhs)
-            && let Some((_, false)) = ctx.locals.get(&stmt_id)
-        {
-            let name = self.local_name(ctx, stmt_id);
-            self.diagnostic(
-                "E0031",
-                format!(
-                    "cannot assign to `{}`, as it is not declared as mutable",
-                    name
-                ),
+                format!("cannot assign to `{name}`, as it is not declared as mutable"),
                 span,
             );
             return;
@@ -3618,23 +3728,24 @@ impl TypeChecker<'_> {
     }
 
     /// Walk the expression to find the root local StmtId (ignoring dereferences).
-    fn root_local_of_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<StmtId> {
+    fn root_binding_of_expr(
+        &self,
+        ctx: &BodyCtx<'_>,
+        expr_id: ExprId,
+    ) -> Option<(PatternBindingId, String)> {
         match &ctx.body.exprs[expr_id] {
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
-                ..
-            } => Some(*stmt),
-            Expr::FieldAccess { base, .. } => self.root_local_of_expr(ctx, *base),
-            Expr::IndexAccess { base, .. } => self.root_local_of_expr(ctx, *base),
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                path,
+            } => Some((
+                *id,
+                path.as_single_name()
+                    .map(|name| name.0.clone())
+                    .unwrap_or_default(),
+            )),
+            Expr::FieldAccess { base, .. } => self.root_binding_of_expr(ctx, *base),
+            Expr::IndexAccess { base, .. } => self.root_binding_of_expr(ctx, *base),
             _ => None,
-        }
-    }
-
-    /// Get the name of a local binding for error messages.
-    fn local_name(&self, ctx: &BodyCtx<'_>, stmt_id: StmtId) -> String {
-        match &ctx.body.stmts[stmt_id] {
-            Stmt::Let { name, .. } => name.0.clone(),
-            _ => String::from("_"),
         }
     }
 
@@ -3668,7 +3779,7 @@ impl TypeChecker<'_> {
             Pattern::Path { path } => {
                 self.validate_unit_variant_pattern(expected, &path, span);
             }
-            Pattern::Binding { name } => {
+            Pattern::Binding { name, is_mut } => {
                 if let Some(is_unit) = self.enum_variant_is_unit(expected, &name.0) {
                     if !is_unit {
                         self.diagnostic(
@@ -3686,6 +3797,7 @@ impl TypeChecker<'_> {
                             pattern: pat,
                             field: None,
                         },
+                        is_mut,
                     );
                 }
             }
@@ -3937,6 +4049,7 @@ impl TypeChecker<'_> {
                             pattern: binding_pat,
                             field: Some(field_index),
                         },
+                        false,
                     );
                 }
             }
@@ -4013,6 +4126,7 @@ impl TypeChecker<'_> {
                         pattern: binding_pat,
                         field: Some(field_index),
                     },
+                    false,
                 );
             }
         }
@@ -4024,11 +4138,131 @@ impl TypeChecker<'_> {
         name: String,
         ty: Type,
         id: PatternBindingId,
+        is_mut: bool,
     ) {
         self.result
             .pattern_binding_types
             .insert((ctx.body_id, id), ty.clone());
-        ctx.bindings.insert(name, ty, id);
+        ctx.bindings.insert(name, ty, id, is_mut);
+    }
+
+    fn report_duplicate_pattern_bindings(&mut self, ctx: &BodyCtx<'_>, pat: PatId) {
+        fn collect(body: &Body, pat: PatId, bindings: &mut Vec<(PatternBindingId, String)>) {
+            match &body.pats[pat] {
+                Pattern::Binding { name, .. } => bindings.push((
+                    PatternBindingId {
+                        pattern: pat,
+                        field: None,
+                    },
+                    name.0.clone(),
+                )),
+                Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
+                    for element in elements {
+                        collect(body, *element, bindings);
+                    }
+                }
+                Pattern::Struct { fields, .. } => {
+                    for (index, field) in fields.iter().enumerate() {
+                        if let Some(field_pat) = field.pat {
+                            collect(body, field_pat, bindings);
+                        } else {
+                            bindings.push((
+                                PatternBindingId {
+                                    pattern: pat,
+                                    field: Some(index),
+                                },
+                                field.name.0.clone(),
+                            ));
+                        }
+                    }
+                }
+                Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            }
+        }
+
+        let mut bindings = Vec::new();
+        collect(ctx.body, pat, &mut bindings);
+        let mut seen = HashSet::new();
+        for (id, name) in bindings {
+            if !self
+                .result
+                .pattern_binding_types
+                .contains_key(&(ctx.body_id, id))
+            {
+                continue;
+            }
+            if !seen.insert(name.clone()) {
+                self.diagnostic(
+                    "E0058",
+                    format!("identifier `{name}` is bound more than once in the same pattern"),
+                    ctx.pat_range(id.pattern),
+                );
+            }
+        }
+    }
+
+    /// Binds a `let` pattern. Unlike a match arm, a `let` must be irrefutable:
+    /// there is no alternative branch to take when the pattern does not match,
+    /// so a binding would otherwise read uninitialized storage.
+    fn bind_let_pattern(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        pat: PatId,
+        expected: &Type,
+        stmt_id: StmtId,
+    ) {
+        let before = self.result.diagnostics.len();
+        self.bind_pattern(ctx, pat, expected);
+        self.report_duplicate_pattern_bindings(ctx, pat);
+        // A pattern whose shape already mismatched the type reports a nonsense
+        // witness — `let (a, b, c) = (1, 2)` is a wrong arity, not a refutable
+        // pattern — so only well-formed patterns reach the coverage check.
+        if self.result.diagnostics.len() == before
+            && !expected.is_unknown_like()
+            && let Some((witness, _)) = self.missing_let_pattern(ctx, pat, expected)
+        {
+            self.diagnostic(
+                "E0057",
+                format!("refutable pattern in `let` binding: `{witness}` is not covered"),
+                ctx.pat_range(pat).or_else(|| ctx.stmt_range(stmt_id)),
+            );
+        }
+    }
+
+    fn mark_delayed_pattern(&self, ctx: &mut BodyCtx<'_>, pat: PatId) -> Vec<PatternBindingId> {
+        fn collect(body: &Body, pat: PatId, ids: &mut Vec<PatternBindingId>) {
+            match &body.pats[pat] {
+                Pattern::Binding { .. } => ids.push(PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                }),
+                Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
+                    for element in elements {
+                        collect(body, *element, ids);
+                    }
+                }
+                Pattern::Struct { fields, .. } => {
+                    for (index, field) in fields.iter().enumerate() {
+                        if let Some(field_pat) = field.pat {
+                            collect(body, field_pat, ids);
+                        } else {
+                            ids.push(PatternBindingId {
+                                pattern: pat,
+                                field: Some(index),
+                            });
+                        }
+                    }
+                }
+                Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            }
+        }
+
+        let mut ids = Vec::new();
+        collect(ctx.body, pat, &mut ids);
+        for id in &ids {
+            ctx.mark_delayed_binding(*id);
+        }
+        ids
     }
 
     fn type_of_resolved_name(
@@ -4037,15 +4271,15 @@ impl TypeChecker<'_> {
         resolved: Option<&ResolvedName>,
     ) -> Type {
         match resolved {
-            Some(ResolvedName::Local(stmt)) => ctx
-                .locals
-                .get(stmt)
-                .map(|(ty, _)| ty.clone())
+            Some(ResolvedName::PatternBinding(id)) => self
+                .result
+                .pattern_binding_types
+                .get(&(ctx.body_id, *id))
+                .cloned()
                 .unwrap_or(Type::Unknown),
             Some(ResolvedName::Param(index)) => ctx
                 .function
-                .params
-                .get(*index)
+                .and_then(|function| function.params.get(*index))
                 .map(|param| {
                     self.lower_type_ref_with_params_at(
                         &param.ty,
@@ -4070,7 +4304,6 @@ impl TypeChecker<'_> {
             }
             Some(ResolvedName::TypeAlias(tid)) => self.lower_type_alias(*tid),
             Some(ResolvedName::Unresolved) | None => Type::Unknown,
-            Some(ResolvedName::PatternBinding(_)) => Type::Unknown,
             Some(ResolvedName::Enum(eid)) => Type::Enum(*eid, Vec::new()),
             Some(ResolvedName::EnumVariant(eid, _)) => Type::Enum(*eid, Vec::new()),
             Some(ResolvedName::Trait(_)) | Some(ResolvedName::Module(_)) => Type::Unknown,
@@ -4106,6 +4339,20 @@ fn item_contains_function(tree: &ItemTree, item: TopLevelItem, target: FunctionI
     }
 }
 
+fn item_contains_body_owner(
+    tree: &ItemTree,
+    item: TopLevelItem,
+    function: Option<FunctionId>,
+    konst: Option<hir::item_tree::ConstId>,
+) -> bool {
+    function.is_some_and(|target| item_contains_function(tree, item, target))
+        || konst.is_some_and(|target| match item {
+            TopLevelItem::Const(id) => id == target,
+            TopLevelItem::Impl(imp) => tree.impls[imp].consts.contains(&target),
+            _ => false,
+        })
+}
+
 fn module_contains(tree: &ItemTree, ancestor: ModuleId, target: ModuleId) -> bool {
     ancestor == target
         || tree.modules[ancestor].items.as_ref().is_some_and(|items| {
@@ -4125,7 +4372,7 @@ struct ResolvedMethod {
 fn expected_has_param(ty: &Type) -> bool {
     match ty {
         Type::Param(_) | Type::Const(ConstArg::Param(_)) => true,
-        Type::Ref(inner, _) => expected_has_param(inner),
+        Type::Ref(inner, _) | Type::Slice(inner) => expected_has_param(inner),
         Type::Ptr { inner, .. } => expected_has_param(inner),
         Type::Tuple(elements) => elements.iter().any(expected_has_param),
         Type::Array(inner, len) => expected_has_param(inner) || const_has_param(len),
@@ -4162,6 +4409,9 @@ fn generic_arg_unknown(ty: &Type) -> bool {
 }
 
 fn is_supported_cast(source: &Type, target: &Type) -> bool {
+    if is_unsafe_dst_layout_cast(source, target) || is_str_to_byte_slice_cast(source, target) {
+        return true;
+    }
     let source = match source {
         Type::Ref(inner, _) => inner.as_ref(),
         source => source,
@@ -4179,10 +4429,52 @@ fn is_supported_cast(source: &Type, target: &Type) -> bool {
     )
 }
 
+fn is_unsafe_dst_layout_cast(source: &Type, target: &Type) -> bool {
+    match (source, target) {
+        (Type::Tuple(parts), Type::Ref(target, false)) => {
+            let Type::Slice(target) = target.as_ref() else {
+                return false;
+            };
+            matches!(
+                parts.as_slice(),
+                [Type::Ptr { inner, .. }, Type::Int(IntTy::Usize)] if inner.as_ref() == target.as_ref()
+            )
+        }
+        // `&[T] as (*const T, usize)`: the decomposition direction. A `*mut T`
+        // part additionally requires the slice reference itself to be mutable.
+        (Type::Ref(source, source_mut), Type::Tuple(parts)) => {
+            let Type::Slice(element) = source.as_ref() else {
+                return false;
+            };
+            matches!(
+                parts.as_slice(),
+                [Type::Ptr { inner, mutable }, Type::Int(IntTy::Usize)]
+                    if inner.as_ref() == element.as_ref() && (!mutable || *source_mut)
+            )
+        }
+        (Type::Ref(source, false), Type::Ref(target, false)) => matches!(
+            (source.as_ref(), target.as_ref()),
+            (Type::Slice(element), Type::Str)
+                if matches!(element.as_ref(), Type::Int(IntTy::U8))
+        ),
+        _ => false,
+    }
+}
+
+fn is_str_to_byte_slice_cast(source: &Type, target: &Type) -> bool {
+    matches!(
+        (source, target),
+        (Type::Ref(source, false), Type::Ref(target, false))
+            if matches!(source.as_ref(), Type::Str)
+                && matches!(target.as_ref(), Type::Slice(element)
+                    if matches!(element.as_ref(), Type::Int(IntTy::U8)))
+    )
+}
+
 fn type_contains_unresolved_const_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
     match ty {
         Type::Const(ConstArg::Param(name)) => !matches!(params.get(name), Some(Type::Const(_))),
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } => {
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
             type_contains_unresolved_const_param(inner, params)
         }
         Type::Tuple(elements) => elements
@@ -4212,7 +4504,7 @@ fn type_contains_unresolved_const_param(ty: &Type, params: &HashMap<String, Type
 fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
     match ty {
         HirTypeRef::Error => true,
-        HirTypeRef::Ref(inner, _) => type_ref_contains_error(inner),
+        HirTypeRef::Ref(inner, _) | HirTypeRef::Slice(inner) => type_ref_contains_error(inner),
         HirTypeRef::Array(inner, len) => {
             type_ref_contains_error(inner) || matches!(len, hir::item_tree::HirConstArg::Error)
         }
@@ -4231,7 +4523,9 @@ fn grows_generic_arg(ty: &Type, params: &HashMap<String, Type>) -> bool {
     match ty {
         Type::Param(name) => !params.contains_key(name),
         Type::Const(ConstArg::Param(name)) => !params.contains_key(name),
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } => contains_current_param(inner, params),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
+            contains_current_param(inner, params)
+        }
         Type::Array(inner, len) => {
             contains_current_param(inner, params) || const_contains_current_param(len, params)
         }
@@ -4249,7 +4543,9 @@ fn contains_current_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
     match ty {
         Type::Param(name) => params.contains_key(name),
         Type::Const(ConstArg::Param(name)) => params.contains_key(name),
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } => contains_current_param(inner, params),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
+            contains_current_param(inner, params)
+        }
         Type::Array(inner, len) => {
             contains_current_param(inner, params) || const_contains_current_param(len, params)
         }

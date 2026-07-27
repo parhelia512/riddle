@@ -1,4 +1,4 @@
-use crate::{DefKind, build, local_stmt, param_fn, resolve_paths, resolve_reference};
+use crate::{DefKind, build, local_binding, param_fn, resolve_paths, resolve_reference};
 
 use scope_graph::Node;
 
@@ -75,15 +75,15 @@ fn let_bindings_are_distinct_across_statement_chain() {
 
     let y_init_x = refs
         .iter()
-        .find(|(path, defs)| path == "x" && local_stmt(defs).is_some())
-        .and_then(|(_, defs)| local_stmt(defs))
+        .find(|(path, defs)| path == "x" && local_binding(defs).is_some())
+        .and_then(|(_, defs)| local_binding(defs))
         .unwrap();
 
     let tail_x = refs
         .iter()
         .rev()
-        .find(|(path, defs)| path == "x" && local_stmt(defs).is_some())
-        .and_then(|(_, defs)| local_stmt(defs))
+        .find(|(path, defs)| path == "x" && local_binding(defs).is_some())
+        .and_then(|(_, defs)| local_binding(defs))
         .unwrap();
 
     assert_ne!(y_init_x, tail_x);
@@ -93,7 +93,7 @@ fn let_bindings_are_distinct_across_statement_chain() {
     );
     assert!(
         refs.iter()
-            .any(|(path, defs)| path == "y" && local_stmt(defs).is_some())
+            .any(|(path, defs)| path == "y" && local_binding(defs).is_some())
     );
 }
 
@@ -146,7 +146,7 @@ fn same_named_locals_in_sibling_blocks_do_not_cross_resolve() {
                 .map(|name| name.0.as_str())
                 .collect::<Vec<_>>()
                 == ["go"])
-            .then(|| local_stmt(&resolve_reference(&sg, nid)).unwrap())
+            .then(|| local_binding(&resolve_reference(&sg, nid)).unwrap())
         })
         .collect();
 

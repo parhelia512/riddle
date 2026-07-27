@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use la_arena::{Arena, Idx};
 use rowan::TextRange;
 
@@ -25,7 +27,7 @@ pub struct ItemTree {
     pub consts: Arena<HirConst>,
     pub type_aliases: Arena<HirTypeAlias>,
     pub top_level: Vec<TopLevelItem>,
-    /// Functions declared in `extern "C"` blocks (no body).
+    /// Functions declared or defined with the `extern "C"` ABI.
     pub extern_function_ids: Vec<FunctionId>,
 }
 
@@ -256,11 +258,30 @@ pub enum HirUseTreeKind {
     List(Vec<HirUseTree>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct HirPath {
     pub anchor: PathAnchor,
     pub segments: Vec<Name>,
     pub type_args: Vec<HirTypeRef>,
+    pub range: TextRange,
+}
+
+impl PartialEq for HirPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.anchor == other.anchor
+            && self.segments == other.segments
+            && self.type_args == other.type_args
+    }
+}
+
+impl Eq for HirPath {}
+
+impl Hash for HirPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.anchor.hash(state);
+        self.segments.hash(state);
+        self.type_args.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -283,6 +304,7 @@ pub enum HirTypeRef {
         inner: Box<HirTypeRef>,
     },
     Tuple(Vec<HirTypeRef>),
+    Slice(Box<HirTypeRef>),
     Array(Box<HirTypeRef>, HirConstArg),
     Const(HirConstArg),
     Function {
@@ -368,6 +390,7 @@ impl HirTypeRef {
                     .join(", ");
                 format!("({inner})")
             }
+            HirTypeRef::Slice(inner) => format!("[{}]", inner.display()),
             HirTypeRef::Array(inner, len) => format!("[{}; {}]", inner.display(), len.display()),
             HirTypeRef::Const(value) => value.display(),
             HirTypeRef::Function {

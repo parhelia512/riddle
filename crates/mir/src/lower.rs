@@ -87,12 +87,16 @@ pub fn lower_hir(
         capture_access: HashMap::new(),
         current_lambda: None,
         lambda_counter: 0,
+        active_consts: HashSet::new(),
     };
 
     // 遍历所有有函数体的函数
     for (fid, func) in hir.item_tree.functions.iter() {
         if ctx.builtin_operator_for_method(fid).is_some()
             || ctx.default_methods.contains_key(&fid)
+            || (hir.std_loaded
+                && hir.package_for_range(func.name_range).is_none()
+                && func.attrs.iter().any(|attr| attr.name.0 == "builtin"))
             || !func.generics.is_empty()
             || ctx
                 .impl_for_method(fid)
@@ -113,10 +117,6 @@ pub fn lower_hir(
         .extern_function_ids
         .iter()
         .filter(|&&fid| !hir.function_bodies.contains_key(&fid))
-        .filter(|&&fid| {
-            let function = &hir.item_tree.functions[fid];
-            function.generics.is_empty() && function.const_generics.is_empty()
-        })
         .map(|&fid| {
             let func = &hir.item_tree.functions[fid];
             (func.name.0.clone(), func)
@@ -151,12 +151,12 @@ struct LowerCtx<'a> {
     /// The BodyId currently being lowered, used to look up expr_types.
     current_body: Option<BodyId>,
     current_function: Option<hir::item_tree::FunctionId>,
-    /// Maps let-bound StmtId → Value for local variable resolution.
-    scope_map: HashMap<StmtId, Value>,
+    /// Maps a `let` binding → its Value (or storage pointer, see below).
+    scope_map: HashMap<PatternBindingId, Value>,
     drop_scopes: Vec<Vec<DropSlot>>,
     drop_slots: HashMap<CaptureSource, Vec<DropSlot>>,
-    /// StmtIds backed by storage rather than a direct SSA value.
-    storage_bindings: HashSet<StmtId>,
+    /// Bindings backed by storage rather than a direct SSA value.
+    storage_bindings: HashSet<PatternBindingId>,
     parameter_storage: HashMap<CaptureSource, Value>,
     pattern_bindings: Vec<HashMap<PatternBindingId, PatternBindingValue>>,
     generic_subst: HashMap<String, Type>,
@@ -170,6 +170,7 @@ struct LowerCtx<'a> {
     capture_access: HashMap<CaptureSource, CaptureAccess>,
     current_lambda: Option<ExprId>,
     lambda_counter: u32,
+    active_consts: HashSet<hir::item_tree::ConstId>,
 }
 
 #[derive(Clone)]
@@ -190,6 +191,14 @@ struct DropSlot {
 enum DropProjection {
     Field(usize),
     Index(usize),
+}
+
+/// Where a `let` binding's data lives: a stable slot it can take the address
+/// of, or a plain SSA value.
+#[derive(Clone, Copy)]
+enum LetSource {
+    Place(Value),
+    Value(Value),
 }
 
 #[derive(Clone)]
@@ -621,20 +630,8 @@ impl<'a> LowerCtx<'a> {
             return builder.load(access.place, access.ty);
         }
         match source {
-            CaptureSource::Local(stmt) => {
-                let value = self
-                    .scope_map
-                    .get(stmt)
-                    .copied()
-                    .unwrap_or_else(|| builder.unit_const());
-                if self.storage_bindings.contains(stmt) {
-                    builder.load(value, ty.clone())
-                } else {
-                    value
-                }
-            }
             CaptureSource::Pattern(id) => self
-                .pattern_binding_value(builder, *id)
+                .binding_value(builder, *id, ty)
                 .unwrap_or_else(|| builder.unit_const()),
             CaptureSource::Param(index) => self
                 .parameter_storage
@@ -667,14 +664,8 @@ impl<'a> LowerCtx<'a> {
         if let Some(access) = self.capture_access.get(source) {
             return access.place;
         }
-        if let CaptureSource::Local(stmt) = source
-            && self.storage_bindings.contains(stmt)
-            && let Some(place) = self.scope_map.get(stmt)
-        {
-            return *place;
-        }
         if let CaptureSource::Pattern(id) = source
-            && let Some(place) = self.pattern_binding_place(builder, *id)
+            && let Some(place) = self.binding_place(builder, *id)
         {
             return place;
         }
@@ -822,28 +813,6 @@ impl<'a> LowerCtx<'a> {
             Expr::BoolLiteral { value } => builder.bconst(*value),
 
             Expr::Path { path, resolved } => match resolved {
-                Some(ResolvedName::Local(stmt)) => {
-                    let value = if let Some(access) = self
-                        .capture_access
-                        .get(&CaptureSource::Local(*stmt))
-                        .cloned()
-                    {
-                        builder.load(access.place, access.ty)
-                    } else {
-                        let storage = self
-                            .scope_map
-                            .get(stmt)
-                            .copied()
-                            .unwrap_or_else(|| builder.unit_const());
-                        if self.storage_bindings.contains(stmt) {
-                            builder.load(storage, mir_type.clone())
-                        } else {
-                            storage
-                        }
-                    };
-                    self.clear_drop_flags_if_moved(builder, body, expr_id);
-                    value
-                }
                 Some(ResolvedName::Param(idx)) => {
                     let value = if let Some(access) = self
                         .capture_access
@@ -891,7 +860,7 @@ impl<'a> LowerCtx<'a> {
                     let value = if let Some(access) = self.capture_access.get(&source).cloned() {
                         builder.load(access.place, access.ty)
                     } else {
-                        self.pattern_binding_value(builder, *id)
+                        self.binding_value(builder, *id, &mir_type)
                             .unwrap_or_else(|| builder.unit_const())
                     };
                     self.clear_drop_flags_if_moved(builder, body, expr_id);
@@ -900,6 +869,7 @@ impl<'a> LowerCtx<'a> {
                 Some(ResolvedName::Function(fid)) => {
                     self.lower_function_value(builder, *fid, &mir_type)
                 }
+                Some(ResolvedName::Const(const_id)) => self.lower_const_value(builder, *const_id),
                 Some(ResolvedName::EnumVariant(enum_id, idx)) => {
                     self.lower_enum_variant_value(builder, *enum_id, *idx, Vec::new(), mir_type)
                 }
@@ -997,7 +967,22 @@ impl<'a> LowerCtx<'a> {
                                     })
                                 })
                                 .unwrap_or_default();
-                            if let Some(ty) = lhs_ty.as_ref()
+                            // Raw-pointer indexing addresses uninitialized storage in
+                            // containers such as `Vector<T>`; there is no old value to drop.
+                            let raw_pointer_index = matches!(
+                                &body.exprs[*lhs],
+                                Expr::IndexAccess { base, .. }
+                                    if self
+                                        .current_body
+                                        .and_then(|body_id| {
+                                            self.type_result.expr_types.get(&(body_id, *base))
+                                        })
+                                        .is_some_and(|ty| {
+                                            matches!(ty, type_checker::Type::Ptr { .. })
+                                        })
+                            );
+                            if !raw_pointer_index
+                                && let Some(ty) = lhs_ty.as_ref()
                                 && self.type_needs_drop(ty, 0)
                             {
                                 if assignment_slots.is_empty() {
@@ -1318,6 +1303,8 @@ impl<'a> LowerCtx<'a> {
                         arg_vals,
                         mir_type,
                     )
+                } else if let Some(value) = self.lower_builtin_call(builder, *callee) {
+                    value
                 } else if self.callee_function_id(*callee).is_none() {
                     let callee_value = self.lower_expr(builder, param_values, body, *callee);
                     let mut arg_values = args
@@ -1360,7 +1347,8 @@ impl<'a> LowerCtx<'a> {
                     }
 
                     let name = if let Some((fid, base)) = method_target {
-                        self.mono_method_name(fid, base, args.first().copied())
+                        self.mono_function_name(fid, *callee)
+                            .or_else(|| self.mono_method_name(fid, base, args.first().copied()))
                             .unwrap_or_else(|| self.function_name(fid))
                     } else {
                         target_fid
@@ -1431,7 +1419,11 @@ impl<'a> LowerCtx<'a> {
             Expr::IndexAccess { base, index } => {
                 let base_val = self.lower_expr(builder, param_values, body, *base);
                 let index_val = self.lower_expr(builder, param_values, body, *index);
-                let ptr = builder.index_ptr(base_val, index_val, mir_type.clone());
+                let ptr = if let Some(len) = self.index_len(builder, base_val, *base) {
+                    builder.checked_index_ptr(base_val, index_val, len, mir_type.clone())
+                } else {
+                    builder.index_ptr(base_val, index_val, mir_type.clone())
+                };
                 let value = builder.load(ptr, mir_type);
                 self.clear_drop_flags_if_moved(builder, body, expr_id);
                 self.clear_dynamic_index_drop_flags_if_moved(
@@ -1455,23 +1447,77 @@ impl<'a> LowerCtx<'a> {
                     .map(|t| self.convert_type(t))
                     .unwrap_or(Type::Unit);
 
-                // auto-unwrap Ref
-                let (base_val, base_mir_ty) = if let Type::Ref(inner, _) = &base_mir_ty {
-                    (builder.load(base_val, *inner.clone()), *inner.clone())
+                if is_raw_parts_to_slice_cast(&base_mir_ty, &mir_type) {
+                    let Type::Tuple(parts) = &base_mir_ty else {
+                        unreachable!();
+                    };
+                    let data = builder.extract_value(base_val, 0, parts[0].clone());
+                    let len = builder.extract_value(base_val, 1, Type::Int(IntTy::Usize));
+                    builder.struct_value(vec![data, len], mir_type)
+                } else if is_slice_to_raw_parts_cast(&base_mir_ty, &mir_type) {
+                    let Type::Tuple(parts) = &mir_type else {
+                        unreachable!();
+                    };
+                    let data = builder.extract_value(base_val, 0, parts[0].clone());
+                    let len = builder.extract_value(base_val, 1, Type::Int(IntTy::Usize));
+                    builder.struct_value(vec![data, len], mir_type)
+                } else if is_byte_str_layout_cast(&base_mir_ty, &mir_type) {
+                    let data = builder.extract_value(
+                        base_val,
+                        0,
+                        Type::Ptr(Box::new(Type::Int(IntTy::U8))),
+                    );
+                    let len = builder.extract_value(base_val, 1, Type::Int(IntTy::Usize));
+                    builder.struct_value(vec![data, len], mir_type)
                 } else {
-                    (base_val, base_mir_ty)
-                };
+                    // auto-unwrap Ref
+                    let (base_val, base_mir_ty) = if let Type::Ref(inner, _) = &base_mir_ty {
+                        (builder.load(base_val, *inner.clone()), *inner.clone())
+                    } else {
+                        (base_val, base_mir_ty)
+                    };
 
-                let cast_op = determine_cast_op(&base_mir_ty, &mir_type);
-                builder.cast(cast_op, base_val, mir_type)
+                    let cast_op = determine_cast_op(&base_mir_ty, &mir_type);
+                    builder.cast(cast_op, base_val, mir_type)
+                }
             }
         };
 
+        let value = self.apply_expr_coercion(builder, expr_id, value);
         if diverges && builder.needs_return() {
             builder.set_unreachable();
         }
         self.expr_cache.insert(expr_id, value);
         value
+    }
+
+    fn apply_expr_coercion(&self, builder: &mut Builder, expr_id: ExprId, value: Value) -> Value {
+        let Some(body_id) = self.current_body else {
+            return value;
+        };
+        let Some(target) = self.type_result.expr_coercions.get(&(body_id, expr_id)) else {
+            return value;
+        };
+        let Some(actual) = self.type_result.expr_types.get(&(body_id, expr_id)) else {
+            return value;
+        };
+        let (type_checker::Type::Ref(actual, _), type_checker::Type::Ref(target, target_mut)) =
+            (actual, target)
+        else {
+            return value;
+        };
+        let (
+            type_checker::Type::Array(_, type_checker::ConstArg::Value(len)),
+            type_checker::Type::Slice(_),
+        ) = (actual.as_ref(), target.as_ref())
+        else {
+            return value;
+        };
+        let len = builder.iconst(*len as u64, IntTy::Usize);
+        builder.struct_value(
+            vec![value, len],
+            Type::Ref(Box::new(self.convert_type(target.as_ref())), *target_mut),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1702,6 +1748,13 @@ impl<'a> LowerCtx<'a> {
             vec![iterable_value],
             iter_ty.clone(),
         );
+        // `IntoIterator::into_iter(self)` consumes the owner. Its destructor
+        // must not run again after the iterator takes over the allocation.
+        if !matches!(iterable_ty, type_checker::Type::Ref(..))
+            && let Some((source, _)) = self.drop_place_from_expr(body, iterable)
+        {
+            self.clear_drop_slots_for_source(builder, &source);
+        }
         let iter_slot = builder.alloca(iter_ty.clone());
         builder.store(iter_value, iter_slot);
         let iter_owner_slots = self.create_drop_slots(builder, iter_slot, &iter_tc_ty, Vec::new());
@@ -1900,7 +1953,7 @@ impl<'a> LowerCtx<'a> {
         let pattern = body.pats[pat].clone();
         match pattern {
             Pattern::Wildcard => None,
-            Pattern::Binding { name } => {
+            Pattern::Binding { name, .. } => {
                 let TypePattern::EnumVariant {
                     enum_id,
                     variant_index,
@@ -2134,7 +2187,7 @@ impl<'a> LowerCtx<'a> {
         scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
     ) {
         match body.pats[pat].clone() {
-            Pattern::Binding { name } => {
+            Pattern::Binding { name, .. } => {
                 if !matches!(
                     self.classify_type_pattern(value_ty, Some(&name.0)),
                     TypePattern::EnumVariant { .. }
@@ -2627,6 +2680,9 @@ impl<'a> LowerCtx<'a> {
                     .map(|item| self.lower_hir_type_for_pattern(item, subst))
                     .collect(),
             ),
+            HirTypeRef::Slice(inner) => {
+                type_checker::Type::Slice(Box::new(self.lower_hir_type_for_pattern(inner, subst)))
+            }
             HirTypeRef::Array(inner, len) => type_checker::Type::Array(
                 Box::new(self.lower_hir_type_for_pattern(inner, subst)),
                 match len {
@@ -2699,11 +2755,21 @@ impl<'a> LowerCtx<'a> {
             .sum()
     }
 
-    fn pattern_binding_value(
+    /// Read a binding. `let` bindings live in `scope_map`; `match`/`for` arm
+    /// bindings live in the arm-scoped `pattern_bindings` stack.
+    fn binding_value(
         &mut self,
         builder: &mut Builder,
         id: PatternBindingId,
+        ty: &Type,
     ) -> Option<Value> {
+        if let Some(value) = self.scope_map.get(&id).copied() {
+            return Some(if self.storage_bindings.contains(&id) {
+                builder.load(value, ty.clone())
+            } else {
+                value
+            });
+        }
         let binding = self
             .pattern_bindings
             .iter()
@@ -2715,11 +2781,11 @@ impl<'a> LowerCtx<'a> {
         })
     }
 
-    fn pattern_binding_place(
-        &mut self,
-        builder: &mut Builder,
-        id: PatternBindingId,
-    ) -> Option<Value> {
+    /// The address of a binding, materializing one if it only had a value.
+    fn binding_place(&mut self, builder: &mut Builder, id: PatternBindingId) -> Option<Value> {
+        if self.storage_bindings.contains(&id) {
+            return self.scope_map.get(&id).copied();
+        }
         let binding = self
             .pattern_bindings
             .iter_mut()
@@ -2799,6 +2865,28 @@ impl<'a> LowerCtx<'a> {
                 type_checker::Type::Function(fid) => Some(*fid),
                 _ => None,
             })
+    }
+
+    fn lower_builtin_call(&mut self, builder: &mut Builder, callee: ExprId) -> Option<Value> {
+        let fid = self.callee_function_id(callee)?;
+        let function = &self.hir.item_tree.functions[fid];
+        if !self.hir.std_loaded || self.hir.package_for_range(function.name_range).is_some() {
+            return None;
+        }
+        let builtin = function
+            .attrs
+            .iter()
+            .find(|attr| attr.name.0 == "builtin")
+            .and_then(|attr| attr.value.clone())?;
+        let body_id = self.current_body?;
+        let generic_call = self.type_result.generic_calls.get(&(body_id, callee));
+        match builtin.as_str() {
+            "size_of" => {
+                let ty = self.convert_type(generic_call?.args.first()?);
+                Some(builder.size_of(ty))
+            }
+            _ => None,
+        }
     }
 
     fn lower_operator_call(
@@ -3229,12 +3317,6 @@ impl<'a> LowerCtx<'a> {
         let expr = &body.exprs[expr_id];
         match expr {
             Expr::Path { resolved, .. } => match resolved {
-                Some(ResolvedName::Local(stmt)) => self
-                    .capture_access
-                    .get(&CaptureSource::Local(*stmt))
-                    .map(|access| access.place)
-                    .or_else(|| self.scope_map.get(stmt).copied())
-                    .unwrap_or_else(|| builder.unit_const()),
                 Some(ResolvedName::Param(idx)) => self
                     .capture_access
                     .get(&CaptureSource::Param(*idx))
@@ -3266,7 +3348,12 @@ impl<'a> LowerCtx<'a> {
                     if let Some(access) = self.capture_access.get(&CaptureSource::Pattern(*id)) {
                         access.place
                     } else {
-                        self.pattern_binding_place(builder, *id)
+                        // A `let` binding without storage has no address; the
+                        // SSA value doubles as its location, as before.
+                        self.scope_map
+                            .get(id)
+                            .copied()
+                            .or_else(|| self.binding_place(builder, *id))
                             .unwrap_or_else(|| builder.unit_const())
                     }
                 }
@@ -3280,7 +3367,11 @@ impl<'a> LowerCtx<'a> {
                     .and_then(|bid| self.type_result.expr_types.get(&(bid, expr_id)))
                     .map(|t| self.convert_type(t))
                     .unwrap_or(Type::Unit);
-                builder.index_ptr(base_val, index_val, mir_type)
+                if let Some(len) = self.index_len(builder, base_val, *base) {
+                    builder.checked_index_ptr(base_val, index_val, len, mir_type)
+                } else {
+                    builder.index_ptr(base_val, index_val, mir_type)
+                }
             }
             Expr::FieldAccess { base, field } => {
                 let base_val = self.lower_place_base(builder, param_values, body, *base);
@@ -3334,76 +3425,117 @@ impl<'a> LowerCtx<'a> {
     ) {
         let stmt = &body.stmts[stmt_id];
         match stmt {
-            Stmt::Let {
-                init, ty, is_mut, ..
-            } => {
-                let inferred_ty = init.and_then(|init_expr| {
-                    self.current_body
-                        .and_then(|bid| self.type_result.expr_types.get(&(bid, init_expr)))
-                        .cloned()
+            Stmt::Let { pat, init, ty, .. } => {
+                let (pat, init) = (*pat, *init);
+                let value_ty = init
+                    .and_then(|init_expr| self.adjusted_expr_type(init_expr))
+                    .cloned()
+                    .or_else(|| {
+                        self.current_body
+                            .and_then(|body_id| self.type_result.pattern_types.get(&(body_id, pat)))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| self.lower_hir_type_for_pattern(ty, &self.generic_tc_subst));
+                let needs_drop = self.type_needs_drop(&value_ty, 0);
+                let delayed = init.is_none();
+                // A destructuring `let` keeps one slot for the whole value and
+                // hands out projections, so the slot has to satisfy whichever
+                // of its bindings is the most demanding.
+                let bindings = let_pattern_bindings(body, pat);
+                let is_mut = bindings.iter().any(|(_, is_mut)| *is_mut);
+                let escapes = self.current_body.is_some_and(|bid| {
+                    bindings
+                        .iter()
+                        .any(|(id, _)| self.analysis.escapes(bid, *id))
                 });
-                let needs_drop = inferred_ty
-                    .as_ref()
-                    .is_some_and(|ty| self.type_needs_drop(ty, 0));
-                let escapes = self
-                    .current_body
-                    .map(|bid| self.analysis.escapes(bid, stmt_id))
-                    .unwrap_or(false);
-                let needs_address = self
-                    .current_body
-                    .is_some_and(|bid| self.analysis.local_needs_address(bid, stmt_id));
+                let needs_address = self.current_body.is_some_and(|bid| {
+                    bindings
+                        .iter()
+                        .any(|(id, _)| self.analysis.local_needs_address(bid, *id))
+                });
+                let root = PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                };
 
                 let val = if escapes {
-                    // Use init expr's inferred type (from type checker) for allocation,
-                    // falling back to HIR type annotation if no init.
+                    // Use the checked binding type for delayed declarations.
                     let alloc_ty = init
-                        .and_then(|init_expr| {
-                            self.current_body
-                                .and_then(|bid| self.type_result.expr_types.get(&(bid, init_expr)))
-                        })
+                        .and_then(|init_expr| self.adjusted_expr_type(init_expr))
                         .map(|t| self.convert_type(t))
-                        .unwrap_or_else(|| self.convert_hir_type(ty));
+                        .unwrap_or_else(|| self.convert_type(&value_ty));
                     let ptr = builder.heap_alloc(alloc_ty);
                     if let Some(init_expr) = init {
-                        let init_val = self.lower_expr(builder, param_values, body, *init_expr);
+                        let init_val = self.lower_expr(builder, param_values, body, init_expr);
                         builder.store(init_val, ptr);
                     }
-                    self.storage_bindings.insert(stmt_id);
+                    self.storage_bindings.insert(root);
                     ptr
-                } else if *is_mut || needs_address || needs_drop {
+                } else if delayed || is_mut || needs_address || needs_drop {
                     // Mutable and captured-by-reference bindings need stable stack storage.
                     let alloc_ty = init
-                        .and_then(|init_expr| {
-                            self.current_body
-                                .and_then(|bid| self.type_result.expr_types.get(&(bid, init_expr)))
-                        })
+                        .and_then(|init_expr| self.adjusted_expr_type(init_expr))
                         .map(|t| self.convert_type(t))
-                        .unwrap_or_else(|| self.convert_hir_type(ty));
+                        .unwrap_or_else(|| self.convert_type(&value_ty));
                     let ptr = builder.alloca(alloc_ty);
                     if let Some(init_expr) = init {
-                        let init_val = self.lower_expr(builder, param_values, body, *init_expr);
+                        let init_val = self.lower_expr(builder, param_values, body, init_expr);
                         builder.store(init_val, ptr);
                     }
-                    self.storage_bindings.insert(stmt_id);
+                    self.storage_bindings.insert(root);
                     ptr
                 } else if let Some(init_expr) = init {
-                    self.lower_expr(builder, param_values, body, *init_expr)
+                    self.lower_expr(builder, param_values, body, init_expr)
                 } else {
                     builder.unit_const()
                 };
-                self.scope_map.insert(stmt_id, val);
-                if needs_drop && init.is_some() {
-                    let source = CaptureSource::Local(stmt_id);
-                    let slots = self.create_drop_slots(
-                        builder,
-                        val,
-                        &inferred_ty.expect("initialized Drop local has an inferred type"),
-                        Vec::new(),
-                    );
-                    self.register_drop_slots(source, &slots);
-                    if let Some(scope) = self.drop_scopes.last_mut() {
-                        scope.extend(slots.into_iter().rev());
+                self.scope_map.insert(root, val);
+                let slots = if needs_drop {
+                    let slots = self.create_drop_slots(builder, val, &value_ty, Vec::new());
+                    if delayed {
+                        for slot in &slots {
+                            let inactive = builder.bconst(false);
+                            builder.store(inactive, slot.flag);
+                        }
                     }
+                    slots
+                } else {
+                    Vec::new()
+                };
+
+                let mut bound = vec![(root, Vec::new())];
+                if !matches!(body.pats[pat], Pattern::Binding { .. }) {
+                    let source = if self.storage_bindings.contains(&root) {
+                        LetSource::Place(val)
+                    } else {
+                        LetSource::Value(val)
+                    };
+                    bound.clear();
+                    self.bind_let_pattern(
+                        builder,
+                        body,
+                        pat,
+                        source,
+                        &value_ty,
+                        Vec::new(),
+                        &mut bound,
+                    );
+                }
+                // Drop flags hang off each binding, not off the slot, so moving
+                // one element out of a destructured `let` only disarms its own
+                // fields.
+                for (id, projection) in bound {
+                    let owned = slots
+                        .iter()
+                        .filter(|slot| slot.projection.starts_with(&projection))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !owned.is_empty() {
+                        self.register_drop_slots(CaptureSource::Pattern(id), &owned);
+                    }
+                }
+                if let Some(scope) = self.drop_scopes.last_mut() {
+                    scope.extend(slots.into_iter().rev());
                 }
             }
             Stmt::Expr { expr } => {
@@ -3434,6 +3566,182 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    /// Bind the elements of a destructuring `let`. The whole initializer already
+    /// lives in one slot, so each binding is a projection of it rather than a
+    /// separate allocation — that keeps `&a` valid for `let (a, b) = pair`.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_let_pattern(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        pat: PatId,
+        source: LetSource,
+        value_ty: &type_checker::Type,
+        projection: Vec<DropProjection>,
+        bound: &mut Vec<(PatternBindingId, Vec<DropProjection>)>,
+    ) {
+        match body.pats[pat].clone() {
+            Pattern::Binding { .. } => self.bind_let_element(
+                PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                },
+                source,
+                projection,
+                bound,
+            ),
+            Pattern::Tuple { elements } => {
+                let type_checker::Type::Tuple(element_types) = value_ty else {
+                    return;
+                };
+                let element_types = element_types.clone();
+                for (index, child) in elements.into_iter().enumerate() {
+                    let Some(child_ty) = element_types.get(index) else {
+                        break;
+                    };
+                    let child_source = self.project(builder, source, index, child_ty);
+                    let mut child_projection = projection.clone();
+                    child_projection.push(DropProjection::Field(index));
+                    self.bind_let_pattern(
+                        builder,
+                        body,
+                        child,
+                        child_source,
+                        child_ty,
+                        child_projection,
+                        bound,
+                    );
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                let type_checker::Type::Struct(struct_id, args) = value_ty else {
+                    return;
+                };
+                let field_types = self.struct_pattern_field_types(*struct_id, args);
+                for (binding_index, field) in fields.into_iter().enumerate() {
+                    let Some((index, (_, child_ty))) = field_types
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (name, _))| *name == field.name.0)
+                    else {
+                        continue;
+                    };
+                    let child_ty = child_ty.clone();
+                    let child_source = self.project(builder, source, index, &child_ty);
+                    let mut child_projection = projection.clone();
+                    child_projection.push(DropProjection::Field(index));
+                    match field.pat {
+                        Some(child) => self.bind_let_pattern(
+                            builder,
+                            body,
+                            child,
+                            child_source,
+                            &child_ty,
+                            child_projection,
+                            bound,
+                        ),
+                        None => self.bind_let_element(
+                            PatternBindingId {
+                                pattern: pat,
+                                field: Some(binding_index),
+                            },
+                            child_source,
+                            child_projection,
+                            bound,
+                        ),
+                    }
+                }
+            }
+            // ponytail: enum patterns are refutable and rejected by E0057, and
+            // Riddle has no tuple structs, so nothing else can reach a `let`.
+            Pattern::Wildcard
+            | Pattern::Literal(_)
+            | Pattern::Path { .. }
+            | Pattern::TupleStruct { .. } => {}
+        }
+    }
+
+    fn bind_let_element(
+        &mut self,
+        id: PatternBindingId,
+        source: LetSource,
+        projection: Vec<DropProjection>,
+        bound: &mut Vec<(PatternBindingId, Vec<DropProjection>)>,
+    ) {
+        match source {
+            LetSource::Place(place) => {
+                self.storage_bindings.insert(id);
+                self.scope_map.insert(id, place);
+            }
+            LetSource::Value(value) => {
+                self.scope_map.insert(id, value);
+            }
+        }
+        bound.push((id, projection));
+    }
+
+    fn project(
+        &mut self,
+        builder: &mut Builder,
+        source: LetSource,
+        index: usize,
+        field_ty: &type_checker::Type,
+    ) -> LetSource {
+        let mir_ty = self.convert_type(field_ty);
+        match source {
+            LetSource::Place(place) => LetSource::Place(builder.field_ptr(place, index, mir_ty)),
+            LetSource::Value(value) => {
+                LetSource::Value(builder.extract_value(value, index, mir_ty))
+            }
+        }
+    }
+
+    fn adjusted_expr_type(&self, expr: ExprId) -> Option<&type_checker::Type> {
+        let body = self.current_body?;
+        self.type_result
+            .expr_coercions
+            .get(&(body, expr))
+            .or_else(|| self.type_result.expr_types.get(&(body, expr)))
+    }
+
+    fn lower_const_value(
+        &mut self,
+        builder: &mut Builder,
+        const_id: hir::item_tree::ConstId,
+    ) -> Value {
+        let Some(body_id) = self.hir.const_bodies.get(&const_id).copied() else {
+            return builder.unit_const();
+        };
+        if !self.active_consts.insert(const_id) {
+            return builder.unit_const();
+        }
+
+        let body = &self.hir.bodies[body_id];
+        let old_expr_cache = std::mem::take(&mut self.expr_cache);
+        let old_body = self.current_body.replace(body_id);
+        let value = self.lower_expr(builder, &[], body, body.root_block);
+        self.current_body = old_body;
+        self.expr_cache = old_expr_cache;
+        self.active_consts.remove(&const_id);
+        value
+    }
+
+    fn index_len(&self, builder: &mut Builder, base: Value, expr: ExprId) -> Option<Value> {
+        let mut ty = self.adjusted_expr_type(expr)?;
+        while let type_checker::Type::Ref(inner, _) = ty {
+            ty = inner;
+        }
+        match ty {
+            type_checker::Type::Array(_, type_checker::ConstArg::Value(len)) => {
+                Some(builder.iconst(*len as u64, IntTy::Usize))
+            }
+            type_checker::Type::Slice(_) => {
+                Some(builder.extract_value(base, 1, Type::Int(IntTy::Usize)))
+            }
+            _ => None,
+        }
+    }
+
     // 类型转换
 
     fn substitute_tc_type(&self, ty: &type_checker::Type) -> type_checker::Type {
@@ -3458,6 +3766,7 @@ impl<'a> LowerCtx<'a> {
                     .map(|element| self.substitute_tc_type(element))
                     .collect(),
             ),
+            TcType::Slice(inner) => TcType::Slice(Box::new(self.substitute_tc_type(inner))),
             TcType::Array(inner, len) => {
                 let len = match len {
                     TcConstArg::Param(name) => self
@@ -3621,13 +3930,12 @@ impl<'a> LowerCtx<'a> {
             .get(type_checker::lang_items::LangItem::Drop)
             && let Some(function) = self.find_trait_impl_method(trait_id, "drop", &ty, None)
         {
+            let drop_name = self
+                .mono_method_name_for_receiver(function, &ty, None)
+                .unwrap_or_else(|| self.function_name(function));
             let mir_ty = self.convert_type(&ty);
             let receiver = builder.unop(UnOp::MutRef, place, Type::Ref(Box::new(mir_ty), true));
-            builder.call(
-                FuncRef::Local(self.function_name(function)),
-                vec![receiver],
-                Type::Unit,
-            );
+            builder.call(FuncRef::Local(drop_name), vec![receiver], Type::Unit);
         }
 
         let fields = match &ty {
@@ -3701,15 +4009,16 @@ impl<'a> LowerCtx<'a> {
         if depth > 64 {
             return false;
         }
-        if self.type_result.trait_env.type_has_explicit_drop(ty)
+        let ty = self.substitute_tc_type(ty);
+        if self.type_result.trait_env.type_has_explicit_drop(&ty)
             || matches!(
-                ty,
+                &ty,
                 type_checker::Type::Function(_) | type_checker::Type::Fn { .. }
             )
         {
             return true;
         }
-        match ty {
+        match &ty {
             type_checker::Type::Struct(id, args) => self
                 .struct_field_types(*id, args)
                 .iter()
@@ -3822,9 +4131,9 @@ impl<'a> LowerCtx<'a> {
     ) -> Option<(CaptureSource, Vec<DropProjection>)> {
         match &body.exprs[expr_id] {
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
+                resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
-            } => Some((CaptureSource::Local(*stmt), Vec::new())),
+            } => Some((CaptureSource::Pattern(*id), Vec::new())),
             Expr::Path {
                 resolved: Some(ResolvedName::Param(index)),
                 ..
@@ -3839,10 +4148,6 @@ impl<'a> LowerCtx<'a> {
                 },
                 Vec::new(),
             )),
-            Expr::Path {
-                resolved: Some(ResolvedName::PatternBinding(id)),
-                ..
-            } => Some((CaptureSource::Pattern(*id), Vec::new())),
             Expr::FieldAccess { base, field } => {
                 let (source, mut projection) = self.drop_place_from_expr(body, *base)?;
                 projection.push(DropProjection::Field(
@@ -3987,6 +4292,7 @@ impl<'a> LowerCtx<'a> {
             TcType::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_type(e)).collect())
             }
+            TcType::Slice(inner) => Type::Slice(Box::new(self.convert_type(inner))),
             TcType::Array(inner, len) => Type::Array(
                 Box::new(self.convert_type(inner)),
                 len.as_usize().unwrap_or(0),
@@ -4087,6 +4393,9 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Tuple(elems) if elems.is_empty() => Type::Unit,
             hir::item_tree::HirTypeRef::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_hir_type(e)).collect())
+            }
+            hir::item_tree::HirTypeRef::Slice(inner) => {
+                Type::Slice(Box::new(self.convert_hir_type(inner)))
             }
             hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
                 Box::new(self.convert_hir_type(inner)),
@@ -4412,7 +4721,12 @@ impl<'a> LowerCtx<'a> {
             return None;
         }
         let receiver_mir_ty = self.convert_type(&receiver_ty);
-        let subst = self.impl_mir_subst(&imp, &receiver_ty)?;
+        let subst = self
+            .impl_mir_subst(&imp, &receiver_ty)
+            .or_else(|| match &receiver_ty {
+                type_checker::Type::Ref(inner, _) => self.impl_mir_subst(&imp, inner),
+                _ => None,
+            })?;
         let type_subst = subst
             .types
             .iter()
@@ -4486,6 +4800,9 @@ impl<'a> LowerCtx<'a> {
         callee: ExprId,
     ) -> Option<String> {
         let function = &self.hir.item_tree.functions[fid];
+        if !self.hir.function_bodies.contains_key(&fid) {
+            return None;
+        }
         let imp = self.impl_for_method(fid).cloned();
         let outer_generics = imp
             .as_ref()
@@ -4547,23 +4864,6 @@ impl<'a> LowerCtx<'a> {
             .collect();
         let mono_name = format!("{}__{}", function.name.0, suffix);
         self.mono_functions.insert(key, mono_name.clone());
-
-        if !self.hir.function_bodies.contains_key(&fid) {
-            let old_subst = std::mem::replace(&mut self.generic_subst, subst);
-            let params = function
-                .params
-                .iter()
-                .map(|param| self.convert_hir_type(&param.ty))
-                .collect();
-            let ret = function
-                .ret_type
-                .as_ref()
-                .map(|ty| self.convert_hir_type(ty))
-                .unwrap_or(Type::Unit);
-            self.generic_subst = old_subst;
-            self.module.add_extern(mono_name.clone(), params, ret);
-            return Some(mono_name);
-        }
 
         let old_subst = std::mem::replace(&mut self.generic_subst, subst);
         let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
@@ -4825,6 +5125,71 @@ impl<'a> LowerCtx<'a> {
                 }
                 Some(subst)
             }
+            type_checker::Type::Slice(inner) => {
+                let hir::item_tree::HirTypeRef::Slice(pattern_inner) = &imp.self_ty else {
+                    return None;
+                };
+                let generics = imp
+                    .generics
+                    .iter()
+                    .map(|name| name.0.as_str())
+                    .collect::<HashSet<_>>();
+                self.collect_hir_type_subst(
+                    pattern_inner,
+                    inner,
+                    &generics,
+                    &mut subst.types,
+                    &mut subst.tc_types,
+                )
+                .then_some(subst)
+            }
+            type_checker::Type::Ref(inner, mutable) => {
+                let hir::item_tree::HirTypeRef::Ref(pattern_inner, pattern_mut) = &imp.self_ty
+                else {
+                    return None;
+                };
+                if mutable != pattern_mut {
+                    return None;
+                }
+                let generics = imp
+                    .generics
+                    .iter()
+                    .map(|name| name.0.as_str())
+                    .collect::<HashSet<_>>();
+                let (pattern_inner, pattern_len, actual_inner, actual_len) =
+                    match (pattern_inner.as_ref(), inner.as_ref()) {
+                        (
+                            hir::item_tree::HirTypeRef::Array(pattern_inner, pattern_len),
+                            type_checker::Type::Array(actual_inner, actual_len),
+                        ) => (
+                            pattern_inner.as_ref(),
+                            Some(pattern_len),
+                            actual_inner.as_ref(),
+                            Some(actual_len),
+                        ),
+                        (pattern_inner, actual_inner) => (pattern_inner, None, actual_inner, None),
+                    };
+                if !self.collect_hir_type_subst(
+                    pattern_inner,
+                    actual_inner,
+                    &generics,
+                    &mut subst.types,
+                    &mut subst.tc_types,
+                ) {
+                    return None;
+                }
+                if let (Some(pattern_len), Some(actual_len)) = (pattern_len, actual_len)
+                    && let hir::item_tree::HirConstArg::Param(name) = pattern_len
+                    && let Some(value) = actual_len.as_usize()
+                {
+                    subst.consts.insert(name.0.clone(), value);
+                    subst.tc_types.insert(
+                        name.0.clone(),
+                        type_checker::Type::Const(actual_len.clone()),
+                    );
+                }
+                Some(subst)
+            }
             _ => None,
         }
     }
@@ -4878,6 +5243,12 @@ impl<'a> LowerCtx<'a> {
             },
             hir::item_tree::HirTypeRef::Array(inner, _) => match actual {
                 type_checker::Type::Array(actual_inner, _) => {
+                    self.collect_hir_type_subst(inner, actual_inner, generics, subst, tc_subst)
+                }
+                _ => false,
+            },
+            hir::item_tree::HirTypeRef::Slice(inner) => match actual {
+                type_checker::Type::Slice(actual_inner) => {
                     self.collect_hir_type_subst(inner, actual_inner, generics, subst, tc_subst)
                 }
                 _ => false,
@@ -4938,6 +5309,9 @@ impl<'a> LowerCtx<'a> {
                     .map(|elem| self.convert_hir_type_with_substs(elem, subst, const_subst))
                     .collect(),
             ),
+            hir::item_tree::HirTypeRef::Slice(inner) => Type::Slice(Box::new(
+                self.convert_hir_type_with_substs(inner, subst, const_subst),
+            )),
             hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
                 Box::new(self.convert_hir_type_with_substs(inner, subst, const_subst)),
                 self.hir_const_arg_to_usize(len, const_subst),
@@ -5112,7 +5486,12 @@ fn mono_type_name(ty: &Type) -> String {
         Type::Char => "char".into(),
         Type::Unit => "unit".into(),
         Type::Never => "never".into(),
-        Type::Ref(inner, _) | Type::Ptr(inner) => format!("ptr_{}", mono_type_name(inner)),
+        Type::Ref(inner, mutable) => format!(
+            "ref{}_{}",
+            if *mutable { "mut" } else { "" },
+            mono_type_name(inner)
+        ),
+        Type::Ptr(inner) => format!("ptr_{}", mono_type_name(inner)),
         Type::Tuple(elems) => format!(
             "tuple_{}",
             elems
@@ -5121,6 +5500,7 @@ fn mono_type_name(ty: &Type) -> String {
                 .collect::<Vec<_>>()
                 .join("_")
         ),
+        Type::Slice(inner) => format!("slice_{}", mono_type_name(inner)),
         Type::Array(inner, len) => format!("arr{len}_{}", mono_type_name(inner)),
         Type::Struct(st) => st.name.clone(),
         Type::Enum(e) => e.name.clone(),
@@ -5268,6 +5648,7 @@ fn trait_operator_contract(
         anchor: hir::item_tree::PathAnchor::Plain,
         segments: vec![hir::Name("Self".into())],
         type_args: Vec::new(),
+        range: function.name_range,
     });
     if !trait_operator_params_match(trait_item, function, &self_ty, op) {
         return false;
@@ -5535,6 +5916,50 @@ fn callee_name(body: &Body, callee: ExprId) -> String {
     }
 }
 
+/// Every binding a `let` pattern introduces, paired with its `mut` flag.
+fn let_pattern_bindings(body: &Body, pat: PatId) -> Vec<(PatternBindingId, bool)> {
+    let mut bindings = Vec::new();
+    collect_let_pattern_bindings(body, pat, &mut bindings);
+    bindings
+}
+
+fn collect_let_pattern_bindings(
+    body: &Body,
+    pat: PatId,
+    bindings: &mut Vec<(PatternBindingId, bool)>,
+) {
+    match &body.pats[pat] {
+        Pattern::Binding { is_mut, .. } => bindings.push((
+            PatternBindingId {
+                pattern: pat,
+                field: None,
+            },
+            *is_mut,
+        )),
+        Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
+            for element in elements {
+                collect_let_pattern_bindings(body, *element, bindings);
+            }
+        }
+        Pattern::Struct { fields, .. } => {
+            for (index, field) in fields.iter().enumerate() {
+                match field.pat {
+                    Some(nested) => collect_let_pattern_bindings(body, nested, bindings),
+                    // Shorthand `Point { x, y }` binds immutably.
+                    None => bindings.push((
+                        PatternBindingId {
+                            pattern: pat,
+                            field: Some(index),
+                        },
+                        false,
+                    )),
+                }
+            }
+        }
+        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+    }
+}
+
 /// Resolve a struct field name to its index using type information.
 fn resolve_field_index(
     hir: &HirFile,
@@ -5583,5 +6008,48 @@ fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
         (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
         (Type::Ptr(_), Type::Ptr(_)) => CastOp::PtrToPtr,
         _ => unreachable!("unsupported cast reached MIR lowering: {source:?} as {target:?}"),
+    }
+}
+
+fn is_raw_parts_to_slice_cast(source: &Type, target: &Type) -> bool {
+    match (source, target) {
+        (Type::Tuple(parts), Type::Ref(target, false)) => {
+            let Type::Slice(target) = target.as_ref() else {
+                return false;
+            };
+            matches!(
+                parts.as_slice(),
+                [Type::Ptr(source), Type::Int(IntTy::Usize)] if source.as_ref() == target.as_ref()
+            )
+        }
+        _ => false,
+    }
+}
+
+/// `&[T] as (*const T, usize)`: decomposing a fat pointer into its parts.
+fn is_slice_to_raw_parts_cast(source: &Type, target: &Type) -> bool {
+    match (source, target) {
+        (Type::Ref(source, _), Type::Tuple(parts)) => {
+            let Type::Slice(element) = source.as_ref() else {
+                return false;
+            };
+            matches!(
+                parts.as_slice(),
+                [Type::Ptr(inner), Type::Int(IntTy::Usize)] if inner.as_ref() == element.as_ref()
+            )
+        }
+        _ => false,
+    }
+}
+
+fn is_byte_str_layout_cast(source: &Type, target: &Type) -> bool {
+    match (source, target) {
+        (Type::Ref(source, false), Type::Ref(target, false)) => matches!(
+            (source.as_ref(), target.as_ref()),
+            (Type::Slice(element), Type::Str)
+                | (Type::Str, Type::Slice(element))
+                if matches!(element.as_ref(), Type::Int(IntTy::U8))
+        ),
+        _ => false,
     }
 }

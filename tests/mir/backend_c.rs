@@ -1,6 +1,8 @@
-use crate::lower;
+use crate::{compile, lower};
 use mir::Backend;
 use mir::backend::c::CBackend;
+use std::fs;
+use std::process::Command;
 
 fn c_symbol(kind: char, name: &str) -> String {
     let suffix = name
@@ -43,7 +45,132 @@ fn c_simple_function() {
 }
 
 #[test]
-fn c_backend_emits_abort_panic_runtime() {
+fn c_slice_borrow_carries_length_and_indexes_elements() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        struct Item { value: i32 }
+
+        fun second(values: &[Item]) -> i32 {
+            values[1].value
+        }
+
+        fun main() -> i32 {
+            let values = [
+                Item { value: 10 },
+                Item { value: 20 },
+                Item { value: 30 },
+            ];
+            let slice: &[Item] = &values;
+            second(slice)
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(generated.contains("riddle_slice"), "{generated}");
+    assert!(generated.contains(&c_type("Item")), "{generated}");
+    assert!(generated.contains(".ptr"), "{generated}");
+    assert!(generated.contains("UINT64_C(3)"), "{generated}");
+}
+
+#[test]
+fn std_slices_support_safe_access_and_borrowed_iteration() {
+    let result = riddlec::pipeline::compile(
+        r#"
+        fun sum(values: &[i32]) -> i32 {
+            let mut total = 0;
+            for value in values {
+                total += *value;
+            }
+            total
+        }
+
+        fun increment(values: &mut [i32]) {
+            let length = values.len();
+            for value in values {
+                *value += 1;
+            }
+        }
+
+        fun main() -> i32 {
+            let mut values = [10, 20, 30];
+            let slice: &[i32] = &values;
+            let fallback = 0;
+            let before = *slice.get(1usize).unwrap_or(&fallback);
+            let length_ok = slice.len() == 3usize && !slice.is_empty();
+            increment(&mut values);
+            let after: &[i32] = &values;
+            if before == 20 && length_ok && sum(after) == 63 { 0 } else { 1 }
+        }
+        "#,
+    );
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+
+    let generated = riddlec::pipeline::generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+    assert!(generated.contains("riddle_slice"), "{generated}");
+    assert!(generated.contains(".len"), "{generated}");
+    assert!(generated.contains(".ptr"), "{generated}");
+}
+
+#[test]
+fn moving_a_mutable_reference_still_respects_live_reborrows() {
+    let (_, _, analysis, _) = compile(
+        r#"
+        fun consume<T>(value: T) {}
+
+        fun invalid(value: &mut i32) {
+            let child = &mut *value;
+            consume(value);
+            *child = 1;
+        }
+        "#,
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0304"),
+        "{:#?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn bare_slice_values_are_rejected() {
+    let result = riddlec::pipeline::compile_with_options(
+        "fun invalid(value: [i32]) -> [i32] { value }",
+        riddlec::pipeline::CompileOptions { use_std: false },
+    );
+    assert!(
+        result
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0043"),
+        "{:#?}",
+        result.type_result.diagnostics
+    );
+}
+
+#[test]
+fn c_extern_slice_abi_is_rejected() {
+    let module = lower(
+        r#"
+        unsafe extern "C" {
+            fun consume(values: &[i32]);
+        }
+
+        fun main() {}
+        "#,
+    );
+    let error = CBackend::new().compile(&module).unwrap_err();
+    assert!(error.contains("pointer and length separately"), "{error}");
+}
+
+#[test]
+fn c_backend_does_not_abort_after_never_extern() {
     let module = lower(
         r#"
         unsafe extern "C" {
@@ -57,9 +184,14 @@ fn c_backend_emits_abort_panic_runtime() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
-    assert!(generated.contains("riddle_panic"), "{generated}");
-    assert!(generated.contains("fwrite"), "{generated}");
-    assert!(generated.contains("abort()"), "{generated}");
+    assert!(
+        generated.contains("extern void panic(const char*)"),
+        "{generated}"
+    );
+    assert!(!generated.contains("riddle_panic"), "{generated}");
+    assert!(!generated.contains("static void panic"), "{generated}");
+    assert!(!generated.contains("abort()"), "{generated}");
+    assert!(generated.contains("for (;;) {}"), "{generated}");
     assert!(!generated.contains("return 0;"), "{generated}");
 }
 
@@ -850,7 +982,7 @@ fn c_backend_assigns_if_phi_inputs_before_branching() {
 }
 
 #[test]
-fn c_backend_provides_string_builtins() {
+fn c_backend_emits_string_externs() {
     let module = lower(
         r#"
         unsafe extern "C" {
@@ -868,24 +1000,17 @@ fn c_backend_provides_string_builtins() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains("static inline size_t str_len"),
-        "missing str_len builtin:\n{}",
-        result
+        result.contains("extern size_t str_len(const char*)"),
+        "{result}"
     );
     assert!(
-        result.contains("static inline uint8_t str_byte"),
-        "missing str_byte builtin:\n{}",
-        result
+        result.contains("extern uint8_t str_byte(const char*, size_t)"),
+        "{result}"
     );
+    assert!(!result.contains("static inline size_t str_len"), "{result}");
     assert!(
-        !result.contains("extern int64_t str_len"),
-        "str_len should be builtin:\n{}",
-        result
-    );
-    assert!(
-        !result.contains("extern int8_t str_byte"),
-        "str_byte should be builtin:\n{}",
-        result
+        !result.contains("static inline uint8_t str_byte"),
+        "{result}"
     );
 }
 
@@ -893,7 +1018,9 @@ fn c_backend_provides_string_builtins() {
 fn c_backend_wraps_string_extern_returns() {
     let module = lower(
         r#"
-        extern "C" fun greeting() -> &str;
+        unsafe extern "C" {
+            fun greeting() -> &str;
+        }
 
         fun hello() -> &str {
             return unsafe { greeting() };
@@ -1098,6 +1225,34 @@ fn c_backend_monomorphizes_generic_functions() {
     assert!(
         !result.contains(" id ("),
         "generic template should not be emitted directly:\n{}",
+        result
+    );
+}
+
+#[test]
+fn c_backend_monomorphizes_explicit_generic_method_arguments() {
+    let module = lower(
+        r#"
+        struct Helper {}
+
+        impl Helper {
+            fun id<T>(&self, value: T) -> T {
+                value
+            }
+        }
+
+        fun main() -> i32 {
+            let helper = Helper {};
+            helper.id::<i32>(1)
+        }
+        "#,
+    );
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+
+    assert!(
+        result.contains(&c_function("id__Helper_i32")),
+        "missing explicit generic method instance:\n{}",
         result
     );
 }
@@ -1393,4 +1548,172 @@ fn c_backend_heap_allocates_an_escaping_array() {
         generated.contains(&format!("->{}[0][0]", c_member("items"))),
         "{generated}"
     );
+}
+
+#[test]
+fn c_backend_inlines_checked_const_values() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        const ANSWER: i32 = 40 + 2;
+
+        fun answer() -> i32 {
+            ANSWER
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(
+        generated.contains("40") && generated.contains("2"),
+        "{generated}"
+    );
+    assert!(!generated.contains("return 0;"), "{generated}");
+}
+
+#[test]
+fn c_backend_checks_safe_array_and_slice_indexes() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        fun array_get(values: [i32; 2], index: usize) -> i32 {
+            values[index]
+        }
+
+        fun slice_get(values: &[i32], index: usize) -> i32 {
+            values[index]
+        }
+
+        fun raw_get(values: *const i32, index: usize) -> i32 {
+            unsafe { values[index] }
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert_eq!(
+        generated.matches("index out of bounds").count(),
+        2,
+        "{generated}"
+    );
+}
+
+#[test]
+fn c_backend_uses_strict_c11_representations_for_zero_sized_values() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        struct Empty {}
+
+        fun main() {
+            let empty = Empty {};
+            let values: [i32; 0] = [];
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(
+        generated.contains("unsigned char _riddle_zst;"),
+        "{generated}"
+    );
+    assert!(!generated.contains("[0]"), "{generated}");
+    assert!(!generated.contains("{  }"), "{generated}");
+}
+
+#[test]
+fn c_backend_defines_integer_and_float_cast_edge_semantics() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        fun add(left: i32, right: i32) -> i32 { left + right }
+        fun divide(left: i32, right: i32) -> i32 { left / right }
+        fun shift(left: i32, right: i32) -> i32 { left << right }
+        fun convert(value: f64) -> i32 { value as i32 }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(generated.contains("(uint32_t)"), "{generated}");
+    assert!(generated.contains("division by zero"), "{generated}");
+    assert!(generated.contains("isnan("), "{generated}");
+    assert!(generated.contains("INT32_MAX"), "{generated}");
+}
+
+#[test]
+fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    if !Command::new(&compiler)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping strict C11 numeric test: no usable C compiler");
+        return;
+    }
+
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        fun wrap(left: i32, right: i32) -> i32 { left + right }
+
+        fun wrap8(left: u8, right: u8) -> u8 { left + right }
+
+        fun shift(value: i32, count: i32) -> i32 { value >> count }
+
+        fun cast(value: f64) -> i32 { value as i32 }
+
+        fun main() -> i32 {
+            let zero = 0.0f64;
+            let wrapped = wrap(2147483647i32, 1i32);
+            let wrapped8 = wrap8(255u8, 1u8);
+            let shifted = shift(-4i32, 1i32);
+            let nan = cast(zero / zero);
+            if wrapped == -2147483648i32 && wrapped8 == 0u8 && shifted == -2i32 && nan == 0 {
+                0
+            } else {
+                1
+            }
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    let root = std::env::temp_dir().join(format!(
+        "riddle-c-numeric-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("main.c");
+    let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
+    fs::write(&source, generated).unwrap();
+
+    let compile_output = Command::new(&compiler)
+        .args(["-std=c11", "-pedantic-errors", "-Wall", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compile_output.status.success(),
+        "C11 compile failed:\n{}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+    let run = Command::new(&executable).output().unwrap();
+    assert!(
+        run.status.success(),
+        "native program exited with {}",
+        run.status
+    );
+    let _ = fs::remove_dir_all(root);
 }

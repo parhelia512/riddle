@@ -27,7 +27,7 @@ clue run [path] [-- <args>...]
 
 设置 `CC` 时 Clue 会严格使用指定的 C 编译器；否则会尝试 `cc`、`gcc`、`clang`、带版本后缀的 GCC/Clang，Windows 还会尝试 `clang-cl` 和 `cl`。候选必须能够完成 C11 编译和链接。解析后的路径和版本会参与构建指纹。库项目只保留生成的 `.clue/build/<package>.c`，不会链接可执行文件。
 
-二进制项目默认使用 Riddle 内置 GC，也可以通过一个实现 `rgc_init`、`rgc_alloc` 和 `rgc_collect` 的 C 源文件替换：
+二进制项目默认使用 Riddle 内置 GC，也可以通过一个实现 `rgc_init`、`rgc_alloc`、`rgc_realloc`、`rgc_free` 和 `rgc_collect` 的 C 源文件替换：
 
 ```toml
 [runtime]

@@ -21,6 +21,7 @@ pub enum Type {
         inner: Box<Type>,
     },
     Tuple(Vec<Type>),
+    Slice(Box<Type>),
     Array(Box<Type>, ConstArg),
     Struct(StructId, Vec<Type>),
     Enum(EnumId, Vec<Type>),
@@ -118,6 +119,7 @@ impl Type {
                     .join(", ");
                 format!("({inner})")
             }
+            Type::Slice(inner) => format!("[{}]", inner.display(hir)),
             Type::Array(inner, len) => format!("[{}; {}]", inner.display(hir), len.display()),
             Type::Struct(id, args) => {
                 let HirStruct { name, .. } = &hir.item_tree.structs[*id];
@@ -205,10 +207,10 @@ impl Type {
     }
 
     /// Returns `true` if this type has a known size at compile time.
-    /// Unsized types (like `str`) can only exist behind a pointer/reference.
+    /// Unsized types (`str` and `[T]`) can only exist behind a pointer/reference.
     pub fn is_sized(&self) -> bool {
         match self {
-            Type::Str => false,
+            Type::Str | Type::Slice(_) => false,
             Type::Tuple(elements) => elements.iter().all(Type::is_sized),
             Type::Array(inner, _) => inner.is_sized(),
             Type::Struct(_, args) | Type::Enum(_, args) => args.iter().all(Type::is_sized),
@@ -219,9 +221,9 @@ impl Type {
 
     pub(crate) fn is_valid_value_type(&self) -> bool {
         match self {
-            Type::Str => false,
+            Type::Str | Type::Slice(_) => false,
             Type::Ref(inner, _) | Type::Ptr { inner, .. } => {
-                matches!(inner.as_ref(), Type::Str) || inner.is_valid_value_type()
+                matches!(inner.as_ref(), Type::Str | Type::Slice(_)) || inner.is_valid_value_type()
             }
             Type::Tuple(elements) => elements.iter().all(Type::is_valid_value_type),
             Type::Array(inner, _) => inner.is_valid_value_type(),

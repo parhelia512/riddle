@@ -117,9 +117,20 @@ impl<'a> ScopeGraphBuilder<'a> {
         for it in items {
             match it {
                 TopLevelItem::Function(fid) => {
+                    self.encode_function_type_refs(*fid, parent_scope, frag_nodes, frag_edges);
                     self.encode_function(*fid, parent_scope, frag_nodes, frag_edges);
                 }
                 TopLevelItem::Struct(sid) => {
+                    let strukt = self.hir.item_tree.structs[*sid].clone();
+                    self.emit_bound_type_references(
+                        &strukt.generic_bounds,
+                        parent_scope,
+                        frag_nodes,
+                        frag_edges,
+                    );
+                    for field in &strukt.fields {
+                        self.emit_type_references(&field.ty, parent_scope, frag_nodes, frag_edges);
+                    }
                     self.encode_struct_impl_scope(*sid, parent_scope, frag_nodes, frag_edges);
                     let name = self.hir.item_tree.structs[*sid].name.clone();
                     self.emit_named_def(
@@ -131,6 +142,38 @@ impl<'a> ScopeGraphBuilder<'a> {
                     );
                 }
                 TopLevelItem::Enum(eid) => {
+                    let enumeration = self.hir.item_tree.enums[*eid].clone();
+                    self.emit_bound_type_references(
+                        &enumeration.generic_bounds,
+                        parent_scope,
+                        frag_nodes,
+                        frag_edges,
+                    );
+                    for variant in &enumeration.variants {
+                        match &variant.kind {
+                            hir::item_tree::HirVariantKind::Unit => {}
+                            hir::item_tree::HirVariantKind::Tuple(fields) => {
+                                for field in fields {
+                                    self.emit_type_references(
+                                        field,
+                                        parent_scope,
+                                        frag_nodes,
+                                        frag_edges,
+                                    );
+                                }
+                            }
+                            hir::item_tree::HirVariantKind::Struct(fields) => {
+                                for field in fields {
+                                    self.emit_type_references(
+                                        &field.ty,
+                                        parent_scope,
+                                        frag_nodes,
+                                        frag_edges,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let name = self.hir.item_tree.enums[*eid].name.clone();
                     self.emit_named_def(
                         parent_scope,
@@ -142,6 +185,35 @@ impl<'a> ScopeGraphBuilder<'a> {
                     self.encode_enum_variant_scope(*eid, parent_scope, frag_nodes, frag_edges);
                 }
                 TopLevelItem::Trait(tid) => {
+                    let tr = self.hir.item_tree.traits[*tid].clone();
+                    self.emit_bound_type_references(
+                        &tr.generic_bounds,
+                        parent_scope,
+                        frag_nodes,
+                        frag_edges,
+                    );
+                    self.emit_bound_type_references(
+                        &tr.supertraits,
+                        parent_scope,
+                        frag_nodes,
+                        frag_edges,
+                    );
+                    for default in tr.generic_defaults.iter().flatten() {
+                        self.emit_type_references(default, parent_scope, frag_nodes, frag_edges);
+                    }
+                    for method in &tr.methods {
+                        self.emit_function_signature_type_references(
+                            method,
+                            parent_scope,
+                            frag_nodes,
+                            frag_edges,
+                        );
+                    }
+                    for alias in &tr.type_aliases {
+                        if let Some(ty) = &alias.ty {
+                            self.emit_type_references(ty, parent_scope, frag_nodes, frag_edges);
+                        }
+                    }
                     let name = self.hir.item_tree.traits[*tid].name.clone();
                     self.emit_named_def(
                         parent_scope,
@@ -151,10 +223,13 @@ impl<'a> ScopeGraphBuilder<'a> {
                         frag_edges,
                     );
                     for fid in self.hir.item_tree.traits[*tid].default_methods.clone() {
+                        self.encode_function_type_refs(fid, parent_scope, frag_nodes, frag_edges);
                         self.encode_function_body(fid, parent_scope, frag_nodes, frag_edges);
                     }
                 }
                 TopLevelItem::Const(cid) => {
+                    let ty = self.hir.item_tree.consts[*cid].ty.clone();
+                    self.emit_type_references(&ty, parent_scope, frag_nodes, frag_edges);
                     let name = self.hir.item_tree.consts[*cid].name.clone();
                     self.emit_named_def(
                         parent_scope,
@@ -163,8 +238,12 @@ impl<'a> ScopeGraphBuilder<'a> {
                         frag_nodes,
                         frag_edges,
                     );
+                    self.encode_const_body(*cid, parent_scope);
                 }
                 TopLevelItem::TypeAlias(tid) => {
+                    if let Some(ty) = self.hir.item_tree.type_aliases[*tid].ty.clone() {
+                        self.emit_type_references(&ty, parent_scope, frag_nodes, frag_edges);
+                    }
                     let name = self.hir.item_tree.type_aliases[*tid].name.clone();
                     self.emit_named_def(
                         parent_scope,
@@ -330,6 +409,49 @@ impl<'a> ScopeGraphBuilder<'a> {
         self.encode_function_body(fid, parent_scope, frag_nodes, frag_edges);
     }
 
+    fn encode_function_type_refs(
+        &mut self,
+        fid: FunctionId,
+        parent_scope: NodeId,
+        nodes: &mut Vec<NodeId>,
+        edges: &mut Vec<EdgeId>,
+    ) {
+        let function = self.hir.item_tree.functions[fid].clone();
+        self.emit_function_signature_type_references(&function, parent_scope, nodes, edges);
+    }
+
+    fn emit_function_signature_type_references(
+        &mut self,
+        function: &hir::item_tree::HirFunction,
+        current_scope: NodeId,
+        nodes: &mut Vec<NodeId>,
+        edges: &mut Vec<EdgeId>,
+    ) {
+        self.emit_bound_type_references(&function.generic_bounds, current_scope, nodes, edges);
+        for param in &function.params {
+            self.emit_type_references(&param.ty, current_scope, nodes, edges);
+        }
+        if let Some(ret) = &function.ret_type {
+            self.emit_type_references(ret, current_scope, nodes, edges);
+        }
+    }
+
+    fn emit_bound_type_references(
+        &mut self,
+        bounds: &[hir::item_tree::HirGenericBound],
+        current_scope: NodeId,
+        nodes: &mut Vec<NodeId>,
+        edges: &mut Vec<EdgeId>,
+    ) {
+        for bound in bounds {
+            self.emit_type_references(&bound.target_ty, current_scope, nodes, edges);
+            self.emit_type_references(&bound.trait_ty, current_scope, nodes, edges);
+            for constraint in &bound.assoc_constraints {
+                self.emit_type_references(&constraint.ty, current_scope, nodes, edges);
+            }
+        }
+    }
+
     fn encode_function_def(
         &mut self,
         fid: FunctionId,
@@ -467,8 +589,19 @@ impl<'a> ScopeGraphBuilder<'a> {
     ) {
         let imp = &self.hir.item_tree.impls[iid];
         let associated_scope = self.impl_scope_for_self_ty(&imp.self_ty);
+        let item_scope = associated_scope.unwrap_or(parent_scope);
+        let self_ty = imp.self_ty.clone();
+        let trait_ty = imp.trait_ty.clone();
+        let bounds = imp.generic_bounds.clone();
 
-        for &fid in &imp.methods {
+        self.emit_type_references(&self_ty, parent_scope, frag_nodes, frag_edges);
+        if let Some(trait_ty) = &trait_ty {
+            self.emit_type_references(trait_ty, parent_scope, frag_nodes, frag_edges);
+        }
+        self.emit_bound_type_references(&bounds, parent_scope, frag_nodes, frag_edges);
+
+        for fid in imp.methods.clone() {
+            self.encode_function_type_refs(fid, item_scope, frag_nodes, frag_edges);
             let body_parent = associated_scope.unwrap_or(parent_scope);
             if let Some(scope) = associated_scope {
                 self.encode_function_def(fid, scope, frag_nodes, frag_edges);
@@ -478,7 +611,9 @@ impl<'a> ScopeGraphBuilder<'a> {
             }
         }
 
-        for &cid in &imp.consts {
+        for cid in imp.consts.clone() {
+            let ty = self.hir.item_tree.consts[cid].ty.clone();
+            self.emit_type_references(&ty, item_scope, frag_nodes, frag_edges);
             let name = self.hir.item_tree.consts[cid].name.clone();
             let pop = self.sg.alloc_node(Node::PopSymbol {
                 name,
@@ -492,9 +627,13 @@ impl<'a> ScopeGraphBuilder<'a> {
                 0,
             );
             frag_edges.push(e);
+            self.encode_const_body(cid, item_scope);
         }
 
-        for &tid in &imp.type_aliases {
+        for tid in imp.type_aliases.clone() {
+            if let Some(ty) = self.hir.item_tree.type_aliases[tid].ty.clone() {
+                self.emit_type_references(&ty, item_scope, frag_nodes, frag_edges);
+            }
             let name = self.hir.item_tree.type_aliases[tid].name.clone();
             let pop = self.sg.alloc_node(Node::PopSymbol {
                 name,
@@ -714,6 +853,7 @@ impl<'a> ScopeGraphBuilder<'a> {
             anchor: prefix.anchor,
             segments: segs,
             type_args: Vec::new(),
+            range: child.range,
         }
     }
 
@@ -791,28 +931,15 @@ impl<'a> ScopeGraphBuilder<'a> {
         edges: &mut Vec<EdgeId>,
     ) -> NodeId {
         match &body.stmts[sid] {
-            Stmt::Let { name, init, .. } => {
+            Stmt::Let { pat, ty, init, .. } => {
+                self.emit_type_references(ty, current_scope, nodes, edges);
                 if let Some(init) = init {
                     self.walk_expr_for_refs(body_id, body, *init, current_scope, nodes, edges);
                 }
 
-                // A `let` binding becomes visible only after its initializer.
-                let next_scope = self.sg.alloc_node(Node::Scope(ScopeKind::Block));
-                nodes.push(next_scope);
-                let e = self
-                    .sg
-                    .add_edge(next_scope, current_scope, EdgeKind::Lex, 0);
-                edges.push(e);
-
-                let pop = self.sg.alloc_node(Node::PopSymbol {
-                    name: name.clone(),
-                    define: DefRef::Local { stmt: sid },
-                });
-                nodes.push(pop);
-                let e = self.sg.add_edge(next_scope, pop, EdgeKind::Def, 0);
-                edges.push(e);
-
-                next_scope
+                // `let` bindings become visible only after the initializer, and
+                // ride the same pattern machinery as match arms and for loops.
+                self.walk_pat_for_bindings(body, *pat, current_scope, nodes, edges)
             }
             Stmt::Return { value } => {
                 if let Some(v) = value {
@@ -881,14 +1008,22 @@ impl<'a> ScopeGraphBuilder<'a> {
             Expr::Unary { operand, .. } => {
                 self.walk_expr_for_refs(body_id, body, *operand, current_scope, nodes, edges);
             }
-            Expr::Call { callee, args, .. } => {
+            Expr::Call {
+                callee,
+                args,
+                type_args,
+            } => {
                 self.walk_expr_for_refs(body_id, body, *callee, current_scope, nodes, edges);
+                for ty in type_args {
+                    self.emit_type_references(ty, current_scope, nodes, edges);
+                }
                 for a in args {
                     self.walk_expr_for_refs(body_id, body, *a, current_scope, nodes, edges);
                 }
             }
             Expr::Lambda {
                 params,
+                ret_type,
                 body: lambda_body,
                 ..
             } => {
@@ -899,6 +1034,7 @@ impl<'a> ScopeGraphBuilder<'a> {
                     .add_edge(lambda_scope, current_scope, EdgeKind::Lex, 0);
                 edges.push(edge);
                 for (index, param) in params.iter().enumerate() {
+                    self.emit_type_references(&param.ty, lambda_scope, nodes, edges);
                     let pop = self.sg.alloc_node(Node::PopSymbol {
                         name: param.name.clone(),
                         define: DefRef::LambdaParam {
@@ -911,6 +1047,7 @@ impl<'a> ScopeGraphBuilder<'a> {
                     let edge = self.sg.add_edge(lambda_scope, pop, EdgeKind::Def, 0);
                     edges.push(edge);
                 }
+                self.emit_type_references(ret_type, lambda_scope, nodes, edges);
                 self.walk_expr_for_refs(body_id, body, *lambda_body, lambda_scope, nodes, edges);
             }
             Expr::FieldAccess { base, .. } => {
@@ -977,8 +1114,9 @@ impl<'a> ScopeGraphBuilder<'a> {
             Expr::Unsafe { body: b } => {
                 self.walk_expr_for_refs(body_id, body, *b, current_scope, nodes, edges);
             }
-            Expr::Cast { base, .. } => {
+            Expr::Cast { base, target } => {
                 self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
+                self.emit_type_references(target, current_scope, nodes, edges);
             }
             Expr::Array { elements } | Expr::Tuple { elements } => {
                 for e in elements {
@@ -1001,14 +1139,84 @@ impl<'a> ScopeGraphBuilder<'a> {
         nodes: &mut Vec<NodeId>,
         edges: &mut Vec<EdgeId>,
     ) {
+        for ty in &path.type_args {
+            self.emit_type_references(ty, current_scope, nodes, edges);
+        }
+        self.emit_reference(
+            path,
+            RefOrigin::Expr {
+                body: body_id,
+                expr: eid,
+            },
+            current_scope,
+            nodes,
+            edges,
+        );
+    }
+
+    fn encode_const_body(&mut self, cid: hir::item_tree::ConstId, parent_scope: NodeId) {
+        if let Some(body_id) = self.hir.const_bodies.get(&cid).copied() {
+            let body = &self.hir.bodies[body_id];
+            self.encode_body_as_fragment(body_id, body, parent_scope);
+        }
+    }
+
+    fn emit_type_references(
+        &mut self,
+        ty: &HirTypeRef,
+        current_scope: NodeId,
+        nodes: &mut Vec<NodeId>,
+        edges: &mut Vec<EdgeId>,
+    ) {
+        match ty {
+            HirTypeRef::Named(path) => {
+                for arg in &path.type_args {
+                    self.emit_type_references(arg, current_scope, nodes, edges);
+                }
+                if !path.segments.is_empty() {
+                    self.emit_reference(
+                        path,
+                        RefOrigin::Type { range: path.range },
+                        current_scope,
+                        nodes,
+                        edges,
+                    );
+                }
+            }
+            HirTypeRef::Ref(inner, _)
+            | HirTypeRef::Ptr { inner, .. }
+            | HirTypeRef::Slice(inner)
+            | HirTypeRef::Array(inner, _) => {
+                self.emit_type_references(inner, current_scope, nodes, edges);
+            }
+            HirTypeRef::Tuple(elements) => {
+                for element in elements {
+                    self.emit_type_references(element, current_scope, nodes, edges);
+                }
+            }
+            HirTypeRef::Function { params, ret, .. } => {
+                for param in params {
+                    self.emit_type_references(param, current_scope, nodes, edges);
+                }
+                self.emit_type_references(ret, current_scope, nodes, edges);
+            }
+            HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => {}
+        }
+    }
+
+    fn emit_reference(
+        &mut self,
+        path: &HirPath,
+        origin: RefOrigin,
+        current_scope: NodeId,
+        nodes: &mut Vec<NodeId>,
+        edges: &mut Vec<EdgeId>,
+    ) {
         let anchor = self.anchor_scope_for(&path.anchor, current_scope);
         let r = self.sg.alloc_node(Node::Reference {
             segments: path.segments.clone(),
             anchor,
-            origin: RefOrigin::Expr {
-                body: body_id,
-                expr: eid,
-            },
+            origin,
         });
         nodes.push(r);
 
@@ -1080,7 +1288,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         edges: &mut Vec<EdgeId>,
     ) {
         match &body.pats[pat] {
-            Pattern::Binding { name } => {
+            Pattern::Binding { name, .. } => {
                 let next = self.sg.alloc_node(Node::Scope(ScopeKind::Block));
                 nodes.push(next);
                 let e = self.sg.add_edge(next, *current, EdgeKind::Lex, 0);

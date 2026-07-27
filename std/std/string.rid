@@ -1,10 +1,9 @@
-use crate::std::option::Option;
 use crate::std::vector::Vector;
 
-unsafe extern "C" {
-    safe fun str_len(value: &str) -> usize;
-    fun str_byte(value: &str, index: usize) -> u8;
-    fun str_from_raw(data: *const u8, len: usize) -> &str;
+// SAFETY: the caller must guarantee that value contains valid UTF-8.
+unsafe fun from_utf8_unchecked(value: &[u8]) -> &str {
+    // SAFETY: &[u8] and &str use the same pointer and length metadata.
+    unsafe { value as &str }
 }
 
 pub struct String {
@@ -25,7 +24,8 @@ impl String {
     }
 
     pub fun as_str(&self) -> &str {
-        unsafe { str_from_raw(self.bytes.as_ptr(), self.bytes.len()) }
+        // SAFETY: String only stores bytes copied from valid string slices.
+        unsafe { from_utf8_unchecked(self.bytes.as_slice()) }
     }
 
     pub fun len(&self) -> usize {
@@ -41,10 +41,8 @@ impl String {
     }
 
     pub fun push_str(&mut self, value: &str) {
-        let mut index = 0usize;
-        while index < value.len() {
-            self.bytes.push(unsafe { str_byte(value, index) });
-            index += 1usize;
+        for byte in value.as_bytes() {
+            self.bytes.push(*byte);
         }
     }
 
@@ -55,18 +53,14 @@ impl String {
 
 impl str {
     pub fun len(&self) -> usize {
-        str_len(self)
+        self.as_bytes().len()
     }
 
     pub fun is_empty(&self) -> bool {
         self.len() == 0usize
     }
 
-    pub fun byte_at(&self, index: usize) -> Option<u8> {
-        if index < self.len() {
-            Option::Some(unsafe { str_byte(self, index) })
-        } else {
-            Option::None
-        }
+    pub fun as_bytes(&self) -> &[u8] {
+        self as &[u8]
     }
 }

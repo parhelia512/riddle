@@ -48,6 +48,9 @@ impl TypeChecker<'_> {
                     .map(|ty| self.lower_type_ref_with_params_at(ty, params, span))
                     .collect(),
             ),
+            HirTypeRef::Slice(inner) => Type::Slice(Box::new(
+                self.lower_type_ref_with_params_at(inner, params, span),
+            )),
             HirTypeRef::Array(inner, len) => {
                 if let Some(suggestion) = self.swapped_array_type_suggestion(inner, len, params) {
                     self.diagnostic("E0034", "invalid array type syntax", span);
@@ -108,6 +111,7 @@ impl TypeChecker<'_> {
                     .join(", ");
                 format!("({})", inner)
             }
+            HirTypeRef::Slice(elem) => format!("[{}]", Self::type_text(elem)),
             HirTypeRef::Array(elem, len) => {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
@@ -132,8 +136,10 @@ impl TypeChecker<'_> {
         let HirTypeRef::Named(path) = ty else {
             return None;
         };
-        let name = path.segments.last()?.0.as_str();
-        self.find_trait_by_name(name)
+        match self.hir.type_resolutions.get(&path.range) {
+            Some(hir::body::ResolvedName::Trait(id)) => Some(*id),
+            _ => None,
+        }
     }
 
     pub(crate) fn trait_ref_subst(
@@ -195,54 +201,61 @@ impl TypeChecker<'_> {
             return self.lower_type_alias(type_alias);
         }
 
-        let Some(name) = path.as_single_name().map(|name| name.0.as_str()) else {
-            self.diagnostic("E0034", format!("unknown type `{}`", path.display()), span);
-            return Type::Unknown;
-        };
+        if let Some(name) = path.as_single_name().map(|name| name.0.as_str()) {
+            let builtin = match name {
+                "i8" => Some(Type::Int(IntTy::I8)),
+                "i16" => Some(Type::Int(IntTy::I16)),
+                "i32" => Some(Type::Int(IntTy::I32)),
+                "i64" => Some(Type::Int(IntTy::I64)),
+                "isize" => Some(Type::Int(IntTy::Isize)),
+                "u8" => Some(Type::Int(IntTy::U8)),
+                "u16" => Some(Type::Int(IntTy::U16)),
+                "u32" => Some(Type::Int(IntTy::U32)),
+                "u64" => Some(Type::Int(IntTy::U64)),
+                "usize" => Some(Type::Int(IntTy::Usize)),
+                "f32" => Some(Type::Float(FloatTy::F32)),
+                "f64" => Some(Type::Float(FloatTy::F64)),
+                "bool" => Some(Type::Bool),
+                "str" => Some(Type::Str),
+                "char" => Some(Type::Char),
+                _ => None,
+            };
+            if let Some(ty) = builtin {
+                return ty;
+            }
+            if let Some(param_ty) = params.get(name) {
+                return param_ty.clone();
+            }
+        }
 
-        match name {
-            "i8" => Type::Int(IntTy::I8),
-            "i16" => Type::Int(IntTy::I16),
-            "i32" => Type::Int(IntTy::I32),
-            "i64" => Type::Int(IntTy::I64),
-            "isize" => Type::Int(IntTy::Isize),
-            "u8" => Type::Int(IntTy::U8),
-            "u16" => Type::Int(IntTy::U16),
-            "u32" => Type::Int(IntTy::U32),
-            "u64" => Type::Int(IntTy::U64),
-            "usize" => Type::Int(IntTy::Usize),
-            "f32" => Type::Float(FloatTy::F32),
-            "f64" => Type::Float(FloatTy::F64),
-            "bool" => Type::Bool,
-            "str" => Type::Str,
-            "char" => Type::Char,
+        let resolved = self.hir.type_resolutions.get(&path.range).cloned();
+        match resolved {
+            Some(hir::body::ResolvedName::Struct(struct_id)) => {
+                let args = self.lower_type_args(&path.type_args, params, span);
+                self.check_type_arg_count(
+                    &path.display(),
+                    self.hir.item_tree.structs[struct_id].generics.len()
+                        + self.hir.item_tree.structs[struct_id].const_generics.len(),
+                    args.len(),
+                    span,
+                );
+                Type::Struct(struct_id, args)
+            }
+            Some(hir::body::ResolvedName::Enum(enum_id)) => {
+                let args = self.lower_type_args(&path.type_args, params, span);
+                self.check_type_arg_count(
+                    &path.display(),
+                    self.hir.item_tree.enums[enum_id].generics.len()
+                        + self.hir.item_tree.enums[enum_id].const_generics.len(),
+                    args.len(),
+                    span,
+                );
+                Type::Enum(enum_id, args)
+            }
+            Some(hir::body::ResolvedName::TypeAlias(alias)) => self.lower_type_alias(alias),
             _ => {
-                if let Some(param_ty) = params.get(name) {
-                    param_ty.clone()
-                } else if let Some(struct_id) = self.find_struct_by_name(name) {
-                    let args = self.lower_type_args(&path.type_args, params, span);
-                    self.check_type_arg_count(
-                        name,
-                        self.hir.item_tree.structs[struct_id].generics.len()
-                            + self.hir.item_tree.structs[struct_id].const_generics.len(),
-                        args.len(),
-                        span,
-                    );
-                    Type::Struct(struct_id, args)
-                } else if let Some(enum_id) = self.find_enum_by_name(name) {
-                    let args = self.lower_type_args(&path.type_args, params, span);
-                    self.check_type_arg_count(
-                        name,
-                        self.hir.item_tree.enums[enum_id].generics.len()
-                            + self.hir.item_tree.enums[enum_id].const_generics.len(),
-                        args.len(),
-                        span,
-                    );
-                    Type::Enum(enum_id, args)
-                } else {
-                    self.diagnostic("E0034", format!("unknown type `{name}`"), span);
-                    Type::Unknown
-                }
+                self.diagnostic("E0034", format!("unknown type `{}`", path.display()), span);
+                Type::Unknown
             }
         }
     }
@@ -522,6 +535,12 @@ pub(crate) fn collect_subst(
             }
             _ => false,
         },
+        Type::Slice(expected_inner) => match actual {
+            Type::Slice(actual_inner) | Type::Array(actual_inner, _) => {
+                collect_subst(expected_inner, actual_inner, subst)
+            }
+            _ => false,
+        },
         Type::Array(expected_inner, expected_len) => match actual {
             Type::Array(actual_inner, actual_len) => {
                 collect_const_subst(expected_len, actual_len, subst)
@@ -588,6 +607,7 @@ pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type 
                 .map(|ty| substitute_type(ty, subst))
                 .collect(),
         ),
+        Type::Slice(inner) => Type::Slice(Box::new(substitute_type(inner, subst))),
         Type::Array(inner, len) => Type::Array(
             Box::new(substitute_type(inner, subst)),
             substitute_const(len, subst),

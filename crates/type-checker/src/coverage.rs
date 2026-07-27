@@ -70,6 +70,30 @@ struct UsefulnessState {
 }
 
 impl TypeChecker<'_> {
+    /// Whether a single pattern fails to cover `scrutinee_ty`, i.e. whether it
+    /// is refutable. Irrefutability is exactly one-arm exhaustiveness.
+    pub(crate) fn missing_let_pattern(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        pat: PatId,
+        scrutinee_ty: &Type,
+    ) -> Option<(String, Vec<String>)> {
+        if scrutinee_ty.is_unknown_like() {
+            return None;
+        }
+
+        let matrix = vec![vec![self.lower_matrix_pattern(ctx, pat, scrutinee_ty)]];
+        let witness = self.useful(
+            &matrix,
+            &[MatrixPat::Wildcard],
+            std::slice::from_ref(scrutinee_ty),
+        )?;
+        let witness = witness.first()?;
+        let pattern = self.display_matrix_pattern(witness);
+        let notes = integer_range_notes(witness, &pattern);
+        Some((pattern, notes))
+    }
+
     pub(crate) fn missing_match_pattern(
         &mut self,
         ctx: &BodyCtx<'_>,
@@ -244,7 +268,7 @@ impl TypeChecker<'_> {
             Pattern::Literal(literal) => literal_constructor(literal, expected)
                 .map(|constructor| MatrixPat::Constructor(constructor, Vec::new()))
                 .unwrap_or(MatrixPat::Invalid),
-            Pattern::Binding { name } => {
+            Pattern::Binding { name, .. } => {
                 let Type::Enum(enum_id, _) = expected else {
                     return MatrixPat::Wildcard;
                 };
@@ -841,9 +865,10 @@ fn type_head(ty: &Type) -> TypeHead {
 
 fn type_size(ty: &Type) -> usize {
     match ty {
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
-            1usize.saturating_add(type_size(inner))
-        }
+        Type::Ref(inner, _)
+        | Type::Ptr { inner, .. }
+        | Type::Slice(inner)
+        | Type::Array(inner, _) => 1usize.saturating_add(type_size(inner)),
         Type::Tuple(fields) | Type::Struct(_, fields) | Type::Enum(_, fields) => fields
             .iter()
             .fold(1usize, |size, field| size.saturating_add(type_size(field))),

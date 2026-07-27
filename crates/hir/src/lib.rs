@@ -1,8 +1,10 @@
 use body_lower::BodyLower;
 use std::collections::HashMap;
 
-use body::{Body, BodyId};
-use item_tree::{FunctionId, HirInternalAttr, HirModule, HirUse, ItemTree, ModuleId, TopLevelItem};
+use body::{Body, BodyId, ResolvedName};
+use item_tree::{
+    ConstId, FunctionId, HirInternalAttr, HirModule, HirUse, ItemTree, ModuleId, TopLevelItem,
+};
 use la_arena::Arena;
 use lower::{AstLower, Lower};
 use rowan::TextRange;
@@ -26,6 +28,8 @@ pub struct HirFile {
     pub item_tree: ItemTree,
     pub bodies: Arena<Body>,
     pub function_bodies: HashMap<FunctionId, BodyId>,
+    pub const_bodies: HashMap<ConstId, BodyId>,
+    pub type_resolutions: HashMap<TextRange, ResolvedName>,
     pub internal_attrs: Vec<HirInternalAttr>,
     /// Disjoint source ranges owned by packages participating in this compilation.
     pub package_ranges: Vec<TextRange>,
@@ -53,6 +57,8 @@ pub fn lower_root(root: Root) -> HirFile {
         },
         bodies: Arena::new(),
         function_bodies: HashMap::new(),
+        const_bodies: HashMap::new(),
+        type_resolutions: HashMap::new(),
         internal_attrs,
         package_ranges: vec![package_range],
         std_loaded: false,
@@ -123,18 +129,16 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
 
             ast::Stmt::ExternFnDecl(decl) => {
                 let explicitly_unsafe = decl.is_unsafe();
-                if let Some(func) = decl.func_decl() {
-                    let body_ast = func.body();
-                    let is_import = body_ast.is_none();
+                if let Some(func) = decl.func_decl()
+                    && let Some(body_ast) = func.body()
+                {
                     let fid = func.lower(&mut hir.item_tree.functions);
-                    hir.item_tree.functions[fid].is_unsafe |= explicitly_unsafe || is_import;
+                    hir.item_tree.functions[fid].is_unsafe |= explicitly_unsafe;
                     items.push(TopLevelItem::Function(fid));
                     hir.item_tree.extern_function_ids.push(fid);
-                    if let Some(block) = body_ast {
-                        let body = BodyLower::lower(hir, block);
-                        let bid = hir.bodies.alloc(body);
-                        hir.function_bodies.insert(fid, bid);
-                    }
+                    let body = BodyLower::lower(hir, body_ast);
+                    let bid = hir.bodies.alloc(body);
+                    hir.function_bodies.insert(fid, bid);
                 }
             }
 
@@ -149,7 +153,13 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
             }
 
             ast::Stmt::ConstDecl(c) => {
+                let value = c.value();
                 let cid = c.lower(&mut hir.item_tree.consts);
+                if let Some(value) = value {
+                    let body = BodyLower::lower_const(hir, value);
+                    let body_id = hir.bodies.alloc(body);
+                    hir.const_bodies.insert(cid, body_id);
+                }
                 items.push(TopLevelItem::Const(cid));
             }
 
@@ -182,6 +192,7 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
         .collect::<Vec<_>>();
     let tid = t.lower(&mut hir.item_tree.traits);
     let trait_name = hir.item_tree.traits[tid].name.clone();
+    let trait_name_range = hir.item_tree.traits[tid].name_range;
     let trait_generics = hir.item_tree.traits[tid].generics.clone();
 
     for (method, body_ast) in default_methods {
@@ -195,13 +206,14 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
             })
             .unwrap_or_default();
         let fid = method.lower(&mut hir.item_tree.functions);
+        let range = hir.item_tree.functions[fid].name_range;
         let self_ty = HirTypeRef::Named(HirPath {
             anchor: PathAnchor::Plain,
             segments: vec![Name("Self".into())],
             type_args: Vec::new(),
+            range,
         });
         apply_self_receiver_types(&mut hir.item_tree.functions[fid], &receivers, &self_ty);
-        let range = hir.item_tree.functions[fid].name_range;
         hir.item_tree.functions[fid]
             .generic_bounds
             .push(HirGenericBound {
@@ -218,9 +230,11 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
                                 anchor: PathAnchor::Plain,
                                 segments: vec![name.clone()],
                                 type_args: Vec::new(),
+                                range,
                             })
                         })
                         .collect(),
+                    range: trait_name_range,
                 }),
                 trait_range: range,
                 assoc_constraints: Vec::new(),
@@ -312,10 +326,17 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
         }
     }
 
-    let consts = i
-        .consts()
-        .map(|c| c.lower(&mut hir.item_tree.consts))
-        .collect();
+    let mut consts = Vec::new();
+    for c in i.consts() {
+        let value = c.value();
+        let cid = c.lower(&mut hir.item_tree.consts);
+        if let Some(value) = value {
+            let body = BodyLower::lower_const(hir, value);
+            let body_id = hir.bodies.alloc(body);
+            hir.const_bodies.insert(cid, body_id);
+        }
+        consts.push(cid);
+    }
     let type_aliases = i
         .type_aliases()
         .map(|t| t.lower(&mut hir.item_tree.type_aliases))

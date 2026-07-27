@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use hir::{
-    body::{BodyId, ExprId, PatId, PatternBindingId, StmtId},
+    body::{BodyId, ExprId, PatId, PatternBindingId},
     item_tree::{FunctionId, TraitId},
 };
 use rowan::TextRange;
@@ -46,6 +46,7 @@ pub enum Severity {
 pub struct TypeCheckResult {
     pub diagnostics: Vec<Diagnostic>,
     pub expr_types: HashMap<(BodyId, ExprId), Type>,
+    pub expr_coercions: HashMap<(BodyId, ExprId), Type>,
     pub generic_calls: HashMap<(BodyId, ExprId), GenericCall>,
     pub trait_method_calls: HashMap<(BodyId, ExprId), TraitMethodCall>,
     pub operator_calls: HashMap<(BodyId, ExprId), OperatorCall>,
@@ -78,7 +79,6 @@ impl CaptureMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CaptureSource {
-    Local(StmtId),
     Pattern(PatternBindingId),
     Param(usize),
     LambdaParam { lambda: ExprId, index: usize },

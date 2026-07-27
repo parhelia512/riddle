@@ -60,6 +60,7 @@ struct CachedBody {
     body_hash: u64,
     diagnostics: Vec<Diagnostic>,
     expr_types: Vec<(ExprId, Type)>,
+    expr_coercions: Vec<(ExprId, Type)>,
     generic_calls: Vec<(ExprId, GenericCall)>,
     trait_method_calls: Vec<(ExprId, TraitMethodCall)>,
     operator_calls: Vec<(ExprId, OperatorCall)>,
@@ -161,6 +162,11 @@ impl IncrementalTypeChecker {
             impl_diagnostics,
         });
 
+        // Constants are module-level inputs to every body and are not cached
+        // as function bodies. Recheck them on each incremental pass so an
+        // initializer diagnostic cannot disappear behind a reused function.
+        checker.check_const_bodies();
+
         for (fid, function) in hir.item_tree.functions.iter() {
             let Some(body_id) = hir.function_bodies.get(&fid).copied() else {
                 continue;
@@ -193,6 +199,18 @@ impl IncrementalTypeChecker {
             let expr_types = checker
                 .result
                 .expr_types
+                .iter()
+                .filter_map(|((checked_body, expr), ty)| {
+                    if *checked_body == body_id {
+                        Some((*expr, ty.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let expr_coercions = checker
+                .result
+                .expr_coercions
                 .iter()
                 .filter_map(|((checked_body, expr), ty)| {
                     if *checked_body == body_id {
@@ -278,6 +296,7 @@ impl IncrementalTypeChecker {
                     body_hash,
                     diagnostics,
                     expr_types,
+                    expr_coercions,
                     generic_calls,
                     trait_method_calls,
                     operator_calls,
@@ -326,6 +345,12 @@ fn replay_cached_body(
         checker
             .result
             .expr_types
+            .insert((body_id, *expr), ty.clone());
+    }
+    for (expr, ty) in &cached.expr_coercions {
+        checker
+            .result
+            .expr_coercions
             .insert((body_id, *expr), ty.clone());
     }
     for (expr, call) in &cached.generic_calls {

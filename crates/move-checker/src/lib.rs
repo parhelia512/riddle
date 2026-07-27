@@ -16,9 +16,12 @@ use type_checker::{
     SourceLabel, TraitEnv, Type, TypeCheckResult,
 };
 
+mod initialization;
 mod reference_flow;
 
-use reference_flow::{FlowKind, ReferenceFlow, type_may_carry_reference};
+use reference_flow::{
+    FlowKind, FunctionSummary, ReferenceFlow, SummaryOrigin, type_may_carry_reference,
+};
 
 type LoanId = usize;
 
@@ -40,10 +43,14 @@ impl BorrowKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AccessRoot {
-    Local(StmtId),
+    /// Any binding introduced by a pattern — a `let`, a `match` arm, or a `for`
+    /// loop. `let` has no separate root because every `let` carries a pattern.
     Pattern(PatternBindingId),
     Param(usize),
-    LambdaParam { lambda: ExprId, index: usize },
+    LambdaParam {
+        lambda: ExprId,
+        index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,6 +93,69 @@ struct Origin {
 
 type Origins = HashSet<Origin>;
 
+#[derive(Debug, Clone, Default)]
+struct OriginValue {
+    origins: Origins,
+    fields: Vec<OriginValue>,
+}
+
+impl OriginValue {
+    fn from_origins(origins: Origins) -> Self {
+        Self {
+            origins,
+            fields: Vec::new(),
+        }
+    }
+
+    fn from_fields(fields: Vec<Self>) -> Self {
+        let origins = fields
+            .iter()
+            .flat_map(|field| field.origins.iter().cloned())
+            .collect();
+        Self { origins, fields }
+    }
+
+    fn project(&self, index: usize) -> Self {
+        self.fields
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| self.flattened())
+    }
+
+    fn iterated(&self) -> Self {
+        if self.fields.is_empty() {
+            return self.flattened();
+        }
+        let mut value = Self::default();
+        for field in self.fields.iter().cloned() {
+            value.merge(field);
+        }
+        value
+    }
+
+    fn flattened(&self) -> Self {
+        Self::from_origins(self.origins.clone())
+    }
+
+    fn merge(&mut self, other: Self) {
+        if self.origins.is_empty() && self.fields.is_empty() {
+            *self = other;
+            return;
+        }
+        if other.origins.is_empty() && other.fields.is_empty() {
+            return;
+        }
+        if self.fields.len() == other.fields.len() && !self.fields.is_empty() {
+            for (field, other_field) in self.fields.iter_mut().zip(other.fields.iter().cloned()) {
+                field.merge(other_field);
+            }
+        } else {
+            self.fields.clear();
+        }
+        self.origins.extend(other.origins);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AccessTarget {
     place: AccessPlace,
@@ -102,12 +172,14 @@ pub struct AnalysisResult {
 /// heap allocation does not relax move or borrow rules.
 pub fn analyze(hir: &HirFile, type_result: &TypeCheckResult) -> AnalysisResult {
     let reference_flow = ReferenceFlow::build(hir, type_result);
+    let mut result = AnalysisResult::default();
+    initialization::check(hir, type_result, &mut result);
     let mut a = Analyzer {
         hir,
         type_result,
         trait_env: &type_result.trait_env,
         reference_flow: &reference_flow,
-        result: AnalysisResult::default(),
+        result,
     };
     a.analyze_all_bodies();
     a.result
@@ -174,16 +246,14 @@ impl<'a> Analyzer<'a> {
             | Expr::BoolLiteral { .. } => {}
 
             Expr::Path { path, resolved } => {
-                let origins = match resolved {
-                    Some(ResolvedName::Local(stmt)) => {
-                        ctx.local_origins.get(stmt).cloned().unwrap_or_default()
-                    }
-                    Some(ResolvedName::Param(index)) => {
-                        ctx.param_origins.get(index).cloned().unwrap_or_default()
-                    }
-                    _ => Origins::new(),
+                let value = match resolved {
+                    Some(ResolvedName::PatternBinding(id)) => ctx.local_origin_value(*id),
+                    Some(ResolvedName::Param(index)) => OriginValue::from_origins(
+                        ctx.param_origins.get(index).cloned().unwrap_or_default(),
+                    ),
+                    _ => OriginValue::default(),
                 };
-                ctx.expr_origins.insert(expr_id, origins);
+                ctx.set_expr_origin_value(expr_id, value);
                 if let Some(name) = path.as_single_name()
                     && let Some(moved) = ctx.bindings.get(&name.0)
                 {
@@ -191,8 +261,8 @@ impl<'a> Analyzer<'a> {
                         let extra = resolved
                             .as_ref()
                             .and_then(|resolved| {
-                                if let ResolvedName::Local(stmt) = resolved {
-                                    let p = Place::root(*stmt);
+                                if let ResolvedName::PatternBinding(id) = resolved {
+                                    let p = Place::root(*id);
                                     Some(self.move_site_labels(ctx, &p))
                                 } else {
                                     None
@@ -206,13 +276,13 @@ impl<'a> Analyzer<'a> {
                             &extra,
                         );
                     }
-                    if let Some(ResolvedName::Local(stmt)) = resolved {
-                        ctx.release_local_if_dead(*stmt);
+                    if let Some(ResolvedName::PatternBinding(id)) = resolved {
+                        ctx.release_local_if_dead(*id);
                     }
                     return;
                 }
-                if let Some(ResolvedName::Local(stmt)) = resolved {
-                    let place = Place::root(*stmt);
+                if let Some(ResolvedName::PatternBinding(id)) = resolved {
+                    let place = Place::root(*id);
                     if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
                         let label = path.as_single_name().map(|n| n.0.as_str()).unwrap_or("_");
                         let extra = self.move_site_labels(ctx, &place);
@@ -223,9 +293,7 @@ impl<'a> Analyzer<'a> {
                             &extra,
                         );
                     }
-                }
-                if let Some(ResolvedName::Local(stmt)) = resolved {
-                    ctx.release_local_if_dead(*stmt);
+                    ctx.release_local_if_dead(*id);
                 }
             }
 
@@ -234,22 +302,17 @@ impl<'a> Analyzer<'a> {
                 for field in fields {
                     self.move_check_expr(ctx, field.value);
                     self.consume_if_local(ctx, field.value);
-                    origins.extend(
-                        ctx.expr_origins
-                            .get(&field.value)
-                            .cloned()
-                            .unwrap_or_default(),
-                    );
+                    origins.extend(ctx.expr_origin_value(field.value).origins);
                 }
-                let origins = if self.expr_may_carry_reference(ctx, expr_id) {
-                    origins
+                let value = if self.expr_may_carry_reference(ctx, expr_id) {
+                    OriginValue::from_origins(origins)
                 } else {
                     for field in fields {
                         self.deactivate_unretained(ctx, field.value, &HashSet::new());
                     }
-                    Origins::new()
+                    OriginValue::default()
                 };
-                ctx.expr_origins.insert(expr_id, origins);
+                ctx.set_expr_origin_value(expr_id, value);
             }
 
             Expr::Binary { lhs, rhs, op } => {
@@ -266,11 +329,19 @@ impl<'a> Analyzer<'a> {
                             "E0303",
                         );
                     }
-                    if let Some(stmt) = self.direct_local_root(ctx, *lhs) {
-                        ctx.bind_origins(
-                            stmt,
-                            ctx.expr_origins.get(rhs).cloned().unwrap_or_default(),
-                        );
+                    if let Some((binding, direct)) = self.local_assignment(ctx, *lhs) {
+                        let mut value = ctx.expr_origin_value(*rhs);
+                        if !direct {
+                            value.origins.extend(
+                                ctx.local_origins
+                                    .get(&binding)
+                                    .into_iter()
+                                    .flatten()
+                                    .cloned(),
+                            );
+                            value.fields.clear();
+                        }
+                        ctx.bind_origin_value(binding, value);
                     }
                     self.consume_if_local(ctx, *rhs);
                 }
@@ -308,10 +379,7 @@ impl<'a> Analyzer<'a> {
                 }
                 if let Some(tail) = tail {
                     self.move_check_expr(ctx, *tail);
-                    ctx.expr_origins.insert(
-                        expr_id,
-                        ctx.expr_origins.get(tail).cloned().unwrap_or_default(),
-                    );
+                    ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*tail));
                     self.consume_if_local(ctx, *tail);
                 }
                 ctx.pop_scope();
@@ -327,15 +395,11 @@ impl<'a> Analyzer<'a> {
                 if let Some(e) = else_branch {
                     self.move_check_expr(ctx, *e);
                 }
-                let mut origins = ctx
-                    .expr_origins
-                    .get(then_branch)
-                    .cloned()
-                    .unwrap_or_default();
+                let mut value = ctx.expr_origin_value(*then_branch);
                 if let Some(e) = else_branch {
-                    origins.extend(ctx.expr_origins.get(e).cloned().unwrap_or_default());
+                    value.merge(ctx.expr_origin_value(*e));
                 }
-                ctx.expr_origins.insert(expr_id, origins);
+                ctx.set_expr_origin_value(expr_id, value);
             }
 
             Expr::While { condition, body } => {
@@ -348,7 +412,9 @@ impl<'a> Analyzer<'a> {
                 iterable,
                 body,
             } => {
+                ctx.push_scope();
                 self.move_check_expr(ctx, *iterable);
+                let item_value = ctx.expr_origin_value(*iterable).iterated();
                 self.consume_if_local(ctx, *iterable);
                 let item_ty = self
                     .type_result
@@ -369,12 +435,15 @@ impl<'a> Analyzer<'a> {
                 }
                 ctx.push_scope();
                 self.bind_pattern_names(ctx, *pat);
+                self.bind_pattern_origins(ctx, *pat, &item_value);
                 self.move_check_expr(ctx, *body);
+                ctx.pop_scope();
                 ctx.pop_scope();
             }
 
             Expr::Match { scrutinee, arms } => {
                 self.move_check_expr(ctx, *scrutinee);
+                let scrutinee_value = ctx.expr_origin_value(*scrutinee);
                 let scrutinee_ty = self
                     .type_result
                     .expr_types
@@ -395,6 +464,7 @@ impl<'a> Analyzer<'a> {
                     self.check_pattern_move_from_drop(ctx, arm.pat, &scrutinee_ty);
                     ctx.push_scope();
                     self.bind_pattern_names(ctx, arm.pat);
+                    self.bind_pattern_origins(ctx, arm.pat, &scrutinee_value);
                     if let Some(g) = arm.guard {
                         let old_guard = std::mem::replace(&mut ctx.in_match_guard, true);
                         self.move_check_expr(ctx, g);
@@ -429,30 +499,30 @@ impl<'a> Analyzer<'a> {
                 ctx.bindings = merged_bindings;
                 ctx.moved_places = merged_moved_places;
                 ctx.moved_sites = merged_moved_sites;
-                let mut origins = Origins::new();
+                let mut value = OriginValue::default();
                 for arm in arms {
-                    origins.extend(ctx.expr_origins.get(&arm.body).cloned().unwrap_or_default());
+                    value.merge(ctx.expr_origin_value(arm.body));
                 }
-                ctx.expr_origins.insert(expr_id, origins);
+                ctx.set_expr_origin_value(expr_id, value);
             }
 
             Expr::Array { elements } | Expr::Tuple { elements } => {
-                let mut origins = Origins::new();
+                let mut fields = Vec::with_capacity(elements.len());
                 for el in elements {
                     self.move_check_expr(ctx, *el);
                     self.consume_if_local(ctx, *el);
-                    origins.extend(ctx.expr_origins.get(el).cloned().unwrap_or_default());
+                    fields.push(ctx.expr_origin_value(*el));
                 }
-                ctx.expr_origins.insert(expr_id, origins);
+                ctx.set_expr_origin_value(expr_id, OriginValue::from_fields(fields));
             }
 
             Expr::ArrayRepeat { value, len } => {
                 self.move_check_expr(ctx, *value);
                 self.consume_if_local(ctx, *value);
                 self.move_check_expr(ctx, *len);
-                ctx.expr_origins.insert(
+                ctx.set_expr_origin_value(
                     expr_id,
-                    ctx.expr_origins.get(value).cloned().unwrap_or_default(),
+                    OriginValue::from_fields(vec![ctx.expr_origin_value(*value)]),
                 );
             }
 
@@ -475,8 +545,8 @@ impl<'a> Analyzer<'a> {
                     self.move_check_expr(ctx, *arg);
                 }
                 let (inputs, modes, fid) = self.call_signature(ctx, *callee, args);
-                let origins = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, span);
-                ctx.expr_origins.insert(expr_id, origins);
+                let value = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, span);
+                ctx.set_expr_origin_value(expr_id, value);
                 for (index, input) in inputs.iter().enumerate() {
                     if modes.get(index).copied().flatten().is_none() {
                         self.consume_if_local(ctx, *input);
@@ -507,18 +577,12 @@ impl<'a> Analyzer<'a> {
 
             Expr::Unsafe { body } => {
                 self.move_check_expr(ctx, *body);
-                ctx.expr_origins.insert(
-                    expr_id,
-                    ctx.expr_origins.get(body).cloned().unwrap_or_default(),
-                );
+                ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*body));
             }
 
             Expr::Cast { base, .. } => {
                 self.move_check_expr(ctx, *base);
-                ctx.expr_origins.insert(
-                    expr_id,
-                    ctx.expr_origins.get(base).cloned().unwrap_or_default(),
-                );
+                ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*base));
             }
 
             Expr::FieldAccess { base, field } => {
@@ -542,12 +606,15 @@ impl<'a> Analyzer<'a> {
                         &extra,
                     );
                 }
-                let origins = if self.expr_may_carry_reference(ctx, expr_id) {
-                    ctx.expr_origins.get(base).cloned().unwrap_or_default()
+                let value = if self.expr_may_carry_reference(ctx, expr_id) {
+                    let base_value = ctx.expr_origin_value(*base);
+                    self.resolve_field_index(ctx.body_id, *base, field)
+                        .map(|index| base_value.project(index))
+                        .unwrap_or_else(|| base_value.flattened())
                 } else {
-                    Origins::new()
+                    OriginValue::default()
                 };
-                ctx.expr_origins.insert(expr_id, origins);
+                ctx.set_expr_origin_value(expr_id, value);
             }
 
             Expr::IndexAccess { base, index } => {
@@ -564,12 +631,19 @@ impl<'a> Analyzer<'a> {
                         &extra,
                     );
                 }
-                let origins = if self.expr_may_carry_reference(ctx, expr_id) {
-                    ctx.expr_origins.get(base).cloned().unwrap_or_default()
+                let value = if self.expr_may_carry_reference(ctx, expr_id) {
+                    let base_value = ctx.expr_origin_value(*base);
+                    match &ctx.body.exprs[*index] {
+                        Expr::IntLiteral { value: index, .. } => usize::try_from(*index)
+                            .ok()
+                            .map(|index| base_value.project(index))
+                            .unwrap_or_else(|| base_value.iterated()),
+                        _ => base_value.iterated(),
+                    }
                 } else {
-                    Origins::new()
+                    OriginValue::default()
                 };
-                ctx.expr_origins.insert(expr_id, origins);
+                ctx.set_expr_origin_value(expr_id, value);
             }
         }
     }
@@ -577,12 +651,13 @@ impl<'a> Analyzer<'a> {
     fn move_check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
         let s = &ctx.body.stmts[stmt_id];
         match s {
-            Stmt::Let { init, .. } => {
-                if let Some(init) = init {
-                    self.move_check_expr(ctx, *init);
-                    let origins = ctx.expr_origins.get(init).cloned().unwrap_or_default();
-                    ctx.bind_origins(stmt_id, origins);
-                    self.consume_if_local(ctx, *init);
+            Stmt::Let { pat, init, .. } => {
+                let pat = *pat;
+                if let Some(init) = *init {
+                    self.move_check_expr(ctx, init);
+                    let value = ctx.expr_origin_value(init);
+                    self.bind_pattern_origins(ctx, pat, &value);
+                    self.consume_if_local(ctx, init);
                 }
             }
             Stmt::Expr { expr } => self.move_check_expr(ctx, *expr),
@@ -628,7 +703,7 @@ impl<'a> Analyzer<'a> {
                 let access_place = resolved.as_ref().and_then(access_place_from_resolved_name);
                 if access_place
                     .as_ref()
-                    .is_some_and(|place| self.has_any_access_borrow(ctx, place))
+                    .is_some_and(|place| self.has_access_borrow_except_origins(ctx, place, expr_id))
                 {
                     self.diag(
                         format!("cannot move `{}` while borrowed", name.0),
@@ -641,8 +716,8 @@ impl<'a> Analyzer<'a> {
                 self.result.moved_exprs.insert((ctx.body_id, expr_id));
                 // Record move site for secondary label.
                 let span = ctx.expr_range(expr_id);
-                if let Some(ResolvedName::Local(stmt)) = resolved {
-                    let p = Place::root(*stmt);
+                if let Some(ResolvedName::PatternBinding(id)) = resolved {
+                    let p = Place::root(*id);
                     ctx.moved_places.insert(p.clone());
                     ctx.moved_sites.insert(p, (span, "value moved here".into()));
                 }
@@ -716,11 +791,11 @@ impl<'a> Analyzer<'a> {
             .into_iter()
             .flat_map(|info| &info.captures)
             .find_map(|capture| match capture.source {
-                CaptureSource::Local(stmt)
+                CaptureSource::Pattern(id)
                     if capture.mode != CaptureMode::Value
-                        && self.local_has_explicit_drop(ctx, stmt) =>
+                        && self.local_has_explicit_drop(ctx, id) =>
                 {
-                    Some(stmt)
+                    Some(id)
                 }
                 _ => None,
             });
@@ -730,17 +805,15 @@ impl<'a> Analyzer<'a> {
                 .into_iter()
                 .flatten()
                 .find_map(|origin| match origin.place.root {
-                    AccessRoot::Local(stmt) if self.local_has_explicit_drop(ctx, stmt) => {
-                        Some(stmt)
-                    }
+                    AccessRoot::Pattern(id) if self.local_has_explicit_drop(ctx, id) => Some(id),
                     _ => None,
                 })
         });
         let Some(owner) = owner else { return };
         let labels = ctx
             .source_map
-            .stmt_ranges
-            .get(&owner)
+            .pat_ranges
+            .get(&owner.pattern)
             .copied()
             .map(|range| {
                 vec![(
@@ -758,16 +831,10 @@ impl<'a> Analyzer<'a> {
         );
     }
 
-    fn local_has_explicit_drop(&self, ctx: &BodyCtx<'_>, stmt: StmtId) -> bool {
-        let Stmt::Let {
-            init: Some(init), ..
-        } = &ctx.body.stmts[stmt]
-        else {
-            return false;
-        };
+    fn local_has_explicit_drop(&self, ctx: &BodyCtx<'_>, binding: PatternBindingId) -> bool {
         self.type_result
-            .expr_types
-            .get(&(ctx.body_id, *init))
+            .pattern_binding_types
+            .get(&(ctx.body_id, binding))
             .is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty))
     }
 
@@ -783,10 +850,8 @@ impl<'a> Analyzer<'a> {
                 continue;
             }
             let move_place = match capture.source {
-                CaptureSource::Local(stmt) => Some(Place::root(stmt)),
-                CaptureSource::Pattern(_)
-                | CaptureSource::Param(_)
-                | CaptureSource::LambdaParam { .. } => None,
+                CaptureSource::Pattern(id) => Some(Place::root(id)),
+                CaptureSource::Param(_) | CaptureSource::LambdaParam { .. } => None,
             };
             let access_place = access_place_from_capture_source(&capture.source);
             if let Some(place) = &move_place
@@ -894,9 +959,9 @@ impl<'a> Analyzer<'a> {
     fn place_from_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<Place> {
         match &ctx.body.exprs[expr_id] {
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
+                resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
-            } => Some(Place::root(*stmt)),
+            } => Some(Place::root(*id)),
             Expr::FieldAccess { base, field } => {
                 let base_place = self.place_from_expr(ctx, *base)?;
                 let idx = self.resolve_field_index(ctx.body_id, *base, field)?;
@@ -944,15 +1009,22 @@ impl<'a> Analyzer<'a> {
             .any(|loan| loan.active && access_places_overlap(&loan.place, place))
     }
 
+    fn has_access_borrow_except_origins(
+        &self,
+        ctx: &BodyCtx<'_>,
+        place: &AccessPlace,
+        expr_id: ExprId,
+    ) -> bool {
+        let origins = ctx.expr_origins.get(&expr_id);
+        ctx.loans.iter().any(|(id, loan)| {
+            loan.active
+                && access_places_overlap(&loan.place, place)
+                && !origins.is_some_and(|origins| origins.iter().any(|origin| origin.loan == *id))
+        })
+    }
+
     fn access_targets(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Vec<AccessTarget> {
         match &ctx.body.exprs[expr_id] {
-            Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
-                ..
-            } => vec![AccessTarget {
-                place: AccessPlace::new(AccessRoot::Local(*stmt)),
-                parents: HashSet::new(),
-            }],
             Expr::Path {
                 resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
@@ -1015,14 +1087,18 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn direct_local_root(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<StmtId> {
+    fn local_assignment(
+        &self,
+        ctx: &BodyCtx<'_>,
+        expr_id: ExprId,
+    ) -> Option<(PatternBindingId, bool)> {
         match &ctx.body.exprs[expr_id] {
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
+                resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
-            } => Some(*stmt),
+            } => Some((*id, true)),
             Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
-                self.direct_local_root(ctx, *base)
+                self.local_assignment(ctx, *base).map(|(id, _)| (id, false))
             }
             _ => None,
         }
@@ -1115,11 +1191,11 @@ impl<'a> Analyzer<'a> {
         modes: &[Option<BorrowKind>],
         fid: Option<FunctionId>,
         span: Option<TextRange>,
-    ) -> Origins {
+    ) -> OriginValue {
         let mut prepared = Vec::with_capacity(inputs.len());
         for (index, input) in inputs.iter().enumerate() {
             let Some(kind) = modes.get(index).copied().flatten() else {
-                prepared.push(ctx.expr_origins.get(input).cloned().unwrap_or_default());
+                prepared.push(ctx.expr_origin_value(*input));
                 continue;
             };
 
@@ -1146,60 +1222,35 @@ impl<'a> Analyzer<'a> {
                     loan,
                 });
             }
-            prepared.push(origins);
+            prepared.push(OriginValue::from_origins(origins));
         }
 
         let may_carry_reference = self.expr_may_carry_reference(ctx, call);
         let summary = may_carry_reference
             .then(|| fid.and_then(|fid| self.reference_flow.summary(fid)))
             .flatten();
-        let mut result = Origins::new();
-        if let Some(summary) = summary {
-            for source in &summary.origins {
-                let Some(input_origins) = prepared.get(source.param) else {
-                    continue;
-                };
-                for origin in input_origins {
-                    let kind = BorrowKind::from_flow(source.kind, origin.kind);
-                    if kind == origin.kind {
-                        result.insert(origin.clone());
-                        continue;
-                    }
-                    let parents = ctx.loan_family(origin.loan);
-                    if self.borrow_conflicts(
-                        ctx,
-                        &origin.place,
-                        kind,
-                        &parents,
-                        span,
-                        inputs[source.param],
-                    ) {
-                        continue;
-                    }
-                    let loan =
-                        ctx.new_loan_with_parents(origin.place.clone(), kind, span, false, parents);
-                    result.insert(Origin {
-                        place: origin.place.clone(),
-                        kind,
-                        loan,
-                    });
-                }
-            }
+        let result = if let Some(summary) = summary {
+            self.instantiate_call_summary(ctx, summary, &prepared, inputs, span)
         } else if may_carry_reference {
-            for origins in &prepared {
-                result.extend(origins.iter().cloned());
+            let mut result = OriginValue::default();
+            for value in &prepared {
+                result.merge(value.flattened());
             }
-        }
+            result
+        } else {
+            OriginValue::default()
+        };
 
         let retained = result
+            .origins
             .iter()
             .map(|origin| origin.loan)
             .collect::<HashSet<_>>();
-        for (index, origins) in prepared.iter().enumerate() {
+        for (index, value) in prepared.iter().enumerate() {
             if modes.get(index).copied().flatten().is_none() {
                 continue;
             }
-            for origin in origins {
+            for origin in &value.origins {
                 if !retained.contains(&origin.loan)
                     && let Some(loan) = ctx.loans.get_mut(&origin.loan)
                 {
@@ -1213,6 +1264,114 @@ impl<'a> Analyzer<'a> {
         }
 
         result
+    }
+
+    fn instantiate_call_summary(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        summary: &FunctionSummary,
+        inputs: &[OriginValue],
+        input_exprs: &[ExprId],
+        span: Option<TextRange>,
+    ) -> OriginValue {
+        let mut mapped = HashMap::new();
+        self.instantiate_call_summary_inner(ctx, summary, inputs, input_exprs, span, &mut mapped)
+    }
+
+    fn instantiate_call_summary_inner(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        summary: &FunctionSummary,
+        inputs: &[OriginValue],
+        input_exprs: &[ExprId],
+        span: Option<TextRange>,
+        mapped: &mut HashMap<(SummaryOrigin, LoanId), Option<Origin>>,
+    ) -> OriginValue {
+        let mut result = OriginValue::default();
+        for source in &summary.origins {
+            let Some(input) = inputs.get(source.param) else {
+                continue;
+            };
+            result.merge(self.map_summary_input(ctx, input, *source, input_exprs, span, mapped));
+        }
+        if !summary.fields.is_empty() {
+            result.fields = summary
+                .fields
+                .iter()
+                .map(|field| {
+                    self.instantiate_call_summary_inner(
+                        ctx,
+                        field,
+                        inputs,
+                        input_exprs,
+                        span,
+                        mapped,
+                    )
+                })
+                .collect();
+        }
+        if summary.opaque {
+            for input in inputs {
+                result.merge(input.flattened());
+            }
+        }
+        result
+    }
+
+    fn map_summary_input(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        input: &OriginValue,
+        source: SummaryOrigin,
+        input_exprs: &[ExprId],
+        span: Option<TextRange>,
+        mapped: &mut HashMap<(SummaryOrigin, LoanId), Option<Origin>>,
+    ) -> OriginValue {
+        let origins = input
+            .origins
+            .iter()
+            .filter_map(|origin| {
+                if source.kind == FlowKind::Inherit {
+                    return Some(origin.clone());
+                }
+                let key = (source, origin.loan);
+                if let Some(mapped) = mapped.get(&key) {
+                    return mapped.clone();
+                }
+                let kind = BorrowKind::from_flow(source.kind, origin.kind);
+                if kind == origin.kind {
+                    mapped.insert(key, Some(origin.clone()));
+                    return Some(origin.clone());
+                }
+                let parents = ctx.loan_family(origin.loan);
+                let mapped_origin = if self.borrow_conflicts(
+                    ctx,
+                    &origin.place,
+                    kind,
+                    &parents,
+                    span,
+                    input_exprs[source.param],
+                ) {
+                    None
+                } else {
+                    let loan =
+                        ctx.new_loan_with_parents(origin.place.clone(), kind, span, false, parents);
+                    Some(Origin {
+                        place: origin.place.clone(),
+                        kind,
+                        loan,
+                    })
+                };
+                mapped.insert(key, mapped_origin.clone());
+                mapped_origin
+            })
+            .collect();
+        let fields = input
+            .fields
+            .iter()
+            .map(|field| self.map_summary_input(ctx, field, source, input_exprs, span, mapped))
+            .collect();
+        OriginValue { origins, fields }
     }
 
     fn expr_may_carry_reference(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> bool {
@@ -1358,7 +1517,7 @@ impl<'a> Analyzer<'a> {
 
     fn bind_pattern_names(&self, ctx: &mut BodyCtx<'_>, pat: hir::body::PatId) {
         match &ctx.body.pats[pat] {
-            hir::body::Pattern::Binding { name } => {
+            hir::body::Pattern::Binding { name, .. } => {
                 ctx.bindings.insert_available(name.0.clone());
             }
             hir::body::Pattern::Tuple { elements } => {
@@ -1381,6 +1540,45 @@ impl<'a> Analyzer<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn bind_pattern_origins(&self, ctx: &mut BodyCtx<'_>, pat: PatId, value: &OriginValue) {
+        match &ctx.body.pats[pat] {
+            Pattern::Binding { .. } => ctx.bind_origin_value(
+                PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                },
+                value.clone(),
+            ),
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
+                let elements = elements.clone();
+                for (index, element) in elements.into_iter().enumerate() {
+                    self.bind_pattern_origins(ctx, element, &value.project(index));
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                let fields = fields.clone();
+                for (binding_index, field) in fields.into_iter().enumerate() {
+                    let Some(index) = self.pattern_field_index(ctx, pat, &field.name) else {
+                        continue;
+                    };
+                    let field_value = value.project(index);
+                    if let Some(field_pat) = field.pat {
+                        self.bind_pattern_origins(ctx, field_pat, &field_value);
+                    } else {
+                        ctx.bind_origin_value(
+                            PatternBindingId {
+                                pattern: pat,
+                                field: Some(binding_index),
+                            },
+                            field_value,
+                        );
+                    }
+                }
+            }
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
         }
     }
 
@@ -1575,6 +1773,7 @@ impl<'a> Analyzer<'a> {
     ) {
         let span = span.expect("move-checker diagnostics require a source range");
         let notes = match code {
+            "E0059" => vec!["assign the binding on every path before reading it".into()],
             "E0100" => vec!["borrow with `&` if the original value must remain usable".into()],
             "E0300" => vec!["a mutable borrow cannot overlap an existing shared borrow".into()],
             "E0301" => vec!["a shared borrow cannot overlap an existing mutable borrow".into()],
@@ -1622,7 +1821,7 @@ struct BorrowRecord {
     issued_at: Option<TextRange>,
     active: bool,
     permanent: bool,
-    holders: HashSet<StmtId>,
+    holders: HashSet<PatternBindingId>,
     parents: HashSet<LoanId>,
 }
 
@@ -1641,9 +1840,11 @@ struct BodyCtx<'a> {
     loans: HashMap<LoanId, BorrowRecord>,
     next_loan: LoanId,
     expr_origins: HashMap<ExprId, Origins>,
-    local_origins: HashMap<StmtId, Origins>,
+    local_origins: HashMap<PatternBindingId, Origins>,
+    expr_origin_fields: HashMap<ExprId, Vec<OriginValue>>,
+    local_origin_fields: HashMap<PatternBindingId, Vec<OriginValue>>,
     param_origins: HashMap<usize, Origins>,
-    remaining_uses: HashMap<StmtId, usize>,
+    remaining_uses: HashMap<PatternBindingId, usize>,
     scope_depth: usize,
     in_match_guard: bool,
 }
@@ -1661,6 +1862,8 @@ impl<'a> BodyCtx<'a> {
             next_loan: 0,
             expr_origins: HashMap::new(),
             local_origins: HashMap::new(),
+            expr_origin_fields: HashMap::new(),
+            local_origin_fields: HashMap::new(),
             param_origins: HashMap::new(),
             remaining_uses: collect_local_uses(body),
             scope_depth: 0,
@@ -1763,11 +1966,11 @@ impl<'a> BodyCtx<'a> {
         family
     }
 
-    fn bind_origins(&mut self, stmt: StmtId, origins: Origins) {
-        if let Some(previous) = self.local_origins.insert(stmt, origins.clone()) {
+    fn bind_origins(&mut self, binding: PatternBindingId, origins: Origins) {
+        if let Some(previous) = self.local_origins.insert(binding, origins.clone()) {
             for origin in previous {
                 if let Some(loan) = self.loans.get_mut(&origin.loan) {
-                    loan.holders.remove(&stmt);
+                    loan.holders.remove(&binding);
                     if loan.holders.is_empty() && !loan.permanent {
                         loan.active = false;
                     }
@@ -1776,27 +1979,71 @@ impl<'a> BodyCtx<'a> {
         }
         for origin in origins {
             if let Some(loan) = self.loans.get_mut(&origin.loan) {
-                loan.holders.insert(stmt);
+                loan.holders.insert(binding);
                 loan.scope_depth = loan.scope_depth.min(self.scope_depth);
                 loan.active = true;
             }
         }
     }
 
-    fn release_local_if_dead(&mut self, stmt: StmtId) {
-        let Some(remaining) = self.remaining_uses.get_mut(&stmt) else {
+    fn expr_origin_value(&self, expr: ExprId) -> OriginValue {
+        OriginValue {
+            origins: self.expr_origins.get(&expr).cloned().unwrap_or_default(),
+            fields: self
+                .expr_origin_fields
+                .get(&expr)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn local_origin_value(&self, binding: PatternBindingId) -> OriginValue {
+        OriginValue {
+            origins: self
+                .local_origins
+                .get(&binding)
+                .cloned()
+                .unwrap_or_default(),
+            fields: self
+                .local_origin_fields
+                .get(&binding)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn set_expr_origin_value(&mut self, expr: ExprId, value: OriginValue) {
+        self.expr_origins.insert(expr, value.origins);
+        if value.fields.is_empty() {
+            self.expr_origin_fields.remove(&expr);
+        } else {
+            self.expr_origin_fields.insert(expr, value.fields);
+        }
+    }
+
+    fn bind_origin_value(&mut self, binding: PatternBindingId, value: OriginValue) {
+        self.bind_origins(binding, value.origins);
+        if value.fields.is_empty() {
+            self.local_origin_fields.remove(&binding);
+        } else {
+            self.local_origin_fields.insert(binding, value.fields);
+        }
+    }
+
+    fn release_local_if_dead(&mut self, binding: PatternBindingId) {
+        let Some(remaining) = self.remaining_uses.get_mut(&binding) else {
             return;
         };
         *remaining = remaining.saturating_sub(1);
         if *remaining != 0 {
             return;
         }
-        let Some(origins) = self.local_origins.get(&stmt) else {
+        let Some(origins) = self.local_origins.get(&binding) else {
             return;
         };
         for origin in origins {
             if let Some(loan) = self.loans.get_mut(&origin.loan) {
-                loan.holders.remove(&stmt);
+                loan.holders.remove(&binding);
                 if loan.holders.is_empty() && !loan.permanent {
                     loan.active = false;
                 }
@@ -1876,7 +2123,7 @@ fn access_places_overlap(a: &AccessPlace, b: &AccessPlace) -> bool {
 }
 
 fn access_place_from_move_place(place: &Place) -> AccessPlace {
-    let mut result = AccessPlace::new(AccessRoot::Local(place.local));
+    let mut result = AccessPlace::new(AccessRoot::Pattern(place.local));
     for projection in &place.projections {
         result = match projection {
             hir::place::Projection::Field(index) => result.field(*index),
@@ -1888,7 +2135,6 @@ fn access_place_from_move_place(place: &Place) -> AccessPlace {
 
 fn access_place_from_resolved_name(name: &ResolvedName) -> Option<AccessPlace> {
     let root = match name {
-        ResolvedName::Local(stmt) => AccessRoot::Local(*stmt),
         ResolvedName::PatternBinding(id) => AccessRoot::Pattern(*id),
         ResolvedName::Param(index) => AccessRoot::Param(*index),
         ResolvedName::LambdaParam { lambda, index } => AccessRoot::LambdaParam {
@@ -1902,7 +2148,6 @@ fn access_place_from_resolved_name(name: &ResolvedName) -> Option<AccessPlace> {
 
 fn access_place_from_capture_source(source: &CaptureSource) -> AccessPlace {
     let root = match source {
-        CaptureSource::Local(stmt) => AccessRoot::Local(*stmt),
         CaptureSource::Pattern(id) => AccessRoot::Pattern(*id),
         CaptureSource::Param(index) => AccessRoot::Param(*index),
         CaptureSource::LambdaParam { lambda, index } => AccessRoot::LambdaParam {
@@ -1929,13 +2174,13 @@ fn type_ref_kind(ty: &Type) -> Option<BorrowKind> {
     }
 }
 
-fn collect_local_uses(body: &Body) -> HashMap<StmtId, usize> {
-    fn expr(body: &Body, id: ExprId, uses: &mut HashMap<StmtId, usize>) {
+fn collect_local_uses(body: &Body) -> HashMap<PatternBindingId, usize> {
+    fn expr(body: &Body, id: ExprId, uses: &mut HashMap<PatternBindingId, usize>) {
         match &body.exprs[id] {
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
+                resolved: Some(ResolvedName::PatternBinding(binding)),
                 ..
-            } => *uses.entry(*stmt).or_default() += 1,
+            } => *uses.entry(*binding).or_default() += 1,
             Expr::Binary { lhs, rhs, .. } => {
                 expr(body, *lhs, uses);
                 expr(body, *rhs, uses);

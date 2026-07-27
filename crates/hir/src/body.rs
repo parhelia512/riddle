@@ -71,12 +71,12 @@ pub enum Severity {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let {
-        name: Name,
-        name_range: Option<TextRange>,
+        /// Always present: `let x = 1` lowers to a `Pattern::Binding`, so every
+        /// binding in the body — simple or destructured — has one identity.
+        pat: PatId,
         ty: HirTypeRef,
         ty_range: Option<TextRange>,
         init: Option<ExprId>,
-        is_mut: bool,
     },
     Expr {
         expr: ExprId,
@@ -228,6 +228,8 @@ pub enum Pattern {
     /// A bare identifier that binds a new name, e.g. `x` in `match v { x => ... }`.
     Binding {
         name: Name,
+        /// `mut` sits on the binding, as in Rust: `let (mut a, b) = pair`.
+        is_mut: bool,
     },
     /// A path pattern referring to an existing item (enum variant / const), e.g. `Foo::Bar`.
     Path {
@@ -279,7 +281,6 @@ pub struct PatternBindingId {
 
 #[derive(Debug, Clone)]
 pub enum ResolvedName {
-    Local(StmtId),
     PatternBinding(PatternBindingId),
     Param(usize),
     LambdaParam { lambda: ExprId, index: usize },
@@ -414,8 +415,8 @@ impl BodyPrinter<'_> {
 
     fn print_stmt(&self, stmt: StmtId, indent: usize) -> String {
         match &self.body.stmts[stmt] {
-            Stmt::Let { name, ty, init, .. } => {
-                let mut out = format!("let {}", name.0);
+            Stmt::Let { pat, ty, init, .. } => {
+                let mut out = format!("let {}", self.print_pat(*pat));
                 if !matches!(ty, HirTypeRef::Unknown) {
                     out.push_str(": ");
                     out.push_str(&Self::type_text(ty));
@@ -815,6 +816,7 @@ impl BodyPrinter<'_> {
                     .join(", ");
                 format!("({})", inner)
             }
+            HirTypeRef::Slice(elem) => format!("[{}]", Self::type_text(elem)),
             HirTypeRef::Array(elem, len) => {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
@@ -849,7 +851,13 @@ impl BodyPrinter<'_> {
                 LiteralPattern::Char(value) => format!("'{value}'"),
                 LiteralPattern::Bool(value) => value.to_string(),
             },
-            Pattern::Binding { name } => name.0.clone(),
+            Pattern::Binding { name, is_mut } => {
+                if *is_mut {
+                    format!("mut {}", name.0)
+                } else {
+                    name.0.clone()
+                }
+            }
             Pattern::Path { path } => path.display(),
             Pattern::Tuple { elements } => {
                 let inner = elements

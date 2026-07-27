@@ -183,6 +183,83 @@ fn disjoint_struct_fields_can_be_mutably_borrowed() {
 }
 
 #[test]
+fn tuple_destructuring_keeps_reference_provenance_per_element() {
+    is_clean(
+        r#"
+        fun f() {
+            let mut left = 1;
+            let mut right = 2;
+            let (left_ref, right_ref) = (&mut left, &mut right);
+            *right_ref = 20;
+            right = 30;
+            *left_ref = 10;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn returned_tuple_destructuring_keeps_reference_provenance_per_element() {
+    is_clean(
+        r#"
+        fun references(left: &mut i32, right: &mut i32) -> (&mut i32, &mut i32) {
+            (left, right)
+        }
+
+        fun f() {
+            let mut left = 1;
+            let mut right = 2;
+            let (left_ref, right_ref) = references(&mut left, &mut right);
+            *right_ref = 20;
+            right = 30;
+            *left_ref = 10;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn match_binding_keeps_reference_provenance_from_a_local_container() {
+    assert!(has_code(
+        r#"
+        enum Maybe<T> { None, Some(T) }
+
+        fun f() {
+            let mut value = 0;
+            let holder = Maybe::Some(&mut value);
+            match holder {
+                Maybe::Some(reference) => {
+                    let second = &mut value;
+                    *reference = 1;
+                    *second = 2;
+                },
+                Maybe::None => {},
+            }
+        }
+        "#,
+        "E0302"
+    ));
+}
+
+#[test]
+fn for_binding_keeps_reference_provenance_from_a_local_container() {
+    assert!(has_code(
+        r#"
+        fun f() {
+            let mut value = 0;
+            let holders = [&mut value];
+            for reference in holders {
+                let second = &mut value;
+                *reference = 1;
+                *second = 2;
+            }
+        }
+        "#,
+        "E0302"
+    ));
+}
+
+#[test]
 fn whole_struct_borrow_overlaps_a_field_borrow() {
     assert!(has_code(
         r#"

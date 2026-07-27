@@ -4,10 +4,10 @@ use rowan::TextRange;
 
 use hir::{
     HirFile,
-    body::{BodyId, ExprId},
+    body::{Body, BodyId, Expr, ExprId, PatternBindingId, ResolvedName, UnaryOp},
     item_tree::{
-        EnumId, FunctionId, HirConstArg, HirFunction, HirPath, HirTrait, HirTypeAlias, HirTypeRef,
-        HirVariantKind, InternalAttrTarget, PathAnchor, StructId,
+        ConstId, EnumId, FunctionId, HirConstArg, HirFunction, HirPath, HirTrait, HirTypeAlias,
+        HirTypeRef, HirVariantKind, InternalAttrTarget, PathAnchor, StructId,
     },
 };
 
@@ -27,6 +27,7 @@ pub struct TypeChecker<'a> {
     next_infer: u32,
     infer_values: HashMap<u32, Type>,
     pending_lambdas: Vec<PendingLambda>,
+    pub(crate) pending_delayed_bindings: Vec<(BodyId, PatternBindingId, Option<TextRange>)>,
 }
 
 struct PendingLambda {
@@ -63,6 +64,7 @@ impl<'a> TypeChecker<'a> {
             next_infer: 0,
             infer_values: HashMap::new(),
             pending_lambdas: Vec::new(),
+            pending_delayed_bindings: Vec::new(),
         }
     }
 
@@ -74,6 +76,7 @@ impl<'a> TypeChecker<'a> {
         self.check_impls();
         self.build_trait_env();
         self.validate_copy_impls();
+        self.check_const_bodies();
         self.check_function_bodies();
         self.check_generic_recursion();
         self.result
@@ -532,6 +535,55 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    pub(crate) fn check_const_bodies(&mut self) {
+        let mut dependencies = HashMap::<ConstId, Vec<ConstId>>::new();
+        for (const_id, konst) in self.hir.item_tree.consts.iter() {
+            let Some(body_id) = self.hir.const_bodies.get(&const_id).copied() else {
+                continue;
+            };
+            let body = &self.hir.bodies[body_id];
+            let params = self.impl_item_type_params(|imp| imp.consts.contains(&const_id));
+            let declared =
+                self.lower_type_ref_with_params_at(&konst.ty, &params, Some(konst.ty_range));
+            let mut ctx =
+                BodyCtx::new_const(body_id, body, const_id, konst, declared.clone(), params);
+            let actual = self.check_expr_expected(&mut ctx, body.root_block, &declared);
+            self.expect_assignable(
+                &declared,
+                &actual,
+                "constant initializer",
+                ctx.expr_range(body.root_block),
+            );
+
+            let mut deps = Vec::new();
+            if let Some(span) = first_non_const_expr(body, body.root_block, &mut deps) {
+                self.diagnostic(
+                    "E0060",
+                    "constant initializer is not a constant expression",
+                    Some(span),
+                );
+            }
+            dependencies.insert(const_id, deps);
+            self.finish_inference(body_id);
+        }
+
+        let mut states = HashMap::<ConstId, u8>::new();
+        for const_id in dependencies.keys().copied().collect::<Vec<_>>() {
+            if const_cycle_from(const_id, &dependencies, &mut states) {
+                let konst = &self.hir.item_tree.consts[const_id];
+                self.diagnostic(
+                    "E0060",
+                    format!(
+                        "constant `{}` is part of an initialization cycle",
+                        konst.name.0
+                    ),
+                    Some(konst.name_range),
+                );
+                break;
+            }
+        }
+    }
+
     pub(crate) fn check_function(
         &mut self,
         function_id: FunctionId,
@@ -659,6 +711,7 @@ impl<'a> TypeChecker<'a> {
                     .map(|item| self.resolve_type(item))
                     .collect(),
             ),
+            Type::Slice(inner) => Type::Slice(Box::new(self.resolve_type(inner))),
             Type::Array(inner, len) => Type::Array(Box::new(self.resolve_type(inner)), len.clone()),
             Type::Struct(id, args) => {
                 Type::Struct(*id, args.iter().map(|arg| self.resolve_type(arg)).collect())
@@ -746,6 +799,7 @@ impl<'a> TypeChecker<'a> {
             (Type::Tuple(a), Type::Tuple(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(a, b)| self.unify_types(a, b))
             }
+            (Type::Slice(a), Type::Slice(b)) => self.unify_types(a, b),
             (Type::Array(a, al), Type::Array(b, bl)) => al == bl && self.unify_types(a, b),
             (Type::Struct(a, aa), Type::Struct(b, ba)) => {
                 a == b
@@ -840,6 +894,27 @@ impl<'a> TypeChecker<'a> {
             .collect::<Vec<_>>();
         for (key, ty) in pattern_bindings {
             self.result.pattern_binding_types.insert(key, ty);
+        }
+        let delayed_bindings = self
+            .pending_delayed_bindings
+            .iter()
+            .filter(|(checked_body, _, _)| *checked_body == body_id)
+            .copied()
+            .collect::<Vec<_>>();
+        for (_, binding, range) in delayed_bindings {
+            let ty = self
+                .result
+                .pattern_binding_types
+                .get(&(body_id, binding))
+                .cloned()
+                .unwrap_or(Type::Unknown);
+            if matches!(ty, Type::InferVar(_) | Type::Unknown) {
+                self.diagnostic(
+                    "E0045",
+                    "cannot infer the type of a delayed `let` binding",
+                    range,
+                );
+            }
         }
         let pending = self
             .pending_lambdas
@@ -1058,6 +1133,7 @@ impl<'a> TypeChecker<'a> {
                 .any(|ty| self.type_ref_contains_inline_type(ty, target, seen)),
             HirTypeRef::Array(_, HirConstArg::Value(0)) => false,
             HirTypeRef::Array(inner, _) => self.type_ref_contains_inline_type(inner, target, seen),
+            HirTypeRef::Slice(inner) => self.type_ref_contains_inline_type(inner, target, seen),
             HirTypeRef::Never | HirTypeRef::Const(_) => false,
             HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
             HirTypeRef::Function { .. } => false,
@@ -1119,7 +1195,7 @@ impl<'a> TypeChecker<'a> {
                 .any(|field| self.type_has_infinite_layout(field)),
             Type::Array(_, crate::ConstArg::Value(0)) => false,
             Type::Array(inner, _) => self.type_has_infinite_layout(inner),
-            Type::Ref(_, _) | Type::Ptr { .. } => false,
+            Type::Ref(_, _) | Type::Ptr { .. } | Type::Slice(_) => false,
             _ => false,
         }
     }
@@ -1239,6 +1315,7 @@ impl<'a> TypeChecker<'a> {
             || actual.is_unknown_like()
             || expected == actual
             || self.numeric_assignable(&expected, &actual)
+            || self.is_slice_coercion(&expected, &actual)
             || self.structural_assignable(&expected, &actual)
         {
             return;
@@ -1265,8 +1342,13 @@ impl<'a> TypeChecker<'a> {
         self.diagnostic(
             "E0043",
             format!(
-                "type `{}` contains unsized `str` in a position that requires a sized type",
-                ty.display(self.hir)
+                "type `{}` contains unsized {} in a position that requires a sized type",
+                ty.display(self.hir),
+                if type_contains_slice(ty) {
+                    "slice `[T]`"
+                } else {
+                    "`str`"
+                }
             ),
             span,
         );
@@ -1280,6 +1362,16 @@ impl<'a> TypeChecker<'a> {
     ) {
         let span = span.expect("type-checker diagnostics require a source range");
         let message = message.into();
+        if self.result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == code
+                && diagnostic.message == message
+                && diagnostic
+                    .labels
+                    .first()
+                    .is_some_and(|label| label.range == span)
+        }) {
+            return;
+        }
         let notes = match code {
             "E0001" => vec!["expected one type but found another; consider an explicit type annotation or cast".into()],
             "E0002" => vec!["all branches must produce values of the same type; ensure both branches return compatible types".into()],
@@ -1307,11 +1399,14 @@ impl<'a> TypeChecker<'a> {
             "E0039" => vec!["cover every possible case or add a wildcard arm".into()],
             "E0041" => vec!["every field must implement `Copy`; add the required generic bounds or remove the impl".into()],
             "E0042" => vec!["move this statement inside a `while` or `for` loop".into()],
-            "E0043" => vec!["use `&str` or a raw pointer; unsized `str` must be behind a reference or pointer".into()],
+            "E0043" => vec!["put unsized `str` or `[T]` behind a reference or raw pointer".into()],
             "E0044" => vec!["define every supertrait and remove cycles from the trait hierarchy".into()],
-            "E0045" => vec!["add an explicit parameter type or use the function where its signature is known".into()],
+            "E0045" => vec!["add an explicit type annotation or use the binding where its type is known".into()],
             "E0047" => vec!["remove the duplicate or overlapping trait implementation".into()],
             "E0048" => vec!["define the trait or a participating nominal type in the current package".into()],
+            "E0057" => vec!["a `let` has no alternative branch, so its pattern must match every value; use `match` to handle the other cases".into()],
+            "E0059" => vec!["assign the binding on every path before reading it".into()],
+            "E0060" => vec!["use literals, constants, pure operators, casts, or aggregate values in a constant initializer".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
             "E0022" | "E0025" => vec!["remove the duplicate associated type".into()],
             "E0023" => vec!["define the trait or import it into scope".into()],
@@ -1422,8 +1517,30 @@ impl<'a> TypeChecker<'a> {
                         || self.numeric_assignable(expected_inner, actual_inner)
                         || self.structural_assignable(expected_inner, actual_inner))
             }
+            (Type::Slice(expected_inner), Type::Slice(actual_inner)) => {
+                expected_inner == actual_inner
+                    || self.numeric_assignable(expected_inner, actual_inner)
+                    || self.structural_assignable(expected_inner, actual_inner)
+            }
             _ => false,
         }
+    }
+
+    pub(crate) fn is_slice_coercion(&self, expected: &Type, actual: &Type) -> bool {
+        matches!(
+            (expected, actual),
+            (
+                Type::Ref(expected, expected_mut),
+                Type::Ref(actual, actual_mut),
+            ) if expected_mut == actual_mut
+                && matches!(
+                    (expected.as_ref(), actual.as_ref()),
+                    (Type::Slice(expected), Type::Array(actual, _))
+                        if expected == actual
+                            || self.numeric_assignable(expected, actual)
+                            || self.structural_assignable(expected, actual)
+                )
+        )
     }
 
     pub(crate) fn join_numeric_types(&self, lhs: &Type, rhs: &Type) -> Option<Type> {
@@ -1459,6 +1576,87 @@ impl<'a> TypeChecker<'a> {
     }
 }
 
+fn first_non_const_expr(
+    body: &Body,
+    expr_id: ExprId,
+    dependencies: &mut Vec<ConstId>,
+) -> Option<TextRange> {
+    let span = body.source_map.expr_ranges[&expr_id];
+    match &body.exprs[expr_id] {
+        Expr::IntLiteral { .. }
+        | Expr::FloatLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::CharLiteral { .. }
+        | Expr::BoolLiteral { .. } => None,
+        Expr::Path { resolved, .. } => match resolved {
+            Some(ResolvedName::Const(id)) => {
+                dependencies.push(*id);
+                None
+            }
+            Some(ResolvedName::EnumVariant(..) | ResolvedName::Unresolved) => None,
+            _ => Some(span),
+        },
+        Expr::Binary { lhs, rhs, op } if !op.is_assignment() => {
+            first_non_const_expr(body, *lhs, dependencies)
+                .or_else(|| first_non_const_expr(body, *rhs, dependencies))
+        }
+        Expr::Unary {
+            operand,
+            op: UnaryOp::Neg | UnaryOp::Pos | UnaryOp::Not,
+        } => first_non_const_expr(body, *operand, dependencies),
+        Expr::Block { stmts, tail } if stmts.is_empty() => {
+            tail.and_then(|tail| first_non_const_expr(body, tail, dependencies))
+        }
+        Expr::Array { elements } | Expr::Tuple { elements } => elements
+            .iter()
+            .find_map(|expr| first_non_const_expr(body, *expr, dependencies)),
+        Expr::ArrayRepeat { value, len } => first_non_const_expr(body, *value, dependencies)
+            .or_else(|| first_non_const_expr(body, *len, dependencies)),
+        Expr::Struct { fields, .. } => fields
+            .iter()
+            .find_map(|field| first_non_const_expr(body, field.value, dependencies)),
+        Expr::FieldAccess { base, .. } => first_non_const_expr(body, *base, dependencies),
+        Expr::IndexAccess { base, index } => first_non_const_expr(body, *base, dependencies)
+            .or_else(|| first_non_const_expr(body, *index, dependencies)),
+        Expr::Cast { base, .. } => first_non_const_expr(body, *base, dependencies),
+        Expr::Missing
+        | Expr::Binary { .. }
+        | Expr::Unary { .. }
+        | Expr::Call { .. }
+        | Expr::Lambda { .. }
+        | Expr::If { .. }
+        | Expr::While { .. }
+        | Expr::For { .. }
+        | Expr::Match { .. }
+        | Expr::Unsafe { .. }
+        | Expr::Block { .. } => Some(span),
+    }
+}
+
+fn const_cycle_from(
+    const_id: ConstId,
+    dependencies: &HashMap<ConstId, Vec<ConstId>>,
+    states: &mut HashMap<ConstId, u8>,
+) -> bool {
+    match states.get(&const_id) {
+        Some(1) => return true,
+        Some(2) => return false,
+        _ => {}
+    }
+    states.insert(const_id, 1);
+    if dependencies
+        .get(&const_id)
+        .into_iter()
+        .flatten()
+        .copied()
+        .any(|dependency| const_cycle_from(dependency, dependencies, states))
+    {
+        return true;
+    }
+    states.insert(const_id, 2);
+    false
+}
+
 // ── Lang item signature validation ──────────────────────────────────────────
 //
 // Called from `build_trait_env` before a `#[lang = "..."]` trait is
@@ -1474,6 +1672,7 @@ pub(crate) fn validate_lang_item_signature(
         anchor: PathAnchor::Plain,
         segments: vec![hir::Name("Self".into())],
         type_args: Vec::new(),
+        range: tr.name_range,
     });
 
     match item {
@@ -1911,4 +2110,20 @@ fn validate_ord_cmp(tr: &HirTrait, self_ty: &HirTypeRef) -> Option<String> {
         return Some("`cmp` must return `Ordering`".into());
     }
     None
+}
+
+fn type_contains_slice(ty: &Type) -> bool {
+    match ty {
+        Type::Slice(_) => true,
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
+            type_contains_slice(inner)
+        }
+        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => {
+            elements.iter().any(type_contains_slice)
+        }
+        Type::Fn { params, ret, .. } => {
+            params.iter().any(type_contains_slice) || type_contains_slice(ret)
+        }
+        _ => false,
+    }
 }

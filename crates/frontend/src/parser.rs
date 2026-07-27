@@ -463,8 +463,12 @@ impl<'s> Parser<'s> {
             SyntaxKind::Pub => self.pub_item(),
             SyntaxKind::Let => self.var_decl(),
             SyntaxKind::Fun if self.nth(1) == SyntaxKind::LParen => self.expr_stmt(),
-            SyntaxKind::Fun => self.func_decl(),
-            SyntaxKind::Unsafe if self.nth(1) == SyntaxKind::Fun => self.func_decl(),
+            SyntaxKind::Fun => {
+                self.func_decl();
+            }
+            SyntaxKind::Unsafe if self.nth(1) == SyntaxKind::Fun => {
+                self.func_decl();
+            }
             SyntaxKind::Unsafe if self.nth(1) == SyntaxKind::Extern => self.extern_decl(),
             SyntaxKind::Struct => self.struct_decl(),
             SyntaxKind::Mod => self.mod_decl(),
@@ -473,7 +477,7 @@ impl<'s> Parser<'s> {
             SyntaxKind::Trait => self.trait_decl(),
             SyntaxKind::Impl => self.impl_decl(),
             SyntaxKind::Const => self.const_decl(),
-            SyntaxKind::TypeKw => self.type_alias_decl(),
+            SyntaxKind::TypeKw => self.type_alias_decl(true),
             SyntaxKind::Break => self.loop_control_stmt(SyntaxKind::BreakStmt),
             SyntaxKind::Continue => self.loop_control_stmt(SyntaxKind::ContinueStmt),
             SyntaxKind::Return => self.return_stmt(),
@@ -485,9 +489,13 @@ impl<'s> Parser<'s> {
 
     fn pub_item(&mut self) {
         match self.nth(1) {
-            SyntaxKind::Fun => self.func_decl(),
+            SyntaxKind::Fun => {
+                self.func_decl();
+            }
             SyntaxKind::Unsafe => match self.nth(2) {
-                SyntaxKind::Fun => self.func_decl(),
+                SyntaxKind::Fun => {
+                    self.func_decl();
+                }
                 SyntaxKind::Extern => self.extern_decl(),
                 _ => self.error(format!(
                     "expected 'fun' or 'extern' after 'pub unsafe', found {:?}",
@@ -500,7 +508,7 @@ impl<'s> Parser<'s> {
             SyntaxKind::Enum => self.enum_decl(),
             SyntaxKind::Trait => self.trait_decl(),
             SyntaxKind::Const => self.const_decl(),
-            SyntaxKind::TypeKw => self.type_alias_decl(),
+            SyntaxKind::TypeKw => self.type_alias_decl(true),
             SyntaxKind::Extern => self.extern_decl(),
             _ => self.error(format!(
                 "expected item after 'pub', found {:?}",
@@ -692,10 +700,9 @@ impl<'s> Parser<'s> {
     fn var_decl(&mut self) {
         let m = self.start();
         self.bump(); // 'let'
-        if self.at(SyntaxKind::Mut) {
-            self.bump(); // 'mut'
-        }
-        self.expect(SyntaxKind::Ident);
+        // `mut` belongs to the binding, as in Rust: `let mut x` is the pattern
+        // `mut x`, and `let mut (a, b)` is therefore a syntax error.
+        self.pattern();
 
         if self.at(SyntaxKind::Colon) {
             self.bump();
@@ -711,7 +718,7 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::VarDecl);
     }
 
-    fn func_decl(&mut self) {
+    fn func_decl(&mut self) -> bool {
         let m = self.start();
 
         self.optional_pub();
@@ -733,13 +740,16 @@ impl<'s> Parser<'s> {
             self.where_clause();
         }
 
-        if self.at(SyntaxKind::LBrace) {
+        let has_body = if self.at(SyntaxKind::LBrace) {
             self.block();
+            true
         } else {
             self.expect(SyntaxKind::Semi);
-        }
+            false
+        };
 
         m.complete(self, SyntaxKind::FuncDecl);
+        has_body
     }
 
     fn param_list(&mut self) {
@@ -1121,7 +1131,23 @@ impl<'s> Parser<'s> {
                 && op == SyntaxKind::Less
                 && self.type_arg_list_followed_by(0, SyntaxKind::LParen)
             {
+                self.error_no_bump(
+                    "generic arguments in expression paths must use `::<...>`".into(),
+                );
                 let m = lhs.precede(self);
+                self.type_arg_list();
+                self.arg_list();
+                lhs = m.complete(self, SyntaxKind::CallExpr);
+                continue;
+            }
+
+            if matches!(lhs.kind(self), SyntaxKind::NameRef | SyntaxKind::FieldExpr)
+                && op == SyntaxKind::ColonColon
+                && self.nth(1) == SyntaxKind::Less
+                && self.type_arg_list_followed_by(1, SyntaxKind::LParen)
+            {
+                let m = lhs.precede(self);
+                self.bump(); // ::
                 self.type_arg_list();
                 self.arg_list();
                 lhs = m.complete(self, SyntaxKind::CallExpr);
@@ -1553,7 +1579,8 @@ impl<'s> Parser<'s> {
                 self.bump();
                 self.ty();
 
-                if self.expect(SyntaxKind::Semi) {
+                if self.at(SyntaxKind::Semi) {
+                    self.bump();
                     self.expression();
                 }
 
@@ -1694,12 +1721,16 @@ impl<'s> Parser<'s> {
         self.attrs();
         match self.current() {
             SyntaxKind::Pub => match self.nth(1) {
-                SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_decl(),
-                SyntaxKind::TypeKw => self.type_alias_decl(),
+                SyntaxKind::Fun | SyntaxKind::Unsafe => {
+                    self.func_decl();
+                }
+                SyntaxKind::TypeKw => self.type_alias_decl(false),
                 _ => self.error(format!("expected trait item, found {:?}", self.current())),
             },
-            SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_decl(),
-            SyntaxKind::TypeKw => self.type_alias_decl(),
+            SyntaxKind::Fun | SyntaxKind::Unsafe => {
+                self.func_decl();
+            }
+            SyntaxKind::TypeKw => self.type_alias_decl(false),
             _ => {
                 self.error(format!("expected trait item, found {:?}", self.current()));
             }
@@ -1719,6 +1750,9 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
             self.generic_params(true, false);
+            self.error_no_bump(
+                "extern function declarations cannot have generic parameters".into(),
+            );
         }
         self.param_list();
 
@@ -1771,13 +1805,17 @@ impl<'s> Parser<'s> {
         self.attrs();
         match self.current() {
             SyntaxKind::Pub => match self.nth(1) {
-                SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_decl(),
-                SyntaxKind::TypeKw => self.type_alias_decl(),
+                SyntaxKind::Fun | SyntaxKind::Unsafe => {
+                    self.func_decl();
+                }
+                SyntaxKind::TypeKw => self.type_alias_decl(true),
                 SyntaxKind::Const => self.const_decl(),
                 _ => self.error(format!("expected impl item, found {:?}", self.current())),
             },
-            SyntaxKind::Fun | SyntaxKind::Unsafe => self.func_decl(),
-            SyntaxKind::TypeKw => self.type_alias_decl(),
+            SyntaxKind::Fun | SyntaxKind::Unsafe => {
+                self.func_decl();
+            }
+            SyntaxKind::TypeKw => self.type_alias_decl(true),
             SyntaxKind::Const => self.const_decl(),
             _ => {
                 self.error(format!("expected impl item, found {:?}", self.current()));
@@ -1794,8 +1832,7 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Colon);
         self.ty();
 
-        if self.at(SyntaxKind::Eq) {
-            self.bump();
+        if self.expect(SyntaxKind::Eq) {
             self.expression();
         }
 
@@ -1803,14 +1840,16 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::ConstDecl);
     }
 
-    fn type_alias_decl(&mut self) {
+    fn type_alias_decl(&mut self, require_value: bool) {
         let m = self.start();
 
         self.optional_pub();
         self.expect(SyntaxKind::TypeKw);
         self.expect(SyntaxKind::Ident);
 
-        if self.at(SyntaxKind::Eq) {
+        if require_value && self.expect(SyntaxKind::Eq) {
+            self.ty();
+        } else if !require_value && self.at(SyntaxKind::Eq) {
             self.bump();
             self.ty();
         }
@@ -1950,7 +1989,12 @@ impl<'s> Parser<'s> {
 
         if self.at(SyntaxKind::Fun) {
             // extern "C" fun name(...) -> T { body }
-            self.func_decl();
+            if !self.func_decl() {
+                self.error(
+                    "single-function extern declarations are not supported; use an unsafe extern block"
+                        .into(),
+                );
+            }
             m.complete(self, SyntaxKind::ExternFnDecl);
         } else if self.at(SyntaxKind::LBrace) {
             // extern "C" { fun ...; fun ...; }
@@ -2013,6 +2057,14 @@ impl<'s> Parser<'s> {
     /// When `top_level` is true, we are at the start of a pattern and can see `&`.
     fn pattern_inner(&mut self, _top_level: bool) {
         self.attrs();
+        if self.at(SyntaxKind::Mut) {
+            // `mut name` — only a bare binding can be mutable.
+            let m = self.start();
+            self.bump();
+            self.expect(SyntaxKind::Ident);
+            m.complete(self, SyntaxKind::BindingPattern);
+            return;
+        }
         match self.current() {
             SyntaxKind::Underscore => {
                 let m = self.start();

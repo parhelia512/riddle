@@ -88,6 +88,10 @@ impl<'f> Builder<'f> {
         self.emit(InstKind::Cast(op, value, ty.clone()), ty)
     }
 
+    pub fn size_of(&mut self, ty: Type) -> Value {
+        self.emit(InstKind::SizeOf(ty), Type::Int(IntTy::Usize))
+    }
+
     // 内存
 
     pub fn alloca(&mut self, ty: Type) -> Value {
@@ -118,6 +122,17 @@ impl<'f> Builder<'f> {
     pub fn index_ptr(&mut self, base: Value, index: Value, elem_ty: Type) -> Value {
         let ptr_ty = Type::Ptr(Box::new(elem_ty));
         self.emit(InstKind::IndexPtr(base, index), ptr_ty)
+    }
+
+    pub fn checked_index_ptr(
+        &mut self,
+        base: Value,
+        index: Value,
+        len: Value,
+        elem_ty: Type,
+    ) -> Value {
+        let ptr_ty = Type::Ptr(Box::new(elem_ty));
+        self.emit(InstKind::CheckedIndexPtr(base, index, len), ptr_ty)
     }
 
     // 聚合

@@ -127,8 +127,9 @@ pub fn resolve_hir(hir: &mut HirFile, sg: &ScopeGraph) {
         // Only emit E0050 when genuinely unresolved (no candidates).
         // `def_to_resolved_name` may map some DefRef variants (UseAlias) to
         // Unresolved internally; those are not user-visible errors.
-        if candidates.is_empty() {
-            let RefOrigin::Expr { body, expr } = origin;
+        if candidates.is_empty()
+            && let RefOrigin::Expr { body, expr } = origin
+        {
             let path_text = match &hir.bodies[*body].exprs[*expr] {
                 Expr::Path { path, .. } | Expr::Struct { path, .. } => path.display(),
                 _ => String::new(),
@@ -165,6 +166,9 @@ fn write_resolution(hir: &mut HirFile, origin: RefOrigin, resolved_name: Resolve
             }
             _ => {}
         },
+        RefOrigin::Type { range } => {
+            hir.type_resolutions.insert(range, resolved_name);
+        }
     }
 }
 
@@ -177,7 +181,6 @@ fn def_to_resolved_name(def: &DefRef) -> ResolvedName {
         DefRef::Const(cid) => ResolvedName::Const(*cid),
         DefRef::TypeAlias(tid) => ResolvedName::TypeAlias(*tid),
         DefRef::Module { id, .. } => ResolvedName::Module(*id),
-        DefRef::Local { stmt } => ResolvedName::Local(*stmt),
         DefRef::PatternBinding { id, .. } => ResolvedName::PatternBinding(*id),
         DefRef::Param { index, .. } => ResolvedName::Param(*index),
         DefRef::LambdaParam { lambda, index, .. } => ResolvedName::LambdaParam {

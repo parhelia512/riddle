@@ -402,7 +402,9 @@ impl TypeChecker<'_> {
                     .map(|(index, ty)| (index.to_string(), ty.clone()))
                     .collect(),
             ),
-            Type::Array(inner, _) => Some(vec![("element".into(), *inner.clone())]),
+            Type::Slice(inner) | Type::Array(inner, _) => {
+                Some(vec![("element".into(), *inner.clone())])
+            }
             ty if ty.is_fundamentally_copy() => Some(Vec::new()),
             _ => None,
         }
@@ -834,6 +836,7 @@ impl TypeChecker<'_> {
                     .join(", ");
                 format!("({inner})")
             }
+            HirTypeRef::Slice(inner) => format!("[{}]", self.type_ref_source_text(inner)),
             HirTypeRef::Array(inner, len) => {
                 format!("[{}; {}]", self.type_ref_source_text(inner), len.display())
             }
@@ -908,7 +911,9 @@ fn uncovered_orphan_param(ty: &Type, prefix: &str) -> Option<String> {
     match ty {
         Type::Param(name) => name.strip_prefix(prefix).map(str::to_string),
         Type::Const(ConstArg::Param(name)) => name.strip_prefix(prefix).map(str::to_string),
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } => uncovered_orphan_param(inner, prefix),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
+            uncovered_orphan_param(inner, prefix)
+        }
         Type::Array(inner, len) => uncovered_orphan_param(inner, prefix).or_else(|| {
             let ConstArg::Param(name) = len else {
                 return None;
@@ -929,7 +934,9 @@ fn uncovered_orphan_param(ty: &Type, prefix: &str) -> Option<String> {
 fn coherence_type_is_valid(ty: &Type) -> bool {
     match ty {
         Type::Unknown | Type::Error | Type::InferVar(_) => false,
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } => coherence_type_is_valid(inner),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
+            coherence_type_is_valid(inner)
+        }
         Type::Tuple(elements) => elements.iter().all(coherence_type_is_valid),
         Type::Array(inner, len) => coherence_type_is_valid(inner) && coherence_const_is_valid(len),
         Type::Struct(_, args) | Type::Enum(_, args) => args.iter().all(coherence_type_is_valid),
@@ -994,6 +1001,9 @@ fn unify_coherence_type(
                     .iter()
                     .zip(rhs)
                     .all(|(lhs, rhs)| unify_coherence_type(lhs, rhs, type_subst, const_subst))
+        }
+        (Type::Slice(lhs), Type::Slice(rhs)) => {
+            unify_coherence_type(lhs, rhs, type_subst, const_subst)
         }
         (Type::Array(lhs, lhs_len), Type::Array(rhs, rhs_len)) => {
             unify_coherence_type(lhs, rhs, type_subst, const_subst)
@@ -1076,7 +1086,9 @@ fn coherence_type_occurs(name: &str, ty: &Type, subst: &HashMap<String, Type>) -
     let ty = resolve_coherence_type(ty, subst);
     match &ty {
         Type::Param(other) => other == name,
-        Type::Ref(inner, _) | Type::Ptr { inner, .. } => coherence_type_occurs(name, inner, subst),
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
+            coherence_type_occurs(name, inner, subst)
+        }
         Type::Tuple(elements) => elements
             .iter()
             .any(|element| coherence_type_occurs(name, element, subst)),
@@ -1167,7 +1179,9 @@ fn type_ref_size(ty: &HirTypeRef, generics: &HashSet<&str>) -> usize {
                 .map(|element| type_ref_size(element, generics))
                 .sum::<usize>()
         }
-        HirTypeRef::Array(inner, _) => 1 + type_ref_size(inner, generics),
+        HirTypeRef::Slice(inner) | HirTypeRef::Array(inner, _) => {
+            1 + type_ref_size(inner, generics)
+        }
         HirTypeRef::Function { .. } => 1,
         HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => 0,
     }

@@ -62,6 +62,42 @@ impl<'a> BodyLower<'a> {
         }
     }
 
+    pub fn lower_const(hir: &'a mut HirFile, expr: ast::Expr) -> Body {
+        let root_ptr = SyntaxNodePtr::new(expr.syntax());
+        let range = trimmed_range(expr.syntax());
+        let mut lower = BodyLower {
+            hir,
+            exprs: Arena::new(),
+            stmts: Arena::new(),
+            pats: Arena::new(),
+            diagnostics: Vec::new(),
+            expr_ranges: HashMap::new(),
+            stmt_ranges: HashMap::new(),
+            pat_ranges: HashMap::new(),
+        };
+        let tail = lower.lower_expr(expr);
+        let root_block = lower.alloc_expr(
+            Expr::Block {
+                stmts: Vec::new(),
+                tail: Some(tail),
+            },
+            range,
+        );
+        Body {
+            exprs: lower.exprs,
+            stmts: lower.stmts,
+            pats: lower.pats,
+            root_block,
+            root_ptr,
+            diagnostics: lower.diagnostics,
+            source_map: SourceMap {
+                expr_ranges: lower.expr_ranges,
+                stmt_ranges: lower.stmt_ranges,
+                pat_ranges: lower.pat_ranges,
+            },
+        }
+    }
+
     fn alloc_expr(&mut self, expr: Expr, range: TextRange) -> ExprId {
         let id = self.exprs.alloc(expr);
         self.expr_ranges.insert(id, range);
@@ -155,22 +191,20 @@ impl<'a> BodyLower<'a> {
         let range = trimmed_range(stmt.syntax());
         match stmt {
             ast::Stmt::VarDecl(var) => {
-                let name_token = var.name();
-                let name_range = name_token.as_ref().map(|token| token.text_range());
-                let name = lower_name(name_token);
+                let pat = match var.pattern() {
+                    Some(pattern) => self.lower_pattern(pattern),
+                    None => self.alloc_pat(Pattern::Wildcard, range),
+                };
                 let ty_ast = var.ty();
                 let ty_range = ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
                 let ty = self.lower_optional_type(ty_ast);
                 let init = self.lower_optional_expr(var.init());
-                let is_mut = var.is_mut();
                 Some(self.alloc_stmt(
                     Stmt::Let {
-                        name,
-                        name_range,
+                        pat,
                         ty,
                         ty_range,
                         init,
-                        is_mut,
                     },
                     range,
                 ))
@@ -260,7 +294,13 @@ impl<'a> BodyLower<'a> {
 
             ast::Stmt::ConstDecl(c) => {
                 use crate::lower::AstLower;
-                let _cid = c.lower(&mut self.hir.item_tree.consts);
+                let value = c.value();
+                let cid = c.lower(&mut self.hir.item_tree.consts);
+                if let Some(value) = value {
+                    let body = BodyLower::lower_const(self.hir, value);
+                    let body_id = self.hir.bodies.alloc(body);
+                    self.hir.const_bodies.insert(cid, body_id);
+                }
                 None
             }
 
@@ -280,16 +320,15 @@ impl<'a> BodyLower<'a> {
             }
 
             ast::Stmt::ExternFnDecl(decl) => {
-                if let Some(func) = decl.func_decl() {
+                if let Some(func) = decl.func_decl()
+                    && let Some(body_ast) = func.body()
+                {
                     use crate::lower::AstLower;
-                    let body_ast = func.body();
                     let fid = func.lower(&mut self.hir.item_tree.functions);
                     self.hir.item_tree.extern_function_ids.push(fid);
-                    if let Some(block) = body_ast {
-                        let nested_body = BodyLower::lower(self.hir, block);
-                        let body_id = self.hir.bodies.alloc(nested_body);
-                        self.hir.function_bodies.insert(fid, body_id);
-                    }
+                    let nested_body = BodyLower::lower(self.hir, body_ast);
+                    let body_id = self.hir.bodies.alloc(nested_body);
+                    self.hir.function_bodies.insert(fid, body_id);
                 }
                 None
             }
@@ -476,7 +515,13 @@ impl<'a> BodyLower<'a> {
                     .map(|token| token.text_range())
                     .unwrap_or(range);
                 let name = lower_name(name_token);
-                let pat = self.alloc_pat(Pattern::Binding { name }, pat_range);
+                let pat = self.alloc_pat(
+                    Pattern::Binding {
+                        name,
+                        is_mut: false,
+                    },
+                    pat_range,
+                );
                 let iterable =
                     self.lower_required_expr(f.iterable(), "missing for iterable", range);
                 let body = self.lower_required_block(f.body(), "missing for body", range);
@@ -583,12 +628,13 @@ impl<'a> BodyLower<'a> {
                             .value()
                             .map(|value| self.lower_expr(value))
                             .unwrap_or_else(|| {
+                                let r = field.name().map(|t| t.text_range()).unwrap_or(range);
                                 let path = HirPath {
                                     anchor: PathAnchor::Plain,
                                     segments: vec![name.clone()],
                                     type_args: Vec::new(),
+                                    range: r,
                                 };
-                                let r = field.name().map(|t| t.text_range()).unwrap_or(range);
                                 self.alloc_expr(
                                     Expr::Path {
                                         path,
@@ -644,6 +690,11 @@ impl<'a> BodyLower<'a> {
         let range = trimmed_range(pat.syntax());
         match pat {
             ast::Pattern::Wildcard(_) => self.alloc_pat(Pattern::Wildcard, range),
+            ast::Pattern::Binding(binding) => {
+                let name = lower_name(binding.name());
+                let is_mut = binding.is_mut();
+                self.alloc_pat(Pattern::Binding { name, is_mut }, range)
+            }
             ast::Pattern::Literal(literal) => {
                 let token = literal.literal_token();
                 let text = token
@@ -722,9 +773,13 @@ impl<'a> BodyLower<'a> {
                     self.alloc_pat(Pattern::Struct { path, fields }, range)
                 } else {
                     match path.as_single_name() {
-                        Some(name) => {
-                            self.alloc_pat(Pattern::Binding { name: name.clone() }, range)
-                        }
+                        Some(name) => self.alloc_pat(
+                            Pattern::Binding {
+                                name: name.clone(),
+                                is_mut: false,
+                            },
+                            range,
+                        ),
                         None => self.alloc_pat(Pattern::Path { path }, range),
                     }
                 }

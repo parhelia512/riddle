@@ -1,5 +1,146 @@
 use crate::{analyze, messages};
 
+#[test]
+fn delayed_initialization_is_allowed_before_use() {
+    let result = analyze(
+        r#"
+        fun f() -> i32 {
+            let value: i32;
+            value = 7;
+            value
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn delayed_tuple_bindings_are_initialized_independently() {
+    let result = analyze(
+        r#"
+        fun f() -> i32 {
+            let (first, second): (i32, i32);
+            first = 1;
+            second = 2;
+            first + second
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn delayed_initialization_use_before_assignment_is_rejected() {
+    let result = analyze(
+        r#"
+        fun f() -> i32 {
+            let value: i32;
+            value
+        }
+        "#,
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0059" && diagnostic.message.contains("uninitialized")
+        }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn delayed_initialization_requires_every_branch() {
+    let complete = analyze(
+        r#"
+        fun f(flag: bool) -> i32 {
+            let value: i32;
+            if flag { value = 1; } else { value = 2; }
+            value
+        }
+        "#,
+    );
+    assert!(
+        complete.diagnostics.is_empty(),
+        "{:#?}",
+        complete.diagnostics
+    );
+
+    let incomplete = analyze(
+        r#"
+        fun f(flag: bool) -> i32 {
+            let value: i32;
+            if flag { value = 1; }
+            value
+        }
+        "#,
+    );
+    assert!(
+        incomplete
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0059"),
+        "{:#?}",
+        incomplete.diagnostics
+    );
+}
+
+#[test]
+fn immutable_delayed_binding_rejects_second_assignment() {
+    let result = analyze(
+        r#"
+        fun f() {
+            let value: i32;
+            value = 1;
+            value = 2;
+        }
+        "#,
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0031" && diagnostic.message.contains("not declared as mutable")
+        }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn mutable_delayed_binding_can_be_assigned_repeatedly() {
+    let result = analyze(
+        r#"
+        fun f() -> i32 {
+            let mut value: i32;
+            value = 1;
+            value = 2;
+            value
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn delayed_compound_assignment_requires_initialization() {
+    let result = analyze(
+        r#"
+        fun f() {
+            let mut value: i32;
+            value += 1;
+        }
+        "#,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0059")
+            .count(),
+        1,
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
 // == Copy types: no errors ==
 
 #[test]
@@ -1076,10 +1217,10 @@ fn explicit_copy_impl_makes_struct_copyable() {
 fn namespaced_copy_impl_makes_struct_copyable() {
     let result = analyze(
         r#"
-        mod std {
-            mod marker {
+        pub mod std {
+            pub mod marker {
                 #[lang = "copy"]
-                trait Copy {}
+                pub trait Copy {}
             }
         }
 
@@ -1379,5 +1520,48 @@ fn shared_capture_blocks_assignment_while_closure_is_live() {
         messages(&result)
             .iter()
             .any(|message| message.contains("cannot assign") && message.contains("base"))
+    );
+}
+
+#[test]
+fn destructured_bindings_are_tracked_independently() {
+    let result = analyze(
+        r#"
+        struct Token { value: i32 }
+        fun consume(value: Token) {}
+
+        fun main() {
+            let pair = (Token { value: 1 }, Token { value: 2 });
+            let (first, second) = pair;
+            consume(first);
+            consume(second);
+        }
+        "#,
+    );
+
+    assert_eq!(messages(&result), Vec::<&str>::new());
+}
+
+#[test]
+fn moving_a_destructured_binding_twice_is_rejected() {
+    let result = analyze(
+        r#"
+        struct Token { value: i32 }
+        fun consume(value: Token) {}
+
+        fun main() {
+            let (first, second) = (Token { value: 1 }, Token { value: 2 });
+            consume(first);
+            consume(first);
+        }
+        "#,
+    );
+
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|message| message.contains("use of moved value") && message.contains("first")),
+        "{:?}",
+        messages(&result)
     );
 }

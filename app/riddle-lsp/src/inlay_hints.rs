@@ -55,12 +55,17 @@ pub(crate) fn inlay_hints_from_analysis(
     for (body_id, body) in hir.bodies.iter() {
         for (_, statement) in body.stmts.iter() {
             let Stmt::Let {
-                name_range: Some(name_range),
+                pat,
                 ty: HirTypeRef::Unknown,
                 init: Some(init),
                 ..
             } = statement
             else {
+                continue;
+            };
+            // The hint sits after the whole pattern, so `let (a, b) = pair`
+            // reads `let (a, b): (i32, i32) = pair`.
+            let Some(name_range) = body.source_map.pat_ranges.get(pat) else {
                 continue;
             };
             if matches!(body.exprs[*init], Expr::Struct { .. }) {

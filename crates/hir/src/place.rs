@@ -1,4 +1,4 @@
-use crate::body::StmtId;
+use crate::body::PatternBindingId;
 
 /// A projection from a root local to a sub-location.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -15,12 +15,12 @@ pub enum Projection {
 /// `Place { local, projections: [Field(1)] }` — `local.1`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Place {
-    pub local: StmtId,
+    pub local: PatternBindingId,
     pub projections: Vec<Projection>,
 }
 
 impl Place {
-    pub fn root(local: StmtId) -> Self {
+    pub fn root(local: PatternBindingId) -> Self {
         Self {
             local,
             projections: Vec::new(),

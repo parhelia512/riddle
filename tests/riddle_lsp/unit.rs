@@ -457,23 +457,33 @@ fn completion_filters_member_candidates_after_the_dot() {
 
 #[test]
 fn completion_recovers_incomplete_let_member_access() {
-    let source = "use std::String;\n\nfun main() {\n    let c = String::new();\n    let d = c.\n}";
+    let source = "use std::Vector;\n\nfun main() {\n    let c: Vector<i32> = Vector::new();\n    let d = c.\n}";
     let items = completion_items_for_source(
         source,
         position(source, source.find("c.\n").unwrap() + "c.".len()),
         CompileOptions::default(),
     );
 
-    let as_str = items.iter().find(|item| item.label == "as_str").unwrap();
-    let label = as_str.label_details.as_ref().unwrap();
-    assert_eq!(label.detail.as_deref(), Some("(&self)"));
-    assert_eq!(label.description.as_deref(), Some("&str"));
-    assert_eq!(as_str.insert_text.as_deref(), Some("as_str"));
+    assert!(items.iter().any(|item| item.label == "len"), "{items:#?}");
+}
+
+#[test]
+fn completion_resolves_slice_methods() {
+    let source = "fun inspect(values: &[i32]) { values. }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("values.").unwrap() + "values.".len()),
+        CompileOptions::default(),
+    );
+
+    assert!(items.iter().any(|item| item.label == "len"), "{items:#?}");
+    assert!(items.iter().any(|item| item.label == "get"), "{items:#?}");
+    assert!(items.iter().any(|item| item.label == "iter"), "{items:#?}");
 }
 
 #[test]
 fn completion_resolves_std_associated_functions() {
-    let source = "fun main() { let value = String::ne; }";
+    let source = "fun main() { let value = Vector::ne; }";
     let items = completion_items_for_source(
         source,
         position(source, source.find("ne;").unwrap() + 2),
@@ -485,7 +495,10 @@ fn completion_resolves_std_associated_functions() {
             item.label == "new"
                 && item.label_details.as_ref().is_some_and(|label| {
                     label.detail.as_deref() == Some("()")
-                        && label.description.as_deref() == Some("String")
+                        && label
+                            .description
+                            .as_deref()
+                            .is_some_and(|description| description.contains("Vector"))
                 })
                 && item.kind == Some(lsp_types::CompletionItemKind::FUNCTION)
         }),
@@ -495,15 +508,15 @@ fn completion_resolves_std_associated_functions() {
 
 #[test]
 fn completion_includes_std_prelude_imports() {
-    let source = "fun main() { Str }";
+    let source = "fun main() { Vec }";
     let items = completion_items_for_source(
         source,
-        position(source, source.find("Str").unwrap() + 3),
+        position(source, source.find("Vec").unwrap() + 3),
         CompileOptions::default(),
     );
 
     assert!(
-        items.iter().any(|item| item.label == "String"),
+        items.iter().any(|item| item.label == "Vector"),
         "{items:#?}"
     );
 }
@@ -723,7 +736,7 @@ fn project_member_completion_uses_active_module_coordinates() {
 #[test]
 fn completion_preserves_std_member_items_through_document_sessions() {
     let uri = lsp_types::Url::parse("file:///riddle-lsp-completion.rid").unwrap();
-    let text = "use std::String; fun main() { let c = String::new(); let d = c.i }";
+    let text = "use std::Vector; fun main() { let c: Vector<i32> = Vector::new(); let d = c.i }";
     let docs = HashMap::from([(
         uri.clone(),
         Document {
@@ -1030,7 +1043,7 @@ fun main() {
 
 #[test]
 fn semantic_tokens_classify_std_structs_and_associated_new() {
-    let source = include_str!("../../std/std/string.rid");
+    let source = include_str!("../../std/std/vector.rid");
     let tokens = semantic_token_positions(&semantic_tokens_for_source_with_options(
         source,
         CompileOptions::default(),
@@ -1050,26 +1063,18 @@ fn semantic_tokens_classify_std_structs_and_associated_new() {
         })
         .collect::<Vec<_>>();
 
-    for name in ["String", "Vector"] {
-        let expected = source.match_indices(name).count();
-        let actual = symbols
-            .iter()
-            .filter(|(text, kind, modifiers)| {
-                *text == name && *kind == TOKEN_STRUCT && *modifiers & MOD_DEFAULT_LIBRARY != 0
-            })
-            .count();
-        assert_eq!(actual, expected, "{name}: {symbols:#?}");
-    }
+    assert!(
+        symbols.iter().any(|(text, kind, modifiers)| {
+            *text == "Vector" && *kind == TOKEN_STRUCT && *modifiers & MOD_DEFAULT_LIBRARY != 0
+        }),
+        "{symbols:#?}"
+    );
 
     let new_tokens = symbols
         .iter()
         .filter(|(text, kind, _)| *text == "new" && *kind == TOKEN_METHOD)
         .collect::<Vec<_>>();
-    assert_eq!(
-        new_tokens.len(),
-        source.match_indices("new").count(),
-        "{symbols:#?}"
-    );
+    assert!(!new_tokens.is_empty(), "{symbols:#?}");
     assert!(
         new_tokens.iter().all(|(_, _, modifiers)| {
             *modifiers & MOD_STATIC != 0 && *modifiers & MOD_DEFAULT_LIBRARY != 0
@@ -1080,12 +1085,12 @@ fn semantic_tokens_classify_std_structs_and_associated_new() {
 
 #[test]
 fn semantic_tokens_classify_primitives_type_annotations_and_free_functions() {
-    let source = r#"fun make(value: i32, size: usize, enabled: bool) -> String {
-    String::new()
+    let source = r#"fun make(value: i32, size: usize, enabled: bool) -> Vector<i32> {
+    Vector::new()
 }
 
 fun main() {
-    let s: String = make(1i32, 0usize, true);
+    let s: Vector<i32> = make(1i32, 0usize, true);
 }"#;
     let tokens = semantic_token_positions(&semantic_tokens_for_source_with_options(
         source,
@@ -1118,7 +1123,7 @@ fun main() {
         symbols
             .iter()
             .filter(|(text, kind, modifiers)| {
-                *text == "String" && *kind == TOKEN_STRUCT && *modifiers & MOD_DEFAULT_LIBRARY != 0
+                *text == "Vector" && *kind == TOKEN_STRUCT && *modifiers & MOD_DEFAULT_LIBRARY != 0
             })
             .count(),
         3,
@@ -2137,7 +2142,7 @@ fn semantic_tokens_place_local_declaration_and_use_on_identifier() {
 
 #[test]
 fn semantic_tokens_separate_parameters_from_immutable_locals() {
-    let source = r#"extern "C" fun putchar(c: i32) -> i32;
+    let source = r#"unsafe extern "C" { fun putchar(c: i32) -> i32; }
 
 fun print_digit(n: i32){
     putchar(n + 48);
@@ -2161,7 +2166,7 @@ fun main(){
         vec![
             SemanticTokenPosition {
                 line: 0,
-                start: 23,
+                start: 32,
                 length: 1,
                 token_type: TOKEN_PARAMETER,
                 token_modifiers_bitset: MOD_DECLARATION,

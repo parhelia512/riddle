@@ -6,6 +6,16 @@ pub struct IntoIter<T, const N: usize> {
     index: usize,
 }
 
+pub struct Iter<T, const N: usize> {
+    values: &[T; N],
+    index: usize,
+}
+
+pub struct IterMut<T, const N: usize> {
+    values: &mut [T; N],
+    index: usize,
+}
+
 impl<T, const N: usize> Iterator for IntoIter<T, N> {
     type Item = T;
 
@@ -27,6 +37,58 @@ impl<T, const N: usize> IntoIterator for [T; N] {
     fun into_iter(self) -> Self::IntoIter {
         IntoIter {
             values: self,
+            index: 0usize,
+        }
+    }
+}
+
+impl<T, const N: usize> Iterator for Iter<T, N> {
+    type Item = &T;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.index < N {
+            let index = self.index;
+            self.index += 1usize;
+            Option::Some(&self.values[index])
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl<T, const N: usize> IntoIterator for &[T; N] {
+    type Item = &T;
+    type IntoIter = Iter<T, N>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        Iter {
+            values: &*self,
+            index: 0usize,
+        }
+    }
+}
+
+impl<T, const N: usize> Iterator for IterMut<T, N> {
+    type Item = &mut T;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.index < N {
+            let index = self.index;
+            self.index += 1usize;
+            Option::Some(&mut self.values[index])
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl<T, const N: usize> IntoIterator for &mut [T; N] {
+    type Item = &mut T;
+    type IntoIter = IterMut<T, N>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        IterMut {
+            values: &mut *self,
             index: 0usize,
         }
     }

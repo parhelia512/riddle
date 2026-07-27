@@ -1,4 +1,5 @@
 pub use crate::std::array::IntoIter as ArrayIter;
+pub use crate::std::slice::{SliceIter, SliceIterMut};
 pub use crate::std::clone::Clone;
 pub use crate::std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 pub use crate::std::iter::{IntoIterator, Iterator};
@@ -14,9 +15,9 @@ pub use crate::std::string::String;
 pub use crate::std::vector::Vector;
 
 unsafe extern "C" {
-    safe fun riddle_panic(message: &str) -> !;
+    safe fun abort() -> !;
 }
 
 pub fun panic(message: &str) -> ! {
-    riddle_panic(message)
+    abort()
 }

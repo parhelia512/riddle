@@ -103,6 +103,7 @@ pub fn lower_generic_bounds(
                                     anchor: PathAnchor::Plain,
                                     segments: vec![name.clone()],
                                     type_args: Vec::new(),
+                                    range: trait_range,
                                 }),
                                 target_range: trait_range,
                                 trait_ty: HirTypeRef::Named(trait_path),
@@ -297,9 +298,8 @@ impl AstLower for ExternFnDecl {
         let func = self
             .func_decl()
             .expect("ExternFnDecl must contain FuncDecl");
-        let is_import = func.body().is_none();
         let id = func.lower(arena);
-        arena[id].is_unsafe |= explicitly_unsafe || is_import;
+        arena[id].is_unsafe |= explicitly_unsafe;
         id
     }
 }
@@ -430,6 +430,7 @@ impl AstLower for ast::TraitDecl {
                         anchor: PathAnchor::Plain,
                         segments: vec![Name("Self".into())],
                         type_args: Vec::new(),
+                        range: trait_range,
                     }),
                     target_range: trait_range,
                     trait_ty: HirTypeRef::Named(trait_path),
@@ -469,7 +470,7 @@ impl AstLower for ast::TraitDecl {
                                 let is_mut = p.is_mut();
                                 let mut param = p.lower();
                                 if is_self {
-                                    param.ty = self_receiver_type(is_ref, is_mut);
+                                    param.ty = self_receiver_type(is_ref, is_mut, param.ty_range);
                                 }
                                 param
                             })
@@ -534,11 +535,12 @@ impl AstLower for ast::TraitDecl {
     }
 }
 
-fn self_receiver_type(is_ref: bool, is_mut: bool) -> HirTypeRef {
+fn self_receiver_type(is_ref: bool, is_mut: bool, range: rowan::TextRange) -> HirTypeRef {
     let self_ty = HirTypeRef::Named(HirPath {
         anchor: PathAnchor::Plain,
         segments: vec![Name("Self".into())],
         type_args: Vec::new(),
+        range,
     });
     if is_ref {
         HirTypeRef::Ref(Box::new(self_ty), is_mut)
@@ -662,10 +664,12 @@ impl Lower for Type {
                 let Some(inner) = arr.element() else {
                     return HirTypeRef::Error;
                 };
-                let Some(len_expr) = arr.len_expr() else {
-                    return HirTypeRef::Error;
-                };
-                HirTypeRef::Array(Box::new(inner.lower()), lower_const_arg(len_expr))
+                match arr.len_expr() {
+                    Some(len_expr) => {
+                        HirTypeRef::Array(Box::new(inner.lower()), lower_const_arg(len_expr))
+                    }
+                    None => HirTypeRef::Slice(Box::new(inner.lower())),
+                }
             }
             Type::Const(value) => value
                 .value()
@@ -715,6 +719,7 @@ impl Lower for Option<Type> {
 impl Lower for ast::Path {
     type Output = HirPath;
     fn lower(self) -> Self::Output {
+        let range = trimmed_range(self.syntax());
         let absolute = self.is_absolute();
         let mut segs: Vec<(SyntaxKind, String)> = self
             .segments()
@@ -749,6 +754,7 @@ impl Lower for ast::Path {
             anchor,
             segments,
             type_args: Vec::new(),
+            range,
         }
     }
 }
@@ -760,6 +766,7 @@ impl Lower for Option<ast::Path> {
             anchor: PathAnchor::Plain,
             segments: vec![Name("<missing>".into())],
             type_args: Vec::new(),
+            range: rowan::TextRange::default(),
         })
     }
 }

@@ -27,6 +27,7 @@ pub(crate) struct SummaryOrigin {
 pub(crate) struct FunctionSummary {
     pub(crate) origins: HashSet<SummaryOrigin>,
     pub(crate) opaque: bool,
+    pub(crate) fields: Vec<FunctionSummary>,
 }
 
 #[derive(Debug, Default)]
@@ -40,12 +41,16 @@ impl ReferenceFlow {
             .function_bodies
             .keys()
             .copied()
+            .filter(|fid| !is_std_builtin(hir, *fid))
             .map(|fid| (fid, FunctionSummary::default()))
             .collect::<HashMap<_, _>>();
 
         loop {
             let previous = summaries.clone();
             for (fid, body_id) in &hir.function_bodies {
+                if is_std_builtin(hir, *fid) {
+                    continue;
+                }
                 let summary = SummaryAnalyzer::new(hir, type_result, &previous, *body_id)
                     .analyze_function(*fid);
                 summaries.insert(*fid, summary);
@@ -63,13 +68,20 @@ impl ReferenceFlow {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct FlowValue {
-    origins: HashSet<SummaryOrigin>,
-    opaque: bool,
+fn is_std_builtin(hir: &HirFile, fid: FunctionId) -> bool {
+    hir.std_loaded
+        && hir
+            .package_for_range(hir.item_tree.functions[fid].name_range)
+            .is_none()
+        && hir.item_tree.functions[fid]
+            .attrs
+            .iter()
+            .any(|attr| attr.name.0 == "builtin")
 }
 
-impl FlowValue {
+type FlowValue = FunctionSummary;
+
+impl FunctionSummary {
     fn from_param(param: usize) -> Self {
         Self {
             origins: [SummaryOrigin {
@@ -79,10 +91,26 @@ impl FlowValue {
             .into_iter()
             .collect(),
             opaque: false,
+            fields: Vec::new(),
         }
     }
 
     fn merge(&mut self, other: Self) {
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
+        if other.is_empty() {
+            return;
+        }
+
+        if self.fields.len() == other.fields.len() && !self.fields.is_empty() {
+            for (field, other_field) in self.fields.iter_mut().zip(other.fields.iter().cloned()) {
+                field.merge(other_field);
+            }
+        } else {
+            self.fields.clear();
+        }
         self.origins.extend(other.origins);
         self.opaque |= other.opaque;
     }
@@ -96,7 +124,55 @@ impl FlowValue {
                 kind,
             })
             .collect();
+        self.fields = self
+            .fields
+            .into_iter()
+            .map(|field| field.with_kind(kind))
+            .collect();
         self
+    }
+
+    fn from_fields(fields: Vec<Self>) -> Self {
+        let mut value = Self::default();
+        for field in &fields {
+            value.origins.extend(field.origins.iter().copied());
+            value.opaque |= field.opaque;
+        }
+        value.fields = fields;
+        value
+    }
+
+    fn project(&self, index: usize) -> Self {
+        self.fields
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| self.flattened())
+    }
+
+    fn iterated(&self) -> Self {
+        if self.fields.is_empty() {
+            return self.flattened();
+        }
+        merge_values(self.fields.iter().cloned())
+    }
+
+    fn flattened(&self) -> Self {
+        Self {
+            origins: self.origins.clone(),
+            opaque: self.opaque,
+            fields: Vec::new(),
+        }
+    }
+
+    fn retain_params(&mut self, param_count: usize) {
+        self.origins.retain(|origin| origin.param < param_count);
+        for field in &mut self.fields {
+            field.retain_params(param_count);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.origins.is_empty() && !self.opaque && self.fields.is_empty()
     }
 }
 
@@ -106,8 +182,9 @@ struct SummaryAnalyzer<'a> {
     summaries: &'a HashMap<FunctionId, FunctionSummary>,
     body_id: BodyId,
     body: &'a Body,
-    locals: HashMap<StmtId, FlowValue>,
-    pattern_sources: Vec<HashMap<PatternBindingId, FlowValue>>,
+    /// Provenance per binding. `let`, `match` arms and `for` all land here —
+    /// `PatternBindingId` is unique per pattern site, so one flat map suffices.
+    locals: HashMap<PatternBindingId, FlowValue>,
     returned: FlowValue,
 }
 
@@ -125,7 +202,6 @@ impl<'a> SummaryAnalyzer<'a> {
             body_id,
             body: &hir.bodies[body_id],
             locals: HashMap::new(),
-            pattern_sources: Vec::new(),
             returned: FlowValue::default(),
         }
     }
@@ -134,13 +210,8 @@ impl<'a> SummaryAnalyzer<'a> {
         let tail = self.analyze_expr(self.body.root_block);
         self.returned.merge(tail);
         let param_count = self.hir.item_tree.functions[fid].params.len();
+        self.returned.retain_params(param_count);
         self.returned
-            .origins
-            .retain(|origin| origin.param < param_count);
-        FunctionSummary {
-            origins: self.returned.origins,
-            opaque: self.returned.opaque,
-        }
     }
 
     fn analyze_expr(&mut self, expr_id: ExprId) -> FlowValue {
@@ -155,15 +226,9 @@ impl<'a> SummaryAnalyzer<'a> {
 
             Expr::Path { resolved, .. } => match resolved {
                 Some(ResolvedName::Param(index)) => FlowValue::from_param(*index),
-                Some(ResolvedName::Local(stmt)) => {
-                    self.locals.get(stmt).cloned().unwrap_or_default()
+                Some(ResolvedName::PatternBinding(id)) => {
+                    self.locals.get(id).cloned().unwrap_or_default()
                 }
-                Some(ResolvedName::PatternBinding(id)) => self
-                    .pattern_sources
-                    .iter()
-                    .rev()
-                    .find_map(|scope| scope.get(id).cloned())
-                    .unwrap_or_default(),
                 _ => FlowValue::default(),
             },
 
@@ -184,20 +249,15 @@ impl<'a> SummaryAnalyzer<'a> {
             }
 
             Expr::Struct { fields, .. } => {
-                let mut result = FlowValue::default();
-                for field in fields {
-                    result.merge(self.analyze_expr(field.value));
-                }
-                result
+                merge_values(fields.iter().map(|field| self.analyze_expr(field.value)))
             }
 
-            Expr::Array { elements } | Expr::Tuple { elements } => {
-                let mut result = FlowValue::default();
-                for element in elements {
-                    result.merge(self.analyze_expr(*element));
-                }
-                result
-            }
+            Expr::Array { elements } | Expr::Tuple { elements } => FlowValue::from_fields(
+                elements
+                    .iter()
+                    .map(|element| self.analyze_expr(*element))
+                    .collect(),
+            ),
 
             Expr::ArrayRepeat { value, len } => {
                 let result = self.analyze_expr(*value);
@@ -209,9 +269,13 @@ impl<'a> SummaryAnalyzer<'a> {
                 self.analyze_expr(*lhs);
                 let rhs_value = self.analyze_expr(*rhs);
                 if *op == BinaryOp::Assign
-                    && let Some(stmt) = self.direct_local_root(*lhs)
+                    && let Some((binding, direct)) = self.local_assignment(*lhs)
                 {
-                    self.locals.insert(stmt, rhs_value);
+                    if direct {
+                        self.locals.insert(binding, rhs_value);
+                    } else {
+                        self.locals.entry(binding).or_default().merge(rhs_value);
+                    }
                 }
                 FlowValue::default()
             }
@@ -260,11 +324,10 @@ impl<'a> SummaryAnalyzer<'a> {
                 iterable,
                 body,
             } => {
-                let iterable_value = self.analyze_expr(*iterable);
+                let iterable_value = self.analyze_expr(*iterable).iterated();
                 let entry = self.locals.clone();
-                self.push_pattern_sources(*pat, &iterable_value);
+                self.bind_pattern_sources(*pat, &iterable_value);
                 self.analyze_expr(*body);
-                self.pattern_sources.pop();
                 self.locals = merge_two_locals(entry, self.locals.clone());
                 FlowValue::default()
             }
@@ -276,12 +339,11 @@ impl<'a> SummaryAnalyzer<'a> {
                 let mut merged_locals = entry.clone();
                 for arm in arms {
                     self.locals = entry.clone();
-                    self.push_pattern_sources(arm.pat, &scrutinee_value);
+                    self.bind_pattern_sources(arm.pat, &scrutinee_value);
                     if let Some(guard) = arm.guard {
                         self.analyze_expr(guard);
                     }
                     result.merge(self.analyze_expr(arm.body));
-                    self.pattern_sources.pop();
                     merged_locals = merge_two_locals(merged_locals, self.locals.clone());
                 }
                 self.locals = merged_locals;
@@ -296,19 +358,12 @@ impl<'a> SummaryAnalyzer<'a> {
                 if let Some(info) = self.type_result.lambda_infos.get(&(self.body_id, expr_id)) {
                     for capture in &info.captures {
                         match capture.source {
-                            CaptureSource::Local(stmt) => {
-                                result.merge(self.locals.get(&stmt).cloned().unwrap_or_default())
-                            }
                             CaptureSource::Param(index) => {
                                 result.merge(FlowValue::from_param(index));
                             }
-                            CaptureSource::Pattern(id) => result.merge(
-                                self.pattern_sources
-                                    .iter()
-                                    .rev()
-                                    .find_map(|scope| scope.get(&id).cloned())
-                                    .unwrap_or_default(),
-                            ),
+                            CaptureSource::Pattern(id) => {
+                                result.merge(self.locals.get(&id).cloned().unwrap_or_default())
+                            }
                             CaptureSource::LambdaParam { .. } => result.opaque = true,
                         }
                     }
@@ -316,19 +371,30 @@ impl<'a> SummaryAnalyzer<'a> {
                 result
             }
 
-            Expr::FieldAccess { base, .. } => self.analyze_expr(*base),
+            Expr::FieldAccess { base, field } => {
+                let value = self.analyze_expr(*base);
+                self.field_index(*base, field)
+                    .map(|index| value.project(index))
+                    .unwrap_or_else(|| value.flattened())
+            }
 
             Expr::IndexAccess { base, index } => {
-                let result = self.analyze_expr(*base);
+                let value = self.analyze_expr(*base);
                 self.analyze_expr(*index);
-                result
+                match &self.body.exprs[*index] {
+                    Expr::IntLiteral { value: index, .. } => usize::try_from(*index)
+                        .ok()
+                        .map(|index| value.project(index))
+                        .unwrap_or_else(|| value.iterated()),
+                    _ => value.iterated(),
+                }
             }
 
             Expr::Unsafe { body } => self.analyze_expr(*body),
             Expr::Cast { base, .. } => self.analyze_expr(*base),
         };
 
-        if !self.expr_may_carry_reference(expr_id) {
+        if !self.expr_may_carry_provenance(expr_id) {
             value = FlowValue::default();
         }
         value
@@ -336,9 +402,10 @@ impl<'a> SummaryAnalyzer<'a> {
 
     fn analyze_stmt(&mut self, stmt_id: StmtId) {
         match &self.body.stmts[stmt_id] {
-            Stmt::Let { init, .. } => {
+            Stmt::Let { pat, init, .. } => {
+                let (pat, init) = (*pat, *init);
                 let value = init.map(|init| self.analyze_expr(init)).unwrap_or_default();
-                self.locals.insert(stmt_id, value);
+                self.bind_pattern_sources(pat, &value);
             }
             Stmt::Expr { expr } => {
                 self.analyze_expr(*expr);
@@ -368,30 +435,16 @@ impl<'a> SummaryAnalyzer<'a> {
                 ..
             }
         ) {
-            return merge_values(inputs);
+            return FlowValue::from_fields(inputs);
         }
 
         if let Some(fid) = self.resolve_callee(callee)
             && let Some(summary) = self.summaries.get(&fid)
         {
-            let mut result = FlowValue {
-                origins: HashSet::new(),
-                opaque: summary.opaque,
-            };
-            for summary_origin in &summary.origins {
-                let Some(input) = inputs.get(summary_origin.param) else {
-                    continue;
-                };
-                let input = match summary_origin.kind {
-                    FlowKind::Inherit => input.clone(),
-                    kind => input.clone().with_kind(kind),
-                };
-                result.merge(input);
-            }
-            return result;
+            return instantiate_summary(summary, &inputs);
         }
 
-        if !self.expr_may_carry_reference(call) {
+        if !self.expr_may_carry_provenance(call) {
             return FlowValue::default();
         }
         let mut result = callee_value;
@@ -414,18 +467,9 @@ impl<'a> SummaryAnalyzer<'a> {
                 ..
             } => FlowValue::from_param(*index),
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
-                ..
-            } => self.locals.get(stmt).cloned().unwrap_or_default(),
-            Expr::Path {
                 resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
-            } => self
-                .pattern_sources
-                .iter()
-                .rev()
-                .find_map(|scope| scope.get(id).cloned())
-                .unwrap_or_default(),
+            } => self.locals.get(id).cloned().unwrap_or_default(),
             Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
                 self.place_value(*base)
             }
@@ -437,31 +481,109 @@ impl<'a> SummaryAnalyzer<'a> {
         }
     }
 
-    fn expr_may_carry_reference(&self, expr_id: ExprId) -> bool {
+    fn expr_may_carry_provenance(&self, expr_id: ExprId) -> bool {
         self.type_result
             .expr_types
             .get(&(self.body_id, expr_id))
-            .is_none_or(|ty| type_may_carry_reference(self.hir, ty))
+            .is_none_or(|ty| type_may_carry_provenance(self.hir, ty))
     }
 
-    fn direct_local_root(&self, expr_id: ExprId) -> Option<StmtId> {
+    fn local_assignment(&self, expr_id: ExprId) -> Option<(PatternBindingId, bool)> {
         match &self.body.exprs[expr_id] {
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
+                resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
-            } => Some(*stmt),
+            } => Some((*id, true)),
             Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
-                self.direct_local_root(*base)
+                self.local_assignment(*base).map(|(id, _)| (id, false))
             }
             _ => None,
         }
     }
 
-    fn push_pattern_sources(&mut self, pat: PatId, value: &FlowValue) {
-        let mut bindings = HashSet::new();
-        collect_pattern_bindings(self.body, pat, &mut bindings);
-        self.pattern_sources
-            .push(bindings.into_iter().map(|id| (id, value.clone())).collect());
+    fn bind_pattern_sources(&mut self, pat: PatId, value: &FlowValue) {
+        match &self.body.pats[pat] {
+            Pattern::Binding { .. } => {
+                self.locals.insert(
+                    PatternBindingId {
+                        pattern: pat,
+                        field: None,
+                    },
+                    value.clone(),
+                );
+            }
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
+                for (index, element) in elements.iter().enumerate() {
+                    self.bind_pattern_sources(*element, &value.project(index));
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for (binding_index, field) in fields.iter().enumerate() {
+                    let Some(index) = self.pattern_field_index(pat, &field.name) else {
+                        continue;
+                    };
+                    let field_value = value.project(index);
+                    if let Some(field_pat) = field.pat {
+                        self.bind_pattern_sources(field_pat, &field_value);
+                    } else {
+                        self.locals.insert(
+                            PatternBindingId {
+                                pattern: pat,
+                                field: Some(binding_index),
+                            },
+                            field_value,
+                        );
+                    }
+                }
+            }
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+        }
+    }
+
+    fn field_index(&self, base: ExprId, field: &hir::Name) -> Option<usize> {
+        match self.type_result.expr_types.get(&(self.body_id, base))? {
+            Type::Ref(inner, _) => self.field_index_for_type(inner, field),
+            ty => self.field_index_for_type(ty, field),
+        }
+    }
+
+    fn field_index_for_type(&self, ty: &Type, field: &hir::Name) -> Option<usize> {
+        match ty {
+            Type::Struct(id, _) => self.hir.item_tree.structs[*id]
+                .fields
+                .iter()
+                .position(|item| item.name == *field),
+            Type::Tuple(elements) => field
+                .0
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index < elements.len()),
+            _ => None,
+        }
+    }
+
+    fn pattern_field_index(&self, pat: PatId, field: &hir::Name) -> Option<usize> {
+        match self.type_result.pattern_types.get(&(self.body_id, pat))? {
+            Type::Struct(id, _) => self.hir.item_tree.structs[*id]
+                .fields
+                .iter()
+                .position(|item| item.name == *field),
+            Type::Enum(id, _) => {
+                let Pattern::Struct { path, .. } = &self.body.pats[pat] else {
+                    return None;
+                };
+                let name = path.segments.last()?;
+                let variant = self.hir.item_tree.enums[*id]
+                    .variants
+                    .iter()
+                    .find(|variant| variant.name == *name)?;
+                let hir::item_tree::HirVariantKind::Struct(fields) = &variant.kind else {
+                    return None;
+                };
+                fields.iter().position(|item| item.name == *field)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -478,35 +600,6 @@ impl OpaqueReference for FlowValue {
     }
 }
 
-fn collect_pattern_bindings(body: &Body, pat: PatId, bindings: &mut HashSet<PatternBindingId>) {
-    match &body.pats[pat] {
-        Pattern::Binding { .. } => {
-            bindings.insert(PatternBindingId {
-                pattern: pat,
-                field: None,
-            });
-        }
-        Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
-            for element in elements {
-                collect_pattern_bindings(body, *element, bindings);
-            }
-        }
-        Pattern::Struct { fields, .. } => {
-            for (index, field) in fields.iter().enumerate() {
-                if let Some(field_pat) = field.pat {
-                    collect_pattern_bindings(body, field_pat, bindings);
-                } else {
-                    bindings.insert(PatternBindingId {
-                        pattern: pat,
-                        field: Some(index),
-                    });
-                }
-            }
-        }
-        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
-    }
-}
-
 fn merge_values(values: impl IntoIterator<Item = FlowValue>) -> FlowValue {
     let mut result = FlowValue::default();
     for value in values {
@@ -515,52 +608,89 @@ fn merge_values(values: impl IntoIterator<Item = FlowValue>) -> FlowValue {
     result
 }
 
+fn instantiate_summary(summary: &FunctionSummary, inputs: &[FlowValue]) -> FlowValue {
+    let mut result = FlowValue::default();
+    for origin in &summary.origins {
+        let Some(input) = inputs.get(origin.param) else {
+            continue;
+        };
+        result.merge(match origin.kind {
+            FlowKind::Inherit => input.clone(),
+            kind => input.clone().with_kind(kind),
+        });
+    }
+    if !summary.fields.is_empty() {
+        result.fields = summary
+            .fields
+            .iter()
+            .map(|field| instantiate_summary(field, inputs))
+            .collect();
+    }
+    if summary.opaque {
+        result.merge(merge_values(inputs.iter().cloned()));
+        result.opaque = true;
+    }
+    result
+}
+
 fn merge_two_locals(
-    mut left: HashMap<StmtId, FlowValue>,
-    right: HashMap<StmtId, FlowValue>,
-) -> HashMap<StmtId, FlowValue> {
-    for (stmt, value) in right {
-        left.entry(stmt).or_default().merge(value);
+    mut left: HashMap<PatternBindingId, FlowValue>,
+    right: HashMap<PatternBindingId, FlowValue>,
+) -> HashMap<PatternBindingId, FlowValue> {
+    for (binding, value) in right {
+        left.entry(binding).or_default().merge(value);
     }
     left
 }
 
 fn merge_locals(
-    entry: HashMap<StmtId, FlowValue>,
-    left: HashMap<StmtId, FlowValue>,
-    right: HashMap<StmtId, FlowValue>,
-) -> HashMap<StmtId, FlowValue> {
+    entry: HashMap<PatternBindingId, FlowValue>,
+    left: HashMap<PatternBindingId, FlowValue>,
+    right: HashMap<PatternBindingId, FlowValue>,
+) -> HashMap<PatternBindingId, FlowValue> {
     merge_two_locals(merge_two_locals(entry, left), right)
 }
 
 pub(crate) fn type_may_carry_reference(hir: &HirFile, ty: &Type) -> bool {
+    type_may_carry_flow(hir, ty, false)
+}
+
+fn type_may_carry_provenance(hir: &HirFile, ty: &Type) -> bool {
+    type_may_carry_flow(hir, ty, true)
+}
+
+fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> bool {
     match ty {
         Type::Ref(..) => true,
-        Type::Ptr { .. } => false,
+        Type::Ptr { .. } => through_raw_pointer,
         Type::Tuple(elements) => elements
             .iter()
-            .any(|element| type_may_carry_reference(hir, element)),
-        Type::Array(inner, _) => type_may_carry_reference(hir, inner),
+            .any(|element| type_may_carry_flow(hir, element, through_raw_pointer)),
+        Type::Slice(inner) | Type::Array(inner, _) => {
+            type_may_carry_flow(hir, inner, through_raw_pointer)
+        }
         Type::Struct(id, args) => {
-            args.iter().any(|arg| type_may_carry_reference(hir, arg))
+            args.iter()
+                .any(|arg| type_may_carry_flow(hir, arg, through_raw_pointer))
                 || hir.item_tree.structs[*id]
                     .fields
                     .iter()
-                    .any(|field| hir_type_may_carry_reference(&field.ty))
+                    .any(|field| hir_type_may_carry_flow(&field.ty, through_raw_pointer))
         }
         Type::Enum(id, args) => {
-            args.iter().any(|arg| type_may_carry_reference(hir, arg))
+            args.iter()
+                .any(|arg| type_may_carry_flow(hir, arg, through_raw_pointer))
                 || hir.item_tree.enums[*id]
                     .variants
                     .iter()
                     .any(|variant| match &variant.kind {
                         hir::item_tree::HirVariantKind::Unit => false,
-                        hir::item_tree::HirVariantKind::Tuple(fields) => {
-                            fields.iter().any(hir_type_may_carry_reference)
-                        }
+                        hir::item_tree::HirVariantKind::Tuple(fields) => fields
+                            .iter()
+                            .any(|field| hir_type_may_carry_flow(field, through_raw_pointer)),
                         hir::item_tree::HirVariantKind::Struct(fields) => fields
                             .iter()
-                            .any(|field| hir_type_may_carry_reference(&field.ty)),
+                            .any(|field| hir_type_may_carry_flow(&field.ty, through_raw_pointer)),
                     })
         }
         Type::Param(..) | Type::InferVar(..) | Type::Unknown | Type::Error => true,
@@ -568,8 +698,8 @@ pub(crate) fn type_may_carry_reference(hir: &HirFile, ty: &Type) -> bool {
         Type::Fn { params, ret, .. } => {
             params
                 .iter()
-                .any(|param| type_may_carry_reference(hir, param))
-                || type_may_carry_reference(hir, ret)
+                .any(|param| type_may_carry_flow(hir, param, through_raw_pointer))
+                || type_may_carry_flow(hir, ret, through_raw_pointer)
         }
         Type::Int(..)
         | Type::Float(..)
@@ -584,20 +714,26 @@ pub(crate) fn type_may_carry_reference(hir: &HirFile, ty: &Type) -> bool {
     }
 }
 
-fn hir_type_may_carry_reference(ty: &hir::item_tree::HirTypeRef) -> bool {
+fn hir_type_may_carry_flow(ty: &hir::item_tree::HirTypeRef, through_raw_pointer: bool) -> bool {
     match ty {
         hir::item_tree::HirTypeRef::Ref(..) => true,
-        hir::item_tree::HirTypeRef::Ptr { .. } => false,
-        hir::item_tree::HirTypeRef::Tuple(elements) => {
-            elements.iter().any(hir_type_may_carry_reference)
+        hir::item_tree::HirTypeRef::Ptr { .. } => through_raw_pointer,
+        hir::item_tree::HirTypeRef::Tuple(elements) => elements
+            .iter()
+            .any(|element| hir_type_may_carry_flow(element, through_raw_pointer)),
+        hir::item_tree::HirTypeRef::Slice(inner) | hir::item_tree::HirTypeRef::Array(inner, _) => {
+            hir_type_may_carry_flow(inner, through_raw_pointer)
         }
-        hir::item_tree::HirTypeRef::Array(inner, _) => hir_type_may_carry_reference(inner),
         hir::item_tree::HirTypeRef::Function { params, ret, .. } => {
-            params.iter().any(hir_type_may_carry_reference) || hir_type_may_carry_reference(ret)
+            params
+                .iter()
+                .any(|param| hir_type_may_carry_flow(param, through_raw_pointer))
+                || hir_type_may_carry_flow(ret, through_raw_pointer)
         }
-        hir::item_tree::HirTypeRef::Named(path) => {
-            path.type_args.iter().any(hir_type_may_carry_reference)
-        }
+        hir::item_tree::HirTypeRef::Named(path) => path
+            .type_args
+            .iter()
+            .any(|arg| hir_type_may_carry_flow(arg, through_raw_pointer)),
         hir::item_tree::HirTypeRef::Never
         | hir::item_tree::HirTypeRef::Const(_)
         | hir::item_tree::HirTypeRef::Unknown

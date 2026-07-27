@@ -13,18 +13,18 @@ use type_checker::{CaptureMode, CaptureSource, OperatorCall, Type, TypeCheckResu
 /// Result of escape analysis: which locals and parameter places need stable storage.
 #[derive(Debug, Default)]
 pub struct EscapeResult {
-    pub escaping_locals: HashSet<(BodyId, StmtId)>,
+    pub escaping_locals: HashSet<(BodyId, PatternBindingId)>,
     escaping_params: HashSet<(BodyId, usize)>,
     escaping_lambda_params: HashSet<(BodyId, ExprId, usize)>,
     escaping_lambdas: HashSet<(BodyId, ExprId)>,
-    address_taken_locals: HashSet<(BodyId, StmtId)>,
+    address_taken_locals: HashSet<(BodyId, PatternBindingId)>,
     address_taken_params: HashSet<(BodyId, usize)>,
     address_taken_lambda_params: HashSet<(BodyId, ExprId, usize)>,
 }
 
 impl EscapeResult {
-    pub fn escapes(&self, body_id: BodyId, stmt: StmtId) -> bool {
-        self.escaping_locals.contains(&(body_id, stmt))
+    pub fn escapes(&self, body_id: BodyId, binding: PatternBindingId) -> bool {
+        self.escaping_locals.contains(&(body_id, binding))
     }
 
     pub fn param_escapes(&self, body_id: BodyId, index: usize) -> bool {
@@ -40,8 +40,8 @@ impl EscapeResult {
         self.escaping_lambdas.contains(&(body_id, lambda))
     }
 
-    pub fn local_needs_address(&self, body_id: BodyId, stmt: StmtId) -> bool {
-        self.address_taken_locals.contains(&(body_id, stmt))
+    pub fn local_needs_address(&self, body_id: BodyId, binding: PatternBindingId) -> bool {
+        self.address_taken_locals.contains(&(body_id, binding))
     }
 
     pub fn param_needs_address(&self, body_id: BodyId, index: usize) -> bool {
@@ -73,6 +73,7 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
                 FnSummary {
                     escaping: all_params,
                     returned: HashSet::new(),
+                    returned_fields: Vec::new(),
                 },
             );
         }
@@ -110,12 +111,19 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
 struct FnSummary {
     escaping: HashSet<usize>,
     returned: HashSet<usize>,
+    returned_fields: Vec<ReturnSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReturnSummary {
+    params: HashSet<usize>,
+    fields: Vec<ReturnSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RefSource {
-    Local(StmtId),
-    LocalValue(StmtId),
+    Local(PatternBindingId),
+    LocalValue(PatternBindingId),
     ParamPlace(usize),
     ParamValue(usize),
     LambdaParamPlace(ExprId, usize),
@@ -124,6 +132,61 @@ enum RefSource {
 }
 
 type RefSources = HashSet<RefSource>;
+
+#[derive(Debug, Clone, Default)]
+struct SourceValue {
+    sources: RefSources,
+    fields: Vec<SourceValue>,
+}
+
+impl SourceValue {
+    fn from_sources(sources: RefSources) -> Self {
+        Self {
+            sources,
+            fields: Vec::new(),
+        }
+    }
+
+    fn project(&self, index: usize) -> Self {
+        self.fields
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| self.flattened())
+    }
+
+    fn iterated(&self) -> Self {
+        if self.fields.is_empty() {
+            return self.flattened();
+        }
+        let mut value = Self::default();
+        for field in self.fields.iter().cloned() {
+            value.merge(field);
+        }
+        value
+    }
+
+    fn flattened(&self) -> Self {
+        Self::from_sources(self.sources.clone())
+    }
+
+    fn merge(&mut self, other: Self) {
+        if self.sources.is_empty() && self.fields.is_empty() {
+            *self = other;
+            return;
+        }
+        if other.sources.is_empty() && other.fields.is_empty() {
+            return;
+        }
+        if self.fields.len() == other.fields.len() && !self.fields.is_empty() {
+            for (field, other_field) in self.fields.iter_mut().zip(other.fields.iter().cloned()) {
+                field.merge(other_field);
+            }
+        } else {
+            self.fields.clear();
+        }
+        self.sources.extend(other.sources);
+    }
+}
 
 struct EscapeAnalyzer<'a> {
     hir: &'a HirFile,
@@ -171,8 +234,8 @@ impl<'a> EscapeAnalyzer<'a> {
         self.propagate_escaping_to_locals(&mut ctx);
 
         // Record results
-        for stmt in &ctx.escaping_locals {
-            self.result.escaping_locals.insert((body_id, *stmt));
+        for binding in &ctx.escaping_locals {
+            self.result.escaping_locals.insert((body_id, *binding));
         }
         for index in &ctx.escaping_param_places {
             self.result.escaping_params.insert((body_id, *index));
@@ -185,8 +248,8 @@ impl<'a> EscapeAnalyzer<'a> {
         for lambda in &ctx.escaping_lambdas {
             self.result.escaping_lambdas.insert((body_id, *lambda));
         }
-        for stmt in &ctx.address_taken_locals {
-            self.result.address_taken_locals.insert((body_id, *stmt));
+        for binding in &ctx.address_taken_locals {
+            self.result.address_taken_locals.insert((body_id, *binding));
         }
         for index in &ctx.address_taken_params {
             self.result.address_taken_params.insert((body_id, *index));
@@ -197,9 +260,16 @@ impl<'a> EscapeAnalyzer<'a> {
                 .insert((body_id, *lambda, *index));
         }
 
+        let returned_fields = ctx
+            .returned_value
+            .fields
+            .iter()
+            .map(|field| Self::summarize_return_value(&ctx, field))
+            .collect();
         FnSummary {
             escaping: ctx.escaping_params,
             returned: ctx.returned_params,
+            returned_fields,
         }
     }
 
@@ -216,7 +286,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
                 if let Some(tail) = tail {
                     self.mark_escaping_exprs(ctx, *tail);
-                    self.record_ref_chain(ctx, expr_id, *tail);
+                    ctx.set_expr_source_value(expr_id, ctx.expr_source_value(*tail));
                     ctx.escaping_exprs.contains(tail)
                 } else {
                     false
@@ -247,10 +317,7 @@ impl<'a> EscapeAnalyzer<'a> {
                         .first()
                         .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
                     let returned = self.handle_call_operand(ctx, Some(fid), 0, *operand, by_ref);
-                    ctx.expr_sources
-                        .entry(expr_id)
-                        .or_default()
-                        .extend(returned);
+                    ctx.set_expr_source_value(expr_id, returned);
                 } else {
                     self.mark_escaping_exprs(ctx, *operand);
                 }
@@ -277,6 +344,13 @@ impl<'a> EscapeAnalyzer<'a> {
                 for el in elements {
                     self.record_ref_chain(ctx, expr_id, *el);
                 }
+                ctx.set_expr_source_fields(
+                    expr_id,
+                    elements
+                        .iter()
+                        .map(|element| ctx.expr_source_value(*element))
+                        .collect(),
+                );
                 elements.iter().any(|e| ctx.escaping_exprs.contains(e))
             }
 
@@ -284,17 +358,11 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.mark_escaping_exprs(ctx, *value);
                 self.mark_escaping_exprs(ctx, *len);
                 self.record_ref_chain(ctx, expr_id, *value);
+                ctx.set_expr_source_fields(expr_id, vec![ctx.expr_source_value(*value)]);
                 ctx.escaping_exprs.contains(value)
             }
 
             Expr::Path { resolved, .. } => match resolved {
-                Some(ResolvedName::Local(stmt)) => {
-                    ctx.expr_sources
-                        .entry(expr_id)
-                        .or_default()
-                        .insert(RefSource::LocalValue(*stmt));
-                    ctx.escaping_locals.contains(stmt)
-                }
                 Some(ResolvedName::Param(idx)) => {
                     ctx.expr_sources
                         .entry(expr_id)
@@ -311,10 +379,17 @@ impl<'a> EscapeAnalyzer<'a> {
                         .contains(&(*lambda, *index))
                 }
                 Some(ResolvedName::PatternBinding(id)) => {
-                    if let Some(sources) = self.pattern_sources(ctx, *id) {
-                        ctx.expr_sources.entry(expr_id).or_default().extend(sources);
+                    // `LocalValue` alone: reading a binding yields its value, and
+                    // `mark_sources` chases `binding_sources` from there — for a
+                    // `let` that is the initializer, for an arm the scrutinee.
+                    ctx.expr_sources
+                        .entry(expr_id)
+                        .or_default()
+                        .insert(RefSource::LocalValue(*id));
+                    if let Some(fields) = ctx.binding_source_fields.get(id).cloned() {
+                        ctx.set_expr_source_fields(expr_id, fields);
                     }
-                    false
+                    ctx.escaping_locals.contains(id)
                 }
                 _ => false,
             },
@@ -327,8 +402,12 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.mark_escaping_exprs(ctx, *lhs);
                 self.mark_escaping_exprs(ctx, *rhs);
                 if let Some(sources) = ctx.expr_sources.get(rhs).cloned() {
-                    if let Some(stmt) = self.direct_local_root(ctx, *lhs) {
-                        ctx.stmt_sources.entry(stmt).or_default().extend(sources);
+                    if let Some(binding) = self.direct_local_root(ctx, *lhs) {
+                        ctx.binding_sources
+                            .entry(binding)
+                            .or_default()
+                            .extend(sources);
+                        ctx.binding_source_fields.remove(&binding);
                     } else {
                         Self::mark_source_sink(ctx, &sources);
                     }
@@ -347,10 +426,7 @@ impl<'a> EscapeAnalyzer<'a> {
                     })
                 {
                     let returned = self.handle_operator_args(ctx, fid, *lhs, *rhs);
-                    ctx.expr_sources
-                        .entry(expr_id)
-                        .or_default()
-                        .extend(returned);
+                    ctx.set_expr_source_value(expr_id, returned);
                 } else {
                     self.mark_escaping_exprs(ctx, *lhs);
                     self.mark_escaping_exprs(ctx, *rhs);
@@ -361,10 +437,7 @@ impl<'a> EscapeAnalyzer<'a> {
             Expr::Call { callee, args, .. } => {
                 self.mark_escaping_exprs(ctx, *callee);
                 let returned = self.handle_call_args(ctx, *callee, args);
-                ctx.expr_sources
-                    .entry(expr_id)
-                    .or_default()
-                    .extend(returned);
+                ctx.set_expr_source_value(expr_id, returned);
                 false
             }
 
@@ -372,7 +445,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 let mut sources: RefSources = std::iter::once(RefSource::Lambda(expr_id)).collect();
                 if let Some(info) = self.type_result.lambda_infos.get(&(ctx.body_id, expr_id)) {
                     for capture in &info.captures {
-                        let captured = self.capture_sources(ctx, &capture.source, capture.mode);
+                        let captured = self.capture_sources(&capture.source, capture.mode);
                         if matches!(capture.mode, CaptureMode::Shared | CaptureMode::Mutable) {
                             Self::mark_address_taken(ctx, &captured);
                         }
@@ -402,10 +475,11 @@ impl<'a> EscapeAnalyzer<'a> {
                 if let Some(eb) = else_branch {
                     self.mark_escaping_exprs(ctx, *eb);
                 }
-                self.record_ref_chain(ctx, expr_id, *then_branch);
+                let mut value = ctx.expr_source_value(*then_branch);
                 if let Some(else_branch) = else_branch {
-                    self.record_ref_chain(ctx, expr_id, *else_branch);
+                    value.merge(ctx.expr_source_value(*else_branch));
                 }
+                ctx.set_expr_source_value(expr_id, value);
                 let t = ctx.escaping_exprs.contains(then_branch);
                 let e = else_branch.is_some_and(|eb| ctx.escaping_exprs.contains(&eb));
                 t || e
@@ -423,33 +497,40 @@ impl<'a> EscapeAnalyzer<'a> {
                 body,
             } => {
                 self.mark_escaping_exprs(ctx, *iterable);
-                let sources = ctx.expr_sources.get(iterable).cloned().unwrap_or_default();
-                self.push_pattern_sources(ctx, *pat, &sources);
+                let value = ctx.expr_source_value(*iterable).iterated();
+                self.bind_pattern_sources(ctx, *pat, &value);
                 self.mark_escaping_exprs(ctx, *body);
-                ctx.pattern_sources.pop();
                 ctx.escaping_exprs.contains(body)
             }
 
             Expr::Match { scrutinee, arms } => {
                 self.mark_escaping_exprs(ctx, *scrutinee);
-                let sources = ctx.expr_sources.get(scrutinee).cloned().unwrap_or_default();
+                let value = ctx.expr_source_value(*scrutinee);
                 for arm in arms {
-                    self.push_pattern_sources(ctx, arm.pat, &sources);
+                    self.bind_pattern_sources(ctx, arm.pat, &value);
                     if let Some(guard) = arm.guard {
                         self.mark_escaping_exprs(ctx, guard);
                     }
                     self.mark_escaping_exprs(ctx, arm.body);
-                    self.record_ref_chain(ctx, expr_id, arm.body);
-                    ctx.pattern_sources.pop();
                 }
+                let mut value = SourceValue::default();
+                for arm in arms {
+                    value.merge(ctx.expr_source_value(arm.body));
+                }
+                ctx.set_expr_source_value(expr_id, value);
                 arms.iter()
                     .any(|arm| ctx.escaping_exprs.contains(&arm.body))
             }
 
-            Expr::FieldAccess { base, .. } => {
+            Expr::FieldAccess { base, field } => {
                 self.mark_escaping_exprs(ctx, *base);
                 if self.expr_may_carry_reference(ctx, expr_id) {
-                    self.record_ref_chain(ctx, expr_id, *base);
+                    let base_value = ctx.expr_source_value(*base);
+                    let value = self
+                        .field_index(ctx, *base, field)
+                        .map(|index| base_value.project(index))
+                        .unwrap_or_else(|| base_value.flattened());
+                    ctx.set_expr_source_value(expr_id, value);
                 }
                 ctx.escaping_exprs.contains(base)
             }
@@ -458,7 +539,15 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.mark_escaping_exprs(ctx, *base);
                 self.mark_escaping_exprs(ctx, *index);
                 if self.expr_may_carry_reference(ctx, expr_id) {
-                    self.record_ref_chain(ctx, expr_id, *base);
+                    let base_value = ctx.expr_source_value(*base);
+                    let value = match &ctx.body.exprs[*index] {
+                        Expr::IntLiteral { value: index, .. } => usize::try_from(*index)
+                            .ok()
+                            .map(|index| base_value.project(index))
+                            .unwrap_or_else(|| base_value.iterated()),
+                        _ => base_value.iterated(),
+                    };
+                    ctx.set_expr_source_value(expr_id, value);
                 }
                 ctx.escaping_exprs.contains(base) || ctx.escaping_exprs.contains(index)
             }
@@ -472,14 +561,14 @@ impl<'a> EscapeAnalyzer<'a> {
 
             Expr::Unsafe { body } => {
                 self.mark_escaping_exprs(ctx, *body);
-                self.record_ref_chain(ctx, expr_id, *body);
+                ctx.set_expr_source_value(expr_id, ctx.expr_source_value(*body));
                 ctx.escaping_exprs.contains(body)
             }
 
             Expr::Cast { base, .. } => {
                 self.mark_escaping_exprs(ctx, *base);
                 if self.expr_may_carry_reference(ctx, expr_id) {
-                    self.record_ref_chain(ctx, expr_id, *base);
+                    ctx.set_expr_source_value(expr_id, ctx.expr_source_value(*base));
                 }
                 ctx.escaping_exprs.contains(base)
             }
@@ -498,9 +587,10 @@ impl<'a> EscapeAnalyzer<'a> {
         ctx: &mut EscapeCtx<'_>,
         callee: ExprId,
         args: &[ExprId],
-    ) -> RefSources {
+    ) -> SourceValue {
         let callee_fid = self.resolve_callee(ctx, callee);
-        let mut returned = RefSources::new();
+        let mut returned = SourceValue::default();
+        let mut inputs = Vec::new();
         let mut pending = ctx
             .expr_sources
             .get(&callee)
@@ -514,16 +604,20 @@ impl<'a> EscapeAnalyzer<'a> {
                 continue;
             }
             match source {
-                RefSource::Lambda(lambda) => returned.extend(
+                RefSource::Lambda(lambda) => returned.sources.extend(
                     ctx.lambda_return_sources
                         .get(&lambda)
                         .into_iter()
                         .flatten()
                         .copied(),
                 ),
-                RefSource::LocalValue(stmt) => {
-                    pending.extend(ctx.stmt_sources.get(&stmt).into_iter().flatten().copied())
-                }
+                RefSource::LocalValue(binding) => pending.extend(
+                    ctx.binding_sources
+                        .get(&binding)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                ),
                 _ => {}
             }
         }
@@ -536,19 +630,26 @@ impl<'a> EscapeAnalyzer<'a> {
         });
 
         if let Some((receiver, by_ref)) = receiver {
-            returned.extend(self.handle_call_operand(ctx, callee_fid, 0, receiver, by_ref));
+            let value = self.handle_call_operand(ctx, callee_fid, 0, receiver, by_ref);
+            returned.merge(value.clone());
+            inputs.push(value);
         }
 
         let param_offset = usize::from(receiver.is_some());
 
         for (i, arg) in args.iter().enumerate() {
-            returned.extend(self.handle_call_operand(
-                ctx,
-                callee_fid,
-                i + param_offset,
-                *arg,
-                false,
-            ));
+            let value = self.handle_call_operand(ctx, callee_fid, i + param_offset, *arg, false);
+            returned.merge(value.clone());
+            inputs.push(value);
+        }
+        if let Some(summary) = callee_fid.and_then(|fid| self.fn_summaries.get(&fid))
+            && !summary.returned_fields.is_empty()
+        {
+            returned.fields = summary
+                .returned_fields
+                .iter()
+                .map(|field| Self::instantiate_return_summary(field, &inputs))
+                .collect();
         }
         returned
     }
@@ -559,13 +660,13 @@ impl<'a> EscapeAnalyzer<'a> {
         fid: FunctionId,
         lhs: ExprId,
         rhs: ExprId,
-    ) -> RefSources {
+    ) -> SourceValue {
         let receiver_by_ref = self.hir.item_tree.functions[fid]
             .params
             .first()
             .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
         let mut returned = self.handle_call_operand(ctx, Some(fid), 0, lhs, receiver_by_ref);
-        returned.extend(self.handle_call_operand(ctx, Some(fid), 1, rhs, false));
+        returned.merge(self.handle_call_operand(ctx, Some(fid), 1, rhs, false));
         returned
     }
 
@@ -576,31 +677,48 @@ impl<'a> EscapeAnalyzer<'a> {
         param_index: usize,
         operand: ExprId,
         auto_borrow: bool,
-    ) -> RefSources {
+    ) -> SourceValue {
         self.mark_escaping_exprs(ctx, operand);
-        let sources = if auto_borrow
+        let value = if auto_borrow
             && !self
                 .type_result
                 .expr_types
                 .get(&(ctx.body_id, operand))
                 .is_some_and(|ty| matches!(ty, Type::Ref(..)))
         {
-            self.place_sources(ctx, operand)
+            SourceValue::from_sources(self.place_sources(ctx, operand))
         } else {
-            ctx.expr_sources.get(&operand).cloned().unwrap_or_default()
+            ctx.expr_source_value(operand)
         };
         let Some(summary) = callee_fid.and_then(|fid| self.fn_summaries.get(&fid)) else {
-            Self::mark_source_sink(ctx, &sources);
-            return RefSources::new();
+            Self::mark_source_sink(ctx, &value.sources);
+            return SourceValue::default();
         };
         if summary.escaping.contains(&param_index) {
-            Self::mark_source_sink(ctx, &sources);
+            Self::mark_source_sink(ctx, &value.sources);
         }
         if summary.returned.contains(&param_index) {
-            sources
+            value
         } else {
-            RefSources::new()
+            SourceValue::default()
         }
+    }
+
+    fn instantiate_return_summary(summary: &ReturnSummary, inputs: &[SourceValue]) -> SourceValue {
+        let mut result = SourceValue::default();
+        for param in &summary.params {
+            if let Some(input) = inputs.get(*param) {
+                result.merge(input.clone());
+            }
+        }
+        if !summary.fields.is_empty() {
+            result.fields = summary
+                .fields
+                .iter()
+                .map(|field| Self::instantiate_return_summary(field, inputs))
+                .collect();
+        }
+        result
     }
 
     fn resolve_callee(&self, ctx: &EscapeCtx<'_>, callee: ExprId) -> Option<FunctionId> {
@@ -619,13 +737,20 @@ impl<'a> EscapeAnalyzer<'a> {
     fn escape_check_stmt(&mut self, ctx: &mut EscapeCtx<'_>, stmt_id: StmtId) {
         let s = &ctx.body.stmts[stmt_id];
         match s {
-            Stmt::Let { init, .. } => {
+            Stmt::Let { pat, init, .. } => {
+                let (pat, init) = (*pat, *init);
+                let mut bindings = HashSet::new();
+                Self::collect_pattern_bindings(ctx.body, pat, &mut bindings);
                 if let Some(lambda) = ctx.lambda_stack.last().copied() {
-                    ctx.lambda_locals.entry(lambda).or_default().insert(stmt_id);
+                    ctx.lambda_locals
+                        .entry(lambda)
+                        .or_default()
+                        .extend(bindings.iter().copied());
                 }
                 if let Some(init) = init {
-                    self.mark_escaping_exprs(ctx, *init);
-                    self.record_stmt_ref_chain(ctx, stmt_id, *init);
+                    self.mark_escaping_exprs(ctx, init);
+                    let value = ctx.expr_source_value(init);
+                    self.bind_pattern_sources(ctx, pat, &value);
                 }
             }
             Stmt::Expr { expr } => {
@@ -654,6 +779,8 @@ impl<'a> EscapeAnalyzer<'a> {
     }
 
     fn mark_returning_sources(&self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) {
+        let value = ctx.expr_source_value(expr_id);
+        ctx.returned_value.merge(value);
         let Some(sources) = ctx.expr_sources.get(&expr_id).cloned() else {
             return;
         };
@@ -664,11 +791,11 @@ impl<'a> EscapeAnalyzer<'a> {
                 continue;
             }
             match source {
-                RefSource::Local(stmt) => {
-                    ctx.escaping_locals.insert(stmt);
+                RefSource::Local(binding) => {
+                    ctx.escaping_locals.insert(binding);
                 }
-                RefSource::LocalValue(stmt) => {
-                    if let Some(nested) = ctx.stmt_sources.get(&stmt) {
+                RefSource::LocalValue(binding) => {
+                    if let Some(nested) = ctx.binding_sources.get(&binding) {
                         pending.extend(nested.iter().copied());
                     }
                 }
@@ -690,6 +817,41 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
+    fn summarize_return_value(ctx: &EscapeCtx<'_>, value: &SourceValue) -> ReturnSummary {
+        let mut params = HashSet::new();
+        let mut pending = value.sources.iter().copied().collect::<Vec<_>>();
+        let mut seen = RefSources::new();
+        while let Some(source) = pending.pop() {
+            if !seen.insert(source) {
+                continue;
+            }
+            match source {
+                RefSource::LocalValue(binding) => pending.extend(
+                    ctx.binding_sources
+                        .get(&binding)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                ),
+                RefSource::ParamPlace(index) | RefSource::ParamValue(index) => {
+                    params.insert(index);
+                }
+                RefSource::Local(_)
+                | RefSource::LambdaParamPlace(..)
+                | RefSource::LambdaParamValue(..)
+                | RefSource::Lambda(_) => {}
+            }
+        }
+        ReturnSummary {
+            params,
+            fields: value
+                .fields
+                .iter()
+                .map(|field| Self::summarize_return_value(ctx, field))
+                .collect(),
+        }
+    }
+
     fn record_lambda_return_sources(
         &self,
         ctx: &mut EscapeCtx<'_>,
@@ -708,11 +870,11 @@ impl<'a> EscapeAnalyzer<'a> {
                 continue;
             }
             match source {
-                RefSource::Local(stmt) if locals.contains(&stmt) => {
-                    ctx.escaping_locals.insert(stmt);
+                RefSource::Local(binding) if locals.contains(&binding) => {
+                    ctx.escaping_locals.insert(binding);
                 }
-                RefSource::LocalValue(stmt) if locals.contains(&stmt) => {
-                    if let Some(nested) = ctx.stmt_sources.get(&stmt) {
+                RefSource::LocalValue(binding) if locals.contains(&binding) => {
+                    if let Some(nested) = ctx.binding_sources.get(&binding) {
                         pending.extend(nested.iter().copied());
                     }
                 }
@@ -753,8 +915,8 @@ impl<'a> EscapeAnalyzer<'a> {
                 RefSource::Local(stmt) => {
                     changed |= ctx.escaping_locals.insert(stmt);
                 }
-                RefSource::LocalValue(stmt) => {
-                    if let Some(nested) = ctx.stmt_sources.get(&stmt) {
+                RefSource::LocalValue(binding) => {
+                    if let Some(nested) = ctx.binding_sources.get(&binding) {
                         pending.extend(nested.iter().copied());
                     }
                 }
@@ -777,21 +939,15 @@ impl<'a> EscapeAnalyzer<'a> {
         changed
     }
 
-    fn capture_sources(
-        &self,
-        ctx: &EscapeCtx<'_>,
-        source: &CaptureSource,
-        mode: CaptureMode,
-    ) -> RefSources {
+    fn capture_sources(&self, source: &CaptureSource, mode: CaptureMode) -> RefSources {
         let by_ref = matches!(mode, CaptureMode::Shared | CaptureMode::Mutable);
         match source {
-            CaptureSource::Local(stmt) if by_ref => {
-                [RefSource::Local(*stmt), RefSource::LocalValue(*stmt)]
+            CaptureSource::Pattern(id) if by_ref => {
+                [RefSource::Local(*id), RefSource::LocalValue(*id)]
                     .into_iter()
                     .collect()
             }
-            CaptureSource::Local(stmt) => std::iter::once(RefSource::LocalValue(*stmt)).collect(),
-            CaptureSource::Pattern(id) => self.pattern_sources(ctx, *id).unwrap_or_default(),
+            CaptureSource::Pattern(id) => std::iter::once(RefSource::LocalValue(*id)).collect(),
             CaptureSource::Param(index) if by_ref => {
                 [RefSource::ParamPlace(*index), RefSource::ParamValue(*index)]
                     .into_iter()
@@ -813,8 +969,8 @@ impl<'a> EscapeAnalyzer<'a> {
     fn mark_address_taken(ctx: &mut EscapeCtx<'_>, sources: &RefSources) {
         for source in sources {
             match source {
-                RefSource::Local(stmt) => {
-                    ctx.address_taken_locals.insert(*stmt);
+                RefSource::Local(binding) => {
+                    ctx.address_taken_locals.insert(*binding);
                 }
                 RefSource::ParamPlace(index) => {
                     ctx.address_taken_params.insert(*index);
@@ -842,15 +998,30 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    fn push_pattern_sources(&self, ctx: &mut EscapeCtx<'_>, pat: PatId, sources: &RefSources) {
-        let mut bindings = HashSet::new();
-        Self::collect_pattern_bindings(ctx.body, pat, &mut bindings);
-        ctx.pattern_sources.push(
-            bindings
-                .into_iter()
-                .map(|id| (id, sources.clone()))
-                .collect(),
-        );
+    fn bind_pattern_sources(&self, ctx: &mut EscapeCtx<'_>, pat: PatId, value: &SourceValue) {
+        match &ctx.body.pats[pat] {
+            Pattern::Binding { .. } => ctx.bind_source_value(
+                PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                },
+                value.clone(),
+            ),
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
+                let elements = elements.clone();
+                for (index, element) in elements.into_iter().enumerate() {
+                    self.bind_pattern_sources(ctx, element, &value.project(index));
+                }
+            }
+            Pattern::Struct { .. } => {
+                let mut bindings = HashSet::new();
+                Self::collect_pattern_bindings(ctx.body, pat, &mut bindings);
+                for binding in bindings {
+                    ctx.bind_source_value(binding, value.flattened());
+                }
+            }
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+        }
     }
 
     fn collect_pattern_bindings(body: &Body, pat: PatId, bindings: &mut HashSet<PatternBindingId>) {
@@ -882,19 +1053,12 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    fn pattern_sources(&self, ctx: &EscapeCtx<'_>, id: PatternBindingId) -> Option<RefSources> {
-        ctx.pattern_sources
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(&id).cloned())
-    }
-
     fn place_sources(&self, ctx: &EscapeCtx<'_>, expr_id: ExprId) -> RefSources {
         match &ctx.body.exprs[expr_id] {
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
+                resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
-            } => [RefSource::Local(*stmt), RefSource::LocalValue(*stmt)]
+            } => [RefSource::Local(*id), RefSource::LocalValue(*id)]
                 .into_iter()
                 .collect(),
             Expr::Path {
@@ -912,10 +1076,6 @@ impl<'a> EscapeAnalyzer<'a> {
             ]
             .into_iter()
             .collect(),
-            Expr::Path {
-                resolved: Some(ResolvedName::PatternBinding(id)),
-                ..
-            } => self.pattern_sources(ctx, *id).unwrap_or_default(),
             Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
                 let indirect = self
                     .type_result
@@ -943,12 +1103,32 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    fn direct_local_root(&self, ctx: &EscapeCtx<'_>, expr_id: ExprId) -> Option<StmtId> {
+    fn field_index(&self, ctx: &EscapeCtx<'_>, base: ExprId, field: &hir::Name) -> Option<usize> {
+        let ty = self.type_result.expr_types.get(&(ctx.body_id, base))?;
+        let ty = match ty {
+            Type::Ref(inner, _) => inner.as_ref(),
+            ty => ty,
+        };
+        match ty {
+            Type::Struct(id, _) => self.hir.item_tree.structs[*id]
+                .fields
+                .iter()
+                .position(|item| item.name == *field),
+            Type::Tuple(elements) => field
+                .0
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index < elements.len()),
+            _ => None,
+        }
+    }
+
+    fn direct_local_root(&self, ctx: &EscapeCtx<'_>, expr_id: ExprId) -> Option<PatternBindingId> {
         match &ctx.body.exprs[expr_id] {
             Expr::Path {
-                resolved: Some(ResolvedName::Local(stmt)),
+                resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
-            } => Some(*stmt),
+            } => Some(*id),
             Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
                 let indirect = self
                     .type_result
@@ -963,16 +1143,10 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    /// Propagate ref-source chains through struct/array/field expressions.
+    /// Propagate a flattened ref-source chain through an aggregate expression.
     fn record_ref_chain(&self, ctx: &mut EscapeCtx<'_>, parent: ExprId, child: ExprId) {
         if let Some(sources) = ctx.expr_sources.get(&child).cloned() {
             ctx.expr_sources.entry(parent).or_default().extend(sources);
-        }
-    }
-
-    fn record_stmt_ref_chain(&self, ctx: &mut EscapeCtx<'_>, stmt_id: StmtId, init: ExprId) {
-        if let Some(sources) = ctx.expr_sources.get(&init).cloned() {
-            ctx.stmt_sources.entry(stmt_id).or_default().extend(sources);
         }
     }
 
@@ -991,9 +1165,9 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
             }
 
-            let locals: Vec<StmtId> = ctx.escaping_locals.iter().copied().collect();
-            for stmt in &locals {
-                if let Some(sources) = ctx.stmt_sources.get(stmt).cloned() {
+            let locals: Vec<PatternBindingId> = ctx.escaping_locals.iter().copied().collect();
+            for binding in &locals {
+                if let Some(sources) = ctx.binding_sources.get(binding).cloned() {
                     changed |= Self::mark_sources(ctx, &sources);
                 }
             }
@@ -1005,7 +1179,7 @@ fn type_may_carry_reference(ty: &Type) -> bool {
     match ty {
         Type::Ref(..) | Type::Ptr { .. } => true,
         Type::Tuple(elements) => elements.iter().any(type_may_carry_reference),
-        Type::Array(inner, _) => type_may_carry_reference(inner),
+        Type::Slice(inner) | Type::Array(inner, _) => type_may_carry_reference(inner),
         Type::Struct(..)
         | Type::Enum(..)
         | Type::Param(..)
@@ -1035,22 +1209,26 @@ struct EscapeCtx<'a> {
     body: &'a Body,
 
     escaping_exprs: HashSet<ExprId>,
-    escaping_locals: HashSet<StmtId>,
+    escaping_locals: HashSet<PatternBindingId>,
     escaping_params: HashSet<usize>,
     returned_params: HashSet<usize>,
+    returned_value: SourceValue,
     escaping_param_places: HashSet<usize>,
     escaping_lambda_param_places: HashSet<(ExprId, usize)>,
     escaping_lambdas: HashSet<ExprId>,
-    address_taken_locals: HashSet<StmtId>,
+    address_taken_locals: HashSet<PatternBindingId>,
     address_taken_params: HashSet<usize>,
     address_taken_lambda_params: HashSet<(ExprId, usize)>,
     lambda_stack: Vec<ExprId>,
-    lambda_locals: HashMap<ExprId, HashSet<StmtId>>,
+    lambda_locals: HashMap<ExprId, HashSet<PatternBindingId>>,
     lambda_return_sources: HashMap<ExprId, RefSources>,
     escaping_sources: RefSources,
     expr_sources: HashMap<ExprId, RefSources>,
-    stmt_sources: HashMap<StmtId, RefSources>,
-    pattern_sources: Vec<HashMap<PatternBindingId, RefSources>>,
+    expr_source_fields: HashMap<ExprId, Vec<SourceValue>>,
+    /// What each binding's value refers to. `let`, `match` arms and `for` all
+    /// land here — `PatternBindingId` is unique per pattern site.
+    binding_sources: HashMap<PatternBindingId, RefSources>,
+    binding_source_fields: HashMap<PatternBindingId, Vec<SourceValue>>,
 }
 
 impl<'a> EscapeCtx<'a> {
@@ -1062,6 +1240,7 @@ impl<'a> EscapeCtx<'a> {
             escaping_locals: HashSet::new(),
             escaping_params: HashSet::new(),
             returned_params: HashSet::new(),
+            returned_value: SourceValue::default(),
             escaping_param_places: HashSet::new(),
             escaping_lambda_param_places: HashSet::new(),
             escaping_lambdas: HashSet::new(),
@@ -1073,8 +1252,56 @@ impl<'a> EscapeCtx<'a> {
             lambda_return_sources: HashMap::new(),
             escaping_sources: RefSources::new(),
             expr_sources: HashMap::new(),
-            stmt_sources: HashMap::new(),
-            pattern_sources: Vec::new(),
+            expr_source_fields: HashMap::new(),
+            binding_sources: HashMap::new(),
+            binding_source_fields: HashMap::new(),
+        }
+    }
+
+    fn expr_source_value(&self, expr: ExprId) -> SourceValue {
+        SourceValue {
+            sources: self.expr_sources.get(&expr).cloned().unwrap_or_default(),
+            fields: self
+                .expr_source_fields
+                .get(&expr)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn set_expr_source_fields(&mut self, expr: ExprId, fields: Vec<SourceValue>) {
+        if fields.is_empty() {
+            self.expr_source_fields.remove(&expr);
+        } else {
+            self.expr_source_fields.insert(expr, fields);
+        }
+    }
+
+    fn set_expr_source_value(&mut self, expr: ExprId, value: SourceValue) {
+        self.expr_sources
+            .entry(expr)
+            .or_default()
+            .extend(value.sources);
+        self.set_expr_source_fields(expr, value.fields);
+    }
+
+    fn bind_source_value(&mut self, binding: PatternBindingId, value: SourceValue) {
+        self.binding_sources
+            .entry(binding)
+            .or_default()
+            .extend(value.sources);
+        if value.fields.is_empty() {
+            self.binding_source_fields.remove(&binding);
+        } else if let Some(fields) = self.binding_source_fields.get_mut(&binding) {
+            if fields.len() == value.fields.len() {
+                for (field, other) in fields.iter_mut().zip(value.fields) {
+                    field.merge(other);
+                }
+            } else {
+                self.binding_source_fields.remove(&binding);
+            }
+        } else {
+            self.binding_source_fields.insert(binding, value.fields);
         }
     }
 }

@@ -154,7 +154,7 @@ fn rust_style_array_repeat_parses_and_lowers() {
             if matches!(
                 body.exprs[*value],
                 Expr::Path {
-                    resolved: Some(ResolvedName::Local(_)),
+                    resolved: Some(ResolvedName::PatternBinding(_)),
                     ..
                 }
             ) && matches!(body.exprs[*len], Expr::IntLiteral { value: 3, .. })
@@ -225,23 +225,32 @@ fn raw_string_attribute_values_unquote() {
 }
 
 #[test]
-fn array_type_requires_rust_style_length() {
-    let mut parser = IncrementalParser::new();
-    let parse = parser.set_source(
+fn slice_and_array_types_use_rust_style_syntax() {
+    let (hir, _) = build_hir_and_graph(
         r#"
-        fun f() {
-            let xs: [i32] = [];
-            let ys: [i32;] = [];
-        }
+        fun f(xs: &[i32], ys: &[i32; 4]) {}
         "#,
     );
+    let function = hir.item_tree.functions.iter().next().unwrap().1;
+    assert!(matches!(
+        &function.params[0].ty,
+        hir::item_tree::HirTypeRef::Ref(inner, false)
+            if matches!(inner.as_ref(), hir::item_tree::HirTypeRef::Slice(_))
+    ));
+    assert!(matches!(
+        &function.params[1].ty,
+        hir::item_tree::HirTypeRef::Ref(inner, false)
+            if matches!(inner.as_ref(), hir::item_tree::HirTypeRef::Array(_, _))
+    ));
+
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source("fun invalid(value: [i32;]) {}");
     let messages = parse
         .errors
         .iter()
         .map(|error| error.message.as_str())
         .collect::<Vec<_>>();
 
-    assert!(messages.iter().any(|msg| msg.contains("expected Semi")));
     assert!(
         messages
             .iter()
@@ -250,14 +259,16 @@ fn array_type_requires_rust_style_length() {
 }
 
 #[test]
-fn accepts_explicit_generic_call_and_struct_expr() {
+fn accepts_rust_style_explicit_generic_calls_and_struct_expr() {
     let source = r#"
         struct Wrap<T> {
             inner: T,
         }
 
         fun f<T>(x: T) {
-            g<Wrap<T>>(x);
+            g::<Wrap<T>>(x);
+            crate::g::<T>(x);
+            x.convert::<T>();
             Wrap::<T> { inner: x };
         }
         "#;
@@ -271,6 +282,19 @@ fn accepts_explicit_generic_call_and_struct_expr() {
         .collect::<Vec<_>>();
 
     assert_eq!(messages, Vec::<&str>::new());
+}
+
+#[test]
+fn rejects_legacy_explicit_generic_call_syntax() {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(
+        r#"
+        fun id<T>(value: T) -> T { value }
+        fun main() { id<i32>(1); }
+        "#,
+    );
+
+    assert!(!parse.errors.is_empty());
 }
 
 #[test]

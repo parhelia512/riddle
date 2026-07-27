@@ -483,17 +483,13 @@ fn push_definition_completion(
             CompletionItemKind::MODULE,
             Some(format!("mod {label}")),
         )),
-        DefRef::Local { stmt } => {
-            if let Stmt::Let { ty, .. } = &hir.bodies[body].stmts[*stmt] {
-                out.push(completion_item(
-                    label,
-                    CompletionItemKind::VARIABLE,
-                    (ty != &HirTypeRef::Unknown).then(|| ty.display()),
-                ));
-            }
-        }
-        DefRef::PatternBinding { .. } => {
-            out.push(completion_item(label, CompletionItemKind::VARIABLE, None))
+        DefRef::PatternBinding { id, .. } => {
+            // A `let` records its annotation on the statement; other patterns
+            // (match arms, `for`) only get their type from inference.
+            let ty = let_stmt_of_pattern(&hir.bodies[body], id.pattern)
+                .filter(|ty| **ty != HirTypeRef::Unknown)
+                .map(HirTypeRef::display);
+            out.push(completion_item(label, CompletionItemKind::VARIABLE, ty));
         }
         DefRef::Param { fn_id, index } => {
             let param = &hir.item_tree.functions[*fn_id].params[*index];
@@ -536,6 +532,16 @@ fn push_definition_completion(
             ));
         }
     }
+}
+
+/// The type annotation of the `let` whose pattern is `pat`, if any.
+fn let_stmt_of_pattern(body: &hir::body::Body, pat: hir::body::PatId) -> Option<&HirTypeRef> {
+    body.stmts.iter().find_map(|(_, stmt)| match stmt {
+        Stmt::Let {
+            pat: let_pat, ty, ..
+        } if *let_pat == pat => Some(ty),
+        _ => None,
+    })
 }
 
 fn collect_resolved_associated_completions(
@@ -638,7 +644,7 @@ fn collect_member_completions(
     }
 
     for (_, impl_item) in hir.item_tree.impls.iter() {
-        if !type_ref_matches_type(hir, &impl_item.self_ty, receiver) {
+        if !type_ref_matches_type(hir, &impl_item.generics, &impl_item.self_ty, receiver) {
             continue;
         }
         for function_id in &impl_item.methods {
@@ -863,26 +869,41 @@ fn receiver_struct_id(ty: &type_checker::Type) -> Option<StructId> {
 
 fn type_ref_matches_type(
     hir: &hir::HirFile,
+    generics: &[hir::Name],
     expected: &HirTypeRef,
     actual: &type_checker::Type,
 ) -> bool {
     match (expected, actual) {
         (HirTypeRef::Ref(expected, _), type_checker::Type::Ref(actual, _))
         | (HirTypeRef::Ref(expected, _), type_checker::Type::Ptr { inner: actual, .. }) => {
-            type_ref_matches_type(hir, expected, actual)
+            type_ref_matches_type(hir, generics, expected, actual)
         }
         (
             HirTypeRef::Ptr {
                 inner: expected, ..
             },
             type_checker::Type::Ptr { inner: actual, .. },
-        ) => type_ref_matches_type(hir, expected, actual),
+        ) => type_ref_matches_type(hir, generics, expected, actual),
         (HirTypeRef::Array(expected, _), type_checker::Type::Array(actual, _)) => {
-            type_ref_matches_type(hir, expected, actual)
+            type_ref_matches_type(hir, generics, expected, actual)
+        }
+        (HirTypeRef::Slice(expected), type_checker::Type::Slice(actual)) => {
+            type_ref_matches_type(hir, generics, expected, actual)
+        }
+        (expected @ HirTypeRef::Slice(_), type_checker::Type::Ref(actual, _))
+        | (expected @ HirTypeRef::Slice(_), type_checker::Type::Ptr { inner: actual, .. }) => {
+            type_ref_matches_type(hir, generics, expected, actual)
         }
         (HirTypeRef::Named(_), type_checker::Type::Ref(actual, _))
         | (HirTypeRef::Named(_), type_checker::Type::Ptr { inner: actual, .. }) => {
-            type_ref_matches_type(hir, expected, actual)
+            type_ref_matches_type(hir, generics, expected, actual)
+        }
+        (HirTypeRef::Named(path), _)
+            if path.segments.len() == 1
+                && path.type_args.is_empty()
+                && generics.contains(&path.segments[0]) =>
+        {
+            true
         }
         (HirTypeRef::Named(_), _) => type_ref_name(expected).is_some_and(|expected| {
             let actual = actual.display(hir);

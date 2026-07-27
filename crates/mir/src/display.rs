@@ -148,6 +148,7 @@ impl fmt::Display for TypeFmt<'_> {
                 let inner: Vec<String> = elems.iter().map(|t| format!("{}", TypeFmt(t))).collect();
                 write!(f, "({})", inner.join(", "))
             }
+            Type::Slice(inner) => write!(f, "[{}]", TypeFmt(inner)),
             Type::Array(inner, len) => write!(f, "[{}; {}]", TypeFmt(inner), len),
             Type::Struct(s) => write!(f, "{}", s.name),
             Type::Enum(e) => write!(f, "{}", e.name),
@@ -173,12 +174,16 @@ impl fmt::Display for InstFmt<'_> {
             InstKind::UnOp(op, a) => write!(f, "{:?} v{}", op, a.0),
             InstKind::Cmp(op, a, b) => write!(f, "cmp_{:?} v{}, v{}", op, a.0, b.0),
             InstKind::Cast(op, a, _) => write!(f, "cast_{:?} v{}", op, a.0),
+            InstKind::SizeOf(ty) => write!(f, "size_of {}", TypeFmt(ty)),
             InstKind::Alloca(_) => write!(f, "alloca"),
             InstKind::HeapAlloc(_) => write!(f, "heap_alloc"),
             InstKind::Load(p) => write!(f, "load v{}", p.0),
             InstKind::Store(v, p) => write!(f, "store v{} -> v{}", v.0, p.0),
             InstKind::FieldPtr(b, idx) => write!(f, "field_ptr v{}, #{}", b.0, idx),
             InstKind::IndexPtr(b, i) => write!(f, "index_ptr v{}, v{}", b.0, i.0),
+            InstKind::CheckedIndexPtr(b, i, len) => {
+                write!(f, "checked_index_ptr v{}, v{}, v{}", b.0, i.0, len.0)
+            }
             InstKind::ExtractValue(v, i) => write!(f, "extract_value v{}, #{}", v.0, i),
             InstKind::Call(callee, args) => {
                 let args_str: Vec<String> = args.iter().map(|a| format!("v{}", a.0)).collect();

@@ -250,6 +250,8 @@ pub enum SyntaxKind {
     TuplePattern,
     StructPattern,
     EnumPattern,
+    /// `mut name` — a binding that is explicitly mutable.
+    BindingPattern,
     WildcardPattern,
     LiteralPattern,
     FloatLit,

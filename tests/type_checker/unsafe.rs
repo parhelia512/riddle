@@ -113,6 +113,127 @@ fn accepts_mut_ptr_index_inside_unsafe() {
 }
 
 #[test]
+fn accepts_dst_layout_casts_inside_unsafe() {
+    let result = check(
+        r#"
+        unsafe fun slice_from_parts<T>(data: *const T, len: usize) -> &[T] {
+            unsafe { (data, len) as &[T] }
+        }
+
+        unsafe fun str_from_bytes(bytes: &[u8]) -> &str {
+            unsafe { bytes as &str }
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_slice_to_raw_parts_casts_inside_unsafe() {
+    let result = check(
+        r#"
+        unsafe fun parts<T>(values: &[T]) -> usize {
+            match unsafe { values as (*const T, usize) } {
+                (_, len) => len,
+            }
+        }
+
+        unsafe fun mut_parts<T>(values: &mut [T]) -> *mut T {
+            match unsafe { values as (*mut T, usize) } {
+                (data, _) => data,
+            }
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn rejects_mutable_raw_parts_from_shared_slice() {
+    let result = check(
+        r#"
+        unsafe fun mut_parts<T>(values: &[T]) -> *mut T {
+            match unsafe { values as (*mut T, usize) } {
+                (data, _) => data,
+            }
+        }
+        "#,
+    );
+    assert!(
+        !result.diagnostics.is_empty(),
+        "shared slice must not yield a *mut part"
+    );
+}
+
+#[test]
+fn slice_to_raw_parts_casts_require_unsafe() {
+    let result = check(
+        r#"
+        fun parts<T>(values: &[T]) -> usize {
+            match values as (*const T, usize) {
+                (_, len) => len,
+            }
+        }
+        "#,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0046")
+            .count(),
+        1,
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn str_to_byte_slice_layout_cast_is_safe() {
+    let result = check(
+        r#"
+        fun as_bytes(value: &str) -> &[u8] {
+            value as &[u8]
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn dst_layout_casts_require_unsafe() {
+    let result = check(
+        r#"
+        fun slice_from_parts<T>(data: *const T, len: usize) -> &[T] {
+            (data, len) as &[T]
+        }
+
+        fun str_from_bytes(bytes: &[u8]) -> &str {
+            bytes as &str
+        }
+        "#,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0046")
+            .count(),
+        2,
+        "{:#?}",
+        result.diagnostics
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0012"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn nested_unsafe_blocks_work() {
     let result = check(
         r#"
@@ -304,17 +425,6 @@ fn extern_imports_default_to_unsafe_and_allow_safe_opt_out() {
             .count(),
         1
     );
-}
-
-#[test]
-fn legacy_single_extern_import_is_unsafe() {
-    let result = check(
-        r#"
-        extern "C" fun external();
-        fun main() { external(); }
-        "#,
-    );
-    assert!(result.diagnostics.iter().any(|diag| diag.code == "E0046"));
 }
 
 #[test]

@@ -11,7 +11,7 @@ use ast::{self, support::AstNode};
 use frontend::{incremental::IncrementalParser, tree_builder::Parse};
 use hir::{
     HirFile,
-    body::StmtId,
+    body::PatternBindingId,
     item_tree::{FunctionId, ModuleId, StructId, TopLevelItem},
     lower_root,
 };
@@ -177,7 +177,6 @@ fn def_kind(def: &DefRef) -> DefKind {
         DefRef::Const(_) => DefKind::Struct,
         DefRef::TypeAlias(_) => DefKind::Struct,
         DefRef::Module { .. } => DefKind::Module,
-        DefRef::Local { .. } => DefKind::Local,
         DefRef::Param { .. } => DefKind::Param,
         DefRef::LambdaParam { .. } => DefKind::Param,
         DefRef::ConstParam { .. } => DefKind::Param,
@@ -187,9 +186,10 @@ fn def_kind(def: &DefRef) -> DefKind {
     }
 }
 
-fn local_stmt(defs: &[DefRef]) -> Option<StmtId> {
+/// Identity of the local a reference resolved to, for shadowing assertions.
+fn local_binding(defs: &[DefRef]) -> Option<PatternBindingId> {
     defs.iter().find_map(|def| match def {
-        DefRef::Local { stmt } => Some(*stmt),
+        DefRef::PatternBinding { id, .. } => Some(*id),
         _ => None,
     })
 }

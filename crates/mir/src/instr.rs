@@ -116,6 +116,9 @@ pub enum InstKind {
     /// Type cast: `result = cast(value, target_type)`
     Cast(CastOp, Value, Type),
 
+    /// Compute the target-dependent size of a type.
+    SizeOf(Type),
+
     /// Stack allocation: `result = alloca type` (returns `Ptr<type>`)
     Alloca(Type),
 
@@ -134,6 +137,9 @@ pub enum InstKind {
 
     /// Compute address of an array element: `result = index_ptr(base, index)`
     IndexPtr(Value, Value),
+
+    /// Compute a bounds-checked array or slice element address.
+    CheckedIndexPtr(Value, Value, Value),
 
     /// Extract a field from an aggregate value: `result = extract_value(aggregate, index)`
     ExtractValue(Value, usize),
