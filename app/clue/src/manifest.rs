@@ -45,6 +45,7 @@ pub struct Manifest {
     pub name: String,
     pub entry: PathBuf,
     pub kind: ProjectKind,
+    pub build_target: Option<String>,
     pub runtime_source: Option<PathBuf>,
     pub fingerprint: String,
     pub dependencies: Vec<Dependency>,
@@ -85,11 +86,16 @@ pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
         ));
     }
     let runtime_source = runtime_source(root, &value, kind)?;
+    let build_target = table(&value, "build")
+        .map(|build| optional_string_field(build, "target", "build"))
+        .transpose()?
+        .flatten();
 
     Ok(Manifest {
         name,
         entry,
         kind,
+        build_target,
         runtime_source,
         fingerprint: value.to_string(),
         dependencies: dependencies(&value)?,

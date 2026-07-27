@@ -96,6 +96,7 @@ pub(crate) struct LoadedPackage {
     pub name: String,
     pub entry: PathBuf,
     pub kind: ProjectKind,
+    pub build_target: Option<String>,
     pub runtime_source: Option<PathBuf>,
     pub manifest_fingerprint: String,
     pub source: pipeline::LoadedSource,
@@ -198,6 +199,7 @@ fn load_inner(
         name: manifest.name,
         entry: manifest.entry,
         kind: manifest.kind,
+        build_target: manifest.build_target,
         runtime_source: manifest.runtime_source,
         manifest_fingerprint,
         source: pipeline::LoadedSource {

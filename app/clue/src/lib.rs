@@ -1,6 +1,7 @@
 mod build;
 mod manifest;
 mod project;
+mod target;
 
 use anyhow::bail;
 use std::collections::{BTreeMap, HashMap};
@@ -10,12 +11,14 @@ use std::process::{Command, ExitStatus};
 use std::time::SystemTime;
 
 pub use project::{ProjectKind, init, new};
+pub use riddlec::target::TargetTriple;
 
 pub struct ProjectAnalysis {
     pub entry: PathBuf,
     pub source: riddlec::pipeline::LoadedSource,
     pub result: riddlec::pipeline::CompileResult,
     pub kind: ProjectKind,
+    build_target: Option<String>,
     runtime_source: Option<PathBuf>,
     package_name: String,
     manifest_fingerprint: String,
@@ -175,6 +178,7 @@ pub fn resolve_project_with_session_cancellable(
         source: package.source,
         result,
         kind: package.kind,
+        build_target: package.build_target,
         runtime_source: package.runtime_source,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
@@ -218,6 +222,7 @@ pub fn check_project_with_session_cancellable(
         source: package.source,
         result,
         kind: package.kind,
+        build_target: package.build_target,
         runtime_source: package.runtime_source,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
@@ -249,6 +254,7 @@ fn analyze_project_impl(
         source: package.source,
         result,
         kind: package.kind,
+        build_target: package.build_target,
         runtime_source: package.runtime_source,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
@@ -256,11 +262,16 @@ fn analyze_project_impl(
 }
 
 pub fn check(path: &Path) -> anyhow::Result<()> {
+    check_for_target(path, None)
+}
+
+pub fn check_for_target(path: &Path, explicit_target: Option<TargetTriple>) -> anyhow::Result<()> {
     let analysis = check_project_with_options(
         path,
         &HashMap::new(),
         riddlec::pipeline::CompileOptions::default(),
     )?;
+    target::resolve(explicit_target, analysis.build_target.as_deref())?;
     let errors = riddlec::diagnostics::report_mapped(
         &analysis.result,
         &analysis.source,
@@ -274,14 +285,36 @@ pub fn check(path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn build(path: &Path) -> anyhow::Result<()> {
-    build::run(path).map(|_| ())
+    build_for_target(path, None)
+}
+
+pub fn build_for_target(path: &Path, explicit_target: Option<TargetTriple>) -> anyhow::Result<()> {
+    build::run(path, explicit_target).map(|_| ())
 }
 
 pub fn run(path: &Path, args: &[OsString]) -> anyhow::Result<ExitStatus> {
-    let artifact = build::run(path)?;
-    let build::BuildArtifact::Executable(executable) = artifact else {
+    run_for_target(path, args, None)
+}
+
+pub fn run_for_target(
+    path: &Path,
+    args: &[OsString],
+    explicit_target: Option<TargetTriple>,
+) -> anyhow::Result<ExitStatus> {
+    let artifact = build::run(path, explicit_target)?;
+    let build::BuildArtifact::Executable {
+        path: executable,
+        target,
+    } = artifact
+    else {
         bail!("cannot run a library package");
     };
+    if target != TargetTriple::host().map_err(anyhow::Error::msg)? {
+        bail!(
+            "cannot run target `{target}` on host `{}`; run the built program on the target system",
+            TargetTriple::host().map_err(anyhow::Error::msg)?
+        );
+    }
     Command::new(&executable)
         .args(args)
         .current_dir(path)

@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use riddlec::{diagnostics, pipeline};
+use riddlec::{diagnostics, pipeline, target::TargetTriple};
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum BackendKind {
@@ -31,6 +31,10 @@ struct Opts {
     /// Generate code for a target backend.
     #[arg(short, long, value_enum)]
     backend: Option<BackendKind>,
+
+    /// Select the target platform triple.
+    #[arg(long, value_name = "TRIPLE")]
+    target: Option<TargetTriple>,
 
     /// Write generated code to a file.
     #[arg(short, long)]
@@ -66,6 +70,13 @@ fn main() {
         eprintln!("riddlec: no input files");
         process::exit(1);
     }
+    let target = match selected_target(opts.target) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("riddlec: {error}");
+            process::exit(1);
+        }
+    };
     if matches!(opts.backend, Some(BackendKind::C)) && opts.files.len() != 1 {
         eprintln!("riddlec: C backend accepts exactly one input file");
         process::exit(1);
@@ -99,6 +110,7 @@ fn main() {
             if opts.files.len() > 1 {
                 println!("== {} ==", file.display());
             }
+            println!("target: {target}");
             let source_name = file.display().to_string();
             diagnostics::report_verbose(&result, Some(&loaded.source), &source_name);
             println!();
@@ -161,6 +173,19 @@ where
     T: Into<OsString> + Clone,
 {
     Opts::try_parse_from(args)
+}
+
+fn selected_target(explicit: Option<TargetTriple>) -> Result<TargetTriple, String> {
+    if let Some(target) = explicit {
+        return Ok(target);
+    }
+    if let Some(target) = env::var_os("RIDDLE_TARGET") {
+        return target
+            .to_string_lossy()
+            .parse()
+            .map_err(|error| format!("invalid RIDDLE_TARGET: {error}"));
+    }
+    TargetTriple::host().map_err(|error| error.to_string())
 }
 
 /// Write generated C code to a `.c` source file.

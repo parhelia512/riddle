@@ -41,6 +41,38 @@ fn accepts_no_std() {
 }
 
 #[test]
+fn accepts_supported_target_and_rejects_unknown_target() {
+    let root = temp_root("target");
+    fs::create_dir_all(&root).unwrap();
+    let input = root.join("main.rid");
+    fs::write(&input, "fun main() {}\n").unwrap();
+
+    let accepted = run(&[
+        Path::new("--target"),
+        Path::new("aarch64-unknown-linux-gnu"),
+        &input,
+    ]);
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let rejected = run(&[
+        Path::new("--target"),
+        Path::new("x86_64-unknown-linux-musl"),
+        &input,
+    ]);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("unsupported target"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn c_backend_rejects_multiple_inputs() {
     let root = temp_root("multiple-inputs");
     fs::create_dir_all(&root).unwrap();

@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
-use clue::{ProjectKind, build, check, init, new, run};
+use clue::{
+    ProjectKind, TargetTriple, build_for_target, check_for_target, init, new, run_for_target,
+};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -16,12 +18,18 @@ enum Commands {
     New(ProjectArgs),
     Check {
         path: Option<PathBuf>,
+        #[arg(long, value_name = "TRIPLE")]
+        target: Option<TargetTriple>,
     },
     Build {
         path: Option<PathBuf>,
+        #[arg(long, value_name = "TRIPLE")]
+        target: Option<TargetTriple>,
     },
     Run {
         path: Option<PathBuf>,
+        #[arg(long, value_name = "TRIPLE")]
+        target: Option<TargetTriple>,
         #[arg(last = true)]
         args: Vec<OsString>,
     },
@@ -59,16 +67,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             new(&args.path, args.kind())?;
             println!("clue: created {}", args.path.display());
         }
-        Commands::Check { path } => {
-            check(path.as_deref().unwrap_or_else(|| std::path::Path::new(".")))?;
+        Commands::Check { path, target } => {
+            check_for_target(
+                path.as_deref().unwrap_or_else(|| std::path::Path::new(".")),
+                target,
+            )?;
         }
-        Commands::Build { path } => {
-            build(path.as_deref().unwrap_or_else(|| std::path::Path::new(".")))?;
+        Commands::Build { path, target } => {
+            build_for_target(
+                path.as_deref().unwrap_or_else(|| std::path::Path::new(".")),
+                target,
+            )?;
         }
-        Commands::Run { path, args } => {
-            let status = run(
+        Commands::Run { path, target, args } => {
+            let status = run_for_target(
                 path.as_deref().unwrap_or_else(|| std::path::Path::new(".")),
                 &args,
+                target,
             )?;
             std::process::exit(status.code().unwrap_or(1));
         }

@@ -80,6 +80,36 @@ strictly; otherwise it searches for `cc`, `gcc`, `clang`, and versioned command
 names, plus `clang-cl` and `cl` on Windows. A candidate must compile and link
 C11 successfully. `clue run` performs the same build before running the program.
 
+## Cross-compilation
+
+`clue check`, `clue build`, and `riddlec` accept `--target <triple>`. Clue
+selects a target from the command line, `RIDDLE_TARGET`, `[build].target` in
+`Clue.toml`, then the host platform, in that order. Ridup installs target
+components:
+
+```powershell
+ridup target add aarch64-unknown-linux-gnu
+clue build --target aarch64-unknown-linux-gnu
+```
+
+The first release is strictly limited to these seven targets; no other triple
+is accepted:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `i686-unknown-linux-gnu`
+- `x86_64-pc-windows-msvc`
+- `i686-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+- `aarch64-apple-darwin`
+
+A target component and a ready C toolchain are separate states. `ridup target
+add` installs the Riddle runtime and offers to install matching LLVM/Clang, but
+linking still needs the target platform libraries: a Linux sysroot, the Windows
+SDK and MSVC libraries for MSVC targets, or an Apple SDK for macOS. Ridup does
+not report a target as ready while these requirements are missing. `clue run`
+only runs the host target; run a cross-built artifact on its target system.
+
 ## License
 
 Riddle is distributed under the [Apache License 2.0](./LICENSE).

@@ -157,7 +157,7 @@ jobs:
             fi
           done
 
-          cp LICENSE README.md dist/
+          cp LICENSE README.md crates/gc/src/runtime.c dist/
 
           ZIPNAME="riddle-${HASH}-nightly-${SUFFIX}.zip"
           if [ "${{ matrix.platform }}" = "windows" ]; then
@@ -166,6 +166,24 @@ jobs:
             cd dist && zip "../${ZIPNAME}" * && cd ..
           fi
           ls -lh "${ZIPNAME}"
+
+          rm -rf dist-target
+          mkdir -p dist-target
+          cp LICENSE crates/gc/src/runtime.c dist-target/
+          cat > dist-target/target.toml <<EOF
+          schema = 1
+          triple = "${{ matrix.target }}"
+          runtime = "runtime.c"
+          llvm_version = "22.1.3"
+          EOF
+
+          TARGET_ZIP="riddle-${HASH}-nightly-target-${{ matrix.target }}.zip"
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            powershell -Command "Compress-Archive -Path dist-target\* -DestinationPath ${TARGET_ZIP}"
+          else
+            cd dist-target && zip "../${TARGET_ZIP}" * && cd ..
+          fi
+          ls -lh "${TARGET_ZIP}"
 
       - name: 上传 zip
         uses: actions/upload-artifact@v4
@@ -223,6 +241,58 @@ jobs:
           path: .
           merge-multiple: true
 
+      - name: 生成发行清单
+        shell: bash
+        run: |
+          HASH=$(git rev-parse --short HEAD)
+          cat > riddle-dist.toml <<EOF
+          schema = 1
+          channel = "nightly"
+          version = "${HASH}"
+          commit = "${GITHUB_SHA}"
+          llvm_version = "22.1.3"
+          EOF
+
+          emit_entry() {
+            KIND="$1"
+            TRIPLE="$2"
+            ASSET="$3"
+            if [ ! -f "$ASSET" ]; then
+              echo "Missing distribution asset: $ASSET"
+              exit 1
+            fi
+            DIGEST=$(sha256sum "$ASSET" | awk '{print $1}')
+            cat >> riddle-dist.toml <<EOF
+
+          [[${KIND}]]
+          triple = "${TRIPLE}"
+          asset = "${ASSET}"
+          sha256 = "${DIGEST}"
+          EOF
+          }
+
+          emit_entry hosts x86_64-unknown-linux-gnu "riddle-${HASH}-nightly-linux-x86_64.zip"
+          emit_entry hosts aarch64-unknown-linux-gnu "riddle-${HASH}-nightly-linux-aarch64.zip"
+          emit_entry hosts i686-unknown-linux-gnu "riddle-${HASH}-nightly-linux-i686.zip"
+          emit_entry hosts x86_64-pc-windows-msvc "riddle-${HASH}-nightly-windows-x86_64.zip"
+          emit_entry hosts i686-pc-windows-msvc "riddle-${HASH}-nightly-windows-i686.zip"
+          emit_entry hosts aarch64-pc-windows-msvc "riddle-${HASH}-nightly-windows-aarch64.zip"
+          emit_entry hosts aarch64-apple-darwin "riddle-${HASH}-nightly-macos-aarch64.zip"
+
+          for TRIPLE in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            i686-unknown-linux-gnu \
+            x86_64-pc-windows-msvc \
+            i686-pc-windows-msvc \
+            aarch64-pc-windows-msvc \
+            aarch64-apple-darwin
+          do
+            emit_entry targets "$TRIPLE" "riddle-${HASH}-nightly-target-${TRIPLE}.zip"
+          done
+
+          cat riddle-dist.toml
+
       - name: 更新 nightly tag 并推送
         run: |
           git config user.name  "github-actions[bot]"
@@ -242,7 +312,7 @@ jobs:
         run: |
           HASH=$(git rev-parse --short HEAD)
           URL="${{ github.server_url }}/${{ github.repository }}/releases/download/nightly"
-          gh release create nightly riddle-*.zip riddle-vscode.vsix \
+          gh release create nightly riddle-*.zip riddle-dist.toml riddle-vscode.vsix \
             --title "Nightly Build $(date +'%Y-%m-%d')" \
             --prerelease \
             --notes "$(cat <<EOF

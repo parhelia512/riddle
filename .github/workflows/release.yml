@@ -154,6 +154,24 @@ jobs:
           fi
           ls -lh "${ZIPNAME}"
 
+          rm -rf dist-target
+          mkdir -p dist-target
+          cp LICENSE crates/gc/src/runtime.c dist-target/
+          cat > dist-target/target.toml <<EOF
+          schema = 1
+          triple = "${{ matrix.target }}"
+          runtime = "runtime.c"
+          llvm_version = "22.1.3"
+          EOF
+
+          TARGET_ZIP="riddle-${{ github.ref_name }}-target-${{ matrix.target }}.zip"
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            powershell -Command "Compress-Archive -Path dist-target\* -DestinationPath ${TARGET_ZIP}"
+          else
+            cd dist-target && zip "../${TARGET_ZIP}" * && cd ..
+          fi
+          ls -lh "${TARGET_ZIP}"
+
       - name: 上传 zip
         uses: actions/upload-artifact@v4
         with:
@@ -203,11 +221,63 @@ jobs:
           path: .
           merge-multiple: true
 
+      - name: 生成发行清单
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > riddle-dist.toml <<EOF
+          schema = 1
+          channel = "stable"
+          version = "${VERSION}"
+          commit = "${GITHUB_SHA}"
+          llvm_version = "22.1.3"
+          EOF
+
+          emit_entry() {
+            KIND="$1"
+            TRIPLE="$2"
+            ASSET="$3"
+            if [ ! -f "$ASSET" ]; then
+              echo "Missing distribution asset: $ASSET"
+              exit 1
+            fi
+            DIGEST=$(sha256sum "$ASSET" | awk '{print $1}')
+            cat >> riddle-dist.toml <<EOF
+
+          [[${KIND}]]
+          triple = "${TRIPLE}"
+          asset = "${ASSET}"
+          sha256 = "${DIGEST}"
+          EOF
+          }
+
+          emit_entry hosts x86_64-unknown-linux-gnu "riddle-${GITHUB_REF_NAME}-linux-x86_64.zip"
+          emit_entry hosts aarch64-unknown-linux-gnu "riddle-${GITHUB_REF_NAME}-linux-aarch64.zip"
+          emit_entry hosts i686-unknown-linux-gnu "riddle-${GITHUB_REF_NAME}-linux-i686.zip"
+          emit_entry hosts x86_64-pc-windows-msvc "riddle-${GITHUB_REF_NAME}-windows-x86_64.zip"
+          emit_entry hosts i686-pc-windows-msvc "riddle-${GITHUB_REF_NAME}-windows-i686.zip"
+          emit_entry hosts aarch64-pc-windows-msvc "riddle-${GITHUB_REF_NAME}-windows-aarch64.zip"
+          emit_entry hosts aarch64-apple-darwin "riddle-${GITHUB_REF_NAME}-macos-aarch64.zip"
+
+          for TRIPLE in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            i686-unknown-linux-gnu \
+            x86_64-pc-windows-msvc \
+            i686-pc-windows-msvc \
+            aarch64-pc-windows-msvc \
+            aarch64-apple-darwin
+          do
+            emit_entry targets "$TRIPLE" "riddle-${GITHUB_REF_NAME}-target-${TRIPLE}.zip"
+          done
+
+          cat riddle-dist.toml
+
       - name: 创建正式 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" riddle-*.zip riddle-vscode.vsix \
+          gh release create "${{ github.ref_name }}" riddle-*.zip riddle-dist.toml riddle-vscode.vsix \
             --repo "${{ github.repository }}" \
             --title "Riddle ${{ github.ref_name }}" \
             --generate-notes

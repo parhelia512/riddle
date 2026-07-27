@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +20,7 @@ fn clue(args: &[&str], root: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clue"))
         .args(args)
         .current_dir(root)
+        .env_remove("RIDDLE_TARGET")
         .output()
         .unwrap()
 }
@@ -28,6 +30,16 @@ fn clue_with_cc(args: &[&str], root: &Path, cc: &Path) -> Output {
         .args(args)
         .current_dir(root)
         .env("CC", cc)
+        .env_remove("RIDDLE_TARGET")
+        .output()
+        .unwrap()
+}
+
+fn clue_with_target_env(args: &[&str], root: &Path, target: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_clue"))
+        .args(args)
+        .current_dir(root)
+        .env("RIDDLE_TARGET", target)
         .output()
         .unwrap()
 }
@@ -131,6 +143,68 @@ fn explicit_cc_is_strict_and_reports_an_unusable_compiler() {
     assert!(
         stderr.contains("C compiler from CC") && stderr.contains("could not report its version"),
         "{stderr}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn target_selection_prefers_cli_then_environment_then_manifest() {
+    let root = temp_root("target-precedence");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let project = root.join("app");
+    let manifest = project.join("Clue.toml");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&manifest)
+        .unwrap()
+        .write_all(b"\n[build]\ntarget = \"unsupported-triple\"\n")
+        .unwrap();
+
+    let invalid_manifest = clue(&["check", "app"], &root);
+    assert!(!invalid_manifest.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_manifest.stderr).contains("invalid build.target"),
+        "{}",
+        String::from_utf8_lossy(&invalid_manifest.stderr)
+    );
+
+    let host = riddlec::target::TargetTriple::host().unwrap().to_string();
+    let environment = clue_with_target_env(&["check", "app"], &root, &host);
+    assert!(
+        environment.status.success(),
+        "{}",
+        String::from_utf8_lossy(&environment.stderr)
+    );
+    let explicit = clue(&["check", "app", "--target", &host], &root);
+    assert!(
+        explicit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cross_build_requires_an_installed_target_component() {
+    let root = temp_root("missing-target-component");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let host = riddlec::target::TargetTriple::host().unwrap();
+    let cross = riddlec::target::TargetTriple::ALL
+        .into_iter()
+        .find(|target| *target != host)
+        .unwrap()
+        .to_string();
+
+    let output = clue(&["build", "app", "--target", &cross], &root);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "target component `{cross}` is not installed; run `ridup target add {cross}`"
+        )),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let _ = fs::remove_dir_all(root);
 }

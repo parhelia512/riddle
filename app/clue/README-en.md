@@ -14,13 +14,13 @@ clue init <path> [--bin|--lib]
 clue new <path> [--bin|--lib]
 
 # Check the whole project without generating C
-clue check [path]
+clue check [path] [--target <triple>]
 
 # Generate C and build .clue/build/<package>[.exe]
-clue build [path]
+clue build [path] [--target <triple>]
 
 # Build and run a binary package
-clue run [path] [-- <args>...]
+clue run [path] [--target <triple>] [-- <args>...]
 ```
 
 Binary projects are the default. Clue supports local path dependencies declared in
@@ -46,6 +46,28 @@ source = "runtime/custom_gc.c"
 
 Runtime selection belongs to the final binary package; library packages cannot
 declare `[runtime]`.
+
+## Targets
+
+Target selection precedence is `--target`, `RIDDLE_TARGET`, `[build].target` in
+`Clue.toml`, then the host platform:
+
+```toml
+[build]
+target = "aarch64-unknown-linux-gnu"
+```
+
+The current release supports only `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu`,
+`x86_64-pc-windows-msvc`, `i686-pc-windows-msvc`,
+`aarch64-pc-windows-msvc`, and `aarch64-apple-darwin`. Every other triple is
+rejected.
+
+Before cross-building a binary package, run `ridup target add <triple>`. The
+target component supplies the Riddle runtime; C-toolchain readiness is checked
+separately. Linux needs a target sysroot, Windows MSVC targets need the Windows
+SDK and MSVC libraries, and macOS needs an Apple SDK. `clue run` does not run a
+cross-built artifact on the host.
 
 ## Library API
 
@@ -75,3 +97,4 @@ refuse to overwrite an existing manifest or target entry file.
 - `project.rs`: project creation, templates, and dependency loading
 - `manifest.rs`: `Clue.toml` serialization and parsing
 - `build.rs`: compilation and build cache
+- `target.rs`: target components and C-toolchain configuration

@@ -1,4 +1,5 @@
-use crate::{ProjectKind, analyze_project};
+use crate::target::{self, TargetConfig};
+use crate::{ProjectKind, TargetTriple, analyze_project};
 use anyhow::{Context, bail};
 use riddlec::pipeline;
 use std::collections::HashMap;
@@ -11,11 +12,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) enum BuildArtifact {
-    Executable(PathBuf),
+    Executable { path: PathBuf, target: TargetTriple },
     Library,
 }
 
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Flavor {
     Unix,
     Msvc,
@@ -26,9 +27,14 @@ struct CCompiler {
     program: OsString,
     flavor: Flavor,
     version: Vec<u8>,
+    clang: bool,
+    target: TargetConfig,
 }
 
-pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
+pub(crate) fn run(
+    root: &Path,
+    explicit_target: Option<TargetTriple>,
+) -> anyhow::Result<BuildArtifact> {
     let root = if root.is_absolute() {
         root.to_path_buf()
     } else {
@@ -43,11 +49,13 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
     if errors > 0 || !analysis.result.success() {
         bail!("build failed");
     }
+    let triple = target::resolve(explicit_target, analysis.build_target.as_deref())?;
+    let target = target::load(triple, analysis.kind == ProjectKind::Binary)?;
 
     let build_dir = root.join(".clue").join("build");
     fs::create_dir_all(&build_dir)?;
     let compiler = if analysis.kind == ProjectKind::Binary {
-        Some(CCompiler::detect(&build_dir)?)
+        Some(CCompiler::detect(&build_dir, target.clone())?)
     } else {
         None
     };
@@ -57,7 +65,12 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
         Some(match &custom_runtime_path {
             Some(path) => fs::read_to_string(path)
                 .with_context(|| format!("failed to read runtime source `{}`", path.display()))?,
-            None => gc::RUNTIME_C.to_owned(),
+            None => match &target.runtime_source {
+                Some(path) => fs::read_to_string(path).with_context(|| {
+                    format!("failed to read target runtime `{}`", path.display())
+                })?,
+                None => gc::RUNTIME_C.to_owned(),
+            },
         })
     } else {
         None
@@ -73,6 +86,7 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
         &analysis.source.source,
         runtime_source.as_deref(),
         compiler.as_ref(),
+        &target,
     );
     let source_is_fresh = c_path.is_file()
         && runtime_path.as_ref().is_none_or(|path| path.is_file())
@@ -103,10 +117,13 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
         return Ok(BuildArtifact::Library);
     };
 
-    let executable = executable_path(&c_path);
+    let executable = executable_path(&c_path, triple);
     if source_is_fresh && executable.is_file() {
         println!("clue: fresh {}", executable.display());
-        return Ok(BuildArtifact::Executable(executable));
+        return Ok(BuildArtifact::Executable {
+            path: executable,
+            target: triple,
+        });
     }
 
     compiler.compile(
@@ -120,7 +137,10 @@ pub(crate) fn run(root: &Path) -> anyhow::Result<BuildArtifact> {
     )?;
     fs::write(&hash_path, hash)?;
     println!("clue: built {}", executable.display());
-    Ok(BuildArtifact::Executable(executable))
+    Ok(BuildArtifact::Executable {
+        path: executable,
+        target: triple,
+    })
 }
 
 fn fingerprint(
@@ -128,6 +148,7 @@ fn fingerprint(
     source: &str,
     runtime: Option<&str>,
     compiler: Option<&CCompiler>,
+    target: &TargetConfig,
 ) -> String {
     let mut hasher = DefaultHasher::new();
     manifest.hash(&mut hasher);
@@ -135,8 +156,7 @@ fn fingerprint(
     runtime.hash(&mut hasher);
     "c11".hash(&mut hasher);
     riddlec::GIT_HASH.hash(&mut hasher);
-    env::consts::OS.hash(&mut hasher);
-    env::consts::ARCH.hash(&mut hasher);
+    target.hash(&mut hasher);
     if let Some(compiler) = compiler {
         compiler.program.hash(&mut hasher);
         compiler.flavor.hash(&mut hasher);
@@ -145,18 +165,18 @@ fn fingerprint(
     format!("{:016x}", hasher.finish())
 }
 
-fn executable_path(c_path: &Path) -> PathBuf {
+fn executable_path(c_path: &Path, target: TargetTriple) -> PathBuf {
     let mut path = c_path.with_extension("");
-    if cfg!(windows) {
-        path.set_extension("exe");
+    if !target.executable_suffix().is_empty() {
+        path.set_extension(target.executable_suffix().trim_start_matches('.'));
     }
     path
 }
 
 impl CCompiler {
-    fn detect(build_dir: &Path) -> anyhow::Result<Self> {
+    fn detect(build_dir: &Path, target: TargetConfig) -> anyhow::Result<Self> {
         if let Some(program) = env::var_os("CC") {
-            let compiler = Self::new(program.clone()).ok_or_else(|| {
+            let compiler = Self::new(program.clone(), target.clone()).ok_or_else(|| {
                 anyhow::anyhow!(
                     "C compiler from CC `{}` could not report its version",
                     program.to_string_lossy()
@@ -171,13 +191,36 @@ impl CCompiler {
             );
         }
 
-        let mut programs = ["cc", "gcc", "clang"]
-            .into_iter()
+        if let Some(program) = &target.c_toolchain.compiler {
+            let compiler =
+                Self::new(program.as_os_str().to_owned(), target.clone()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "configured C compiler `{}` could not report its version",
+                        program.display()
+                    )
+                })?;
+            if compiler.probe(build_dir) {
+                return Ok(compiler);
+            }
+            bail!(
+                "configured C compiler `{}` cannot compile and link for `{}`",
+                program.display(),
+                target.triple
+            );
+        }
+
+        let candidates: &[&str] = if target.triple.is_windows() && cfg!(windows) {
+            &["clang-cl", "clang", "cc", "gcc", "cl"]
+        } else if target.triple.is_windows() {
+            &["clang", "cc", "gcc", "clang-cl"]
+        } else {
+            &["clang", "cc", "gcc"]
+        };
+        let mut programs = candidates
+            .iter()
+            .copied()
             .map(OsString::from)
             .collect::<Vec<_>>();
-        if cfg!(windows) {
-            programs.extend(["clang-cl", "cl"].into_iter().map(OsString::from));
-        }
         programs.extend(versioned_compilers());
         let tried = programs
             .iter()
@@ -186,7 +229,7 @@ impl CCompiler {
             .join(", ");
         programs
             .into_iter()
-            .filter_map(Self::new)
+            .filter_map(|program| Self::new(program, target.clone()))
             .find(|compiler| compiler.probe(build_dir))
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -195,7 +238,7 @@ impl CCompiler {
             })
     }
 
-    fn new(program: OsString) -> Option<Self> {
+    fn new(program: OsString, target: TargetConfig) -> Option<Self> {
         let program = resolve_program(&program);
         let flavor = flavor_for(&program);
         let output = Command::new(&program)
@@ -207,10 +250,23 @@ impl CCompiler {
             .ok()?;
         let mut version = output.stdout;
         version.extend(output.stderr);
+        let clang = program_name(&program).starts_with("clang")
+            || String::from_utf8_lossy(&version)
+                .to_ascii_lowercase()
+                .contains("clang");
+        let host = TargetTriple::host().ok()?;
+        if target.triple != host && !clang {
+            return None;
+        }
+        if !target.triple.is_windows() && flavor == Flavor::Msvc {
+            return None;
+        }
         (!version.is_empty()).then_some(Self {
             program,
             flavor,
             version,
+            clang,
+            target,
         })
     }
 
@@ -222,7 +278,7 @@ impl CCompiler {
         }
 
         let source = build_dir.join(format!(".cc-{identity:016x}.c"));
-        let executable = executable_path(&source);
+        let executable = executable_path(&source, self.target.triple);
         if fs::write(&source, "int main(void) { return 0; }\n").is_err() {
             return false;
         }
@@ -244,6 +300,8 @@ impl CCompiler {
         self.program.hash(&mut hasher);
         self.flavor.hash(&mut hasher);
         self.version.hash(&mut hasher);
+        self.clang.hash(&mut hasher);
+        self.target.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -268,13 +326,25 @@ impl CCompiler {
 
     fn command(&self, sources: &[&Path], executable: &Path) -> Command {
         let mut command = Command::new(&self.program);
+        let host = TargetTriple::host().ok();
+        let cross = host.is_some_and(|host| host != self.target.triple);
         match self.flavor {
             Flavor::Unix => {
                 command.args(["-std=c11", "-O2"]);
+                if cross {
+                    command.arg(format!("--target={}", self.target.triple));
+                    command.arg("-fuse-ld=lld");
+                }
+                self.apply_unix_target_options(&mut command);
                 command.args(sources).arg("-o").arg(executable);
             }
             Flavor::Msvc => {
                 command.args(["/nologo", "/std:c11", "/O2"]);
+                if cross && self.clang {
+                    command.arg(format!("--target={}", self.target.triple));
+                    command.arg("-fuse-ld=lld");
+                }
+                self.apply_msvc_target_options(&mut command);
                 command
                     .args(sources)
                     .arg(format!("/Fe{}", executable.display()));
@@ -283,6 +353,80 @@ impl CCompiler {
         command.current_dir(executable.parent().unwrap_or_else(|| Path::new(".")));
         command
     }
+
+    fn apply_unix_target_options(&self, command: &mut Command) {
+        if let Some(sysroot) = &self.target.c_toolchain.sysroot {
+            if self.target.triple.is_macos() {
+                command.arg("-isysroot").arg(sysroot);
+            } else {
+                command.arg(format!("--sysroot={}", sysroot.display()));
+            }
+        }
+        if self.target.triple.is_windows() {
+            for include in self.windows_include_paths() {
+                command.arg("-isystem").arg(include);
+            }
+            for library in self.windows_library_paths() {
+                command.arg("-L").arg(library);
+            }
+        }
+    }
+
+    fn apply_msvc_target_options(&self, command: &mut Command) {
+        let includes = self.windows_include_paths();
+        if !includes.is_empty()
+            && let Ok(value) = env::join_paths(includes)
+        {
+            command.env("INCLUDE", value);
+        }
+        let libraries = self.windows_library_paths();
+        if !libraries.is_empty()
+            && let Ok(value) = env::join_paths(libraries)
+        {
+            command.env("LIB", value);
+        }
+    }
+
+    fn windows_include_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(msvc) = &self.target.c_toolchain.msvc {
+            paths.push(msvc.join("include"));
+        }
+        if let Some(sdk) = &self.target.c_toolchain.windows_sdk
+            && let Some(version) = latest_child(&sdk.join("Include"))
+        {
+            for name in ["ucrt", "shared", "um", "winrt"] {
+                paths.push(version.join(name));
+            }
+        }
+        paths
+    }
+
+    fn windows_library_paths(&self) -> Vec<PathBuf> {
+        let arch = self.target.triple.msvc_architecture();
+        let mut paths = Vec::new();
+        if let Some(msvc) = &self.target.c_toolchain.msvc {
+            paths.push(msvc.join("lib").join(arch));
+        }
+        if let Some(sdk) = &self.target.c_toolchain.windows_sdk
+            && let Some(version) = latest_child(&sdk.join("Lib"))
+        {
+            paths.push(version.join("ucrt").join(arch));
+            paths.push(version.join("um").join(arch));
+        }
+        paths
+    }
+}
+
+fn latest_child(root: &Path) -> Option<PathBuf> {
+    let mut directories = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories.pop()
 }
 
 fn resolve_program(program: &OsStr) -> OsString {
@@ -366,16 +510,20 @@ fn versioned_compiler_name(name: &OsStr) -> Option<Vec<u32>> {
 }
 
 fn flavor_for(program: &OsStr) -> Flavor {
+    let name = program_name(program);
+    if name == "cl" || name == "clang-cl" || name.starts_with("clang-cl-") {
+        Flavor::Msvc
+    } else {
+        Flavor::Unix
+    }
+}
+
+fn program_name(program: &OsStr) -> String {
     let name = program
         .to_string_lossy()
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    if name == "cl" || name == "clang-cl" || name.starts_with("clang-cl-") {
-        Flavor::Msvc
-    } else {
-        Flavor::Unix
-    }
+    name.strip_suffix(".exe").unwrap_or(&name).to_owned()
 }
