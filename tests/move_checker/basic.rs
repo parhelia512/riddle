@@ -604,6 +604,41 @@ fn assignment_moves_rhs_struct() {
     );
 }
 
+#[test]
+fn assignment_reinitializes_binding_after_rhs_move() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun move(value: Point) -> Point { value }
+
+        fun f(flag: bool) {
+            let mut p = Point{x: 1};
+            if flag { p = move(p); } else { }
+            let q = p;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn assignment_reinitializes_previously_moved_binding() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun f() {
+            let mut p = Point{x: 1};
+            let moved = p;
+            p = Point{x: 2};
+            let reused = p;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
 // == Match scrutinee ==
 
 #[test]

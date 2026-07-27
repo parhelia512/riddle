@@ -316,7 +316,16 @@ impl<'a> Analyzer<'a> {
             }
 
             Expr::Binary { lhs, rhs, op } => {
-                self.move_check_expr(ctx, *lhs);
+                let direct_assignment = (*op == hir::body::BinaryOp::Assign)
+                    .then(|| self.local_assignment(ctx, *lhs))
+                    .flatten()
+                    .filter(|(_, direct)| *direct)
+                    .map(|(binding, _)| binding);
+                if let Some(binding) = direct_assignment {
+                    ctx.release_local_if_dead(binding);
+                } else {
+                    self.move_check_expr(ctx, *lhs);
+                }
                 self.move_check_expr(ctx, *rhs);
                 if op.is_assignment() {
                     if let Some(lhs_place) = self.place_from_expr(ctx, *lhs)
@@ -344,6 +353,14 @@ impl<'a> Analyzer<'a> {
                         ctx.bind_origin_value(binding, value);
                     }
                     self.consume_if_local(ctx, *rhs);
+                    if let Some(binding) = direct_assignment {
+                        let place = Place::root(binding);
+                        ctx.bindings.mark_available(&self.expr_name(ctx, *lhs));
+                        ctx.moved_places
+                            .retain(|moved| !place_overlaps(moved, &place));
+                        ctx.moved_sites
+                            .retain(|moved, _| !place_overlaps(moved, &place));
+                    }
                 }
                 let origins = if op.is_assignment() {
                     ctx.expr_origins.get(rhs).cloned().unwrap_or_default()
@@ -2080,6 +2097,15 @@ impl MoveBindings {
         for s in self.scopes.iter_mut().rev() {
             if let Some(m) = s.get_mut(name) {
                 *m = true;
+                return;
+            }
+        }
+    }
+
+    fn mark_available(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(moved) = scope.get_mut(name) {
+                *moved = false;
                 return;
             }
         }
