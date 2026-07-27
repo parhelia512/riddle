@@ -9,7 +9,7 @@
 </h3>
 
 Riddle is an experimental programming language inspired by Rust and Go. Version
-`v0.1.1` provides type checking, a move checker, borrow and escape analysis,
+`v0.2.0` provides type checking, a move checker, borrow and escape analysis,
 unsafe semantics, a bundled standard library, a C backend, project tooling, and
 an LSP.
 
@@ -64,6 +64,12 @@ cargo install --path . --features install-bins --force --target-dir "$env:TEMP\r
 ```
 
 Both methods install `clue`, `riddle-lsp`, and `riddlec`.
+
+To validate only the installable binaries, select the root distribution package so the workspace's development packages do not emit duplicate binaries:
+
+```bash
+cargo build -p riddle --release --features install-bins --bins
+```
 
 ## Quick Start
 

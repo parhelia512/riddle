@@ -32,11 +32,18 @@ jobs:
       - name: 严格 Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: 校验标签与 Cargo 版本
+      - name: 验证源码安装构建
+        run: cargo build -p riddle --release --features install-bins --bins
+
+      - name: 校验标签、Cargo 版本与发布说明
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           if [ "${{ github.ref_name }}" != "v${VERSION}" ]; then
             echo "标签 ${{ github.ref_name }} 与 Cargo 版本 ${VERSION} 不匹配"
+            exit 1
+          fi
+          if ! grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md 缺少 ${VERSION} 的发布说明"
             exit 1
           fi
 
@@ -214,6 +221,9 @@ jobs:
     needs: [build, package-editors]
     runs-on: ubuntu-latest
     steps:
+      - name: 检出发布说明
+        uses: actions/checkout@v5
+
       - name: 下载全部平台 zip
         uses: actions/download-artifact@v4
         with:
@@ -273,6 +283,21 @@ jobs:
 
           cat riddle-dist.toml
 
+      - name: 提取发布说明
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v version="$VERSION" '
+            $0 == "## [" version "]" || index($0, "## [" version "] - ") == 1 {
+              found = 1
+              next
+            }
+            found && /^## \[/ { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
       - name: 创建正式 Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -280,7 +305,7 @@ jobs:
           gh release create "${{ github.ref_name }}" riddle-*.zip riddle-dist.toml riddle-vscode.vsix \
             --repo "${{ github.repository }}" \
             --title "Riddle ${{ github.ref_name }}" \
-            --generate-notes
+            --notes-file release-notes.md
 
   notify:
     name: 通知失败

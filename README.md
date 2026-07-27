@@ -8,7 +8,7 @@
     <a href="README-en.md">English</a> | <a href="README.md">中文</a>
 </h3>
 
-Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.1.1` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。
+Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.0` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。
 
 当前版本是技术预览：语言和工具链仍可能发生不兼容变化。教程与已实现能力见 [The Riddle Book](https://riddle-lang.github.io/docs/)。
 
@@ -50,6 +50,12 @@ cargo install --path . --features install-bins --force --target-dir "$env:TEMP\r
 ```
 
 两种方式都会安装 `clue`、`riddle-lsp` 和 `riddlec`。
+
+如果只验证这三个安装二进制的构建，请限定根发行包，避免 workspace 中的同名开发包重复输出：
+
+```bash
+cargo build -p riddle --release --features install-bins --bins
+```
 
 ## 快速开始
 
