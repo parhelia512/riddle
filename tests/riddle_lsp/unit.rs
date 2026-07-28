@@ -33,7 +33,7 @@ const DOCUMENTED_ERROR_CODES: &[&str] = &[
     "E0028", "E0029", "E0030", "E0031", "E0032", "E0033", "E0034", "E0035", "E0036", "E0037",
     "E0038", "E0039", "E0040", "E0041", "E0042", "E0043", "E0044", "E0045", "E0047", "E0048",
     "E0049", "E0050", "E0051", "E0052", "E0053", "E0054", "E0055", "E0056", "E0072", "E0100",
-    "E0200", "E0300", "E0301", "E0302", "E0303", "E0304", "E0305", "E0306", "E0307",
+    "E0200", "E0300", "E0301", "E0302", "E0303", "E0304", "E0305", "E0306", "E0307", "E0308",
 ];
 const SOURCE_UNREACHABLE_CODES: &[&str] = &["E0048", "E0049", "E0200"];
 
@@ -1813,6 +1813,13 @@ fn reachable_diagnostic_producers_have_exact_primary_and_lsp_spans() {
             "struct Token {} enum MaybeToken { Some(Token), None } fun consume(value: Token) -> bool { true } fun main(value: MaybeToken) { match value { MaybeToken::Some(token) if consume(token) => {}, MaybeToken::Some(token) => {}, MaybeToken::None => {} } }",
             "token",
             "consume(token",
+        ),
+        (
+            "E0308",
+            "cannot move out of dereference",
+            "struct Token {} fun main() { let mut token = Token {}; let reference = &mut token; let moved = *reference; }",
+            "*reference",
+            "let moved = *reference",
         ),
     ];
     let uri = lsp_types::Url::parse("file:///producer-spans.rid").unwrap();

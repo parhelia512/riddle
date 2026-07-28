@@ -733,6 +733,58 @@ fn vector_mutation_is_rejected_while_shared_element_reference_is_live() {
 }
 
 #[test]
+fn dereferencing_non_copy_reference_cannot_move_value_out() {
+    let result = compile(
+        r#"
+            struct Point { x: i32, y: i32 }
+
+            fun forward(value: &mut Point) -> &mut Point { value }
+
+            fun main() {
+                let mut point = Point { x: 3, y: 4 };
+                let moved = *forward(&mut point);
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(result.mir_module.is_none());
+    assert!(
+        result.analysis_diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0308"
+                && diagnostic
+                    .message
+                    .contains("cannot move out of dereference")
+        }),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn dereferencing_copy_reference_reads_a_copy() {
+    let result = compile(
+        r#"
+            struct Point { x: i32, y: i32 }
+            impl Copy for Point {}
+
+            fun forward(value: &mut Point) -> &mut Point { value }
+
+            fun main() {
+                let mut point = Point { x: 3, y: 4 };
+                let first = *forward(&mut point);
+                let second = *forward(&mut point);
+                let still_available = point;
+                let mut reference = forward(&mut point);
+                reference.x = 1;
+            }
+            "#,
+    );
+
+    assert!(result.success(), "{:#?}", result.analysis_diagnostics);
+}
+
+#[test]
 fn string_mutation_is_rejected_while_str_view_is_live() {
     let result = compile(
         r#"

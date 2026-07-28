@@ -742,9 +742,6 @@ impl<'a> Analyzer<'a> {
             return;
         }
 
-        let Some(place) = self.place_from_expr(ctx, expr_id) else {
-            return;
-        };
         let ty = self
             .type_result
             .expr_types
@@ -761,6 +758,17 @@ impl<'a> Analyzer<'a> {
         {
             return;
         }
+        if self.place_has_explicit_reference_deref(ctx, expr_id) {
+            self.diag(
+                "cannot move out of dereference of a non-Copy value".into(),
+                ctx.expr_range(expr_id),
+                "E0308",
+            );
+            return;
+        }
+        let Some(place) = self.place_from_expr(ctx, expr_id) else {
+            return;
+        };
         if !place.projections.is_empty()
             && self
                 .root_type_from_expr(ctx, expr_id)
@@ -993,6 +1001,24 @@ impl<'a> Analyzer<'a> {
                 Some(base_place.index(idx))
             }
             _ => None,
+        }
+    }
+
+    fn place_has_explicit_reference_deref(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> bool {
+        match &ctx.body.exprs[expr_id] {
+            Expr::Unary {
+                operand,
+                op: UnaryOp::Deref,
+            } => matches!(
+                self.type_result.expr_types.get(&(ctx.body_id, *operand)),
+                Some(Type::Ref(..))
+            ),
+            // ponytail: implicit field/index deref stays permissive until owning array
+            // iteration has a ManuallyDrop-like primitive for moving elements out.
+            Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
+                self.place_has_explicit_reference_deref(ctx, *base)
+            }
+            _ => false,
         }
     }
 
@@ -1799,6 +1825,10 @@ impl<'a> Analyzer<'a> {
             "E0304" => vec!["the borrow must end before moving the value".into()],
             "E0307" => vec![
                 "borrow the pattern binding in the guard or move it from the selected arm body"
+                    .into(),
+            ],
+            "E0308" => vec![
+                "borrow through the reference, or implement `Copy` when duplication is intended"
                     .into(),
             ],
             _ => Vec::new(),
