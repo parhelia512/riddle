@@ -740,6 +740,32 @@ fn c_heap_alloc() {
 }
 
 #[test]
+fn c_heap_alloc_uses_linux_frame_boundary_for_gc_roots() {
+    let module = lower(
+        r#"
+        struct Data { value: i32 }
+
+        fun escape() -> &Data {
+            let local = Data { value: 1 };
+            &local
+        }
+
+        fun main() { escape(); }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("rgc_init(__builtin_frame_address(0));"),
+        "missing Linux frame boundary: {generated}"
+    );
+    assert!(
+        generated.contains("rgc_init(&rgc_stack_anchor);"),
+        "missing portable stack anchor fallback: {generated}"
+    );
+}
+
+#[test]
 fn c_multiple_functions() {
     let module = lower(
         r#"

@@ -307,8 +307,12 @@ impl CBackend {
         writeln!(out, ") {{").unwrap();
 
         if self.needs_runtime && func.name == "main" {
+            writeln!(out, "#if defined(__linux__) && defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))").unwrap();
+            writeln!(out, "  rgc_init(__builtin_frame_address(0));").unwrap();
+            writeln!(out, "#else").unwrap();
             writeln!(out, "  int rgc_stack_anchor = 0;").unwrap();
             writeln!(out, "  rgc_init(&rgc_stack_anchor);").unwrap();
+            writeln!(out, "#endif").unwrap();
         }
         self.predeclare_phi_vars(func, out);
 
