@@ -938,6 +938,22 @@ fn semantic_tokens_keep_utf16_positions_across_lines() {
 }
 
 #[test]
+fn semantic_tokens_exclude_cr_from_crlf_comment_lengths() {
+    let tokens = semantic_token_positions(&semantic_tokens("// ok\r\nfun main() {}"));
+    let comment = tokens
+        .iter()
+        .find(|token| token.token_type == TOKEN_COMMENT)
+        .unwrap();
+    let function = tokens
+        .iter()
+        .find(|token| token.token_type == TOKEN_FUNCTION)
+        .unwrap();
+
+    assert_eq!((comment.line, comment.start, comment.length), (0, 0, 5));
+    assert_eq!((function.line, function.start, function.length), (1, 4, 4));
+}
+
+#[test]
 fn semantic_tokens_highlight_str_and_self_as_keywords() {
     let source = "struct Foo { text: &str }\nimpl Foo { fun get(&self) -> &str { self.text } }";
     let tokens = semantic_token_positions(&semantic_tokens(source));

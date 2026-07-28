@@ -579,6 +579,7 @@ fn encode_semantic_tokens(source: &str, raw_tokens: Vec<RawSemanticToken>) -> Se
         let Some(text) = source.get(start_offset..end_offset) else {
             continue;
         };
+        let text = text.strip_suffix('\r').unwrap_or(text);
         if text.is_empty() || text.contains('\n') {
             continue;
         }

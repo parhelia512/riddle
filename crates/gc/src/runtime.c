@@ -158,7 +158,21 @@ void rgc_init(void *stack_bottom) {
 }
 
 RGC_NOINLINE void rgc_collect(void) {
-#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__linux__) && defined(__x86_64__) \
+    && (defined(__GNUC__) || defined(__clang__))
+    uintptr_t registers[6];
+    __asm__ volatile(
+        "movq %%rbx, %0\n"
+        "movq %%rbp, %1\n"
+        "movq %%r12, %2\n"
+        "movq %%r13, %3\n"
+        "movq %%r14, %4\n"
+        "movq %%r15, %5\n"
+        : "=m"(registers[0]), "=m"(registers[1]), "=m"(registers[2]),
+          "=m"(registers[3]), "=m"(registers[4]), "=m"(registers[5])
+        :
+        : "memory");
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
     uintptr_t registers[11];
     __asm__ volatile(
         "mov x9, %0\n"
@@ -181,11 +195,7 @@ RGC_NOINLINE void rgc_collect(void) {
         return;
     }
 
-#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
-    rgc_mark_roots(registers, rgc_stack_bottom, registers, sizeof(registers));
-#else
     rgc_mark_roots(&registers, rgc_stack_bottom, &registers, sizeof(registers));
-#endif
     rgc_sweep();
 }
 
