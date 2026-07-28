@@ -570,6 +570,29 @@ pub(crate) fn collect_subst(
             }
             _ => false,
         },
+        Type::Fn {
+            is_unsafe: expected_unsafe,
+            kind: expected_kind,
+            params: expected_params,
+            ret: expected_ret,
+        } => match actual {
+            Type::Fn {
+                is_unsafe: actual_unsafe,
+                kind: actual_kind,
+                params: actual_params,
+                ret: actual_ret,
+            } if (!*actual_unsafe || *expected_unsafe)
+                && expected_kind.accepts(*actual_kind)
+                && expected_params.len() == actual_params.len() =>
+            {
+                expected_params
+                    .iter()
+                    .zip(actual_params)
+                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
+                    && collect_subst(expected_ret, actual_ret, subst)
+            }
+            _ => false,
+        },
         _ => expected.is_unknown_like() || actual.is_unknown_like() || expected == actual,
     }
 }
@@ -620,6 +643,17 @@ pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type 
             *id,
             args.iter().map(|ty| substitute_type(ty, subst)).collect(),
         ),
+        Type::Fn {
+            is_unsafe,
+            kind,
+            params,
+            ret,
+        } => Type::Fn {
+            is_unsafe: *is_unsafe,
+            kind: *kind,
+            params: params.iter().map(|ty| substitute_type(ty, subst)).collect(),
+            ret: Box::new(substitute_type(ret, subst)),
+        },
         _ => ty.clone(),
     }
 }

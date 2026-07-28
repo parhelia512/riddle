@@ -10,10 +10,11 @@ use hir::{
 };
 use type_checker::{CaptureMode, CaptureSource, OperatorCall, Type, TypeCheckResult};
 
-/// Result of escape analysis: which locals and parameter places need stable storage.
+/// Result of escape analysis: which locals, parameters, and temporaries need stable storage.
 #[derive(Debug, Default)]
 pub struct EscapeResult {
     pub escaping_locals: HashSet<(BodyId, PatternBindingId)>,
+    escaping_temporaries: HashSet<(BodyId, ExprId)>,
     escaping_params: HashSet<(BodyId, usize)>,
     escaping_lambda_params: HashSet<(BodyId, ExprId, usize)>,
     escaping_lambdas: HashSet<(BodyId, ExprId)>,
@@ -25,6 +26,10 @@ pub struct EscapeResult {
 impl EscapeResult {
     pub fn escapes(&self, body_id: BodyId, binding: PatternBindingId) -> bool {
         self.escaping_locals.contains(&(body_id, binding))
+    }
+
+    pub fn temporary_escapes(&self, body_id: BodyId, expr: ExprId) -> bool {
+        self.escaping_temporaries.contains(&(body_id, expr))
     }
 
     pub fn param_escapes(&self, body_id: BodyId, index: usize) -> bool {
@@ -90,6 +95,7 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
     // In practice this converges in 2–3 iterations.
     loop {
         analyzer.result.escaping_locals.clear();
+        analyzer.result.escaping_temporaries.clear();
         analyzer.result.escaping_params.clear();
         analyzer.result.escaping_lambda_params.clear();
         analyzer.result.escaping_lambdas.clear();
@@ -124,6 +130,7 @@ struct ReturnSummary {
 enum RefSource {
     Local(PatternBindingId),
     LocalValue(PatternBindingId),
+    Temporary(ExprId),
     ParamPlace(usize),
     ParamValue(usize),
     LambdaParamPlace(ExprId, usize),
@@ -236,6 +243,9 @@ impl<'a> EscapeAnalyzer<'a> {
         // Record results
         for binding in &ctx.escaping_locals {
             self.result.escaping_locals.insert((body_id, *binding));
+        }
+        for expr in &ctx.escaping_temporaries {
+            self.result.escaping_temporaries.insert((body_id, *expr));
         }
         for index in &ctx.escaping_param_places {
             self.result.escaping_params.insert((body_id, *index));
@@ -618,6 +628,9 @@ impl<'a> EscapeAnalyzer<'a> {
                         .flatten()
                         .copied(),
                 ),
+                RefSource::Temporary(expr) => {
+                    pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied())
+                }
                 _ => {}
             }
         }
@@ -686,7 +699,9 @@ impl<'a> EscapeAnalyzer<'a> {
                 .get(&(ctx.body_id, operand))
                 .is_some_and(|ty| matches!(ty, Type::Ref(..)))
         {
-            SourceValue::from_sources(self.place_sources(ctx, operand))
+            let sources = self.place_sources(ctx, operand);
+            Self::mark_address_taken(ctx, &sources);
+            SourceValue::from_sources(sources)
         } else {
             ctx.expr_source_value(operand)
         };
@@ -799,6 +814,12 @@ impl<'a> EscapeAnalyzer<'a> {
                         pending.extend(nested.iter().copied());
                     }
                 }
+                RefSource::Temporary(expr) => {
+                    ctx.escaping_temporaries.insert(expr);
+                    if let Some(nested) = ctx.expr_sources.get(&expr) {
+                        pending.extend(nested.iter().copied());
+                    }
+                }
                 RefSource::ParamPlace(index) => {
                     ctx.escaping_param_places.insert(index);
                     ctx.returned_params.insert(index);
@@ -833,6 +854,9 @@ impl<'a> EscapeAnalyzer<'a> {
                         .flatten()
                         .copied(),
                 ),
+                RefSource::Temporary(expr) => {
+                    pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied())
+                }
                 RefSource::ParamPlace(index) | RefSource::ParamValue(index) => {
                     params.insert(index);
                 }
@@ -878,6 +902,12 @@ impl<'a> EscapeAnalyzer<'a> {
                         pending.extend(nested.iter().copied());
                     }
                 }
+                RefSource::Temporary(expr) => {
+                    ctx.escaping_temporaries.insert(expr);
+                    if let Some(nested) = ctx.expr_sources.get(&expr) {
+                        pending.extend(nested.iter().copied());
+                    }
+                }
                 RefSource::LambdaParamPlace(owner, index) if owner == lambda => {
                     ctx.escaping_lambda_param_places.insert((owner, index));
                 }
@@ -917,6 +947,12 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
                 RefSource::LocalValue(binding) => {
                     if let Some(nested) = ctx.binding_sources.get(&binding) {
+                        pending.extend(nested.iter().copied());
+                    }
+                }
+                RefSource::Temporary(expr) => {
+                    changed |= ctx.escaping_temporaries.insert(expr);
+                    if let Some(nested) = ctx.expr_sources.get(&expr) {
                         pending.extend(nested.iter().copied());
                     }
                 }
@@ -979,6 +1015,7 @@ impl<'a> EscapeAnalyzer<'a> {
                     ctx.address_taken_lambda_params.insert((*lambda, *index));
                 }
                 RefSource::LocalValue(_)
+                | RefSource::Temporary(_)
                 | RefSource::ParamValue(_)
                 | RefSource::LambdaParamValue(..)
                 | RefSource::Lambda(_) => {}
@@ -990,6 +1027,7 @@ impl<'a> EscapeAnalyzer<'a> {
     /// of `operand`.
     fn record_ref(&self, ctx: &mut EscapeCtx<'_>, ref_expr: ExprId, operand: ExprId) {
         let sources = self.place_sources(ctx, operand);
+        Self::mark_address_taken(ctx, &sources);
         if !sources.is_empty() {
             ctx.expr_sources
                 .entry(ref_expr)
@@ -1096,10 +1134,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 .get(operand)
                 .cloned()
                 .unwrap_or_else(|| self.place_sources(ctx, *operand)),
-            Expr::Block {
-                tail: Some(tail), ..
-            } => ctx.expr_sources.get(tail).cloned().unwrap_or_default(),
-            _ => ctx.expr_sources.get(&expr_id).cloned().unwrap_or_default(),
+            _ => std::iter::once(RefSource::Temporary(expr_id)).collect(),
         }
     }
 
@@ -1210,6 +1245,7 @@ struct EscapeCtx<'a> {
 
     escaping_exprs: HashSet<ExprId>,
     escaping_locals: HashSet<PatternBindingId>,
+    escaping_temporaries: HashSet<ExprId>,
     escaping_params: HashSet<usize>,
     returned_params: HashSet<usize>,
     returned_value: SourceValue,
@@ -1238,6 +1274,7 @@ impl<'a> EscapeCtx<'a> {
             body,
             escaping_exprs: HashSet::new(),
             escaping_locals: HashSet::new(),
+            escaping_temporaries: HashSet::new(),
             escaping_params: HashSet::new(),
             returned_params: HashSet::new(),
             returned_value: SourceValue::default(),

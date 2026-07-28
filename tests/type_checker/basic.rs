@@ -172,6 +172,21 @@ fn checks_generic_function_calls() {
 }
 
 #[test]
+fn infers_generic_function_parameter_from_anonymous_function() {
+    let result = check(
+        r#"
+        fun test<T>(f: fun(T) -> T) {}
+
+        fun main() {
+            test(fun(x) { x + 1 });
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn infers_const_generic_array_length_from_struct_field() {
     let result = check(
         r#"

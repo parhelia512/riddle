@@ -904,7 +904,8 @@ fn std_clone_and_comparison_methods_are_callable() {
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
     assert!(c.contains(&c_function("clone__i32")), "{c}");
     assert!(c.contains(&c_function("cmp__i32")), "{c}");
-    assert!(c.contains("ref_tmp"), "{c}");
+    assert!(!c.contains("ref_tmp"), "{c}");
+    assert!(c.contains(&format!("{}((&a", c_function("eq__i32"))), "{c}");
     assert!(!c.contains("&((int32_t)7)"), "{c}");
 }
 

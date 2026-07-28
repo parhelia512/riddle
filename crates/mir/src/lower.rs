@@ -3123,11 +3123,15 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Ref(_, _) if matches!(actual_mir_ty, Type::Ref(_, _)) => {
                 value
             }
-            hir::item_tree::HirTypeRef::Ref(_, mutable) => builder.unop(
-                if *mutable { UnOp::MutRef } else { UnOp::Ref },
-                value,
-                Type::Ref(Box::new(actual_mir_ty), *mutable),
-            ),
+            hir::item_tree::HirTypeRef::Ref(_, mutable) => {
+                let place = builder.alloca(actual_mir_ty.clone());
+                builder.store(value, place);
+                builder.unop(
+                    if *mutable { UnOp::MutRef } else { UnOp::Ref },
+                    place,
+                    Type::Ref(Box::new(actual_mir_ty), *mutable),
+                )
+            }
             _ => value,
         }
     }
@@ -3387,7 +3391,24 @@ impl<'a> LowerCtx<'a> {
                 operand,
                 op: HirUnOp::Deref,
             } => self.lower_expr(builder, param_values, body, *operand),
-            _ => self.lower_expr(builder, param_values, body, expr_id),
+            _ => {
+                let ty = self
+                    .current_body
+                    .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
+                    .map(|ty| self.convert_type(ty))
+                    .unwrap_or(Type::Unit);
+                let value = self.lower_expr(builder, param_values, body, expr_id);
+                let place = if self
+                    .current_body
+                    .is_some_and(|body_id| self.analysis.temporary_escapes(body_id, expr_id))
+                {
+                    builder.heap_alloc(ty)
+                } else {
+                    builder.alloca(ty)
+                };
+                builder.store(value, place);
+                place
+            }
         }
     }
 

@@ -534,20 +534,12 @@ impl CBackend {
 
             InstKind::UnOp(op, operand) => {
                 let ct = ctype_of(&inst.ty);
-                let mut operand_name = self.name(*operand).to_owned();
+                let operand_name = self.name(*operand).to_owned();
                 let operand_ct = self
                     .ctypes
                     .get(operand.0 as usize)
                     .cloned()
                     .unwrap_or_default();
-                if matches!(op, UnOp::Ref | UnOp::MutRef)
-                    && self.inline_of.contains_key(&operand.0)
-                    && !is_fat_repr(&inst.ty)
-                {
-                    let temporary = fresh_c(&mut self.counter, "ref_tmp");
-                    writeln!(out, "  {} {} = {};", operand_ct, temporary, operand_name).unwrap();
-                    operand_name = temporary;
-                }
                 // Ref is a no-op when the operand/value is already a pointer-like thing:
                 // thin pointer: is_indirect (ctype ends with '*')
                 // fat pointer: result type is a fat Ref (unsized inner, value already ptr+len)

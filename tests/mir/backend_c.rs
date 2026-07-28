@@ -740,6 +740,33 @@ fn c_heap_alloc() {
 }
 
 #[test]
+fn c_backend_heap_allocates_escaping_reference_temporaries() {
+    let module = lower(
+        r#"
+        fun nested() -> &&i32 {
+            let value = 1;
+            &&value
+        }
+
+        fun literal() -> &i32 { &2 }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("rgc_alloc(sizeof(int32_t*))"),
+        "nested reference temporary was not heap allocated:\n{generated}"
+    );
+    assert_eq!(
+        generated.matches("rgc_alloc(sizeof(int32_t))").count(),
+        2,
+        "both referenced i32 values must escape:\n{generated}"
+    );
+    assert!(!generated.contains("return ref_tmp"), "{generated}");
+    assert!(!generated.contains("return (&ref_tmp"), "{generated}");
+}
+
+#[test]
 fn c_heap_alloc_uses_linux_frame_boundary_for_gc_roots() {
     let module = lower(
         r#"

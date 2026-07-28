@@ -2441,6 +2441,34 @@ fn escaping_local_produces_heap_alloc_instruction() {
 }
 
 #[test]
+fn non_escaping_reference_temporary_uses_stack_storage() {
+    let module = lower(
+        r#"
+        fun read() -> i32 {
+            let value = 1;
+            **&&value
+        }
+        "#,
+    );
+    let func = &module.functions[module.function_order[0]];
+    assert!(
+        func.blocks
+            .values()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::Alloca(_))),
+        "a non-escaping reference temporary needs stack storage: {func:#?}"
+    );
+    assert!(
+        !func
+            .blocks
+            .values()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_))),
+        "a local-only reference temporary must not escape: {func:#?}"
+    );
+}
+
+#[test]
 fn escaping_destructured_binding_moves_the_whole_slot_to_the_heap() {
     let module = lower(
         r#"
