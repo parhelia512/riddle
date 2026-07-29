@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,6 +11,13 @@ const stableUri = 'file:///riddle-lsp-stable.rid';
 const fixUri = 'file:///riddle-lsp-fix.rid';
 const completionUri = 'file:///riddle-lsp-completion.rid';
 const generalCompletionUri = 'file:///riddle-lsp-general-completion.rid';
+const navigationUri = 'file:///riddle-lsp-navigation.rid';
+const navigationText = [
+  'trait Show { fun show(&self) -> i32; }',
+  'struct Value {}',
+  'impl Show for Value { fun show(&self) -> i32 { 1 } }',
+  'fun main() { let value = Value {}; value.show(); }',
+].join('\n');
 const projectRoot = mkdtempSync(join(tmpdir(), 'riddle-lsp-smoke-'));
 const projectMainText = 'mod util;\nfun main() { let callable = util::make; callable; }\n';
 const projectUtilText = 'pub fun make() -> i32 { 1 }\n';
@@ -20,7 +27,8 @@ writeFileSync(
   '[package]\nname = "smoke"\n\n[dependencies]\n',
 );
 writeFileSync(join(projectRoot, 'src', 'main.rid'), projectMainText);
-writeFileSync(join(projectRoot, 'src', 'util.rid'), projectUtilText);
+const projectUtilPath = join(projectRoot, 'src', 'util.rid');
+writeFileSync(projectUtilPath, projectUtilText);
 const projectMainUri = pathToFileURL(join(projectRoot, 'src', 'main.rid')).href;
 const projectUtilUri = pathToFileURL(join(projectRoot, 'src', 'util.rid')).href;
 const server = spawn(command, [], { stdio: ['pipe', 'pipe', 'inherit'] });
@@ -102,6 +110,9 @@ try {
   assert.equal(initialized.result.capabilities.positionEncoding, 'utf-16');
   assert.equal(initialized.result.capabilities.textDocumentSync, 2);
   assert.equal(initialized.result.capabilities.codeActionProvider, true);
+  assert.equal(initialized.result.capabilities.hoverProvider, true);
+  assert.equal(initialized.result.capabilities.definitionProvider, true);
+  assert.equal(initialized.result.capabilities.implementationProvider, true);
   const triggerCharacters = initialized.result.capabilities.completionProvider.triggerCharacters;
   assert.deepEqual(triggerCharacters, ['.', ':']);
   assert.equal(initialized.result.capabilities.inlayHintProvider, true);
@@ -239,9 +250,14 @@ try {
   assert.equal(codeActions.result.length, 1);
   assert.equal(codeActions.result[0].kind, 'quickfix');
   assert.equal(codeActions.result[0].isPreferred, true);
-  assert.deepEqual(codeActions.result[0].edit.changes[fixUri][0], {
-    range: { start: mutableClosure.range.start, end: mutableClosure.range.start },
-    newText: 'mut ',
+  assert.deepEqual(codeActions.result[0].edit.documentChanges[0], {
+    textDocument: { uri: fixUri, version: 1 },
+    edits: [
+      {
+        range: { start: mutableClosure.range.start, end: mutableClosure.range.start },
+        newText: 'mut ',
+      },
+    ],
   });
 
   send({
@@ -274,6 +290,18 @@ try {
       message.params.version === 2 &&
       message.params.diagnostics.some((diagnostic) => diagnostic.code === 'E0100'),
   );
+  send({
+    jsonrpc: '2.0',
+    id: 23,
+    method: 'textDocument/codeAction',
+    params: {
+      textDocument: { uri: fixUri },
+      range: mutableClosure.range,
+      context: { diagnostics: [mutableClosure], only: ['quickfix'] },
+    },
+  });
+  const staleCodeActions = await read((message) => message.id === 23);
+  assert.deepEqual(staleCodeActions.result, []);
   send({
     jsonrpc: '2.0',
     id: 3,
@@ -500,6 +528,79 @@ try {
 
   send({
     jsonrpc: '2.0',
+    id: 24,
+    method: 'textDocument/hover',
+    params: {
+      textDocument: { uri: projectMainUri },
+      position: { line: 1, character: makeCharacter + 1 },
+    },
+  });
+  const projectHover = await read((message) => message.id === 24);
+  assert.match(projectHover.result.contents.value, /pub fun make\(\) -> i32/);
+
+  send({
+    jsonrpc: '2.0',
+    id: 25,
+    method: 'textDocument/definition',
+    params: {
+      textDocument: { uri: projectMainUri },
+      position: { line: 1, character: makeCharacter + 1 },
+    },
+  });
+  const projectDefinition = await read((message) => message.id === 25);
+  assert.equal(projectDefinition.result.uri, projectUtilUri);
+  assert.deepEqual(projectDefinition.result.range, {
+    start: { line: 0, character: 8 },
+    end: { line: 0, character: 12 },
+  });
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: navigationUri,
+        languageId: 'riddle',
+        version: 1,
+        text: navigationText,
+      },
+    },
+  });
+  await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === navigationUri &&
+      message.params.version === 1,
+  );
+  const traitCallCharacter = navigationText.split('\n')[3].indexOf('show');
+  send({
+    jsonrpc: '2.0',
+    id: 26,
+    method: 'textDocument/definition',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 3, character: traitCallCharacter + 1 },
+    },
+  });
+  const traitDefinition = await read((message) => message.id === 26);
+  assert.equal(traitDefinition.result.range.start.line, 0);
+  assert.equal(traitDefinition.result.range.start.character, navigationText.split('\n')[0].indexOf('show'));
+
+  send({
+    jsonrpc: '2.0',
+    id: 27,
+    method: 'textDocument/implementation',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 3, character: traitCallCharacter + 1 },
+    },
+  });
+  const traitImplementation = await read((message) => message.id === 27);
+  assert.equal(traitImplementation.result.length, 1);
+  assert.equal(traitImplementation.result[0].range.start.line, 2);
+
+  send({
+    jsonrpc: '2.0',
     method: 'textDocument/didChange',
     params: {
       textDocument: { uri: projectUtilUri, version: 2 },
@@ -520,12 +621,48 @@ try {
   send({
     jsonrpc: '2.0',
     method: 'textDocument/didClose',
-    params: { textDocument: { uri: projectMainUri } },
+    params: { textDocument: { uri: projectUtilUri } },
   });
+
+  const fixedTime = new Date('2020-01-01T00:00:00.000Z');
+  writeFileSync(projectUtilPath, 'pub fun make() -> i32 { missing_a }\n');
+  utimesSync(projectUtilPath, fixedTime, fixedTime);
+  send({
+    jsonrpc: '2.0',
+    method: 'workspace/didChangeWatchedFiles',
+    params: { changes: [{ uri: projectUtilUri, type: 2 }] },
+  });
+  const firstDiskDiagnostics = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === projectUtilUri &&
+      message.params.diagnostics.some((diagnostic) => diagnostic.message.includes('missing_a')),
+  );
+  assert.equal(firstDiskDiagnostics.params.diagnostics[0].code, 'E0050');
+  const firstDiskStat = statSync(projectUtilPath);
+
+  writeFileSync(projectUtilPath, 'pub fun make() -> i32 { missing_b }\n');
+  utimesSync(projectUtilPath, fixedTime, fixedTime);
+  const secondDiskStat = statSync(projectUtilPath);
+  assert.equal(secondDiskStat.size, firstDiskStat.size);
+  assert.equal(secondDiskStat.mtimeMs, firstDiskStat.mtimeMs);
+  send({
+    jsonrpc: '2.0',
+    method: 'workspace/didChangeWatchedFiles',
+    params: { changes: [{ uri: projectUtilUri, type: 2 }] },
+  });
+  const secondDiskDiagnostics = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === projectUtilUri &&
+      message.params.diagnostics.some((diagnostic) => diagnostic.message.includes('missing_b')),
+  );
+  assert.equal(secondDiskDiagnostics.params.diagnostics[0].code, 'E0050');
+
   send({
     jsonrpc: '2.0',
     method: 'textDocument/didClose',
-    params: { textDocument: { uri: projectUtilUri } },
+    params: { textDocument: { uri: projectMainUri } },
   });
 
   send({
@@ -593,8 +730,23 @@ try {
   );
   assert.deepEqual(generalCompletionClosed.params.diagnostics, []);
 
-  send({ jsonrpc: '2.0', id: 10, method: 'shutdown', params: null });
-  await read((message) => message.id === 10);
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: navigationUri } },
+  });
+  const navigationClosed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === navigationUri &&
+      message.params.version == null,
+  );
+  assert.deepEqual(navigationClosed.params.diagnostics, []);
+
+  send({ jsonrpc: '2.0', id: 10, method: 'shutdown' });
+  const shutdown = await read((message) => message.id === 10);
+  assert.equal(shutdown.error, undefined);
+  assert.equal(shutdown.result, null);
   send({ jsonrpc: '2.0', method: 'exit' });
   console.log(
     `riddle-lsp stdio handshake passed (member ${memberCompletionMs.toFixed(1)} ms, general ${generalCompletionMs.toFixed(1)} ms)`,

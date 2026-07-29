@@ -7,16 +7,19 @@ use std::{
     time::Duration,
 };
 
+use lsp_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use lsp_types::{
     CodeActionKind, CodeActionParams, CodeActionResponse, CompletionOptions, CompletionParams,
     CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
-    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams, MessageType,
-    OneOf, PositionEncodingKind, Registration, SemanticTokens, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
+    DidOpenTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    InlayHint, InlayHintParams, MessageType, OneOf, PositionEncodingKind, Registration,
+    SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind,
 };
 use riddlec::pipeline::CompileOptions;
 use tower_lsp::jsonrpc::Result;
@@ -27,6 +30,7 @@ use crate::{
     completion::{completion_items_for_document, completion_trigger_characters},
     diagnostics::{self, DiagnosticSessions, collect_workspace_diagnostics_cancellable},
     inlay_hints::inlay_hints_for_document,
+    navigation::{definition_for_document, hover_for_document, implementation_for_document},
     semantic_tokens::{semantic_token_delta, semantic_tokens_for_document, semantic_tokens_legend},
     session::AnalysisSessions,
     text::apply_content_changes,
@@ -46,8 +50,7 @@ pub(crate) struct Backend {
     /// Sessions used for the fallback analysis (the original, unmodified source).
     completion_fallback_sessions: Arc<AnalysisSessions>,
     analysis_sessions: Arc<AnalysisSessions>,
-    // Workspace-wide only for cancelling in-flight requests; caches use project revisions below.
-    analysis_revision: Arc<AtomicU64>,
+    analysis_revisions: Arc<RequestRevisions>,
     completion_revisions: Arc<RequestRevisions>,
     semantic_tokens: Arc<Mutex<HashMap<lsp_types::Url, CachedSemanticTokens>>>,
     semantic_token_revision: Arc<AtomicU64>,
@@ -58,7 +61,7 @@ pub(crate) struct Backend {
 
 const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub text: String,
     pub version: Option<i32>,
@@ -83,7 +86,11 @@ impl RequestRevisions {
     }
 
     pub fn is_current(&self, uri: &lsp_types::Url, revision: u64) -> bool {
-        self.0.lock().unwrap().get(uri) == Some(&revision)
+        self.current(uri) == revision
+    }
+
+    pub fn current(&self, uri: &lsp_types::Url) -> u64 {
+        self.0.lock().unwrap().get(uri).copied().unwrap_or(0)
     }
 
     pub fn remove(&self, uri: &lsp_types::Url) {
@@ -111,6 +118,9 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
                 code_action_provider: Some(true.into()),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(completion_trigger_characters()),
@@ -181,8 +191,8 @@ impl LanguageServer for Backend {
             version: Some(params.text_document.version),
         };
         let mut docs = self.docs.lock().unwrap();
-        docs.insert(uri, doc);
-        self.analysis_revision.fetch_add(1, Ordering::SeqCst);
+        docs.insert(uri.clone(), doc);
+        bump_related_revisions(&self.analysis_revisions, &docs, &uri);
         drop(docs);
         self.schedule_diagnostics();
     }
@@ -197,7 +207,7 @@ impl LanguageServer for Backend {
             return;
         }
         document.version = Some(params.text_document.version);
-        self.analysis_revision.fetch_add(1, Ordering::SeqCst);
+        bump_related_revisions(&self.analysis_revisions, &docs, &uri);
         drop(docs);
         self.schedule_diagnostics();
     }
@@ -209,11 +219,15 @@ impl LanguageServer for Backend {
         // the retain_open() calls below.
         let open_docs = {
             let mut docs = self.docs.lock().unwrap();
+            let related = related_document_uris(&docs, &uri);
             docs.remove(&uri);
-            self.analysis_revision.fetch_add(1, Ordering::SeqCst);
+            for related_uri in related {
+                self.analysis_revisions.begin(&related_uri);
+            }
             docs.clone()
         };
         self.semantic_tokens.lock().unwrap().remove(&uri);
+        self.analysis_revisions.remove(&uri);
         self.completion_revisions.remove(&uri);
         self.completion_sessions.retain_open(&open_docs);
         self.completion_fallback_sessions.retain_open(&open_docs);
@@ -226,11 +240,7 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
-        let (docs, analysis_revision) = {
-            let docs = self.docs.lock().unwrap();
-            (docs.clone(), self.analysis_revision.load(Ordering::SeqCst))
-        };
-        let Some(text) = docs.get(&uri).map(|doc| doc.text.clone()) else {
+        let Some((docs, text, analysis_revision)) = self.analysis_snapshot(&uri) else {
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: Vec::new(),
@@ -275,14 +285,7 @@ impl LanguageServer for Backend {
                 .to_string(),
         );
         let project_revision = self.analysis_sessions.revision(&uri);
-        let is_current = self.analysis_revision.load(Ordering::SeqCst) == analysis_revision
-            && self
-                .docs
-                .lock()
-                .unwrap()
-                .get(&uri)
-                .is_some_and(|document| document.text == text);
-        if !is_current {
+        if !self.analysis_is_current(&uri, &text, analysis_revision) {
             return Ok(None);
         }
         self.semantic_tokens.lock().unwrap().insert(
@@ -329,11 +332,7 @@ impl LanguageServer for Backend {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
-        let (docs, analysis_revision) = {
-            let docs = self.docs.lock().unwrap();
-            (docs.clone(), self.analysis_revision.load(Ordering::SeqCst))
-        };
-        let Some(text) = docs.get(&uri).map(|document| document.text.clone()) else {
+        let Some((docs, text, analysis_revision)) = self.analysis_snapshot(&uri) else {
             return Ok(Some(Vec::new()));
         };
         let compile_options = self.compile_options;
@@ -359,14 +358,7 @@ impl LanguageServer for Backend {
                 return Err(tower_lsp::jsonrpc::Error::internal_error());
             }
         };
-        if self.analysis_revision.load(Ordering::SeqCst) != analysis_revision
-            || self
-                .docs
-                .lock()
-                .unwrap()
-                .get(&uri)
-                .is_none_or(|document| document.text != text)
-        {
+        if !self.analysis_is_current(&uri, &text, analysis_revision) {
             return Ok(None);
         }
 
@@ -383,18 +375,14 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
         }
-        let (docs, analysis_revision) = {
-            let docs = self.docs.lock().unwrap();
-            (docs.clone(), self.analysis_revision.load(Ordering::SeqCst))
-        };
-        let Some(text) = docs.get(&uri).map(|document| document.text.clone()) else {
+        let Some((docs, text, analysis_revision)) = self.analysis_snapshot(&uri) else {
             return Ok(Some(CompletionResponse::Array(Vec::new())));
         };
         let compile_options = self.compile_options;
         let analysis_sessions = Arc::clone(&self.completion_sessions);
         let fallback_sessions = Arc::clone(&self.completion_fallback_sessions);
         let completion_revisions = Arc::clone(&self.completion_revisions);
-        let current_analysis_revision = Arc::clone(&self.analysis_revision);
+        let current_analysis_revisions = Arc::clone(&self.analysis_revisions);
         let completion_uri = uri.clone();
         let analysis = tokio::task::spawn_blocking(move || {
             completion_items_for_document(
@@ -406,7 +394,8 @@ impl LanguageServer for Backend {
                 &fallback_sessions,
                 || {
                     !completion_revisions.is_current(&completion_uri, request_revision)
-                        || current_analysis_revision.load(Ordering::SeqCst) != analysis_revision
+                        || !current_analysis_revisions
+                            .is_current(&completion_uri, analysis_revision)
                 },
             )
         })
@@ -422,19 +411,109 @@ impl LanguageServer for Backend {
                 return Err(tower_lsp::jsonrpc::Error::internal_error());
             }
         };
-        if self.analysis_revision.load(Ordering::SeqCst) != analysis_revision
-            || self
-                .docs
-                .lock()
-                .unwrap()
-                .get(&uri)
-                .is_none_or(|document| document.text != text)
+        if !self.analysis_is_current(&uri, &text, analysis_revision)
             || !self.completion_revisions.is_current(&uri, request_revision)
         {
             return Ok(None);
         }
 
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let result = tokio::task::spawn_blocking(move || {
+            hover_for_document(&analysis_uri, &docs, position, options, &sessions)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let hover = match result {
+            Ok(hover) => hover,
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("hover failed: {error}"))
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(hover)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let result = tokio::task::spawn_blocking(move || {
+            definition_for_document(&analysis_uri, &docs, position, options, &sessions)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let definition = match result {
+            Ok(definition) => definition,
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("definition failed: {error}"))
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(definition)
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> Result<Option<GotoImplementationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let result = tokio::task::spawn_blocking(move || {
+            implementation_for_document(&analysis_uri, &docs, position, options, &sessions)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let implementation = match result {
+            Ok(implementation) => implementation,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("implementation failed: {error}"),
+                    )
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(implementation)
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
@@ -445,31 +524,98 @@ impl LanguageServer for Backend {
         }) {
             return Ok(Some(Vec::new()));
         }
-        Ok(Some(quick_fixes(
-            &params.text_document.uri,
-            &params.context.diagnostics,
-        )))
+        let uri = params.text_document.uri;
+        let Some(document) = self.docs.lock().unwrap().get(&uri).cloned() else {
+            return Ok(Some(Vec::new()));
+        };
+        let Some(published) = self.published.lock().unwrap().get(&uri).cloned() else {
+            return Ok(Some(Vec::new()));
+        };
+        if published.version != document.version {
+            return Ok(Some(Vec::new()));
+        }
+        let diagnostics = params
+            .context
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| published.diagnostics.contains(diagnostic))
+            .collect::<Vec<_>>();
+        Ok(Some(quick_fixes(&uri, document.version, &diagnostics)))
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        self.analysis_revision.fetch_add(1, Ordering::SeqCst);
-        if params.changes.iter().any(watched_change_resets_sessions) {
+        let reset_all = params.changes.iter().any(|change| is_manifest(&change.uri));
+        {
+            let docs = self.docs.lock().unwrap();
+            for change in &params.changes {
+                bump_related_revisions(&self.analysis_revisions, &docs, &change.uri);
+            }
+        }
+        if reset_all {
             *self.diagnostic_sessions.lock().unwrap() = DiagnosticSessions::default();
             self.completion_sessions.clear_projects();
             self.completion_fallback_sessions.clear_projects();
             self.analysis_sessions.clear_projects();
+        } else {
+            for change in &params.changes {
+                self.diagnostic_sessions
+                    .lock()
+                    .unwrap()
+                    .invalidate_project(&change.uri);
+                self.completion_sessions.invalidate_project(&change.uri);
+                self.completion_fallback_sessions
+                    .invalidate_project(&change.uri);
+                self.analysis_sessions.invalidate_project(&change.uri);
+            }
         }
         self.schedule_diagnostics();
     }
 }
 
-fn watched_change_resets_sessions(change: &FileEvent) -> bool {
-    change.typ != FileChangeType::CHANGED
-        || change
-            .uri
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            == Some("Clue.toml")
+fn is_manifest(uri: &lsp_types::Url) -> bool {
+    uri.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        == Some("Clue.toml")
+}
+
+pub fn documents_for_uri(
+    docs: &HashMap<lsp_types::Url, Document>,
+    uri: &lsp_types::Url,
+) -> HashMap<lsp_types::Url, Document> {
+    let Some(root) = project_root(uri) else {
+        return docs
+            .get(uri)
+            .cloned()
+            .map(|document| HashMap::from([(uri.clone(), document)]))
+            .unwrap_or_default();
+    };
+    docs.iter()
+        .filter(|(candidate, _)| project_root(candidate).as_ref() == Some(&root))
+        .map(|(uri, document)| (uri.clone(), document.clone()))
+        .collect()
+}
+
+fn project_root(uri: &lsp_types::Url) -> Option<std::path::PathBuf> {
+    uri.to_file_path()
+        .ok()
+        .and_then(|path| clue::find_project_root(&path))
+}
+
+fn related_document_uris(
+    docs: &HashMap<lsp_types::Url, Document>,
+    uri: &lsp_types::Url,
+) -> Vec<lsp_types::Url> {
+    documents_for_uri(docs, uri).into_keys().collect()
+}
+
+fn bump_related_revisions(
+    revisions: &RequestRevisions,
+    docs: &HashMap<lsp_types::Url, Document>,
+    uri: &lsp_types::Url,
+) {
+    for related in related_document_uris(docs, uri) {
+        revisions.begin(&related);
+    }
 }
 
 impl Backend {
@@ -488,7 +634,7 @@ impl Backend {
             completion_sessions: Arc::new(AnalysisSessions::default()),
             completion_fallback_sessions: Arc::new(AnalysisSessions::default()),
             analysis_sessions: Arc::new(AnalysisSessions::default()),
-            analysis_revision: Arc::new(AtomicU64::new(1)),
+            analysis_revisions: Arc::new(RequestRevisions::default()),
             completion_revisions: Arc::new(RequestRevisions::default()),
             semantic_tokens: Arc::new(Mutex::new(HashMap::new())),
             semantic_token_revision: Arc::new(AtomicU64::new(1)),
@@ -496,6 +642,30 @@ impl Backend {
             compile_options,
             completion_delay,
         }
+    }
+
+    fn analysis_snapshot(
+        &self,
+        uri: &lsp_types::Url,
+    ) -> Option<(HashMap<lsp_types::Url, Document>, String, u64)> {
+        let all_docs = self.docs.lock().unwrap();
+        let text = all_docs.get(uri)?.text.clone();
+        let docs = documents_for_uri(&all_docs, uri);
+        let revision = self.analysis_revisions.current(uri);
+        Some((docs, text, revision))
+    }
+
+    fn analysis_is_current(&self, uri: &lsp_types::Url, text: &str, revision: u64) -> bool {
+        if !self.analysis_revisions.is_current(uri, revision) {
+            return false;
+        }
+        let unchanged = self
+            .docs
+            .lock()
+            .unwrap()
+            .get(uri)
+            .is_some_and(|document| document.text == text);
+        unchanged && self.analysis_revisions.is_current(uri, revision)
     }
 
     fn schedule_diagnostics(&self) {

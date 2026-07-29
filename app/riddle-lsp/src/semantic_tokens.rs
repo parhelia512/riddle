@@ -259,14 +259,20 @@ fn collect_hir_symbol_tokens(
         }
     }
     for (_, item) in hir.item_tree.traits.iter() {
-        symbol_types.entry(item.name.0.as_str()).or_insert((
-            TOKEN_INTERFACE,
-            if default_library_source {
+        let in_source = analysis.local_range(item.name_range).is_some();
+        let modifiers =
+            if default_library_source || usize::from(item.name_range.start()) >= user_source_len {
                 MOD_DEFAULT_LIBRARY
             } else {
                 0
-            },
-        ));
+            };
+        if in_source {
+            symbol_types.insert(item.name.0.as_str(), (TOKEN_INTERFACE, modifiers));
+        } else {
+            symbol_types
+                .entry(item.name.0.as_str())
+                .or_insert((TOKEN_INTERFACE, modifiers));
+        }
         for method in &item.methods {
             if let Some(method_range) = analysis.local_range(method.name_range) {
                 let mut modifiers = MOD_DECLARATION;

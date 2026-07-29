@@ -1,6 +1,6 @@
 use lsp_types::{
-    DiagnosticSeverity, InlayHintLabel, Position, Range, SemanticToken, SemanticTokens,
-    TextDocumentContentChangeEvent,
+    DiagnosticSeverity, GotoDefinitionResponse, HoverContents, InlayHintLabel, Position, Range,
+    SemanticToken, SemanticTokens, TextDocumentContentChangeEvent,
 };
 use riddle_lsp::{
     parse_args,
@@ -11,9 +11,11 @@ use riddle_lsp::{
         TOKEN_TYPE, TOKEN_VARIABLE, apply_content_changes, collect_diagnostics,
         collect_document_diagnostics, collect_workspace_diagnostics,
         collect_workspace_diagnostics_cancellable, collect_workspace_diagnostics_with_sessions,
-        completion_items_for_document, completion_items_for_source, inlay_hints_for_document,
-        inlay_hints_for_source, semantic_token_delta, semantic_tokens_for_document,
-        semantic_tokens_for_source, semantic_tokens_for_source_with_options, to_lsp, to_lsp_mapped,
+        completion_items_for_document, completion_items_for_source, definition_for_document,
+        definition_for_source, documents_for_uri, hover_for_source, implementation_for_source,
+        inlay_hints_for_document, inlay_hints_for_source, semantic_token_delta,
+        semantic_tokens_for_document, semantic_tokens_for_source,
+        semantic_tokens_for_source_with_options, to_lsp, to_lsp_mapped,
     },
 };
 use riddlec::pipeline::{CompileOptions, IntoDiagnosticExt};
@@ -313,6 +315,37 @@ fn completion_revisions_are_isolated_per_document_and_removable() {
 }
 
 #[test]
+fn analysis_snapshots_are_isolated_per_project() {
+    let first_root = temp_root("analysis-project-first");
+    let second_root = temp_root("analysis-project-second");
+    for root in [&first_root, &second_root] {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Clue.toml"), "[package]\nname = \"app\"\n").unwrap();
+    }
+    let first_main = lsp_types::Url::from_file_path(first_root.join("src/main.rid")).unwrap();
+    let first_util = lsp_types::Url::from_file_path(first_root.join("src/util.rid")).unwrap();
+    let second_main = lsp_types::Url::from_file_path(second_root.join("src/main.rid")).unwrap();
+    let document = || Document {
+        text: "fun main() {}\n".into(),
+        version: Some(1),
+    };
+    let docs = HashMap::from([
+        (first_main.clone(), document()),
+        (first_util.clone(), document()),
+        (second_main.clone(), document()),
+    ]);
+
+    let snapshot = documents_for_uri(&docs, &first_main);
+    assert_eq!(snapshot.len(), 2);
+    assert!(snapshot.contains_key(&first_main));
+    assert!(snapshot.contains_key(&first_util));
+    assert!(!snapshot.contains_key(&second_main));
+
+    fs::remove_dir_all(first_root).unwrap();
+    fs::remove_dir_all(second_root).unwrap();
+}
+
+#[test]
 fn semantic_token_delta_replaces_only_the_changed_middle() {
     let token = |delta_start, token_type| SemanticToken {
         delta_line: 0,
@@ -426,6 +459,32 @@ fn completion_includes_struct_and_enum_names_in_type_positions() {
 }
 
 #[test]
+fn completion_keeps_private_imports_and_generics_in_type_positions() {
+    let imported =
+        "mod models { pub struct Widget {} } use crate::models::Widget; fun inspect(value: Wid) {}";
+    let imported_items = completion_items_for_source(
+        imported,
+        position(imported, imported.rfind("Wid").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(
+        imported_items.iter().any(|item| item.label == "Widget"),
+        "{imported_items:#?}"
+    );
+
+    let generic = "fun inspect<T>(value: T) {}";
+    let generic_items = completion_items_for_source(
+        generic,
+        position(generic, generic.rfind("T").unwrap() + 1),
+        CompileOptions { use_std: false },
+    );
+    assert!(
+        generic_items.iter().any(|item| item.label == "T"),
+        "{generic_items:#?}"
+    );
+}
+
+#[test]
 fn completion_keeps_expression_candidates_after_struct_field_colons() {
     let source =
         "struct Foo { field: i32 }\nfun main() { let value = 1; let item = Foo { field: val }; }";
@@ -483,6 +542,33 @@ fn completion_hides_private_fields_outside_the_defining_module() {
 
     assert!(items.iter().any(|item| item.label == "y"), "{items:#?}");
     assert!(!items.iter().any(|item| item.label == "x"), "{items:#?}");
+}
+
+#[test]
+fn completion_hides_private_methods_outside_the_defining_module() {
+    let member_source = "mod model { pub struct Thing {} impl Thing { fun secret(&self) {} pub fun shown(&self) {} } pub fun make() -> Thing { Thing {} } } fun main() { model::make(). }";
+    let member_items = completion_items_for_source(
+        member_source,
+        position(
+            member_source,
+            member_source.rfind("model::make().").unwrap() + "model::make().".len(),
+        ),
+        CompileOptions { use_std: false },
+    );
+    assert!(member_items.iter().any(|item| item.label == "shown"));
+    assert!(!member_items.iter().any(|item| item.label == "secret"));
+
+    let associated_source = "mod model { pub struct Thing {} impl Thing { fun secret() {} pub fun shown() {} } } fun main() { model::Thing:: }";
+    let associated_items = completion_items_for_source(
+        associated_source,
+        position(
+            associated_source,
+            associated_source.rfind("::").unwrap() + 2,
+        ),
+        CompileOptions { use_std: false },
+    );
+    assert!(associated_items.iter().any(|item| item.label == "shown"));
+    assert!(!associated_items.iter().any(|item| item.label == "secret"));
 }
 
 #[test]
@@ -1161,6 +1247,150 @@ fn semantic_tokens_classify_std_structs_and_associated_new() {
         }),
         "{symbols:#?}"
     );
+}
+
+#[test]
+fn semantic_tokens_mark_standard_library_traits() {
+    let source = "fun inspect(value: Copy) {}";
+    let tokens = semantic_token_positions(&semantic_tokens_for_source_with_options(
+        source,
+        CompileOptions::default(),
+        false,
+    ));
+    let copy_start = source.find("Copy").unwrap() as u32;
+
+    assert!(
+        tokens.iter().any(|token| {
+            token.line == 0
+                && token.start == copy_start
+                && token.token_type == TOKEN_INTERFACE
+                && token.token_modifiers_bitset & MOD_DEFAULT_LIBRARY != 0
+        }),
+        "{tokens:#?}"
+    );
+}
+
+#[test]
+fn hover_shows_resolved_function_and_local_types() {
+    let source = "fun add(value: i32) -> i32 { value } fun main() { let answer = add(1); answer; }";
+    let function_hover = hover_for_source(
+        source,
+        position(source, source.rfind("add(1)").unwrap() + 1),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let HoverContents::Markup(function_contents) = function_hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(
+        function_contents
+            .value
+            .contains("fun add(value: i32) -> i32")
+    );
+
+    let local_hover = hover_for_source(
+        source,
+        position(source, source.rfind("answer;").unwrap() + 1),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let HoverContents::Markup(local_contents) = local_hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(local_contents.value.contains("let answer: i32"));
+}
+
+#[test]
+fn definition_and_implementation_follow_trait_dispatch() {
+    let source = "trait Render { fun render(&self) -> i32; } struct View {} impl Render for View { fun render(&self) -> i32 { 1 } } fun run(value: View) -> i32 { value.render() }";
+    let call = source.rfind("render()").unwrap();
+    let definition = definition_for_source(
+        source,
+        position(source, call + 2),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(definition) = definition else {
+        panic!("expected one definition")
+    };
+    let trait_method = source.find("render(&self)").unwrap();
+    assert_eq!(
+        definition.range,
+        Range::new(
+            position(source, trait_method),
+            position(source, trait_method + "render".len()),
+        )
+    );
+
+    let implementation = implementation_for_source(
+        source,
+        position(source, call + 2),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let GotoDefinitionResponse::Array(implementations) = implementation else {
+        panic!("expected implementation locations")
+    };
+    let impl_method = source.match_indices("render(&self)").nth(1).unwrap().0;
+    assert_eq!(implementations.len(), 1);
+    assert_eq!(
+        implementations[0].range,
+        Range::new(
+            position(source, impl_method),
+            position(source, impl_method + "render".len()),
+        )
+    );
+}
+
+#[test]
+fn definition_maps_project_symbols_to_unopened_modules() {
+    let root = temp_root("project-definition");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_source = "mod util;\nfun main() -> i32 { util::value() }\n";
+    fs::write(&main, main_source).unwrap();
+    let util = root.join("src/util.rid");
+    let util_source = "pub fun value() -> i32 { 1 }\n";
+    fs::write(&util, util_source).unwrap();
+    let main_uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let util_uri = lsp_types::Url::from_file_path(fs::canonicalize(&util).unwrap()).unwrap();
+    let docs = HashMap::from([(
+        main_uri.clone(),
+        Document {
+            text: main_source.into(),
+            version: Some(1),
+        },
+    )]);
+
+    let definition = definition_for_document(
+        &main_uri,
+        &docs,
+        position(main_source, main_source.find("value()").unwrap() + 2),
+        CompileOptions { use_std: false },
+        &AnalysisSessions::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(location) = definition else {
+        panic!("expected one definition")
+    };
+    assert_eq!(location.uri, util_uri);
+    assert_eq!(
+        location.range,
+        Range::new(
+            position(util_source, util_source.find("value").unwrap()),
+            position(
+                util_source,
+                util_source.find("value").unwrap() + "value".len(),
+            ),
+        )
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

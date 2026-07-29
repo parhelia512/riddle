@@ -661,7 +661,12 @@ impl Lower for Option<StructFieldList> {
 impl Lower for StructField {
     type Output = HirStructField;
     fn lower(self) -> Self::Output {
-        let name = lower_name(self.name());
+        let name_token = self.name();
+        let name_range = name_token
+            .as_ref()
+            .map(|token| token.text_range())
+            .unwrap_or_else(|| trimmed_range(self.syntax()));
+        let name = lower_name(name_token);
         let ty = self.ty().lower();
         let ty_range = self
             .ty()
@@ -670,6 +675,7 @@ impl Lower for StructField {
         let attrs = lower_attrs(self.syntax());
         HirStructField {
             name,
+            name_range,
             visibility: lower_visibility(self.is_pub()),
             ty,
             ty_range,

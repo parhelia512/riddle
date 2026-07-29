@@ -1,4 +1,4 @@
-use lsp_types::{Position, TextDocumentContentChangeEvent};
+use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use rowan::TextRange;
 use std::path::PathBuf;
 
@@ -9,6 +9,42 @@ pub(crate) fn normalized_path(path: PathBuf) -> PathBuf {
             .and_then(|parent| path.file_name().map(|name| parent.join(name)))
             .unwrap_or(path)
     })
+}
+
+pub(crate) struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    pub(crate) fn new(source: &str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+        );
+        Self { starts }
+    }
+
+    pub(crate) fn position(&self, source: &str, offset: usize) -> Option<Position> {
+        if offset > source.len() || !source.is_char_boundary(offset) {
+            return None;
+        }
+        let line = self.starts.partition_point(|start| *start <= offset) - 1;
+        let character = source[self.starts[line]..offset]
+            .chars()
+            .map(char::len_utf16)
+            .sum::<usize>();
+        Some(Position::new(line as u32, character as u32))
+    }
+
+    pub(crate) fn range(&self, source: &str, range: TextRange) -> Option<Range> {
+        Some(Range::new(
+            self.position(source, usize::from(range.start()))?,
+            self.position(source, usize::from(range.end()))?,
+        ))
+    }
 }
 
 pub fn apply_content_changes(

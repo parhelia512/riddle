@@ -37,8 +37,52 @@ pub fn struct_field_is_visible(
     if visibility.is_public() {
         return true;
     }
-    let owner = hir
-        .function_bodies
+    let owner = body_owner(hir, body_id);
+    let Some((owner_range, function_id, const_id)) = owner else {
+        return false;
+    };
+
+    struct_field_is_visible_for_owner(
+        hir,
+        owner_range,
+        function_id,
+        const_id,
+        struct_id,
+        visibility,
+    )
+}
+
+pub fn method_is_visible(
+    hir: &hir::HirFile,
+    body_id: BodyId,
+    function_id: FunctionId,
+    visibility: &Visibility,
+) -> bool {
+    if visibility.is_public() {
+        return true;
+    }
+    let Some((owner_range, owner_function, owner_const)) = body_owner(hir, body_id) else {
+        return false;
+    };
+    method_is_visible_for_owner(
+        hir,
+        owner_range,
+        owner_function,
+        owner_const,
+        function_id,
+        visibility,
+    )
+}
+
+fn body_owner(
+    hir: &hir::HirFile,
+    body_id: BodyId,
+) -> Option<(
+    rowan::TextRange,
+    Option<FunctionId>,
+    Option<hir::item_tree::ConstId>,
+)> {
+    hir.function_bodies
         .iter()
         .find_map(|(function_id, candidate)| {
             (*candidate == body_id).then(|| {
@@ -59,19 +103,7 @@ pub fn struct_field_is_visible(
                     )
                 })
             })
-        });
-    let Some((owner_range, function_id, const_id)) = owner else {
-        return false;
-    };
-
-    struct_field_is_visible_for_owner(
-        hir,
-        owner_range,
-        function_id,
-        const_id,
-        struct_id,
-        visibility,
-    )
+        })
 }
 
 fn struct_field_is_visible_for_owner(
@@ -107,6 +139,42 @@ fn struct_field_is_visible_for_owner(
     };
 
     module_contains(&hir.item_tree, owner, current)
+}
+
+fn method_is_visible_for_owner(
+    hir: &hir::HirFile,
+    owner_range: rowan::TextRange,
+    owner_function: Option<FunctionId>,
+    owner_const: Option<hir::item_tree::ConstId>,
+    function_id: FunctionId,
+    visibility: &Visibility,
+) -> bool {
+    if visibility.is_public() {
+        return true;
+    }
+    let function = &hir.item_tree.functions[function_id];
+    if hir.package_for_range(function.name_range) != hir.package_for_range(owner_range) {
+        return false;
+    }
+
+    let Some(defining_module) =
+        containing_module(&hir.item_tree, &hir.item_tree.top_level, &|item| {
+            item_contains_function(&hir.item_tree, item, function_id)
+        })
+        .flatten()
+    else {
+        return true;
+    };
+    let Some(current_module) =
+        containing_module(&hir.item_tree, &hir.item_tree.top_level, &|item| {
+            item_contains_body_owner(&hir.item_tree, item, owner_function, owner_const)
+        })
+        .flatten()
+    else {
+        return false;
+    };
+
+    module_contains(&hir.item_tree, defining_module, current_module)
 }
 
 fn capture_mode(is_move: bool, use_kind: ValueUse) -> CaptureMode {
@@ -3661,23 +3729,52 @@ impl TypeChecker<'_> {
         let base = *base;
         let method_name = field.clone();
         let base_ty = self.check_place_expr(ctx, base);
-        let Some(method) = self.find_method(ctx, &base_ty, &method_name) else {
-            for arg in args {
-                self.check_expr(ctx, *arg);
-                self.record_value_use(ctx, *arg, ValueUse::Move);
+        let method = match self.find_method(ctx, &base_ty, &method_name) {
+            Ok(Some(method)) => method,
+            Ok(None) => {
+                for arg in args {
+                    self.check_expr(ctx, *arg);
+                    self.record_value_use(ctx, *arg, ValueUse::Move);
+                }
+                if !base_ty.is_unknown_like() {
+                    self.diagnostic(
+                        "E0013",
+                        format!(
+                            "unknown method `{}` on type {}",
+                            method_name.0,
+                            base_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                }
+                return Type::Error;
             }
-            if !base_ty.is_unknown_like() {
+            Err(private_method) => {
+                for arg in args {
+                    self.check_expr(ctx, *arg);
+                    self.record_value_use(ctx, *arg, ValueUse::Move);
+                }
+                let owner = match &base_ty {
+                    Type::Struct(id, _) => Some(*id),
+                    Type::Ref(inner, _) => match inner.as_ref() {
+                        Type::Struct(id, _) => Some(*id),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let owner = owner
+                    .map(|id| format!("struct `{}`", self.hir.item_tree.structs[id].name.0))
+                    .unwrap_or_else(|| format!("type `{}`", base_ty.display(self.hir)));
                 self.diagnostic(
-                    "E0013",
+                    "E0054",
                     format!(
-                        "unknown method `{}` on type {}",
-                        method_name.0,
-                        base_ty.display(self.hir)
+                        "method `{}` of {owner} is private",
+                        self.hir.item_tree.functions[private_method].name.0
                     ),
                     span,
                 );
+                return Type::Error;
             }
-            return Type::Error;
         };
 
         if method.function.is_unsafe {
@@ -3907,17 +4004,21 @@ impl TypeChecker<'_> {
         ctx: &BodyCtx<'_>,
         receiver_ty: &Type,
         method_name: &Name,
-    ) -> Option<ResolvedMethod> {
-        self.find_inherent_method(receiver_ty, method_name)
-            .or_else(|| self.find_trait_impl_method_by_name(receiver_ty, method_name))
-            .or_else(|| self.find_trait_bound_method(ctx, receiver_ty, method_name))
+    ) -> Result<Option<ResolvedMethod>, FunctionId> {
+        match self.find_inherent_method(ctx, receiver_ty, method_name)? {
+            Some(method) => Ok(Some(method)),
+            None => Ok(self
+                .find_trait_impl_method_by_name(receiver_ty, method_name)
+                .or_else(|| self.find_trait_bound_method(ctx, receiver_ty, method_name))),
+        }
     }
 
     fn find_inherent_method(
         &mut self,
+        ctx: &BodyCtx<'_>,
         receiver_ty: &Type,
         method_name: &Name,
-    ) -> Option<ResolvedMethod> {
+    ) -> Result<Option<ResolvedMethod>, FunctionId> {
         let receiver_self_ty = match receiver_ty {
             Type::Ref(inner, _) => inner.as_ref(),
             other => other,
@@ -3930,6 +4031,7 @@ impl TypeChecker<'_> {
             .map(|(_, imp)| imp.clone())
             .collect::<Vec<_>>();
 
+        let mut private = None;
         for imp in impls {
             if imp.trait_ty.is_some() {
                 continue;
@@ -3942,18 +4044,30 @@ impl TypeChecker<'_> {
             }
             subst.insert("Self".into(), receiver_self_ty.clone());
             for fid in imp.methods {
-                if self.hir.item_tree.functions[fid].name == *method_name {
-                    return Some(ResolvedMethod {
+                let function = &self.hir.item_tree.functions[fid];
+                if function.name == *method_name {
+                    if !method_is_visible_for_owner(
+                        self.hir,
+                        ctx.owner_range(),
+                        ctx.function_id,
+                        ctx.const_id,
                         fid,
-                        function: self.hir.item_tree.functions[fid].clone(),
+                        &function.visibility,
+                    ) {
+                        private.get_or_insert(fid);
+                        continue;
+                    }
+                    return Ok(Some(ResolvedMethod {
+                        fid,
+                        function: function.clone(),
                         subst,
                         trait_id: None,
-                    });
+                    }));
                 }
             }
         }
 
-        None
+        private.map_or(Ok(None), Err)
     }
 
     fn find_trait_impl_method_by_name(

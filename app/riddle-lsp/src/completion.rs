@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use frontend::syntax_kind::SyntaxKind;
-use hir::body::{BodyId, Expr, ExprId, Stmt};
+use hir::body::{BodyId, Expr, Stmt};
 use hir::item_tree::{
     HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem, Visibility,
 };
@@ -129,7 +129,7 @@ pub fn completion_items_for_document(
                 .hir
                 .as_ref()
                 .zip(analysis.result.scope_graph.as_ref())
-                .is_some_and(|(hir, graph)| completion_marker_reference(hir, graph).is_none())
+                .is_some_and(|(_, graph)| completion_marker_reference(graph).is_none())
             {
                 let fb_session = fallback_sessions.project(&root);
                 let mut fb_session = fb_session.lock().unwrap_or_else(|p| p.into_inner());
@@ -201,7 +201,7 @@ pub fn completion_items_for_document(
         .hir
         .as_ref()
         .zip(result.scope_graph.as_ref())
-        .is_some_and(|(hir, graph)| completion_marker_reference(hir, graph).is_none())
+        .is_some_and(|(_, graph)| completion_marker_reference(graph).is_none())
     {
         let fb_session = fallback_sessions.standalone(uri);
         let mut fb_session = fb_session
@@ -244,7 +244,7 @@ pub fn completion_items_for_source(
         .hir
         .as_ref()
         .zip(resolved.scope_graph.as_ref())
-        .is_some_and(|(hir, graph)| completion_marker_reference(hir, graph).is_none()))
+        .is_some_and(|(_, graph)| completion_marker_reference(graph).is_none()))
     .then(|| riddlec::pipeline::resolve_with_options(source, compile_options));
     completion_items_from_result(
         &resolved,
@@ -343,17 +343,23 @@ fn completion_items_from_result(
     }
 
     if let (Some(hir), Some(scope_graph)) = (resolved.hir.as_ref(), resolved.scope_graph.as_ref()) {
-        let marker = completion_marker_reference(hir, scope_graph);
+        let marker = completion_marker_reference(scope_graph);
         match site.context {
             CompletionContext::General => {
-                if let Some((reference, body, _, _)) = marker {
-                    collect_visible_completions(hir, scope_graph, reference, body, &mut items);
+                if let Some(marker) = marker {
+                    collect_visible_completions(
+                        hir,
+                        scope_graph,
+                        marker.reference,
+                        marker.body,
+                        &mut items,
+                    );
                 } else {
                     collect_global_completions(fallback_hir.unwrap_or(hir), &mut items);
                 }
             }
             CompletionContext::Type => {
-                collect_type_completions(fallback_hir.unwrap_or(hir), &mut items);
+                collect_type_completions(hir, scope_graph, marker, fallback_hir, &mut items);
             }
             CompletionContext::Member => {
                 let checked_types;
@@ -366,13 +372,13 @@ fn completion_items_from_result(
                 collect_member_completions(hir, types, &mut items);
             }
             CompletionContext::Associated => {
-                if let Some((reference, body, _, path)) = marker {
+                if let Some(marker) = marker {
                     collect_resolved_associated_completions(
                         hir,
                         scope_graph,
-                        reference,
-                        body,
-                        path,
+                        marker.reference,
+                        marker.body,
+                        marker.segments,
                         &mut items,
                     );
                 }
@@ -387,43 +393,42 @@ fn completion_items_from_result(
     items
 }
 
-fn completion_marker_reference<'a>(
-    hir: &'a hir::HirFile,
-    scope_graph: &ScopeGraph,
-) -> Option<(NodeId, BodyId, ExprId, &'a hir::item_tree::HirPath)> {
-    for (body_id, body) in hir.bodies.iter() {
-        for (expr_id, expr) in body.exprs.iter() {
-            let Expr::Path { path, .. } = expr else {
-                continue;
-            };
-            if path
-                .segments
-                .last()
-                .is_none_or(|name| name.0 != COMPLETION_MARKER)
-            {
-                continue;
-            }
-            let reference = scope_graph.nodes.iter().find_map(|(node_id, node)| {
-                matches!(
-                    node,
-                    Node::Reference {
-                        origin: RefOrigin::Expr { body, expr },
-                        ..
-                    } if *body == body_id && *expr == expr_id
-                )
-                .then_some(node_id)
-            })?;
-            return Some((reference, body_id, expr_id, path));
-        }
-    }
-    None
+#[derive(Clone, Copy)]
+struct CompletionMarker<'a> {
+    reference: NodeId,
+    body: Option<BodyId>,
+    origin: RefOrigin,
+    segments: &'a [hir::Name],
+}
+
+fn completion_marker_reference(scope_graph: &ScopeGraph) -> Option<CompletionMarker<'_>> {
+    scope_graph.nodes.iter().find_map(|(reference, node)| {
+        let Node::Reference {
+            segments, origin, ..
+        } = node
+        else {
+            return None;
+        };
+        (segments
+            .last()
+            .is_some_and(|name| name.0 == COMPLETION_MARKER))
+        .then_some(CompletionMarker {
+            reference,
+            body: match origin {
+                RefOrigin::Expr { body, .. } => Some(*body),
+                RefOrigin::Type { .. } => None,
+            },
+            origin: *origin,
+            segments,
+        })
+    })
 }
 
 fn collect_visible_completions(
     hir: &hir::HirFile,
     scope_graph: &ScopeGraph,
     reference: NodeId,
-    body: BodyId,
+    body: Option<BodyId>,
     out: &mut Vec<CompletionItem>,
 ) {
     for (name, definition) in visible_definitions(scope_graph, reference) {
@@ -433,7 +438,7 @@ fn collect_visible_completions(
 
 fn push_definition_completion(
     hir: &hir::HirFile,
-    body: BodyId,
+    body: Option<BodyId>,
     label: &str,
     definition: &DefRef,
     out: &mut Vec<CompletionItem>,
@@ -477,14 +482,15 @@ fn push_definition_completion(
             CompletionItemKind::MODULE,
             Some(format!("mod {label}")),
         )),
-        DefRef::PatternBinding { id, .. } => {
+        DefRef::PatternBinding { id, .. } if body.is_some() => {
             // A `let` records its annotation on the statement; other patterns
             // (match arms, `for`) only get their type from inference.
-            let ty = let_stmt_of_pattern(&hir.bodies[body], id.pattern)
+            let ty = let_stmt_of_pattern(&hir.bodies[body.unwrap()], id.pattern)
                 .filter(|ty| **ty != HirTypeRef::Unknown)
                 .map(HirTypeRef::display);
             out.push(completion_item(label, CompletionItemKind::VARIABLE, ty));
         }
+        DefRef::PatternBinding { .. } => {}
         DefRef::Param { fn_id, index } => {
             let param = &hir.item_tree.functions[*fn_id].params[*index];
             out.push(completion_item(
@@ -542,11 +548,11 @@ fn collect_resolved_associated_completions(
     hir: &hir::HirFile,
     scope_graph: &ScopeGraph,
     reference: NodeId,
-    body: BodyId,
-    marker_path: &hir::item_tree::HirPath,
+    body: Option<BodyId>,
+    marker_segments: &[hir::Name],
     out: &mut Vec<CompletionItem>,
 ) {
-    let qualifier = &marker_path.segments[..marker_path.segments.len().saturating_sub(1)];
+    let qualifier = &marker_segments[..marker_segments.len().saturating_sub(1)];
     for definition in resolve_path_at_reference(scope_graph, reference, qualifier) {
         let definitions = match definition {
             DefRef::Module { enter, .. } => exported_definitions(scope_graph, enter),
@@ -563,6 +569,11 @@ fn collect_resolved_associated_completions(
             _ => Vec::new(),
         };
         for (name, associated) in definitions {
+            if let DefRef::Function(id) = &associated
+                && !function_is_visible(hir, body, *id)
+            {
+                continue;
+            }
             if let DefRef::Function(id) = &associated
                 && hir.item_tree.functions[*id]
                     .params
@@ -587,9 +598,26 @@ fn collect_global_completions(hir: &hir::HirFile, out: &mut Vec<CompletionItem>)
     }
 }
 
-fn collect_type_completions(hir: &hir::HirFile, out: &mut Vec<CompletionItem>) {
+fn collect_type_completions(
+    hir: &hir::HirFile,
+    scope_graph: &ScopeGraph,
+    marker: Option<CompletionMarker<'_>>,
+    fallback_hir: Option<&hir::HirFile>,
+    out: &mut Vec<CompletionItem>,
+) {
     let mut candidates = Vec::new();
-    collect_global_completions(hir, &mut candidates);
+    if let Some(marker) = marker {
+        collect_visible_completions(
+            hir,
+            scope_graph,
+            marker.reference,
+            marker.body,
+            &mut candidates,
+        );
+        collect_generic_type_completions(hir, marker, &mut candidates);
+    } else {
+        collect_global_completions(fallback_hir.unwrap_or(hir), &mut candidates);
+    }
     out.extend(candidates.into_iter().filter(|item| {
         matches!(
             item.kind,
@@ -603,6 +631,83 @@ fn collect_type_completions(hir: &hir::HirFile, out: &mut Vec<CompletionItem>) {
             )
         )
     }));
+}
+
+fn collect_generic_type_completions(
+    hir: &hir::HirFile,
+    marker: CompletionMarker<'_>,
+    out: &mut Vec<CompletionItem>,
+) {
+    let RefOrigin::Type { range } = marker.origin else {
+        return;
+    };
+    for (function_id, function) in hir.item_tree.functions.iter() {
+        let contains_marker = function
+            .params
+            .iter()
+            .any(|param| type_ref_contains_range(&param.ty, range))
+            || function
+                .ret_type
+                .as_ref()
+                .is_some_and(|ty| type_ref_contains_range(ty, range))
+            || function.generic_bounds.iter().any(|bound| {
+                type_ref_contains_range(&bound.target_ty, range)
+                    || type_ref_contains_range(&bound.trait_ty, range)
+            });
+        if !contains_marker {
+            continue;
+        }
+        let impl_generics = hir.item_tree.impls.iter().find_map(|(_, implementation)| {
+            implementation
+                .methods
+                .contains(&function_id)
+                .then_some(implementation.generics.as_slice())
+        });
+        for generic in impl_generics
+            .into_iter()
+            .flatten()
+            .chain(function.generics.iter())
+        {
+            out.push(completion_item(
+                &generic.0,
+                CompletionItemKind::TYPE_PARAMETER,
+                Some("type parameter".into()),
+            ));
+        }
+        return;
+    }
+}
+
+fn type_ref_contains_range(ty: &HirTypeRef, range: TextRange) -> bool {
+    match ty {
+        HirTypeRef::Named(path) => {
+            path.range == range
+                || path
+                    .type_args
+                    .iter()
+                    .any(|arg| type_ref_contains_range(arg, range))
+        }
+        HirTypeRef::Ref(inner, _)
+        | HirTypeRef::Ptr { inner, .. }
+        | HirTypeRef::Slice(inner)
+        | HirTypeRef::Array(inner, _) => type_ref_contains_range(inner, range),
+        HirTypeRef::Tuple(elements) => elements
+            .iter()
+            .any(|element| type_ref_contains_range(element, range)),
+        HirTypeRef::ImplTrait {
+            trait_ty, callable, ..
+        } => {
+            type_ref_contains_range(trait_ty, range)
+                || callable.as_ref().is_some_and(|signature| {
+                    signature
+                        .params
+                        .iter()
+                        .any(|param| type_ref_contains_range(param, range))
+                        || type_ref_contains_range(&signature.ret, range)
+                })
+        }
+        HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => false,
+    }
 }
 
 fn collect_member_completions(
@@ -653,7 +758,7 @@ fn collect_member_completions(
                 .params
                 .first()
                 .is_some_and(|param| param.name.0 == "self")
-                && (item_is_visible(hir, function.visibility.clone(), function.name_range)
+                && (function_is_visible(hir, Some(body_id), *function_id)
                     || impl_item.trait_ty.is_some())
             {
                 out.push(function_completion(function, CompletionItemKind::METHOD));
@@ -853,8 +958,19 @@ fn visible_for_completion(
     visibility.is_public() || (allow_private_user_item && hir.package_for_range(range).is_some())
 }
 
-fn item_is_visible(hir: &hir::HirFile, visibility: Visibility, range: TextRange) -> bool {
-    visibility.is_public() || hir.package_for_range(range).is_some()
+fn function_is_visible(
+    hir: &hir::HirFile,
+    body: Option<BodyId>,
+    function_id: hir::item_tree::FunctionId,
+) -> bool {
+    let function = &hir.item_tree.functions[function_id];
+    function.visibility.is_public()
+        || hir.item_tree.impls.iter().any(|(_, implementation)| {
+            implementation.trait_ty.is_some() && implementation.methods.contains(&function_id)
+        })
+        || body.is_some_and(|body| {
+            type_checker::method_is_visible(hir, body, function_id, &function.visibility)
+        })
 }
 
 fn receiver_struct_id(ty: &type_checker::Type) -> Option<StructId> {

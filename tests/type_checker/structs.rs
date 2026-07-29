@@ -223,6 +223,46 @@ fn rejects_private_field_access_outside_its_module() {
 }
 
 #[test]
+fn rejects_private_method_calls_outside_the_defining_module() {
+    let result = check(
+        r#"
+        mod model {
+            pub struct Point {}
+
+            impl Point {
+                fun secret(&self) -> i32 { 1 }
+                pub fun shown(&self) -> i32 { 2 }
+            }
+
+            pub fun make() -> Point { Point {} }
+            pub fun inside(point: &Point) -> i32 { point.secret() }
+
+            pub mod nested {
+                pub fun inside(point: &super::Point) -> i32 { point.secret() }
+            }
+        }
+
+        fun main() -> i32 {
+            let point = model::make();
+            point.secret() + point.shown() + model::inside(&point) + model::nested::inside(&point)
+        }
+        "#,
+    );
+
+    let private = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0054")
+        .collect::<Vec<_>>();
+    assert_eq!(private.len(), 1, "diagnostics: {:?}", result.diagnostics);
+    assert!(
+        private[0]
+            .message
+            .contains("method `secret` of struct `Point` is private")
+    );
+}
+
+#[test]
 fn rejects_private_field_in_struct_literal_outside_its_module() {
     let result = check(
         r#"

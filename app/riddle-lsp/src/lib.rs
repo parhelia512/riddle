@@ -4,6 +4,7 @@ mod code_actions;
 mod completion;
 mod diagnostics;
 mod inlay_hints;
+mod navigation;
 mod semantic_tokens;
 mod server;
 mod session;
@@ -22,6 +23,9 @@ pub mod test_support {
         to_lsp, to_lsp_mapped,
     };
     pub use crate::inlay_hints::{inlay_hints_for_document, inlay_hints_for_source};
+    pub use crate::navigation::{
+        definition_for_document, definition_for_source, hover_for_source, implementation_for_source,
+    };
     pub use crate::semantic_tokens::{
         MOD_DECLARATION, MOD_DEFAULT_LIBRARY, MOD_MUTABLE, MOD_STATIC, TOKEN_COMMENT, TOKEN_ENUM,
         TOKEN_FUNCTION, TOKEN_INTERFACE, TOKEN_KEYWORD, TOKEN_METHOD, TOKEN_PARAMETER,
@@ -29,7 +33,7 @@ pub mod test_support {
         semantic_tokens_for_document, semantic_tokens_for_source,
         semantic_tokens_for_source_with_options,
     };
-    pub use crate::server::{Document, RequestRevisions};
+    pub use crate::server::{Document, RequestRevisions, documents_for_uri};
     pub use crate::session::AnalysisSessions;
     pub use crate::text::apply_content_changes;
 }

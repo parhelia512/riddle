@@ -55,6 +55,17 @@ impl AnalysisSessions {
         self.projects.lock().unwrap().clear();
     }
 
+    pub(crate) fn invalidate_project(&self, uri: &lsp_types::Url) {
+        let Some(root) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| clue::find_project_root(&path))
+        else {
+            return;
+        };
+        self.projects.lock().unwrap().remove(&root);
+    }
+
     pub(crate) fn current_revision(
         &self,
         uri: &lsp_types::Url,

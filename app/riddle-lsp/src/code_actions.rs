@@ -1,7 +1,6 @@
-use std::collections::HashMap;
-
 use lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionResponse, NumberOrString, Range,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionResponse, DocumentChanges,
+    NumberOrString, OneOf, OptionalVersionedTextDocumentIdentifier, Range, TextDocumentEdit,
     TextEdit, WorkspaceEdit,
 };
 
@@ -10,6 +9,7 @@ const MUTABLE_CLOSURE_BINDING_MESSAGE: &str =
 
 pub(crate) fn quick_fixes(
     uri: &lsp_types::Url,
+    version: Option<i32>,
     diagnostics: &[lsp_types::Diagnostic],
 ) -> CodeActionResponse {
     diagnostics
@@ -31,10 +31,16 @@ pub(crate) fn quick_fixes(
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: Some(vec![diagnostic.clone()]),
                 edit: Some(WorkspaceEdit {
-                    changes: Some(HashMap::from([(
-                        uri.clone(),
-                        vec![TextEdit::new(Range::new(start, start), "mut ".into())],
-                    )])),
+                    document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: uri.clone(),
+                            version,
+                        },
+                        edits: vec![OneOf::Left(TextEdit::new(
+                            Range::new(start, start),
+                            "mut ".into(),
+                        ))],
+                    }])),
                     ..WorkspaceEdit::default()
                 }),
                 is_preferred: Some(true),

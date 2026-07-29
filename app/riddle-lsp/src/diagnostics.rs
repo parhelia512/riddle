@@ -16,7 +16,10 @@ use riddlec::pipeline::{
 use rowan::{TextRange, TextSize};
 use type_checker::{LabelStyle, SourceLabel};
 
-use crate::{server::Document, text::normalized_path};
+use crate::{
+    server::Document,
+    text::{LineIndex, normalized_path},
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishedDiagnostics {
@@ -30,46 +33,23 @@ struct ResolvedLabel {
     range: Range,
 }
 
-struct LineIndex {
-    starts: Vec<usize>,
-}
-
-impl LineIndex {
-    fn new(source: &str) -> Self {
-        let mut starts = vec![0];
-        starts.extend(
-            source
-                .bytes()
-                .enumerate()
-                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
-        );
-        Self { starts }
-    }
-
-    fn position(&self, source: &str, offset: usize) -> Option<Position> {
-        if offset > source.len() || !source.is_char_boundary(offset) {
-            return None;
-        }
-        let line = self.starts.partition_point(|start| *start <= offset) - 1;
-        let character = source[self.starts[line]..offset]
-            .chars()
-            .map(char::len_utf16)
-            .sum::<usize>();
-        Some(Position::new(line as u32, character as u32))
-    }
-
-    fn range(&self, source: &str, range: TextRange) -> Option<Range> {
-        Some(Range::new(
-            self.position(source, usize::from(range.start()))?,
-            self.position(source, usize::from(range.end()))?,
-        ))
-    }
-}
-
 #[derive(Default)]
 pub struct DiagnosticSessions {
     standalone: HashMap<Url, StandaloneDiagnosticSession>,
     projects: HashMap<PathBuf, ProjectDiagnosticSession>,
+}
+
+impl DiagnosticSessions {
+    pub(crate) fn invalidate_project(&mut self, uri: &Url) {
+        let Some(root) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| clue::find_project_root(&path))
+        else {
+            return;
+        };
+        self.projects.remove(&root);
+    }
 }
 
 #[derive(Default)]

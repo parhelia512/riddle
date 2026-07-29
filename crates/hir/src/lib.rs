@@ -254,13 +254,19 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
 /// Both `body_lower` and `lower_items` use this helper so module children are always promoted into
 /// the global item tree.
 pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: ast::ModDecl) -> ModuleId {
-    let name = lower::lower_name(m.name());
+    let name_token = m.name();
+    let name_range = name_token
+        .as_ref()
+        .map(|token| token.text_range())
+        .unwrap_or_else(|| trimmed_range(m.syntax()));
+    let name = lower::lower_name(name_token);
 
     // Allocate a placeholder first so the module has a stable id while lowering children.
     let attrs = lower::lower_attrs(m.syntax());
     let visibility = lower::lower_visibility(m.is_pub());
     let mid = hir.item_tree.modules.alloc(HirModule {
         name,
+        name_range,
         visibility,
         items: None,
         attrs,

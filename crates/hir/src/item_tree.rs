@@ -143,6 +143,7 @@ pub struct HirStruct {
 #[derive(Debug, Clone)]
 pub struct HirStructField {
     pub name: Name,
+    pub name_range: TextRange,
     pub visibility: Visibility,
     pub ty: HirTypeRef,
     pub ty_range: TextRange,
@@ -236,6 +237,7 @@ pub struct HirTypeAlias {
 #[derive(Debug, Clone)]
 pub struct HirModule {
     pub name: Name,
+    pub name_range: TextRange,
     pub visibility: Visibility,
     /// `mod foo;` → None; `mod foo { ... }` → Some(items)
     pub items: Option<Vec<TopLevelItem>>,
