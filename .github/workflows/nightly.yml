@@ -110,7 +110,7 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: true
 
@@ -186,7 +186,7 @@ jobs:
           ls -lh "${TARGET_ZIP}"
 
       - name: 上传 zip
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nightly-zip-${{ matrix.platform }}-${{ matrix.arch }}
           path: riddle-*.zip
@@ -217,7 +217,7 @@ jobs:
         run: bash editors/package.sh
 
       - name: 上传编辑器扩展
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: editor-packages
           path: editors/dist/*
@@ -230,12 +230,12 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: 下载全部平台 zip
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: "{nightly-zip-*,editor-packages}"
           path: .
