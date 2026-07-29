@@ -277,7 +277,9 @@ impl<'a> LowerCtx<'a> {
         let old_generic_const_subst = self.generic_const_subst.clone();
         let old_loop_targets = std::mem::take(&mut self.loop_targets);
         self.current_function = Some(fid);
-        if let Some(self_ty) = self.impl_self_mir_type(fid) {
+        if !self.generic_subst.contains_key("Self")
+            && let Some(self_ty) = self.impl_self_mir_type(fid)
+        {
             self.generic_subst.insert("Self".into(), self_ty);
         }
 
@@ -5077,28 +5079,35 @@ impl<'a> LowerCtx<'a> {
             .iter()
             .map(|arg| self.convert_type(arg))
             .collect::<Vec<_>>();
-        let type_names = outer_generics
-            .iter()
-            .chain(function.generics.iter())
-            .collect::<Vec<_>>();
-        let subst = type_names
+        let mut subst = outer_generics
             .iter()
             .zip(args.iter())
             .map(|(name, ty)| (name.0.clone(), ty.clone()))
             .collect::<HashMap<_, _>>();
-        let suffix = if let Some(imp) = &imp {
-            let refs = subst
+        subst.extend(
+            function
+                .generics
                 .iter()
-                .map(|(name, ty)| (name.as_str(), ty))
-                .collect::<HashMap<_, _>>();
-            std::iter::once(mono_type_name(&self.convert_hir_type_with_substs(
-                &imp.self_ty,
-                &refs,
-                &HashMap::new(),
-            )))
-            .chain(args.iter().skip(outer_generics.len()).map(mono_type_name))
-            .collect::<Vec<_>>()
-            .join("_")
+                .zip(args.iter().skip(outer_generics.len()))
+                .map(|(name, ty)| (name.0.clone(), ty.clone())),
+        );
+        let outer_tc_subst = outer_generics
+            .iter()
+            .zip(tc_args.iter())
+            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .collect::<HashMap<_, _>>();
+        let self_tc_ty = imp
+            .as_ref()
+            .map(|imp| self.lower_hir_type_for_pattern(&imp.self_ty, &outer_tc_subst));
+        let self_mir_ty = self_tc_ty.as_ref().map(|ty| self.convert_type(ty));
+        if let Some(self_ty) = &self_mir_ty {
+            subst.insert("Self".into(), self_ty.clone());
+        }
+        let suffix = if let Some(self_ty) = &self_mir_ty {
+            std::iter::once(mono_type_name(self_ty))
+                .chain(args.iter().skip(outer_generics.len()).map(mono_type_name))
+                .collect::<Vec<_>>()
+                .join("_")
         } else {
             args.iter()
                 .map(mono_type_name)
@@ -5110,11 +5119,17 @@ impl<'a> LowerCtx<'a> {
             return Some(name.clone());
         }
 
-        let tc_subst = type_names
-            .iter()
-            .zip(tc_args)
-            .map(|(name, ty)| (name.0.clone(), ty))
-            .collect();
+        let mut tc_subst = outer_tc_subst;
+        tc_subst.extend(
+            function
+                .generics
+                .iter()
+                .zip(tc_args.iter().skip(outer_generics.len()))
+                .map(|(name, ty)| (name.0.clone(), ty.clone())),
+        );
+        if let Some(self_ty) = self_tc_ty {
+            tc_subst.insert("Self".into(), self_ty);
+        }
         let mono_name = format!("{}__{}", function.name.0, suffix);
         self.mono_functions.insert(key, mono_name.clone());
 

@@ -1311,6 +1311,36 @@ fn c_backend_monomorphizes_explicit_generic_method_arguments() {
 }
 
 #[test]
+fn c_backend_separates_shadowed_impl_and_method_generics() {
+    let module = lower(
+        r#"
+        struct C<T> {
+            value: T,
+        }
+
+        impl<T> C<T> {
+            fun test<T>(&self, value: T) -> T {
+                value
+            }
+        }
+
+        fun main() -> i32 {
+            let c = C { value: true };
+            c.test(1)
+        }
+        "#,
+    );
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+
+    assert!(
+        result.contains(&c_function("test__C_bool_i32")),
+        "impl and method generic arguments were conflated:\n{}",
+        result
+    );
+}
+
+#[test]
 fn c_backend_dispatches_trait_bound_method_in_generic_function() {
     let module = lower(
         r#"

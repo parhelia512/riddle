@@ -213,7 +213,7 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
             type_args: Vec::new(),
             range,
         });
-        apply_self_receiver_types(&mut hir.item_tree.functions[fid], &receivers, &self_ty);
+        apply_self_receiver_types(&mut hir.item_tree.functions[fid], &receivers);
         hir.item_tree.functions[fid]
             .generic_bounds
             .push(HirGenericBound {
@@ -317,7 +317,7 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
             })
             .unwrap_or_default();
         let fid = func.lower(&mut hir.item_tree.functions);
-        apply_self_receiver_types(&mut hir.item_tree.functions[fid], &receivers, &self_ty);
+        apply_self_receiver_types(&mut hir.item_tree.functions[fid], &receivers);
         methods.push(fid);
         if let Some(block) = body_ast {
             let body = BodyLower::lower(hir, block);
@@ -357,20 +357,22 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
     })
 }
 
-fn apply_self_receiver_types(
-    func: &mut item_tree::HirFunction,
-    receivers: &[(bool, bool, bool)],
-    self_ty: &item_tree::HirTypeRef,
-) {
+fn apply_self_receiver_types(func: &mut item_tree::HirFunction, receivers: &[(bool, bool, bool)]) {
     for (param, (is_self, is_ref, is_mut)) in func.params.iter_mut().zip(receivers) {
         if !*is_self {
             continue;
         }
 
+        let self_ty = item_tree::HirTypeRef::Named(item_tree::HirPath {
+            anchor: item_tree::PathAnchor::Plain,
+            segments: vec![Name("Self".into())],
+            type_args: Vec::new(),
+            range: param.ty_range,
+        });
         param.ty = if *is_ref {
-            item_tree::HirTypeRef::Ref(Box::new(self_ty.clone()), *is_mut)
+            item_tree::HirTypeRef::Ref(Box::new(self_ty), *is_mut)
         } else {
-            self_ty.clone()
+            self_ty
         };
     }
 }

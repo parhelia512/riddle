@@ -3163,15 +3163,7 @@ impl TypeChecker<'_> {
         );
         let mut params = method.subst.clone();
         params.extend(method_params);
-        let mut subst = method.subst.clone();
-        for name in method
-            .function
-            .generics
-            .iter()
-            .chain(&method.function.const_generics)
-        {
-            subst.remove(&name.0);
-        }
+        let mut subst = HashMap::new();
 
         if !type_args.is_empty() {
             if type_args.len() != method.function.generics.len() {
@@ -3232,9 +3224,11 @@ impl TypeChecker<'_> {
         }
 
         if let Some(receiver) = method.function.params.first() {
-            let pattern =
-                self.lower_type_ref_with_params_at(&receiver.ty, &params, Some(receiver.ty_range));
-            let expected = substitute_type(&pattern, &subst);
+            let expected = self.lower_type_ref_with_params_at(
+                &receiver.ty,
+                &method.subst,
+                Some(receiver.ty_range),
+            );
             let actual = self.receiver_argument_type(&base_ty, &expected);
             // A `&mut self` receiver only constrains the *place* when the
             // compiler has to auto-ref it; an already-mutable reference is
@@ -3272,18 +3266,12 @@ impl TypeChecker<'_> {
             || !method.function.generics.is_empty()
             || !method.function.const_generics.is_empty()
         {
-            let unresolved = impl_generics
+            let unresolved = method
+                .function
+                .generics
                 .iter()
-                .map(String::as_str)
-                .chain(method.function.generics.iter().map(|name| name.0.as_str()))
-                .chain(impl_const_generics.iter().map(String::as_str))
-                .chain(
-                    method
-                        .function
-                        .const_generics
-                        .iter()
-                        .map(|name| name.0.as_str()),
-                )
+                .chain(&method.function.const_generics)
+                .map(|name| name.0.as_str())
                 .any(|name| subst.get(name).is_none_or(generic_arg_unknown));
             if unresolved {
                 self.diagnostic(
@@ -3295,21 +3283,33 @@ impl TypeChecker<'_> {
                     span,
                 );
             }
-            self.check_generic_bounds(ctx, &method.function, &subst, span);
-            let generic_args = impl_generics
+            let mut bound_subst = method.subst.clone();
+            bound_subst.extend(subst.clone());
+            self.check_generic_bounds(ctx, &method.function, &bound_subst, span);
+            let mut generic_args = impl_generics
                 .iter()
                 .map(String::as_str)
-                .chain(method.function.generics.iter().map(|name| name.0.as_str()))
-                .chain(impl_const_generics.iter().map(String::as_str))
-                .chain(
-                    method
-                        .function
-                        .const_generics
-                        .iter()
-                        .map(|name| name.0.as_str()),
-                )
-                .map(|name| subst.get(name).cloned().unwrap_or(Type::Unknown))
-                .collect();
+                .map(|name| method.subst.get(name).cloned().unwrap_or(Type::Unknown))
+                .collect::<Vec<_>>();
+            generic_args.extend(
+                method
+                    .function
+                    .generics
+                    .iter()
+                    .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown)),
+            );
+            generic_args.extend(
+                impl_const_generics
+                    .iter()
+                    .map(|name| method.subst.get(name).cloned().unwrap_or(Type::Unknown)),
+            );
+            generic_args.extend(
+                method
+                    .function
+                    .const_generics
+                    .iter()
+                    .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown)),
+            );
             self.result.generic_calls.insert(
                 (ctx.body_id, callee),
                 crate::result::GenericCall { args: generic_args },

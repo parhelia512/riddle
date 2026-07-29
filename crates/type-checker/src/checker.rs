@@ -149,6 +149,10 @@ impl<'a> TypeChecker<'a> {
         for (id, function) in functions {
             let outer_generics = self.impl_generic_names(id);
             let outer_const_generics = self.impl_const_generic_names(id);
+            let outer_params = crate::lowering::generic_param_map_with_consts(
+                outer_generics.iter().map(String::as_str),
+                outer_const_generics.iter().map(String::as_str),
+            );
             let mut params = crate::lowering::generic_param_map_with_consts(
                 outer_generics
                     .iter()
@@ -162,7 +166,7 @@ impl<'a> TypeChecker<'a> {
             if let Some(self_ty_ref) = self.impl_self_ty_ref(id).cloned() {
                 let range = self.impl_self_ty_range(id).unwrap_or(function.name_range);
                 let self_ty =
-                    self.lower_type_ref_with_params_at(&self_ty_ref, &params, Some(range));
+                    self.lower_type_ref_with_params_at(&self_ty_ref, &outer_params, Some(range));
                 let owner = self
                     .hir
                     .item_tree
@@ -593,6 +597,10 @@ impl<'a> TypeChecker<'a> {
         outer_const_generics: Vec<String>,
     ) {
         let body = &self.hir.bodies[body_id];
+        let outer_params = crate::lowering::generic_param_map_with_consts(
+            outer_generics.iter().map(String::as_str),
+            outer_const_generics.iter().map(String::as_str),
+        );
         let mut params = crate::lowering::generic_param_map_with_consts(
             outer_generics
                 .iter()
@@ -615,8 +623,11 @@ impl<'a> TypeChecker<'a> {
                         .then_some(imp.self_ty_range)
                 })
                 .unwrap_or(function.name_range);
-            let self_ty =
-                self.lower_type_ref_with_params_at(&self_ty_ref, &params, Some(self_ty_range));
+            let self_ty = self.lower_type_ref_with_params_at(
+                &self_ty_ref,
+                &outer_params,
+                Some(self_ty_range),
+            );
             let owner = self
                 .hir
                 .item_tree

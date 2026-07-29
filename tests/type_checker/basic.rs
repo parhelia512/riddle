@@ -202,6 +202,34 @@ fn infers_generic_method_arguments() {
 }
 
 #[test]
+fn method_generic_can_shadow_impl_generic() {
+    let result = check(
+        r#"
+        pub struct C<T> {}
+
+        impl<T> C<T> {
+            fun test<T>(&self, f: T) {}
+        }
+
+        pub fun f1() {
+            let c = C {};
+            c.test("1");
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert!(
+        result
+            .generic_calls
+            .values()
+            .any(|call| { call.args == [Type::Unknown, Type::Ref(Box::new(Type::Str), false)] }),
+        "{:#?}",
+        result.generic_calls
+    );
+}
+
+#[test]
 fn infers_generic_function_parameter_from_anonymous_function() {
     let result = check(
         r#"
