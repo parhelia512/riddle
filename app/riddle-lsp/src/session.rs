@@ -54,4 +54,53 @@ impl AnalysisSessions {
     pub(crate) fn clear_projects(&self) {
         self.projects.lock().unwrap().clear();
     }
+
+    pub(crate) fn current_revision(
+        &self,
+        uri: &lsp_types::Url,
+        docs: &HashMap<lsp_types::Url, Document>,
+    ) -> Option<u64> {
+        let Ok(path) = uri.to_file_path() else {
+            return Some(0);
+        };
+        let Some(root) = clue::find_project_root(&path) else {
+            return Some(0);
+        };
+        let overlays = docs
+            .iter()
+            .filter_map(|(uri, document)| {
+                uri.to_file_path()
+                    .ok()
+                    .map(|path| (path, document.text.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let session = self.projects.lock().unwrap().get(&root).cloned()?;
+        let session = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session
+            .inputs_are_current(&overlays)
+            .then(|| session.revision())
+    }
+
+    pub(crate) fn revision(&self, uri: &lsp_types::Url) -> u64 {
+        let Some(root) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| clue::find_project_root(&path))
+        else {
+            return 0;
+        };
+        self.projects
+            .lock()
+            .unwrap()
+            .get(&root)
+            .map(|session| {
+                session
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .revision()
+            })
+            .unwrap_or(0)
+    }
 }

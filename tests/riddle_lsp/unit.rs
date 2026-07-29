@@ -470,6 +470,22 @@ fn completion_resolves_fields_and_instance_methods() {
 }
 
 #[test]
+fn completion_hides_private_fields_outside_the_defining_module() {
+    let source = "mod model { pub struct Point { x: i32, pub y: i32 } pub fun make() -> Point { Point { x: 1, y: 2 } } } fun main() { model::make(). }";
+    let items = completion_items_for_source(
+        source,
+        position(
+            source,
+            source.rfind("model::make().").unwrap() + "model::make().".len(),
+        ),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "y"), "{items:#?}");
+    assert!(!items.iter().any(|item| item.label == "x"), "{items:#?}");
+}
+
+#[test]
 fn completion_filters_member_candidates_after_the_dot() {
     let source = "struct Foo { bar: i32 }\nfun main() { let c = Foo { bar: 1 }; c.b }";
     let items = completion_items_for_source(
@@ -921,6 +937,28 @@ fn inlay_hints_show_inferred_types() {
     assert!(type_hints.iter().all(|hint| {
         matches!(&hint.label, lsp_types::InlayHintLabel::String(label) if label == ": Foo")
     }));
+}
+
+#[test]
+fn inlay_hints_respect_the_start_character_on_a_single_line() {
+    let source = "fun main() { let first = 1; let second = 2; }";
+    let hints = inlay_hints_for_source(
+        source,
+        Range::new(
+            position(source, source.find("let second").unwrap()),
+            position(source, source.len()),
+        ),
+    );
+
+    assert_eq!(hints.len(), 1, "{hints:#?}");
+    assert_eq!(
+        hints[0].position,
+        position(source, source.find("second =").unwrap() + "second".len())
+    );
+    assert!(matches!(
+        &hints[0].label,
+        lsp_types::InlayHintLabel::String(label) if label == ": i32"
+    ));
 }
 
 #[test]

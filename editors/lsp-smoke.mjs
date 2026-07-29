@@ -93,6 +93,7 @@ try {
       rootUri: null,
       capabilities: {
         textDocument: { completion: { completionItem: { labelDetailsSupport: true } } },
+        workspace: { didChangeWatchedFiles: { dynamicRegistration: true } },
       },
     },
   });
@@ -102,13 +103,24 @@ try {
   assert.equal(initialized.result.capabilities.textDocumentSync, 2);
   assert.equal(initialized.result.capabilities.codeActionProvider, true);
   const triggerCharacters = initialized.result.capabilities.completionProvider.triggerCharacters;
-  assert(triggerCharacters.includes('.'));
-  assert(triggerCharacters.includes(':'));
-  assert(triggerCharacters.includes('f'));
+  assert.deepEqual(triggerCharacters, ['.', ':']);
   assert.equal(initialized.result.capabilities.inlayHintProvider, true);
   assert.equal(initialized.result.capabilities.semanticTokensProvider.full.delta, true);
 
   send({ jsonrpc: '2.0', method: 'initialized', params: {} });
+  const watcherRegistration = await read(
+    (message) => message.method === 'client/registerCapability',
+    3_000,
+  );
+  const watchedFiles = watcherRegistration.params.registrations.find(
+    (registration) => registration.method === 'workspace/didChangeWatchedFiles',
+  );
+  assert(watchedFiles);
+  assert.deepEqual(
+    new Set(watchedFiles.registerOptions.watchers.map((watcher) => watcher.globPattern)),
+    new Set(['**/*.rid', '**/Clue.toml']),
+  );
+  send({ jsonrpc: '2.0', id: watcherRegistration.id, result: null });
   send({
     jsonrpc: '2.0',
     method: 'textDocument/didOpen',
@@ -173,6 +185,13 @@ try {
       message.params.version === 1,
   );
   assert.equal(stable.params.diagnostics[0].code, 'E0050');
+  send({
+    jsonrpc: '2.0',
+    id: 21,
+    method: 'textDocument/semanticTokens/full',
+    params: { textDocument: { uri: stableUri } },
+  });
+  const stableTokens = await read((message) => message.id === 21);
 
   send({
     jsonrpc: '2.0',
@@ -197,6 +216,14 @@ try {
   );
   assert(mutableClosure);
   assert.equal(mutableClosure.relatedInformation[0].message, 'mutable closure called here');
+  send({
+    jsonrpc: '2.0',
+    id: 22,
+    method: 'textDocument/semanticTokens/full',
+    params: { textDocument: { uri: stableUri } },
+  });
+  const stableTokensAfterUnrelatedOpen = await read((message) => message.id === 22);
+  assert.equal(stableTokensAfterUnrelatedOpen.result.resultId, stableTokens.result.resultId);
 
   send({
     jsonrpc: '2.0',
@@ -216,6 +243,19 @@ try {
     range: { start: mutableClosure.range.start, end: mutableClosure.range.start },
     newText: 'mut ',
   });
+
+  send({
+    jsonrpc: '2.0',
+    id: 20,
+    method: 'textDocument/codeAction',
+    params: {
+      textDocument: { uri: fixUri },
+      range: mutableClosure.range,
+      context: { diagnostics: [mutableClosure], only: ['source.organizeImports'] },
+    },
+  });
+  const filteredCodeActions = await read((message) => message.id === 20);
+  assert.deepEqual(filteredCodeActions.result, []);
 
   send({
     jsonrpc: '2.0',

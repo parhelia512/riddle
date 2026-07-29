@@ -123,6 +123,9 @@ pub(crate) fn inlay_hints_from_analysis(
         if line < range.start.line || line > range.end.line {
             return false;
         }
+        if line == range.start.line && hint.position.character < range.start.character {
+            return false;
+        }
         if line == range.end.line && hint.position.character >= range.end.character {
             return false;
         }

@@ -29,13 +29,7 @@ pub(crate) const BUILTIN_TYPES: &[&str] = &[
 ];
 
 pub(crate) fn completion_trigger_characters() -> Vec<String> {
-    let mut triggers = vec![".".into(), ":".into(), "_".into()];
-    triggers.extend(
-        ('a'..='z')
-            .chain('A'..='Z')
-            .map(|character| character.to_string()),
-    );
-    triggers
+    vec![".".into(), ":".into()]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -622,24 +616,30 @@ fn collect_member_completions(
                 return None;
             };
             (field.0 == COMPLETION_MARKER)
-                .then(|| types.expr_types.get(&(body_id, *base)))
+                .then(|| {
+                    types
+                        .expr_types
+                        .get(&(body_id, *base))
+                        .map(|receiver| (body_id, receiver))
+                })
                 .flatten()
         })
     });
-    let Some(receiver) = receiver else {
+    let Some((body_id, receiver)) = receiver else {
         return;
     };
 
     if let Some(struct_id) = receiver_struct_id(receiver) {
         let struct_item = &hir.item_tree.structs[struct_id];
-        if hir.package_for_range(struct_item.name_range).is_some() {
-            for field in &struct_item.fields {
-                out.push(completion_item(
-                    &field.name.0,
-                    CompletionItemKind::FIELD,
-                    Some(field.ty.display()),
-                ));
+        for field in &struct_item.fields {
+            if !type_checker::struct_field_is_visible(hir, body_id, struct_id, &field.visibility) {
+                continue;
             }
+            out.push(completion_item(
+                &field.name.0,
+                CompletionItemKind::FIELD,
+                Some(field.ty.display()),
+            ));
         }
     }
 

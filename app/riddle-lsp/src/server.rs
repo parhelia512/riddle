@@ -2,20 +2,21 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use lsp_types::{
-    CodeActionParams, CodeActionResponse, CompletionOptions, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, FileChangeType, FileEvent, InitializeParams, InitializeResult,
-    InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf, PositionEncodingKind,
-    SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind,
+    CodeActionKind, CodeActionParams, CodeActionResponse, CompletionOptions, CompletionParams,
+    CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
+    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams, MessageType,
+    OneOf, PositionEncodingKind, Registration, SemanticTokens, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use riddlec::pipeline::CompileOptions;
 use tower_lsp::jsonrpc::Result;
@@ -45,11 +46,12 @@ pub(crate) struct Backend {
     /// Sessions used for the fallback analysis (the original, unmodified source).
     completion_fallback_sessions: Arc<AnalysisSessions>,
     analysis_sessions: Arc<AnalysisSessions>,
-    // ponytail: workspace-wide invalidation; shard by project if large workspaces show churn.
+    // Workspace-wide only for cancelling in-flight requests; caches use project revisions below.
     analysis_revision: Arc<AtomicU64>,
     completion_revisions: Arc<RequestRevisions>,
     semantic_tokens: Arc<Mutex<HashMap<lsp_types::Url, CachedSemanticTokens>>>,
     semantic_token_revision: Arc<AtomicU64>,
+    supports_watched_files: AtomicBool,
     compile_options: CompileOptions,
     completion_delay: Duration,
 }
@@ -65,7 +67,7 @@ pub struct Document {
 #[derive(Clone)]
 struct CachedSemanticTokens {
     text: String,
-    analysis_revision: u64,
+    project_revision: u64,
     tokens: SemanticTokens,
 }
 
@@ -91,7 +93,17 @@ impl RequestRevisions {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        self.supports_watched_files.store(
+            params
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+                .and_then(|capabilities| capabilities.dynamic_registration)
+                .unwrap_or(false),
+            Ordering::SeqCst,
+        );
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 position_encoding: Some(PositionEncodingKind::UTF16),
@@ -126,6 +138,33 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        if self.supports_watched_files.load(Ordering::SeqCst) {
+            let options = DidChangeWatchedFilesRegistrationOptions {
+                watchers: ["**/*.rid", "**/Clue.toml"]
+                    .into_iter()
+                    .map(|pattern| FileSystemWatcher {
+                        glob_pattern: GlobPattern::String(pattern.into()),
+                        kind: None,
+                    })
+                    .collect(),
+            };
+            let registration = Registration {
+                id: "riddle-watched-files".into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: Some(
+                    serde_json::to_value(options)
+                        .expect("watched-file registration options must serialize"),
+                ),
+            };
+            if let Err(error) = self.client.register_capability(vec![registration]).await {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("failed to register file watchers: {error}"),
+                    )
+                    .await;
+            }
+        }
         self.client
             .log_message(MessageType::INFO, "riddle-lsp initialized")
             .await;
@@ -197,12 +236,15 @@ impl LanguageServer for Backend {
                 data: Vec::new(),
             })));
         };
+        let project_revision = self.analysis_sessions.current_revision(&uri, &docs);
         if let Some(cached) = self
             .semantic_tokens
             .lock()
             .unwrap()
             .get(&uri)
-            .filter(|cached| cached.text == text && cached.analysis_revision == analysis_revision)
+            .filter(|cached| {
+                cached.text == text && project_revision == Some(cached.project_revision)
+            })
         {
             return Ok(Some(SemanticTokensResult::Tokens(cached.tokens.clone())));
         }
@@ -232,6 +274,7 @@ impl LanguageServer for Backend {
                 .fetch_add(1, Ordering::SeqCst)
                 .to_string(),
         );
+        let project_revision = self.analysis_sessions.revision(&uri);
         let is_current = self.analysis_revision.load(Ordering::SeqCst) == analysis_revision
             && self
                 .docs
@@ -246,7 +289,7 @@ impl LanguageServer for Backend {
             uri,
             CachedSemanticTokens {
                 text,
-                analysis_revision,
+                project_revision,
                 tokens: tokens.clone(),
             },
         );
@@ -395,6 +438,13 @@ impl LanguageServer for Backend {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        if params.context.only.as_ref().is_some_and(|kinds| {
+            !kinds
+                .iter()
+                .any(|kind| kind.as_str().is_empty() || kind == &CodeActionKind::QUICKFIX)
+        }) {
+            return Ok(Some(Vec::new()));
+        }
         Ok(Some(quick_fixes(
             &params.text_document.uri,
             &params.context.diagnostics,
@@ -442,6 +492,7 @@ impl Backend {
             completion_revisions: Arc::new(RequestRevisions::default()),
             semantic_tokens: Arc::new(Mutex::new(HashMap::new())),
             semantic_token_revision: Arc::new(AtomicU64::new(1)),
+            supports_watched_files: AtomicBool::new(false),
             compile_options,
             completion_delay,
         }

@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use hir::{
     Name,
     body::{
-        BinaryOp, Body, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern, PatternBindingId,
-        ResolvedName, Stmt, StmtId, UnaryOp,
+        BinaryOp, Body, BodyId, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern,
+        PatternBindingId, ResolvedName, Stmt, StmtId, UnaryOp,
     },
     item_tree::{
         FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound, HirStructField,
@@ -28,6 +28,87 @@ use crate::{
     types::{CallableSignature, ClosureId, ClosureKind, ConstArg, FloatTy, IntTy, Type},
 };
 
+pub fn struct_field_is_visible(
+    hir: &hir::HirFile,
+    body_id: BodyId,
+    struct_id: StructId,
+    visibility: &Visibility,
+) -> bool {
+    if visibility.is_public() {
+        return true;
+    }
+    let owner = hir
+        .function_bodies
+        .iter()
+        .find_map(|(function_id, candidate)| {
+            (*candidate == body_id).then(|| {
+                (
+                    hir.item_tree.functions[*function_id].name_range,
+                    Some(*function_id),
+                    None,
+                )
+            })
+        })
+        .or_else(|| {
+            hir.const_bodies.iter().find_map(|(const_id, candidate)| {
+                (*candidate == body_id).then(|| {
+                    (
+                        hir.item_tree.consts[*const_id].name_range,
+                        None,
+                        Some(*const_id),
+                    )
+                })
+            })
+        });
+    let Some((owner_range, function_id, const_id)) = owner else {
+        return false;
+    };
+
+    struct_field_is_visible_for_owner(
+        hir,
+        owner_range,
+        function_id,
+        const_id,
+        struct_id,
+        visibility,
+    )
+}
+
+fn struct_field_is_visible_for_owner(
+    hir: &hir::HirFile,
+    owner_range: rowan::TextRange,
+    function_id: Option<FunctionId>,
+    const_id: Option<hir::item_tree::ConstId>,
+    struct_id: StructId,
+    visibility: &Visibility,
+) -> bool {
+    if visibility.is_public() {
+        return true;
+    }
+
+    let strukt = &hir.item_tree.structs[struct_id];
+    if hir.package_for_range(strukt.name_range) != hir.package_for_range(owner_range) {
+        return false;
+    }
+
+    let Some(owner) = containing_module(
+        &hir.item_tree,
+        &hir.item_tree.top_level,
+        &|item| matches!(item, TopLevelItem::Struct(id) if id == struct_id),
+    )
+    .flatten() else {
+        return true;
+    };
+    let Some(current) = containing_module(&hir.item_tree, &hir.item_tree.top_level, &|item| {
+        item_contains_body_owner(&hir.item_tree, item, function_id, const_id)
+    })
+    .flatten() else {
+        return false;
+    };
+
+    module_contains(&hir.item_tree, owner, current)
+}
+
 fn capture_mode(is_move: bool, use_kind: ValueUse) -> CaptureMode {
     if is_move {
         return CaptureMode::Value;
@@ -46,37 +127,14 @@ impl TypeChecker<'_> {
         struct_id: StructId,
         visibility: &Visibility,
     ) -> bool {
-        if visibility.is_public() {
-            return true;
-        }
-
-        let strukt = &self.hir.item_tree.structs[struct_id];
-        if self.hir.package_for_range(strukt.name_range)
-            != self.hir.package_for_range(ctx.owner_range())
-        {
-            return false;
-        }
-
-        let Some(owner) = containing_module(
-            &self.hir.item_tree,
-            &self.hir.item_tree.top_level,
-            &|item| matches!(item, TopLevelItem::Struct(id) if id == struct_id),
+        struct_field_is_visible_for_owner(
+            self.hir,
+            ctx.owner_range(),
+            ctx.function_id,
+            ctx.const_id,
+            struct_id,
+            visibility,
         )
-        .flatten() else {
-            return true;
-        };
-        let Some(current) = containing_module(
-            &self.hir.item_tree,
-            &self.hir.item_tree.top_level,
-            &|item| {
-                item_contains_body_owner(&self.hir.item_tree, item, ctx.function_id, ctx.const_id)
-            },
-        )
-        .flatten() else {
-            return false;
-        };
-
-        module_contains(&self.hir.item_tree, owner, current)
     }
 
     fn check_struct_field_visibility(

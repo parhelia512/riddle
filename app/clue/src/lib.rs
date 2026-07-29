@@ -28,6 +28,7 @@ pub struct ProjectAnalysis {
 pub struct ProjectSession {
     checker: riddlec::pipeline::CheckSession,
     cached: Option<CachedProject>,
+    revision: u64,
 }
 
 struct CachedProject {
@@ -42,10 +43,7 @@ impl ProjectSession {
         path: &Path,
         overlays: &HashMap<PathBuf, String>,
     ) -> anyhow::Result<project::LoadedPackage> {
-        let normalized_overlays = overlays
-            .iter()
-            .map(|(path, source)| (normalized_path(path), source.clone()))
-            .collect::<HashMap<_, _>>();
+        let normalized_overlays = normalized_overlays(overlays);
         let mut topology_changed = false;
         if let Some(cached) = &self.cached {
             let relevant_overlays =
@@ -62,6 +60,7 @@ impl ProjectSession {
         if topology_changed {
             self.checker = riddlec::pipeline::CheckSession::default();
         }
+        self.revision = self.revision.wrapping_add(1).max(1);
         self.cached = Some(CachedProject {
             overlays: relevant_overlays(&normalized_overlays, &package.source.files),
             disk: file_stamps(&package.watched_files, &normalized_overlays),
@@ -69,6 +68,25 @@ impl ProjectSession {
         });
         Ok(package)
     }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn inputs_are_current(&self, overlays: &HashMap<PathBuf, String>) -> bool {
+        let normalized_overlays = normalized_overlays(overlays);
+        self.cached.as_ref().is_some_and(|cached| {
+            relevant_overlays(&normalized_overlays, &cached.package.source.files) == cached.overlays
+                && file_stamps(&cached.package.watched_files, &normalized_overlays) == cached.disk
+        })
+    }
+}
+
+fn normalized_overlays(overlays: &HashMap<PathBuf, String>) -> HashMap<PathBuf, String> {
+    overlays
+        .iter()
+        .map(|(path, source)| (normalized_path(path), source.clone()))
+        .collect()
 }
 
 fn relevant_overlays(

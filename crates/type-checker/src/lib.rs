@@ -10,6 +10,7 @@ mod trait_env;
 mod traits;
 mod types;
 
+pub use body::struct_field_is_visible;
 pub use checker::{TypeChecker, check_hir};
 pub use incremental::{
     IncrementalStats, IncrementalTypeCheckResult, IncrementalTypeChecker, check_hir_incremental,

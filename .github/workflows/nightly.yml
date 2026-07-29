@@ -119,6 +119,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: 安装 Node.js（仅原生目标）
+        if: matrix.cross != true
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
       - name: 安装交叉编译依赖（Linux i686）
         if: matrix.target == 'i686-unknown-linux-gnu'
         run: |
@@ -136,6 +142,14 @@ jobs:
 
       - name: Release 构建
         run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: LSP stdio smoke（仅原生目标）
+        if: matrix.cross != true
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/riddle-lsp"
+          if [ "${{ matrix.platform }}" = "windows" ]; then BIN="${BIN}.exe"; fi
+          node editors/lsp-smoke.mjs "$BIN"
 
       - name: 打包平台构建产物
         shell: bash
