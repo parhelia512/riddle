@@ -96,7 +96,8 @@ ast_node!(PtrType, PtrType);
 ast_node!(TupleType, TupleType);
 ast_node!(ArrayType, ArrayType);
 ast_node!(ConstType, ConstType);
-ast_node!(FnType, FnType);
+ast_node!(ImplTraitType, ImplTraitType);
+ast_node!(CallableTraitArgs, CallableTraitArgs);
 
 // patterns
 ast_node!(WildcardPat, WildcardPattern);
@@ -587,6 +588,7 @@ pub struct GenericBound {
     pub trait_path: Path,
     pub type_args: Vec<Type>,
     pub assoc_constraints: Vec<GenericAssocConstraint>,
+    pub callable: Option<CallableTraitArgs>,
 }
 
 #[derive(Debug, Clone)]
@@ -659,6 +661,11 @@ fn parse_generic_bounds(elements: &[SyntaxElement]) -> Vec<GenericBound> {
                 trait_path,
                 type_args,
                 assoc_constraints,
+                callable: bound.iter().find_map(|element| {
+                    element
+                        .as_node()
+                        .and_then(|node| CallableTraitArgs::cast(node.clone()))
+                }),
             })
         })
         .collect()
@@ -797,6 +804,10 @@ impl Block {
 }
 
 impl LambdaExpr {
+    pub fn is_move(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Move).is_some()
+    }
+
     pub fn param_list(&self) -> Option<ParamList> {
         support::child(&self.syntax)
     }
@@ -1259,29 +1270,22 @@ impl ConstType {
     }
 }
 
-impl FnType {
-    pub fn is_unsafe(&self) -> bool {
-        support::token_of(&self.syntax, SyntaxKind::Unsafe).is_some()
+impl ImplTraitType {
+    pub fn bound(&self) -> Option<GenericBound> {
+        let elements = self.syntax.children_with_tokens().collect::<Vec<_>>();
+        parse_generic_bounds(&elements).into_iter().next()
     }
+}
 
-    pub fn param_types(&self) -> impl Iterator<Item = Type> + '_ {
-        let arrow = support::token_of(&self.syntax, SyntaxKind::Arrow)
-            .map(|token| token.text_range().start());
-        self.syntax.children().filter_map(move |node| {
-            if arrow.is_some_and(|offset| node.text_range().start() > offset) {
-                None
-            } else {
-                Type::cast(node)
-            }
-        })
+impl CallableTraitArgs {
+    pub fn params(&self) -> impl Iterator<Item = Type> + '_ {
+        let ret = self.return_type().map(|ty| ty.syntax().text_range());
+        support::children(&self.syntax)
+            .filter(move |ty: &Type| Some(ty.syntax().text_range()) != ret)
     }
 
     pub fn return_type(&self) -> Option<Type> {
-        let arrow = support::token_of(&self.syntax, SyntaxKind::Arrow)?;
-        self.syntax
-            .children()
-            .filter(|node| node.text_range().start() > arrow.text_range().start())
-            .find_map(Type::cast)
+        support::last_child(&self.syntax)
     }
 }
 
@@ -1666,7 +1670,7 @@ pub enum Type {
     Tuple(TupleType),
     Array(ArrayType),
     Const(ConstType),
-    Function(FnType),
+    ImplTrait(ImplTraitType),
 }
 
 impl AstNode for Type {
@@ -1679,7 +1683,7 @@ impl AstNode for Type {
             SyntaxKind::TupleType => Some(Type::Tuple(TupleType { syntax: node })),
             SyntaxKind::ArrayType => Some(Type::Array(ArrayType { syntax: node })),
             SyntaxKind::ConstType => Some(Type::Const(ConstType { syntax: node })),
-            SyntaxKind::FnType => Some(Type::Function(FnType { syntax: node })),
+            SyntaxKind::ImplTraitType => Some(Type::ImplTrait(ImplTraitType { syntax: node })),
             _ => None,
         }
     }
@@ -1693,7 +1697,7 @@ impl AstNode for Type {
             Type::Tuple(it) => it.syntax(),
             Type::Array(it) => it.syntax(),
             Type::Const(it) => it.syntax(),
-            Type::Function(it) => it.syntax(),
+            Type::ImplTrait(it) => it.syntax(),
         }
     }
 }

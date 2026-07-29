@@ -15,8 +15,11 @@ pub use incremental::{
     IncrementalStats, IncrementalTypeCheckResult, IncrementalTypeChecker, check_hir_incremental,
 };
 pub use result::{
-    CaptureMode, CaptureSource, Diagnostic, ForLoopInfo, LabelStyle, LambdaCapture, LambdaInfo,
-    OperatorCall, PatternBindingMode, Severity, SourceLabel, TraitMethodCall, TypeCheckResult,
+    CaptureMode, CapturePlace, CaptureSource, Diagnostic, ForLoopInfo, LabelStyle, LambdaCapture,
+    LambdaInfo, OperatorCall, PatternBindingMode, Severity, SourceLabel, TraitMethodCall,
+    TypeCheckResult, ValueUse,
 };
 pub use trait_env::TraitEnv;
-pub use types::{ClosureKind, ConstArg, FloatTy, IntTy, Type};
+pub use types::{
+    CallableSignature, ClosureId, ClosureKind, ConstArg, FloatTy, IntTy, OpaqueCallableId, Type,
+};

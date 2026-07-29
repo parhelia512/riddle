@@ -610,11 +610,11 @@ fn assignment_reinitializes_binding_after_rhs_move() {
         r#"
         struct Point { x: i32 }
 
-        fun move(value: Point) -> Point { value }
+        fun consume(value: Point) -> Point { value }
 
         fun f(flag: bool) {
             let mut p = Point{x: 1};
-            if flag { p = move(p); } else { }
+            if flag { p = consume(p); } else { }
             let q = p;
         }
         "#,
@@ -1460,7 +1460,7 @@ fn once_closure_cannot_be_called_twice() {
 fn closure_value_moves_when_passed_by_value() {
     let result = analyze(
         r#"
-        fun consume(f: fun(i32) -> i32) {}
+        fun consume(f: impl Fn(i32) -> i32) {}
 
         fun test() {
             let add_one = fun(value: i32) { value + 1 };
@@ -1486,13 +1486,9 @@ fn once_closure_stays_once_after_branch_join() {
         fun consume(value: Token) {}
 
         fun main() {
-            let left = Token { value: 1 };
-            let right = Token { value: 2 };
-            let once = if true {
-                fun() { consume(left); }
-            } else {
-                fun() { consume(right); }
-            };
+            let token = Token { value: 1 };
+            let once = fun() { consume(token); };
+            let once = if true { once } else { once };
             once();
             once();
         }
@@ -1504,6 +1500,22 @@ fn once_closure_stays_once_after_branch_join() {
             .iter()
             .any(|message| message.contains("use of moved value") && message.contains("once"))
     );
+}
+
+#[test]
+fn fn_once_parameter_is_consumed_by_its_first_call() {
+    let result = analyze(
+        r#"
+        fun call_twice(callback: impl FnOnce() -> i32) -> i32 {
+            callback();
+            callback()
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0100" && diagnostic.message.contains("callback")
+    }));
 }
 
 #[test]
@@ -1598,5 +1610,37 @@ fn moving_a_destructured_binding_twice_is_rejected() {
             .any(|message| message.contains("use of moved value") && message.contains("first")),
         "{:?}",
         messages(&result)
+    );
+}
+
+#[test]
+fn by_value_operator_makes_its_closure_single_use() {
+    let result = analyze(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+        struct Token { value: i32 }
+        impl Add for Token {
+            type Output = i32;
+            fun add(self, rhs: Self) -> i32 { self.value + rhs.value }
+        }
+        fun main() {
+            let left = Token { value: 1 };
+            let right = Token { value: 2 };
+            let add = fun() { left + right };
+            add();
+            add();
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "E0100" && diagnostic.message.contains("add") })
     );
 }

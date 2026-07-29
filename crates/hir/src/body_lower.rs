@@ -560,6 +560,7 @@ impl<'a> BodyLower<'a> {
                                 LambdaParam {
                                     name: lower_name(name_token.clone()),
                                     name_range: name_token.map(|token| token.text_range()),
+                                    is_mut: param.is_mut(),
                                     ty_range: ty.as_ref().map(|ty| trimmed_range(ty.syntax())),
                                     ty: self.lower_optional_type(ty),
                                 }
@@ -577,6 +578,7 @@ impl<'a> BodyLower<'a> {
                 );
                 self.alloc_expr(
                     Expr::Lambda {
+                        is_move: lambda.is_move(),
                         params,
                         ret_type,
                         ret_type_range,

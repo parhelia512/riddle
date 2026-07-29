@@ -8,7 +8,7 @@ use rowan::TextRange;
 
 use crate::{
     TraitEnv,
-    types::{ClosureKind, Type},
+    types::{ClosureKind, OpaqueCallableId, Type},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +55,8 @@ pub struct TypeCheckResult {
     pub pattern_types: HashMap<(BodyId, PatId), Type>,
     pub pattern_binding_types: HashMap<(BodyId, PatternBindingId), Type>,
     pub pattern_binding_modes: HashMap<(BodyId, PatternBindingId), PatternBindingMode>,
+    pub value_uses: HashMap<(BodyId, ExprId), ValueUse>,
+    pub opaque_hidden_types: HashMap<OpaqueCallableId, Type>,
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,
@@ -92,12 +94,21 @@ pub enum CaptureMode {
     Value,
 }
 
-impl CaptureMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueUse {
+    Shared,
+    Mutable,
+    Copy,
+    Move,
+}
+
+impl ValueUse {
     pub(crate) fn merge(self, other: Self) -> Self {
-        use CaptureMode::{Mutable, Shared, Value};
+        use ValueUse::{Copy, Move, Mutable, Shared};
         match (self, other) {
-            (Value, _) | (_, Value) => Value,
+            (Move, _) | (_, Move) => Move,
             (Mutable, _) | (_, Mutable) => Mutable,
+            (Copy, _) | (_, Copy) => Copy,
             _ => Shared,
         }
     }
@@ -110,12 +121,44 @@ pub enum CaptureSource {
     LambdaParam { lambda: ExprId, index: usize },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CapturePlace {
+    pub source: CaptureSource,
+    pub projections: Vec<hir::place::Projection>,
+}
+
+impl CapturePlace {
+    pub fn root(source: CaptureSource) -> Self {
+        Self {
+            source,
+            projections: Vec::new(),
+        }
+    }
+
+    pub fn is_prefix_of(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.projections.len() <= other.projections.len()
+            && self
+                .projections
+                .iter()
+                .zip(&other.projections)
+                .all(|(left, right)| match (left, right) {
+                    (hir::place::Projection::Index(None), hir::place::Projection::Index(_))
+                    | (hir::place::Projection::Index(_), hir::place::Projection::Index(None)) => {
+                        true
+                    }
+                    _ => left == right,
+                })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LambdaCapture {
-    pub source: CaptureSource,
+    pub place: CapturePlace,
     pub name: String,
     pub ty: Type,
     pub mode: CaptureMode,
+    pub use_kind: ValueUse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

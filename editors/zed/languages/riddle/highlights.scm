@@ -93,6 +93,7 @@
   "impl"
   "let"
   "mod"
+  "move"
   "pub"
   "struct"
   "for"
@@ -127,7 +128,7 @@
 ((identifier) @keyword
   (#any-of? @keyword
     "let" "fun" "struct" "as" "self" "mod" "use" "mut" "pub" "super" "crate"
-    "enum" "trait" "impl" "const" "type" "extern" "unsafe" "safe" "where"))
+    "enum" "trait" "impl" "const" "type" "extern" "unsafe" "safe" "where" "move"))
 
 ((identifier) @boolean
   (#any-of? @boolean "true" "false"))

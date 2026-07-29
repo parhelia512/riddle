@@ -38,4 +38,60 @@ mod tests {
 
         assert!(!parse.errors.is_empty());
     }
+
+    #[test]
+    fn accepts_callable_bounds_move_lambdas_and_mutable_parameters() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r#"
+            fun apply(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
+                f(value)
+            }
+
+            fun main() {
+                let bump = move fun(mut value: i32) {
+                    value += 1;
+                    value
+                };
+            }
+            "#,
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+    }
+
+    #[test]
+    fn accepts_parenthesized_callable_generic_bounds() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            "fun apply<F>(f: F, value: i32) -> i32 where F: Fn(i32) -> i32 { f(value) }",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+    }
+
+    #[test]
+    fn rejects_removed_structural_function_type() {
+        let mut parser = IncrementalParser::new();
+        let source = ["fun apply(f: ", "fun(i32) -> i32) {}"].concat();
+        let parse = parser.set_source(&source);
+
+        assert!(parse.errors.iter().any(|error| {
+            error
+                .message
+                .contains("function type syntax has been removed")
+                && error.message.contains("impl Fn(i32) -> i32")
+        }));
+    }
+
+    #[test]
+    fn anonymous_functions_keep_named_nongeneric_parameters() {
+        let mut parser = IncrementalParser::new();
+        let pattern =
+            parser.set_source("fun main() { let f = fun((left, right): (i32, i32)) { left }; }");
+        assert!(!pattern.errors.is_empty());
+
+        let generic = parser.set_source("fun main() { let f = fun<T>(value: T) { value }; }");
+        assert!(!generic.errors.is_empty());
+    }
 }

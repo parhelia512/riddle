@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use hir::{
-    body::{Body, BodyId, ExprId, PatternBindingId, SourceMap, StmtId},
+    body::{Body, BodyId, ExprId, PatternBindingId, ResolvedName, SourceMap, StmtId},
     item_tree::{ConstId, FunctionId, HirConst, HirFunction},
 };
 use rowan::TextRange;
@@ -112,11 +112,31 @@ impl<'a> BodyCtx<'a> {
     pub(crate) fn pat_range(&self, id: hir::body::PatId) -> Option<TextRange> {
         self.source_map.pat_ranges.get(&id).copied()
     }
+
+    pub(crate) fn resolved_param_is_mut(&self, resolved: &ResolvedName) -> bool {
+        match resolved {
+            ResolvedName::Param(index) => self
+                .function
+                .and_then(|function| function.params.get(*index))
+                .is_some_and(|param| param.is_mut),
+            ResolvedName::LambdaParam { lambda, index } => self
+                .lambdas
+                .iter()
+                .rev()
+                .find(|ctx| ctx.expr == *lambda)
+                .and_then(|ctx| ctx.param_mutability.get(*index))
+                .copied()
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
 }
 
 pub(crate) struct LambdaCtx {
     pub(crate) expr: ExprId,
     pub(crate) params: Vec<Type>,
+    pub(crate) param_mutability: Vec<bool>,
+    pub(crate) is_move: bool,
     pub(crate) outer_patterns: HashSet<PatternBindingId>,
     pub(crate) captures: Vec<LambdaCapture>,
 }

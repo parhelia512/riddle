@@ -377,8 +377,8 @@ fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         SyntaxKind::NamedType
         | SyntaxKind::RefType
         | SyntaxKind::TupleType
-        | SyntaxKind::ArrayType => Some(ReparseEntry::Type),
-        SyntaxKind::FnType => Some(ReparseEntry::Type),
+        | SyntaxKind::ArrayType
+        | SyntaxKind::ImplTraitType => Some(ReparseEntry::Type),
 
         SyntaxKind::UseDecl | SyntaxKind::ModDecl => Some(ReparseEntry::Statement),
 

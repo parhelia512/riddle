@@ -81,6 +81,42 @@ fn resolve_hir_updates_expr_path_resolutions() {
 }
 
 #[test]
+fn lowers_move_lambda_mutable_params_and_impl_fn() {
+    let (hir, _) = build_hir_and_graph(
+        r#"
+        fun apply(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
+            f(value)
+        }
+        fun main() {
+            let bump = move fun(mut value: i32) { value };
+        }
+        "#,
+    );
+
+    let apply = hir
+        .item_tree
+        .functions
+        .iter()
+        .map(|(_, function)| function)
+        .find(|function| function.name.0 == "apply")
+        .unwrap();
+    assert!(apply.params[0].is_mut);
+    assert_eq!(apply.implicit_generics.len(), 1);
+    assert!(matches!(
+        &apply.params[0].ty,
+        hir::item_tree::HirTypeRef::ImplTrait { .. }
+    ));
+
+    assert!(
+        hir.bodies
+            .iter()
+            .any(|(_, body)| body.exprs.iter().any(|(_, expr)| {
+                matches!(expr, Expr::Lambda { is_move: true, params, .. } if params[0].is_mut)
+            }))
+    );
+}
+
+#[test]
 fn assignment_and_struct_literal_parse_and_lower() {
     let source = r#"
         struct Foo {

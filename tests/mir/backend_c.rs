@@ -336,7 +336,7 @@ fn c_array_comparison_is_lowered_elementwise() {
 fn c_anonymous_function_uses_typed_function_pointer() {
     let module = lower(
         r#"
-        fun apply(f: fun(i32) -> i32, value: i32) -> i32 {
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 {
             f(value)
         }
 
@@ -395,7 +395,7 @@ fn c_non_escaping_closure_capture_uses_stack_environment() {
 fn c_returned_closure_keeps_parameter_alive() {
     let module = lower(
         r#"
-        fun make_adder(base: i32) -> fun(i32) -> i32 {
+        fun make_adder(base: i32) -> impl Fn(i32) -> i32 {
             fun(value: i32) { base + value }
         }
 
@@ -428,7 +428,7 @@ fn c_gc_closure_environment_has_deterministic_drop_glue() {
         impl Drop for Guard { fun drop(&mut self) {} }
         fun consume(value: Guard) {}
 
-        fun make() -> fun() {
+        fun make() -> impl FnOnce() -> () {
             let guard = Guard {};
             fun() { consume(guard); }
         }
@@ -460,7 +460,7 @@ fn c_named_function_value_uses_empty_environment_adapter() {
     let module = lower(
         r#"
         fun inc(value: i32) -> i32 { value + 1 }
-        fun apply(f: fun(i32) -> i32, value: i32) -> i32 { f(value) }
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun main() -> i32 { apply(inc, 41) }
         "#,
     );
@@ -470,10 +470,7 @@ fn c_named_function_value_uses_empty_environment_adapter() {
         generated.contains(&c_function("__riddle_fn_adapter_inc")),
         "{generated}"
     );
-    assert!(
-        generated.contains(&format!("{}(s", c_function("apply"))),
-        "{generated}"
-    );
+    assert!(generated.contains(&c_function("apply__")), "{generated}");
 }
 
 #[test]
@@ -579,6 +576,18 @@ fn c_backend_emits_unicode_char_as_u32_code_point() {
     );
     assert!(generated.contains("UINT32_C(20013)"), "{generated}");
     assert!(!generated.contains("'\u{4e2d}'"), "{generated}");
+}
+
+#[test]
+fn c_backend_casts_char_to_u32_code_point() {
+    let module = lower("fun code_point() -> u32 { '\u{4e2d}' as u32 }");
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains(&format!("uint32_t {}", c_function("code_point"))),
+        "{generated}"
+    );
+    assert!(generated.contains("UINT32_C(20013)"), "{generated}");
 }
 
 #[test]
@@ -1799,4 +1808,82 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
         run.status
     );
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn c_closure_environment_stores_only_the_captured_field() {
+    let module = lower(
+        r#"
+        struct First { value: i32 }
+        struct Second { value: i32 }
+        struct Pair { first: First, second: Second }
+        fun read(value: First) -> i32 { value.value }
+        fun main() -> i32 {
+            let pair = Pair {
+                first: First { value: 1 },
+                second: Second { value: 2 },
+            };
+            let take_first = fun() { read(pair.first) };
+            pair.second.value
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+    let member = c_member("capture_0_pair_first");
+    let capture_line = generated
+        .lines()
+        .find(|line| line.contains(&member))
+        .expect("missing projected capture field");
+
+    assert!(capture_line.contains(&c_type("First")), "{capture_line}");
+    assert!(!capture_line.contains(&c_type("Pair")), "{capture_line}");
+}
+
+#[test]
+fn c_impl_fn_supports_closures_named_functions_and_opaque_returns() {
+    let module = lower(
+        r#"
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
+        fun increment(value: i32) -> i32 { value + 1 }
+        fun make(base: i32) -> impl Fn(i32) -> i32 {
+            move fun(value: i32) { base + value }
+        }
+        fun main() -> i32 {
+            apply(increment, 1) + apply(make(38), 2)
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains(&c_function("apply__")), "{generated}");
+    assert!(
+        generated.contains(&c_function("__riddle_fn_adapter_increment")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&c_function("__riddle_lambda_")),
+        "{generated}"
+    );
+    assert!(!generated.contains("vtable"), "{generated}");
+}
+
+#[test]
+fn c_generic_function_item_adapter_targets_one_instantiation() {
+    let module = lower(
+        r#"
+        fun identity<T>(value: T) -> T { value }
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
+        fun main() -> i32 { apply(identity, 42) }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains(&c_function("identity__i32")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&c_function("__riddle_fn_adapter_identity__i32")),
+        "{generated}"
+    );
 }

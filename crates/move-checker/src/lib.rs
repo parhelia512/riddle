@@ -12,8 +12,8 @@ use hir::{
     place::Place,
 };
 use type_checker::{
-    CaptureMode, CaptureSource, ClosureKind, Diagnostic, LabelStyle, LambdaInfo,
-    PatternBindingMode, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult,
+    CaptureMode, CapturePlace, CaptureSource, ClosureKind, Diagnostic, LabelStyle, LambdaInfo,
+    PatternBindingMode, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult, ValueUse,
 };
 
 mod initialization;
@@ -244,7 +244,7 @@ impl<'a> Analyzer<'a> {
         } = &ctx.body.exprs[ctx.body.root_block]
         {
             self.check_returned_drop_borrow(ctx, *tail);
-            self.consume_if_local(ctx, *tail);
+            self.apply_recorded_value_use(ctx, *tail);
         }
     }
 
@@ -314,7 +314,7 @@ impl<'a> Analyzer<'a> {
                 let mut origins = Origins::new();
                 for field in fields {
                     self.move_check_expr(ctx, field.value);
-                    self.consume_if_local(ctx, field.value);
+                    self.apply_recorded_value_use(ctx, field.value);
                     origins.extend(ctx.expr_origin_value(field.value).origins);
                 }
                 let value = if self.expr_may_carry_reference(ctx, expr_id) {
@@ -365,7 +365,7 @@ impl<'a> Analyzer<'a> {
                         }
                         ctx.bind_origin_value(binding, value);
                     }
-                    self.consume_if_local(ctx, *rhs);
+                    self.apply_recorded_value_use(ctx, *rhs);
                     if let Some(binding) = direct_assignment {
                         let place = Place::root(binding);
                         ctx.bindings.mark_available(&self.expr_name(ctx, *lhs));
@@ -378,6 +378,8 @@ impl<'a> Analyzer<'a> {
                 let origins = if op.is_assignment() {
                     ctx.expr_origins.get(rhs).cloned().unwrap_or_default()
                 } else {
+                    self.apply_recorded_value_use(ctx, *lhs);
+                    self.apply_recorded_value_use(ctx, *rhs);
                     self.deactivate_unretained(ctx, *lhs, &HashSet::new());
                     self.deactivate_unretained(ctx, *rhs, &HashSet::new());
                     Origins::new()
@@ -400,6 +402,7 @@ impl<'a> Analyzer<'a> {
                     Origins::new()
                 };
                 ctx.expr_origins.insert(expr_id, origins);
+                self.apply_recorded_value_use(ctx, *operand);
             }
 
             Expr::Block { stmts, tail } => {
@@ -410,7 +413,7 @@ impl<'a> Analyzer<'a> {
                 if let Some(tail) = tail {
                     self.move_check_expr(ctx, *tail);
                     ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*tail));
-                    self.consume_if_local(ctx, *tail);
+                    self.apply_recorded_value_use(ctx, *tail);
                 }
                 ctx.pop_scope();
             }
@@ -421,9 +424,12 @@ impl<'a> Analyzer<'a> {
                 else_branch,
             } => {
                 self.move_check_expr(ctx, *cond);
+                self.apply_recorded_value_use(ctx, *cond);
                 self.move_check_expr(ctx, *then_branch);
+                self.apply_recorded_value_use(ctx, *then_branch);
                 if let Some(e) = else_branch {
                     self.move_check_expr(ctx, *e);
+                    self.apply_recorded_value_use(ctx, *e);
                 }
                 let mut value = ctx.expr_origin_value(*then_branch);
                 if let Some(e) = else_branch {
@@ -434,7 +440,9 @@ impl<'a> Analyzer<'a> {
 
             Expr::While { condition, body } => {
                 self.move_check_expr(ctx, *condition);
+                self.apply_recorded_value_use(ctx, *condition);
                 self.move_check_expr(ctx, *body);
+                self.apply_recorded_value_use(ctx, *body);
             }
 
             Expr::For {
@@ -445,7 +453,7 @@ impl<'a> Analyzer<'a> {
                 ctx.push_scope();
                 self.move_check_expr(ctx, *iterable);
                 let item_value = ctx.expr_origin_value(*iterable).iterated();
-                self.consume_if_local(ctx, *iterable);
+                self.apply_recorded_value_use(ctx, *iterable);
                 let item_ty = self
                     .type_result
                     .for_loops
@@ -523,6 +531,7 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                     self.move_check_expr(ctx, arm.body);
+                    self.apply_recorded_value_use(ctx, arm.body);
                     ctx.pop_scope();
                     merged_bindings.merge_moved_from(&ctx.bindings);
                     merged_moved_places.extend(ctx.moved_places.iter().cloned());
@@ -542,7 +551,7 @@ impl<'a> Analyzer<'a> {
                 let mut fields = Vec::with_capacity(elements.len());
                 for el in elements {
                     self.move_check_expr(ctx, *el);
-                    self.consume_if_local(ctx, *el);
+                    self.apply_recorded_value_use(ctx, *el);
                     fields.push(ctx.expr_origin_value(*el));
                 }
                 ctx.set_expr_origin_value(expr_id, OriginValue::from_fields(fields));
@@ -550,8 +559,9 @@ impl<'a> Analyzer<'a> {
 
             Expr::ArrayRepeat { value, len } => {
                 self.move_check_expr(ctx, *value);
-                self.consume_if_local(ctx, *value);
+                self.apply_recorded_value_use(ctx, *value);
                 self.move_check_expr(ctx, *len);
+                self.apply_recorded_value_use(ctx, *len);
                 ctx.set_expr_origin_value(
                     expr_id,
                     OriginValue::from_fields(vec![ctx.expr_origin_value(*value)]),
@@ -579,20 +589,10 @@ impl<'a> Analyzer<'a> {
                 let (inputs, modes, fid) = self.call_signature(ctx, *callee, args);
                 let value = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, span);
                 ctx.set_expr_origin_value(expr_id, value);
-                for (index, input) in inputs.iter().enumerate() {
-                    if modes.get(index).copied().flatten().is_none() {
-                        self.consume_if_local(ctx, *input);
-                    }
+                for input in &inputs {
+                    self.apply_recorded_value_use(ctx, *input);
                 }
-                if self
-                    .type_result
-                    .expr_types
-                    .get(&(ctx.body_id, *callee))
-                    .and_then(Type::closure_kind)
-                    == Some(ClosureKind::FnOnce)
-                {
-                    self.consume_if_local(ctx, *callee);
-                }
+                self.apply_recorded_value_use(ctx, *callee);
             }
 
             Expr::Lambda { params, body, .. } => {
@@ -610,11 +610,13 @@ impl<'a> Analyzer<'a> {
             Expr::Unsafe { body } => {
                 self.move_check_expr(ctx, *body);
                 ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*body));
+                self.apply_recorded_value_use(ctx, *body);
             }
 
             Expr::Cast { base, .. } => {
                 self.move_check_expr(ctx, *base);
                 ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*base));
+                self.apply_recorded_value_use(ctx, *base);
             }
 
             Expr::FieldAccess { base, field } => {
@@ -691,17 +693,18 @@ impl<'a> Analyzer<'a> {
                     self.bind_pattern_origins(ctx, pat, &value);
                     self.deactivate_unretained(ctx, init, &HashSet::new());
                     self.check_explicit_reference_pattern_move(ctx, pat);
-                    if self.pattern_moves_non_copy(ctx, pat) {
-                        self.consume_if_local(ctx, init);
-                    }
+                    self.apply_recorded_value_use(ctx, init);
                 }
             }
-            Stmt::Expr { expr } => self.move_check_expr(ctx, *expr),
+            Stmt::Expr { expr } => {
+                self.move_check_expr(ctx, *expr);
+                self.apply_recorded_value_use(ctx, *expr);
+            }
             Stmt::Return { value } => {
                 if let Some(v) = value {
                     self.move_check_expr(ctx, *v);
                     self.check_returned_drop_borrow(ctx, *v);
-                    self.consume_if_local(ctx, *v);
+                    self.apply_recorded_value_use(ctx, *v);
                 }
             }
             Stmt::Break | Stmt::Continue => {}
@@ -816,6 +819,18 @@ impl<'a> Analyzer<'a> {
         ctx.moved_sites.insert(place, (span, desc));
     }
 
+    fn apply_recorded_value_use(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        if self
+            .type_result
+            .value_uses
+            .get(&(ctx.body_id, expr_id))
+            .copied()
+            == Some(ValueUse::Move)
+        {
+            self.consume_if_local(ctx, expr_id);
+        }
+    }
+
     fn root_type_from_expr<'b>(&'b self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<&'b Type> {
         let mut root = expr_id;
         loop {
@@ -834,12 +849,12 @@ impl<'a> Analyzer<'a> {
             .get(&(ctx.body_id, expr_id))
             .into_iter()
             .flat_map(|info| &info.captures)
-            .find_map(|capture| match capture.source {
+            .find_map(|capture| match &capture.place.source {
                 CaptureSource::Pattern(id)
                     if capture.mode != CaptureMode::Value
-                        && self.local_has_explicit_drop(ctx, id) =>
+                        && self.local_has_explicit_drop(ctx, *id) =>
                 {
-                    Some(id)
+                    Some(*id)
                 }
                 _ => None,
             });
@@ -893,11 +908,8 @@ impl<'a> Analyzer<'a> {
                 );
                 continue;
             }
-            let move_place = match capture.source {
-                CaptureSource::Pattern(id) => Some(Place::root(id)),
-                CaptureSource::Param(_) | CaptureSource::LambdaParam { .. } => None,
-            };
-            let access_place = access_place_from_capture_source(&capture.source);
+            let move_place = move_place_from_capture(&capture.place);
+            let access_place = access_place_from_capture(&capture.place);
             if let Some(place) = &move_place
                 && ctx
                     .moved_places
@@ -953,7 +965,9 @@ impl<'a> Analyzer<'a> {
                     if self.trait_env.type_is_copy(&capture.ty) {
                         continue;
                     }
-                    if ctx.in_match_guard && matches!(capture.source, CaptureSource::Pattern(_)) {
+                    if ctx.in_match_guard
+                        && matches!(&capture.place.source, CaptureSource::Pattern(_))
+                    {
                         self.diag(
                             format!(
                                 "cannot move pattern binding `{}` in a match guard",
@@ -961,6 +975,23 @@ impl<'a> Analyzer<'a> {
                             ),
                             span,
                             "E0307",
+                        );
+                        continue;
+                    }
+                    if !capture.place.projections.is_empty()
+                        && match &capture.place.source {
+                            CaptureSource::Pattern(id) => self
+                                .type_result
+                                .pattern_binding_types
+                                .get(&(ctx.body_id, *id))
+                                .is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty)),
+                            CaptureSource::Param(_) | CaptureSource::LambdaParam { .. } => false,
+                        }
+                    {
+                        self.diag(
+                            "cannot move out of a field of a type that implements `Drop`".into(),
+                            span,
+                            "E0305",
                         );
                         continue;
                     }
@@ -977,7 +1008,9 @@ impl<'a> Analyzer<'a> {
                         ctx.moved_sites
                             .insert(place, (span, "value moved into closure here".into()));
                     }
-                    ctx.bindings.mark_moved(&capture.name);
+                    if capture.place.projections.is_empty() {
+                        ctx.bindings.mark_moved(&capture.name);
+                    }
                 }
             }
         }
@@ -1216,7 +1249,7 @@ impl<'a> Analyzer<'a> {
         }
 
         let fid = match self.type_result.expr_types.get(&(ctx.body_id, callee)) {
-            Some(Type::Function(fid)) => Some(*fid),
+            Some(Type::FunctionItem { function: fid, .. }) => Some(*fid),
             _ => None,
         };
         if let Some(fid) = fid {
@@ -1239,7 +1272,11 @@ impl<'a> Analyzer<'a> {
 
         let inputs = args.to_vec();
         let modes = match self.type_result.expr_types.get(&(ctx.body_id, callee)) {
-            Some(Type::Fn { params, .. }) => params.iter().map(type_ref_kind).collect(),
+            Some(
+                Type::CallableConstraint(signature)
+                | Type::Closure { signature, .. }
+                | Type::OpaqueCallable { signature, .. },
+            ) => signature.params.iter().map(type_ref_kind).collect(),
             _ => vec![None; inputs.len()],
         };
         (inputs, modes, None)
@@ -2432,8 +2469,8 @@ fn access_place_from_resolved_name(name: &ResolvedName) -> Option<AccessPlace> {
     Some(AccessPlace::new(root))
 }
 
-fn access_place_from_capture_source(source: &CaptureSource) -> AccessPlace {
-    let root = match source {
+fn access_place_from_capture(place: &CapturePlace) -> AccessPlace {
+    let root = match &place.source {
         CaptureSource::Pattern(id) => AccessRoot::Pattern(*id),
         CaptureSource::Param(index) => AccessRoot::Param(*index),
         CaptureSource::LambdaParam { lambda, index } => AccessRoot::LambdaParam {
@@ -2441,7 +2478,28 @@ fn access_place_from_capture_source(source: &CaptureSource) -> AccessPlace {
             index: *index,
         },
     };
-    AccessPlace::new(root)
+    let mut result = AccessPlace::new(root);
+    for projection in &place.projections {
+        result = match projection {
+            hir::place::Projection::Field(index) => result.field(*index),
+            hir::place::Projection::Index(index) => result.index(*index),
+        };
+    }
+    result
+}
+
+fn move_place_from_capture(capture: &CapturePlace) -> Option<Place> {
+    let CaptureSource::Pattern(id) = &capture.source else {
+        return None;
+    };
+    let mut place = Place::root(*id);
+    for projection in &capture.projections {
+        place = match projection {
+            hir::place::Projection::Field(index) => place.field(*index),
+            hir::place::Projection::Index(index) => place.index(*index),
+        };
+    }
+    Some(place)
 }
 
 fn hir_ref_kind(ty: &HirTypeRef) -> Option<BorrowKind> {

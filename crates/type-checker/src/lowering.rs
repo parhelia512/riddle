@@ -1,17 +1,42 @@
 use std::collections::HashMap;
 
-use hir::item_tree::{EnumId, HirConstArg, HirPath, HirTypeRef, StructId, TraitId, TypeAliasId};
+use hir::item_tree::{
+    EnumId, HirCallableSignature, HirConstArg, HirPath, HirTypeRef, StructId, TraitId, TypeAliasId,
+};
 use rowan::TextRange;
 
 use crate::{
     checker::TypeChecker,
-    types::{ClosureKind, ConstArg, FloatTy, IntTy, Type},
+    types::{CallableSignature, ClosureKind, ConstArg, FloatTy, IntTy, OpaqueCallableId, Type},
 };
+
+pub(crate) fn builtin_callable_kind(ty: &HirTypeRef) -> Option<ClosureKind> {
+    let HirTypeRef::Named(path) = ty else {
+        return None;
+    };
+    match path.as_single_name()?.0.as_str() {
+        "Fn" => Some(ClosureKind::Fn),
+        "FnMut" => Some(ClosureKind::FnMut),
+        "FnOnce" => Some(ClosureKind::FnOnce),
+        _ => None,
+    }
+}
 
 impl TypeChecker<'_> {
     pub(crate) fn lower_type_alias(&mut self, type_alias: TypeAliasId) -> Type {
         let alias = self.hir.item_tree.type_aliases[type_alias].clone();
-        alias
+        if !self.lowering_type_aliases.insert(type_alias) {
+            self.diagnostic(
+                "E0391",
+                format!(
+                    "cycle detected when expanding type alias `{}`",
+                    alias.name.0
+                ),
+                Some(alias.name_range),
+            );
+            return Type::Error;
+        }
+        let ty = alias
             .ty
             .as_ref()
             .map(|ty| {
@@ -21,7 +46,9 @@ impl TypeChecker<'_> {
                     alias.ty_range.or(Some(alias.name_range)),
                 )
             })
-            .unwrap_or(Type::Unknown)
+            .unwrap_or(Type::Unknown);
+        self.lowering_type_aliases.remove(&type_alias);
+        ty
     }
 
     pub(crate) fn lower_type_ref_with_params_at(
@@ -67,19 +94,37 @@ impl TypeChecker<'_> {
                 )
             }
             HirTypeRef::Const(value) => Type::Const(self.lower_const_arg(value, params)),
-            HirTypeRef::Function {
-                is_unsafe,
-                params: fn_params,
-                ret,
-            } => Type::Fn {
-                is_unsafe: *is_unsafe,
-                kind: ClosureKind::Fn,
-                params: fn_params
-                    .iter()
-                    .map(|param| self.lower_type_ref_with_params_at(param, params, span))
-                    .collect(),
-                ret: Box::new(self.lower_type_ref_with_params_at(ret, params, span)),
-            },
+            HirTypeRef::ImplTrait {
+                trait_ty,
+                trait_range,
+                callable,
+                hidden,
+            } => {
+                let Some(kind) = builtin_callable_kind(trait_ty) else {
+                    self.diagnostic(
+                        "E0047",
+                        "only impl Fn, impl FnMut, and impl FnOnce are currently supported",
+                        span.or(Some(*trait_range)),
+                    );
+                    return Type::Unknown;
+                };
+                let Some(callable) = callable else {
+                    self.diagnostic(
+                        "E0047",
+                        format!("impl {} requires a callable signature", kind.as_str()),
+                        span.or(Some(*trait_range)),
+                    );
+                    return Type::Unknown;
+                };
+                if let Some(hidden) = hidden {
+                    Type::Param(hidden.0.clone())
+                } else {
+                    Type::OpaqueCallable {
+                        id: OpaqueCallableId(*trait_range),
+                        signature: self.lower_hir_callable_signature(callable, kind, params, span),
+                    }
+                }
+            }
             HirTypeRef::Unknown => Type::Unknown,
             HirTypeRef::Error => Type::Error,
         }
@@ -116,19 +161,7 @@ impl TypeChecker<'_> {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
             HirTypeRef::Const(value) => value.display(),
-            HirTypeRef::Function {
-                is_unsafe,
-                params,
-                ret,
-            } => {
-                let params = params
-                    .iter()
-                    .map(Self::type_text)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prefix = if *is_unsafe { "unsafe " } else { "" };
-                format!("{prefix}fun({params}) -> {}", Self::type_text(ret))
-            }
+            HirTypeRef::ImplTrait { .. } => ty.display(),
         }
     }
 
@@ -139,6 +172,25 @@ impl TypeChecker<'_> {
         match self.hir.type_resolutions.get(&path.range) {
             Some(hir::body::ResolvedName::Trait(id)) => Some(*id),
             _ => None,
+        }
+    }
+
+    pub(crate) fn lower_hir_callable_signature(
+        &mut self,
+        signature: &HirCallableSignature,
+        kind: ClosureKind,
+        params: &HashMap<String, Type>,
+        span: Option<TextRange>,
+    ) -> CallableSignature {
+        CallableSignature {
+            is_unsafe: false,
+            kind,
+            params: signature
+                .params
+                .iter()
+                .map(|param| self.lower_type_ref_with_params_at(param, params, span))
+                .collect(),
+            ret: Box::new(self.lower_type_ref_with_params_at(&signature.ret, params, span)),
         }
     }
 
@@ -570,29 +622,87 @@ pub(crate) fn collect_subst(
             }
             _ => false,
         },
-        Type::Fn {
-            is_unsafe: expected_unsafe,
-            kind: expected_kind,
-            params: expected_params,
-            ret: expected_ret,
+        Type::FunctionItem {
+            function: expected_function,
+            args: expected_args,
         } => match actual {
-            Type::Fn {
-                is_unsafe: actual_unsafe,
-                kind: actual_kind,
-                params: actual_params,
-                ret: actual_ret,
-            } if (!*actual_unsafe || *expected_unsafe)
-                && expected_kind.accepts(*actual_kind)
-                && expected_params.len() == actual_params.len() =>
+            Type::FunctionItem {
+                function: actual_function,
+                args: actual_args,
+            } if expected_function == actual_function
+                && expected_args.len() == actual_args.len() =>
             {
-                expected_params
+                expected_args
                     .iter()
-                    .zip(actual_params)
+                    .zip(actual_args)
                     .all(|(expected, actual)| collect_subst(expected, actual, subst))
-                    && collect_subst(expected_ret, actual_ret, subst)
             }
             _ => false,
         },
+        Type::Closure {
+            id: expected_id,
+            signature: expected,
+        } => match actual {
+            Type::Closure {
+                id: actual_id,
+                signature: actual,
+            } if expected_id == actual_id
+                && expected.kind == actual.kind
+                && expected.is_unsafe == actual.is_unsafe
+                && expected.params.len() == actual.params.len() =>
+            {
+                expected
+                    .params
+                    .iter()
+                    .zip(&actual.params)
+                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
+                    && collect_subst(&expected.ret, &actual.ret, subst)
+            }
+            _ => false,
+        },
+        Type::OpaqueCallable {
+            id: expected_id,
+            signature: expected,
+        } => match actual {
+            Type::OpaqueCallable {
+                id: actual_id,
+                signature: actual,
+            } if expected_id == actual_id
+                && expected.kind == actual.kind
+                && expected.is_unsafe == actual.is_unsafe
+                && expected.params.len() == actual.params.len() =>
+            {
+                expected
+                    .params
+                    .iter()
+                    .zip(&actual.params)
+                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
+                    && collect_subst(&expected.ret, &actual.ret, subst)
+            }
+            _ => false,
+        },
+        Type::CallableConstraint(expected) => {
+            let (actual_unsafe, actual_kind, actual_params, actual_ret) = match actual {
+                Type::CallableConstraint(signature)
+                | Type::Closure { signature, .. }
+                | Type::OpaqueCallable { signature, .. } => (
+                    signature.is_unsafe,
+                    signature.kind,
+                    signature.params.as_slice(),
+                    signature.ret.as_ref(),
+                ),
+                _ => return false,
+            };
+            (!actual_unsafe || expected.is_unsafe)
+                && expected.kind.accepts(actual_kind)
+                && expected.params.len() == actual_params.len()
+                && expected
+                    .params
+                    .iter()
+                    .zip(actual_params)
+                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
+                && collect_subst(&expected.ret, actual_ret, subst)
+        }
         _ => expected.is_unknown_like() || actual.is_unknown_like() || expected == actual,
     }
 }
@@ -643,17 +753,46 @@ pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type 
             *id,
             args.iter().map(|ty| substitute_type(ty, subst)).collect(),
         ),
-        Type::Fn {
-            is_unsafe,
-            kind,
-            params,
-            ret,
-        } => Type::Fn {
-            is_unsafe: *is_unsafe,
-            kind: *kind,
-            params: params.iter().map(|ty| substitute_type(ty, subst)).collect(),
-            ret: Box::new(substitute_type(ret, subst)),
+        Type::FunctionItem { function, args } => Type::FunctionItem {
+            function: *function,
+            args: args.iter().map(|ty| substitute_type(ty, subst)).collect(),
         },
+        Type::Closure { id, signature } => Type::Closure {
+            id: *id,
+            signature: crate::CallableSignature {
+                is_unsafe: signature.is_unsafe,
+                kind: signature.kind,
+                params: signature
+                    .params
+                    .iter()
+                    .map(|ty| substitute_type(ty, subst))
+                    .collect(),
+                ret: Box::new(substitute_type(&signature.ret, subst)),
+            },
+        },
+        Type::OpaqueCallable { id, signature } => Type::OpaqueCallable {
+            id: *id,
+            signature: crate::CallableSignature {
+                is_unsafe: signature.is_unsafe,
+                kind: signature.kind,
+                params: signature
+                    .params
+                    .iter()
+                    .map(|ty| substitute_type(ty, subst))
+                    .collect(),
+                ret: Box::new(substitute_type(&signature.ret, subst)),
+            },
+        },
+        Type::CallableConstraint(signature) => Type::CallableConstraint(crate::CallableSignature {
+            is_unsafe: signature.is_unsafe,
+            kind: signature.kind,
+            params: signature
+                .params
+                .iter()
+                .map(|ty| substitute_type(ty, subst))
+                .collect(),
+            ret: Box::new(substitute_type(&signature.ret, subst)),
+        }),
         _ => ty.clone(),
     }
 }

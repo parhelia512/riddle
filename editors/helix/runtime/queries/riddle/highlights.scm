@@ -1,1 +1,3 @@
 ; inherits: rust
+
+"move" @keyword

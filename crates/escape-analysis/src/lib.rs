@@ -457,7 +457,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 let mut sources: RefSources = std::iter::once(RefSource::Lambda(expr_id)).collect();
                 if let Some(info) = self.type_result.lambda_infos.get(&(ctx.body_id, expr_id)) {
                     for capture in &info.captures {
-                        let captured = self.capture_sources(&capture.source, capture.mode);
+                        let captured = self.capture_sources(&capture.place.source, capture.mode);
                         if matches!(capture.mode, CaptureMode::Shared | CaptureMode::Mutable) {
                             Self::mark_address_taken(ctx, &captured);
                         }
@@ -739,7 +739,9 @@ impl<'a> EscapeAnalyzer<'a> {
     }
 
     fn resolve_callee(&self, ctx: &EscapeCtx<'_>, callee: ExprId) -> Option<FunctionId> {
-        if let Some(Type::Function(fid)) = self.type_result.expr_types.get(&(ctx.body_id, callee)) {
+        if let Some(Type::FunctionItem { function: fid, .. }) =
+            self.type_result.expr_types.get(&(ctx.body_id, callee))
+        {
             return Some(*fid);
         }
         match &ctx.body.exprs[callee] {
@@ -1260,10 +1262,11 @@ fn type_may_carry_reference(ty: &Type) -> bool {
         | Type::InferVar(..)
         | Type::Unknown
         | Type::Error => true,
-        Type::Fn { params, ret, .. } => {
-            params.iter().any(type_may_carry_reference) || type_may_carry_reference(ret)
+        Type::CallableConstraint(signature) => {
+            signature.params.iter().any(type_may_carry_reference)
+                || type_may_carry_reference(&signature.ret)
         }
-        Type::Function(..) => true,
+        Type::FunctionItem { .. } | Type::Closure { .. } | Type::OpaqueCallable { .. } => true,
         Type::Int(..)
         | Type::Float(..)
         | Type::InferInt

@@ -233,10 +233,10 @@ fn method_generic_can_shadow_impl_generic() {
 fn infers_generic_function_parameter_from_anonymous_function() {
     let result = check(
         r#"
-        fun test<T>(f: fun(T) -> T) {}
+        fun test<T>(value: T, f: impl Fn(T) -> T) { f(value); }
 
         fun main() {
-            test(fun(x) { x + 1 });
+            test(1, fun(x) { x + 1 });
         }
         "#,
     );
@@ -350,7 +350,7 @@ fn reports_growing_generic_recursion() {
 fn infers_and_calls_anonymous_function() {
     let result = check(
         r#"
-        fun apply(f: fun(i32) -> i32, value: i32) -> i32 {
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 {
             f(value)
         }
 
@@ -416,7 +416,7 @@ fn captures_pattern_bindings() {
     assert_eq!(result.diagnostics, vec![]);
     let capture = &result.lambda_infos.values().next().unwrap().captures[0];
     assert_eq!(capture.name, "base");
-    assert!(matches!(capture.source, CaptureSource::Pattern(_)));
+    assert!(matches!(capture.place.source, CaptureSource::Pattern(_)));
     assert_eq!(capture.mode, CaptureMode::Shared);
 }
 
@@ -513,12 +513,12 @@ fn by_value_method_receiver_makes_once_closure() {
 }
 
 #[test]
-fn once_closure_is_rejected_at_fn_type_boundary() {
+fn once_closure_is_rejected_at_fn_boundary() {
     let result = check(
         r#"
         struct Token { value: i32 }
         fun consume(value: Token) {}
-        fun call(callback: fun()) { callback(); }
+        fun call(callback: impl Fn() -> ()) { callback(); }
         fun main() {
             let token = Token { value: 1 };
             let once = fun() { consume(token); };
@@ -528,10 +528,8 @@ fn once_closure_is_rejected_at_fn_type_boundary() {
     );
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0001"
-            && diagnostic
-                .message
-                .contains("function argument type mismatch")
+        diagnostic.code == "E0035"
+            && diagnostic.message.contains("callable bound")
             && diagnostic.message.contains("FnOnce")
     }));
 }
@@ -540,7 +538,7 @@ fn once_closure_is_rejected_at_fn_type_boundary() {
 fn nested_closure_does_not_capture_inner_parameters_in_outer_environment() {
     let result = check(
         r#"
-        fun nested(base: i32) -> fun(i32) -> fun(i32) -> i32 {
+        fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
             fun(first: i32) {
                 fun(second: i32) { base + first + second }
             }
@@ -1018,4 +1016,306 @@ fn nested_private_types_do_not_leak_into_outer_type_scope() {
         "{:#?}",
         result.diagnostics
     );
+}
+
+#[test]
+fn self_application_reports_an_infinite_type_without_overflowing() {
+    let result = check(
+        r#"
+        fun main() {
+            let id = fun(value) { value };
+            id(id);
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0046" && diagnostic.message == "cannot construct an infinite type"
+    }));
+}
+
+#[test]
+fn different_anonymous_function_expressions_have_different_types() {
+    let result = check(
+        r#"
+        fun main() {
+            let first = fun(value: i32) { value };
+            let second = fun(value: i32) { value };
+            let selected = if true { first } else { second };
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0002" && diagnostic.message.contains("incompatible types")
+    }));
+}
+
+#[test]
+fn impl_fn_accepts_closures_and_safe_named_functions() {
+    let result = check(
+        r#"
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
+        fun increment(value: i32) -> i32 { value + 1 }
+
+        fun main() -> i32 {
+            let add_two = fun(value: i32) { value + 2 };
+            apply(increment, 39) + apply(add_two, 0)
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn callable_generic_arguments_are_fully_resolved() {
+    let result = check(
+        r#"
+        fun run_mut(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
+            f(value);
+            f(value)
+        }
+        fun main() -> i32 {
+            let mut total: i32 = 0;
+            let add = fun(value: i32) { total += value; total };
+            run_mut(add, 2)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert!(
+        result.generic_calls.values().any(|call| {
+            call.args.iter().any(|arg| {
+                matches!(
+                    arg,
+                    Type::Closure { signature, .. }
+                        if signature.ret.as_ref() == &Type::Int(IntTy::I32)
+                )
+            })
+        }),
+        "{:#?}",
+        result.generic_calls
+    );
+}
+
+#[test]
+fn explicit_callable_bound_can_name_one_callable_type() {
+    let result = check(
+        r#"
+        fun call_twice<F>(mut f: F, value: i32) -> i32
+        where F: FnMut(i32) -> i32
+        {
+            f(value);
+            f(value)
+        }
+        fun main() -> i32 { call_twice(fun(value: i32) { value + 1 }, 1) }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn return_position_impl_fn_has_one_hidden_type() {
+    let valid = check(
+        r#"
+        fun make(base: i32) -> impl Fn(i32) -> i32 {
+            move fun(value: i32) { base + value }
+        }
+        fun main() -> i32 { make(40)(2) }
+        "#,
+    );
+    assert_eq!(valid.diagnostics, vec![]);
+
+    let invalid = check(
+        r#"
+        fun choose(flag: bool) -> impl Fn(i32) -> i32 {
+            if flag {
+                fun(value: i32) { value + 1 }
+            } else {
+                fun(value: i32) { value + 2 }
+            }
+        }
+        "#,
+    );
+    assert!(
+        invalid
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.message.contains("opaque callable return") })
+    );
+}
+
+#[test]
+fn each_impl_fn_parameter_has_an_independent_hidden_type() {
+    let result = check(
+        r#"
+        fun combine(
+            first: impl Fn(i32) -> i32,
+            second: impl Fn(i32) -> i32,
+            value: i32
+        ) -> i32 {
+            first(value) + second(value)
+        }
+        fun main() -> i32 {
+            combine(
+                fun(value: i32) { value + 1 },
+                fun(value: i32) { value + 2 },
+                1,
+            )
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn callable_capability_requirements_follow_the_fn_hierarchy() {
+    let result = check(
+        r#"
+        struct Token { value: i32 }
+        fun needs_fn(f: impl Fn() -> i32) -> i32 { f() }
+        fun needs_mut(mut f: impl FnMut() -> i32) -> i32 { f() }
+        fun needs_once(f: impl FnOnce() -> i32) -> i32 { f() }
+        fun consume(value: Token) -> i32 { value.value }
+
+        fun main() {
+            let shared = fun() { 1 };
+            let shared_for_mut = fun() { 1 };
+            let shared_for_once = fun() { 1 };
+            let mut total = 0;
+            let mutable = fun() { total += 1; total };
+            let mut other_total = 0;
+            let mutable_for_once = fun() { other_total += 1; other_total };
+            let token = Token { value: 2 };
+            let once = fun() { consume(token) };
+            needs_fn(shared);
+            needs_mut(shared_for_mut);
+            needs_once(shared_for_once);
+            needs_mut(mutable);
+            needs_once(mutable_for_once);
+            needs_once(once);
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn move_capture_does_not_make_a_read_only_closure_fn_once() {
+    let result = check(
+        r#"
+        struct Token { value: i32 }
+        fun main() {
+            let token = Token { value: 1 };
+            let read = move fun() { token.value };
+            read();
+            read();
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    let info = result.lambda_infos.values().next().unwrap();
+    assert_eq!(info.kind, ClosureKind::Fn);
+    assert_eq!(info.captures[0].mode, CaptureMode::Value);
+}
+
+#[test]
+fn mutable_callable_parameter_requires_mut() {
+    let result = check(
+        r#"
+        fun run(f: impl FnMut() -> i32) -> i32 { f() }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0031" && diagnostic.message.contains("immutable parameter")
+    }));
+}
+
+#[test]
+fn ordinary_mutable_parameter_can_be_assigned() {
+    let result = check(
+        r#"
+        fun increment(mut value: i32) -> i32 {
+            value += 1;
+            value
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn wildcard_match_does_not_make_a_closure_fn_once() {
+    let result = check(
+        r#"
+        struct Token { value: i32 }
+        fun main() {
+            let token = Token { value: 1 };
+            let inspect = fun() { match token { _ => 0 } };
+            inspect();
+            inspect();
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert_eq!(
+        result.lambda_infos.values().next().unwrap().kind,
+        ClosureKind::Fn
+    );
+}
+
+#[test]
+fn captures_only_the_referenced_struct_field() {
+    let result = check(
+        r#"
+        struct Pair { left: i32, right: i32 }
+        fun main() {
+            let pair = Pair { left: 1, right: 2 };
+            let read = fun() { pair.left };
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    let capture = &result.lambda_infos.values().next().unwrap().captures[0];
+    assert_eq!(
+        capture.place.projections.as_slice(),
+        &[hir::place::Projection::Field(0)]
+    );
+}
+
+#[test]
+fn dynamic_index_and_deref_stop_capture_projection_at_their_base() {
+    let indexed = check(
+        r#"
+        fun inspect(values: [i32; 2], index: usize) {
+            let read = fun() { values[index] };
+        }
+        "#,
+    );
+    assert_eq!(indexed.diagnostics, vec![]);
+    let indexed_info = indexed.lambda_infos.values().next().unwrap();
+    let values = indexed_info
+        .captures
+        .iter()
+        .find(|capture| capture.name == "values")
+        .unwrap();
+    assert!(values.place.projections.is_empty());
+
+    let dereferenced = check(
+        r#"
+        fun inspect(value: &i32) {
+            let read = fun() { *value };
+        }
+        "#,
+    );
+    assert_eq!(dereferenced.diagnostics, vec![]);
+    let capture = &dereferenced.lambda_infos.values().next().unwrap().captures[0];
+    assert!(capture.place.projections.is_empty());
+    assert!(matches!(capture.ty, Type::Ref(_, false)));
 }

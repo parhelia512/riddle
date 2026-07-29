@@ -1,7 +1,26 @@
 use hir::{
     HirFile,
+    body::{BodyId, ExprId},
     item_tree::{EnumId, FunctionId, HirStruct, StructId},
 };
+use rowan::TextRange;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClosureId {
+    pub body: BodyId,
+    pub expr: ExprId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpaqueCallableId(pub TextRange);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallableSignature {
+    pub is_unsafe: bool,
+    pub kind: ClosureKind,
+    pub params: Vec<Type>,
+    pub ret: Box<Type>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -27,13 +46,19 @@ pub enum Type {
     Enum(EnumId, Vec<Type>),
     Param(String),
     Const(ConstArg),
-    Function(FunctionId),
-    Fn {
-        is_unsafe: bool,
-        kind: ClosureKind,
-        params: Vec<Type>,
-        ret: Box<Type>,
+    FunctionItem {
+        function: FunctionId,
+        args: Vec<Type>,
     },
+    Closure {
+        id: ClosureId,
+        signature: CallableSignature,
+    },
+    OpaqueCallable {
+        id: OpaqueCallableId,
+        signature: CallableSignature,
+    },
+    CallableConstraint(CallableSignature),
     InferVar(u32),
     Unknown,
     Error,
@@ -147,30 +172,18 @@ impl Type {
                     format!("{}<{}>", enum_data.name.0, args)
                 }
             }
-            Type::Function(id) => {
+            Type::FunctionItem { function: id, .. } => {
                 let function = &hir.item_tree.functions[*id];
                 let prefix = if function.is_unsafe { "unsafe " } else { "" };
                 format!("{prefix}fun {}", function.name.0)
             }
-            Type::Fn {
-                is_unsafe,
-                kind,
-                params,
-                ret,
-            } => {
-                let params = params
-                    .iter()
-                    .map(|param| param.display(hir))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prefix = if *is_unsafe { "unsafe " } else { "" };
-                let capability = match kind {
-                    ClosureKind::Fn => "",
-                    ClosureKind::FnMut => "FnMut ",
-                    ClosureKind::FnOnce => "FnOnce ",
-                };
-                format!("{capability}{prefix}fun({params}) -> {}", ret.display(hir))
+            Type::Closure { signature, .. } => {
+                format_callable_signature(signature, "anonymous ", hir)
             }
+            Type::OpaqueCallable { signature, .. } => {
+                format_callable_signature(signature, "impl ", hir)
+            }
+            Type::CallableConstraint(signature) => format_callable_signature(signature, "", hir),
             Type::InferVar(_) => "_".to_string(),
             Type::Param(name) => name.clone(),
             Type::Const(value) => value.display(),
@@ -214,7 +227,12 @@ impl Type {
             Type::Tuple(elements) => elements.iter().all(Type::is_sized),
             Type::Array(inner, _) => inner.is_sized(),
             Type::Struct(_, args) | Type::Enum(_, args) => args.iter().all(Type::is_sized),
-            Type::Fn { params, ret, .. } => params.iter().all(Type::is_sized) && ret.is_sized(),
+            Type::CallableConstraint(signature)
+            | Type::Closure { signature, .. }
+            | Type::OpaqueCallable { signature, .. } => {
+                signature.params.iter().all(Type::is_sized) && signature.ret.is_sized()
+            }
+            Type::FunctionItem { args, .. } => args.iter().all(Type::is_sized),
             _ => true,
         }
     }
@@ -230,9 +248,13 @@ impl Type {
             Type::Struct(_, args) | Type::Enum(_, args) => {
                 args.iter().all(Type::is_valid_value_type)
             }
-            Type::Fn { params, ret, .. } => {
-                params.iter().all(Type::is_valid_value_type) && ret.is_valid_value_type()
+            Type::CallableConstraint(signature)
+            | Type::Closure { signature, .. }
+            | Type::OpaqueCallable { signature, .. } => {
+                signature.params.iter().all(Type::is_valid_value_type)
+                    && signature.ret.is_valid_value_type()
             }
+            Type::FunctionItem { args, .. } => args.iter().all(Type::is_valid_value_type),
             _ => true,
         }
     }
@@ -252,7 +274,7 @@ impl Type {
                 | Type::Never
                 | Type::Ref(_, false)
                 | Type::Ptr { .. }
-                | Type::Function(_)
+                | Type::FunctionItem { .. }
                 | Type::InferVar(_)
                 | Type::Unknown
                 | Type::Error
@@ -261,7 +283,20 @@ impl Type {
 
     pub fn closure_kind(&self) -> Option<ClosureKind> {
         match self {
-            Type::Fn { kind, .. } => Some(*kind),
+            Type::CallableConstraint(signature) => Some(signature.kind),
+            Type::Closure { signature, .. } | Type::OpaqueCallable { signature, .. } => {
+                Some(signature.kind)
+            }
+            Type::FunctionItem { .. } => Some(ClosureKind::Fn),
+            _ => None,
+        }
+    }
+
+    pub fn callable_signature(&self) -> Option<&CallableSignature> {
+        match self {
+            Type::CallableConstraint(signature)
+            | Type::Closure { signature, .. }
+            | Type::OpaqueCallable { signature, .. } => Some(signature),
             _ => None,
         }
     }
@@ -273,6 +308,20 @@ impl Type {
             self
         }
     }
+}
+
+fn format_callable_signature(signature: &CallableSignature, prefix: &str, hir: &HirFile) -> String {
+    let params = signature
+        .params
+        .iter()
+        .map(|param| param.display(hir))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{prefix}{}({params}) -> {}",
+        signature.kind.as_str(),
+        signature.ret.display(hir)
+    )
 }
 
 impl ConstArg {

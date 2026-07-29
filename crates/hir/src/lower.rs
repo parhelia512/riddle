@@ -9,10 +9,11 @@ use frontend::syntax_kind::{SyntaxKind, SyntaxToken};
 use super::{
     Name,
     item_tree::{
-        ConstId, EnumId, FunctionId, HirAssocTypeConstraint, HirAttr, HirConst, HirConstArg,
-        HirEnum, HirEnumVariant, HirFunction, HirGenericBound, HirInternalAttr, HirParam, HirPath,
-        HirStruct, HirStructField, HirTrait, HirTypeAlias, HirTypeRef, HirUseTree, HirUseTreeKind,
-        HirVariantKind, InternalAttrTarget, PathAnchor, StructId, TraitId, TypeAliasId, Visibility,
+        ConstId, EnumId, FunctionId, HirAssocTypeConstraint, HirAttr, HirCallableSignature,
+        HirConst, HirConstArg, HirEnum, HirEnumVariant, HirFunction, HirGenericBound,
+        HirInternalAttr, HirParam, HirPath, HirStruct, HirStructField, HirTrait, HirTypeAlias,
+        HirTypeRef, HirUseTree, HirUseTreeKind, HirVariantKind, InternalAttrTarget, PathAnchor,
+        StructId, TraitId, TypeAliasId, Visibility,
     },
 };
 
@@ -81,6 +82,7 @@ pub fn lower_generic_bounds(
                         .bounds
                         .into_iter()
                         .map(move |bound| {
+                            let callable = lower_callable_signature(bound.callable);
                             let trait_range = trimmed_range(bound.trait_path.syntax());
                             let mut trait_path = bound.trait_path.lower();
                             trait_path.type_args =
@@ -108,6 +110,7 @@ pub fn lower_generic_bounds(
                                 target_range: trait_range,
                                 trait_ty: HirTypeRef::Named(trait_path),
                                 trait_range,
+                                callable,
                                 assoc_constraints,
                             }
                         })
@@ -124,6 +127,7 @@ pub fn lower_generic_bounds(
             let target_ty = predicate.target_ty.lower();
             let param = generic_bound_param_name(&target_ty);
             predicate.bounds.into_iter().map(move |bound| {
+                let callable = lower_callable_signature(bound.callable);
                 let trait_range = trimmed_range(bound.trait_path.syntax());
                 let mut trait_path = bound.trait_path.lower();
                 trait_path.type_args = bound.type_args.into_iter().map(Lower::lower).collect();
@@ -145,6 +149,7 @@ pub fn lower_generic_bounds(
                     target_range,
                     trait_ty: HirTypeRef::Named(trait_path),
                     trait_range,
+                    callable,
                     assoc_constraints,
                 }
             })
@@ -152,6 +157,33 @@ pub fn lower_generic_bounds(
     }
 
     bounds
+}
+
+fn lower_callable_signature(
+    callable: Option<ast::CallableTraitArgs>,
+) -> Option<HirCallableSignature> {
+    callable.map(|callable| HirCallableSignature {
+        params: callable.params().map(Lower::lower).collect(),
+        ret: Box::new(
+            callable
+                .return_type()
+                .map(Lower::lower)
+                .unwrap_or(HirTypeRef::Error),
+        ),
+    })
+}
+
+fn assign_implicit_generics(params: &mut [HirParam]) -> Vec<Name> {
+    let mut names = Vec::new();
+    for (index, param) in params.iter_mut().enumerate() {
+        let HirTypeRef::ImplTrait { hidden, .. } = &mut param.ty else {
+            continue;
+        };
+        let name = Name(format!("#impl{index}"));
+        *hidden = Some(name.clone());
+        names.push(name);
+    }
+    names
 }
 
 fn generic_bound_param_name(ty: &HirTypeRef) -> Name {
@@ -224,6 +256,7 @@ impl Lower for Param {
     type Output = HirParam;
     fn lower(self) -> Self::Output {
         let range = trimmed_range(self.syntax());
+        let is_mut = self.is_mut() && !self.is_self_receiver();
         let name_token = self.name();
         let name_range = name_token
             .as_ref()
@@ -240,6 +273,7 @@ impl Lower for Param {
         HirParam {
             name,
             name_range,
+            is_mut,
             ty,
             ty_range,
             attrs,
@@ -262,10 +296,11 @@ impl AstLower for FuncDecl {
         let generics = lower_generic_params(generic_params.clone());
         let const_generics = lower_const_generic_params(generic_params.clone());
         let generic_bounds = lower_generic_bounds(generic_params, self.where_clause());
-        let params = self
+        let mut params: Vec<HirParam> = self
             .param_list()
             .map(|pl| pl.params().map(|p| p.lower()).collect())
             .unwrap_or_default();
+        let implicit_generics = assign_implicit_generics(&mut params);
         let ret_type_ast = self.return_type();
         let ret_type_range = ret_type_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
         let ret_type = ret_type_ast.map(|ty| ty.lower());
@@ -279,6 +314,7 @@ impl AstLower for FuncDecl {
             visibility,
             is_unsafe,
             generics,
+            implicit_generics,
             const_generics,
             generic_bounds,
             params,
@@ -421,6 +457,7 @@ impl AstLower for ast::TraitDecl {
             .supertraits()
             .into_iter()
             .map(|bound| {
+                let callable = lower_callable_signature(bound.callable);
                 let trait_range = trimmed_range(bound.trait_path.syntax());
                 let mut trait_path = bound.trait_path.lower();
                 trait_path.type_args = bound.type_args.into_iter().map(Lower::lower).collect();
@@ -435,6 +472,7 @@ impl AstLower for ast::TraitDecl {
                     target_range: trait_range,
                     trait_ty: HirTypeRef::Named(trait_path),
                     trait_range,
+                    callable,
                     assoc_constraints: bound
                         .assoc_constraints
                         .into_iter()
@@ -460,7 +498,7 @@ impl AstLower for ast::TraitDecl {
                     .map(|token| token.text_range())
                     .unwrap_or(method_range);
                 let mname = lower_name(method_name);
-                let params = m
+                let mut params: Vec<HirParam> = m
                     .param_list()
                     .map(|pl| {
                         pl.params()
@@ -477,6 +515,7 @@ impl AstLower for ast::TraitDecl {
                             .collect()
                     })
                     .unwrap_or_default();
+                let implicit_generics = assign_implicit_generics(&mut params);
                 let ret_type_ast = m.return_type();
                 let ret_type_range = ret_type_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
                 let ret_type = ret_type_ast.map(|ty| ty.lower());
@@ -487,6 +526,7 @@ impl AstLower for ast::TraitDecl {
                     visibility: lower_visibility(m.is_pub()),
                     is_unsafe: m.is_unsafe(),
                     generics: lower_generic_params(generic_params.clone()),
+                    implicit_generics,
                     const_generics: lower_const_generic_params(generic_params.clone()),
                     generic_bounds: lower_generic_bounds(generic_params, m.where_clause()),
                     params,
@@ -675,16 +715,21 @@ impl Lower for Type {
                 .value()
                 .map(|value| HirTypeRef::Const(HirConstArg::Value(value)))
                 .unwrap_or(HirTypeRef::Error),
-            Type::Function(function) => HirTypeRef::Function {
-                is_unsafe: function.is_unsafe(),
-                params: function.param_types().map(Lower::lower).collect(),
-                ret: Box::new(
-                    function
-                        .return_type()
-                        .map(Lower::lower)
-                        .unwrap_or_else(|| HirTypeRef::Tuple(Vec::new())),
-                ),
-            },
+            Type::ImplTrait(impl_trait) => {
+                let Some(bound) = impl_trait.bound() else {
+                    return HirTypeRef::Error;
+                };
+                let callable = lower_callable_signature(bound.callable);
+                let trait_range = trimmed_range(bound.trait_path.syntax());
+                let mut trait_path = bound.trait_path.lower();
+                trait_path.type_args = bound.type_args.into_iter().map(Lower::lower).collect();
+                HirTypeRef::ImplTrait {
+                    trait_ty: Box::new(HirTypeRef::Named(trait_path)),
+                    trait_range,
+                    callable,
+                    hidden: None,
+                }
+            }
         }
     }
 }

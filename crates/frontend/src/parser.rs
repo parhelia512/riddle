@@ -440,6 +440,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Star
                 | SyntaxKind::Bang
                 | SyntaxKind::Fun
+                | SyntaxKind::Move
         )
     }
 
@@ -781,6 +782,9 @@ impl<'s> Parser<'s> {
             }
             self.expect(SyntaxKind::SelfKw);
         } else {
+            if self.at(SyntaxKind::Mut) {
+                self.bump();
+            }
             self.expect(SyntaxKind::Ident);
             self.expect(SyntaxKind::Colon);
             self.ty();
@@ -790,6 +794,9 @@ impl<'s> Parser<'s> {
 
     fn lambda_expr(&mut self) -> CompletedMarker {
         let m = self.start();
+        if self.at(SyntaxKind::Move) {
+            self.bump();
+        }
         self.expect(SyntaxKind::Fun);
         self.lambda_param_list();
         if self.at(SyntaxKind::Arrow) {
@@ -819,6 +826,9 @@ impl<'s> Parser<'s> {
 
     fn lambda_param(&mut self) {
         let m = self.start();
+        if self.at(SyntaxKind::Mut) {
+            self.bump();
+        }
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Colon) {
             self.bump();
@@ -1436,6 +1446,11 @@ impl<'s> Parser<'s> {
             SyntaxKind::Unsafe => Some(self.unsafe_expr()),
 
             SyntaxKind::Fun => Some(self.lambda_expr()),
+            SyntaxKind::Move if self.nth(1) == SyntaxKind::Fun => Some(self.lambda_expr()),
+            SyntaxKind::Move => {
+                self.error("expected 'fun' after 'move'".into());
+                None
+            }
 
             SyntaxKind::LBracket => {
                 let m = self.start();
@@ -1592,8 +1607,12 @@ impl<'s> Parser<'s> {
                 self.bump();
                 m.complete(self, SyntaxKind::ConstType);
             }
+            SyntaxKind::Impl => self.impl_trait_type(),
             SyntaxKind::Fun | SyntaxKind::Unsafe => {
                 let m = self.start();
+                self.error(
+                    "function type syntax has been removed; use `impl Fn(i32) -> i32` or an explicit `F: Fn(i32) -> i32` bound".into(),
+                );
                 self.optional_unsafe();
                 self.expect(SyntaxKind::Fun);
                 self.expect(SyntaxKind::LParen);
@@ -1612,7 +1631,7 @@ impl<'s> Parser<'s> {
                     self.bump();
                     self.ty();
                 }
-                m.complete(self, SyntaxKind::FnType);
+                m.complete(self, SyntaxKind::ErrorNode);
             }
             SyntaxKind::Ident
             | SyntaxKind::SelfKw
@@ -1898,7 +1917,9 @@ impl<'s> Parser<'s> {
 
     fn generic_bound(&mut self) {
         self.path();
-        if self.at(SyntaxKind::Less) {
+        if self.at(SyntaxKind::LParen) {
+            self.callable_trait_args();
+        } else if self.at(SyntaxKind::Less) {
             self.bump();
             if !self.at(SyntaxKind::Greater) && !self.at(SyntaxKind::Eof) {
                 self.generic_bound_arg();
@@ -1916,6 +1937,25 @@ impl<'s> Parser<'s> {
                 self.expect(SyntaxKind::Greater);
             }
         }
+    }
+
+    fn callable_trait_args(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::LParen);
+        if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
+            self.type_list();
+        }
+        self.expect(SyntaxKind::RParen);
+        self.expect(SyntaxKind::Arrow);
+        self.ty();
+        m.complete(self, SyntaxKind::CallableTraitArgs);
+    }
+
+    fn impl_trait_type(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::Impl);
+        self.generic_bound();
+        m.complete(self, SyntaxKind::ImplTraitType);
     }
 
     fn generic_bound_arg(&mut self) {
@@ -2045,6 +2085,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Bang
                 | SyntaxKind::Fun
                 | SyntaxKind::Unsafe
+                | SyntaxKind::Impl
         )
     }
 

@@ -40,7 +40,7 @@ fn rejects_returned_closure_borrowing_a_drop_owner() {
         impl Drop for Guard { fun drop(&mut self) {} }
         fun inspect(value: &Guard) {}
 
-        fun leak() -> fun() {
+        fun leak() -> impl Fn() -> () {
             let guard = Guard { value: 1 };
             fun() { inspect(&guard); }
         }
@@ -875,6 +875,27 @@ fn unknown_external_reference_return_is_conservative() {
         "{:?}",
         result.diagnostics
     );
+}
+
+#[test]
+fn moving_one_field_into_a_closure_leaves_the_other_field_available() {
+    let result = analyze(
+        r#"
+        struct Token { value: i32 }
+        struct Pair { left: Token, right: Token }
+        fun consume(value: Token) -> i32 { value.value }
+        fun main() -> i32 {
+            let pair = Pair {
+                left: Token { value: 1 },
+                right: Token { value: 2 },
+            };
+            let take_left = fun() { consume(pair.left) };
+            consume(pair.right)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
 }
 
 #[test]

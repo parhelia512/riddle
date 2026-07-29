@@ -1194,11 +1194,16 @@ impl<'a> ScopeGraphBuilder<'a> {
                     self.emit_type_references(element, current_scope, nodes, edges);
                 }
             }
-            HirTypeRef::Function { params, ret, .. } => {
-                for param in params {
-                    self.emit_type_references(param, current_scope, nodes, edges);
+            HirTypeRef::ImplTrait {
+                trait_ty, callable, ..
+            } => {
+                self.emit_type_references(trait_ty, current_scope, nodes, edges);
+                if let Some(signature) = callable {
+                    for param in &signature.params {
+                        self.emit_type_references(param, current_scope, nodes, edges);
+                    }
+                    self.emit_type_references(&signature.ret, current_scope, nodes, edges);
                 }
-                self.emit_type_references(ret, current_scope, nodes, edges);
             }
             HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => {}
         }

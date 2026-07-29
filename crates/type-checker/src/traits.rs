@@ -411,6 +411,13 @@ impl TypeChecker<'_> {
     }
 
     fn check_trait_decl(&mut self, trait_id: hir::item_tree::TraitId, tr: &HirTrait) {
+        if matches!(tr.name.0.as_str(), "Fn" | "FnMut" | "FnOnce") {
+            self.diagnostic(
+                "E0048",
+                "callable capabilities are implemented only by functions and anonymous functions",
+                Some(tr.name_range),
+            );
+        }
         for supertrait in &tr.supertraits {
             let Some(supertrait_id) = self.resolve_trait_ref(&supertrait.trait_ty) else {
                 self.diagnostic(
@@ -468,6 +475,15 @@ impl TypeChecker<'_> {
         let Some(trait_ty) = imp.trait_ty.as_ref() else {
             return;
         };
+
+        if crate::lowering::builtin_callable_kind(trait_ty).is_some() {
+            self.diagnostic(
+                "E0048",
+                "callable capabilities are implemented only by functions and anonymous functions",
+                imp.trait_ty_range.or(Some(imp.self_ty_range)),
+            );
+            return;
+        }
 
         let self_ty_text = self.display_type_ref(&imp.self_ty);
         let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
@@ -845,22 +861,7 @@ impl TypeChecker<'_> {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", self.type_ref_source_text(inner))
             }
-            HirTypeRef::Function {
-                is_unsafe,
-                params,
-                ret,
-            } => {
-                let params = params
-                    .iter()
-                    .map(|param| self.type_ref_source_text(param))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prefix = if *is_unsafe { "unsafe " } else { "" };
-                format!(
-                    "{prefix}fun({params}) -> {}",
-                    self.type_ref_source_text(ret)
-                )
-            }
+            HirTypeRef::ImplTrait { .. } => ty.display(),
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
         }
@@ -923,9 +924,15 @@ fn uncovered_orphan_param(ty: &Type, prefix: &str) -> Option<String> {
         Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => elements
             .iter()
             .find_map(|ty| uncovered_orphan_param(ty, prefix)),
-        Type::Fn { params, ret, .. } => params
+        Type::FunctionItem { args, .. } => args
             .iter()
-            .chain(std::iter::once(ret.as_ref()))
+            .find_map(|ty| uncovered_orphan_param(ty, prefix)),
+        Type::CallableConstraint(signature)
+        | Type::Closure { signature, .. }
+        | Type::OpaqueCallable { signature, .. } => signature
+            .params
+            .iter()
+            .chain(std::iter::once(signature.ret.as_ref()))
             .find_map(|ty| uncovered_orphan_param(ty, prefix)),
         _ => None,
     }
@@ -940,8 +947,12 @@ fn coherence_type_is_valid(ty: &Type) -> bool {
         Type::Tuple(elements) => elements.iter().all(coherence_type_is_valid),
         Type::Array(inner, len) => coherence_type_is_valid(inner) && coherence_const_is_valid(len),
         Type::Struct(_, args) | Type::Enum(_, args) => args.iter().all(coherence_type_is_valid),
-        Type::Fn { params, ret, .. } => {
-            params.iter().all(coherence_type_is_valid) && coherence_type_is_valid(ret)
+        Type::FunctionItem { args, .. } => args.iter().all(coherence_type_is_valid),
+        Type::CallableConstraint(signature)
+        | Type::Closure { signature, .. }
+        | Type::OpaqueCallable { signature, .. } => {
+            signature.params.iter().all(coherence_type_is_valid)
+                && coherence_type_is_valid(&signature.ret)
         }
         Type::Const(value) => coherence_const_is_valid(value),
         _ => true,
@@ -1026,27 +1037,32 @@ fn unify_coherence_type(
                     .all(|(lhs, rhs)| unify_coherence_type(lhs, rhs, type_subst, const_subst))
         }
         (
-            Type::Fn {
-                is_unsafe: lhs_unsafe,
-                kind: lhs_kind,
-                params: lhs_params,
-                ret: lhs_ret,
+            Type::FunctionItem {
+                function: lhs_id,
+                args: lhs,
             },
-            Type::Fn {
-                is_unsafe: rhs_unsafe,
-                kind: rhs_kind,
-                params: rhs_params,
-                ret: rhs_ret,
+            Type::FunctionItem {
+                function: rhs_id,
+                args: rhs,
             },
         ) => {
-            lhs_unsafe == rhs_unsafe
-                && lhs_kind == rhs_kind
-                && lhs_params.len() == rhs_params.len()
-                && lhs_params
+            lhs_id == rhs_id
+                && lhs.len() == rhs.len()
+                && lhs
                     .iter()
-                    .zip(rhs_params)
+                    .zip(rhs)
                     .all(|(lhs, rhs)| unify_coherence_type(lhs, rhs, type_subst, const_subst))
-                && unify_coherence_type(lhs_ret, rhs_ret, type_subst, const_subst)
+        }
+        (Type::CallableConstraint(lhs), Type::CallableConstraint(rhs)) => {
+            lhs.is_unsafe == rhs.is_unsafe
+                && lhs.kind == rhs.kind
+                && lhs.params.len() == rhs.params.len()
+                && lhs
+                    .params
+                    .iter()
+                    .zip(&rhs.params)
+                    .all(|(lhs, rhs)| unify_coherence_type(lhs, rhs, type_subst, const_subst))
+                && unify_coherence_type(&lhs.ret, &rhs.ret, type_subst, const_subst)
         }
         (Type::Const(lhs), Type::Const(rhs)) => unify_coherence_const(lhs, rhs, const_subst),
         _ => false,
@@ -1096,11 +1112,17 @@ fn coherence_type_occurs(name: &str, ty: &Type, subst: &HashMap<String, Type>) -
         Type::Struct(_, args) | Type::Enum(_, args) => args
             .iter()
             .any(|arg| coherence_type_occurs(name, arg, subst)),
-        Type::Fn { params, ret, .. } => {
-            params
+        Type::FunctionItem { args, .. } => args
+            .iter()
+            .any(|arg| coherence_type_occurs(name, arg, subst)),
+        Type::CallableConstraint(signature)
+        | Type::Closure { signature, .. }
+        | Type::OpaqueCallable { signature, .. } => {
+            signature
+                .params
                 .iter()
                 .any(|param| coherence_type_occurs(name, param, subst))
-                || coherence_type_occurs(name, ret, subst)
+                || coherence_type_occurs(name, &signature.ret, subst)
         }
         _ => false,
     }
@@ -1182,7 +1204,7 @@ fn type_ref_size(ty: &HirTypeRef, generics: &HashSet<&str>) -> usize {
         HirTypeRef::Slice(inner) | HirTypeRef::Array(inner, _) => {
             1 + type_ref_size(inner, generics)
         }
-        HirTypeRef::Function { .. } => 1,
+        HirTypeRef::ImplTrait { .. } => 1,
         HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => 0,
     }
 }

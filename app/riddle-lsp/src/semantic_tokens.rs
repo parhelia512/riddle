@@ -724,6 +724,7 @@ fn is_keyword(kind: SyntaxKind) -> bool {
             | SyntaxKind::For
             | SyntaxKind::In
             | SyntaxKind::Where
+            | SyntaxKind::Move
             | SyntaxKind::True
             | SyntaxKind::False
     )

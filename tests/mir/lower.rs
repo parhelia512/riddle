@@ -569,7 +569,7 @@ fn returned_closure_drops_value_captures_through_its_drop_function() {
         impl Drop for Guard { fun drop(&mut self) {} }
         fun consume(value: Guard) {}
 
-        fun make() -> fun() {
+        fun make() -> impl FnOnce() -> () {
             let guard = Guard {};
             fun() { consume(guard); }
         }
@@ -2838,13 +2838,13 @@ fn all_reference_forms_promote_their_source_local() {
         fun consume_holder(holder: Holder) -> i32 { holder.value.value }
         fun read_holder(holder: &Holder) -> i32 { holder.value.value }
 
-        fun value_capture() -> fun() -> i32 {
+        fun value_capture() -> impl Fn() -> i32 {
             let local = Data { value: 1 };
             let holder = Holder { value: &local };
             fun() { read_holder(&holder) }
         }
 
-        fun lambda_param_ref() -> fun(Data) -> &Data {
+        fun lambda_param_ref() -> impl Fn(Data) -> &Data {
             fun(value: Data) -> &Data { &value }
         }
 
@@ -3267,7 +3267,7 @@ fn pos_unary_is_noop() {
 fn anonymous_function_lowers_to_function_pointer_call() {
     let module = lower(
         r#"
-        fun apply(f: fun(i32) -> i32, value: i32) -> i32 {
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 {
             f(value)
         }
 
@@ -3288,7 +3288,7 @@ fn anonymous_function_lowers_to_function_pointer_call() {
         .function_order
         .iter()
         .map(|id| &module.functions[*id])
-        .find(|function| function.name == "apply")
+        .find(|function| function.name.starts_with("apply__"))
         .unwrap();
     assert!(apply.blocks.iter().any(|(_, block)| {
         block
@@ -3349,7 +3349,7 @@ fn non_escaping_closure_keeps_environment_and_capture_on_stack() {
 fn lambda_returned_from_lambda_uses_heap_environment() {
     let module = lower(
         r#"
-        fun nested(base: i32) -> fun(i32) -> fun(i32) -> i32 {
+        fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
             fun(first: i32) {
                 fun(second: i32) { base + first + second }
             }
@@ -3371,5 +3371,62 @@ fn lambda_returned_from_lambda_uses_heap_environment() {
                 ))
             })),
         "an inner lambda returned across the outer lambda frame must escape"
+    );
+}
+
+#[test]
+fn closure_field_capture_clears_only_that_fields_drop_slot() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop { fun drop(&mut self); }
+        struct First {}
+        struct Second {}
+        struct Pair { first: First, second: Second }
+        impl Drop for First { fun drop(&mut self) {} }
+        impl Drop for Second { fun drop(&mut self) {} }
+        fun consume(value: First) {}
+        fun main() {
+            let pair = Pair { first: First {}, second: Second {} };
+            let take_first = fun() { consume(pair.first); };
+        }
+        "#,
+    );
+
+    let lambda_drop = module
+        .functions
+        .values()
+        .find(|function| {
+            function.name.starts_with("__riddle_lambda_") && function.name.ends_with("_drop")
+        })
+        .expect("missing closure drop function");
+    assert!(
+        lambda_drop
+            .blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name == "drop__First"
+                )
+            }))
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    assert!(
+        main.blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| {
+                matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                        if name == "drop__Second"
+                )
+            }))
     );
 }

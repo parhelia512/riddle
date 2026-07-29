@@ -78,6 +78,8 @@ fn validates_cast_source_and_target_types() {
             let truncated = 1.5 as i32;
             let boolean = 1 as bool;
             let from_boolean = true as i32;
+            let code_point = '中' as u32;
+            let narrowed_code_point = 'a' as i32;
             let raw = 0 as *const i32;
             let mutable = pointer as *mut i32;
         }
@@ -99,7 +101,7 @@ fn validates_cast_source_and_target_types() {
         fun rejected(point: Point) {
             let float = true as f64;
             let boolean = 1.5 as bool;
-            let character = 'a' as i32;
+            let character = 65u32 as char;
             let aggregate = point as i32;
         }
         "#,

@@ -49,3 +49,4 @@ Cargo.lock
 /.agents
 /.codex
 /.omo
+**/superpowers/

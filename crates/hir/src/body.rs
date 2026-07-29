@@ -176,6 +176,7 @@ pub enum Expr {
         type_args: Vec<HirTypeRef>,
     },
     Lambda {
+        is_move: bool,
         params: Vec<LambdaParam>,
         ret_type: HirTypeRef,
         ret_type_range: Option<TextRange>,
@@ -215,6 +216,7 @@ pub struct MatchArm {
 pub struct LambdaParam {
     pub name: Name,
     pub name_range: Option<TextRange>,
+    pub is_mut: bool,
     pub ty: HirTypeRef,
     pub ty_range: Option<TextRange>,
 }
@@ -826,19 +828,7 @@ impl BodyPrinter<'_> {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
             HirTypeRef::Const(value) => value.display(),
-            HirTypeRef::Function {
-                is_unsafe,
-                params,
-                ret,
-            } => {
-                let params = params
-                    .iter()
-                    .map(Self::type_text)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prefix = if *is_unsafe { "unsafe " } else { "" };
-                format!("{prefix}fun({params}) -> {}", Self::type_text(ret))
-            }
+            HirTypeRef::ImplTrait { .. } => ty.display(),
         }
     }
 

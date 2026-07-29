@@ -46,6 +46,8 @@ pub enum SyntaxKind {
     Use,
     #[token("mut")]
     Mut,
+    #[token("move")]
+    Move,
     #[token("pub")]
     Pub,
     #[token("super")]
@@ -235,7 +237,8 @@ pub enum SyntaxKind {
     TupleType,
     ArrayType,
     ConstType,
-    FnType,
+    ImplTraitType,
+    CallableTraitArgs,
     ArrayExpr,
     MatchExpr,
     MatchArm,

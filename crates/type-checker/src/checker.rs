@@ -7,7 +7,7 @@ use hir::{
     body::{Body, BodyId, Expr, ExprId, PatternBindingId, ResolvedName, UnaryOp},
     item_tree::{
         ConstId, EnumId, FunctionId, HirConstArg, HirFunction, HirPath, HirTrait, HirTypeAlias,
-        HirTypeRef, HirVariantKind, InternalAttrTarget, PathAnchor, StructId,
+        HirTypeRef, HirVariantKind, InternalAttrTarget, PathAnchor, StructId, TypeAliasId,
     },
 };
 
@@ -16,7 +16,7 @@ use crate::{
     lang_items::{LangItem, RegisterResult},
     result::{Diagnostic, LabelStyle, Severity, SourceLabel, TypeCheckResult},
     trait_env::{TraitAssocConstraint, TraitBound},
-    types::{ClosureKind, FloatTy, IntTy, Type},
+    types::{CallableSignature, ClosureKind, FloatTy, IntTy, OpaqueCallableId, Type},
 };
 
 pub struct TypeChecker<'a> {
@@ -24,8 +24,10 @@ pub struct TypeChecker<'a> {
     pub(crate) result: TypeCheckResult,
     pub(crate) generic_edges: Vec<GenericEdge>,
     infinite_layout_types: HashSet<NominalType>,
+    pub(crate) lowering_type_aliases: HashSet<TypeAliasId>,
     next_infer: u32,
     infer_values: HashMap<u32, Type>,
+    pub(crate) last_occurs_error: Option<(u32, Type)>,
     pending_lambdas: Vec<PendingLambda>,
     pub(crate) pending_delayed_bindings: Vec<(BodyId, PatternBindingId, Option<TextRange>)>,
 }
@@ -61,8 +63,10 @@ impl<'a> TypeChecker<'a> {
             result: TypeCheckResult::default(),
             generic_edges: Vec::new(),
             infinite_layout_types: HashSet::new(),
+            lowering_type_aliases: HashSet::new(),
             next_infer: 0,
             infer_values: HashMap::new(),
+            last_occurs_error: None,
             pending_lambdas: Vec::new(),
             pending_delayed_bindings: Vec::new(),
         }
@@ -157,7 +161,13 @@ impl<'a> TypeChecker<'a> {
                 outer_generics
                     .iter()
                     .map(String::as_str)
-                    .chain(function.generics.iter().map(|name| name.0.as_str())),
+                    .chain(function.generics.iter().map(|name| name.0.as_str()))
+                    .chain(
+                        function
+                            .implicit_generics
+                            .iter()
+                            .map(|name| name.0.as_str()),
+                    ),
                 outer_const_generics
                     .iter()
                     .map(String::as_str)
@@ -208,6 +218,7 @@ impl<'a> TypeChecker<'a> {
                     item.generics
                         .iter()
                         .chain(method.generics.iter())
+                        .chain(method.implicit_generics.iter())
                         .map(|name| name.0.as_str()),
                     method.const_generics.iter().map(|name| name.0.as_str()),
                 );
@@ -605,7 +616,13 @@ impl<'a> TypeChecker<'a> {
             outer_generics
                 .iter()
                 .map(String::as_str)
-                .chain(function.generics.iter().map(|name| name.0.as_str())),
+                .chain(function.generics.iter().map(|name| name.0.as_str()))
+                .chain(
+                    function
+                        .implicit_generics
+                        .iter()
+                        .map(|name| name.0.as_str()),
+                ),
             outer_const_generics
                 .iter()
                 .map(String::as_str)
@@ -730,41 +747,108 @@ impl<'a> TypeChecker<'a> {
             Type::Enum(id, args) => {
                 Type::Enum(*id, args.iter().map(|arg| self.resolve_type(arg)).collect())
             }
-            Type::Fn {
-                is_unsafe,
-                kind,
-                params,
-                ret,
-            } => Type::Fn {
-                is_unsafe: *is_unsafe,
-                kind: *kind,
-                params: params
-                    .iter()
-                    .map(|param| self.resolve_type(param))
-                    .collect(),
-                ret: Box::new(self.resolve_type(ret)),
+            Type::FunctionItem { function, args } => Type::FunctionItem {
+                function: *function,
+                args: args.iter().map(|arg| self.resolve_type(arg)).collect(),
             },
+            Type::Closure { id, signature } => Type::Closure {
+                id: *id,
+                signature: self.resolve_callable_signature(signature),
+            },
+            Type::OpaqueCallable { id, signature } => Type::OpaqueCallable {
+                id: *id,
+                signature: self.resolve_callable_signature(signature),
+            },
+            Type::CallableConstraint(signature) => {
+                Type::CallableConstraint(self.resolve_callable_signature(signature))
+            }
             _ => ty.clone(),
         }
     }
 
     pub(crate) fn callable_type(&mut self, ty: &Type) -> Type {
         let ty = self.resolve_type(ty);
-        let Type::Function(fid) = ty else {
+        let Some(signature) = self.callable_signature_for_type(&ty) else {
             return ty;
         };
+        Type::CallableConstraint(signature)
+    }
+
+    fn resolve_callable_signature(&self, signature: &CallableSignature) -> CallableSignature {
+        CallableSignature {
+            is_unsafe: signature.is_unsafe,
+            kind: signature.kind,
+            params: signature
+                .params
+                .iter()
+                .map(|param| self.resolve_type(param))
+                .collect(),
+            ret: Box::new(self.resolve_type(&signature.ret)),
+        }
+    }
+
+    pub(crate) fn callable_signature_for_type(&mut self, ty: &Type) -> Option<CallableSignature> {
+        match ty {
+            Type::CallableConstraint(signature) => Some(signature.clone()),
+            Type::Closure { signature, .. } | Type::OpaqueCallable { signature, .. } => {
+                Some(signature.clone())
+            }
+            Type::FunctionItem { function, args } => {
+                Some(self.function_item_signature(*function, args))
+            }
+            _ => None,
+        }
+    }
+
+    fn function_item_signature(&mut self, fid: FunctionId, args: &[Type]) -> CallableSignature {
         let function = self.hir.item_tree.functions[fid].clone();
-        Type::Fn {
+        let impl_generics = self.impl_generic_names(fid);
+        let impl_const_generics = self.impl_const_generic_names(fid);
+        let params = crate::lowering::generic_param_map_with_consts(
+            impl_generics
+                .iter()
+                .map(String::as_str)
+                .chain(function.generics.iter().map(|name| name.0.as_str()))
+                .chain(
+                    function
+                        .implicit_generics
+                        .iter()
+                        .map(|name| name.0.as_str()),
+                ),
+            impl_const_generics
+                .iter()
+                .map(String::as_str)
+                .chain(function.const_generics.iter().map(|name| name.0.as_str())),
+        );
+        let subst = impl_generics
+            .iter()
+            .map(String::as_str)
+            .chain(function.generics.iter().map(|name| name.0.as_str()))
+            .chain(
+                function
+                    .implicit_generics
+                    .iter()
+                    .map(|name| name.0.as_str()),
+            )
+            .chain(impl_const_generics.iter().map(String::as_str))
+            .chain(function.const_generics.iter().map(|name| name.0.as_str()))
+            .zip(args.iter())
+            .map(|(name, ty)| (name.to_string(), ty.clone()))
+            .collect::<HashMap<_, _>>();
+        CallableSignature {
             is_unsafe: function.is_unsafe,
             kind: ClosureKind::Fn,
             params: function
                 .params
                 .iter()
                 .map(|param| {
-                    self.lower_type_ref_with_params_at(
-                        &param.ty,
-                        &HashMap::new(),
-                        Some(param.ty_range),
+                    crate::lowering::substitute_type(
+                        &self.lower_type_ref_with_params_at(
+                            &param.ty,
+                            &params,
+                            Some(param.ty_range),
+                        ),
+                        &subst,
                     )
                 })
                 .collect(),
@@ -773,10 +857,13 @@ impl<'a> TypeChecker<'a> {
                     .ret_type
                     .as_ref()
                     .map(|ret| {
-                        self.lower_type_ref_with_params_at(
-                            ret,
-                            &HashMap::new(),
-                            function.ret_type_range.or(Some(function.name_range)),
+                        crate::lowering::substitute_type(
+                            &self.lower_type_ref_with_params_at(
+                                ret,
+                                &params,
+                                function.ret_type_range.or(Some(function.name_range)),
+                            ),
+                            &subst,
                         )
                     })
                     .unwrap_or(Type::Unit),
@@ -785,18 +872,28 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub(crate) fn unify_types(&mut self, lhs: &Type, rhs: &Type) -> bool {
-        let lhs = self.callable_type(lhs);
-        let rhs = self.callable_type(rhs);
+        self.last_occurs_error = None;
+        self.unify_types_inner(lhs, rhs)
+    }
+
+    fn unify_types_inner(&mut self, lhs: &Type, rhs: &Type) -> bool {
+        let lhs = self.resolve_type(lhs);
+        let rhs = self.resolve_type(rhs);
+        if let Type::CallableConstraint(expected) = &lhs
+            && !matches!(rhs, Type::CallableConstraint(_))
+            && let Some(actual) = self.callable_signature_for_type(&rhs)
+        {
+            return self.unify_callable_signature(
+                expected.is_unsafe,
+                expected.kind,
+                &expected.params,
+                &expected.ret,
+                &actual,
+            );
+        }
         match (&lhs, &rhs) {
-            (Type::InferVar(id), ty) | (ty, Type::InferVar(id)) => {
-                if matches!(ty, Type::InferVar(other) if other == id) {
-                    true
-                } else {
-                    self.infer_values.insert(*id, ty.clone());
-                    true
-                }
-            }
-            (Type::Ref(a, am), Type::Ref(b, bm)) => am == bm && self.unify_types(a, b),
+            (Type::InferVar(id), ty) | (ty, Type::InferVar(id)) => self.bind_infer_var(*id, ty),
+            (Type::Ref(a, am), Type::Ref(b, bm)) => am == bm && self.unify_types_inner(a, b),
             (
                 Type::Ptr {
                     mutable: am,
@@ -806,44 +903,112 @@ impl<'a> TypeChecker<'a> {
                     mutable: bm,
                     inner: b,
                 },
-            ) => am == bm && self.unify_types(a, b),
+            ) => am == bm && self.unify_types_inner(a, b),
             (Type::Tuple(a), Type::Tuple(b)) => {
-                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| self.unify_types(a, b))
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| self.unify_types_inner(a, b))
             }
-            (Type::Slice(a), Type::Slice(b)) => self.unify_types(a, b),
-            (Type::Array(a, al), Type::Array(b, bl)) => al == bl && self.unify_types(a, b),
+            (Type::Slice(a), Type::Slice(b)) => self.unify_types_inner(a, b),
+            (Type::Array(a, al), Type::Array(b, bl)) => al == bl && self.unify_types_inner(a, b),
             (Type::Struct(a, aa), Type::Struct(b, ba)) => {
                 a == b
                     && aa.len() == ba.len()
-                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types(a, b))
+                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types_inner(a, b))
             }
             (Type::Enum(a, aa), Type::Enum(b, ba)) => {
                 a == b
                     && aa.len() == ba.len()
-                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types(a, b))
+                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types_inner(a, b))
             }
             (
-                Type::Fn {
-                    is_unsafe: expected_unsafe,
-                    kind: expected_kind,
-                    params: ap,
-                    ret: ar,
+                Type::FunctionItem {
+                    function: af,
+                    args: aa,
                 },
-                Type::Fn {
-                    is_unsafe: actual_unsafe,
-                    kind: actual_kind,
-                    params: bp,
-                    ret: br,
+                Type::FunctionItem {
+                    function: bf,
+                    args: ba,
                 },
             ) => {
-                (!*actual_unsafe || *expected_unsafe)
-                    && expected_kind.accepts(*actual_kind)
-                    && ap.len() == bp.len()
-                    && ap.iter().zip(bp).all(|(a, b)| self.unify_types(a, b))
-                    && self.unify_types(ar, br)
+                af == bf
+                    && aa.len() == ba.len()
+                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types_inner(a, b))
             }
+            (
+                Type::Closure {
+                    id: aid,
+                    signature: a,
+                },
+                Type::Closure {
+                    id: bid,
+                    signature: b,
+                },
+            ) => aid == bid && self.unify_same_callable_signature(a, b),
+            (
+                Type::OpaqueCallable {
+                    id: aid,
+                    signature: a,
+                },
+                Type::OpaqueCallable {
+                    id: bid,
+                    signature: b,
+                },
+            ) => aid == bid && self.unify_same_callable_signature(a, b),
+            (Type::CallableConstraint(expected), Type::CallableConstraint(actual)) => self
+                .unify_callable_signature(
+                    expected.is_unsafe,
+                    expected.kind,
+                    &expected.params,
+                    &expected.ret,
+                    actual,
+                ),
             _ => lhs == rhs || self.numeric_assignable(&lhs, &rhs),
         }
+    }
+
+    fn unify_callable_signature(
+        &mut self,
+        expected_unsafe: bool,
+        expected_kind: ClosureKind,
+        expected_params: &[Type],
+        expected_ret: &Type,
+        actual: &CallableSignature,
+    ) -> bool {
+        (!actual.is_unsafe || expected_unsafe)
+            && expected_kind.accepts(actual.kind)
+            && expected_params.len() == actual.params.len()
+            && expected_params
+                .iter()
+                .zip(&actual.params)
+                .all(|(a, b)| self.unify_types_inner(a, b))
+            && self.unify_types_inner(expected_ret, &actual.ret)
+    }
+
+    fn unify_same_callable_signature(
+        &mut self,
+        lhs: &CallableSignature,
+        rhs: &CallableSignature,
+    ) -> bool {
+        lhs.is_unsafe == rhs.is_unsafe
+            && lhs.kind == rhs.kind
+            && lhs.params.len() == rhs.params.len()
+            && lhs
+                .params
+                .iter()
+                .zip(&rhs.params)
+                .all(|(a, b)| self.unify_types_inner(a, b))
+            && self.unify_types_inner(&lhs.ret, &rhs.ret)
+    }
+
+    fn bind_infer_var(&mut self, id: u32, ty: &Type) -> bool {
+        if matches!(ty, Type::InferVar(other) if *other == id) {
+            return true;
+        }
+        if type_contains_infer_var(id, ty, &self.infer_values, &mut HashSet::new()) {
+            self.last_occurs_error = Some((id, ty.clone()));
+            return false;
+        }
+        self.infer_values.insert(id, ty.clone());
+        true
     }
 
     pub(crate) fn record_lambda(
@@ -869,6 +1034,20 @@ impl<'a> TypeChecker<'a> {
             .collect::<Vec<_>>();
         for (key, ty) in exprs {
             self.result.expr_types.insert(key, ty);
+        }
+        let generic_calls = self
+            .result
+            .generic_calls
+            .iter()
+            .filter(|((checked_body, _), _)| *checked_body == body_id)
+            .map(|(key, call)| {
+                let mut call = call.clone();
+                call.args = call.args.iter().map(|arg| self.resolve_type(arg)).collect();
+                (*key, call)
+            })
+            .collect::<Vec<_>>();
+        for (key, call) in generic_calls {
+            self.result.generic_calls.insert(key, call);
         }
         let lambdas = self
             .result
@@ -1147,7 +1326,7 @@ impl<'a> TypeChecker<'a> {
             HirTypeRef::Slice(inner) => self.type_ref_contains_inline_type(inner, target, seen),
             HirTypeRef::Never | HirTypeRef::Const(_) => false,
             HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
-            HirTypeRef::Function { .. } => false,
+            HirTypeRef::ImplTrait { .. } => false,
             HirTypeRef::Unknown | HirTypeRef::Error => false,
         }
     }
@@ -1263,10 +1442,20 @@ impl<'a> TypeChecker<'a> {
         if self.unify_types(&lhs, &rhs) {
             return self.resolve_type(&lhs);
         }
-        if matches!((&lhs, &rhs), (Type::Fn { .. }, Type::Fn { .. }))
-            && self.unify_types(&rhs, &lhs)
+        if self.last_occurs_error.take().is_some() {
+            self.diagnostic("E0046", "cannot construct an infinite type", span);
+            return Type::Error;
+        }
+        if matches!(
+            (&lhs, &rhs),
+            (Type::CallableConstraint(_), Type::CallableConstraint(_))
+        ) && self.unify_types(&rhs, &lhs)
         {
             return self.resolve_type(&rhs);
+        }
+        if self.last_occurs_error.take().is_some() {
+            self.diagnostic("E0046", "cannot construct an infinite type", span);
+            return Type::Error;
         }
         if lhs.is_never() {
             return rhs;
@@ -1317,7 +1506,26 @@ impl<'a> TypeChecker<'a> {
         context: &str,
         span: Option<TextRange>,
     ) {
+        self.expect_assignable_with_occurs_span(expected, actual, context, span, span);
+    }
+
+    pub(crate) fn expect_assignable_with_occurs_span(
+        &mut self,
+        expected: &Type,
+        actual: &Type,
+        context: &str,
+        span: Option<TextRange>,
+        occurs_span: Option<TextRange>,
+    ) {
+        if let Type::OpaqueCallable { id, signature } = self.resolve_type(expected) {
+            self.expect_opaque_callable_assignable(id, &signature, actual, span, occurs_span);
+            return;
+        }
         if self.unify_types(expected, actual) {
+            return;
+        }
+        if self.last_occurs_error.take().is_some() {
+            self.diagnostic("E0046", "cannot construct an infinite type", occurs_span);
             return;
         }
         let expected = self.resolve_type(expected);
@@ -1340,6 +1548,66 @@ impl<'a> TypeChecker<'a> {
                 "{} type mismatch: expected {}, got {}",
                 context,
                 expected.display(self.hir),
+                actual.display(self.hir)
+            ),
+            span,
+        );
+    }
+
+    fn expect_opaque_callable_assignable(
+        &mut self,
+        id: OpaqueCallableId,
+        signature: &CallableSignature,
+        actual: &Type,
+        span: Option<TextRange>,
+        occurs_span: Option<TextRange>,
+    ) {
+        let actual = self.resolve_type(actual);
+        if actual.is_unknown_like() || actual.is_never() {
+            return;
+        }
+        if matches!(actual, Type::OpaqueCallable { id: actual_id, .. } if actual_id == id) {
+            return;
+        }
+
+        let required = Type::CallableConstraint(signature.clone());
+        if !self.unify_types(&required, &actual) {
+            if self.last_occurs_error.take().is_some() {
+                self.diagnostic("E0046", "cannot construct an infinite type", occurs_span);
+                return;
+            }
+            let message = self
+                .callable_signature_for_type(&actual)
+                .filter(|actual| actual.is_unsafe && !signature.is_unsafe)
+                .map(|_| {
+                    format!(
+                        "unsafe function does not satisfy opaque callable return bound `{}`",
+                        signature.kind.as_str()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "opaque callable return does not satisfy `{}`",
+                        required.display(self.hir)
+                    )
+                });
+            self.diagnostic("E0035", message, span);
+            return;
+        }
+
+        let actual = self.resolve_type(&actual);
+        let Some(previous) = self.result.opaque_hidden_types.get(&id).cloned() else {
+            self.result.opaque_hidden_types.insert(id, actual);
+            return;
+        };
+        if self.unify_types(&previous, &actual) {
+            return;
+        }
+        self.diagnostic(
+            "E0002",
+            format!(
+                "opaque callable return has incompatible concrete types: {} and {}",
+                previous.display(self.hir),
                 actual.display(self.hir)
             ),
             span,
@@ -1401,6 +1669,9 @@ impl<'a> TypeChecker<'a> {
             "E0031" if message == "cannot call a mutable closure through an immutable binding" => {
                 vec!["add `mut` to the closure binding because calling it may update captured state".into()]
             }
+            "E0031" if message.contains("immutable parameter") => {
+                vec!["add `mut` to the parameter declaration".into()]
+            }
             "E0031" => vec!["add `mut` to the `let` binding if reassignment is intended".into()],
             "E0033" => vec!["recursive generic calls must reuse the same type arguments; wrapping them requires infinitely many instantiations".into()],
             "E0035" => vec!["the inferred type must implement every trait bound on the generic parameter".into()],
@@ -1413,12 +1684,19 @@ impl<'a> TypeChecker<'a> {
             "E0043" => vec!["put unsized `str` or `[T]` behind a reference or raw pointer".into()],
             "E0044" => vec!["define every supertrait and remove cycles from the trait hierarchy".into()],
             "E0045" => vec!["add an explicit type annotation or use the binding where its type is known".into()],
+            "E0047" if message.contains("only impl Fn") => {
+                vec!["use an explicit generic parameter and where-clause for other traits".into()]
+            }
             "E0047" => vec!["remove the duplicate or overlapping trait implementation".into()],
+            "E0048" if message.contains("implemented only by functions") => {
+                vec!["use a function or anonymous function value instead".into()]
+            }
             "E0048" => vec!["define the trait or a participating nominal type in the current package".into()],
             "E0057" => vec!["a `let` has no alternative branch, so its pattern must match every value; use `match` to handle the other cases".into()],
             "E0059" => vec!["assign the binding on every path before reading it".into()],
             "E0060" => vec!["use literals, constants, pure operators, casts, or aggregate values in a constant initializer".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
+            "E0391" => vec!["replace the recursive alias with a non-recursive type".into()],
             "E0022" | "E0025" => vec!["remove the duplicate associated type".into()],
             "E0023" => vec!["define the trait or import it into scope".into()],
             "E0026" => vec!["add an implementation for the required method".into()],
@@ -1426,7 +1704,8 @@ impl<'a> TypeChecker<'a> {
             "E0028" | "E0029" | "E0030" => vec!["the method signature must exactly match the trait declaration: check parameter count, types, and return type".into()],
             _ => Vec::new(),
         };
-        let help = (code == "E0046").then(|| "wrap this operation in `unsafe { ... }`".to_string());
+        let help = (code == "E0046" && message != "cannot construct an infinite type")
+            .then(|| "wrap this operation in `unsafe { ... }`".to_string());
         self.result.diagnostics.push(Diagnostic {
             code,
             severity: Severity::Error,
@@ -1584,6 +1863,59 @@ impl<'a> TypeChecker<'a> {
                 span,
             );
         }
+    }
+}
+
+fn type_contains_infer_var(
+    needle: u32,
+    ty: &Type,
+    infer_values: &HashMap<u32, Type>,
+    visited: &mut HashSet<u32>,
+) -> bool {
+    match ty {
+        Type::InferVar(id) => {
+            if *id == needle {
+                return true;
+            }
+            visited.insert(*id)
+                && infer_values
+                    .get(id)
+                    .is_some_and(|ty| type_contains_infer_var(needle, ty, infer_values, visited))
+        }
+        Type::Ref(inner, _) | Type::Slice(inner) => {
+            type_contains_infer_var(needle, inner, infer_values, visited)
+        }
+        Type::Ptr { inner, .. } | Type::Array(inner, _) => {
+            type_contains_infer_var(needle, inner, infer_values, visited)
+        }
+        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => elements
+            .iter()
+            .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
+        Type::FunctionItem { args, .. } => args
+            .iter()
+            .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
+        Type::CallableConstraint(signature)
+        | Type::Closure { signature, .. }
+        | Type::OpaqueCallable { signature, .. } => {
+            signature
+                .params
+                .iter()
+                .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited))
+                || type_contains_infer_var(needle, &signature.ret, infer_values, visited)
+        }
+        Type::Int(_)
+        | Type::Float(_)
+        | Type::InferInt
+        | Type::InferFloat
+        | Type::Bool
+        | Type::Str
+        | Type::Char
+        | Type::Unit
+        | Type::Never
+        | Type::Param(_)
+        | Type::Const(_)
+        | Type::Unknown
+        | Type::Error => false,
     }
 }
 
@@ -2132,9 +2464,31 @@ fn type_contains_slice(ty: &Type) -> bool {
         Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => {
             elements.iter().any(type_contains_slice)
         }
-        Type::Fn { params, ret, .. } => {
-            params.iter().any(type_contains_slice) || type_contains_slice(ret)
+        Type::CallableConstraint(signature)
+        | Type::Closure { signature, .. }
+        | Type::OpaqueCallable { signature, .. } => {
+            signature.params.iter().any(type_contains_slice) || type_contains_slice(&signature.ret)
         }
+        Type::FunctionItem { args, .. } => args.iter().any(type_contains_slice),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use super::type_contains_infer_var;
+    use crate::Type;
+
+    #[test]
+    fn detects_an_inference_variable_nested_in_a_type() {
+        let ty = Type::Tuple(vec![Type::Int(crate::IntTy::I32), Type::InferVar(7)]);
+        assert!(type_contains_infer_var(
+            7,
+            &ty,
+            &HashMap::new(),
+            &mut HashSet::new()
+        ));
     }
 }

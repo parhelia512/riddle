@@ -20,9 +20,9 @@ use crate::{
     checker::{GenericEdge, TypeChecker},
     result::{
         Diagnostic, ForLoopInfo, GenericCall, LambdaInfo, OperatorCall, PatternBindingMode,
-        TraitMethodCall,
+        TraitMethodCall, ValueUse,
     },
-    types::Type,
+    types::{OpaqueCallableId, Type},
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,8 @@ struct CachedBody {
     pattern_types: Vec<(PatId, Type)>,
     pattern_binding_types: Vec<(PatternBindingId, Type)>,
     pattern_binding_modes: Vec<(PatternBindingId, PatternBindingMode)>,
+    value_uses: Vec<(ExprId, ValueUse)>,
+    opaque_hidden_types: Vec<(OpaqueCallableId, Type)>,
     generic_edges: Vec<GenericEdge>,
 }
 
@@ -191,6 +193,12 @@ impl IncrementalTypeChecker {
             stats.checked_bodies += 1;
             let diagnostic_start = checker.result.diagnostics.len();
             let generic_edge_start = checker.generic_edges.len();
+            let opaque_hidden_before = checker
+                .result
+                .opaque_hidden_types
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>();
             checker.check_function(
                 fid,
                 function,
@@ -300,6 +308,20 @@ impl IncrementalTypeChecker {
                 .filter(|((checked_body, _), _)| *checked_body == body_id)
                 .map(|((_, binding), mode)| (*binding, *mode))
                 .collect();
+            let value_uses = checker
+                .result
+                .value_uses
+                .iter()
+                .filter(|((checked_body, _), _)| *checked_body == body_id)
+                .map(|((_, expr), use_kind)| (*expr, *use_kind))
+                .collect();
+            let opaque_hidden_types = checker
+                .result
+                .opaque_hidden_types
+                .iter()
+                .filter(|(id, _)| !opaque_hidden_before.contains(id))
+                .map(|(id, ty)| (*id, ty.clone()))
+                .collect();
             self.bodies.insert(
                 fid,
                 CachedBody {
@@ -316,6 +338,8 @@ impl IncrementalTypeChecker {
                     pattern_types,
                     pattern_binding_types,
                     pattern_binding_modes,
+                    value_uses,
+                    opaque_hidden_types,
                     generic_edges,
                 },
             );
@@ -412,6 +436,15 @@ fn replay_cached_body(
             .result
             .pattern_binding_modes
             .insert((body_id, *binding), *mode);
+    }
+    for (expr, use_kind) in &cached.value_uses {
+        checker
+            .result
+            .value_uses
+            .insert((body_id, *expr), *use_kind);
+    }
+    for (id, ty) in &cached.opaque_hidden_types {
+        checker.result.opaque_hidden_types.insert(*id, ty.clone());
     }
     checker.generic_edges.extend(generic_edges);
     true

@@ -9,9 +9,11 @@ use hir::{
         PatternBindingId, ResolvedName, Stmt, StmtId, UnaryOp as HirUnOp,
     },
     item_tree::{HirTypeRef, PathAnchor},
+    place::Projection,
 };
 use type_checker::{
-    CaptureMode, CaptureSource, LambdaInfo, OperatorCall, PatternBindingMode, TypeCheckResult,
+    CaptureMode, CapturePlace, CaptureSource, LambdaCapture, LambdaInfo, OperatorCall,
+    PatternBindingMode, TypeCheckResult,
 };
 
 use crate::builder::Builder;
@@ -100,6 +102,7 @@ pub fn lower_hir(
                 && hir.package_for_range(func.name_range).is_none()
                 && func.attrs.iter().any(|attr| attr.name.0 == "builtin"))
             || !func.generics.is_empty()
+            || !func.implicit_generics.is_empty()
             || ctx
                 .impl_for_method(fid)
                 .map(|imp| !imp.generics.is_empty() || !imp.const_generics.is_empty())
@@ -168,8 +171,8 @@ struct LowerCtx<'a> {
     mono_methods: HashMap<(hir::item_tree::FunctionId, String), String>,
     loop_targets: Vec<LoopTargets>,
     lambda_functions: HashMap<(BodyId, ExprId), String>,
-    function_adapters: HashMap<hir::item_tree::FunctionId, String>,
-    capture_access: HashMap<CaptureSource, CaptureAccess>,
+    function_adapters: HashMap<(hir::item_tree::FunctionId, Vec<type_checker::Type>), String>,
+    capture_access: HashMap<CapturePlace, CaptureAccess>,
     current_lambda: Option<ExprId>,
     lambda_counter: u32,
     active_consts: HashSet<hir::item_tree::ConstId>,
@@ -316,7 +319,10 @@ impl<'a> LowerCtx<'a> {
                 let needs_drop = self.type_needs_drop(&tc_ty, 0);
                 let storage = if self.analysis.param_escapes(body_id, index) {
                     Some(builder.heap_alloc(self.convert_hir_type(&param.ty)))
-                } else if self.analysis.param_needs_address(body_id, index) || needs_drop {
+                } else if param.is_mut
+                    || self.analysis.param_needs_address(body_id, index)
+                    || needs_drop
+                {
                     Some(builder.alloca(self.convert_hir_type(&param.ty)))
                 } else {
                     None
@@ -408,7 +414,14 @@ impl<'a> LowerCtx<'a> {
                         }
                         CaptureMode::Value => ty.clone(),
                     };
-                    (format!("capture_{}_{}", index, capture.name), field_ty)
+                    (
+                        format!(
+                            "capture_{}_{}",
+                            index,
+                            self.capture_environment_name(capture)
+                        ),
+                        field_ty,
+                    )
                 })
                 .collect(),
         };
@@ -428,16 +441,16 @@ impl<'a> LowerCtx<'a> {
                 let field_ty = env_struct.fields[index].1.clone();
                 let value = match capture.mode {
                     CaptureMode::Shared | CaptureMode::Mutable => {
-                        self.capture_place(builder, outer_params, &capture.source, capture_ty)
+                        self.capture_place(builder, outer_params, &capture.place, capture_ty)
                     }
                     CaptureMode::Value => {
-                        self.capture_value(builder, outer_params, &capture.source, capture_ty)
+                        self.capture_value(builder, outer_params, &capture.place, capture_ty)
                     }
                 };
                 let field = builder.field_ptr(env_ptr, index, field_ty);
                 builder.store(value, field);
                 if capture.mode == CaptureMode::Value && self.type_needs_drop(&capture.ty, 0) {
-                    self.clear_drop_slots_for_source(builder, &capture.source);
+                    self.clear_drop_slots_for_capture(builder, &capture.place);
                 }
             }
             builder.cast(CastOp::PtrToPtr, env_ptr, closure_env_type())
@@ -469,6 +482,41 @@ impl<'a> LowerCtx<'a> {
             closure_drop_function_type(),
         );
         builder.struct_value(vec![call, env_value, drop], ty.clone())
+    }
+
+    fn capture_environment_name(&self, capture: &LambdaCapture) -> String {
+        let mut name = capture.name.clone();
+        let root_ty = self.capture_root_type(&capture.place.source);
+        for (position, projection) in capture.place.projections.iter().enumerate() {
+            match projection {
+                Projection::Field(index) => {
+                    let field_name = if position == 0 {
+                        match &root_ty {
+                            Some(type_checker::Type::Struct(struct_id, _)) => {
+                                self.hir.item_tree.structs[*struct_id]
+                                    .fields
+                                    .get(*index)
+                                    .map(|field| field.name.0.as_str())
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    name.push('_');
+                    name.push_str(
+                        &field_name
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("field_{index}")),
+                    );
+                }
+                Projection::Index(Some(index)) => {
+                    name.push_str(&format!("_{index}"));
+                }
+                Projection::Index(None) => name.push_str("_index"),
+            }
+        }
+        name
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -516,9 +564,10 @@ impl<'a> LowerCtx<'a> {
                 let needs_drop = self.type_needs_drop(&tc_ty, 0);
                 let storage = if self.analysis.lambda_param_escapes(body_id, expr_id, index) {
                     Some(lambda_builder.heap_alloc(ty.clone()))
-                } else if self
-                    .analysis
-                    .lambda_param_needs_address(body_id, expr_id, index)
+                } else if params[index].is_mut
+                    || self
+                        .analysis
+                        .lambda_param_needs_address(body_id, expr_id, index)
                     || needs_drop
                 {
                     Some(lambda_builder.alloca(ty))
@@ -562,7 +611,7 @@ impl<'a> LowerCtx<'a> {
                         CaptureMode::Value => field,
                     };
                     self.capture_access.insert(
-                        capture.source.clone(),
+                        capture.place.clone(),
                         CaptureAccess {
                             place,
                             ty: capture_ty.clone(),
@@ -627,19 +676,72 @@ impl<'a> LowerCtx<'a> {
         &mut self,
         builder: &mut Builder,
         params: &[Value],
+        capture: &CapturePlace,
+        ty: &Type,
+    ) -> Value {
+        if let Some(access) = self.capture_access_for_place(builder, capture) {
+            return builder.load(access.place, access.ty);
+        }
+        let place = self.capture_place(builder, params, capture, ty);
+        builder.load(place, ty.clone())
+    }
+
+    fn capture_place(
+        &mut self,
+        builder: &mut Builder,
+        params: &[Value],
+        capture: &CapturePlace,
+        ty: &Type,
+    ) -> Value {
+        if let Some(access) = self.capture_access_for_place(builder, capture) {
+            return access.place;
+        }
+        let root_ty = self.capture_root_mir_type(builder, params, &capture.source, ty);
+        let root_place = match &capture.source {
+            CaptureSource::Pattern(id) => self.binding_place(builder, *id),
+            CaptureSource::Param(index) => self
+                .parameter_storage
+                .get(&CaptureSource::Param(*index))
+                .copied(),
+            source @ CaptureSource::LambdaParam { lambda, .. }
+                if self.current_lambda == Some(*lambda) =>
+            {
+                self.parameter_storage.get(source).copied()
+            }
+            CaptureSource::LambdaParam { .. } => None,
+        }
+        .unwrap_or_else(|| {
+            let value = self.capture_root_value(builder, params, &capture.source, &root_ty);
+            let place = builder.heap_alloc(root_ty.clone());
+            builder.store(value, place);
+            place
+        });
+        self.project_capture_access(
+            builder,
+            CaptureAccess {
+                place: root_place,
+                ty: root_ty,
+            },
+            &capture.projections,
+        )
+        .map(|access| access.place)
+        .unwrap_or(root_place)
+    }
+
+    fn capture_root_value(
+        &mut self,
+        builder: &mut Builder,
+        params: &[Value],
         source: &CaptureSource,
         ty: &Type,
     ) -> Value {
-        if let Some(access) = self.capture_access.get(source).cloned() {
-            return builder.load(access.place, access.ty);
-        }
         match source {
             CaptureSource::Pattern(id) => self
                 .binding_value(builder, *id, ty)
                 .unwrap_or_else(|| builder.unit_const()),
             CaptureSource::Param(index) => self
                 .parameter_storage
-                .get(&CaptureSource::Param(*index))
+                .get(source)
                 .copied()
                 .map(|place| builder.load(place, ty.clone()))
                 .or_else(|| params.get(*index).copied())
@@ -658,35 +760,104 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    fn capture_place(
+    fn capture_access_for_place(
         &mut self,
         builder: &mut Builder,
+        requested: &CapturePlace,
+    ) -> Option<CaptureAccess> {
+        let (ancestor, access) = self
+            .capture_access
+            .iter()
+            .filter(|(place, _)| place.is_prefix_of(requested))
+            .max_by_key(|(place, _)| place.projections.len())
+            .map(|(place, access)| (place.clone(), access.clone()))?;
+        self.project_capture_access(
+            builder,
+            access,
+            &requested.projections[ancestor.projections.len()..],
+        )
+    }
+
+    fn project_capture_access(
+        &self,
+        builder: &mut Builder,
+        mut access: CaptureAccess,
+        projections: &[Projection],
+    ) -> Option<CaptureAccess> {
+        for projection in projections {
+            let ty = match (projection, &access.ty) {
+                (Projection::Field(index), Type::Struct(strukt)) => {
+                    strukt.fields.get(*index)?.1.clone()
+                }
+                (Projection::Field(index), Type::Tuple(elements)) => elements.get(*index)?.clone(),
+                (Projection::Index(Some(_)), Type::Array(element, _)) => *element.clone(),
+                (Projection::Index(None), _) => return None,
+                _ => return None,
+            };
+            access.place = match projection {
+                Projection::Field(index) => builder.field_ptr(access.place, *index, ty.clone()),
+                Projection::Index(Some(index)) => {
+                    let index = builder.iconst(*index as u64, IntTy::Usize);
+                    builder.index_ptr(access.place, index, ty.clone())
+                }
+                Projection::Index(None) => return None,
+            };
+            access.ty = ty;
+        }
+        Some(access)
+    }
+
+    fn capture_root_mir_type(
+        &self,
+        builder: &Builder,
         params: &[Value],
         source: &CaptureSource,
-        ty: &Type,
-    ) -> Value {
-        if let Some(access) = self.capture_access.get(source) {
-            return access.place;
+        fallback: &Type,
+    ) -> Type {
+        if let Some(tc_ty) = self.capture_root_type(source) {
+            return self.convert_type(&tc_ty);
         }
-        if let CaptureSource::Pattern(id) = source
-            && let Some(place) = self.binding_place(builder, *id)
-        {
-            return place;
+        let index = match source {
+            CaptureSource::Param(index) | CaptureSource::LambdaParam { index, .. } => *index,
+            CaptureSource::Pattern(_) => return fallback.clone(),
+        };
+        params
+            .get(index)
+            .and_then(|value| {
+                builder
+                    .func
+                    .params
+                    .iter()
+                    .find(|param| param.value == *value)
+                    .map(|param| param.ty.clone())
+            })
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    fn capture_root_type(&self, source: &CaptureSource) -> Option<type_checker::Type> {
+        match source {
+            CaptureSource::Pattern(id) => self.current_body.and_then(|body_id| {
+                self.type_result
+                    .pattern_binding_types
+                    .get(&(body_id, *id))
+                    .cloned()
+            }),
+            CaptureSource::Param(index) => self.current_function.and_then(|function| {
+                self.hir.item_tree.functions[function]
+                    .params
+                    .get(*index)
+                    .map(|param| self.lower_hir_type_for_pattern(&param.ty, &self.generic_tc_subst))
+            }),
+            CaptureSource::LambdaParam { lambda, index } => {
+                let body_id = self.current_body?;
+                let Expr::Lambda { params, .. } = &self.hir.bodies[body_id].exprs[*lambda] else {
+                    return None;
+                };
+                params
+                    .get(*index)
+                    .map(|param| self.lower_hir_type_for_pattern(&param.ty, &self.generic_tc_subst))
+            }
         }
-        if let CaptureSource::Param(index) = source
-            && let Some(place) = self.parameter_storage.get(&CaptureSource::Param(*index))
-        {
-            return *place;
-        }
-        if matches!(source, CaptureSource::LambdaParam { .. })
-            && let Some(place) = self.parameter_storage.get(source)
-        {
-            return *place;
-        }
-        let value = self.capture_value(builder, params, source, ty);
-        let place = builder.heap_alloc(ty.clone());
-        builder.store(value, place);
-        place
     }
 
     fn null_env(&self, builder: &mut Builder) -> Value {
@@ -698,17 +869,25 @@ impl<'a> LowerCtx<'a> {
         &mut self,
         builder: &mut Builder,
         fid: hir::item_tree::FunctionId,
+        args: &[type_checker::Type],
         ty: &Type,
     ) -> Value {
         let Some(signature) = closure_call_signature(ty) else {
             return builder.unit_const();
         };
-        let adapter = if let Some(name) = self.function_adapters.get(&fid) {
+        let args = args
+            .iter()
+            .map(|arg| self.substitute_tc_type(arg))
+            .collect::<Vec<_>>();
+        let key = (fid, args.clone());
+        let adapter = if let Some(name) = self.function_adapters.get(&key) {
             name.clone()
         } else {
-            let target = self.function_name(fid);
+            let target = self
+                .mono_function_name_for_args(fid, &args)
+                .unwrap_or_else(|| self.function_name(fid));
             let name = format!("__riddle_fn_adapter_{}", target);
-            self.function_adapters.insert(fid, name.clone());
+            self.function_adapters.insert(key, name.clone());
 
             let mut function = Function::new(name.clone(), (*signature.ret).clone());
             function.add_param("__env".into(), closure_env_type());
@@ -818,24 +997,22 @@ impl<'a> LowerCtx<'a> {
 
             Expr::Path { path, resolved } => match resolved {
                 Some(ResolvedName::Param(idx)) => {
-                    let value = if let Some(access) = self
-                        .capture_access
-                        .get(&CaptureSource::Param(*idx))
-                        .cloned()
-                    {
-                        builder.load(access.place, access.ty)
-                    } else if let Some(storage) = self
-                        .parameter_storage
-                        .get(&CaptureSource::Param(*idx))
-                        .copied()
-                    {
-                        builder.load(storage, mir_type.clone())
-                    } else {
-                        param_values
-                            .get(*idx)
+                    let capture = CapturePlace::root(CaptureSource::Param(*idx));
+                    let value =
+                        if let Some(access) = self.capture_access_for_place(builder, &capture) {
+                            builder.load(access.place, access.ty)
+                        } else if let Some(storage) = self
+                            .parameter_storage
+                            .get(&CaptureSource::Param(*idx))
                             .copied()
-                            .unwrap_or_else(|| builder.unit_const())
-                    };
+                        {
+                            builder.load(storage, mir_type.clone())
+                        } else {
+                            param_values
+                                .get(*idx)
+                                .copied()
+                                .unwrap_or_else(|| builder.unit_const())
+                        };
                     self.clear_drop_flags_if_moved(builder, body, expr_id);
                     value
                 }
@@ -851,7 +1028,9 @@ impl<'a> LowerCtx<'a> {
                             .map(|place| builder.load(place, mir_type.clone()))
                             .or_else(|| param_values.get(*index).copied())
                             .unwrap_or_else(|| builder.unit_const())
-                    } else if let Some(access) = self.capture_access.get(&source).cloned() {
+                    } else if let Some(access) =
+                        self.capture_access_for_place(builder, &CapturePlace::root(source.clone()))
+                    {
                         builder.load(access.place, access.ty)
                     } else {
                         builder.unit_const()
@@ -861,7 +1040,9 @@ impl<'a> LowerCtx<'a> {
                 }
                 Some(ResolvedName::PatternBinding(id)) => {
                     let source = CaptureSource::Pattern(*id);
-                    let value = if let Some(access) = self.capture_access.get(&source).cloned() {
+                    let value = if let Some(access) =
+                        self.capture_access_for_place(builder, &CapturePlace::root(source))
+                    {
                         builder.load(access.place, access.ty)
                     } else {
                         self.binding_value(builder, *id, &mir_type)
@@ -871,7 +1052,11 @@ impl<'a> LowerCtx<'a> {
                     value
                 }
                 Some(ResolvedName::Function(fid)) => {
-                    self.lower_function_value(builder, *fid, &mir_type)
+                    let args = match tc_type {
+                        Some(type_checker::Type::FunctionItem { args, .. }) => args.clone(),
+                        _ => Vec::new(),
+                    };
+                    self.lower_function_value(builder, *fid, &args, &mir_type)
                 }
                 Some(ResolvedName::Const(const_id)) => self.lower_const_value(builder, *const_id),
                 Some(ResolvedName::EnumVariant(enum_id, idx)) => {
@@ -1413,27 +1598,45 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::FieldAccess { base, field } => {
-                let bv = self.lower_expr(builder, param_values, body, *base);
-                let field_idx = self.resolve_field_index(*base, field);
-                let value = builder.extract_value(bv, field_idx, mir_type);
+                let captured = self
+                    .capture_place_from_expr(body, expr_id)
+                    .and_then(|place| self.capture_access_for_place(builder, &place))
+                    .filter(|access| access.ty == mir_type);
+                let value = if let Some(access) = captured {
+                    builder.load(access.place, access.ty)
+                } else {
+                    let bv = self.lower_expr(builder, param_values, body, *base);
+                    let field_idx = self.resolve_field_index(*base, field);
+                    builder.extract_value(bv, field_idx, mir_type)
+                };
                 self.clear_drop_flags_if_moved(builder, body, expr_id);
                 value
             }
 
             Expr::IndexAccess { base, index } => {
-                let base_val = self.lower_expr(builder, param_values, body, *base);
-                let index_val = self.lower_expr(builder, param_values, body, *index);
-                let ptr = if let Some(len) = self.index_len(builder, base_val, *base) {
-                    builder.checked_index_ptr(base_val, index_val, len, mir_type.clone())
+                let captured = self
+                    .capture_place_from_expr(body, expr_id)
+                    .and_then(|place| self.capture_access_for_place(builder, &place))
+                    .filter(|access| access.ty == mir_type);
+                if let Some(access) = captured {
+                    let value = builder.load(access.place, access.ty);
+                    self.clear_drop_flags_if_moved(builder, body, expr_id);
+                    value
                 } else {
-                    builder.index_ptr(base_val, index_val, mir_type.clone())
-                };
-                let value = builder.load(ptr, mir_type);
-                self.clear_drop_flags_if_moved(builder, body, expr_id);
-                self.clear_dynamic_index_drop_flags_if_moved(
-                    builder, body, expr_id, *base, *index, index_val,
-                );
-                value
+                    let base_val = self.lower_expr(builder, param_values, body, *base);
+                    let index_val = self.lower_expr(builder, param_values, body, *index);
+                    let ptr = if let Some(len) = self.index_len(builder, base_val, *base) {
+                        builder.checked_index_ptr(base_val, index_val, len, mir_type.clone())
+                    } else {
+                        builder.index_ptr(base_val, index_val, mir_type.clone())
+                    };
+                    let value = builder.load(ptr, mir_type);
+                    self.clear_drop_flags_if_moved(builder, body, expr_id);
+                    self.clear_dynamic_index_drop_flags_if_moved(
+                        builder, body, expr_id, *base, *index, index_val,
+                    );
+                    value
+                }
             }
 
             Expr::Unsafe { body: body_expr } => {
@@ -2828,19 +3031,46 @@ impl<'a> LowerCtx<'a> {
                 HirConstArg::Unknown => ConstArg::Unknown,
                 HirConstArg::Error => ConstArg::Error,
             }),
-            HirTypeRef::Function {
-                is_unsafe,
-                params,
-                ret,
-            } => type_checker::Type::Fn {
-                is_unsafe: *is_unsafe,
-                kind: type_checker::ClosureKind::Fn,
-                params: params
-                    .iter()
-                    .map(|param| self.lower_hir_type_for_pattern(param, subst))
-                    .collect(),
-                ret: Box::new(self.lower_hir_type_for_pattern(ret, subst)),
-            },
+            HirTypeRef::ImplTrait {
+                trait_ty,
+                trait_range,
+                callable,
+                hidden,
+            } => {
+                if let Some(hidden) = hidden {
+                    return subst
+                        .get(&hidden.0)
+                        .cloned()
+                        .unwrap_or_else(|| type_checker::Type::Param(hidden.0.clone()));
+                }
+                let kind = match trait_ty.as_ref() {
+                    HirTypeRef::Named(path) => {
+                        match path.segments.last().map(|name| name.0.as_str()) {
+                            Some("Fn") => type_checker::ClosureKind::Fn,
+                            Some("FnMut") => type_checker::ClosureKind::FnMut,
+                            Some("FnOnce") => type_checker::ClosureKind::FnOnce,
+                            _ => return type_checker::Type::Unknown,
+                        }
+                    }
+                    _ => return type_checker::Type::Unknown,
+                };
+                let Some(callable) = callable else {
+                    return type_checker::Type::Unknown;
+                };
+                type_checker::Type::OpaqueCallable {
+                    id: type_checker::OpaqueCallableId(*trait_range),
+                    signature: type_checker::CallableSignature {
+                        is_unsafe: false,
+                        kind,
+                        params: callable
+                            .params
+                            .iter()
+                            .map(|param| self.lower_hir_type_for_pattern(param, subst))
+                            .collect(),
+                        ret: Box::new(self.lower_hir_type_for_pattern(&callable.ret, subst)),
+                    },
+                }
+            }
             HirTypeRef::Unknown => type_checker::Type::Unknown,
             HirTypeRef::Error => type_checker::Type::Error,
         }
@@ -2989,7 +3219,7 @@ impl<'a> LowerCtx<'a> {
         self.current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, callee)))
             .and_then(|ty| match ty {
-                type_checker::Type::Function(fid) => Some(*fid),
+                type_checker::Type::FunctionItem { function: fid, .. } => Some(*fid),
                 _ => None,
             })
     }
@@ -3434,6 +3664,52 @@ impl<'a> LowerCtx<'a> {
         resolve_field_index(self.hir, self.type_result, body_id, base, field_name)
     }
 
+    fn capture_place_from_expr(&self, body: &Body, expr_id: ExprId) -> Option<CapturePlace> {
+        match &body.exprs[expr_id] {
+            Expr::Path {
+                resolved: Some(resolved),
+                ..
+            } => {
+                let source = match resolved {
+                    ResolvedName::PatternBinding(id) => CaptureSource::Pattern(*id),
+                    ResolvedName::Param(index) => CaptureSource::Param(*index),
+                    ResolvedName::LambdaParam { lambda, index } => CaptureSource::LambdaParam {
+                        lambda: *lambda,
+                        index: *index,
+                    },
+                    _ => return None,
+                };
+                Some(CapturePlace::root(source))
+            }
+            Expr::FieldAccess { base, field } => {
+                let mut place = self.capture_place_from_expr(body, *base)?;
+                let base_ty = self
+                    .current_body
+                    .and_then(|body_id| self.type_result.expr_types.get(&(body_id, *base)));
+                if matches!(base_ty, Some(type_checker::Type::Struct(..))) {
+                    place
+                        .projections
+                        .push(Projection::Field(self.resolve_field_index(*base, field)));
+                }
+                Some(place)
+            }
+            Expr::IndexAccess { base, index } => {
+                let mut place = self.capture_place_from_expr(body, *base)?;
+                if let Expr::IntLiteral { value, .. } = body.exprs[*index]
+                    && let Ok(index) = usize::try_from(value)
+                {
+                    place.projections.push(Projection::Index(Some(index)));
+                }
+                Some(place)
+            }
+            Expr::Unary {
+                operand,
+                op: HirUnOp::Deref,
+            } => self.capture_place_from_expr(body, *operand),
+            _ => None,
+        }
+    }
+
     /// Resolve a path as an lvalue (storage location) without loading.
     /// For mut bindings: returns the alloca pointer directly.
     /// For non-mut bindings / params: returns the value as-is (SSA values are
@@ -3445,18 +3721,24 @@ impl<'a> LowerCtx<'a> {
         body: &Body,
         expr_id: ExprId,
     ) -> Value {
+        if let Some(access) = self
+            .capture_place_from_expr(body, expr_id)
+            .and_then(|place| self.capture_access_for_place(builder, &place))
+            && self
+                .current_body
+                .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
+                .map(|ty| self.convert_type(ty))
+                .is_some_and(|ty| ty == access.ty)
+        {
+            return access.place;
+        }
         let expr = &body.exprs[expr_id];
         match expr {
             Expr::Path { resolved, .. } => match resolved {
                 Some(ResolvedName::Param(idx)) => self
-                    .capture_access
+                    .parameter_storage
                     .get(&CaptureSource::Param(*idx))
-                    .map(|access| access.place)
-                    .or_else(|| {
-                        self.parameter_storage
-                            .get(&CaptureSource::Param(*idx))
-                            .copied()
-                    })
+                    .copied()
                     .or_else(|| param_values.get(*idx).copied())
                     .unwrap_or_else(|| builder.unit_const()),
                 Some(ResolvedName::LambdaParam { lambda, index }) => {
@@ -3464,10 +3746,9 @@ impl<'a> LowerCtx<'a> {
                         lambda: *lambda,
                         index: *index,
                     };
-                    self.capture_access
+                    self.parameter_storage
                         .get(&source)
-                        .map(|access| access.place)
-                        .or_else(|| self.parameter_storage.get(&source).copied())
+                        .copied()
                         .or_else(|| {
                             (self.current_lambda == Some(*lambda))
                                 .then(|| param_values.get(*index).copied())
@@ -3476,17 +3757,13 @@ impl<'a> LowerCtx<'a> {
                         .unwrap_or_else(|| builder.unit_const())
                 }
                 Some(ResolvedName::PatternBinding(id)) => {
-                    if let Some(access) = self.capture_access.get(&CaptureSource::Pattern(*id)) {
-                        access.place
-                    } else {
-                        // A `let` binding without storage has no address; the
-                        // SSA value doubles as its location, as before.
-                        self.scope_map
-                            .get(id)
-                            .copied()
-                            .or_else(|| self.binding_place(builder, *id))
-                            .unwrap_or_else(|| builder.unit_const())
-                    }
+                    // A `let` binding without storage has no address; the
+                    // SSA value doubles as its location, as before.
+                    self.scope_map
+                        .get(id)
+                        .copied()
+                        .or_else(|| self.binding_place(builder, *id))
+                        .unwrap_or_else(|| builder.unit_const())
                 }
                 _ => builder.unit_const(),
             },
@@ -4048,6 +4325,51 @@ impl<'a> LowerCtx<'a> {
                     .map(|arg| self.substitute_tc_type(arg))
                     .collect(),
             ),
+            TcType::FunctionItem { function, args } => TcType::FunctionItem {
+                function: *function,
+                args: args
+                    .iter()
+                    .map(|arg| self.substitute_tc_type(arg))
+                    .collect(),
+            },
+            TcType::Closure { id, signature } => TcType::Closure {
+                id: *id,
+                signature: type_checker::CallableSignature {
+                    is_unsafe: signature.is_unsafe,
+                    kind: signature.kind,
+                    params: signature
+                        .params
+                        .iter()
+                        .map(|param| self.substitute_tc_type(param))
+                        .collect(),
+                    ret: Box::new(self.substitute_tc_type(&signature.ret)),
+                },
+            },
+            TcType::OpaqueCallable { id, signature } => TcType::OpaqueCallable {
+                id: *id,
+                signature: type_checker::CallableSignature {
+                    is_unsafe: signature.is_unsafe,
+                    kind: signature.kind,
+                    params: signature
+                        .params
+                        .iter()
+                        .map(|param| self.substitute_tc_type(param))
+                        .collect(),
+                    ret: Box::new(self.substitute_tc_type(&signature.ret)),
+                },
+            },
+            TcType::CallableConstraint(signature) => {
+                TcType::CallableConstraint(type_checker::CallableSignature {
+                    is_unsafe: signature.is_unsafe,
+                    kind: signature.kind,
+                    params: signature
+                        .params
+                        .iter()
+                        .map(|param| self.substitute_tc_type(param))
+                        .collect(),
+                    ret: Box::new(self.substitute_tc_type(&signature.ret)),
+                })
+            }
             TcType::Const(TcConstArg::Param(name)) => self
                 .generic_tc_subst
                 .get(name)
@@ -4075,7 +4397,9 @@ impl<'a> LowerCtx<'a> {
             || matches!(ty, type_checker::Type::Enum(..))
             || matches!(
                 ty,
-                type_checker::Type::Function(_) | type_checker::Type::Fn { .. }
+                type_checker::Type::FunctionItem { .. }
+                    | type_checker::Type::Closure { .. }
+                    | type_checker::Type::OpaqueCallable { .. }
             )
         {
             let flag = builder.alloca(Type::Bool);
@@ -4170,7 +4494,9 @@ impl<'a> LowerCtx<'a> {
         let ty = self.substitute_tc_type(ty);
         if matches!(
             ty,
-            type_checker::Type::Function(_) | type_checker::Type::Fn { .. }
+            type_checker::Type::FunctionItem { .. }
+                | type_checker::Type::Closure { .. }
+                | type_checker::Type::OpaqueCallable { .. }
         ) {
             let closure = builder.load(place, self.convert_type(&ty));
             let env = builder.extract_value(closure, 1, closure_env_type());
@@ -4268,7 +4594,9 @@ impl<'a> LowerCtx<'a> {
         if self.type_result.trait_env.type_has_explicit_drop(&ty)
             || matches!(
                 &ty,
-                type_checker::Type::Function(_) | type_checker::Type::Fn { .. }
+                type_checker::Type::FunctionItem { .. }
+                    | type_checker::Type::Closure { .. }
+                    | type_checker::Type::OpaqueCallable { .. }
             )
         {
             return true;
@@ -4371,6 +4699,32 @@ impl<'a> LowerCtx<'a> {
             .get(source)
             .into_iter()
             .flatten()
+            .map(|slot| slot.flag)
+            .collect::<HashSet<_>>();
+        for flag in flags {
+            let inactive = builder.bconst(false);
+            builder.store(inactive, flag);
+        }
+    }
+
+    fn clear_drop_slots_for_capture(&self, builder: &mut Builder, capture: &CapturePlace) {
+        let projection = capture
+            .projections
+            .iter()
+            .filter_map(|projection| match projection {
+                Projection::Field(index) => Some(DropProjection::Field(*index)),
+                Projection::Index(Some(index)) => Some(DropProjection::Index(*index)),
+                Projection::Index(None) => None,
+            })
+            .collect::<Vec<_>>();
+        let flags = self
+            .drop_slots
+            .get(&capture.source)
+            .into_iter()
+            .flatten()
+            .filter(|slot| {
+                slot.projection.starts_with(&projection) || projection.starts_with(&slot.projection)
+            })
             .map(|slot| slot.flag)
             .collect::<HashSet<_>>();
         for flag in flags {
@@ -4554,34 +4908,74 @@ impl<'a> LowerCtx<'a> {
             ),
             TcType::Struct(sid, args) => self.convert_struct_type(*sid, args),
             TcType::Enum(eid, args) => self.convert_enum_type(*eid, args),
-            TcType::Function(fid) => {
-                let f = &self.hir.item_tree.functions[*fid];
-                let params = f
+            TcType::FunctionItem {
+                function: fid,
+                args,
+            } => closure_value_type(self.function_item_signature(*fid, args)),
+            TcType::CallableConstraint(signature) => closure_value_type(FnPtrType {
+                params: signature
                     .params
-                    .iter()
-                    .map(|p| self.convert_hir_type(&p.ty))
-                    .collect();
-                let ret = f
-                    .ret_type
-                    .as_ref()
-                    .map(|rt| self.convert_hir_type(rt))
-                    .unwrap_or(Type::Unit);
-                closure_value_type(FnPtrType {
-                    params,
-                    ret: Box::new(ret),
-                })
-            }
-            TcType::Fn { params, ret, .. } => closure_value_type(FnPtrType {
-                params: params
                     .iter()
                     .map(|param| self.convert_type(param))
                     .collect(),
-                ret: Box::new(self.convert_type(ret)),
+                ret: Box::new(self.convert_type(&signature.ret)),
             }),
+            TcType::Closure { signature, .. } | TcType::OpaqueCallable { signature, .. } => {
+                closure_value_type(FnPtrType {
+                    params: signature
+                        .params
+                        .iter()
+                        .map(|param| self.convert_type(param))
+                        .collect(),
+                    ret: Box::new(self.convert_type(&signature.ret)),
+                })
+            }
             TcType::InferVar(_) => Type::Unit,
             TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
             TcType::Const(_) => Type::Unit,
             TcType::Unknown | TcType::Error => Type::Unit,
+        }
+    }
+
+    fn function_item_signature(
+        &self,
+        fid: hir::item_tree::FunctionId,
+        args: &[type_checker::Type],
+    ) -> FnPtrType {
+        let function = &self.hir.item_tree.functions[fid];
+        let mut names = Vec::new();
+        if let Some(imp) = self.impl_for_method(fid) {
+            names.extend(imp.generics.iter().map(|name| name.0.clone()));
+        }
+        names.extend(function.generics.iter().map(|name| name.0.clone()));
+        names.extend(function.implicit_generics.iter().map(|name| name.0.clone()));
+        if let Some(imp) = self.impl_for_method(fid) {
+            names.extend(imp.const_generics.iter().map(|name| name.0.clone()));
+        }
+        names.extend(function.const_generics.iter().map(|name| name.0.clone()));
+
+        let mut subst = names
+            .into_iter()
+            .zip(args.iter().map(|arg| self.substitute_tc_type(arg)))
+            .collect::<HashMap<_, _>>();
+        if let Some(imp) = self.impl_for_method(fid) {
+            let self_ty = self.lower_hir_type_for_pattern(&imp.self_ty, &subst);
+            subst.insert("Self".into(), self_ty);
+        }
+
+        FnPtrType {
+            params: function
+                .params
+                .iter()
+                .map(|param| self.convert_type(&self.lower_hir_type_for_pattern(&param.ty, &subst)))
+                .collect(),
+            ret: Box::new(
+                function
+                    .ret_type
+                    .as_ref()
+                    .map(|ret| self.convert_type(&self.lower_hir_type_for_pattern(ret, &subst)))
+                    .unwrap_or(Type::Unit),
+            ),
         }
     }
 
@@ -4657,14 +5051,27 @@ impl<'a> LowerCtx<'a> {
                 self.hir_const_arg_to_usize(len, &HashMap::new()),
             ),
             hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
-            hir::item_tree::HirTypeRef::Function { params, ret, .. } => {
-                closure_value_type(FnPtrType {
-                    params: params
-                        .iter()
-                        .map(|param| self.convert_hir_type(param))
-                        .collect(),
-                    ret: Box::new(self.convert_hir_type(ret)),
-                })
+            hir::item_tree::HirTypeRef::ImplTrait {
+                callable, hidden, ..
+            } => {
+                if let Some(hidden) = hidden
+                    && let Some(ty) = self.generic_subst.get(&hidden.0)
+                {
+                    return ty.clone();
+                }
+                callable
+                    .as_ref()
+                    .map(|signature| {
+                        closure_value_type(FnPtrType {
+                            params: signature
+                                .params
+                                .iter()
+                                .map(|param| self.convert_hir_type(param))
+                                .collect(),
+                            ret: Box::new(self.convert_hir_type(&signature.ret)),
+                        })
+                    })
+                    .unwrap_or(Type::Unit)
             }
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
@@ -5054,24 +5461,37 @@ impl<'a> LowerCtx<'a> {
         fid: hir::item_tree::FunctionId,
         callee: ExprId,
     ) -> Option<String> {
-        let function = &self.hir.item_tree.functions[fid];
-        if !self.hir.function_bodies.contains_key(&fid) {
-            return None;
-        }
-        let imp = self.impl_for_method(fid).cloned();
-        let outer_generics = imp
-            .as_ref()
-            .map(|imp| imp.generics.as_slice())
-            .unwrap_or_default();
-        if outer_generics.is_empty() && function.generics.is_empty() {
-            return None;
-        }
         let body_id = self.current_body?;
         let tc_args = self
             .type_result
             .generic_calls
             .get(&(body_id, callee))?
             .args
+            .clone();
+        self.mono_function_name_for_args(fid, &tc_args)
+    }
+
+    fn mono_function_name_for_args(
+        &mut self,
+        fid: hir::item_tree::FunctionId,
+        tc_args: &[type_checker::Type],
+    ) -> Option<String> {
+        if !self.hir.function_bodies.contains_key(&fid) {
+            return None;
+        }
+        let function = self.hir.item_tree.functions[fid].clone();
+        let imp = self.impl_for_method(fid).cloned();
+        let outer_generics = imp
+            .as_ref()
+            .map(|imp| imp.generics.as_slice())
+            .unwrap_or_default();
+        if outer_generics.is_empty()
+            && function.generics.is_empty()
+            && function.implicit_generics.is_empty()
+        {
+            return None;
+        }
+        let tc_args = tc_args
             .iter()
             .map(|arg| self.substitute_tc_type(arg))
             .collect::<Vec<_>>();
@@ -5088,6 +5508,7 @@ impl<'a> LowerCtx<'a> {
             function
                 .generics
                 .iter()
+                .chain(function.implicit_generics.iter())
                 .zip(args.iter().skip(outer_generics.len()))
                 .map(|(name, ty)| (name.0.clone(), ty.clone())),
         );
@@ -5124,6 +5545,7 @@ impl<'a> LowerCtx<'a> {
             function
                 .generics
                 .iter()
+                .chain(function.implicit_generics.iter())
                 .zip(tc_args.iter().skip(outer_generics.len()))
                 .map(|(name, ty)| (name.0.clone(), ty.clone())),
         );
@@ -5585,15 +6007,7 @@ impl<'a> LowerCtx<'a> {
                 self.hir_const_arg_to_usize(len, const_subst),
             ),
             hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
-            hir::item_tree::HirTypeRef::Function { params, ret, .. } => {
-                closure_value_type(FnPtrType {
-                    params: params
-                        .iter()
-                        .map(|param| self.convert_hir_type_with_substs(param, subst, const_subst))
-                        .collect(),
-                    ret: Box::new(self.convert_hir_type_with_substs(ret, subst, const_subst)),
-                })
-            }
+            hir::item_tree::HirTypeRef::ImplTrait { .. } => Type::Unit,
             hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
@@ -6275,6 +6689,7 @@ fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
         (Type::Float(_), Type::Int(_)) => CastOp::FloatToInt,
         (Type::Float(_), Type::Float(_)) => CastOp::FloatToFloat,
         (Type::Bool, Type::Int(_)) => CastOp::BoolToInt,
+        (Type::Char, Type::Int(_)) => CastOp::IntToInt,
         (Type::Int(_), Type::Bool) => CastOp::IntToBool,
         (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
         (Type::Ptr(_), Type::Ptr(_)) => CastOp::PtrToPtr,

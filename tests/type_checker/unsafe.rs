@@ -351,41 +351,15 @@ fn unsafe_function_body_still_requires_unsafe_block() {
 }
 
 #[test]
-fn unsafe_function_pointer_preserves_call_contract() {
+fn safe_function_item_satisfies_callable_bound() {
     let result = check(
         r#"
-        unsafe fun dangerous(value: i32) -> i32 { value }
-        fun main() -> i32 {
-            let callback: unsafe fun(i32) -> i32 = dangerous;
-            callback(1)
-        }
-        "#,
-    );
-    assert!(result.diagnostics.iter().any(|diag| diag.code == "E0046"));
-}
-
-#[test]
-fn function_pointer_safety_is_one_way() {
-    let accepted = check(
-        r#"
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun normal(value: i32) -> i32 { value }
-        fun main() -> i32 {
-            let callback: unsafe fun(i32) -> i32 = normal;
-            unsafe { callback(1) }
-        }
+        fun main() -> i32 { apply(normal, 1) }
         "#,
     );
-    assert_eq!(accepted.diagnostics, vec![]);
-
-    let rejected = check(
-        r#"
-        unsafe fun dangerous(value: i32) -> i32 { value }
-        fun main() {
-            let callback: fun(i32) -> i32 = dangerous;
-        }
-        "#,
-    );
-    assert!(rejected.diagnostics.iter().any(|diag| diag.code == "E0001"));
+    assert_eq!(result.diagnostics, vec![]);
 }
 
 #[test]
@@ -470,4 +444,20 @@ fn trait_impl_method_safety_must_match() {
             .iter()
             .any(|diag| { diag.code == "E0028" && diag.message.contains("safety mismatch") })
     );
+}
+
+#[test]
+fn unsafe_function_item_does_not_satisfy_safe_fn_bound() {
+    let result = check(
+        r#"
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
+        unsafe fun dangerous(value: i32) -> i32 { value }
+        fun main() -> i32 { apply(dangerous, 1) }
+        "#,
+    );
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0001"
+            && diagnostic.message.contains("unsafe function")
+            && diagnostic.message.contains("Fn")
+    }));
 }

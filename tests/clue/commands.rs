@@ -235,7 +235,20 @@ fun escaped(value: i32) -> &Data {
 
 fun take(token: Token) -> i32 { token.value }
 
-fun make_adder(base: i32) -> fun(i32) -> i32 {
+fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
+
+fun increment(value: i32) -> i32 { value + 1 }
+
+fun run_mut(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
+    f(value);
+    f(value)
+}
+
+fun make_callable(base: i32) -> impl Fn(i32) -> i32 {
+    move fun(value: i32) { base + value }
+}
+
+fun make_adder(base: i32) -> impl Fn(i32) -> i32 {
     fun(value: i32) { base + value }
 }
 
@@ -255,7 +268,7 @@ fun value_capture() -> i32 {
     consume()
 }
 
-fun nested(base: i32) -> fun(i32) -> fun(i32) -> i32 {
+fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
     fun(first: i32) {
         fun(second: i32) { base + first + second }
     }
@@ -310,10 +323,14 @@ fun main() -> i32 {
     let add = make_adder(40);
     let outer = nested(10);
     let inner = outer(20);
+    let mut total = 0;
+    let add_total = fun(value: i32) { total += value; total };
+    let made = make_callable(40);
     if (*first).value == 42 && (*second).value == 7 && while_sum == 8 && for_sum == 8
         && add(2) == 42 && mutable_capture() == 3 && value_capture() == 7
         && inner(12) == 42 && match_capture() == 42
-        && shadowed_pattern_capture() == 3 && for_capture() == 6 {
+        && shadowed_pattern_capture() == 3 && for_capture() == 6
+        && apply(increment, 1) == 2 && run_mut(add_total, 2) == 4 && made(2) == 42 {
         0
     } else {
         1
@@ -556,7 +573,7 @@ fun nested_field_array_ref() -> &Data {
 
 fun param_ref(value: Data) -> &Data { &value }
 
-fun lambda_ref() -> fun(Data) -> &Data {
+fun lambda_ref() -> impl Fn(Data) -> &Data {
     fun(value: Data) -> &Data { &value }
 }
 

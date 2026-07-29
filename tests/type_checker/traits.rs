@@ -1967,3 +1967,55 @@ fn no_std_mode_rejects_incomplete_lang_item_signatures() {
         );
     }
 }
+
+#[test]
+fn rejects_general_impl_trait_and_manual_callable_impls() {
+    let general = check(
+        r#"
+        trait Display {}
+        fun show(value: impl Display) {}
+        "#,
+    );
+    assert!(general.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0047" && diagnostic.message.contains("only impl Fn")
+    }));
+
+    let manual = check(
+        r#"
+        struct Callable {}
+        impl Fn for Callable {}
+        "#,
+    );
+    assert!(manual.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0048" && diagnostic.message.contains("implemented only by functions")
+    }));
+}
+
+#[test]
+fn by_value_operator_capture_is_fn_once() {
+    let result = check(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+        struct Token { value: i32 }
+        impl Add for Token {
+            type Output = i32;
+            fun add(self, rhs: Self) -> i32 { self.value + rhs.value }
+        }
+        fun main() {
+            let left = Token { value: 1 };
+            let right = Token { value: 2 };
+            let add = fun() { left + right };
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert_eq!(
+        result.lambda_infos.values().next().unwrap().kind,
+        type_checker::ClosureKind::FnOnce
+    );
+}

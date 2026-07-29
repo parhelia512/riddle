@@ -84,6 +84,7 @@ pub struct HirFunction {
     pub visibility: Visibility,
     pub is_unsafe: bool,
     pub generics: Vec<Name>,
+    pub implicit_generics: Vec<Name>,
     pub const_generics: Vec<Name>,
     pub generic_bounds: Vec<HirGenericBound>,
     pub params: Vec<HirParam>,
@@ -100,7 +101,14 @@ pub struct HirGenericBound {
     pub target_range: TextRange,
     pub trait_ty: HirTypeRef,
     pub trait_range: TextRange,
+    pub callable: Option<HirCallableSignature>,
     pub assoc_constraints: Vec<HirAssocTypeConstraint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HirCallableSignature {
+    pub params: Vec<HirTypeRef>,
+    pub ret: Box<HirTypeRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +122,7 @@ pub struct HirAssocTypeConstraint {
 pub struct HirParam {
     pub name: Name,
     pub name_range: TextRange,
+    pub is_mut: bool,
     pub ty: HirTypeRef,
     pub ty_range: TextRange,
     pub attrs: Vec<HirAttr>,
@@ -307,10 +316,11 @@ pub enum HirTypeRef {
     Slice(Box<HirTypeRef>),
     Array(Box<HirTypeRef>, HirConstArg),
     Const(HirConstArg),
-    Function {
-        is_unsafe: bool,
-        params: Vec<HirTypeRef>,
-        ret: Box<HirTypeRef>,
+    ImplTrait {
+        trait_ty: Box<HirTypeRef>,
+        trait_range: TextRange,
+        callable: Option<HirCallableSignature>,
+        hidden: Option<Name>,
     },
     Unknown,
     Error,
@@ -393,18 +403,20 @@ impl HirTypeRef {
             HirTypeRef::Slice(inner) => format!("[{}]", inner.display()),
             HirTypeRef::Array(inner, len) => format!("[{}; {}]", inner.display(), len.display()),
             HirTypeRef::Const(value) => value.display(),
-            HirTypeRef::Function {
-                is_unsafe,
-                params,
-                ret,
+            HirTypeRef::ImplTrait {
+                trait_ty, callable, ..
             } => {
-                let params = params
-                    .iter()
-                    .map(HirTypeRef::display)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prefix = if *is_unsafe { "unsafe " } else { "" };
-                format!("{prefix}fun({params}) -> {}", ret.display())
+                let mut display = format!("impl {}", trait_ty.display());
+                if let Some(signature) = callable {
+                    let params = signature
+                        .params
+                        .iter()
+                        .map(HirTypeRef::display)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    display.push_str(&format!("({params}) -> {}", signature.ret.display()));
+                }
+                display
             }
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),

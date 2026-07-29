@@ -237,6 +237,7 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
                     range: trait_name_range,
                 }),
                 trait_range: range,
+                callable: None,
                 assoc_constraints: Vec::new(),
             });
         let body = BodyLower::lower(hir, body_ast);

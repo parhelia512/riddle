@@ -34,6 +34,7 @@ const DOCUMENTED_ERROR_CODES: &[&str] = &[
     "E0038", "E0039", "E0040", "E0041", "E0042", "E0043", "E0044", "E0045", "E0047", "E0048",
     "E0049", "E0050", "E0051", "E0052", "E0053", "E0054", "E0055", "E0056", "E0072", "E0100",
     "E0200", "E0300", "E0301", "E0302", "E0303", "E0304", "E0305", "E0306", "E0307", "E0308",
+    "E0391",
 ];
 const SOURCE_UNREACHABLE_CODES: &[&str] = &["E0048", "E0049", "E0200"];
 
@@ -229,6 +230,31 @@ fn parser_eof_diagnostic_stays_at_user_eof_with_std() {
         diagnostic.range.start == Position::new(0, source.len() as u32)
             && diagnostic.range.end == Position::new(0, source.len() as u32)
     }));
+}
+
+#[test]
+fn recursive_type_alias_reports_diagnostic_without_crashing() {
+    let source = "type Result = Result;";
+    let uri = lsp_types::Url::parse("file:///recursive-type-alias.rid").unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: source.into(),
+            version: Some(1),
+        },
+    )]);
+
+    let diagnostics = collect_document_diagnostics(&uri, source, &docs, CompileOptions::default());
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == Some(lsp_types::NumberOrString::String("E0391".into()))
+                && diagnostic
+                    .message
+                    .contains("cycle detected when expanding type alias `Result`")
+        }),
+        "{diagnostics:#?}"
+    );
 }
 
 #[test]
@@ -864,7 +890,7 @@ fn semantic_tokens_classifies_core_tokens() {
 
 #[test]
 fn semantic_tokens_classify_every_keyword() {
-    let source = "let fun struct if else while break continue return as self mod use mut pub super crate enum trait impl match const type extern unsafe for in where true false";
+    let source = "let fun struct if else while break continue return as self mod use mut pub super crate enum trait impl match const type extern unsafe for in where move true false";
     let tokens = semantic_tokens(source);
 
     assert_eq!(
@@ -1821,6 +1847,13 @@ fn reachable_diagnostic_producers_have_exact_primary_and_lsp_spans() {
             "*reference",
             "let moved = *reference",
         ),
+        (
+            "E0391",
+            "cycle detected when expanding type alias",
+            "type Result = Result;",
+            "Result",
+            "type Result",
+        ),
     ];
     let uri = lsp_types::Url::parse("file:///producer-spans.rid").unwrap();
 
@@ -1916,6 +1949,34 @@ fn closure_diagnostic_spans_point_at_the_relevant_source() {
             "base = 2",
             true,
         ),
+        (
+            "E0046",
+            "infinite type",
+            "fun main() { let id = fun(value) { value }; id(id); }",
+            "id(id)",
+            true,
+        ),
+        (
+            "E0031",
+            "immutable parameter",
+            "fun run(callback: impl FnMut() -> i32) -> i32 { callback() }",
+            "callback",
+            false,
+        ),
+        (
+            "E0047",
+            "only impl Fn",
+            "trait Display {} fun show(value: impl Display) {}",
+            "impl Display",
+            false,
+        ),
+        (
+            "E0001",
+            "unsafe function",
+            "fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) } unsafe fun dangerous(value: i32) -> i32 { value } fun main() -> i32 { apply(dangerous, 1) }",
+            "dangerous",
+            true,
+        ),
     ];
     let uri = lsp_types::Url::parse("file:///closure-spans.rid").unwrap();
 
@@ -1953,6 +2014,27 @@ fn closure_diagnostic_spans_point_at_the_relevant_source() {
             Range::new(position(source, start), position(source, end),),
             "{code}: {diagnostic:#?}"
         );
+    }
+
+    let source =
+        "fun main() { let value = if true { fun(x: i32) { x } } else { fun(x: i32) { x } }; }";
+    let result = riddlec::pipeline::compile_with_options(source, CompileOptions { use_std: false });
+    let diagnostic = result
+        .type_result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0002")
+        .expect("missing distinct anonymous function type diagnostic");
+    assert_eq!(
+        diagnostic
+            .labels
+            .iter()
+            .filter(|label| label.style == type_checker::LabelStyle::Primary)
+            .count(),
+        1
+    );
+    for label in &diagnostic.labels {
+        assert!(!source[label.range].trim().is_empty());
     }
 }
 

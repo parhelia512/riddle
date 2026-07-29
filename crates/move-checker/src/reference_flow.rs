@@ -7,8 +7,9 @@ use hir::{
         StmtId, UnaryOp,
     },
     item_tree::FunctionId,
+    place::Projection,
 };
-use type_checker::{CaptureSource, PatternBindingMode, Type, TypeCheckResult};
+use type_checker::{CapturePlace, CaptureSource, PatternBindingMode, Type, TypeCheckResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FlowKind {
@@ -357,15 +358,7 @@ impl<'a> SummaryAnalyzer<'a> {
                 let mut result = FlowValue::default();
                 if let Some(info) = self.type_result.lambda_infos.get(&(self.body_id, expr_id)) {
                     for capture in &info.captures {
-                        match capture.source {
-                            CaptureSource::Param(index) => {
-                                result.merge(FlowValue::from_param(index));
-                            }
-                            CaptureSource::Pattern(id) => {
-                                result.merge(self.locals.get(&id).cloned().unwrap_or_default())
-                            }
-                            CaptureSource::LambdaParam { .. } => result.opaque = true,
-                        }
+                        result.merge(self.capture_value(&capture.place));
                     }
                 }
                 result
@@ -396,6 +389,24 @@ impl<'a> SummaryAnalyzer<'a> {
 
         if !self.expr_may_carry_provenance(expr_id) {
             value = FlowValue::default();
+        }
+        value
+    }
+
+    fn capture_value(&self, place: &CapturePlace) -> FlowValue {
+        let mut value = match &place.source {
+            CaptureSource::Param(index) => FlowValue::from_param(*index),
+            CaptureSource::Pattern(id) => self.locals.get(id).cloned().unwrap_or_default(),
+            CaptureSource::LambdaParam { .. } => FlowValue {
+                opaque: true,
+                ..FlowValue::default()
+            },
+        };
+        for projection in &place.projections {
+            value = match projection {
+                Projection::Field(index) | Projection::Index(Some(index)) => value.project(*index),
+                Projection::Index(None) => value.iterated(),
+            };
         }
         value
     }
@@ -455,7 +466,11 @@ impl<'a> SummaryAnalyzer<'a> {
 
     fn resolve_callee(&self, callee: ExprId) -> Option<FunctionId> {
         match self.type_result.expr_types.get(&(self.body_id, callee)) {
-            Some(Type::Function(fid)) if self.hir.function_bodies.contains_key(fid) => Some(*fid),
+            Some(Type::FunctionItem { function: fid, .. })
+                if self.hir.function_bodies.contains_key(fid) =>
+            {
+                Some(*fid)
+            }
             _ => None,
         }
     }
@@ -724,12 +739,14 @@ fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> b
                     })
         }
         Type::Param(..) | Type::InferVar(..) | Type::Unknown | Type::Error => true,
-        Type::Function(..) => false,
-        Type::Fn { params, ret, .. } => {
-            params
+        Type::FunctionItem { .. } => false,
+        Type::Closure { .. } | Type::OpaqueCallable { .. } => true,
+        Type::CallableConstraint(signature) => {
+            signature
+                .params
                 .iter()
                 .any(|param| type_may_carry_flow(hir, param, through_raw_pointer))
-                || type_may_carry_flow(hir, ret, through_raw_pointer)
+                || type_may_carry_flow(hir, &signature.ret, through_raw_pointer)
         }
         Type::Int(..)
         | Type::Float(..)
@@ -754,11 +771,17 @@ fn hir_type_may_carry_flow(ty: &hir::item_tree::HirTypeRef, through_raw_pointer:
         hir::item_tree::HirTypeRef::Slice(inner) | hir::item_tree::HirTypeRef::Array(inner, _) => {
             hir_type_may_carry_flow(inner, through_raw_pointer)
         }
-        hir::item_tree::HirTypeRef::Function { params, ret, .. } => {
-            params
-                .iter()
-                .any(|param| hir_type_may_carry_flow(param, through_raw_pointer))
-                || hir_type_may_carry_flow(ret, through_raw_pointer)
+        hir::item_tree::HirTypeRef::ImplTrait {
+            trait_ty, callable, ..
+        } => {
+            hir_type_may_carry_flow(trait_ty, through_raw_pointer)
+                || callable.as_ref().is_some_and(|signature| {
+                    signature
+                        .params
+                        .iter()
+                        .any(|param| hir_type_may_carry_flow(param, through_raw_pointer))
+                        || hir_type_may_carry_flow(&signature.ret, through_raw_pointer)
+                })
         }
         hir::item_tree::HirTypeRef::Named(path) => path
             .type_args
