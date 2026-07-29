@@ -1310,6 +1310,9 @@ impl<'a> ScopeGraphBuilder<'a> {
 
                 *current = next;
             }
+            Pattern::Reference { pattern, .. } => {
+                self.emit_pat_bindings(body, *pattern, current, nodes, edges);
+            }
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
             Pattern::Tuple { elements } => {
                 for e in elements {

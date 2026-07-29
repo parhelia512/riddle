@@ -10,7 +10,9 @@ use hir::{
     },
     item_tree::{HirTypeRef, PathAnchor},
 };
-use type_checker::{CaptureMode, CaptureSource, LambdaInfo, OperatorCall, TypeCheckResult};
+use type_checker::{
+    CaptureMode, CaptureSource, LambdaInfo, OperatorCall, PatternBindingMode, TypeCheckResult,
+};
 
 use crate::builder::Builder;
 use crate::func::Function;
@@ -1950,9 +1952,18 @@ impl<'a> LowerCtx<'a> {
         value: Value,
         value_ty: &type_checker::Type,
     ) -> Option<Value> {
+        let (value, _, value_ty) = self.adjust_pattern_value(builder, pat, value, None, value_ty);
+        let value_ty = &value_ty;
         let pattern = body.pats[pat].clone();
         match pattern {
             Pattern::Wildcard => None,
+            Pattern::Reference { pattern, .. } => {
+                let type_checker::Type::Ref(inner, _) = value_ty else {
+                    return Some(builder.bconst(false));
+                };
+                let inner_value = builder.load(value, self.convert_type(inner));
+                self.lower_pattern_condition(builder, body, pattern, inner_value, inner)
+            }
             Pattern::Binding { name, .. } => {
                 let TypePattern::EnumVariant {
                     enum_id,
@@ -2186,26 +2197,44 @@ impl<'a> LowerCtx<'a> {
         projection: Vec<DropProjection>,
         scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
     ) {
+        let (value, place, value_ty) =
+            self.adjust_pattern_value(builder, pat, value, place, value_ty);
+        let value_ty = &value_ty;
         match body.pats[pat].clone() {
             Pattern::Binding { name, .. } => {
                 if !matches!(
                     self.classify_type_pattern(value_ty, Some(&name.0)),
                     TypePattern::EnumVariant { .. }
                 ) {
-                    scope.insert(
+                    self.insert_match_pattern_binding(
+                        builder,
                         PatternBindingId {
                             pattern: pat,
                             field: None,
                         },
-                        PatternBindingValue::direct(
-                            value,
-                            self.convert_type(value_ty),
-                            value_ty.clone(),
-                            place,
-                            projection,
-                        ),
+                        value,
+                        place,
+                        value_ty,
+                        projection,
+                        scope,
                     );
                 }
+            }
+            Pattern::Reference { pattern, .. } => {
+                let type_checker::Type::Ref(inner, _) = value_ty else {
+                    return;
+                };
+                let inner_value = builder.load(value, self.convert_type(inner));
+                self.collect_match_pattern_bindings(
+                    builder,
+                    body,
+                    pattern,
+                    inner_value,
+                    None,
+                    inner,
+                    projection,
+                    scope,
+                );
             }
             Pattern::Tuple { elements } => {
                 let type_checker::Type::Tuple(element_types) = value_ty else {
@@ -2303,18 +2332,17 @@ impl<'a> LowerCtx<'a> {
                                 scope,
                             );
                         } else {
-                            scope.insert(
+                            self.insert_match_pattern_binding(
+                                builder,
                                 PatternBindingId {
                                     pattern: pat,
                                     field: Some(binding_index),
                                 },
-                                PatternBindingValue::direct(
-                                    child_value,
-                                    self.convert_type(child_ty),
-                                    child_ty.clone(),
-                                    child_place,
-                                    child_projection,
-                                ),
+                                child_value,
+                                child_place,
+                                child_ty,
+                                child_projection,
+                                scope,
                             );
                         }
                     }
@@ -2363,24 +2391,116 @@ impl<'a> LowerCtx<'a> {
                             scope,
                         );
                     } else {
-                        scope.insert(
+                        self.insert_match_pattern_binding(
+                            builder,
                             PatternBindingId {
                                 pattern: pat,
                                 field: Some(binding_index),
                             },
-                            PatternBindingValue::direct(
-                                child_value,
-                                self.convert_type(child_ty),
-                                child_ty.clone(),
-                                child_place,
-                                child_projection,
-                            ),
+                            child_value,
+                            child_place,
+                            child_ty,
+                            child_projection,
+                            scope,
                         );
                     }
                 }
             }
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_match_pattern_binding(
+        &mut self,
+        builder: &mut Builder,
+        id: PatternBindingId,
+        value: Value,
+        place: Option<Value>,
+        value_ty: &type_checker::Type,
+        projection: Vec<DropProjection>,
+        scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
+    ) {
+        let mode = self.pattern_binding_mode(id);
+        let binding_ty = self.pattern_binding_type(id, value_ty);
+        let mir_ty = self.convert_type(&binding_ty);
+        let (value, place) = match mode {
+            PatternBindingMode::Move => (value, place),
+            PatternBindingMode::Ref | PatternBindingMode::RefMut => {
+                let place = self.materialize_pattern_place(builder, value, place, value_ty);
+                let op = if mode == PatternBindingMode::RefMut {
+                    UnOp::MutRef
+                } else {
+                    UnOp::Ref
+                };
+                (builder.unop(op, place, mir_ty.clone()), None)
+            }
+        };
+        scope.insert(
+            id,
+            PatternBindingValue::direct(value, mir_ty, binding_ty, place, projection),
+        );
+    }
+
+    fn adjust_pattern_value(
+        &mut self,
+        builder: &mut Builder,
+        pat: PatId,
+        mut value: Value,
+        mut place: Option<Value>,
+        value_ty: &type_checker::Type,
+    ) -> (Value, Option<Value>, type_checker::Type) {
+        let target = self.pattern_type(pat).unwrap_or_else(|| value_ty.clone());
+        let mut current = value_ty.clone();
+        while current != target {
+            let type_checker::Type::Ref(inner, _) = current else {
+                break;
+            };
+            let inner = *inner;
+            let reference = value;
+            value = builder.load(reference, self.convert_type(&inner));
+            place = Some(reference);
+            current = inner;
+        }
+        (value, place, current)
+    }
+
+    fn materialize_pattern_place(
+        &self,
+        builder: &mut Builder,
+        value: Value,
+        place: Option<Value>,
+        value_ty: &type_checker::Type,
+    ) -> Value {
+        place.unwrap_or_else(|| {
+            let place = builder.heap_alloc(self.convert_type(value_ty));
+            builder.store(value, place);
+            place
+        })
+    }
+
+    fn pattern_type(&self, pat: PatId) -> Option<type_checker::Type> {
+        self.current_body
+            .and_then(|body_id| self.type_result.pattern_types.get(&(body_id, pat)))
+            .cloned()
+    }
+
+    fn pattern_binding_mode(&self, id: PatternBindingId) -> PatternBindingMode {
+        self.current_body
+            .and_then(|body_id| self.type_result.pattern_binding_modes.get(&(body_id, id)))
+            .copied()
+            .unwrap_or(PatternBindingMode::Move)
+    }
+
+    fn pattern_binding_type(
+        &self,
+        id: PatternBindingId,
+        fallback: &type_checker::Type,
+    ) -> type_checker::Type {
+        self.current_body
+            .and_then(|body_id| self.type_result.pattern_binding_types.get(&(body_id, id)))
+            .cloned()
+            .unwrap_or_else(|| fallback.clone())
     }
 
     fn push_pattern_drop_scope(
@@ -2407,7 +2527,9 @@ impl<'a> LowerCtx<'a> {
         let mut sources = Vec::new();
         if let Some(bindings) = self.pattern_bindings.last() {
             for (id, binding) in bindings {
-                if !self.type_needs_drop(&binding.tc_ty, 0) {
+                if self.pattern_binding_mode(*id) != PatternBindingMode::Move
+                    || !self.type_needs_drop(&binding.tc_ty, 0)
+                {
                     continue;
                 }
                 let binding_slots = slots
@@ -2431,9 +2553,12 @@ impl<'a> LowerCtx<'a> {
         self.pattern_bindings
             .last()
             .into_iter()
-            .flat_map(|bindings| bindings.values())
-            .filter(|binding| !self.type_result.trait_env.type_is_copy(&binding.tc_ty))
-            .map(|binding| binding.projection.clone())
+            .flat_map(|bindings| bindings.iter())
+            .filter(|(id, binding)| {
+                self.pattern_binding_mode(**id) == PatternBindingMode::Move
+                    && !self.type_result.trait_env.type_is_copy(&binding.tc_ty)
+            })
+            .map(|(_, binding)| binding.projection.clone())
             .collect()
     }
 
@@ -3601,16 +3726,40 @@ impl<'a> LowerCtx<'a> {
         projection: Vec<DropProjection>,
         bound: &mut Vec<(PatternBindingId, Vec<DropProjection>)>,
     ) {
+        let (source, value_ty) = self.adjust_let_pattern_source(builder, pat, source, value_ty);
+        let value_ty = &value_ty;
         match body.pats[pat].clone() {
             Pattern::Binding { .. } => self.bind_let_element(
+                builder,
+                body,
                 PatternBindingId {
                     pattern: pat,
                     field: None,
                 },
                 source,
+                value_ty,
                 projection,
                 bound,
             ),
+            Pattern::Reference { pattern, .. } => {
+                let type_checker::Type::Ref(inner, _) = value_ty else {
+                    return;
+                };
+                let reference = match source {
+                    LetSource::Place(place) => builder.load(place, self.convert_type(value_ty)),
+                    LetSource::Value(value) => value,
+                };
+                let inner_value = builder.load(reference, self.convert_type(inner));
+                self.bind_let_pattern(
+                    builder,
+                    body,
+                    pattern,
+                    LetSource::Value(inner_value),
+                    inner,
+                    projection,
+                    bound,
+                );
+            }
             Pattern::Tuple { elements } => {
                 let type_checker::Type::Tuple(element_types) = value_ty else {
                     return;
@@ -3662,11 +3811,14 @@ impl<'a> LowerCtx<'a> {
                             bound,
                         ),
                         None => self.bind_let_element(
+                            builder,
+                            body,
                             PatternBindingId {
                                 pattern: pat,
                                 field: Some(binding_index),
                             },
                             child_source,
+                            &child_ty,
                             child_projection,
                             bound,
                         ),
@@ -3682,23 +3834,103 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_let_element(
         &mut self,
+        builder: &mut Builder,
+        body: &Body,
         id: PatternBindingId,
         source: LetSource,
+        value_ty: &type_checker::Type,
         projection: Vec<DropProjection>,
         bound: &mut Vec<(PatternBindingId, Vec<DropProjection>)>,
     ) {
-        match source {
-            LetSource::Place(place) => {
-                self.storage_bindings.insert(id);
-                self.scope_map.insert(id, place);
-            }
-            LetSource::Value(value) => {
-                self.scope_map.insert(id, value);
+        let mode = self.pattern_binding_mode(id);
+        let binding_ty = self.pattern_binding_type(id, value_ty);
+        match mode {
+            PatternBindingMode::Move => match source {
+                LetSource::Place(place) => {
+                    self.storage_bindings.insert(id);
+                    self.scope_map.insert(id, place);
+                }
+                LetSource::Value(value) => {
+                    self.bind_let_value(builder, body, id, value, &binding_ty);
+                }
+            },
+            PatternBindingMode::Ref | PatternBindingMode::RefMut => {
+                let place = match source {
+                    LetSource::Place(place) => place,
+                    LetSource::Value(value) => {
+                        self.materialize_pattern_place(builder, value, None, value_ty)
+                    }
+                };
+                let op = if mode == PatternBindingMode::RefMut {
+                    UnOp::MutRef
+                } else {
+                    UnOp::Ref
+                };
+                let value = builder.unop(op, place, self.convert_type(&binding_ty));
+                self.bind_let_value(builder, body, id, value, &binding_ty);
             }
         }
-        bound.push((id, projection));
+        if mode == PatternBindingMode::Move {
+            bound.push((id, projection));
+        }
+    }
+
+    fn bind_let_value(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        id: PatternBindingId,
+        value: Value,
+        value_ty: &type_checker::Type,
+    ) {
+        let is_mut = id.field.is_none()
+            && matches!(body.pats[id.pattern], Pattern::Binding { is_mut: true, .. });
+        let escapes = self
+            .current_body
+            .is_some_and(|body_id| self.analysis.escapes(body_id, id));
+        let needs_address = self
+            .current_body
+            .is_some_and(|body_id| self.analysis.local_needs_address(body_id, id));
+        let place = if escapes {
+            Some(builder.heap_alloc(self.convert_type(value_ty)))
+        } else if is_mut || needs_address || self.type_needs_drop(value_ty, 0) {
+            Some(builder.alloca(self.convert_type(value_ty)))
+        } else {
+            None
+        };
+        if let Some(place) = place {
+            builder.store(value, place);
+            self.storage_bindings.insert(id);
+            self.scope_map.insert(id, place);
+        } else {
+            self.scope_map.insert(id, value);
+        }
+    }
+
+    fn adjust_let_pattern_source(
+        &mut self,
+        builder: &mut Builder,
+        pat: PatId,
+        mut source: LetSource,
+        value_ty: &type_checker::Type,
+    ) -> (LetSource, type_checker::Type) {
+        let target = self.pattern_type(pat).unwrap_or_else(|| value_ty.clone());
+        let mut current = value_ty.clone();
+        while current != target {
+            let type_checker::Type::Ref(inner, _) = &current else {
+                break;
+            };
+            let reference = match source {
+                LetSource::Place(place) => builder.load(place, self.convert_type(&current)),
+                LetSource::Value(value) => value,
+            };
+            current = inner.as_ref().clone();
+            source = LetSource::Place(reference);
+        }
+        (source, current)
     }
 
     fn project(
@@ -5957,6 +6189,9 @@ fn collect_let_pattern_bindings(
             },
             *is_mut,
         )),
+        Pattern::Reference { pattern, .. } => {
+            collect_let_pattern_bindings(body, *pattern, bindings);
+        }
         Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
             for element in elements {
                 collect_let_pattern_bindings(body, *element, bindings);

@@ -695,6 +695,14 @@ impl<'a> BodyLower<'a> {
                 let is_mut = binding.is_mut();
                 self.alloc_pat(Pattern::Binding { name, is_mut }, range)
             }
+            ast::Pattern::Reference(reference) => {
+                let mutable = reference.is_mut();
+                let pattern = reference
+                    .pattern()
+                    .map(|pattern| self.lower_pattern(pattern))
+                    .unwrap_or_else(|| self.alloc_pat(Pattern::Wildcard, range));
+                self.alloc_pat(Pattern::Reference { mutable, pattern }, range)
+            }
             ast::Pattern::Literal(literal) => {
                 let token = literal.literal_token();
                 let text = token

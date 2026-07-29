@@ -390,6 +390,7 @@ fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         | SyntaxKind::LiteralPattern
         | SyntaxKind::TuplePattern
         | SyntaxKind::StructPattern
+        | SyntaxKind::ReferencePattern
         | SyntaxKind::BindingPattern
         | SyntaxKind::EnumPattern => Some(ReparseEntry::Pattern),
 

@@ -1,7 +1,7 @@
 use ast::{self, support::AstNode};
 use frontend::incremental::IncrementalParser;
 use hir::{
-    body::{BinaryOp, Expr, ResolvedName, Stmt},
+    body::{BinaryOp, Expr, Pattern as HirPattern, ResolvedName, Stmt},
     lower_root,
 };
 use scope_graph::builder::build_scope_graph;
@@ -369,6 +369,35 @@ fn resolves_pattern_bindings_for_closure_capture() {
     resolve_hir(&mut hir, &sg);
 
     let body = &hir.bodies[*hir.function_bodies.values().next().unwrap()];
+    assert!(body.exprs.iter().any(|(_, expr)| matches!(
+        expr,
+        Expr::Path {
+            resolved: Some(ResolvedName::PatternBinding(_)),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn lowers_nested_reference_patterns_and_resolves_the_binding() {
+    let (mut hir, sg) =
+        build_hir_and_graph("fun main(value: & &mut i32) -> i32 { let &&mut copy = value; copy }");
+    resolve_hir(&mut hir, &sg);
+
+    let body = &hir.bodies[*hir.function_bodies.values().next().unwrap()];
+    assert!(body.pats.iter().any(|(_, pat)| matches!(
+        pat,
+        HirPattern::Reference {
+            mutable: false,
+            pattern: inner,
+        } if matches!(
+            body.pats[*inner],
+            HirPattern::Reference {
+                mutable: true,
+                pattern: binding,
+            } if matches!(body.pats[binding], HirPattern::Binding { ref name, .. } if name.0 == "copy")
+        )
+    )));
     assert!(body.exprs.iter().any(|(_, expr)| matches!(
         expr,
         Expr::Path {

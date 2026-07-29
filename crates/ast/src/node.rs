@@ -103,6 +103,7 @@ ast_node!(WildcardPat, WildcardPattern);
 ast_node!(LiteralPat, LiteralPattern);
 ast_node!(TuplePat, TuplePattern);
 ast_node!(BindingPat, BindingPattern);
+ast_node!(ReferencePat, ReferencePattern);
 ast_node!(StructPattern, StructPattern);
 ast_node!(EnumPattern, EnumPattern);
 
@@ -1428,6 +1429,7 @@ pub enum Pattern {
     Struct(StructPattern),
     Enum(EnumPattern),
     Binding(BindingPat),
+    Reference(ReferencePat),
 }
 
 impl AstNode for Pattern {
@@ -1439,6 +1441,7 @@ impl AstNode for Pattern {
             SyntaxKind::StructPattern => Some(Pattern::Struct(StructPattern { syntax: node })),
             SyntaxKind::EnumPattern => Some(Pattern::Enum(EnumPattern { syntax: node })),
             SyntaxKind::BindingPattern => Some(Pattern::Binding(BindingPat { syntax: node })),
+            SyntaxKind::ReferencePattern => Some(Pattern::Reference(ReferencePat { syntax: node })),
             _ => None,
         }
     }
@@ -1451,7 +1454,21 @@ impl AstNode for Pattern {
             Pattern::Struct(it) => it.syntax(),
             Pattern::Enum(it) => it.syntax(),
             Pattern::Binding(it) => it.syntax(),
+            Pattern::Reference(it) => it.syntax(),
         }
+    }
+}
+
+impl ReferencePat {
+    pub fn pattern(&self) -> Option<Pattern> {
+        support::child(&self.syntax)
+    }
+
+    pub fn is_mut(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .any(|token| token.kind() == SyntaxKind::Mut)
     }
 }
 

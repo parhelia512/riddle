@@ -901,6 +901,72 @@ fun main() -> i32 {
 }
 
 #[test]
+fn reference_patterns_match_rust_binding_modes_at_runtime() {
+    if c_compiler().is_none() {
+        eprintln!("skipping reference pattern runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("reference-pattern-values");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Point { x: i32, y: i32 }
+
+enum Maybe {
+    Some(i32),
+    None,
+}
+
+fun escaped_first() -> &i32 {
+    let pair = (5, 6);
+    let (first, second) = &pair;
+    first
+}
+
+fun main() -> i32 {
+    let mut pair = (1, 2);
+    let (left, right) = &mut pair;
+    *left = 10;
+    *right = 20;
+    let &mut mut copy = left;
+    copy = 99;
+    print(*left + *right);
+
+    let point = Point { x: 10, y: 20 };
+    let Point { x, y } = &point;
+    print(*x + *y);
+
+    let maybe = Maybe::Some(7);
+    let matched = match &maybe {
+        Maybe::Some(value) => *value,
+        Maybe::None => 0,
+    };
+    print(matched);
+    print(*escaped_first());
+
+    let mut original = 3;
+    let (&mut copied, plain) = (&mut original, 4);
+    original = 5;
+    print(copied + plain + original);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"30307512"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn moved_match_binding_is_not_dropped_twice() {
     if c_compiler().is_none() {
         eprintln!("skipping moved match binding Drop test: no C compiler found");

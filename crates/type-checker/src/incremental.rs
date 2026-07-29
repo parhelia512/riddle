@@ -18,7 +18,10 @@ use rowan::{TextRange, TextSize};
 use crate::{
     TypeCheckResult,
     checker::{GenericEdge, TypeChecker},
-    result::{Diagnostic, ForLoopInfo, GenericCall, LambdaInfo, OperatorCall, TraitMethodCall},
+    result::{
+        Diagnostic, ForLoopInfo, GenericCall, LambdaInfo, OperatorCall, PatternBindingMode,
+        TraitMethodCall,
+    },
     types::Type,
 };
 
@@ -68,6 +71,7 @@ struct CachedBody {
     lambda_infos: Vec<(ExprId, LambdaInfo)>,
     pattern_types: Vec<(PatId, Type)>,
     pattern_binding_types: Vec<(PatternBindingId, Type)>,
+    pattern_binding_modes: Vec<(PatternBindingId, PatternBindingMode)>,
     generic_edges: Vec<GenericEdge>,
 }
 
@@ -289,6 +293,13 @@ impl IncrementalTypeChecker {
                 .filter(|((checked_body, _), _)| *checked_body == body_id)
                 .map(|((_, binding), ty)| (*binding, ty.clone()))
                 .collect();
+            let pattern_binding_modes = checker
+                .result
+                .pattern_binding_modes
+                .iter()
+                .filter(|((checked_body, _), _)| *checked_body == body_id)
+                .map(|((_, binding), mode)| (*binding, *mode))
+                .collect();
             self.bodies.insert(
                 fid,
                 CachedBody {
@@ -304,6 +315,7 @@ impl IncrementalTypeChecker {
                     lambda_infos,
                     pattern_types,
                     pattern_binding_types,
+                    pattern_binding_modes,
                     generic_edges,
                 },
             );
@@ -394,6 +406,12 @@ fn replay_cached_body(
             .result
             .pattern_binding_types
             .insert((body_id, *binding), ty.clone());
+    }
+    for (binding, mode) in &cached.pattern_binding_modes {
+        checker
+            .result
+            .pattern_binding_modes
+            .insert((body_id, *binding), *mode);
     }
     checker.generic_edges.extend(generic_edges);
     true

@@ -476,6 +476,7 @@ fn collect_pattern_bindings(body: &Body, pat: PatId, bindings: &mut Vec<(Pattern
             },
             *is_mut,
         )),
+        Pattern::Reference { pattern, .. } => collect_pattern_bindings(body, *pattern, bindings),
         Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
             for element in elements {
                 collect_pattern_bindings(body, *element, bindings);

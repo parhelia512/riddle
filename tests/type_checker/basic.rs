@@ -1,5 +1,7 @@
 use crate::check;
-use type_checker::{CaptureMode, CaptureSource, ClosureKind, FloatTy, IntTy, Type};
+use type_checker::{
+    CaptureMode, CaptureSource, ClosureKind, FloatTy, IntTy, PatternBindingMode, Type,
+};
 
 #[test]
 fn accepts_basic_function_body() {
@@ -169,6 +171,34 @@ fn checks_generic_function_calls() {
     );
 
     assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn infers_generic_method_arguments() {
+    let result = check(
+        r#"
+        pub struct C {}
+
+        impl C {
+            fun test<T>(&self, f: T) {}
+        }
+
+        pub fun f1() {
+            let c = C {};
+            c.test(1);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert!(
+        result
+            .generic_calls
+            .values()
+            .any(|call| call.args == [Type::InferInt]),
+        "{:#?}",
+        result.generic_calls
+    );
 }
 
 #[test]
@@ -524,6 +554,155 @@ fn destructuring_let_binds_every_element() {
     );
 
     assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn reference_patterns_use_rust_binding_modes() {
+    let explicit = check("fun copy(value: &mut i32) -> i32 { let &mut copy = value; copy }");
+    assert_eq!(explicit.diagnostics, vec![]);
+    assert_eq!(
+        explicit.pattern_binding_types.values().collect::<Vec<_>>(),
+        vec![&Type::Int(IntTy::I32)]
+    );
+    assert_eq!(
+        explicit.pattern_binding_modes.values().collect::<Vec<_>>(),
+        vec![&PatternBindingMode::Move]
+    );
+
+    let ergonomic = check(
+        r#"
+        fun shared(value: &(i32, bool)) -> i32 {
+            let (number, flag) = value;
+            if *flag { *number } else { 0 }
+        }
+        fun mutable(value: &mut (i32, i32)) -> i32 {
+            let (left, right) = value;
+            *left + *right
+        }
+        "#,
+    );
+    assert_eq!(ergonomic.diagnostics, vec![]);
+    let binding_types = ergonomic
+        .pattern_binding_types
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(binding_types.contains(&Type::Ref(Box::new(Type::Int(IntTy::I32)), false)));
+    assert!(binding_types.contains(&Type::Ref(Box::new(Type::Bool), false)));
+    assert!(binding_types.contains(&Type::Ref(Box::new(Type::Int(IntTy::I32)), true)));
+    assert!(
+        ergonomic
+            .pattern_binding_modes
+            .values()
+            .any(|mode| *mode == PatternBindingMode::Ref)
+    );
+    assert!(
+        ergonomic
+            .pattern_binding_modes
+            .values()
+            .any(|mode| *mode == PatternBindingMode::RefMut)
+    );
+
+    let bare = check("fun keep(value: &mut i32) -> i32 { let kept = value; *kept }");
+    assert_eq!(bare.diagnostics, vec![]);
+    assert_eq!(
+        bare.pattern_binding_modes.values().collect::<Vec<_>>(),
+        vec![&PatternBindingMode::Move]
+    );
+}
+
+#[test]
+fn rust_2024_rejects_binding_modifiers_inside_ergonomic_patterns() {
+    let result = check(
+        r#"
+        fun mutable_binding(value: &(i32,)) {
+            let (mut item,) = value;
+        }
+        fun explicit_inside_implicit(value: &(&mut i32,)) {
+            let (&mut item,) = value;
+        }
+        fun mismatched_reference(value: &mut i32) {
+            let &item = value;
+        }
+        "#,
+    );
+
+    let errors = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0010")
+        .count();
+    assert_eq!(errors, 3, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn nested_and_named_patterns_inherit_reference_binding_modes() {
+    let result = check(
+        r#"
+        struct Pair { left: i32, right: i32 }
+        enum Maybe { Some(i32), None }
+
+        fun nested_shared(value: & &mut (i32,)) -> i32 {
+            let (item,) = value;
+            *item
+        }
+        fun nested_explicit(value: & &mut i32) -> i32 {
+            let &&mut item = value;
+            item
+        }
+        fun fields(value: &mut Pair) -> i32 {
+            let Pair { left, right } = value;
+            *left + *right
+        }
+        fun variants(value: &Maybe) -> i32 {
+            match value {
+                Some(item) => *item,
+                None => 0,
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert!(
+        result
+            .pattern_binding_modes
+            .values()
+            .any(|mode| { *mode == PatternBindingMode::Ref })
+    );
+    assert!(
+        result
+            .pattern_binding_modes
+            .values()
+            .filter(|mode| **mode == PatternBindingMode::RefMut)
+            .count()
+            >= 2
+    );
+    assert!(
+        result
+            .pattern_binding_types
+            .values()
+            .any(|ty| { *ty == Type::Ref(Box::new(Type::Int(IntTy::I32)), false) })
+    );
+}
+
+#[test]
+fn delayed_let_rejects_reference_destructuring() {
+    let result = check(
+        r#"
+        fun delayed() {
+            let (implicit,): &(i32,);
+            let &(explicit,): &(i32,);
+        }
+        "#,
+    );
+
+    let errors = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0010")
+        .count();
+    assert_eq!(errors, 2, "{:#?}", result.diagnostics);
 }
 
 #[test]

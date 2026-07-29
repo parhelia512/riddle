@@ -8,7 +8,9 @@ use hir::{
     },
     item_tree::{FunctionId, HirTypeRef},
 };
-use type_checker::{CaptureMode, CaptureSource, OperatorCall, Type, TypeCheckResult};
+use type_checker::{
+    CaptureMode, CaptureSource, OperatorCall, PatternBindingMode, Type, TypeCheckResult,
+};
 
 /// Result of escape analysis: which locals, parameters, and temporaries need stable storage.
 #[derive(Debug, Default)]
@@ -1038,13 +1040,16 @@ impl<'a> EscapeAnalyzer<'a> {
 
     fn bind_pattern_sources(&self, ctx: &mut EscapeCtx<'_>, pat: PatId, value: &SourceValue) {
         match &ctx.body.pats[pat] {
-            Pattern::Binding { .. } => ctx.bind_source_value(
-                PatternBindingId {
+            Pattern::Binding { .. } => {
+                let binding = PatternBindingId {
                     pattern: pat,
                     field: None,
-                },
-                value.clone(),
-            ),
+                };
+                self.bind_pattern_source(ctx, binding, value);
+            }
+            Pattern::Reference { pattern, .. } => {
+                self.bind_pattern_sources(ctx, *pattern, value);
+            }
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 let elements = elements.clone();
                 for (index, element) in elements.into_iter().enumerate() {
@@ -1055,11 +1060,42 @@ impl<'a> EscapeAnalyzer<'a> {
                 let mut bindings = HashSet::new();
                 Self::collect_pattern_bindings(ctx.body, pat, &mut bindings);
                 for binding in bindings {
-                    ctx.bind_source_value(binding, value.flattened());
+                    self.bind_pattern_source(ctx, binding, &value.flattened());
                 }
             }
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
         }
+    }
+
+    fn bind_pattern_source(
+        &self,
+        ctx: &mut EscapeCtx<'_>,
+        binding: PatternBindingId,
+        value: &SourceValue,
+    ) {
+        let mode = self
+            .type_result
+            .pattern_binding_modes
+            .get(&(ctx.body_id, binding))
+            .copied()
+            .unwrap_or(PatternBindingMode::Move);
+        let value = match mode {
+            PatternBindingMode::Ref | PatternBindingMode::RefMut => {
+                Self::mark_address_taken(ctx, &value.sources);
+                value.flattened()
+            }
+            PatternBindingMode::Move
+                if self
+                    .type_result
+                    .pattern_binding_types
+                    .get(&(ctx.body_id, binding))
+                    .is_none_or(type_may_carry_reference) =>
+            {
+                value.clone()
+            }
+            PatternBindingMode::Move => SourceValue::default(),
+        };
+        ctx.bind_source_value(binding, value);
     }
 
     fn collect_pattern_bindings(body: &Body, pat: PatId, bindings: &mut HashSet<PatternBindingId>) {
@@ -1069,6 +1105,9 @@ impl<'a> EscapeAnalyzer<'a> {
                     pattern: pat,
                     field: None,
                 });
+            }
+            Pattern::Reference { pattern, .. } => {
+                Self::collect_pattern_bindings(body, *pattern, bindings);
             }
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 for element in elements {

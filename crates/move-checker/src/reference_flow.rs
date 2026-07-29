@@ -8,7 +8,7 @@ use hir::{
     },
     item_tree::FunctionId,
 };
-use type_checker::{CaptureSource, Type, TypeCheckResult};
+use type_checker::{CaptureSource, PatternBindingMode, Type, TypeCheckResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FlowKind {
@@ -504,13 +504,15 @@ impl<'a> SummaryAnalyzer<'a> {
     fn bind_pattern_sources(&mut self, pat: PatId, value: &FlowValue) {
         match &self.body.pats[pat] {
             Pattern::Binding { .. } => {
-                self.locals.insert(
-                    PatternBindingId {
-                        pattern: pat,
-                        field: None,
-                    },
-                    value.clone(),
-                );
+                let binding = PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                };
+                self.locals
+                    .insert(binding, self.pattern_binding_value(binding, value));
+            }
+            Pattern::Reference { pattern, .. } => {
+                self.bind_pattern_sources(*pattern, value);
             }
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 for (index, element) in elements.iter().enumerate() {
@@ -526,17 +528,45 @@ impl<'a> SummaryAnalyzer<'a> {
                     if let Some(field_pat) = field.pat {
                         self.bind_pattern_sources(field_pat, &field_value);
                     } else {
-                        self.locals.insert(
-                            PatternBindingId {
-                                pattern: pat,
-                                field: Some(binding_index),
-                            },
-                            field_value,
-                        );
+                        let binding = PatternBindingId {
+                            pattern: pat,
+                            field: Some(binding_index),
+                        };
+                        self.locals
+                            .insert(binding, self.pattern_binding_value(binding, &field_value));
                     }
                 }
             }
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+        }
+    }
+
+    fn pattern_binding_value(&self, binding: PatternBindingId, value: &FlowValue) -> FlowValue {
+        match self
+            .type_result
+            .pattern_binding_modes
+            .get(&(self.body_id, binding))
+            .copied()
+            .unwrap_or(PatternBindingMode::Move)
+        {
+            PatternBindingMode::Ref => value
+                .clone()
+                .with_kind(FlowKind::Shared)
+                .or_opaque_reference(),
+            PatternBindingMode::RefMut => value
+                .clone()
+                .with_kind(FlowKind::Mutable)
+                .or_opaque_reference(),
+            PatternBindingMode::Move
+                if self
+                    .type_result
+                    .pattern_binding_types
+                    .get(&(self.body_id, binding))
+                    .is_none_or(|ty| type_may_carry_provenance(self.hir, ty)) =>
+            {
+                value.clone()
+            }
+            PatternBindingMode::Move => FlowValue::default(),
         }
     }
 

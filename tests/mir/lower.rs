@@ -3168,6 +3168,77 @@ fn pattern_bindings_preserve_reference_sources() {
 }
 
 #[test]
+fn ergonomic_pattern_bindings_lower_as_references() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        fun shared(value: &(i32, i32)) -> i32 {
+            let (left, right) = value;
+            *left + *right
+        }
+
+        fun mutable(value: &mut (i32, i32)) -> i32 {
+            let (left, right) = value;
+            *left = 10;
+            *right = 20;
+            *left + *right
+        }
+
+        fun explicit(value: &mut i32) -> i32 {
+            let &mut copy = value;
+            copy
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let has_unop = |name: &str, expected| {
+        module
+            .function_order
+            .iter()
+            .map(|id| &module.functions[*id])
+            .find(|function| function.name == name)
+            .unwrap()
+            .blocks
+            .values()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::UnOp(op, _) if op == expected))
+    };
+    assert!(has_unop("shared", mir::instr::UnOp::Ref));
+    assert!(has_unop("mutable", mir::instr::UnOp::MutRef));
+    assert!(!has_unop("explicit", mir::instr::UnOp::MutRef));
+}
+
+#[test]
+fn returned_ergonomic_pattern_reference_promotes_its_source() {
+    let module = lower(
+        r#"
+        fun first() -> &i32 {
+            let pair = (10, 20);
+            let (first, second) = &pair;
+            first
+        }
+        "#,
+    );
+    let function = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "first")
+        .unwrap();
+    assert_eq!(
+        function
+            .blocks
+            .values()
+            .flat_map(|block| &block.insts)
+            .filter(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
+            .count(),
+        1,
+        "the referenced tuple must outlive the function: {function:#?}"
+    );
+}
+
+#[test]
 fn pos_unary_is_noop() {
     let module = lower(
         r#"

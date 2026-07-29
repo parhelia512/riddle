@@ -140,7 +140,7 @@ fn incremental_replay_preserves_pattern_types() {
         struct Token {}
         enum MaybeToken { Some(Token), None }
 
-        fun stable(value: MaybeToken) {
+        fun stable(value: &MaybeToken) {
             match value {
                 MaybeToken::Some(token) => {},
                 MaybeToken::None => {},
@@ -157,6 +157,7 @@ fn incremental_replay_preserves_pattern_types() {
     let first = checker.check(&hir);
     assert_eq!(first.result.pattern_types.len(), 3);
     assert_eq!(first.result.pattern_binding_types.len(), 1);
+    assert_eq!(first.result.pattern_binding_modes.len(), 1);
 
     let offset = parser.source().find("0;").unwrap();
     parser.apply_edit(offset, 1, "1");
@@ -168,10 +169,15 @@ fn incremental_replay_preserves_pattern_types() {
     assert_eq!(second.stats.reused_bodies, 1);
     assert_eq!(second.result.pattern_types.len(), 3);
     assert_eq!(second.result.pattern_binding_types.len(), 1);
+    assert_eq!(second.result.pattern_binding_modes.len(), 1);
     assert_eq!(second.result.pattern_types, check_hir(&hir).pattern_types);
     assert_eq!(
         second.result.pattern_binding_types,
         check_hir(&hir).pattern_binding_types
+    );
+    assert_eq!(
+        second.result.pattern_binding_modes,
+        check_hir(&hir).pattern_binding_modes
     );
 }
 

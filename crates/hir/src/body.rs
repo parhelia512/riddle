@@ -231,6 +231,11 @@ pub enum Pattern {
         /// `mut` sits on the binding, as in Rust: `let (mut a, b) = pair`.
         is_mut: bool,
     },
+    /// An explicit reference pattern, e.g. `&x` or `&mut x`.
+    Reference {
+        mutable: bool,
+        pattern: PatId,
+    },
     /// A path pattern referring to an existing item (enum variant / const), e.g. `Foo::Bar`.
     Path {
         path: HirPath,
@@ -857,6 +862,10 @@ impl BodyPrinter<'_> {
                 } else {
                     name.0.clone()
                 }
+            }
+            Pattern::Reference { mutable, pattern } => {
+                let prefix = if *mutable { "&mut " } else { "&" };
+                format!("{prefix}{}", self.print_pat(*pattern))
             }
             Pattern::Path { path } => path.display(),
             Pattern::Tuple { elements } => {

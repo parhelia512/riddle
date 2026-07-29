@@ -183,6 +183,149 @@ fn disjoint_struct_fields_can_be_mutably_borrowed() {
 }
 
 #[test]
+fn explicit_reference_pattern_copies_without_moving_the_reference() {
+    is_clean(
+        r#"
+        fun f(reference: &mut i32) -> i32 {
+            let &mut copied = reference;
+            *reference = copied + 1;
+            *reference
+        }
+        "#,
+    );
+}
+
+#[test]
+fn explicit_reference_pattern_releases_a_temporary_borrow() {
+    is_clean(
+        r#"
+        fun f() -> i32 {
+            let mut original = 3;
+            let (&mut copied, plain) = (&mut original, 4);
+            original = 5;
+            copied + plain + original
+        }
+        "#,
+    );
+}
+
+#[test]
+fn explicit_reference_pattern_rejects_moving_borrowed_content() {
+    let result = analyze(
+        r#"
+        struct Token { value: i32 }
+
+        fun f(reference: &mut Token) {
+            let &mut moved = reference;
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0308"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn ergonomic_mutable_pattern_borrow_ends_after_all_bindings_last_use() {
+    is_clean(
+        r#"
+        struct Pair { left: i32, right: i32 }
+
+        fun f() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let Pair { left, right } = &mut pair;
+            *left = 3;
+            *right = 4;
+            pair.left = 5;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn ergonomic_mutable_pattern_keeps_the_source_borrowed_while_live() {
+    assert!(has_code(
+        r#"
+        struct Pair { left: i32, right: i32 }
+
+        fun f() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let Pair { left, right } = &mut pair;
+            pair.left = 3;
+            *left = 4;
+            *right = 5;
+        }
+        "#,
+        "E0303"
+    ));
+}
+
+#[test]
+fn ergonomic_mutable_pattern_reborrow_freezes_the_parent_reference() {
+    assert!(has_code(
+        r#"
+        struct Pair { left: i32, right: i32 }
+        fun update(value: &mut Pair) { value.left = 9; }
+
+        fun f() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let parent = &mut pair;
+            let Pair { left, right } = parent;
+            update(parent);
+            *left = 3;
+            *right = 4;
+        }
+        "#,
+        "E0302"
+    ));
+}
+
+#[test]
+fn ergonomic_mutable_pattern_reborrow_releases_the_parent_reference() {
+    is_clean(
+        r#"
+        struct Pair { left: i32, right: i32 }
+        fun update(value: &mut Pair) { value.left = 9; }
+
+        fun f() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let parent = &mut pair;
+            let Pair { left, right } = parent;
+            *left = 3;
+            *right = 4;
+            update(parent);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn ergonomic_pattern_reborrow_rejects_an_existing_overlapping_child() {
+    assert!(has_code(
+        r#"
+        struct Pair { left: i32, right: i32 }
+
+        fun f() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let mut parent = &mut pair;
+            let existing = &mut parent.left;
+            let Pair { left, right } = parent;
+            *existing = 3;
+            *left = 4;
+            *right = 5;
+        }
+        "#,
+        "E0302"
+    ));
+}
+
+#[test]
 fn tuple_destructuring_keeps_reference_provenance_per_element() {
     is_clean(
         r#"

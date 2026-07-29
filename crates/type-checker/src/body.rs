@@ -20,7 +20,7 @@ use crate::{
     lowering::{collect_subst, generic_param_map_with_consts, substitute_type},
     result::{
         CaptureMode, CaptureSource, ForLoopInfo, LabelStyle, LambdaCapture, LambdaInfo,
-        OperatorCall, SourceLabel, TraitMethodCall,
+        OperatorCall, PatternBindingMode, SourceLabel, TraitMethodCall,
     },
     types::{ClosureKind, ConstArg, FloatTy, IntTy, Type},
 };
@@ -172,7 +172,7 @@ impl TypeChecker<'_> {
                     if inferred {
                         self.expect_sized_value(&local_ty, ctx.stmt_range(stmt_id));
                     }
-                    self.bind_let_pattern(ctx, pat, &local_ty, stmt_id);
+                    self.bind_let_pattern(ctx, pat, &local_ty, stmt_id, true);
                 } else {
                     let delayed_bindings = self.mark_delayed_pattern(ctx, pat);
                     if matches!(ty, HirTypeRef::Unknown) {
@@ -185,7 +185,7 @@ impl TypeChecker<'_> {
                             ));
                         }
                     }
-                    self.bind_let_pattern(ctx, pat, &declared, stmt_id);
+                    self.bind_let_pattern(ctx, pat, &declared, stmt_id, false);
                 }
             }
             Stmt::Expr { expr } => {
@@ -3153,7 +3153,7 @@ impl TypeChecker<'_> {
 
         let impl_generics = self.impl_generic_names(method.fid);
         let impl_const_generics = self.impl_const_generic_names(method.fid);
-        let mut subst = generic_param_map_with_consts(
+        let method_params = generic_param_map_with_consts(
             method.function.generics.iter().map(|name| name.0.as_str()),
             method
                 .function
@@ -3161,7 +3161,17 @@ impl TypeChecker<'_> {
                 .iter()
                 .map(|name| name.0.as_str()),
         );
-        subst.extend(method.subst.clone());
+        let mut params = method.subst.clone();
+        params.extend(method_params);
+        let mut subst = method.subst.clone();
+        for name in method
+            .function
+            .generics
+            .iter()
+            .chain(&method.function.const_generics)
+        {
+            subst.remove(&name.0);
+        }
 
         if !type_args.is_empty() {
             if type_args.len() != method.function.generics.len() {
@@ -3222,8 +3232,9 @@ impl TypeChecker<'_> {
         }
 
         if let Some(receiver) = method.function.params.first() {
-            let expected =
-                self.lower_type_ref_with_params_at(&receiver.ty, &subst, Some(receiver.ty_range));
+            let pattern =
+                self.lower_type_ref_with_params_at(&receiver.ty, &params, Some(receiver.ty_range));
+            let expected = substitute_type(&pattern, &subst);
             let actual = self.receiver_argument_type(&base_ty, &expected);
             // A `&mut self` receiver only constrains the *place* when the
             // compiler has to auto-ref it; an already-mutable reference is
@@ -3241,7 +3252,7 @@ impl TypeChecker<'_> {
         for (index, arg) in args.iter().enumerate() {
             if let Some(param) = method.function.params.get(index + receiver_count) {
                 let pattern =
-                    self.lower_type_ref_with_params_at(&param.ty, &subst, Some(param.ty_range));
+                    self.lower_type_ref_with_params_at(&param.ty, &params, Some(param.ty_range));
                 let expected = substitute_type(&pattern, &subst);
                 let actual = if expected_has_param(&expected) {
                     self.check_expr(ctx, *arg)
@@ -3310,13 +3321,16 @@ impl TypeChecker<'_> {
             .ret_type
             .as_ref()
             .map(|ty| {
-                self.lower_type_ref_with_params_at(
-                    ty,
+                substitute_type(
+                    &self.lower_type_ref_with_params_at(
+                        ty,
+                        &params,
+                        method
+                            .function
+                            .ret_type_range
+                            .or(Some(method.function.name_range)),
+                    ),
                     &subst,
-                    method
-                        .function
-                        .ret_type_range
-                        .or(Some(method.function.name_range)),
                 )
             })
             .unwrap_or(Type::Unit)
@@ -3750,16 +3764,104 @@ impl TypeChecker<'_> {
     }
 
     fn bind_pattern(&mut self, ctx: &mut BodyCtx<'_>, pat: PatId, expected: &Type) {
-        self.result
-            .pattern_types
-            .insert((ctx.body_id, pat), expected.clone());
+        self.bind_pattern_with_mode(ctx, pat, expected, PatternBindingMode::Move, true);
+    }
+
+    fn bind_pattern_with_mode(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        pat: PatId,
+        expected: &Type,
+        mut mode: PatternBindingMode,
+        allow_reference_deref: bool,
+    ) {
         let span = ctx.pat_range(pat);
         let pattern = ctx.body.pats[pat].clone();
+        let mut effective = expected.clone();
+        if self.pattern_uses_match_ergonomics(&pattern, expected) {
+            let mut reported_missing_initializer = false;
+            loop {
+                if matches!(
+                    (&pattern, &effective),
+                    (
+                        Pattern::Literal(LiteralPattern::String(_)),
+                        Type::Ref(inner, false)
+                    ) if inner.as_ref() == &Type::Str
+                ) {
+                    break;
+                }
+                let Type::Ref(inner, mutable) = &effective else {
+                    break;
+                };
+                if !allow_reference_deref && !reported_missing_initializer {
+                    self.diagnostic(
+                        "E0010",
+                        "reference destructuring requires an initializer",
+                        span,
+                    );
+                    reported_missing_initializer = true;
+                }
+                mode = mode.through_reference(*mutable);
+                effective = inner.as_ref().clone();
+            }
+        }
+        self.result
+            .pattern_types
+            .insert((ctx.body_id, pat), effective.clone());
         match pattern {
             Pattern::Wildcard => {}
+            Pattern::Reference { mutable, pattern } => {
+                if mode != PatternBindingMode::Move {
+                    self.diagnostic(
+                        "E0010",
+                        "reference patterns may only be written when the default binding mode is `move`",
+                        span,
+                    );
+                }
+                if !allow_reference_deref {
+                    self.diagnostic("E0010", "reference pattern requires an initializer", span);
+                }
+                let Type::Ref(inner, actual_mutable) = &effective else {
+                    if !effective.is_unknown_like() {
+                        self.diagnostic(
+                            "E0010",
+                            format!(
+                                "reference pattern cannot match value of type {}",
+                                effective.display(self.hir)
+                            ),
+                            span,
+                        );
+                    }
+                    self.bind_pattern_with_mode(
+                        ctx,
+                        pattern,
+                        &Type::Unknown,
+                        PatternBindingMode::Move,
+                        allow_reference_deref,
+                    );
+                    return;
+                };
+                if mutable != *actual_mutable {
+                    self.diagnostic(
+                        "E0010",
+                        format!(
+                            "reference pattern mutability does not match value of type {}",
+                            effective.display(self.hir)
+                        ),
+                        span,
+                    );
+                }
+                self.bind_pattern_with_mode(
+                    ctx,
+                    pattern,
+                    inner,
+                    PatternBindingMode::Move,
+                    allow_reference_deref,
+                );
+            }
             Pattern::Literal(literal) => {
-                let literal_ty = self.literal_pattern_type(&literal, Some(expected), span);
-                self.expect_assignable(expected, &literal_ty, "literal pattern", span);
+                let literal_ty = self.literal_pattern_type(&literal, Some(&effective), span);
+                self.expect_assignable(&effective, &literal_ty, "literal pattern", span);
                 if let LiteralPattern::Int {
                     value, valid: true, ..
                 } = literal
@@ -3777,10 +3879,10 @@ impl TypeChecker<'_> {
                 }
             }
             Pattern::Path { path } => {
-                self.validate_unit_variant_pattern(expected, &path, span);
+                self.validate_unit_variant_pattern(&effective, &path, span);
             }
             Pattern::Binding { name, is_mut } => {
-                if let Some(is_unit) = self.enum_variant_is_unit(expected, &name.0) {
+                if let Some(is_unit) = self.enum_variant_is_unit(&effective, &name.0) {
                     if !is_unit {
                         self.diagnostic(
                             "E0038",
@@ -3789,35 +3891,49 @@ impl TypeChecker<'_> {
                         );
                     }
                 } else {
+                    if is_mut && mode != PatternBindingMode::Move {
+                        self.diagnostic(
+                            "E0010",
+                            "`mut` bindings may only be written when the default binding mode is `move`",
+                            span,
+                        );
+                    }
                     self.record_pattern_binding(
                         ctx,
                         name.0,
-                        expected.clone(),
+                        mode.binding_type(effective.clone()),
                         PatternBindingId {
                             pattern: pat,
                             field: None,
                         },
                         is_mut,
+                        mode,
                     );
                 }
             }
             Pattern::Tuple { elements } => {
-                if elements.is_empty() && expected == &Type::Unit {
+                if elements.is_empty() && effective == Type::Unit {
                     return;
                 }
-                let Type::Tuple(expected_elements) = expected else {
-                    if !expected.is_unknown_like() {
+                let Type::Tuple(expected_elements) = &effective else {
+                    if !effective.is_unknown_like() {
                         self.diagnostic(
                             "E0010",
                             format!(
                                 "tuple pattern cannot match value of type {}",
-                                expected.display(self.hir)
+                                effective.display(self.hir)
                             ),
                             span,
                         );
                     }
                     for element in elements {
-                        self.bind_pattern(ctx, element, &Type::Unknown);
+                        self.bind_pattern_with_mode(
+                            ctx,
+                            element,
+                            &Type::Unknown,
+                            mode,
+                            allow_reference_deref,
+                        );
                     }
                     return;
                 };
@@ -3835,15 +3951,46 @@ impl TypeChecker<'_> {
                 }
                 for (index, element) in elements.into_iter().enumerate() {
                     let ty = expected_elements.get(index).unwrap_or(&Type::Unknown);
-                    self.bind_pattern(ctx, element, ty);
+                    self.bind_pattern_with_mode(ctx, element, ty, mode, allow_reference_deref);
                 }
             }
             Pattern::TupleStruct { path, elements } => {
-                self.bind_tuple_variant_pattern(ctx, expected, &path, &elements, span);
+                self.bind_tuple_variant_pattern(
+                    ctx,
+                    &effective,
+                    &path,
+                    &elements,
+                    span,
+                    mode,
+                    allow_reference_deref,
+                );
             }
             Pattern::Struct { path, fields } => {
-                self.bind_struct_variant_pattern(ctx, pat, expected, &path, &fields, span);
+                self.bind_struct_variant_pattern(
+                    ctx,
+                    pat,
+                    &effective,
+                    &path,
+                    &fields,
+                    span,
+                    mode,
+                    allow_reference_deref,
+                );
             }
+        }
+    }
+
+    fn pattern_uses_match_ergonomics(&self, pattern: &Pattern, expected: &Type) -> bool {
+        match pattern {
+            Pattern::Literal(_)
+            | Pattern::Path { .. }
+            | Pattern::Tuple { .. }
+            | Pattern::TupleStruct { .. }
+            | Pattern::Struct { .. } => true,
+            Pattern::Binding { name, .. } => self
+                .enum_variant_is_unit_through_refs(expected, &name.0)
+                .is_some(),
+            Pattern::Wildcard | Pattern::Reference { .. } => false,
         }
     }
 
@@ -3877,6 +4024,14 @@ impl TypeChecker<'_> {
             .map(|variant| matches!(variant.kind, HirVariantKind::Unit))
     }
 
+    fn enum_variant_is_unit_through_refs(&self, expected: &Type, name: &str) -> Option<bool> {
+        let mut expected = expected;
+        while let Type::Ref(inner, _) = expected {
+            expected = inner;
+        }
+        self.enum_variant_is_unit(expected, name)
+    }
+
     fn validate_unit_variant_pattern(
         &mut self,
         expected: &Type,
@@ -3905,6 +4060,7 @@ impl TypeChecker<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_tuple_variant_pattern(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -3912,6 +4068,8 @@ impl TypeChecker<'_> {
         path: &hir::item_tree::HirPath,
         elements: &[PatId],
         span: Option<rowan::TextRange>,
+        mode: PatternBindingMode,
+        allow_reference_deref: bool,
     ) {
         let Type::Enum(enum_id, args) = expected else {
             self.diagnostic(
@@ -3920,7 +4078,13 @@ impl TypeChecker<'_> {
                 span,
             );
             for element in elements {
-                self.bind_pattern(ctx, *element, &Type::Unknown);
+                self.bind_pattern_with_mode(
+                    ctx,
+                    *element,
+                    &Type::Unknown,
+                    mode,
+                    allow_reference_deref,
+                );
             }
             return;
         };
@@ -3980,10 +4144,11 @@ impl TypeChecker<'_> {
                     )
                 })
                 .unwrap_or(Type::Unknown);
-            self.bind_pattern(ctx, *element, &ty);
+            self.bind_pattern_with_mode(ctx, *element, &ty, mode, allow_reference_deref);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_struct_variant_pattern(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -3992,6 +4157,8 @@ impl TypeChecker<'_> {
         path: &hir::item_tree::HirPath,
         fields: &[hir::body::FieldPat],
         span: Option<rowan::TextRange>,
+        mode: PatternBindingMode,
+        allow_reference_deref: bool,
     ) {
         if let Type::Struct(struct_id, args) = expected {
             let strukt = self.hir.item_tree.structs[*struct_id].clone();
@@ -4039,17 +4206,18 @@ impl TypeChecker<'_> {
                 self.check_struct_field_visibility(ctx, *struct_id, item, span);
                 let ty = self.lower_type_ref_with_params_at(&item.ty, &subst, Some(item.ty_range));
                 if let Some(pat) = field.pat {
-                    self.bind_pattern(ctx, pat, &ty);
+                    self.bind_pattern_with_mode(ctx, pat, &ty, mode, allow_reference_deref);
                 } else {
                     self.record_pattern_binding(
                         ctx,
                         field.name.0.clone(),
-                        ty,
+                        mode.binding_type(ty),
                         PatternBindingId {
                             pattern: binding_pat,
                             field: Some(field_index),
                         },
                         false,
+                        mode,
                     );
                 }
             }
@@ -4116,17 +4284,18 @@ impl TypeChecker<'_> {
             };
             let ty = self.lower_type_ref_with_params_at(&item.ty, &subst, Some(item.ty_range));
             if let Some(pat) = field.pat {
-                self.bind_pattern(ctx, pat, &ty);
+                self.bind_pattern_with_mode(ctx, pat, &ty, mode, allow_reference_deref);
             } else {
                 self.record_pattern_binding(
                     ctx,
                     field.name.0.clone(),
-                    ty,
+                    mode.binding_type(ty),
                     PatternBindingId {
                         pattern: binding_pat,
                         field: Some(field_index),
                     },
                     false,
+                    mode,
                 );
             }
         }
@@ -4139,10 +4308,14 @@ impl TypeChecker<'_> {
         ty: Type,
         id: PatternBindingId,
         is_mut: bool,
+        mode: PatternBindingMode,
     ) {
         self.result
             .pattern_binding_types
             .insert((ctx.body_id, id), ty.clone());
+        self.result
+            .pattern_binding_modes
+            .insert((ctx.body_id, id), mode);
         ctx.bindings.insert(name, ty, id, is_mut);
     }
 
@@ -4156,6 +4329,7 @@ impl TypeChecker<'_> {
                     },
                     name.0.clone(),
                 )),
+                Pattern::Reference { pattern, .. } => collect(body, *pattern, bindings),
                 Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                     for element in elements {
                         collect(body, *element, bindings);
@@ -4210,9 +4384,16 @@ impl TypeChecker<'_> {
         pat: PatId,
         expected: &Type,
         stmt_id: StmtId,
+        has_initializer: bool,
     ) {
         let before = self.result.diagnostics.len();
-        self.bind_pattern(ctx, pat, expected);
+        self.bind_pattern_with_mode(
+            ctx,
+            pat,
+            expected,
+            PatternBindingMode::Move,
+            has_initializer,
+        );
         self.report_duplicate_pattern_bindings(ctx, pat);
         // A pattern whose shape already mismatched the type reports a nonsense
         // witness — `let (a, b, c) = (1, 2)` is a wrong arity, not a refutable
@@ -4236,6 +4417,7 @@ impl TypeChecker<'_> {
                     pattern: pat,
                     field: None,
                 }),
+                Pattern::Reference { pattern, .. } => collect(body, *pattern, ids),
                 Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                     for element in elements {
                         collect(body, *element, ids);

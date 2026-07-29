@@ -2051,11 +2051,10 @@ impl<'s> Parser<'s> {
     // == patterns ==
 
     fn pattern(&mut self) {
-        self.pattern_inner(false);
+        self.pattern_inner();
     }
 
-    /// When `top_level` is true, we are at the start of a pattern and can see `&`.
-    fn pattern_inner(&mut self, _top_level: bool) {
+    fn pattern_inner(&mut self) {
         self.attrs();
         if self.at(SyntaxKind::Mut) {
             // `mut name` — only a bare binding can be mutable.
@@ -2066,6 +2065,26 @@ impl<'s> Parser<'s> {
             return;
         }
         match self.current() {
+            SyntaxKind::Amp => {
+                let m = self.start();
+                self.bump();
+                if self.at(SyntaxKind::Mut) {
+                    self.bump();
+                }
+                self.pattern();
+                m.complete(self, SyntaxKind::ReferencePattern);
+            }
+            SyntaxKind::AmpAmp => {
+                let outer = self.start();
+                let inner = self.start();
+                self.bump();
+                if self.at(SyntaxKind::Mut) {
+                    self.bump();
+                }
+                self.pattern();
+                inner.complete(self, SyntaxKind::ReferencePattern);
+                outer.complete(self, SyntaxKind::ReferencePattern);
+            }
             SyntaxKind::Underscore => {
                 let m = self.start();
                 self.bump();

@@ -286,6 +286,19 @@ fn destructuring_let_patterns_parse() {
 }
 
 #[test]
+fn reference_patterns_parse() {
+    let result = compile(
+        r#"
+            fun shared(value: &i32) { let &copy = value; }
+            fun mutable(value: &mut i32) { let &mut copy = value; }
+            fun nested(value: & &mut i32) { let &&mut copy = value; }
+        "#,
+    );
+
+    assert!(result.parse_errors.is_empty(), "{:#?}", result.parse_errors);
+}
+
+#[test]
 fn extern_blocks_require_unsafe_modifier() {
     let result = compile_with_options(
         r#"

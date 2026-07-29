@@ -54,9 +54,35 @@ pub struct TypeCheckResult {
     pub lambda_infos: HashMap<(BodyId, ExprId), LambdaInfo>,
     pub pattern_types: HashMap<(BodyId, PatId), Type>,
     pub pattern_binding_types: HashMap<(BodyId, PatternBindingId), Type>,
+    pub pattern_binding_modes: HashMap<(BodyId, PatternBindingId), PatternBindingMode>,
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PatternBindingMode {
+    Move,
+    Ref,
+    RefMut,
+}
+
+impl PatternBindingMode {
+    pub(crate) fn through_reference(self, mutable: bool) -> Self {
+        match (self, mutable) {
+            (Self::Ref, _) | (Self::RefMut, false) => Self::Ref,
+            (_, true) => Self::RefMut,
+            (Self::Move, false) => Self::Ref,
+        }
+    }
+
+    pub(crate) fn binding_type(self, ty: Type) -> Type {
+        match self {
+            Self::Move => ty,
+            Self::Ref => Type::Ref(Box::new(ty), false),
+            Self::RefMut => Type::Ref(Box::new(ty), true),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

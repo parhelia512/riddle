@@ -12,8 +12,8 @@ use hir::{
     place::Place,
 };
 use type_checker::{
-    CaptureMode, CaptureSource, ClosureKind, Diagnostic, LabelStyle, LambdaInfo, Severity,
-    SourceLabel, TraitEnv, Type, TypeCheckResult,
+    CaptureMode, CaptureSource, ClosureKind, Diagnostic, LabelStyle, LambdaInfo,
+    PatternBindingMode, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult,
 };
 
 mod initialization;
@@ -154,6 +154,19 @@ impl OriginValue {
         }
         self.origins.extend(other.origins);
     }
+}
+
+fn projected_origin_value(
+    value: &OriginValue,
+    projection: &[AccessProjection],
+    index: usize,
+) -> (OriginValue, Vec<AccessProjection>) {
+    if let Some(field) = value.fields.get(index) {
+        return (field.clone(), Vec::new());
+    }
+    let mut projection = projection.to_vec();
+    projection.push(AccessProjection::Field(index));
+    (value.flattened(), projection)
 }
 
 #[derive(Debug, Clone)]
@@ -450,6 +463,7 @@ impl<'a> Analyzer<'a> {
                 if let Some(item_ty) = item_ty {
                     self.check_pattern_move_from_drop(ctx, *pat, &item_ty);
                 }
+                self.check_explicit_reference_pattern_move(ctx, *pat);
                 ctx.push_scope();
                 self.bind_pattern_names(ctx, *pat);
                 self.bind_pattern_origins(ctx, *pat, &item_value);
@@ -479,6 +493,7 @@ impl<'a> Analyzer<'a> {
                     ctx.moved_places = base_moved_places.clone();
                     ctx.moved_sites = base_moved_sites.clone();
                     self.check_pattern_move_from_drop(ctx, arm.pat, &scrutinee_ty);
+                    self.check_explicit_reference_pattern_move(ctx, arm.pat);
                     ctx.push_scope();
                     self.bind_pattern_names(ctx, arm.pat);
                     self.bind_pattern_origins(ctx, arm.pat, &scrutinee_value);
@@ -674,7 +689,11 @@ impl<'a> Analyzer<'a> {
                     self.move_check_expr(ctx, init);
                     let value = ctx.expr_origin_value(init);
                     self.bind_pattern_origins(ctx, pat, &value);
-                    self.consume_if_local(ctx, init);
+                    self.deactivate_unretained(ctx, init, &HashSet::new());
+                    self.check_explicit_reference_pattern_move(ctx, pat);
+                    if self.pattern_moves_non_copy(ctx, pat) {
+                        self.consume_if_local(ctx, init);
+                    }
                 }
             }
             Stmt::Expr { expr } => self.move_check_expr(ctx, *expr),
@@ -1435,12 +1454,7 @@ impl<'a> Analyzer<'a> {
             if retained.contains(&origin.loan) {
                 continue;
             }
-            if let Some(loan) = ctx.loans.get_mut(&origin.loan)
-                && loan.holders.is_empty()
-                && !loan.permanent
-            {
-                loan.active = false;
-            }
+            ctx.deactivate_loan_if_unheld(origin.loan);
         }
     }
 
@@ -1481,6 +1495,19 @@ impl<'a> Analyzer<'a> {
         span: Option<TextRange>,
         expr_id: ExprId,
     ) -> bool {
+        let name = self.expr_name(ctx, expr_id);
+        self.borrow_conflicts_named(ctx, place, kind, parents, span, &name)
+    }
+
+    fn borrow_conflicts_named(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        place: &AccessPlace,
+        kind: BorrowKind,
+        parents: &HashSet<LoanId>,
+        span: Option<TextRange>,
+        name: &str,
+    ) -> bool {
         let conflict = ctx.loans.iter().find_map(|(id, loan)| {
             (loan.active
                 && !parents.contains(id)
@@ -1492,7 +1519,6 @@ impl<'a> Analyzer<'a> {
             return false;
         };
 
-        let name = self.expr_name(ctx, expr_id);
         let (code, message) = match (kind, conflict.kind) {
             (BorrowKind::Mutable, BorrowKind::Shared) => (
                 "E0300",
@@ -1563,6 +1589,9 @@ impl<'a> Analyzer<'a> {
             hir::body::Pattern::Binding { name, .. } => {
                 ctx.bindings.insert_available(name.0.clone());
             }
+            hir::body::Pattern::Reference { pattern, .. } => {
+                self.bind_pattern_names(ctx, *pattern);
+            }
             hir::body::Pattern::Tuple { elements } => {
                 for el in elements {
                     self.bind_pattern_names(ctx, *el);
@@ -1586,19 +1615,44 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn bind_pattern_origins(&self, ctx: &mut BodyCtx<'_>, pat: PatId, value: &OriginValue) {
+    fn bind_pattern_origins(&mut self, ctx: &mut BodyCtx<'_>, pat: PatId, value: &OriginValue) {
+        let mut reborrows = HashMap::new();
+        self.bind_pattern_origins_inner(ctx, pat, value, &[], &mut reborrows);
+    }
+
+    fn bind_pattern_origins_inner(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        pat: PatId,
+        value: &OriginValue,
+        projection: &[AccessProjection],
+        reborrows: &mut HashMap<(LoanId, BorrowKind, Vec<AccessProjection>), Origin>,
+    ) {
         match &ctx.body.pats[pat] {
-            Pattern::Binding { .. } => ctx.bind_origin_value(
-                PatternBindingId {
+            Pattern::Binding { .. } => {
+                let id = PatternBindingId {
                     pattern: pat,
                     field: None,
-                },
-                value.clone(),
-            ),
+                };
+                let value =
+                    self.pattern_binding_origin_value(ctx, id, value, projection, reborrows);
+                ctx.bind_origin_value(id, value);
+            }
+            Pattern::Reference { pattern, .. } => {
+                self.bind_pattern_origins_inner(ctx, *pattern, value, projection, reborrows);
+            }
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 let elements = elements.clone();
                 for (index, element) in elements.into_iter().enumerate() {
-                    self.bind_pattern_origins(ctx, element, &value.project(index));
+                    let (field_value, field_projection) =
+                        projected_origin_value(value, projection, index);
+                    self.bind_pattern_origins_inner(
+                        ctx,
+                        element,
+                        &field_value,
+                        &field_projection,
+                        reborrows,
+                    );
                 }
             }
             Pattern::Struct { fields, .. } => {
@@ -1607,22 +1661,86 @@ impl<'a> Analyzer<'a> {
                     let Some(index) = self.pattern_field_index(ctx, pat, &field.name) else {
                         continue;
                     };
-                    let field_value = value.project(index);
+                    let (field_value, field_projection) =
+                        projected_origin_value(value, projection, index);
                     if let Some(field_pat) = field.pat {
-                        self.bind_pattern_origins(ctx, field_pat, &field_value);
-                    } else {
-                        ctx.bind_origin_value(
-                            PatternBindingId {
-                                pattern: pat,
-                                field: Some(binding_index),
-                            },
-                            field_value,
+                        self.bind_pattern_origins_inner(
+                            ctx,
+                            field_pat,
+                            &field_value,
+                            &field_projection,
+                            reborrows,
                         );
+                    } else {
+                        let id = PatternBindingId {
+                            pattern: pat,
+                            field: Some(binding_index),
+                        };
+                        let field_value = self.pattern_binding_origin_value(
+                            ctx,
+                            id,
+                            &field_value,
+                            &field_projection,
+                            reborrows,
+                        );
+                        ctx.bind_origin_value(id, field_value);
                     }
                 }
             }
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
         }
+    }
+
+    fn pattern_binding_origin_value(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        id: PatternBindingId,
+        value: &OriginValue,
+        projection: &[AccessProjection],
+        reborrows: &mut HashMap<(LoanId, BorrowKind, Vec<AccessProjection>), Origin>,
+    ) -> OriginValue {
+        let kind = match self
+            .type_result
+            .pattern_binding_modes
+            .get(&(ctx.body_id, id))
+        {
+            Some(PatternBindingMode::Ref) => BorrowKind::Shared,
+            Some(PatternBindingMode::RefMut) => BorrowKind::Mutable,
+            _ => {
+                return self
+                    .type_result
+                    .pattern_binding_types
+                    .get(&(ctx.body_id, id))
+                    .filter(|ty| type_may_carry_reference(self.hir, ty))
+                    .map(|_| value.clone())
+                    .unwrap_or_default();
+            }
+        };
+        let mut origins = Origins::new();
+        for origin in &value.origins {
+            let key = (origin.loan, kind, projection.to_vec());
+            if let Some(reborrow) = reborrows.get(&key) {
+                origins.insert(reborrow.clone());
+                continue;
+            }
+            let mut place = origin.place.clone();
+            for projection in projection {
+                place = match projection {
+                    AccessProjection::Field(index) => place.field(*index),
+                    AccessProjection::Index(index) => place.index(*index),
+                };
+            }
+            let parents = ctx.loan_family(origin.loan);
+            let span = ctx.source_map.pat_ranges.get(&id.pattern).copied();
+            if self.borrow_conflicts_named(ctx, &place, kind, &parents, span, "pattern binding") {
+                continue;
+            }
+            let loan = ctx.new_loan_with_parents(place.clone(), kind, span, false, parents);
+            let reborrow = Origin { place, kind, loan };
+            reborrows.insert(key, reborrow.clone());
+            origins.insert(reborrow);
+        }
+        OriginValue::from_origins(origins)
     }
 
     fn pattern_move_places(&self, ctx: &BodyCtx<'_>, pat: PatId, root: &Place) -> Vec<Place> {
@@ -1640,9 +1758,14 @@ impl<'a> Analyzer<'a> {
     ) {
         let binding_moves = |id| {
             self.type_result
-                .pattern_binding_types
+                .pattern_binding_modes
                 .get(&(ctx.body_id, id))
-                .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
+                == Some(&PatternBindingMode::Move)
+                && self
+                    .type_result
+                    .pattern_binding_types
+                    .get(&(ctx.body_id, id))
+                    .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
         };
         match &ctx.body.pats[pat] {
             Pattern::Binding { .. } => {
@@ -1653,6 +1776,7 @@ impl<'a> Analyzer<'a> {
                     places.push(root.clone());
                 }
             }
+            Pattern::Reference { .. } => {}
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 for (index, element) in elements.iter().enumerate() {
                     self.collect_pattern_move_places(
@@ -1737,6 +1861,7 @@ impl<'a> Analyzer<'a> {
         let children = match &ctx.body.pats[pat] {
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => elements.clone(),
             Pattern::Struct { fields, .. } => fields.iter().filter_map(|field| field.pat).collect(),
+            Pattern::Reference { .. } => Vec::new(),
             _ => Vec::new(),
         };
         children.into_iter().find_map(|child| {
@@ -1748,9 +1873,14 @@ impl<'a> Analyzer<'a> {
     fn pattern_moves_non_copy(&self, ctx: &BodyCtx<'_>, pat: PatId) -> bool {
         let binding_moves = |id| {
             self.type_result
-                .pattern_binding_types
+                .pattern_binding_modes
                 .get(&(ctx.body_id, id))
-                .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
+                == Some(&PatternBindingMode::Move)
+                && self
+                    .type_result
+                    .pattern_binding_types
+                    .get(&(ctx.body_id, id))
+                    .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
         };
         match &ctx.body.pats[pat] {
             Pattern::Binding { .. } => binding_moves(PatternBindingId {
@@ -1770,7 +1900,79 @@ impl<'a> Analyzer<'a> {
                             field: Some(index),
                         }))
             }),
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => false,
+            Pattern::Reference { .. }
+            | Pattern::Wildcard
+            | Pattern::Literal(_)
+            | Pattern::Path { .. } => false,
+        }
+    }
+
+    fn check_explicit_reference_pattern_move(&mut self, ctx: &BodyCtx<'_>, pat: PatId) {
+        let Some(binding) = self.explicit_reference_pattern_move(ctx, pat, false) else {
+            return;
+        };
+        self.diag(
+            "cannot move out of dereference of a non-Copy value".into(),
+            ctx.source_map.pat_ranges.get(&binding).copied(),
+            "E0308",
+        );
+    }
+
+    fn explicit_reference_pattern_move(
+        &self,
+        ctx: &BodyCtx<'_>,
+        pat: PatId,
+        behind_reference: bool,
+    ) -> Option<PatId> {
+        let binding_moves = |id| {
+            self.type_result
+                .pattern_binding_modes
+                .get(&(ctx.body_id, id))
+                == Some(&PatternBindingMode::Move)
+                && self
+                    .type_result
+                    .pattern_binding_types
+                    .get(&(ctx.body_id, id))
+                    .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
+        };
+        match &ctx.body.pats[pat] {
+            Pattern::Binding { .. }
+                if behind_reference
+                    && binding_moves(PatternBindingId {
+                        pattern: pat,
+                        field: None,
+                    }) =>
+            {
+                Some(pat)
+            }
+            Pattern::Reference { pattern, .. } => {
+                self.explicit_reference_pattern_move(ctx, *pattern, true)
+            }
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
+                elements.iter().find_map(|element| {
+                    self.explicit_reference_pattern_move(ctx, *element, behind_reference)
+                })
+            }
+            Pattern::Struct { fields, .. } => {
+                fields.iter().enumerate().find_map(|(index, field)| {
+                    if let Some(field_pattern) = field.pat {
+                        self.explicit_reference_pattern_move(ctx, field_pattern, behind_reference)
+                    } else if behind_reference
+                        && binding_moves(PatternBindingId {
+                            pattern: pat,
+                            field: Some(index),
+                        })
+                    {
+                        Some(pat)
+                    } else {
+                        None
+                    }
+                })
+            }
+            Pattern::Binding { .. }
+            | Pattern::Wildcard
+            | Pattern::Literal(_)
+            | Pattern::Path { .. } => None,
         }
     }
 
@@ -2015,13 +2217,15 @@ impl<'a> BodyCtx<'a> {
 
     fn bind_origins(&mut self, binding: PatternBindingId, origins: Origins) {
         if let Some(previous) = self.local_origins.insert(binding, origins.clone()) {
+            let mut released = Vec::new();
             for origin in previous {
                 if let Some(loan) = self.loans.get_mut(&origin.loan) {
                     loan.holders.remove(&binding);
-                    if loan.holders.is_empty() && !loan.permanent {
-                        loan.active = false;
-                    }
+                    released.push(origin.loan);
                 }
+            }
+            for loan in released {
+                self.deactivate_loan_if_unheld(loan);
             }
         }
         for origin in origins {
@@ -2088,13 +2292,39 @@ impl<'a> BodyCtx<'a> {
         let Some(origins) = self.local_origins.get(&binding) else {
             return;
         };
-        for origin in origins {
-            if let Some(loan) = self.loans.get_mut(&origin.loan) {
-                loan.holders.remove(&binding);
-                if loan.holders.is_empty() && !loan.permanent {
-                    loan.active = false;
-                }
+        let origins = origins.iter().map(|origin| origin.loan).collect::<Vec<_>>();
+        for loan in &origins {
+            if let Some(record) = self.loans.get_mut(loan) {
+                record.holders.remove(&binding);
             }
+        }
+        for loan in origins {
+            self.deactivate_loan_if_unheld(loan);
+        }
+    }
+
+    fn deactivate_loan_if_unheld(&mut self, loan: LoanId) {
+        let can_deactivate = self.loans.get(&loan).is_some_and(|record| {
+            record.active
+                && !record.permanent
+                && record.holders.is_empty()
+                && !self.loans.iter().any(|(child, child_record)| {
+                    *child != loan && child_record.active && child_record.parents.contains(&loan)
+                })
+        });
+        if !can_deactivate {
+            return;
+        }
+        let parents = self
+            .loans
+            .get(&loan)
+            .map(|record| record.parents.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if let Some(record) = self.loans.get_mut(&loan) {
+            record.active = false;
+        }
+        for parent in parents {
+            self.deactivate_loan_if_unheld(parent);
         }
     }
 }

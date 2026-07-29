@@ -82,11 +82,12 @@ impl TypeChecker<'_> {
             return None;
         }
 
-        let matrix = vec![vec![self.lower_matrix_pattern(ctx, pat, scrutinee_ty)]];
+        let coverage_ty = reference_pattern_coverage_type(scrutinee_ty);
+        let matrix = vec![vec![self.lower_matrix_pattern(ctx, pat, &coverage_ty)]];
         let witness = self.useful(
             &matrix,
             &[MatrixPat::Wildcard],
-            std::slice::from_ref(scrutinee_ty),
+            std::slice::from_ref(&coverage_ty),
         )?;
         let witness = witness.first()?;
         let pattern = self.display_matrix_pattern(witness);
@@ -104,15 +105,16 @@ impl TypeChecker<'_> {
             return None;
         }
 
+        let coverage_ty = reference_pattern_coverage_type(scrutinee_ty);
         let matrix = arms
             .iter()
             .filter(|arm| arm.guard.is_none())
-            .map(|arm| vec![self.lower_matrix_pattern(ctx, arm.pat, scrutinee_ty)])
+            .map(|arm| vec![self.lower_matrix_pattern(ctx, arm.pat, &coverage_ty)])
             .collect::<Vec<_>>();
         let witness = self.useful(
             &matrix,
             &[MatrixPat::Wildcard],
-            std::slice::from_ref(scrutinee_ty),
+            std::slice::from_ref(&coverage_ty),
         )?;
         let witness = witness.first()?;
         let pattern = self.display_matrix_pattern(witness);
@@ -263,8 +265,16 @@ impl TypeChecker<'_> {
         pat: PatId,
         expected: &Type,
     ) -> MatrixPat {
+        let effective = self
+            .result
+            .pattern_types
+            .get(&(ctx.body_id, pat))
+            .cloned()
+            .unwrap_or_else(|| expected.clone());
+        let expected = &effective;
         match ctx.body.pats[pat].clone() {
             Pattern::Wildcard => MatrixPat::Wildcard,
+            Pattern::Reference { pattern, .. } => self.lower_matrix_pattern(ctx, pattern, expected),
             Pattern::Literal(literal) => literal_constructor(literal, expected)
                 .map(|constructor| MatrixPat::Constructor(constructor, Vec::new()))
                 .unwrap_or(MatrixPat::Invalid),
@@ -660,6 +670,19 @@ impl TypeChecker<'_> {
                 Constructor::Char(value) => format!("'{value}'"),
             },
         }
+    }
+}
+
+fn reference_pattern_coverage_type(ty: &Type) -> Type {
+    let mut ty = ty.clone();
+    loop {
+        let Type::Ref(inner, mutable) = &ty else {
+            return ty;
+        };
+        if !mutable && inner.as_ref() == &Type::Str {
+            return ty;
+        }
+        ty = inner.as_ref().clone();
     }
 }
 
