@@ -567,7 +567,7 @@ impl TypeChecker<'_> {
                 callee,
                 args,
                 type_args,
-            } => self.check_call(ctx, *callee, args, type_args, expected, span),
+            } => self.check_call(ctx, expr_id, *callee, args, type_args, expected),
             Expr::Lambda {
                 is_move,
                 params,
@@ -596,31 +596,7 @@ impl TypeChecker<'_> {
                 ty
             }
             Expr::IndexAccess { base, index } => {
-                let base_ty = self.check_expr(ctx, *base);
-                let index_ty = self.check_expr(ctx, *index);
-                if !index_ty.is_unknown_like() && !index_ty.is_integer() {
-                    self.expect_assignable(
-                        &Type::Int(IntTy::I32),
-                        &index_ty,
-                        "index",
-                        ctx.expr_range(*index),
-                    );
-                }
-                self.record_value_use(ctx, *index, ValueUse::Move);
-                // Extract element type from arrays / references / pointers.
-                let index_base = match &base_ty {
-                    Type::Ref(inner, _) => inner.as_ref(),
-                    _ => &base_ty,
-                };
-                match index_base {
-                    Type::Slice(inner) => *inner.clone(),
-                    Type::Array(inner, _) => *inner.clone(),
-                    Type::Ptr { inner, .. } => {
-                        self.require_unsafe(ctx, "indexing a raw pointer", span);
-                        *inner.clone()
-                    }
-                    _ => Type::Unknown,
-                }
+                self.check_index_access(ctx, expr_id, *base, *index, span)
             }
             Expr::Cast { base, target } => {
                 let source_ty = self.check_expr(ctx, *base);
@@ -646,6 +622,7 @@ impl TypeChecker<'_> {
                 }
                 target_ty
             }
+            Expr::Try { operand } => self.check_try(ctx, expr_id, *operand, span),
         };
 
         let ty = if ty.is_never() || self.expr_always_returns(ctx, expr_id) {
@@ -658,6 +635,120 @@ impl TypeChecker<'_> {
             .expr_types
             .insert((ctx.body_id, expr_id), ty.clone());
         ty
+    }
+
+    fn check_try(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        operand: ExprId,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let operand_ty = self.check_expr(ctx, operand);
+        let operand_ty = self.resolve_type(&operand_ty);
+        self.record_value_use(ctx, operand, ValueUse::Move);
+
+        let Type::Enum(result_id, result_args) = &operand_ty else {
+            self.diagnostic("E0061", "`?` requires a Result value as its operand", span);
+            return Type::Error;
+        };
+        let is_result = self.hir.item_tree.enums[*result_id].name.0 == "Result";
+        if !is_result || result_args.len() != 2 {
+            self.diagnostic("E0061", "`?` requires a Result value as its operand", span);
+            return Type::Error;
+        }
+
+        let return_ty = self.resolve_type(&ctx.return_ty);
+        let Type::Enum(return_id, return_args) = &return_ty else {
+            self.diagnostic(
+                "E0062",
+                "the `?` operator can only be used in a function returning Result",
+                span,
+            );
+            return result_args[0].clone();
+        };
+        if *return_id != *result_id || return_args.len() != 2 {
+            self.diagnostic(
+                "E0062",
+                "the `?` operator can only be used in a function returning Result",
+                span,
+            );
+            return result_args[0].clone();
+        }
+
+        let source_error = &result_args[1];
+        let target_error = &return_args[1];
+        if !self.bound_types_match(target_error, source_error) {
+            let Some(into_trait) = self.find_trait_by_name("Into") else {
+                self.diagnostic(
+                    "E0063",
+                    format!(
+                        "cannot convert `{}` into the enclosing Result error type `{}`",
+                        source_error.display(self.hir),
+                        target_error.display(self.hir)
+                    ),
+                    span,
+                );
+                return result_args[0].clone();
+            };
+            let Some(method) = self.find_trait_impl_method(
+                source_error,
+                Some(target_error),
+                None,
+                into_trait,
+                "into",
+            ) else {
+                self.diagnostic(
+                    "E0063",
+                    format!(
+                        "cannot convert `{}` into the enclosing Result error type `{}`",
+                        source_error.display(self.hir),
+                        target_error.display(self.hir)
+                    ),
+                    span,
+                );
+                return result_args[0].clone();
+            };
+            let converted = method
+                .function
+                .ret_type
+                .as_ref()
+                .map(|ty| {
+                    substitute_type(
+                        &self.lower_type_ref_with_params_at(
+                            ty,
+                            &method.subst,
+                            method
+                                .function
+                                .ret_type_range
+                                .or(Some(method.function.name_range)),
+                        ),
+                        &method.subst,
+                    )
+                })
+                .unwrap_or(Type::Unit);
+            if !self.bound_types_match(target_error, &converted) {
+                self.diagnostic(
+                    "E0063",
+                    format!(
+                        "`Into::into` returns `{}`, not the enclosing Result error type `{}`",
+                        converted.display(self.hir),
+                        target_error.display(self.hir)
+                    ),
+                    span,
+                );
+            } else {
+                self.result.trait_method_calls.insert(
+                    (ctx.body_id, expr_id),
+                    TraitMethodCall {
+                        trait_id: into_trait,
+                        method: "into".into(),
+                    },
+                );
+            }
+        }
+
+        result_args[0].clone()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1285,8 +1376,13 @@ impl TypeChecker<'_> {
             return Some(ty);
         }
         let receiver_ty = Self::default_inferred_numeric_type(lhs_ty);
-        let method =
-            self.find_trait_impl_method(&receiver_ty, Some(rhs_ty), trait_id, method_name)?;
+        let method = self.find_trait_impl_method(
+            &receiver_ty,
+            Some(rhs_ty),
+            Some(rhs_ty),
+            trait_id,
+            method_name,
+        )?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -1354,6 +1450,247 @@ impl TypeChecker<'_> {
         )
     }
 
+    fn check_index_access(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        base: ExprId,
+        index: ExprId,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let base_ty = self.check_expr(ctx, base);
+        let index_ty = self.check_expr(ctx, index);
+        let receiver_ty = match &base_ty {
+            Type::Ref(inner, _) => inner.as_ref(),
+            _ => &base_ty,
+        };
+
+        if let Some(output) = match receiver_ty {
+            Type::Slice(inner) | Type::Array(inner, _) => Some(*inner.clone()),
+            Type::Ptr { inner, .. } => {
+                self.require_unsafe(ctx, "indexing a raw pointer", span);
+                Some(*inner.clone())
+            }
+            _ => None,
+        } {
+            if !index_ty.is_unknown_like() && !index_ty.is_integer() {
+                self.expect_assignable(
+                    &Type::Int(IntTy::I32),
+                    &index_ty,
+                    "index",
+                    ctx.expr_range(index),
+                );
+            }
+            self.record_value_use(ctx, index, ValueUse::Move);
+            return output;
+        }
+
+        let Some(trait_id) = self.result.trait_env.lang_items.get(LangItem::Index) else {
+            self.diagnostic("E0036", "missing `Index` trait", span);
+            return Type::Error;
+        };
+        if let Some(output) = self.check_trait_bound_index(
+            ctx,
+            expr_id,
+            base,
+            index,
+            receiver_ty,
+            &index_ty,
+            trait_id,
+            "index",
+        ) {
+            return output;
+        }
+        let Some(method) = self.find_trait_impl_method(
+            receiver_ty,
+            Some(&index_ty),
+            Some(&index_ty),
+            trait_id,
+            "index",
+        ) else {
+            if !base_ty.is_unknown_like() && !index_ty.is_unknown_like() {
+                self.diagnostic(
+                    "E0036",
+                    format!(
+                        "type `{}` cannot be indexed by `{}`",
+                        base_ty.display(self.hir),
+                        index_ty.display(self.hir)
+                    ),
+                    span,
+                );
+            }
+            return Type::Error;
+        };
+
+        let receiver = &method.function.params[0];
+        let expected_receiver = self.lower_type_ref_with_params_at(
+            &receiver.ty,
+            &method.subst,
+            Some(receiver.ty_range),
+        );
+        let actual_receiver = self.receiver_argument_type(&base_ty, &expected_receiver);
+        self.expect_assignable(
+            &expected_receiver,
+            &actual_receiver,
+            "index receiver",
+            ctx.expr_range(base),
+        );
+        self.record_value_use(ctx, base, Self::hir_parameter_value_use(&receiver.ty));
+
+        let index_param = &method.function.params[1];
+        let expected_index = self.lower_type_ref_with_params_at(
+            &index_param.ty,
+            &method.subst,
+            Some(index_param.ty_range),
+        );
+        self.expect_assignable(&expected_index, &index_ty, "index", ctx.expr_range(index));
+        self.constrain_index_type(ctx, index, &index_ty, &expected_index);
+        self.record_value_use(ctx, index, Self::hir_parameter_value_use(&index_param.ty));
+        self.result.trait_method_calls.insert(
+            (ctx.body_id, expr_id),
+            TraitMethodCall {
+                trait_id,
+                method: "index".into(),
+            },
+        );
+
+        method
+            .function
+            .ret_type
+            .as_ref()
+            .map(|ret| {
+                self.lower_type_ref_with_params_at(
+                    ret,
+                    &method.subst,
+                    method
+                        .function
+                        .ret_type_range
+                        .or(Some(method.function.name_range)),
+                )
+            })
+            .and_then(|ty| match ty {
+                Type::Ref(output, _) => Some(*output),
+                _ => None,
+            })
+            .unwrap_or(Type::Error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_trait_bound_index(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        base: ExprId,
+        index: ExprId,
+        receiver_ty: &Type,
+        index_ty: &Type,
+        trait_id: TraitId,
+        method_name: &str,
+    ) -> Option<Type> {
+        let Type::Param(param) = receiver_ty else {
+            return None;
+        };
+        let bound = self.current_generic_bounds(ctx).into_iter().find(|bound| {
+            bound_target_param(bound).is_some_and(|name| name == *param)
+                && self
+                    .resolve_trait_ref(&bound.trait_ty)
+                    .is_some_and(|bound_trait| self.trait_implies(bound_trait, trait_id))
+        })?;
+        let bound_trait = self.resolve_trait_ref(&bound.trait_ty)?;
+        let method = self.hir.item_tree.traits[trait_id]
+            .methods
+            .iter()
+            .find(|method| method.name.0 == method_name)
+            .cloned()?;
+        let bound_subst = self.trait_ref_subst(
+            bound_trait,
+            &bound.trait_ty,
+            receiver_ty,
+            &ctx.generic_params,
+            Some(bound.trait_range),
+        );
+        let subst = self.supertrait_subst(
+            bound_trait,
+            trait_id,
+            receiver_ty,
+            &bound_subst,
+            &mut HashSet::new(),
+        )?;
+
+        let receiver = method.params.first()?;
+        let expected_receiver =
+            self.lower_type_ref_with_params_at(&receiver.ty, &subst, Some(receiver.ty_range));
+        let base_ty = self
+            .result
+            .expr_types
+            .get(&(ctx.body_id, base))
+            .cloned()
+            .unwrap_or(Type::Error);
+        let actual_receiver = self.receiver_argument_type(&base_ty, &expected_receiver);
+        self.expect_assignable(
+            &expected_receiver,
+            &actual_receiver,
+            "index receiver",
+            ctx.expr_range(base),
+        );
+        self.record_value_use(ctx, base, Self::hir_parameter_value_use(&receiver.ty));
+        let index_param = method.params.get(1)?;
+        let expected_index =
+            self.lower_type_ref_with_params_at(&index_param.ty, &subst, Some(index_param.ty_range));
+        self.expect_assignable(&expected_index, index_ty, "index", ctx.expr_range(index));
+        self.constrain_index_type(ctx, index, index_ty, &expected_index);
+        self.record_value_use(ctx, index, Self::hir_parameter_value_use(&index_param.ty));
+        self.result.trait_method_calls.insert(
+            (ctx.body_id, expr_id),
+            TraitMethodCall {
+                trait_id,
+                method: method_name.into(),
+            },
+        );
+
+        self.bound_assoc_type(ctx, &bound, "Output").or_else(|| {
+            method.ret_type.as_ref().and_then(|ret| {
+                match self.lower_type_ref_with_params_at(
+                    ret,
+                    &subst,
+                    method.ret_type_range.or(Some(method.name_range)),
+                ) {
+                    Type::Ref(output, _) => Some(*output),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    fn constrain_index_type(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        index: ExprId,
+        actual: &Type,
+        expected: &Type,
+    ) {
+        if matches!(actual, Type::InferInt) && matches!(expected, Type::Int(_)) {
+            self.result
+                .expr_types
+                .insert((ctx.body_id, index), expected.clone());
+            if let Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                ..
+            } = &ctx.body.exprs[index]
+                && self
+                    .result
+                    .pattern_binding_types
+                    .get(&(ctx.body_id, *id))
+                    .is_some_and(|ty| matches!(ty, Type::InferInt))
+            {
+                self.result
+                    .pattern_binding_types
+                    .insert((ctx.body_id, *id), expected.clone());
+                ctx.bindings.set_type(*id, expected.clone());
+            }
+        }
+    }
+
     fn check_overloaded_unary(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -1376,7 +1713,7 @@ impl TypeChecker<'_> {
         ) {
             return Some(ty);
         }
-        let method = self.find_trait_impl_method(operand_ty, None, trait_id, method_name)?;
+        let method = self.find_trait_impl_method(operand_ty, None, None, trait_id, method_name)?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -1445,8 +1782,13 @@ impl TypeChecker<'_> {
             return Some(());
         }
         let receiver_ty = Self::default_inferred_numeric_type(lhs_ty);
-        let method =
-            self.find_trait_impl_method(&receiver_ty, Some(rhs_ty), trait_id, method_name)?;
+        let method = self.find_trait_impl_method(
+            &receiver_ty,
+            Some(rhs_ty),
+            Some(rhs_ty),
+            trait_id,
+            method_name,
+        )?;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
@@ -2580,12 +2922,22 @@ impl TypeChecker<'_> {
     fn check_call(
         &mut self,
         ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
         callee: ExprId,
         args: &[ExprId],
         type_args: &[HirTypeRef],
         expected: Option<&Type>,
-        span: Option<rowan::TextRange>,
     ) -> Type {
+        let span = ctx.expr_range(expr_id);
+        let impl_type_args = match &ctx.body.exprs[callee] {
+            Expr::Path { path, .. } => path
+                .segments
+                .len()
+                .checked_sub(2)
+                .map(|index| path.type_args_for_segment(index).to_vec())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         if matches!(&ctx.body.exprs[callee], Expr::FieldAccess { .. }) {
             return self.check_method_call(ctx, callee, args, type_args, span);
         }
@@ -2603,6 +2955,15 @@ impl TypeChecker<'_> {
                 expected,
                 span,
             );
+        }
+
+        if let Expr::Path {
+            path,
+            resolved: Some(ResolvedName::Trait(trait_id)),
+        } = &ctx.body.exprs[callee]
+            && path.segments.last().is_some_and(|name| name.0 == "default")
+        {
+            return self.check_static_trait_call(ctx, expr_id, *trait_id, args, expected, span);
         }
 
         let callee_ty = self.check_expr(ctx, callee);
@@ -2698,12 +3059,28 @@ impl TypeChecker<'_> {
         let mut subst = HashMap::new();
         let mut generic_arg_spans = HashMap::new();
 
-        // Seed substitution from explicit type arguments if provided
+        if !impl_type_args.is_empty() {
+            if impl_type_args.len() != impl_generics.len() {
+                self.diagnostic(
+                    "E0005",
+                    format!(
+                        "associated function `{}` expects {} type argument(s) on its type, got {}",
+                        function.name.0,
+                        impl_generics.len(),
+                        impl_type_args.len()
+                    ),
+                    span,
+                );
+            }
+            for (param_name, type_arg) in impl_generics.iter().zip(&impl_type_args) {
+                let lowered =
+                    self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
+                subst.insert(param_name.clone(), lowered);
+            }
+        }
+
         if !type_args.is_empty() {
-            let type_param_names: Vec<_> = impl_generics
-                .iter()
-                .chain(function.generics.iter().map(|n| &n.0))
-                .collect();
+            let type_param_names: Vec<_> = function.generics.iter().map(|name| &name.0).collect();
             if type_args.len() != type_param_names.len() {
                 self.diagnostic(
                     "E0005",
@@ -2856,6 +3233,83 @@ impl TypeChecker<'_> {
                 )
             })
             .unwrap_or(Type::Unit)
+    }
+
+    fn check_static_trait_call(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        trait_id: TraitId,
+        args: &[ExprId],
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        if !args.is_empty() {
+            for arg in args {
+                self.check_expr(ctx, *arg);
+                self.record_value_use(ctx, *arg, ValueUse::Move);
+            }
+            self.diagnostic(
+                "E0005",
+                "static trait functions do not take arguments",
+                span,
+            );
+            return Type::Error;
+        }
+        let Some(expected) = expected.filter(|ty| !ty.is_unknown_like()) else {
+            return Type::Unknown;
+        };
+        let Some(method) = self.find_trait_impl_method(expected, None, None, trait_id, "default")
+        else {
+            self.diagnostic(
+                "E0013",
+                format!(
+                    "no `default` implementation for `{}`",
+                    expected.display(self.hir)
+                ),
+                span,
+            );
+            return Type::Error;
+        };
+        if !method.function.params.is_empty() {
+            self.diagnostic("E0013", "`default` must be a static trait function", span);
+            return Type::Error;
+        }
+        let return_ty = method
+            .function
+            .ret_type
+            .as_ref()
+            .map(|ty| {
+                self.lower_type_ref_with_params_at(
+                    ty,
+                    &method.subst,
+                    method
+                        .function
+                        .ret_type_range
+                        .or(Some(method.function.name_range)),
+                )
+            })
+            .unwrap_or(Type::Unit);
+        if !self.bound_types_match(expected, &return_ty) {
+            self.diagnostic(
+                "E0013",
+                format!(
+                    "`default` returns `{}`, expected `{}`",
+                    return_ty.display(self.hir),
+                    expected.display(self.hir)
+                ),
+                span,
+            );
+            return Type::Error;
+        }
+        self.result.trait_method_calls.insert(
+            (ctx.body_id, expr_id),
+            TraitMethodCall {
+                trait_id,
+                method: "default".into(),
+            },
+        );
+        return_ty
     }
 
     fn check_enum_variant_call(
@@ -4122,7 +4576,8 @@ impl TypeChecker<'_> {
     fn find_trait_impl_method(
         &mut self,
         receiver_ty: &Type,
-        rhs_ty: Option<&Type>,
+        trait_arg_ty: Option<&Type>,
+        method_arg_ty: Option<&Type>,
         trait_id: TraitId,
         method_name: &str,
     ) -> Option<ResolvedMethod> {
@@ -4156,7 +4611,15 @@ impl TypeChecker<'_> {
             let Some(fid) = fid else { continue };
             subst =
                 self.trait_ref_subst(trait_id, trait_ty, receiver_ty, &subst, imp.trait_ty_range);
-            if let Some(rhs_ty) = rhs_ty {
+            if let Some(trait_arg_ty) = trait_arg_ty
+                && let Some(trait_arg) = self.hir.item_tree.traits[trait_id].generics.first()
+            {
+                let expected = subst.get(&trait_arg.0).cloned().unwrap_or(Type::Unknown);
+                if !self.bound_types_match(&expected, trait_arg_ty) {
+                    continue;
+                }
+            }
+            if let Some(rhs_ty) = method_arg_ty {
                 let function = &self.hir.item_tree.functions[fid];
                 let Some(rhs_param) = function.params.get(1) else {
                     continue;
@@ -4397,6 +4860,98 @@ impl TypeChecker<'_> {
                 );
             }
             return;
+        }
+        if let Expr::IndexAccess { base, index } = &ctx.body.exprs[lhs]
+            && self
+                .result
+                .trait_method_calls
+                .get(&(ctx.body_id, lhs))
+                .is_some_and(|call| call.method == "index")
+        {
+            let base = *base;
+            let index = *index;
+            let base_ty = self
+                .result
+                .expr_types
+                .get(&(ctx.body_id, base))
+                .cloned()
+                .unwrap_or(Type::Error);
+            let index_ty = self
+                .result
+                .expr_types
+                .get(&(ctx.body_id, index))
+                .cloned()
+                .unwrap_or(Type::Error);
+            let receiver_ty = match &base_ty {
+                Type::Ref(inner, _) => inner.as_ref(),
+                _ => &base_ty,
+            };
+            let Some(trait_id) = self.result.trait_env.lang_items.get(LangItem::IndexMut) else {
+                self.diagnostic("E0036", "missing `IndexMut` trait", span);
+                return;
+            };
+            if self
+                .check_trait_bound_index(
+                    ctx,
+                    lhs,
+                    base,
+                    index,
+                    receiver_ty,
+                    &index_ty,
+                    trait_id,
+                    "index_mut",
+                )
+                .is_none()
+            {
+                let Some(method) = self.find_trait_impl_method(
+                    receiver_ty,
+                    Some(&index_ty),
+                    Some(&index_ty),
+                    trait_id,
+                    "index_mut",
+                ) else {
+                    self.diagnostic(
+                        "E0036",
+                        format!(
+                            "type `{}` cannot be mutably indexed by `{}`",
+                            base_ty.display(self.hir),
+                            index_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                    return;
+                };
+                let receiver = &method.function.params[0];
+                let expected_receiver = self.lower_type_ref_with_params_at(
+                    &receiver.ty,
+                    &method.subst,
+                    Some(receiver.ty_range),
+                );
+                let actual_receiver = self.receiver_argument_type(&base_ty, &expected_receiver);
+                self.expect_assignable(
+                    &expected_receiver,
+                    &actual_receiver,
+                    "mutable index receiver",
+                    ctx.expr_range(base),
+                );
+                self.record_value_use(ctx, base, Self::hir_parameter_value_use(&receiver.ty));
+                let index_param = &method.function.params[1];
+                let expected_index = self.lower_type_ref_with_params_at(
+                    &index_param.ty,
+                    &method.subst,
+                    Some(index_param.ty_range),
+                );
+                self.expect_assignable(&expected_index, &index_ty, "index", ctx.expr_range(index));
+                self.constrain_index_type(ctx, index, &index_ty, &expected_index);
+                self.record_value_use(ctx, index, Self::hir_parameter_value_use(&index_param.ty));
+                self.result.trait_method_calls.insert(
+                    (ctx.body_id, lhs),
+                    TraitMethodCall {
+                        trait_id,
+                        method: "index_mut".into(),
+                    },
+                );
+            }
         }
         self.record_value_use(ctx, lhs, ValueUse::Mutable);
         if let Some((id, name)) = self.root_binding_of_expr(ctx, lhs)
@@ -5309,6 +5864,7 @@ fn is_supported_cast(source: &Type, target: &Type) -> bool {
             Type::Float(_) | Type::InferFloat,
             Type::Int(_) | Type::Float(_)
         ) | (Type::Bool, Type::Int(_))
+            | (Type::Int(IntTy::U8), Type::Char)
             | (Type::Char, Type::Int(_))
             | (Type::Ptr { .. }, Type::Ptr { .. })
     )

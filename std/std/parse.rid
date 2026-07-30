@@ -1,0 +1,31 @@
+use crate::std::option::Option;
+
+pub fun parse_i32(value: &str) -> Option<i32> {
+    if value.is_empty() {
+        return Option::None;
+    }
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    let mut negative = false;
+    if bytes[0usize] == 45u8 {
+        negative = true;
+        index = 1usize;
+        if index == bytes.len() {
+            return Option::None;
+        }
+    }
+    let mut output = 0i32;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte < 48u8 || byte > 57u8 {
+            return Option::None;
+        }
+        output = output * 10i32 + (byte - 48u8) as i32;
+        index += 1usize;
+    }
+    if negative {
+        Option::Some(-output)
+    } else {
+        Option::Some(output)
+    }
+}

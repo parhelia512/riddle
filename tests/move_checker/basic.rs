@@ -1,5 +1,18 @@
 use crate::{analyze, messages};
 
+const INDEX_TRAITS: &str = r#"
+#[lang = "index"]
+trait Index<Idx = usize> {
+    type Output;
+    fun index(&self, index: Idx) -> &Self::Output;
+}
+
+#[lang = "index_mut"]
+trait IndexMut<Idx = usize>: Index<Idx> {
+    fun index_mut(&mut self, index: Idx) -> &mut Self::Output;
+}
+"#;
+
 #[test]
 fn delayed_initialization_is_allowed_before_use() {
     let result = analyze(
@@ -12,6 +25,73 @@ fn delayed_initialization_is_allowed_before_use() {
         "#,
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn trait_index_cannot_move_non_copy_output() {
+    let result = analyze(&format!(
+        r#"
+        {INDEX_TRAITS}
+
+        struct Token {{ value: i32 }}
+        struct Slot {{ value: Token }}
+
+        impl Index for Slot {{
+            type Output = Token;
+            fun index(&self, index: usize) -> &Self::Output {{ &self.value }}
+        }}
+
+        fun consume(value: Token) {{}}
+
+        fun main() {{
+            let slot = Slot {{ value: Token {{ value: 1 }} }};
+            consume(slot[0usize]);
+        }}
+        "#
+    ));
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0308"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn trait_index_borrow_blocks_mutable_receiver_call() {
+    let result = analyze(&format!(
+        r#"
+        {INDEX_TRAITS}
+
+        struct Slot {{ value: i32 }}
+
+        impl Index for Slot {{
+            type Output = i32;
+            fun index(&self, index: usize) -> &Self::Output {{ &self.value }}
+        }}
+
+        impl Slot {{
+            fun set(&mut self, value: i32) {{ self.value = value; }}
+        }}
+
+        fun main() {{
+            let mut slot = Slot {{ value: 1 }};
+            let value = &slot[0usize];
+            slot.set(2);
+            *value;
+        }}
+        "#
+    ));
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0300"),
+        "{:#?}",
+        result.diagnostics
+    );
 }
 
 #[test]

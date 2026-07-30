@@ -1,0 +1,7 @@
+unsafe extern "C" {
+    safe fun time(value: *mut i64) -> i64;
+}
+
+pub fun time_now() -> i64 {
+    time(0usize as *mut i64)
+}

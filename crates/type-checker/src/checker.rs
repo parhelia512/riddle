@@ -336,7 +336,7 @@ impl<'a> TypeChecker<'a> {
                         help: Some(
                             "recognized lang items: drop, copy, clone, partial_eq, eq, partial_ord, ord, \
                              add, sub, mul, div, rem, neg, not, bitand, bitor, bitxor, \
-                             shl, shr, and the *_assign variants"
+                             shl, shr, index, index_mut, and the *_assign variants"
                                 .to_string(),
                         ),
                         notes: Vec::new(),
@@ -1962,6 +1962,7 @@ fn first_non_const_expr(
         Expr::IndexAccess { base, index } => first_non_const_expr(body, *base, dependencies)
             .or_else(|| first_non_const_expr(body, *index, dependencies)),
         Expr::Cast { base, .. } => first_non_const_expr(body, *base, dependencies),
+        Expr::Try { operand } => first_non_const_expr(body, *operand, dependencies),
         Expr::Missing
         | Expr::Binary { .. }
         | Expr::Unary { .. }
@@ -2014,6 +2015,7 @@ pub(crate) fn validate_lang_item_signature(
     let self_ty = HirTypeRef::Named(HirPath {
         anchor: PathAnchor::Plain,
         segments: vec![hir::Name("Self".into())],
+        segment_type_args: Vec::new(),
         type_args: Vec::new(),
         range: tr.name_range,
     });
@@ -2149,6 +2151,9 @@ pub(crate) fn validate_lang_item_signature(
         | LangItem::BitXorAssign
         | LangItem::ShlAssign
         | LangItem::ShrAssign => validate_assign_operator_trait(tr, item.as_str(), &self_ty),
+
+        LangItem::Index => validate_index_trait(tr, "index", false, &self_ty),
+        LangItem::IndexMut => validate_index_trait(tr, "index_mut", true, &self_ty),
     }
 }
 
@@ -2333,6 +2338,72 @@ fn validate_assign_operator_trait(
     }
     if !lang_returns_unit(method) {
         return Some(format!("`{method_name}` must return `()` (unit)"));
+    }
+    None
+}
+
+fn validate_index_trait(
+    tr: &HirTrait,
+    method_name: &str,
+    mutable: bool,
+    self_ty: &HirTypeRef,
+) -> Option<String> {
+    if tr.generics.len() != 1 {
+        return Some("index trait must have exactly one index type parameter".into());
+    }
+    let Some(method) = tr
+        .methods
+        .iter()
+        .find(|method| method.name.0 == method_name)
+    else {
+        return Some(format!("must define a method named `{method_name}`"));
+    };
+    if !method.generics.is_empty() || !method.const_generics.is_empty() {
+        return Some(format!(
+            "`{method_name}` must not carry its own generic parameters"
+        ));
+    }
+    if !mutable && !lang_has_output_assoc_type(tr) {
+        return Some("`Index` must declare an associated type `Output`".into());
+    }
+    if mutable
+        && !tr.supertraits.iter().any(|bound| {
+            matches!(&bound.trait_ty,
+                HirTypeRef::Named(path)
+                    if path.segments.last().is_some_and(|name| name.0 == "Index")
+                        && path.type_args.len() == 1
+                        && lang_type_is_rhs(tr, &path.type_args[0]))
+        })
+    {
+        return Some("`IndexMut<Idx>` must extend `Index<Idx>`".into());
+    }
+    if method.params.len() != 2 {
+        return Some(format!("`{method_name}` must take exactly 2 parameters"));
+    }
+    if !matches!(&method.params[0].ty,
+        HirTypeRef::Ref(inner, is_mut) if *is_mut == mutable && lang_type_is_self(inner, self_ty))
+    {
+        return Some(format!(
+            "first parameter of `{method_name}` must be `{}`",
+            if mutable { "&mut self" } else { "&self" }
+        ));
+    }
+    if !lang_type_is_rhs(tr, &method.params[1].ty) {
+        return Some(format!(
+            "second parameter of `{method_name}` must match the index type"
+        ));
+    }
+    if !matches!(method.ret_type.as_ref(),
+        Some(HirTypeRef::Ref(inner, is_mut)) if *is_mut == mutable && lang_is_self_output(inner))
+    {
+        return Some(format!(
+            "`{method_name}` must return `{}`",
+            if mutable {
+                "&mut Self::Output"
+            } else {
+                "&Self::Output"
+            }
+        ));
     }
     None
 }

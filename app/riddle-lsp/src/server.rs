@@ -15,11 +15,12 @@ use lsp_types::{
     DidOpenTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
     ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHint, InlayHintParams, MessageType, OneOf, PositionEncodingKind, Registration,
-    SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind,
+    InlayHint, InlayHintParams, MessageType, OneOf, PositionEncodingKind, PrepareRenameResponse,
+    ReferenceParams, Registration, RenameOptions, RenameParams, SemanticTokens,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, WorkspaceEdit,
 };
 use riddlec::pipeline::CompileOptions;
 use tower_lsp::jsonrpc::Result;
@@ -30,7 +31,11 @@ use crate::{
     completion::{completion_items_for_document, completion_trigger_characters},
     diagnostics::{self, DiagnosticSessions, collect_workspace_diagnostics_cancellable},
     inlay_hints::inlay_hints_for_document,
-    navigation::{definition_for_document, hover_for_document, implementation_for_document},
+    navigation::{
+        definition_for_document, hover_for_document, implementation_for_document,
+        prepare_rename_for_document, references_for_document, rename_for_document,
+        validate_identifier,
+    },
     semantic_tokens::{semantic_token_delta, semantic_tokens_for_document, semantic_tokens_legend},
     session::AnalysisSessions,
     text::apply_content_changes,
@@ -121,6 +126,11 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(completion_trigger_characters()),
@@ -514,6 +524,121 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         Ok(implementation)
+    }
+
+    async fn references(
+        &self,
+        params: ReferenceParams,
+    ) -> Result<Option<Vec<lsp_types::Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let result = tokio::task::spawn_blocking(move || {
+            references_for_document(
+                &analysis_uri,
+                &docs,
+                position,
+                include_declaration,
+                options,
+                &sessions,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let references = match result {
+            Ok(references) => references,
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("references failed: {error}"))
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(references)
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+        let position = params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let result = tokio::task::spawn_blocking(move || {
+            prepare_rename_for_document(&analysis_uri, &docs, position, options, &sessions)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("prepare rename failed: {error}"),
+                    )
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(prepared)
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        if let Err(error) = validate_identifier(&params.new_name) {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(error));
+        }
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let result = tokio::task::spawn_blocking(move || {
+            rename_for_document(
+                &analysis_uri,
+                &docs,
+                position,
+                &new_name,
+                options,
+                &sessions,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let edit = match result {
+            Ok(edit) => edit,
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("rename failed: {error}"))
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(edit)
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {

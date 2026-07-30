@@ -1,0 +1,307 @@
+use crate::std::cmp::{Ord, Ordering};
+use crate::std::option::Option;
+use crate::std::vector::Vector;
+
+struct TreeNode<K> {
+    key: K,
+    parent: Option<usize>,
+    left: Option<usize>,
+    right: Option<usize>,
+    red: bool,
+}
+
+pub struct TreeMap<K, V> {
+    nodes: Vector<TreeNode<K>>,
+    values: Vector<V>,
+    root: Option<usize>,
+}
+
+impl<K, V> TreeMap<K, V> {
+    pub fun new() -> TreeMap<K, V> {
+        let nodes: Vector<TreeNode<K>> = Vector::new();
+        let values: Vector<V> = Vector::new();
+        TreeMap {
+            nodes,
+            values,
+            root: Option::None,
+        }
+    }
+
+    pub fun len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fun is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fun insert(&mut self, key: K, value: V)
+    where K: Ord {
+        let mut parent: Option<usize> = Option::None;
+        let mut current = self.root;
+        let mut insert_left = false;
+        let mut existing: Option<usize> = Option::None;
+
+        while current.is_some() {
+            let index = current.unwrap_or(0usize);
+            parent = Option::Some(index);
+            let ordering = match self.nodes.get(index) {
+                Option::Some(node) => key.cmp(&node.key),
+                Option::None => Ordering::Equal,
+            };
+            match ordering {
+                Ordering::Less => {
+                    insert_left = true;
+                    current = self.left(index);
+                },
+                Ordering::Greater => {
+                    insert_left = false;
+                    current = self.right(index);
+                },
+                Ordering::Equal => {
+                    existing = Option::Some(index);
+                    current = Option::None;
+                },
+            }
+        }
+
+        let value_index = self.values.len();
+        self.values.push(value);
+        if existing.is_some() {
+            let existing = existing.unwrap_or(0usize);
+            self.values.swap(existing, value_index);
+            let _old_value = self.values.pop();
+        } else {
+            let index = self.nodes.len();
+            self.nodes.push(TreeNode {
+                key,
+                parent,
+                left: Option::None,
+                right: Option::None,
+                red: true,
+            });
+
+            match parent {
+                Option::Some(parent) => {
+                    if insert_left {
+                        self.set_left(parent, Option::Some(index));
+                    } else {
+                        self.set_right(parent, Option::Some(index));
+                    }
+                },
+                Option::None => { self.root = Option::Some(index); },
+            }
+            self.fix_insert(index);
+        }
+    }
+
+    pub fun get(&self, key: &K) -> Option<&V>
+    where K: Ord {
+        let index = self.find_index(key);
+        match index {
+            Option::Some(index) => self.values.get(index),
+            Option::None => Option::None,
+        }
+    }
+
+    pub fun contains_key(&self, key: &K) -> bool
+    where K: Ord {
+        self.find_index(key).is_some()
+    }
+
+    fun find_index(&self, key: &K) -> Option<usize>
+    where K: Ord {
+        let mut current = self.root;
+        while current.is_some() {
+            let index = current.unwrap_or(0usize);
+            match self.nodes.get(index) {
+                Option::Some(node) => match key.cmp(&node.key) {
+                    Ordering::Less => { current = node.left; },
+                    Ordering::Greater => { current = node.right; },
+                    Ordering::Equal => { return Option::Some(index); },
+                },
+                Option::None => { return Option::None; },
+            }
+        }
+        Option::None
+    }
+
+    fun fix_insert(&mut self, mut node: usize) {
+        while self.parent(node).is_some() {
+            let parent = self.parent(node).unwrap_or(node);
+            if !self.is_red(Option::Some(parent)) {
+                break;
+            }
+            let grand = self.parent(parent).unwrap_or(parent);
+            if self.is_left_child(parent, grand) {
+                let uncle = self.right(grand);
+                if self.is_red(uncle) {
+                    self.set_red(parent, false);
+                    match uncle {
+                        Option::Some(uncle) => { self.set_red(uncle, false); },
+                        Option::None => {},
+                    }
+                    self.set_red(grand, true);
+                    node = grand;
+                } else {
+                    if !self.is_left_child(node, parent) {
+                        node = parent;
+                        self.rotate_left(node);
+                    }
+                    let parent = self.parent(node).unwrap_or(node);
+                    let grand = self.parent(parent).unwrap_or(parent);
+                    self.set_red(parent, false);
+                    self.set_red(grand, true);
+                    self.rotate_right(grand);
+                }
+            } else {
+                let uncle = self.left(grand);
+                if self.is_red(uncle) {
+                    self.set_red(parent, false);
+                    match uncle {
+                        Option::Some(uncle) => { self.set_red(uncle, false); },
+                        Option::None => {},
+                    }
+                    self.set_red(grand, true);
+                    node = grand;
+                } else {
+                    if self.is_left_child(node, parent) {
+                        node = parent;
+                        self.rotate_right(node);
+                    }
+                    let parent = self.parent(node).unwrap_or(node);
+                    let grand = self.parent(parent).unwrap_or(parent);
+                    self.set_red(parent, false);
+                    self.set_red(grand, true);
+                    self.rotate_left(grand);
+                }
+            }
+        }
+        match self.root {
+            Option::Some(root) => { self.set_red(root, false); },
+            Option::None => {},
+        }
+    }
+
+    fun rotate_left(&mut self, root: usize) {
+        let right = match self.right(root) {
+            Option::Some(right) => right,
+            Option::None => { return; },
+        };
+        let right_left = self.left(right);
+        self.set_right(root, right_left);
+        match right_left {
+            Option::Some(child) => { self.set_parent(child, Option::Some(root)); },
+            Option::None => {},
+        }
+
+        let parent = self.parent(root);
+        self.set_parent(right, parent);
+        match parent {
+            Option::Some(parent) => {
+                if self.is_left_child(root, parent) {
+                    self.set_left(parent, Option::Some(right));
+                } else {
+                    self.set_right(parent, Option::Some(right));
+                }
+            },
+            Option::None => { self.root = Option::Some(right); },
+        }
+        self.set_left(right, Option::Some(root));
+        self.set_parent(root, Option::Some(right));
+    }
+
+    fun rotate_right(&mut self, root: usize) {
+        let left = match self.left(root) {
+            Option::Some(left) => left,
+            Option::None => { return; },
+        };
+        let left_right = self.right(left);
+        self.set_left(root, left_right);
+        match left_right {
+            Option::Some(child) => { self.set_parent(child, Option::Some(root)); },
+            Option::None => {},
+        }
+
+        let parent = self.parent(root);
+        self.set_parent(left, parent);
+        match parent {
+            Option::Some(parent) => {
+                if self.is_left_child(root, parent) {
+                    self.set_left(parent, Option::Some(left));
+                } else {
+                    self.set_right(parent, Option::Some(left));
+                }
+            },
+            Option::None => { self.root = Option::Some(left); },
+        }
+        self.set_right(left, Option::Some(root));
+        self.set_parent(root, Option::Some(left));
+    }
+
+    fun parent(&self, index: usize) -> Option<usize> {
+        match self.nodes.get(index) {
+            Option::Some(node) => node.parent,
+            Option::None => Option::None,
+        }
+    }
+
+    fun left(&self, index: usize) -> Option<usize> {
+        match self.nodes.get(index) {
+            Option::Some(node) => node.left,
+            Option::None => Option::None,
+        }
+    }
+
+    fun right(&self, index: usize) -> Option<usize> {
+        match self.nodes.get(index) {
+            Option::Some(node) => node.right,
+            Option::None => Option::None,
+        }
+    }
+
+    fun is_left_child(&self, child: usize, parent: usize) -> bool {
+        match self.left(parent) {
+            Option::Some(left) => left == child,
+            Option::None => false,
+        }
+    }
+
+    fun is_red(&self, node: Option<usize>) -> bool {
+        match node {
+            Option::Some(index) => match self.nodes.get(index) {
+                Option::Some(node) => node.red,
+                Option::None => false,
+            },
+            Option::None => false,
+        }
+    }
+
+    fun set_parent(&mut self, index: usize, parent: Option<usize>) {
+        match self.nodes.get_mut(index) {
+            Option::Some(mut node) => { node.parent = parent; },
+            Option::None => {},
+        }
+    }
+
+    fun set_left(&mut self, index: usize, child: Option<usize>) {
+        match self.nodes.get_mut(index) {
+            Option::Some(mut node) => { node.left = child; },
+            Option::None => {},
+        }
+    }
+
+    fun set_right(&mut self, index: usize, child: Option<usize>) {
+        match self.nodes.get_mut(index) {
+            Option::Some(mut node) => { node.right = child; },
+            Option::None => {},
+        }
+    }
+
+    fun set_red(&mut self, index: usize, red: bool) {
+        match self.nodes.get_mut(index) {
+            Option::Some(mut node) => { node.red = red; },
+            Option::None => {},
+        }
+    }
+}

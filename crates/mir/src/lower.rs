@@ -1100,6 +1100,16 @@ impl<'a> LowerCtx<'a> {
                     let Some(function) = function else {
                         return builder.unit_const();
                     };
+                    if let Some(op) = self.builtin_operator_for_method(function) {
+                        return self.lower_builtin_operator_method_call(
+                            builder,
+                            param_values,
+                            body,
+                            *lhs,
+                            &[*rhs],
+                            op,
+                        );
+                    }
                     let receiver_ty = self.hir.item_tree.functions[function]
                         .params
                         .first()
@@ -1257,6 +1267,16 @@ impl<'a> LowerCtx<'a> {
                     let Some(function) = function else {
                         return builder.unit_const();
                     };
+                    if let Some(op) = self.builtin_operator_for_method(function) {
+                        return self.lower_builtin_operator_method_call(
+                            builder,
+                            param_values,
+                            body,
+                            *operand,
+                            &[],
+                            op,
+                        );
+                    }
                     let receiver_ty = self.hir.item_tree.functions[function]
                         .params
                         .first()
@@ -1476,7 +1496,16 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::Call { callee, args, .. } => {
-                if let Expr::Path {
+                if let Some(value) = self.lower_static_trait_call(
+                    builder,
+                    body,
+                    expr_id,
+                    *callee,
+                    args,
+                    mir_type.clone(),
+                ) {
+                    value
+                } else if let Expr::Path {
                     resolved: Some(ResolvedName::EnumVariant(enum_id, variant_index)),
                     ..
                 } = &body.exprs[*callee]
@@ -1614,6 +1643,22 @@ impl<'a> LowerCtx<'a> {
             }
 
             Expr::IndexAccess { base, index } => {
+                if let Some(place) = self.lower_trait_index_place(
+                    builder,
+                    param_values,
+                    body,
+                    expr_id,
+                    *base,
+                    *index,
+                ) {
+                    let value = builder.load(place, mir_type);
+                    self.clear_drop_flags_if_moved(builder, body, expr_id);
+                    let value = self.apply_expr_coercion(builder, expr_id, value);
+                    if !diverges {
+                        self.expr_cache.insert(expr_id, value);
+                    }
+                    return value;
+                }
                 let captured = self
                     .capture_place_from_expr(body, expr_id)
                     .and_then(|place| self.capture_access_for_place(builder, &place))
@@ -1688,6 +1733,10 @@ impl<'a> LowerCtx<'a> {
                     builder.cast(cast_op, base_val, mir_type)
                 }
             }
+
+            Expr::Try { operand } => {
+                self.lower_try_expr(builder, param_values, body, expr_id, *operand, mir_type)
+            }
         };
 
         let value = self.apply_expr_coercion(builder, expr_id, value);
@@ -1696,6 +1745,170 @@ impl<'a> LowerCtx<'a> {
         }
         self.expr_cache.insert(expr_id, value);
         value
+    }
+
+    fn lower_try_expr(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        expr_id: ExprId,
+        operand: ExprId,
+        result_ty: Type,
+    ) -> Value {
+        let Some(body_id) = self.current_body else {
+            return builder.unit_const();
+        };
+        let operand_tc_ty = self
+            .type_result
+            .expr_types
+            .get(&(body_id, operand))
+            .cloned()
+            .unwrap_or(type_checker::Type::Unknown);
+        let type_checker::Type::Enum(result_id, result_args) = &operand_tc_ty else {
+            return self.lower_expr(builder, param_values, body, operand);
+        };
+        let Some(return_ty) = self.current_function_return_type() else {
+            return self.lower_expr(builder, param_values, body, operand);
+        };
+        let type_checker::Type::Enum(return_id, _) = &return_ty else {
+            return self.lower_expr(builder, param_values, body, operand);
+        };
+        if result_id != return_id || result_args.len() != 2 {
+            return self.lower_expr(builder, param_values, body, operand);
+        }
+
+        let operand_value = self.lower_expr(builder, param_values, body, operand);
+        let operand_mir_ty = self.convert_type(&operand_tc_ty);
+        let tag = builder.extract_value(operand_value, 0, Type::Int(IntTy::U32));
+        let enum_data = &self.hir.item_tree.enums[*result_id];
+        let Some(ok_variant) = enum_data
+            .variants
+            .iter()
+            .position(|variant| variant.name.0 == "Ok")
+        else {
+            return operand_value;
+        };
+        let Some(err_variant) = enum_data
+            .variants
+            .iter()
+            .position(|variant| variant.name.0 == "Err")
+        else {
+            return operand_value;
+        };
+        let ok_block = builder.func.new_block_labeled("try_ok");
+        let err_block = builder.func.new_block_labeled("try_err");
+        let merge_block = builder.func.new_block_labeled("try_merge");
+        let expected_tag = builder.iconst(ok_variant as u64, IntTy::U32);
+        let is_ok = builder.cmp(CmpOp::Eq, tag, expected_tag);
+        builder.set_cond_branch(is_ok, ok_block, err_block);
+
+        builder.switch_to_block(err_block);
+        let err_offset = 1 + self.enum_payload_offset(enum_data, err_variant);
+        let error_mir_ty = match &operand_mir_ty {
+            Type::Enum(enum_ty) => enum_ty
+                .variants
+                .get(err_variant)
+                .and_then(|variant| match &variant.kind {
+                    EnumVariantKind::Tuple(fields) if fields.len() == 1 => fields.first().cloned(),
+                    EnumVariantKind::Struct(fields) if fields.len() == 1 => {
+                        fields.first().map(|(_, ty)| ty.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Type::Unit),
+            _ => Type::Unit,
+        };
+        let error_value = builder.extract_value(operand_value, err_offset, error_mir_ty.clone());
+        let error_tc_ty = result_args[1].clone();
+        let converted_error = if let Some(call) = self
+            .type_result
+            .trait_method_calls
+            .get(&(body_id, expr_id))
+            .cloned()
+        {
+            let target_error = match &return_ty {
+                type_checker::Type::Enum(_, return_args) => &return_args[1],
+                _ => &error_tc_ty,
+            };
+            match self.find_trait_impl_method(
+                call.trait_id,
+                &call.method,
+                &error_tc_ty,
+                Some(target_error),
+            ) {
+                Some(fid) => {
+                    let name = self
+                        .mono_method_name_for_receiver(fid, &error_tc_ty, Some(target_error))
+                        .unwrap_or_else(|| self.function_name(fid));
+                    let return_mir_ty = self.hir.item_tree.functions[fid]
+                        .ret_type
+                        .as_ref()
+                        .map(|ty| self.convert_hir_type(ty))
+                        .unwrap_or(Type::Unit);
+                    builder.call(FuncRef::Local(name), vec![error_value], return_mir_ty)
+                }
+                None => error_value,
+            }
+        } else {
+            error_value
+        };
+        let return_mir_ty = self.current_function_return_mir_type();
+        let error_result = self.lower_enum_variant_value(
+            builder,
+            *return_id,
+            err_variant,
+            vec![converted_error],
+            return_mir_ty,
+        );
+        self.emit_current_drop_scope(builder);
+        builder.set_return(Some(error_result));
+
+        builder.switch_to_block(ok_block);
+        let ok_offset = 1 + self.enum_payload_offset(enum_data, ok_variant);
+        let ok_mir_ty = match &operand_mir_ty {
+            Type::Enum(enum_ty) => enum_ty
+                .variants
+                .get(ok_variant)
+                .and_then(|variant| match &variant.kind {
+                    EnumVariantKind::Tuple(fields) if fields.len() == 1 => fields.first().cloned(),
+                    EnumVariantKind::Struct(fields) if fields.len() == 1 => {
+                        fields.first().map(|(_, ty)| ty.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(result_ty.clone()),
+            _ => result_ty.clone(),
+        };
+        let ok_value = builder.extract_value(operand_value, ok_offset, ok_mir_ty);
+        builder.set_branch(merge_block);
+
+        builder.switch_to_block(merge_block);
+        let phi = Inst::new(InstKind::Phi(vec![(ok_value, ok_block)]), result_ty);
+        builder.func.push_inst(merge_block, phi)
+    }
+
+    fn current_function_return_type(&self) -> Option<type_checker::Type> {
+        let fid = self.current_function?;
+        let function = &self.hir.item_tree.functions[fid];
+        Some(
+            function
+                .ret_type
+                .as_ref()
+                .map(|ty| self.lower_hir_type_for_pattern(ty, &self.generic_tc_subst))
+                .unwrap_or(type_checker::Type::Unit),
+        )
+    }
+
+    fn current_function_return_mir_type(&self) -> Type {
+        let Some(fid) = self.current_function else {
+            return Type::Unit;
+        };
+        self.hir.item_tree.functions[fid]
+            .ret_type
+            .as_ref()
+            .map(|ty| self.convert_hir_type(ty))
+            .unwrap_or(Type::Unit)
     }
 
     fn apply_expr_coercion(&self, builder: &mut Builder, expr_id: ExprId, value: Value) -> Value {
@@ -2293,6 +2506,11 @@ impl<'a> LowerCtx<'a> {
             Pattern::Literal(literal) => {
                 let literal_value = self.lower_literal_pattern(builder, &literal, value_ty);
                 Some(builder.cmp(CmpOp::Eq, value, literal_value))
+            }
+            Pattern::Tuple { ref elements }
+                if elements.is_empty() && value_ty == &type_checker::Type::Unit =>
+            {
+                None
             }
             Pattern::Tuple { elements } => {
                 let type_checker::Type::Tuple(element_types) = value_ty else {
@@ -3246,6 +3464,40 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    fn lower_static_trait_call(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        expr_id: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+        result_ty: Type,
+    ) -> Option<Value> {
+        if !args.is_empty()
+            || !matches!(
+                body.exprs[callee],
+                Expr::Path {
+                    resolved: Some(ResolvedName::Trait(_)),
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        let body_id = self.current_body?;
+        let call = self
+            .type_result
+            .trait_method_calls
+            .get(&(body_id, expr_id))
+            .cloned()?;
+        let receiver_ty = self.type_result.expr_types.get(&(body_id, expr_id))?;
+        let fid = self.find_trait_impl_method(call.trait_id, &call.method, receiver_ty, None)?;
+        let name = self
+            .mono_method_name_for_receiver(fid, receiver_ty, None)
+            .unwrap_or_else(|| self.function_name(fid));
+        Some(builder.call(FuncRef::Local(name), Vec::new(), result_ty))
+    }
+
     fn lower_operator_call(
         &mut self,
         builder: &mut Builder,
@@ -3657,6 +3909,64 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    fn lower_trait_index_place(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        expr_id: ExprId,
+        base: ExprId,
+        index: ExprId,
+    ) -> Option<Value> {
+        let body_id = self.current_body?;
+        let call = self
+            .type_result
+            .trait_method_calls
+            .get(&(body_id, expr_id))?
+            .clone();
+        if call.method != "index" && call.method != "index_mut" {
+            return None;
+        }
+        let base_ty = self
+            .type_result
+            .expr_types
+            .get(&(body_id, base))
+            .cloned()
+            .map(|ty| self.substitute_tc_type(&ty))?;
+        let receiver_ty = match &base_ty {
+            type_checker::Type::Ref(inner, _) => inner.as_ref().clone(),
+            _ => base_ty.clone(),
+        };
+        let index_ty = self
+            .type_result
+            .expr_types
+            .get(&(body_id, index))
+            .cloned()
+            .map(|ty| self.substitute_tc_type(&ty))?;
+        let fid = self.find_trait_impl_method(
+            call.trait_id,
+            &call.method,
+            &receiver_ty,
+            Some(&index_ty),
+        )?;
+        let function = &self.hir.item_tree.functions[fid];
+        let receiver_param = function.params.first()?.ty.clone();
+        let index_param = function.params.get(1)?.ty.clone();
+        let name = self
+            .mono_method_name_for_receiver(fid, &receiver_ty, Some(&index_ty))
+            .unwrap_or_else(|| self.function_name(fid));
+        let receiver = self.lower_receiver_arg(builder, param_values, body, base, &receiver_param);
+        let index = self.lower_receiver_arg(builder, param_values, body, index, &index_param);
+        let output = self
+            .type_result
+            .expr_types
+            .get(&(body_id, expr_id))
+            .cloned()
+            .map(|ty| self.convert_type(&ty))?;
+        let result = Type::Ref(Box::new(output), call.method == "index_mut");
+        Some(builder.call(FuncRef::Local(name), vec![receiver, index], result))
+    }
+
     fn resolve_field_index(&self, base: ExprId, field_name: &hir::Name) -> usize {
         let Some(body_id) = self.current_body else {
             return 0;
@@ -3721,6 +4031,12 @@ impl<'a> LowerCtx<'a> {
         body: &Body,
         expr_id: ExprId,
     ) -> Value {
+        if let Expr::IndexAccess { base, index } = &body.exprs[expr_id]
+            && let Some(place) =
+                self.lower_trait_index_place(builder, param_values, body, expr_id, *base, *index)
+        {
+            return place;
+        }
         if let Some(access) = self
             .capture_place_from_expr(body, expr_id)
             .and_then(|place| self.capture_access_for_place(builder, &place))
@@ -4983,6 +5299,12 @@ impl<'a> LowerCtx<'a> {
         match t {
             hir::item_tree::HirTypeRef::Never => Type::Never,
             hir::item_tree::HirTypeRef::Named(path) => {
+                if let Some(ResolvedName::TypeAlias(alias)) =
+                    self.hir.type_resolutions.get(&path.range)
+                    && let Some(ty) = &self.hir.item_tree.type_aliases[*alias].ty
+                {
+                    return self.convert_hir_type(ty);
+                }
                 if let Some(ty) = self.convert_self_associated_type(path) {
                     return ty;
                 }
@@ -5956,6 +6278,12 @@ impl<'a> LowerCtx<'a> {
         match t {
             hir::item_tree::HirTypeRef::Never => Type::Never,
             hir::item_tree::HirTypeRef::Named(path) => {
+                if let Some(ResolvedName::TypeAlias(alias)) =
+                    self.hir.type_resolutions.get(&path.range)
+                    && let Some(ty) = &self.hir.item_tree.type_aliases[*alias].ty
+                {
+                    return self.convert_hir_type_with_substs(ty, subst, const_subst);
+                }
                 if let Some(name) = path.as_single_name().map(|name| name.0.as_str())
                     && let Some(ty) = subst.get(name)
                 {
@@ -6260,7 +6588,9 @@ fn builtin_operator_supports(op: BuiltinOperator, scalar: &str) -> bool {
         | BuiltinOperator::Assign(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => {
             integer || float
         }
-        BuiltinOperator::Binary(BinOp::Mod) | BuiltinOperator::Assign(BinOp::Mod) => integer,
+        BuiltinOperator::Binary(BinOp::Mod) | BuiltinOperator::Assign(BinOp::Mod) => {
+            integer || float
+        }
         BuiltinOperator::Unary(UnOp::Neg) => signed || float,
         BuiltinOperator::Unary(UnOp::Not) => scalar == "bool" || integer,
         BuiltinOperator::Binary(BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
@@ -6329,6 +6659,7 @@ fn trait_operator_contract(
     let self_ty = hir::item_tree::HirTypeRef::Named(hir::item_tree::HirPath {
         anchor: hir::item_tree::PathAnchor::Plain,
         segments: vec![hir::Name("Self".into())],
+        segment_type_args: Vec::new(),
         type_args: Vec::new(),
         range: function.name_range,
     });
@@ -6684,6 +7015,7 @@ fn resolve_field_index(
 
 fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
     match (source, target) {
+        (Type::Int(IntTy::U8), Type::Char) => CastOp::IntToChar,
         (Type::Int(_), Type::Int(_)) => CastOp::IntToInt,
         (Type::Int(_), Type::Float(_)) => CastOp::IntToFloat,
         (Type::Float(_), Type::Int(_)) => CastOp::FloatToInt,

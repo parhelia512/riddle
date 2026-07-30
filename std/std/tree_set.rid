@@ -1,0 +1,31 @@
+use crate::std::cmp::Ord;
+use crate::std::tree_map::TreeMap;
+
+pub struct TreeSet<T> {
+    values: TreeMap<T, bool>,
+}
+
+impl<T> TreeSet<T> {
+    pub fun new() -> TreeSet<T> {
+        let values: TreeMap<T, bool> = TreeMap::new();
+        TreeSet { values }
+    }
+
+    pub fun len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fun is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fun insert(&mut self, value: T)
+    where T: Ord {
+        self.values.insert(value, true);
+    }
+
+    pub fun contains(&self, value: &T) -> bool
+    where T: Ord {
+        self.values.contains_key(value)
+    }
+}

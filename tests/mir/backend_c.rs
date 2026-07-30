@@ -591,6 +591,21 @@ fn c_backend_casts_char_to_u32_code_point() {
 }
 
 #[test]
+fn c_backend_casts_u8_to_char_code_point() {
+    let module = lower("fun code_point() -> char { 65u8 as char }");
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains(&format!("uint32_t {}", c_function("code_point"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("((uint32_t)((uint8_t)UINT64_C(65)))"),
+        "{generated}"
+    );
+}
+
+#[test]
 fn c_arithmetic() {
     let module = lower(
         r#"
@@ -776,7 +791,7 @@ fn c_backend_heap_allocates_escaping_reference_temporaries() {
 }
 
 #[test]
-fn c_heap_alloc_uses_linux_frame_boundary_for_gc_roots() {
+fn c_heap_alloc_wraps_main_with_a_gc_stack_boundary() {
     let module = lower(
         r#"
         struct Data { value: i32 }
@@ -791,13 +806,16 @@ fn c_heap_alloc_uses_linux_frame_boundary_for_gc_roots() {
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
+    let user_main = c_function("main");
     assert!(
-        generated.contains("rgc_init(__builtin_frame_address(0));"),
-        "missing Linux frame boundary: {generated}"
+        generated.contains(&format!("int {user_main} (void)")),
+        "{generated}"
     );
     assert!(
-        generated.contains("rgc_init(&rgc_stack_anchor);"),
-        "missing portable stack anchor fallback: {generated}"
+        generated.contains(&format!(
+            "int main(void) {{\n  int rgc_stack_anchor = 0;\n  rgc_init(&rgc_stack_anchor);\n  return (int){user_main}();"
+        )),
+        "missing GC entry wrapper: {generated}"
     );
 }
 

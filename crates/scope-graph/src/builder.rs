@@ -738,7 +738,11 @@ impl<'a> ScopeGraphBuilder<'a> {
 
                 let pop = self.sg.alloc_node(Node::PopSymbol {
                     name: exposed,
-                    define: DefRef::UseAlias { rewrite_to, anchor },
+                    define: DefRef::UseAlias {
+                        rewrite_to,
+                        anchor,
+                        use_range: tree.range,
+                    },
                 });
                 frag_nodes.push(pop);
                 let e = self.sg.add_edge(current_scope, pop, EdgeKind::Def, 0);
@@ -848,10 +852,19 @@ impl<'a> ScopeGraphBuilder<'a> {
             return child.clone();
         }
         let mut segs = prefix.segments.clone();
+        let child_offset = segs.len();
         segs.extend(child.segments.iter().cloned());
+        let mut segment_type_args = prefix.segment_type_args.clone();
+        segment_type_args.extend(
+            child
+                .segment_type_args
+                .iter()
+                .map(|(index, args)| (child_offset + index, args.clone())),
+        );
         HirPath {
             anchor: prefix.anchor,
             segments: segs,
+            segment_type_args,
             type_args: Vec::new(),
             range: child.range,
         }
@@ -1118,6 +1131,9 @@ impl<'a> ScopeGraphBuilder<'a> {
                 self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
                 self.emit_type_references(target, current_scope, nodes, edges);
             }
+            Expr::Try { operand } => {
+                self.walk_expr_for_refs(body_id, body, *operand, current_scope, nodes, edges);
+            }
             Expr::Array { elements } | Expr::Tuple { elements } => {
                 for e in elements {
                     self.walk_expr_for_refs(body_id, body, *e, current_scope, nodes, edges);
@@ -1139,6 +1155,11 @@ impl<'a> ScopeGraphBuilder<'a> {
         nodes: &mut Vec<NodeId>,
         edges: &mut Vec<EdgeId>,
     ) {
+        for (_, args) in &path.segment_type_args {
+            for ty in args {
+                self.emit_type_references(ty, current_scope, nodes, edges);
+            }
+        }
         for ty in &path.type_args {
             self.emit_type_references(ty, current_scope, nodes, edges);
         }
@@ -1170,6 +1191,11 @@ impl<'a> ScopeGraphBuilder<'a> {
     ) {
         match ty {
             HirTypeRef::Named(path) => {
+                for (_, args) in &path.segment_type_args {
+                    for arg in args {
+                        self.emit_type_references(arg, current_scope, nodes, edges);
+                    }
+                }
                 for arg in &path.type_args {
                     self.emit_type_references(arg, current_scope, nodes, edges);
                 }

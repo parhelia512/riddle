@@ -584,6 +584,12 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
                 ctx.escaping_exprs.contains(base)
             }
+
+            Expr::Try { operand } => {
+                self.mark_escaping_exprs(ctx, *operand);
+                ctx.set_expr_source_value(expr_id, ctx.expr_source_value(*operand));
+                ctx.escaping_exprs.contains(operand)
+            }
         };
 
         if escapes {

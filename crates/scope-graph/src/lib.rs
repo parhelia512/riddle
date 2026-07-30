@@ -125,6 +125,7 @@ pub enum DefRef {
     UseAlias {
         rewrite_to: Vec<Name>,
         anchor: NodeId,
+        use_range: rowan::TextRange,
     },
     /// Enum variant, e.g. `A` in `Foo::A`.
     EnumVariant {

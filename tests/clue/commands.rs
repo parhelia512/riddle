@@ -688,8 +688,8 @@ fn standard_library_basics_compile_and_run() {
         r#"fun main() -> i32 {
     let value: Option<i32> = Some(2);
     let error: Result<i32, bool> = Err(true);
-    print(-42);
-    print(0);
+    print(&(-42));
+    print(&0);
     if value.is_some() && value.unwrap_or(0) == 2
         && error.is_err() && error.err().is_some() {
         0
@@ -713,6 +713,200 @@ fn standard_library_basics_compile_and_run() {
 }
 
 #[test]
+fn rust_style_display_fmt_compiles_and_runs() {
+    if c_compiler().is_none() {
+        eprintln!("skipping Display::fmt runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("display-fmt");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Label {
+    text: &str,
+}
+
+impl Display for Label {
+    fun fmt(&self, formatter: &mut Formatter) -> std::fmt::Result {
+        match formatter.write_str(self.text) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fun main() -> i32 {
+    let label = Label { text: "value=" };
+    print(&label);
+    print(&label);
+    println(&'中');
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.ends_with("value=value=中\r\n".as_bytes())
+            || output.stdout.ends_with("value=value=中\n".as_bytes())
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn tree_collections_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping tree collection runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("tree-collections");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Payload { value: i32 }
+
+impl Drop for Payload {
+    fun drop(&mut self) { print(&self.value); }
+}
+
+fun main() -> i32 {
+    let mut map: TreeMap<i32, i32> = TreeMap::new();
+    let mut key = 0;
+    while key < 64 {
+        map.insert(key, key * 2);
+        key += 1;
+    }
+    key = 127;
+    while key >= 64 {
+        map.insert(key, key * 2);
+        key -= 1;
+    }
+    map.insert(32, 999);
+    if map.len() != 128usize || map.is_empty() { return 1; }
+    if !map.contains_key(&0) || !map.contains_key(&127) { return 2; }
+    match map.get(&32) {
+        Some(value) => { if *value != 999 { return 3; } },
+        None => { return 4; },
+    }
+
+    let mut set: TreeSet<i32> = TreeSet::new();
+    key = 127;
+    while key >= 0 {
+        set.insert(key % 17);
+        key -= 1;
+    }
+    if set.len() != 17usize || !set.contains(&0) || !set.contains(&16) { return 5; }
+
+    let mut payloads: TreeMap<i32, Payload> = TreeMap::new();
+    payloads.insert(1, Payload { value: 10 });
+    payloads.insert(1, Payload { value: 20 });
+    if payloads.len() != 1usize { return 6; }
+    match payloads.get(&1) {
+        Some(payload) => { if payload.value != 20 { return 7; } },
+        None => { return 8; },
+    }
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"1020"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn hash_collections_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping hash collection runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("hash-collections");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Key { value: i32 }
+struct Payload { value: i32 }
+
+impl Drop for Payload {
+    fun drop(&mut self) { print(&self.value); }
+}
+
+impl PartialEq for Key {
+    fun eq(&self, other: &Self) -> bool { self.value == other.value }
+}
+impl Eq for Key {}
+impl Hash for Key {
+    fun hash(&self) -> usize { self.value as usize }
+}
+
+fun main() -> i32 {
+    let mut map: HashMap<i32, i32> = HashMap::new();
+    let mut key = 0;
+    while key < 96 {
+        map.insert(key * 8, key + 1);
+        key += 1;
+    }
+    map.insert(8, 777);
+    if map.len() != 96usize || map.is_empty() { return 1; }
+    if !map.contains_key(&0) || !map.contains_key(&(95 * 8)) { return 2; }
+    match map.get(&8) {
+        Some(value) => { if *value != 777 { return 3; } },
+        None => { return 4; },
+    }
+
+    let mut set: HashSet<i32> = HashSet::new();
+    key = 0;
+    while key < 96 {
+        set.insert((key % 23) * 8);
+        key += 1;
+    }
+    if set.len() != 23usize || !set.contains(&0) || !set.contains(&(22 * 8)) { return 5; }
+
+    let mut owned: HashMap<Key, Payload> = HashMap::new();
+    owned.insert(Key { value: 3 }, Payload { value: 9 });
+    owned.insert(Key { value: 3 }, Payload { value: 11 });
+    let query = Key { value: 3 };
+    if owned.len() != 1usize { return 6; }
+    match owned.get(&query) {
+        Some(payload) => { if payload.value != 11 { return 7; } },
+        None => { return 8; },
+    }
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"911"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn deterministic_drop_runs_in_native_binary() {
     if c_compiler().is_none() {
         eprintln!("skipping Drop runtime test: no C compiler found");
@@ -727,7 +921,7 @@ fn deterministic_drop_runs_in_native_binary() {
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(self.id);
+        print(&self.id);
     }
 }
 
@@ -736,7 +930,7 @@ fun main() -> i32 {
     {
         let second = Guard { id: 2 };
     }
-    print(0);
+    print(&0);
     0
 }
 "#,
@@ -774,7 +968,7 @@ enum MaybeGuard {
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(self.id);
+        print(&self.id);
     }
 }
 
@@ -784,7 +978,7 @@ fun main() -> i32 {
         MaybeGuard::Some(guard) => {},
         MaybeGuard::None => {},
     }
-    print(0);
+    print(&0);
     0
 }
 "#,
@@ -817,7 +1011,7 @@ fn moved_destructured_binding_is_not_dropped_twice() {
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(self.id);
+        print(&self.id);
     }
 }
 
@@ -826,7 +1020,7 @@ fun consume(guard: Guard) {}
 fun main() -> i32 {
     let (first, second) = (Guard { id: 1 }, Guard { id: 2 });
     consume(first);
-    print(0);
+    print(&0);
     0
 }
 "#,
@@ -863,7 +1057,7 @@ fn closures_capture_destructured_bindings() {
     let mut bump = fun() { c = c + d; };
     bump();
     bump();
-    print(sum() + c);
+    print(&(sum() + c));
     0
 }
 "#,
@@ -899,7 +1093,7 @@ fun main() -> i32 {
     let Point { x, y } = Point { x: 10, y: 20 };
     let (mut total, step) = (0, 100);
     total = total + step;
-    print(a + b + c + x + y + total);
+    print(&(a + b + c + x + y + total));
     0
 }
 "#,
@@ -948,24 +1142,24 @@ fun main() -> i32 {
     *right = 20;
     let &mut mut copy = left;
     copy = 99;
-    print(*left + *right);
+    print(&(*left + *right));
 
     let point = Point { x: 10, y: 20 };
     let Point { x, y } = &point;
-    print(*x + *y);
+    print(&(*x + *y));
 
     let maybe = Maybe::Some(7);
     let matched = match &maybe {
         Maybe::Some(value) => *value,
         Maybe::None => 0,
     };
-    print(matched);
-    print(*escaped_first());
+    print(&matched);
+    print(&(*escaped_first()));
 
     let mut original = 3;
     let (&mut copied, plain) = (&mut original, 4);
     original = 5;
-    print(copied + plain + original);
+    print(&(copied + plain + original));
     0
 }
 "#,
@@ -1003,7 +1197,7 @@ enum MaybeGuard {
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(self.id);
+        print(&self.id);
     }
 }
 
@@ -1015,7 +1209,7 @@ fun main() -> i32 {
         MaybeGuard::Some(guard) => { consume(guard); },
         MaybeGuard::None => {},
     }
-    print(0);
+    print(&0);
     0
 }
 "#,
@@ -1050,7 +1244,7 @@ struct Pair { left: Guard, right: Guard }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(self.id);
+        print(&self.id);
     }
 }
 
@@ -1062,8 +1256,8 @@ fun main() -> i32 {
     match pair {
         Pair { left } => {}
     }
-    print(pair.right.id);
-    print(0);
+    print(&pair.right.id);
+    print(&0);
     0
 }
 "#,
@@ -1096,7 +1290,7 @@ fn array_for_break_drops_current_and_remaining_items_once() {
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(self.id);
+        print(&self.id);
     }
 }
 
@@ -1111,7 +1305,7 @@ fun main() -> i32 {
             break;
         }
     }
-    print(0);
+    print(&0);
     0
 }
 "#,
@@ -1145,13 +1339,13 @@ struct Once { yielded: bool }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(self.id);
+        print(&self.id);
     }
 }
 
 impl Drop for Once {
     fun drop(&mut self) {
-        print(9);
+        print(&9);
     }
 }
 
@@ -1182,7 +1376,7 @@ fun main() -> i32 {
     for guard in once {
         break;
     }
-    print(0);
+    print(&0);
     0
 }
 "#,
@@ -1355,7 +1549,10 @@ fn string_and_vector_compile_and_run() {
     let mut text = String::from_str("hello");
     text.push_str(" world");
     let text_matches = text.len() == 11usize && text.as_str() == "hello world";
-    print(text.as_str());
+    {
+        let text_view = text.as_str();
+        print(&text_view);
+    }
     text.clear();
     let text_cleared = text.is_empty() && text.as_str() == "";
     let empty = String::new();
@@ -1399,6 +1596,137 @@ fn string_and_vector_compile_and_run() {
 }
 
 #[test]
+fn vector_indexing_compiles_and_runs() {
+    if c_compiler().is_none() {
+        eprintln!("skipping Vector indexing runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("vector-indexing");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"fun main() -> i32 {
+    let mut values: Vector<i32> = Vector::new();
+    values.push(10);
+    values.push(20);
+    let index = 1;
+
+    if values[0] != 10 { return 1; }
+    values[index] = 7;
+    values[index] += 5;
+    {
+        let first = &values[0];
+        if *first != 10 { return 2; }
+    }
+    {
+        let second = &mut values[index];
+        *second += 1;
+    }
+    print(&values[index]);
+    if values[index] == 13 { 0 } else { 3 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"13"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn associated_type_turbofish_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping associated type turbofish runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("associated-type-turbofish");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"struct Marker<T> {
+    pointer: *const T,
+}
+
+impl<T> Marker<T> {
+    fun sizes<U>() -> usize {
+        5usize
+    }
+}
+
+fun main() -> i32 {
+    let mut values = Vector::<i32>::new();
+    values.push(41);
+    let sizes = Marker::<i32>::sizes::<u8>();
+    if values.pop().unwrap_or(0) == 41 && sizes == 5usize { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn str_into_iterator_decodes_utf8() {
+    if c_compiler().is_none() {
+        eprintln!("skipping str iterator runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("str-iterator");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"fun main() -> i32 {
+    let text: &str = "Aé中🙂";
+    let mut index = 0;
+    for ch in text {
+        if index == 0 && ch != 'A' { return 1; }
+        if index == 1 && ch != 'é' { return 2; }
+        if index == 2 && ch != '中' { return 3; }
+        if index == 3 && ch != '🙂' { return 4; }
+        if index > 3 { return 5; }
+        index += 1;
+    }
+    for unused in "" {
+        return 6;
+    }
+    if index == 4 { 0 } else { 7 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn vector_drops_owned_elements() {
     if c_compiler().is_none() {
         eprintln!("skipping Vector Drop runtime test: no C compiler found");
@@ -1413,7 +1741,7 @@ fn vector_drops_owned_elements() {
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(self.id);
+        print(&self.id);
     }
 }
 
@@ -1423,7 +1751,7 @@ fun main() -> i32 {
         values.push(Guard { id: 1 });
         values.push(Guard { id: 2 });
     }
-    print(0);
+    print(&0);
 
     {
         let mut values: Vector<Guard> = Vector::new();
@@ -1431,7 +1759,7 @@ fun main() -> i32 {
         values.push(Guard { id: 4 });
         values.clear();
     }
-    print(0);
+    print(&0);
 
     {
         let mut values: Vector<Guard> = Vector::new();
@@ -1442,7 +1770,7 @@ fun main() -> i32 {
             break;
         }
     }
-    print(0);
+    print(&0);
     0
 }
 "#,

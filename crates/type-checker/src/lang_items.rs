@@ -55,6 +55,10 @@ pub enum LangItem {
     BitXorAssign,
     ShlAssign,
     ShrAssign,
+
+    // Indexing
+    Index,
+    IndexMut,
 }
 
 impl LangItem {
@@ -90,6 +94,8 @@ impl LangItem {
             "bitxor_assign" => Self::BitXorAssign,
             "shl_assign" => Self::ShlAssign,
             "shr_assign" => Self::ShrAssign,
+            "index" => Self::Index,
+            "index_mut" => Self::IndexMut,
             _ => return None,
         })
     }
@@ -126,6 +132,8 @@ impl LangItem {
             Self::BitXorAssign => "bitxor_assign",
             Self::ShlAssign => "shl_assign",
             Self::ShrAssign => "shr_assign",
+            Self::Index => "index",
+            Self::IndexMut => "index_mut",
         }
     }
 

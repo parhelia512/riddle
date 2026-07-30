@@ -1,0 +1,183 @@
+use crate::std::cmp::Eq;
+use crate::std::hash::Hash;
+use crate::std::option::Option;
+use crate::std::vector::Vector;
+
+enum HashBucket {
+    Empty,
+    Occupied(usize),
+}
+
+impl crate::std::marker::Copy for HashBucket {}
+
+fun occupy_hash_bucket(
+    mut buckets: &mut Vector<HashBucket>,
+    bucket_index: usize,
+    entry_index: usize
+) {
+    match buckets.get_mut(bucket_index) {
+        Option::Some(mut bucket) => { *bucket = HashBucket::Occupied(entry_index); },
+        Option::None => {},
+    }
+}
+
+pub struct HashMap<K, V> {
+    buckets: Vector<HashBucket>,
+    keys: Vector<K>,
+    values: Vector<V>,
+}
+
+impl<K, V> HashMap<K, V> {
+    pub fun new() -> HashMap<K, V> {
+        let mut buckets: Vector<HashBucket> = Vector::new();
+        let mut index = 0usize;
+        while index < 8usize {
+            buckets.push(HashBucket::Empty);
+            index += 1usize;
+        }
+        let keys: Vector<K> = Vector::new();
+        let values: Vector<V> = Vector::new();
+        HashMap {
+            buckets,
+            keys,
+            values,
+        }
+    }
+
+    pub fun len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fun is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fun insert(&mut self, key: K, value: V)
+    where K: Hash + Eq {
+        let existing = self.find_entry(&key);
+        if existing.is_none()
+            && (self.keys.len() + 1usize) * 4usize >= self.buckets.len() * 3usize {
+            self.grow();
+        }
+
+        let bucket_index = if existing.is_none() {
+            self.find_empty_bucket(&key).unwrap_or(0usize)
+        } else {
+            0usize
+        };
+        let value_index = self.values.len();
+        self.values.push(value);
+
+        if existing.is_some() {
+            let entry_index = existing.unwrap_or(0usize);
+            self.values.swap(entry_index, value_index);
+            let _old_value = self.values.pop();
+        } else {
+            let entry_index = self.keys.len();
+            self.keys.push(key);
+            occupy_hash_bucket(&mut self.buckets, bucket_index, entry_index);
+        }
+    }
+
+    pub fun get(&self, key: &K) -> Option<&V>
+    where K: Hash + Eq {
+        match self.find_entry(key) {
+            Option::Some(entry_index) => self.values.get(entry_index),
+            Option::None => Option::None,
+        }
+    }
+
+    pub fun contains_key(&self, key: &K) -> bool
+    where K: Hash + Eq {
+        self.find_entry(key).is_some()
+    }
+
+    fun find_entry(&self, key: &K) -> Option<usize>
+    where K: Hash + Eq {
+        let capacity = self.buckets.len();
+        if capacity == 0usize {
+            return Option::None;
+        }
+        let mut bucket_index = key.hash() % capacity;
+        let mut scanned = 0usize;
+        while scanned < capacity {
+            match self.buckets.get(bucket_index) {
+                Option::Some(bucket) => match *bucket {
+                    HashBucket::Empty => { return Option::None; },
+                    HashBucket::Occupied(entry_index) => {
+                        match self.keys.get(entry_index) {
+                            Option::Some(stored) => {
+                                if stored.eq(key) {
+                                    return Option::Some(entry_index);
+                                }
+                            },
+                            Option::None => {},
+                        }
+                    },
+                },
+                Option::None => { return Option::None; },
+            }
+            bucket_index = (bucket_index + 1usize) % capacity;
+            scanned += 1usize;
+        }
+        Option::None
+    }
+
+    fun find_empty_bucket(&self, key: &K) -> Option<usize>
+    where K: Hash {
+        let capacity = self.buckets.len();
+        if capacity == 0usize {
+            return Option::None;
+        }
+        let mut bucket_index = key.hash() % capacity;
+        let mut scanned = 0usize;
+        while scanned < capacity {
+            match self.buckets.get(bucket_index) {
+                Option::Some(bucket) => match *bucket {
+                    HashBucket::Empty => { return Option::Some(bucket_index); },
+                    HashBucket::Occupied(_) => {},
+                },
+                Option::None => { return Option::None; },
+            }
+            bucket_index = (bucket_index + 1usize) % capacity;
+            scanned += 1usize;
+        }
+        Option::None
+    }
+
+    fun grow(&mut self)
+    where K: Hash {
+        let capacity = self.buckets.len() * 2usize;
+        let mut buckets: Vector<HashBucket> = Vector::new();
+        let mut bucket_count = 0usize;
+        while bucket_count < capacity {
+            buckets.push(HashBucket::Empty);
+            bucket_count += 1usize;
+        }
+        let mut entry_index = 0usize;
+        while entry_index < self.keys.len() {
+            let mut bucket_index = match self.keys.get(entry_index) {
+                Option::Some(key) => key.hash() % capacity,
+                Option::None => 0usize,
+            };
+            let mut placed = false;
+            while !placed {
+                let empty = match buckets.get(bucket_index) {
+                    Option::Some(bucket) => match *bucket {
+                        HashBucket::Empty => true,
+                        HashBucket::Occupied(_) => false,
+                    },
+                    Option::None => false,
+                };
+                if empty {
+                    occupy_hash_bucket(&mut buckets, bucket_index, entry_index);
+                    placed = true;
+                } else {
+                    bucket_index = (bucket_index + 1usize) % capacity;
+                }
+            }
+            entry_index += 1usize;
+        }
+        self.buckets = buckets;
+    }
+}

@@ -1,0 +1,124 @@
+use crate::std::result::Result::{Err, Ok};
+
+unsafe extern "C" {
+    safe fun putchar(value: i32) -> i32;
+}
+
+pub struct Error {}
+
+pub type Result = crate::std::result::Result<(), Error>;
+
+pub struct Formatter {}
+
+impl Formatter {
+    pub fun write_str(&mut self, value: &str) -> Result {
+        for byte in value.as_bytes() {
+            self.write_byte(*byte)?;
+        }
+        Ok(())
+    }
+
+    pub fun write_char(&mut self, value: char) -> Result {
+        let code = value as u32;
+        if code <= 127u32 {
+            return self.write_byte(code as u8);
+        }
+        if code <= 2047u32 {
+            self.write_byte((192u32 | (code >> 6u32)) as u8)?;
+            return self.write_byte((128u32 | (code & 63u32)) as u8);
+        }
+        if code <= 65535u32 {
+            self.write_byte((224u32 | (code >> 12u32)) as u8)?;
+            self.write_byte((128u32 | ((code >> 6u32) & 63u32)) as u8)?;
+            return self.write_byte((128u32 | (code & 63u32)) as u8);
+        }
+        self.write_byte((240u32 | (code >> 18u32)) as u8)?;
+        self.write_byte((128u32 | ((code >> 12u32) & 63u32)) as u8)?;
+        self.write_byte((128u32 | ((code >> 6u32) & 63u32)) as u8)?;
+        self.write_byte((128u32 | (code & 63u32)) as u8)
+    }
+
+    fun write_byte(&mut self, value: u8) -> Result {
+        if putchar(value as i32) < 0 {
+            Err(Error {})
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub trait Display {
+    fun fmt(&self, formatter: &mut Formatter) -> Result;
+}
+
+impl Display for &str {
+    fun fmt(&self, formatter: &mut Formatter) -> Result {
+        formatter.write_str(*self)
+    }
+}
+
+impl Display for bool {
+    fun fmt(&self, formatter: &mut Formatter) -> Result {
+        if *self {
+            formatter.write_str("true")
+        } else {
+            formatter.write_str("false")
+        }
+    }
+}
+
+impl Display for char {
+    fun fmt(&self, formatter: &mut Formatter) -> Result {
+        formatter.write_char(*self)
+    }
+}
+
+impl Display for i8 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self as i64) } }
+impl Display for i16 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self as i64) } }
+impl Display for i32 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self as i64) } }
+impl Display for i64 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self) } }
+impl Display for isize { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self as i64) } }
+impl Display for u8 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
+impl Display for u16 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
+impl Display for u32 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
+impl Display for u64 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self) } }
+impl Display for usize { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
+impl Display for f32 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_float(formatter, *self as f64) } }
+impl Display for f64 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_float(formatter, *self) } }
+
+fun write_signed(formatter: &mut Formatter, value: i64) -> Result {
+    if value < 0i64 {
+        formatter.write_char('-')?;
+        write_unsigned(formatter, (0i64 - (value + 1i64)) as u64 + 1u64)
+    } else {
+        write_unsigned(formatter, value as u64)
+    }
+}
+
+fun write_unsigned(formatter: &mut Formatter, value: u64) -> Result {
+    if value >= 10u64 {
+        write_unsigned(formatter, value / 10u64)?;
+    }
+    formatter.write_byte((value % 10u64) as u8 + 48u8)
+}
+
+fun write_float(formatter: &mut Formatter, value: f64) -> Result {
+    if value < 0.0f64 {
+        formatter.write_char('-')?;
+        write_float(formatter, -value)?;
+        return Ok(());
+    }
+    let integer = value as u64;
+    write_unsigned(formatter, integer)?;
+    formatter.write_char('.')?;
+    let mut fraction = value - integer as f64;
+    let mut digits = 0usize;
+    while digits < 6usize {
+        fraction *= 10.0f64;
+        let digit = fraction as u64;
+        formatter.write_byte(digit as u8 + 48u8)?;
+        fraction -= digit as f64;
+        digits += 1usize;
+    }
+    Ok(())
+}

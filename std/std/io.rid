@@ -1,42 +1,17 @@
-unsafe extern "C" {
-    safe fun putchar(value: i32) -> i32;
-}
-
-pub trait Display {
-    fun write(self);
-}
-
-impl Display for &str {
-    fun write(self) {
-        for byte in self.as_bytes() {
-            putchar(*byte as i32);
-        }
+use crate::std::fmt::{Display, Formatter};
+fun expect_written(result: crate::std::fmt::Result) {
+    if result.is_err() {
+        panic("failed to write to stdout");
     }
 }
 
-impl Display for i32 {
-    fun write(self) {
-        let mut value = self as i64;
-        if value < 0i64 {
-            putchar(45);
-            value = -value;
-        }
-        print_positive(value);
-    }
+pub fun print<T: Display>(value: &T) {
+    let mut formatter = Formatter {};
+    expect_written(value.fmt(&mut formatter));
 }
 
-fun print_positive(value: i64) {
-    if value >= 10i64 {
-        print_positive(value / 10i64);
-    }
-    putchar((value % 10i64) as i32 + 48);
-}
-
-pub fun print<T: Display>(value: T) {
-    value.write();
-}
-
-pub fun println<T: Display>(value: T) {
-    value.write();
-    putchar(10);
+pub fun println<T: Display>(value: &T) {
+    let mut formatter = Formatter {};
+    expect_written(value.fmt(&mut formatter));
+    expect_written(formatter.write_char('\n'));
 }

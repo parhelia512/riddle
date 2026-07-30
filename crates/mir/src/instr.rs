@@ -71,6 +71,7 @@ pub enum CmpOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastOp {
     IntToInt,
+    IntToChar,
     IntToFloat,
     FloatToInt,
     FloatToFloat,

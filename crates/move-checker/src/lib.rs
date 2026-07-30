@@ -619,6 +619,12 @@ impl<'a> Analyzer<'a> {
                 self.apply_recorded_value_use(ctx, *base);
             }
 
+            Expr::Try { operand } => {
+                self.move_check_expr(ctx, *operand);
+                ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*operand));
+                self.apply_recorded_value_use(ctx, *operand);
+            }
+
             Expr::FieldAccess { base, field } => {
                 // Check if base is already moved before recursing — if so,
                 // skip inner error and emit only this outer one.
@@ -654,6 +660,8 @@ impl<'a> Analyzer<'a> {
             Expr::IndexAccess { base, index } => {
                 self.move_check_expr(ctx, *base);
                 self.move_check_expr(ctx, *index);
+                self.check_trait_index_receiver_borrow(ctx, expr_id, *base, span);
+                self.apply_recorded_value_use(ctx, *index);
                 if let Some(place) = self.place_from_expr(ctx, expr_id)
                     && ctx.moved_places.iter().any(|m| place_overlaps(m, &place))
                 {
@@ -1065,10 +1073,22 @@ impl<'a> Analyzer<'a> {
                 self.type_result.expr_types.get(&(ctx.body_id, *operand)),
                 Some(Type::Ref(..))
             ),
-            // ponytail: implicit field/index deref stays permissive until owning array
-            // iteration has a ManuallyDrop-like primitive for moving elements out.
-            Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
-                self.place_has_explicit_reference_deref(ctx, *base)
+            Expr::FieldAccess { base, .. } => {
+                let base_ty = self.type_result.expr_types.get(&(ctx.body_id, *base));
+                let value_ty = self.type_result.expr_types.get(&(ctx.body_id, expr_id));
+                matches!(base_ty, Some(Type::Ref(..)))
+                    && !matches!(value_ty, Some(Type::Ptr { .. }))
+                    || self.place_has_explicit_reference_deref(ctx, *base)
+            }
+            Expr::IndexAccess { base, .. } => {
+                let base_ty = self.type_result.expr_types.get(&(ctx.body_id, *base));
+                self.type_result
+                    .trait_method_calls
+                    .get(&(ctx.body_id, expr_id))
+                    .is_some_and(|call| call.method == "index" || call.method == "index_mut")
+                    || !matches!(base_ty, Some(Type::Ptr { .. }))
+                        && (matches!(base_ty, Some(Type::Ref(..)))
+                            || self.place_has_explicit_reference_deref(ctx, *base))
             }
             _ => false,
         }
@@ -1096,6 +1116,37 @@ impl<'a> Analyzer<'a> {
     fn has_any_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
         let place = access_place_from_move_place(place);
         self.has_any_access_borrow(ctx, &place)
+    }
+
+    fn check_trait_index_receiver_borrow(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        base: ExprId,
+        span: Option<TextRange>,
+    ) {
+        let Some(call) = self
+            .type_result
+            .trait_method_calls
+            .get(&(ctx.body_id, expr_id))
+        else {
+            return;
+        };
+        let kind = if call.method == "index_mut" {
+            BorrowKind::Mutable
+        } else if call.method == "index" {
+            BorrowKind::Shared
+        } else {
+            return;
+        };
+        let targets = if self.expr_is_reference(ctx, base) {
+            self.origin_targets(ctx, base)
+        } else {
+            self.access_targets(ctx, base)
+        };
+        for target in targets {
+            self.borrow_conflicts(ctx, &target.place, kind, &target.parents, span, base);
+        }
     }
 
     fn has_any_access_borrow(&self, ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
@@ -2532,7 +2583,8 @@ fn collect_local_uses(body: &Body) -> HashMap<PatternBindingId, usize> {
             Expr::Unary { operand, .. }
             | Expr::FieldAccess { base: operand, .. }
             | Expr::Unsafe { body: operand }
-            | Expr::Cast { base: operand, .. } => expr(body, *operand, uses),
+            | Expr::Cast { base: operand, .. }
+            | Expr::Try { operand } => expr(body, *operand, uses),
             Expr::Block { stmts, tail } => {
                 for stmt_id in stmts {
                     match &body.stmts[*stmt_id] {

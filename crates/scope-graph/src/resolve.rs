@@ -43,6 +43,12 @@ pub fn resolve_path_at_reference(
     resolve_from(sg, *anchor, stack, &mut HashSet::new(), 64)
 }
 
+/// Resolves a path from an already selected lexical anchor.
+pub fn resolve_path_from(sg: &ScopeGraph, anchor: NodeId, segments: &[Name]) -> Vec<DefRef> {
+    let stack = segments.iter().rev().cloned().collect();
+    resolve_from(sg, anchor, stack, &mut HashSet::new(), 64)
+}
+
 /// Returns definitions directly exported by a scope without leaking its lexical parent.
 pub fn exported_definitions(sg: &ScopeGraph, scope: NodeId) -> Vec<(Name, DefRef)> {
     collect_definitions(sg, scope, false)
@@ -288,7 +294,9 @@ fn resolve_pop(
     remaining.pop();
 
     match define {
-        DefRef::UseAlias { rewrite_to, anchor } => {
+        DefRef::UseAlias {
+            rewrite_to, anchor, ..
+        } => {
             // `use foo::bar as baz; baz::qux` rewrites to `foo::bar::qux`.
             // The stack bottom stores the rightmost path segments, so keep the remaining segments
             // first and then push `[bar, foo]`; the next lookup will match `foo` first.
@@ -327,6 +335,7 @@ fn resolve_pop(
                 vec![]
             }
         }
+        DefRef::Trait(_) if remaining.len() == 1 => vec![define.clone()],
         _ => {
             if remaining.is_empty() {
                 vec![define.clone()]

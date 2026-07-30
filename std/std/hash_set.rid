@@ -1,0 +1,32 @@
+use crate::std::cmp::Eq;
+use crate::std::hash::Hash;
+use crate::std::hash_map::HashMap;
+
+pub struct HashSet<T> {
+    values: HashMap<T, bool>,
+}
+
+impl<T> HashSet<T> {
+    pub fun new() -> HashSet<T> {
+        let values: HashMap<T, bool> = HashMap::new();
+        HashSet { values }
+    }
+
+    pub fun len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fun is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fun insert(&mut self, value: T)
+    where T: Hash + Eq {
+        self.values.insert(value, true);
+    }
+
+    pub fun contains(&self, value: &T) -> bool
+    where T: Hash + Eq {
+        self.values.contains_key(value)
+    }
+}

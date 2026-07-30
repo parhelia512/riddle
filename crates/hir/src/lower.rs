@@ -104,6 +104,7 @@ pub fn lower_generic_bounds(
                                 target_ty: HirTypeRef::Named(HirPath {
                                     anchor: PathAnchor::Plain,
                                     segments: vec![name.clone()],
+                                    segment_type_args: Vec::new(),
                                     type_args: Vec::new(),
                                     range: trait_range,
                                 }),
@@ -466,6 +467,7 @@ impl AstLower for ast::TraitDecl {
                     target_ty: HirTypeRef::Named(HirPath {
                         anchor: PathAnchor::Plain,
                         segments: vec![Name("Self".into())],
+                        segment_type_args: Vec::new(),
                         type_args: Vec::new(),
                         range: trait_range,
                     }),
@@ -579,6 +581,7 @@ fn self_receiver_type(is_ref: bool, is_mut: bool, range: rowan::TextRange) -> Hi
     let self_ty = HirTypeRef::Named(HirPath {
         anchor: PathAnchor::Plain,
         segments: vec![Name("Self".into())],
+        segment_type_args: Vec::new(),
         type_args: Vec::new(),
         range,
     });
@@ -772,18 +775,19 @@ impl Lower for ast::Path {
     fn lower(self) -> Self::Output {
         let range = trimmed_range(self.syntax());
         let absolute = self.is_absolute();
-        let mut segs: Vec<(SyntaxKind, String)> = self
+        let mut segs: Vec<(SyntaxKind, String, Vec<HirTypeRef>)> = self
             .segments()
             .filter_map(|seg| {
                 let t = seg.name_token()?;
-                Some((t.kind(), t.text().to_string()))
+                let type_args = seg.type_args().into_iter().map(Lower::lower).collect();
+                Some((t.kind(), t.text().to_string(), type_args))
             })
             .collect();
 
         let anchor = if absolute {
             PathAnchor::Absolute
         } else {
-            match segs.first().map(|(k, text)| (*k, text.as_str())) {
+            match segs.first().map(|(k, text, _)| (*k, text.as_str())) {
                 Some((SyntaxKind::CrateKw, _)) | Some((_, "crate")) => {
                     segs.remove(0);
                     PathAnchor::Crate
@@ -800,10 +804,19 @@ impl Lower for ast::Path {
             }
         };
 
-        let segments = segs.into_iter().map(|(_, t)| Name(t)).collect();
+        let mut segments = Vec::with_capacity(segs.len());
+        let mut segment_type_args = Vec::new();
+        for (_, text, type_args) in segs {
+            let index = segments.len();
+            segments.push(Name(text));
+            if !type_args.is_empty() {
+                segment_type_args.push((index, type_args));
+            }
+        }
         HirPath {
             anchor,
             segments,
+            segment_type_args,
             type_args: Vec::new(),
             range,
         }
@@ -816,6 +829,7 @@ impl Lower for Option<ast::Path> {
         self.map(|p| p.lower()).unwrap_or(HirPath {
             anchor: PathAnchor::Plain,
             segments: vec![Name("<missing>".into())],
+            segment_type_args: Vec::new(),
             type_args: Vec::new(),
             range: rowan::TextRange::default(),
         })

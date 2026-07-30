@@ -1,6 +1,7 @@
 use crate::std::iter::{IntoIterator, Iterator};
 use crate::std::mem::size_of;
 use crate::std::option::Option;
+use crate::std::ops::{Index, IndexMut};
 use crate::std::prelude::panic;
 
 // The buffer lives in the GC heap so stored references to escaping values are
@@ -93,6 +94,14 @@ impl<T> Vector<T> {
         }
     }
 
+    pub fun swap(&mut self, left: usize, right: usize) {
+        if left < self.len && right < self.len && left != right {
+            let value = unsafe { self.data[left] };
+            unsafe { self.data[left] = self.data[right]; }
+            unsafe { self.data[right] = value; }
+        }
+    }
+
     pub fun clear(&mut self) {
         let mut index = 0usize;
         while index < self.len {
@@ -126,6 +135,26 @@ impl<T> Drop for Vector<T> {
             index += 1usize;
         }
         rgc_free(self.data as *mut u8);
+    }
+}
+
+impl<T> Index for Vector<T> {
+    type Output = T;
+
+    fun index(&self, index: usize) -> &Self::Output {
+        match self.get(index) {
+            Option::Some(value) => value,
+            Option::None => panic("Vector index out of bounds"),
+        }
+    }
+}
+
+impl<T> IndexMut for Vector<T> {
+    fun index_mut(&mut self, index: usize) -> &mut Self::Output {
+        match self.get_mut(index) {
+            Option::Some(value) => value,
+            Option::None => panic("Vector index out of bounds"),
+        }
     }
 }
 

@@ -184,6 +184,18 @@ impl ScopedBindings {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 
+    pub(crate) fn set_type(&mut self, id: PatternBindingId, ty: Type) {
+        if let Some(binding) = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .flat_map(|scope| scope.values_mut())
+            .find(|binding| binding.id == id)
+        {
+            binding.ty = ty;
+        }
+    }
+
     /// Whether `id` names a binding that was declared `mut`.
     pub(crate) fn is_mut(&self, id: PatternBindingId) -> bool {
         self.scopes

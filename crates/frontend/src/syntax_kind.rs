@@ -165,6 +165,8 @@ pub enum SyntaxKind {
     Greater,
     #[token("!")]
     Bang,
+    #[token("?")]
+    Question,
     #[token("#")]
     Hash,
 
@@ -267,6 +269,7 @@ pub enum SyntaxKind {
     Attribute,
     UnsafeExpr,
     CastExpr,
+    TryExpr,
     PtrType,
     ErrorNode,
 

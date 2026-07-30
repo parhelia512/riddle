@@ -17,6 +17,12 @@ const navigationText = [
   'struct Value {}',
   'impl Show for Value { fun show(&self) -> i32 { 1 } }',
   'fun main() { let value = Value {}; value.show(); }',
+  'enum Foo {',
+  '    A,',
+  '    B(i32),',
+  '    C((i32, &Foo)),',
+  '}',
+  'type Alias = Foo;',
 ].join('\n');
 const projectRoot = mkdtempSync(join(tmpdir(), 'riddle-lsp-smoke-'));
 const projectMainText = 'mod util;\nfun main() { let callable = util::make; callable; }\n';
@@ -113,6 +119,8 @@ try {
   assert.equal(initialized.result.capabilities.hoverProvider, true);
   assert.equal(initialized.result.capabilities.definitionProvider, true);
   assert.equal(initialized.result.capabilities.implementationProvider, true);
+  assert.equal(initialized.result.capabilities.referencesProvider, true);
+  assert.equal(initialized.result.capabilities.renameProvider.prepareProvider, true);
   const triggerCharacters = initialized.result.capabilities.completionProvider.triggerCharacters;
   assert.deepEqual(triggerCharacters, ['.', ':']);
   assert.equal(initialized.result.capabilities.inlayHintProvider, true);
@@ -598,6 +606,87 @@ try {
   const traitImplementation = await read((message) => message.id === 27);
   assert.equal(traitImplementation.result.length, 1);
   assert.equal(traitImplementation.result[0].range.start.line, 2);
+
+  send({
+    jsonrpc: '2.0',
+    id: 29,
+    method: 'textDocument/references',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 3, character: traitCallCharacter + 1 },
+      context: { includeDeclaration: true },
+    },
+  });
+  const traitReferences = await read((message) => message.id === 29);
+  assert.equal(traitReferences.result.length, 3);
+  assert.deepEqual(
+    traitReferences.result.map((location) => location.range.start.line),
+    [0, 2, 3],
+  );
+
+  send({
+    jsonrpc: '2.0',
+    id: 30,
+    method: 'textDocument/prepareRename',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 3, character: traitCallCharacter + 1 },
+    },
+  });
+  const preparedRename = await read((message) => message.id === 30);
+  assert.equal(preparedRename.result.placeholder, 'show');
+  assert.deepEqual(preparedRename.result.range, {
+    start: { line: 3, character: traitCallCharacter },
+    end: { line: 3, character: traitCallCharacter + 4 },
+  });
+
+  send({
+    jsonrpc: '2.0',
+    id: 31,
+    method: 'textDocument/rename',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 3, character: traitCallCharacter + 1 },
+      newName: 'render',
+    },
+  });
+  const traitRename = await read((message) => message.id === 31);
+  assert.equal(traitRename.result.documentChanges.length, 1);
+  assert.deepEqual(traitRename.result.documentChanges[0].textDocument, {
+    uri: navigationUri,
+    version: 1,
+  });
+  assert.equal(traitRename.result.documentChanges[0].edits.length, 3);
+  assert(traitRename.result.documentChanges[0].edits.every((edit) => edit.newText === 'render'));
+
+  send({
+    jsonrpc: '2.0',
+    id: 32,
+    method: 'textDocument/rename',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 3, character: traitCallCharacter + 1 },
+      newName: 'struct',
+    },
+  });
+  const invalidRename = await read((message) => message.id === 32);
+  assert.equal(invalidRename.error.code, -32602);
+
+  const aliasTargetCharacter = navigationText.split('\n')[9].lastIndexOf('Foo');
+  send({
+    jsonrpc: '2.0',
+    id: 28,
+    method: 'textDocument/hover',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 9, character: aliasTargetCharacter + 1 },
+    },
+  });
+  const enumHover = await read((message) => message.id === 28);
+  assert.equal(
+    enumHover.result.contents.value,
+    '```riddle\nenum Foo {\n    A,\n    B(i32),\n    C((i32, &Foo)),\n}\n```',
+  );
 
   send({
     jsonrpc: '2.0',

@@ -1951,6 +1951,8 @@ fn no_std_mode_rejects_incomplete_lang_item_signatures() {
         r#"#[lang = "ord"] trait Ord { fun cmp(&self, other: i32) -> bool; }"#,
         r#"#[lang = "add"] trait Add<Rhs = Self> { type Output; fun add(self, rhs: bool) -> Self::Output; }"#,
         r#"#[lang = "add_assign"] trait AddAssign<Rhs = Self> { fun add_assign(&mut self, rhs: bool); }"#,
+        r#"#[lang = "index"] trait Index { type Output; fun index(&self, index: usize) -> &Self::Output; }"#,
+        r#"#[lang = "index_mut"] trait IndexMut<Idx> { fun index_mut(&mut self, index: Idx) -> &mut Self::Output; }"#,
     ];
 
     for source in cases {

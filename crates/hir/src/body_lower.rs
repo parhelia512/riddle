@@ -482,6 +482,11 @@ impl<'a> BodyLower<'a> {
                 self.alloc_expr(Expr::Cast { base, target }, range)
             }
 
+            ast::Expr::TryExpr(t) => {
+                let operand = self.lower_required_expr(t.operand(), "missing try operand", range);
+                self.alloc_expr(Expr::Try { operand }, range)
+            }
+
             ast::Expr::IfStmt(i) => {
                 let cond = self.lower_required_expr(i.condition(), "missing if condition", range);
                 let then_branch =
@@ -634,6 +639,7 @@ impl<'a> BodyLower<'a> {
                                 let path = HirPath {
                                     anchor: PathAnchor::Plain,
                                     segments: vec![name.clone()],
+                                    segment_type_args: Vec::new(),
                                     type_args: Vec::new(),
                                     range: r,
                                 };

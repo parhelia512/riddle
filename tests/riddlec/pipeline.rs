@@ -682,7 +682,7 @@ fn std_string_and_vector_compile_without_string_runtime_helpers() {
     assert!(c.contains("extern void* rgc_realloc(void*, size_t)"), "{c}");
     assert!(c.contains("extern void rgc_free(void*)"), "{c}");
     assert_eq!(c.matches("extern void abort(void);").count(), 1, "{c}");
-    assert_eq!(c.matches("abort();").count(), 1, "{c}");
+    assert!(c.matches("abort();").count() >= 1, "{c}");
     assert!(c.contains("sizeof(int32_t)"), "{c}");
     assert!(c.contains(&c_function("as_slice__Vector_i32")), "{c}");
     assert!(!c.contains(&c_function("from_raw_parts")), "{c}");
@@ -771,6 +771,264 @@ fn dereferencing_non_copy_reference_cannot_move_value_out() {
         }),
         "{:#?}",
         result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn implicit_reference_field_deref_cannot_move_non_copy_value_out() {
+    let result = compile(
+        r#"
+            struct Token { value: i32 }
+            struct Wrap { token: Token }
+
+            fun main() {
+                let wrap = Wrap { token: Token { value: 1 } };
+                let reference: &Wrap = &wrap;
+                let moved = reference.token;
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(result.mir_module.is_none());
+    assert!(
+        result.analysis_diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0308"
+                && diagnostic
+                    .message
+                    .contains("cannot move out of dereference")
+        }),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn implicit_reference_field_deref_keeps_copy_value_readable() {
+    let result = compile(
+        r#"
+            struct Wrap { value: i32 }
+
+            fun main() -> i32 {
+                let wrap = Wrap { value: 7 };
+                let reference: &Wrap = &wrap;
+                reference.value
+            }
+            "#,
+    );
+
+    assert!(result.success(), "{:#?}", result.analysis_diagnostics);
+}
+
+#[test]
+fn implicit_reference_index_deref_cannot_move_non_copy_value_out() {
+    let result = compile(
+        r#"
+            struct Token { value: i32 }
+
+            fun main() {
+                let values = [Token { value: 1 }];
+                let reference: &[Token; 1] = &values;
+                let moved = reference[0usize];
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(
+        result.analysis_diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0308"
+                && diagnostic
+                    .message
+                    .contains("cannot move out of dereference")
+        }),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn try_propagates_result_and_converts_error() {
+    let result = compile_with_options(
+        r#"
+            enum Result<T, E> { Ok(T), Err(E) }
+            trait Into<T> { fun into(self) -> T; }
+
+            struct InnerError {}
+            struct OtherError {}
+            struct OuterError {}
+
+            impl Into<OtherError> for InnerError {
+                fun into(self) -> OtherError { OtherError {} }
+            }
+
+            impl Into<OuterError> for InnerError {
+                fun into(self) -> OuterError { OuterError {} }
+            }
+
+            fun read() -> Result<i32, InnerError> { Result::Ok(2) }
+
+            fun add_one() -> Result<i32, OuterError> {
+                let value = read()?;
+                Result::Ok(value + 1)
+            }
+
+            fun main() -> i32 {
+                match add_one() {
+                    Result::Ok(value) => value,
+                    Result::Err(_) => 0,
+                }
+            }
+            "#,
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        result.success(),
+        "parse: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+        result.parse_errors,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+    let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+    assert!(c.contains("try_err"), "{c}");
+}
+
+#[test]
+fn try_requires_result_operand() {
+    let result = compile_with_options(
+        "fun main() -> i32 { let value = 1?; value }",
+        CompileOptions { use_std: false },
+    );
+
+    assert!(!result.success());
+    assert!(
+        result
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("`?` requires a Result value")),
+        "{:#?}",
+        result.type_result.diagnostics
+    );
+}
+
+#[test]
+fn std_supports_float_remainder_and_scalar_protocols() {
+    let result = compile(
+        r#"
+            fun main() -> f64 {
+                let value: i64 = 42;
+                let flag = true;
+                print(&value);
+                print(&flag);
+                value as f64 % 5.0
+            }
+            "#,
+    );
+
+    assert!(
+        result.success(),
+        "parse: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+        result.parse_errors,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+    let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+    assert!(c.contains("fmod"), "{c}");
+}
+
+#[test]
+fn std_rejects_legacy_display_write_method() {
+    let result = compile(
+        r#"
+            struct Legacy {}
+
+            impl Display for Legacy {
+                fun write(self) {}
+            }
+
+            fun main() {}
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(
+        result
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("missing method `fmt`")),
+        "{:#?}",
+        result.type_result.diagnostics
+    );
+}
+
+#[test]
+fn std_exposes_default_hash_parse_collections_and_time() {
+    let result = compile(
+        r#"
+            fun main() -> i32 {
+                let value: i32 = Default::default();
+                let hash = value.hash();
+                let parsed = parse_i32("42").unwrap_or(0);
+                let mut tree_map: TreeMap<i32, i32> = TreeMap::new();
+                tree_map.insert(1, parsed);
+                let mut tree_set: TreeSet<usize> = TreeSet::new();
+                tree_set.insert(hash);
+                let mut hash_map: HashMap<i32, i32> = HashMap::new();
+                hash_map.insert(1, parsed);
+                let mut hash_set: HashSet<usize> = HashSet::new();
+                hash_set.insert(hash);
+                let _now = time_now();
+                let mapped = match tree_map.get(&1) {
+                    Some(reference) => *reference,
+                    None => value,
+                };
+                mapped + parsed
+                    + (tree_set.contains(&hash) as i32)
+                    + (hash_map.contains_key(&1) as i32)
+                    + (hash_set.contains(&hash) as i32)
+            }
+            "#,
+    );
+
+    assert!(
+        result.success(),
+        "parse: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+        result.parse_errors,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn std_does_not_expose_legacy_map_and_set_names() {
+    let result = compile(
+        r#"
+            fun legacy(map: Map<i32, i32>, set: Set<i32>) {}
+            fun main() {}
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(
+        result
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown type `Map<i32, i32>`")),
+        "{:#?}",
+        result.type_result.diagnostics
+    );
+    assert!(
+        result
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown type `Set<i32>`")),
+        "{:#?}",
+        result.type_result.diagnostics
     );
 }
 

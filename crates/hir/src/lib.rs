@@ -210,6 +210,7 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
         let self_ty = HirTypeRef::Named(HirPath {
             anchor: PathAnchor::Plain,
             segments: vec![Name("Self".into())],
+            segment_type_args: Vec::new(),
             type_args: Vec::new(),
             range,
         });
@@ -223,12 +224,14 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
                 trait_ty: HirTypeRef::Named(HirPath {
                     anchor: PathAnchor::Plain,
                     segments: vec![trait_name.clone()],
+                    segment_type_args: Vec::new(),
                     type_args: trait_generics
                         .iter()
                         .map(|name| {
                             HirTypeRef::Named(HirPath {
                                 anchor: PathAnchor::Plain,
                                 segments: vec![name.clone()],
+                                segment_type_args: Vec::new(),
                                 type_args: Vec::new(),
                                 range,
                             })
@@ -373,6 +376,7 @@ fn apply_self_receiver_types(func: &mut item_tree::HirFunction, receivers: &[(bo
         let self_ty = item_tree::HirTypeRef::Named(item_tree::HirPath {
             anchor: item_tree::PathAnchor::Plain,
             segments: vec![Name("Self".into())],
+            segment_type_args: Vec::new(),
             type_args: Vec::new(),
             range: param.ty_range,
         });

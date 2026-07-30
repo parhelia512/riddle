@@ -19,6 +19,9 @@ mod tests {
                 g::<T>(x);
                 crate::g::<T>(x);
                 x.convert::<T>();
+                Vector::<i32>::new();
+                crate::collections::Vector::<i32>::new();
+                Vector::<i32>::convert::<u32>();
             }
             "#,
         );

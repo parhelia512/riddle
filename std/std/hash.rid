@@ -1,0 +1,18 @@
+pub trait Hash {
+    fun hash(&self) -> usize;
+}
+
+impl Hash for bool { fun hash(&self) -> usize { if *self { 1usize } else { 0usize } } }
+impl Hash for char { fun hash(&self) -> usize { *self as usize } }
+impl Hash for i8 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for i16 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for i32 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for i64 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for isize { fun hash(&self) -> usize { *self as usize } }
+impl Hash for u8 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for u16 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for u32 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for u64 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for usize { fun hash(&self) -> usize { *self } }
+impl Hash for f32 { fun hash(&self) -> usize { *self as usize } }
+impl Hash for f64 { fun hash(&self) -> usize { *self as usize } }

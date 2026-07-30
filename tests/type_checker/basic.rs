@@ -174,6 +174,32 @@ fn checks_generic_function_calls() {
 }
 
 #[test]
+fn rejects_impl_type_arguments_on_associated_function() {
+    let result = check(
+        r#"
+        struct Container<T> {
+            pointer: *const T,
+        }
+
+        impl<T> Container<T> {
+            fun take(value: T) {}
+        }
+
+        fun main() {
+            Container::take::<i32>(1);
+        }
+        "#,
+    );
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0005"
+            && diagnostic
+                .message
+                .contains("function `take` expects 0 type argument(s), got 1")
+    }));
+}
+
+#[test]
 fn infers_generic_method_arguments() {
     let result = check(
         r#"

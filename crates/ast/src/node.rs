@@ -82,6 +82,7 @@ ast_node!(BoolLitExpr, BoolLit);
 ast_node!(NameRefExpr, NameRef);
 ast_node!(UnsafeExpr, UnsafeExpr);
 ast_node!(CastExpr, CastExpr);
+ast_node!(TryExpr, TryExpr);
 
 // paths
 ast_node!(Path, Path);
@@ -1166,6 +1167,12 @@ impl CastExpr {
     }
 }
 
+impl TryExpr {
+    pub fn operand(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
 // ── Paths ──────────────────────────────────────────────────────────────
 
 impl Path {
@@ -1194,6 +1201,14 @@ impl PathSegment {
                 SyntaxKind::Ident | SyntaxKind::SelfKw | SyntaxKind::SuperKw | SyntaxKind::CrateKw
             )
         })
+    }
+
+    pub fn type_args(&self) -> Vec<Type> {
+        self.syntax
+            .children()
+            .find_map(TypeArgList::cast)
+            .map(|list| list.types().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1594,6 +1609,7 @@ pub enum Expr {
     NameRef(NameRefExpr),
     UnsafeExpr(UnsafeExpr),
     CastExpr(CastExpr),
+    TryExpr(TryExpr),
 }
 
 impl AstNode for Expr {
@@ -1620,6 +1636,7 @@ impl AstNode for Expr {
             SyntaxKind::BoolLit => Some(Expr::BoolLit(BoolLitExpr { syntax: node })),
             SyntaxKind::UnsafeExpr => Some(Expr::UnsafeExpr(UnsafeExpr { syntax: node })),
             SyntaxKind::CastExpr => Some(Expr::CastExpr(CastExpr { syntax: node })),
+            SyntaxKind::TryExpr => Some(Expr::TryExpr(TryExpr { syntax: node })),
             SyntaxKind::NameRef => Some(Expr::NameRef(NameRefExpr { syntax: node })),
             _ => None,
         }
@@ -1649,6 +1666,7 @@ impl AstNode for Expr {
             Expr::NameRef(it) => it.syntax(),
             Expr::UnsafeExpr(it) => it.syntax(),
             Expr::CastExpr(it) => it.syntax(),
+            Expr::TryExpr(it) => it.syntax(),
         }
     }
 }

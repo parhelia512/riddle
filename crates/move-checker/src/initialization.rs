@@ -253,7 +253,9 @@ impl Checker<'_> {
                 let state = self.analyze_expr(base, state);
                 self.analyze_expr(index, state)
             }
-            Expr::Unsafe { body } | Expr::Cast { base: body, .. } => self.analyze_expr(body, state),
+            Expr::Unsafe { body } | Expr::Cast { base: body, .. } | Expr::Try { operand: body } => {
+                self.analyze_expr(body, state)
+            }
         };
 
         if state.reachable

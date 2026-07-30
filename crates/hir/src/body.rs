@@ -197,6 +197,9 @@ pub enum Expr {
         base: ExprId,
         target: HirTypeRef,
     },
+    Try {
+        operand: ExprId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +659,9 @@ impl BodyPrinter<'_> {
                 let base = self.print_expr(*base, current_prec, indent);
                 format!("({} as {})", base, Self::type_text(target))
             }
+            Expr::Try { operand } => {
+                format!("{}?", self.print_expr(*operand, current_prec, indent))
+            }
             Expr::Struct { path, fields, .. } => {
                 let fields = fields
                     .iter()
@@ -718,6 +724,7 @@ impl BodyPrinter<'_> {
             Expr::Call { .. } | Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => 90,
             Expr::Lambda { .. } => 70,
             Expr::Cast { .. } => 85,
+            Expr::Try { .. } => 90,
             Expr::Unary { .. } => 80,
             Expr::Binary { op, .. } => Self::binary_prec(op),
             Expr::Block { .. }

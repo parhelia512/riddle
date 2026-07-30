@@ -1,17 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use frontend::syntax_kind::SyntaxKind;
 use hir::{
     HirFile, Name,
-    body::{BodyId, Expr, Pattern, ResolvedName},
-    item_tree::{FunctionId, HirFunction, HirImpl, HirTypeRef, TraitId},
+    body::{BodyId, Expr, Pattern, PatternBindingId, ResolvedName},
+    item_tree::{
+        FunctionId, HirEnum, HirEnumVariant, HirFunction, HirImpl, HirStruct, HirStructField,
+        HirTypeRef, HirUseTree, HirUseTreeKind, HirVariantKind, TraitId,
+    },
 };
 use lsp_types::{
-    GotoDefinitionResponse, Hover, HoverContents, Location, MarkupContent, MarkupKind, Position,
+    DocumentChanges, GotoDefinitionResponse, Hover, HoverContents, Location, MarkupContent,
+    MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position, PrepareRenameResponse,
+    TextDocumentEdit, TextEdit, WorkspaceEdit,
 };
 use riddlec::pipeline::CompileOptions;
 use rowan::{TextRange, TextSize};
-use scope_graph::{DefRef, Node, RefOrigin, ScopeGraph, resolve::resolve_path_at_reference};
+use scope_graph::{
+    DefRef, Node, RefOrigin, ScopeGraph,
+    resolve::{resolve_path_at_reference, resolve_path_from, visible_definitions},
+};
 use type_checker::{Type, TypeCheckResult};
 
 use crate::{
@@ -19,7 +27,7 @@ use crate::{
     completion::BUILTIN_TYPES,
     server::Document,
     session::AnalysisSessions,
-    text::{LineIndex, offset_for_position},
+    text::{LineIndex, normalized_path, offset_for_position, range_is_in_source},
 };
 
 struct Symbol {
@@ -28,6 +36,8 @@ struct Symbol {
     definition: Option<TextRange>,
     implementations: Vec<TextRange>,
 }
+
+const HOVER_DECLARATION_ITEM_LIMIT: usize = 5;
 
 pub fn hover_for_document(
     uri: &lsp_types::Url,
@@ -73,6 +83,59 @@ pub fn implementation_for_document(
     ))
 }
 
+pub fn references_for_document(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document>,
+    position: Position,
+    include_declaration: bool,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+) -> Result<Option<Vec<Location>>, String> {
+    let document = docs
+        .get(uri)
+        .ok_or_else(|| "document is not open".to_string())?;
+    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
+    Ok(references_from_analysis(
+        uri,
+        document,
+        &analysis,
+        position,
+        include_declaration,
+    ))
+}
+
+pub fn prepare_rename_for_document(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document>,
+    position: Position,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+) -> Result<Option<PrepareRenameResponse>, String> {
+    let document = docs
+        .get(uri)
+        .ok_or_else(|| "document is not open".to_string())?;
+    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
+    Ok(prepare_rename_from_analysis(document, &analysis, position))
+}
+
+pub fn rename_for_document(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document>,
+    position: Position,
+    new_name: &str,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+) -> Result<Option<WorkspaceEdit>, String> {
+    validate_identifier(new_name)?;
+    let document = docs
+        .get(uri)
+        .ok_or_else(|| "document is not open".to_string())?;
+    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
+    Ok(rename_from_analysis(
+        uri, docs, document, &analysis, position, new_name,
+    ))
+}
+
 #[cfg(feature = "test-support")]
 pub fn hover_for_source(
     source: &str,
@@ -115,6 +178,56 @@ pub fn implementation_for_source(
     };
     let analysis = standalone_analysis(source, options);
     implementation_from_analysis(&uri, &document, &analysis, position)
+}
+
+#[cfg(feature = "test-support")]
+pub fn references_for_source(
+    source: &str,
+    position: Position,
+    include_declaration: bool,
+    options: CompileOptions,
+) -> Option<Vec<Location>> {
+    let uri = lsp_types::Url::parse("file:///riddle-navigation.rid").unwrap();
+    let document = Document {
+        text: source.into(),
+        version: Some(1),
+    };
+    let analysis = standalone_analysis(source, options);
+    references_from_analysis(&uri, &document, &analysis, position, include_declaration)
+}
+
+#[cfg(feature = "test-support")]
+pub fn prepare_rename_for_source(
+    source: &str,
+    position: Position,
+    options: CompileOptions,
+) -> Option<PrepareRenameResponse> {
+    let document = Document {
+        text: source.into(),
+        version: Some(1),
+    };
+    let analysis = standalone_analysis(source, options);
+    prepare_rename_from_analysis(&document, &analysis, position)
+}
+
+#[cfg(feature = "test-support")]
+pub fn rename_for_source(
+    source: &str,
+    position: Position,
+    new_name: &str,
+    options: CompileOptions,
+) -> Result<Option<WorkspaceEdit>, String> {
+    validate_identifier(new_name)?;
+    let uri = lsp_types::Url::parse("file:///riddle-navigation.rid").unwrap();
+    let document = Document {
+        text: source.into(),
+        version: Some(1),
+    };
+    let docs = HashMap::from([(uri.clone(), document.clone())]);
+    let analysis = standalone_analysis(source, options);
+    Ok(rename_from_analysis(
+        &uri, &docs, &document, &analysis, position, new_name,
+    ))
 }
 
 #[cfg(feature = "test-support")]
@@ -177,6 +290,151 @@ fn implementation_from_analysis(
     (!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations))
 }
 
+#[derive(Clone, Debug)]
+struct ShorthandField {
+    name: String,
+    definition: TextRange,
+}
+
+#[derive(Clone, Debug)]
+struct SymbolOccurrence {
+    range: TextRange,
+    is_declaration: bool,
+    shorthand: Option<ShorthandField>,
+}
+
+fn references_from_analysis(
+    uri: &lsp_types::Url,
+    document: &Document,
+    analysis: &DocumentAnalysis,
+    position: Position,
+    include_declaration: bool,
+) -> Option<Vec<Location>> {
+    let target = symbol_at(&document.text, analysis, position)?.definition?;
+    let mut locations = symbol_occurrences(analysis, target)
+        .into_iter()
+        .filter(|occurrence| include_declaration || !occurrence.is_declaration)
+        .filter_map(|occurrence| location_for_range(uri, analysis, occurrence.range))
+        .collect::<Vec<_>>();
+    sort_and_dedup_locations(&mut locations);
+    Some(locations)
+}
+
+fn prepare_rename_from_analysis(
+    document: &Document,
+    analysis: &DocumentAnalysis,
+    position: Position,
+) -> Option<PrepareRenameResponse> {
+    let symbol = symbol_at(&document.text, analysis, position)?;
+    let target = symbol.definition?;
+    renamable_target(analysis, target)?;
+    let placeholder = document
+        .text
+        .get(usize::from(symbol.origin.start())..usize::from(symbol.origin.end()))?;
+    Some(PrepareRenameResponse::RangeWithPlaceholder {
+        range: LineIndex::new(&document.text).range(&document.text, symbol.origin)?,
+        placeholder: placeholder.into(),
+    })
+}
+
+fn rename_from_analysis(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document>,
+    document: &Document,
+    analysis: &DocumentAnalysis,
+    position: Position,
+    new_name: &str,
+) -> Option<WorkspaceEdit> {
+    let target = symbol_at(&document.text, analysis, position)?.definition?;
+    renamable_target(analysis, target)?;
+    let mut documents = BTreeMap::<String, (lsp_types::Url, Vec<TextEdit>)>::new();
+    for occurrence in symbol_occurrences(analysis, target) {
+        let location = location_for_range(uri, analysis, occurrence.range)?;
+        let replacement = match occurrence.shorthand {
+            Some(shorthand) if shorthand.definition == target => {
+                format!("{new_name}: {}", shorthand.name)
+            }
+            Some(shorthand) => format!("{}: {new_name}", shorthand.name),
+            None => new_name.into(),
+        };
+        documents
+            .entry(location.uri.as_str().into())
+            .or_insert_with(|| (location.uri.clone(), Vec::new()))
+            .1
+            .push(TextEdit::new(location.range, replacement));
+    }
+
+    let edits = documents
+        .into_values()
+        .map(|(uri, mut edits)| {
+            edits.sort_by_key(|edit| {
+                (
+                    edit.range.start.line,
+                    edit.range.start.character,
+                    edit.range.end.line,
+                    edit.range.end.character,
+                )
+            });
+            TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    version: document_version(docs, &uri),
+                    uri,
+                },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            }
+        })
+        .collect();
+    Some(WorkspaceEdit {
+        document_changes: Some(DocumentChanges::Edits(edits)),
+        ..WorkspaceEdit::default()
+    })
+}
+
+fn sort_and_dedup_locations(locations: &mut Vec<Location>) {
+    locations.sort_by(|left, right| {
+        left.uri
+            .as_str()
+            .cmp(right.uri.as_str())
+            .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+            .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+            .then_with(|| left.range.end.line.cmp(&right.range.end.line))
+            .then_with(|| left.range.end.character.cmp(&right.range.end.character))
+    });
+    locations.dedup();
+}
+
+fn document_version(docs: &HashMap<lsp_types::Url, Document>, uri: &lsp_types::Url) -> Option<i32> {
+    if let Some(document) = docs.get(uri) {
+        return document.version;
+    }
+    let path = normalized_path(uri.to_file_path().ok()?);
+    docs.iter().find_map(|(candidate, document)| {
+        (candidate
+            .to_file_path()
+            .ok()
+            .is_some_and(|candidate| normalized_path(candidate) == path))
+        .then_some(document.version)
+        .flatten()
+    })
+}
+
+pub(crate) fn validate_identifier(name: &str) -> Result<(), String> {
+    let tokens = frontend::lexer::lex(name);
+    if matches!(tokens.as_slice(), [token] if token.kind == SyntaxKind::Ident && token.span == (0..name.len()))
+    {
+        Ok(())
+    } else {
+        Err(format!("`{name}` is not a valid Riddle identifier"))
+    }
+}
+
+fn renamable_target(analysis: &DocumentAnalysis, target: TextRange) -> Option<()> {
+    match &analysis.source_map {
+        Some(source_map) => source_map.map_range(target).map(|_| ()),
+        None => range_is_in_source(target, analysis.source.len()).then_some(()),
+    }
+}
+
 fn location_for_range(
     current_uri: &lsp_types::Url,
     analysis: &DocumentAnalysis,
@@ -195,6 +453,130 @@ fn location_for_range(
     ))
 }
 
+#[derive(Clone)]
+struct ResolvedFieldOccurrence {
+    definition: TextRange,
+    range: TextRange,
+    shorthand: Option<ShorthandField>,
+}
+
+fn symbol_occurrences(analysis: &DocumentAnalysis, target: TextRange) -> Vec<SymbolOccurrence> {
+    let Some(hir) = analysis.result.hir.as_ref() else {
+        return Vec::new();
+    };
+    let Some(graph) = analysis.result.scope_graph.as_ref() else {
+        return Vec::new();
+    };
+    let types = &analysis.result.type_result;
+    let source = &analysis.source;
+    let fields = resolved_field_occurrences(hir, types, source);
+    let shorthand = fields
+        .iter()
+        .filter_map(|field| {
+            field
+                .shorthand
+                .clone()
+                .map(|shorthand| (field.range, shorthand))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut occurrences = fields
+        .into_iter()
+        .filter(|field| field.definition == target)
+        .map(|field| SymbolOccurrence {
+            range: field.range,
+            is_declaration: false,
+            shorthand: field.shorthand,
+        })
+        .collect::<Vec<_>>();
+
+    for (reference, node) in graph.nodes.iter() {
+        let Node::Reference {
+            segments,
+            origin: reference_origin,
+            ..
+        } = node
+        else {
+            continue;
+        };
+        let Some(path_range) = reference_path_range(hir, *reference_origin) else {
+            continue;
+        };
+        let segment_ranges = path_segment_ranges(source, path_range, segments);
+        let body = match reference_origin {
+            RefOrigin::Expr { body, .. } => Some(*body),
+            RefOrigin::Type { .. } => None,
+        };
+        for (index, range) in segment_ranges.into_iter().enumerate() {
+            let Some(symbol) = symbol_for_reference_segment(
+                hir, graph, types, body, reference, segments, index, range, source,
+            ) else {
+                continue;
+            };
+            if symbol.definition == Some(target) {
+                occurrences.push(SymbolOccurrence {
+                    range,
+                    is_declaration: false,
+                    shorthand: shorthand.get(&range).cloned(),
+                });
+            }
+        }
+    }
+
+    for (body_id, body) in hir.bodies.iter() {
+        for (expr_id, expr) in body.exprs.iter() {
+            if !matches!(expr, Expr::FieldAccess { .. }) {
+                continue;
+            }
+            let Some(range) = body
+                .source_map
+                .expr_ranges
+                .get(&expr_id)
+                .and_then(|range| last_identifier_range(source, *range))
+            else {
+                continue;
+            };
+            if field_access_symbol(hir, types, body_id, expr_id, range)
+                .is_some_and(|symbol| symbol.definition == Some(target))
+            {
+                occurrences.push(SymbolOccurrence {
+                    range,
+                    is_declaration: false,
+                    shorthand: None,
+                });
+            }
+        }
+    }
+
+    for symbol in declaration_symbols(hir, types, source) {
+        if symbol.definition == Some(target) {
+            occurrences.push(SymbolOccurrence {
+                range: symbol.origin,
+                is_declaration: true,
+                shorthand: shorthand.get(&symbol.origin).cloned(),
+            });
+        }
+    }
+    collect_use_path_occurrences(hir, graph, types, source, target, &mut occurrences);
+    collect_pattern_path_occurrences(hir, types, source, target, &mut occurrences);
+
+    occurrences.sort_by_key(|occurrence| (occurrence.range.start(), occurrence.range.end()));
+    let mut deduplicated: Vec<SymbolOccurrence> = Vec::with_capacity(occurrences.len());
+    for occurrence in occurrences {
+        if let Some(previous) = deduplicated
+            .last_mut()
+            .filter(|previous| previous.range == occurrence.range)
+        {
+            previous.is_declaration |= occurrence.is_declaration;
+            if previous.shorthand.is_none() {
+                previous.shorthand = occurrence.shorthand;
+            }
+        } else {
+            deduplicated.push(occurrence);
+        }
+    }
+    deduplicated
+}
+
 fn symbol_at(
     document_source: &str,
     analysis: &DocumentAnalysis,
@@ -207,7 +589,10 @@ fn symbol_at(
 
     method_or_field_symbol(hir, &analysis.result.type_result, analysis, origin)
         .or_else(|| reference_symbol(hir, graph, &analysis.result.type_result, analysis, origin))
+        .or_else(|| use_path_symbol(hir, graph, &analysis.result.type_result, analysis, origin))
         .or_else(|| declaration_symbol(hir, &analysis.result.type_result, analysis, origin))
+        .or_else(|| field_label_symbol(hir, &analysis.result.type_result, analysis, origin))
+        .or_else(|| pattern_path_symbol(hir, &analysis.result.type_result, analysis, origin))
         .or_else(|| inferred_expression_symbol(hir, &analysis.result.type_result, analysis, origin))
         .or_else(|| {
             let text = &document_source[origin];
@@ -228,7 +613,7 @@ fn method_or_field_symbol(
 ) -> Option<Symbol> {
     for (body_id, body) in hir.bodies.iter() {
         for (expr_id, expr) in body.exprs.iter() {
-            let Expr::FieldAccess { base, field } = expr else {
+            let Expr::FieldAccess { .. } = expr else {
                 continue;
             };
             let Some(range) = body.source_map.expr_ranges.get(&expr_id).copied() else {
@@ -240,47 +625,48 @@ fn method_or_field_symbol(
             if analysis.local_range(field_range) != Some(origin) {
                 continue;
             }
-
-            if let Some(call) = types.trait_method_calls.get(&(body_id, expr_id)) {
-                return trait_method_symbol(
-                    hir,
-                    types,
-                    body_id,
-                    expr_id,
-                    call.trait_id,
-                    &call.method,
-                    origin,
-                );
-            }
-            if let Some(Type::FunctionItem { function, .. }) =
-                types.expr_types.get(&(body_id, expr_id))
-            {
-                return Some(function_symbol(hir, *function, origin));
-            }
-
-            let Some(receiver) = types.expr_types.get(&(body_id, *base)) else {
-                continue;
-            };
-            let Some(struct_id) = receiver_struct_id(receiver) else {
-                continue;
-            };
-            let strukt = &hir.item_tree.structs[struct_id];
-            let Some(field) = strukt
-                .fields
-                .iter()
-                .find(|candidate| candidate.name == *field)
-            else {
-                continue;
-            };
-            return Some(Symbol {
-                origin,
-                detail: format!("field {}: {}", field.name.0, field.ty.display()),
-                definition: Some(field.name_range),
-                implementations: Vec::new(),
-            });
+            return field_access_symbol(hir, types, body_id, expr_id, origin);
         }
     }
     None
+}
+
+fn field_access_symbol(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    body_id: BodyId,
+    expr_id: hir::body::ExprId,
+    origin: TextRange,
+) -> Option<Symbol> {
+    let Expr::FieldAccess { base, field } = &hir.bodies[body_id].exprs[expr_id] else {
+        return None;
+    };
+    if let Some(call) = types.trait_method_calls.get(&(body_id, expr_id)) {
+        return trait_method_symbol(
+            hir,
+            types,
+            body_id,
+            expr_id,
+            call.trait_id,
+            &call.method,
+            origin,
+        );
+    }
+    if let Some(Type::FunctionItem { function, .. }) = types.expr_types.get(&(body_id, expr_id)) {
+        return Some(function_symbol(hir, *function, origin));
+    }
+
+    let struct_id = receiver_struct_id(types.expr_types.get(&(body_id, *base))?)?;
+    let field = hir.item_tree.structs[struct_id]
+        .fields
+        .iter()
+        .find(|candidate| candidate.name == *field)?;
+    Some(Symbol {
+        origin,
+        detail: format!("field {}: {}", field.name.0, field.ty.display()),
+        definition: Some(field.name_range),
+        implementations: Vec::new(),
+    })
 }
 
 fn reference_symbol(
@@ -313,13 +699,65 @@ fn reference_symbol(
             RefOrigin::Expr { body, .. } => Some(*body),
             RefOrigin::Type { .. } => None,
         };
-        return resolve_path_at_reference(graph, reference, &segments[..=index])
-            .into_iter()
-            .find_map(|definition| {
-                symbol_for_definition(hir, types, body, definition, origin, &analysis.source)
-            });
+        return symbol_for_reference_segment(
+            hir,
+            graph,
+            types,
+            body,
+            reference,
+            segments,
+            index,
+            origin,
+            &analysis.source,
+        );
     }
     None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn symbol_for_reference_segment(
+    hir: &HirFile,
+    graph: &ScopeGraph,
+    types: &TypeCheckResult,
+    body: Option<BodyId>,
+    reference: scope_graph::NodeId,
+    segments: &[Name],
+    index: usize,
+    origin: TextRange,
+    source: &str,
+) -> Option<Symbol> {
+    let mut symbol = resolve_path_at_reference(graph, reference, &segments[..=index])
+        .into_iter()
+        .find_map(|definition| {
+            symbol_for_definition(hir, types, body, definition, origin, source)
+        })?;
+    if index == 0
+        && let Some(alias_range) =
+            explicit_alias_at_reference(hir, graph, reference, &segments[0], source)
+    {
+        symbol.definition = Some(alias_range);
+    }
+    Some(symbol)
+}
+
+fn explicit_alias_at_reference(
+    hir: &HirFile,
+    graph: &ScopeGraph,
+    reference: scope_graph::NodeId,
+    name: &Name,
+    source: &str,
+) -> Option<TextRange> {
+    visible_definitions(graph, reference)
+        .into_iter()
+        .find_map(|(candidate, definition)| {
+            if candidate != *name {
+                return None;
+            }
+            let DefRef::UseAlias { use_range, .. } = definition else {
+                return None;
+            };
+            explicit_alias_range(hir, source, use_range)
+        })
 }
 
 fn declaration_symbol(
@@ -328,6 +766,13 @@ fn declaration_symbol(
     analysis: &DocumentAnalysis,
     origin: TextRange,
 ) -> Option<Symbol> {
+    if let Some(mut symbol) = use_alias_symbols(hir, &analysis.source)
+        .into_iter()
+        .find(|symbol| analysis.local_range(symbol.origin) == Some(origin))
+    {
+        symbol.origin = origin;
+        return Some(symbol);
+    }
     for (trait_id, tr) in hir.item_tree.traits.iter() {
         if analysis.local_range(tr.name_range) == Some(origin) {
             return Some(trait_symbol(hir, trait_id, origin));
@@ -361,7 +806,7 @@ fn declaration_symbol(
         if analysis.local_range(strukt.name_range) == Some(origin) {
             return Some(Symbol {
                 origin,
-                detail: format_nominal("struct", &strukt.name, &strukt.generics),
+                detail: format_struct(strukt),
                 definition: Some(strukt.name_range),
                 implementations: Vec::new(),
             });
@@ -381,7 +826,7 @@ fn declaration_symbol(
         if analysis.local_range(enumeration.name_range) == Some(origin) {
             return Some(Symbol {
                 origin,
-                detail: format_nominal("enum", &enumeration.name, &enumeration.generics),
+                detail: format_enum(enumeration),
                 definition: Some(enumeration.name_range),
                 implementations: Vec::new(),
             });
@@ -390,10 +835,21 @@ fn declaration_symbol(
             if analysis.local_range(variant.name_range) == Some(origin) {
                 return Some(Symbol {
                     origin,
-                    detail: format!("variant {}::{}", enumeration.name.0, variant.name.0),
+                    detail: format!(
+                        "variant {}::{}",
+                        enumeration.name.0,
+                        format_enum_variant(variant)
+                    ),
                     definition: Some(variant.name_range),
                     implementations: Vec::new(),
                 });
+            }
+            if let HirVariantKind::Struct(fields) = &variant.kind {
+                for field in fields {
+                    if analysis.local_range(field.name_range) == Some(origin) {
+                        return Some(field_symbol(field, origin));
+                    }
+                }
             }
         }
     }
@@ -433,32 +889,39 @@ fn declaration_symbol(
     }
     for (body_id, body) in hir.bodies.iter() {
         for (pat_id, pattern) in body.pats.iter() {
-            let Pattern::Binding { name, .. } = pattern else {
-                continue;
-            };
-            let Some(pattern_range) = body.source_map.pat_ranges.get(&pat_id).copied() else {
-                continue;
-            };
-            let Some(name_range) =
-                identifier_named_in_range(&analysis.source, pattern_range, &name.0)
-            else {
-                continue;
-            };
-            if analysis.local_range(name_range) == Some(origin) {
-                let ty = types
-                    .pattern_binding_types
-                    .iter()
-                    .find_map(|((candidate_body, binding), ty)| {
-                        (*candidate_body == body_id && binding.pattern == pat_id)
-                            .then_some(ty.display(hir))
-                    })
-                    .unwrap_or_else(|| "_".into());
-                return Some(Symbol {
-                    origin,
-                    detail: format!("let {}: {ty}", name.0),
-                    definition: Some(name_range),
-                    implementations: Vec::new(),
-                });
+            let mut bindings = Vec::new();
+            match pattern {
+                Pattern::Binding { name, .. } => bindings.push((
+                    name,
+                    PatternBindingId {
+                        pattern: pat_id,
+                        field: None,
+                    },
+                )),
+                Pattern::Struct { fields, .. } => {
+                    bindings.extend(fields.iter().enumerate().filter_map(|(index, field)| {
+                        field.pat.is_none().then_some((
+                            &field.name,
+                            PatternBindingId {
+                                pattern: pat_id,
+                                field: Some(index),
+                            },
+                        ))
+                    }));
+                }
+                _ => {}
+            }
+            for (name, binding) in bindings {
+                let Some(name_range) =
+                    pattern_binding_name_range(hir, body_id, binding, &analysis.source)
+                else {
+                    continue;
+                };
+                if analysis.local_range(name_range) == Some(origin) {
+                    return Some(pattern_binding_symbol(
+                        hir, types, body_id, binding, name, origin, name_range,
+                    ));
+                }
             }
         }
         for (_, expr) in body.exprs.iter() {
@@ -485,6 +948,710 @@ fn declaration_symbol(
         }
     }
     None
+}
+
+fn declaration_symbols(hir: &HirFile, types: &TypeCheckResult, source: &str) -> Vec<Symbol> {
+    let mut symbols = use_alias_symbols(hir, source);
+    for (trait_id, tr) in hir.item_tree.traits.iter() {
+        symbols.push(trait_symbol(hir, trait_id, tr.name_range));
+        symbols.extend(tr.methods.iter().map(|method| {
+            trait_method_declaration_symbol(hir, trait_id, method, method.name_range)
+        }));
+    }
+    for (function_id, function) in hir.item_tree.functions.iter() {
+        symbols.push(function_symbol(hir, function_id, function.name_range));
+        symbols.extend(
+            function
+                .params
+                .iter()
+                .filter(|parameter| parameter.name.0 != "self")
+                .map(|parameter| Symbol {
+                    origin: parameter.name_range,
+                    detail: format!("parameter {}: {}", parameter.name.0, parameter.ty.display()),
+                    definition: Some(parameter.name_range),
+                    implementations: Vec::new(),
+                }),
+        );
+    }
+    for (_, strukt) in hir.item_tree.structs.iter() {
+        symbols.push(Symbol {
+            origin: strukt.name_range,
+            detail: format_struct(strukt),
+            definition: Some(strukt.name_range),
+            implementations: Vec::new(),
+        });
+        symbols.extend(
+            strukt
+                .fields
+                .iter()
+                .map(|field| field_symbol(field, field.name_range)),
+        );
+    }
+    for (_, enumeration) in hir.item_tree.enums.iter() {
+        symbols.push(Symbol {
+            origin: enumeration.name_range,
+            detail: format_enum(enumeration),
+            definition: Some(enumeration.name_range),
+            implementations: Vec::new(),
+        });
+        for variant in &enumeration.variants {
+            symbols.push(Symbol {
+                origin: variant.name_range,
+                detail: format!(
+                    "variant {}::{}",
+                    enumeration.name.0,
+                    format_enum_variant(variant)
+                ),
+                definition: Some(variant.name_range),
+                implementations: Vec::new(),
+            });
+            if let HirVariantKind::Struct(fields) = &variant.kind {
+                symbols.extend(
+                    fields
+                        .iter()
+                        .map(|field| field_symbol(field, field.name_range)),
+                );
+            }
+        }
+    }
+    symbols.extend(hir.item_tree.consts.iter().map(|(_, item)| Symbol {
+        origin: item.name_range,
+        detail: format!("const {}: {}", item.name.0, item.ty.display()),
+        definition: Some(item.name_range),
+        implementations: Vec::new(),
+    }));
+    symbols.extend(hir.item_tree.type_aliases.iter().map(|(_, item)| {
+        Symbol {
+            origin: item.name_range,
+            detail: item
+                .ty
+                .as_ref()
+                .map(|ty| format!("type {} = {}", item.name.0, ty.display()))
+                .unwrap_or_else(|| format!("type {}", item.name.0)),
+            definition: Some(item.name_range),
+            implementations: Vec::new(),
+        }
+    }));
+    symbols.extend(hir.item_tree.modules.iter().map(|(_, item)| Symbol {
+        origin: item.name_range,
+        detail: format!("mod {}", item.name.0),
+        definition: Some(item.name_range),
+        implementations: Vec::new(),
+    }));
+
+    for (body_id, body) in hir.bodies.iter() {
+        for (pat_id, pattern) in body.pats.iter() {
+            let mut bindings = Vec::new();
+            match pattern {
+                Pattern::Binding { name, .. } => bindings.push((
+                    name,
+                    PatternBindingId {
+                        pattern: pat_id,
+                        field: None,
+                    },
+                )),
+                Pattern::Struct { fields, .. } => {
+                    bindings.extend(fields.iter().enumerate().filter_map(|(index, field)| {
+                        field.pat.is_none().then_some((
+                            &field.name,
+                            PatternBindingId {
+                                pattern: pat_id,
+                                field: Some(index),
+                            },
+                        ))
+                    }));
+                }
+                _ => {}
+            }
+            for (name, binding) in bindings {
+                if let Some(name_range) = pattern_binding_name_range(hir, body_id, binding, source)
+                {
+                    symbols.push(pattern_binding_symbol(
+                        hir, types, body_id, binding, name, name_range, name_range,
+                    ));
+                }
+            }
+        }
+        for (_, expr) in body.exprs.iter() {
+            let Expr::Lambda { params, .. } = expr else {
+                continue;
+            };
+            symbols.extend(params.iter().filter_map(|parameter| {
+                let range = parameter.name_range?;
+                Some(Symbol {
+                    origin: range,
+                    detail: format!("parameter {}: {}", parameter.name.0, parameter.ty.display()),
+                    definition: Some(range),
+                    implementations: Vec::new(),
+                })
+            }));
+        }
+    }
+    symbols
+}
+
+fn field_symbol(field: &HirStructField, origin: TextRange) -> Symbol {
+    Symbol {
+        origin,
+        detail: format!("field {}: {}", field.name.0, field.ty.display()),
+        definition: Some(field.name_range),
+        implementations: Vec::new(),
+    }
+}
+
+fn pattern_binding_symbol(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    body: BodyId,
+    binding: PatternBindingId,
+    name: &Name,
+    origin: TextRange,
+    definition: TextRange,
+) -> Symbol {
+    let ty = types
+        .pattern_binding_types
+        .get(&(body, binding))
+        .map(|ty| ty.display(hir))
+        .unwrap_or_else(|| "_".into());
+    Symbol {
+        origin,
+        detail: format!("let {}: {ty}", name.0),
+        definition: Some(definition),
+        implementations: Vec::new(),
+    }
+}
+
+fn pattern_binding_name_range(
+    hir: &HirFile,
+    body_id: BodyId,
+    binding: PatternBindingId,
+    source: &str,
+) -> Option<TextRange> {
+    let body = &hir.bodies[body_id];
+    let pattern_range = body.source_map.pat_ranges.get(&binding.pattern).copied()?;
+    let pattern = &body.pats[binding.pattern];
+    let Some(field_index) = binding.field else {
+        let Pattern::Binding { name, .. } = pattern else {
+            return None;
+        };
+        return identifier_named_in_range(source, pattern_range, &name.0);
+    };
+    let Pattern::Struct { path, fields } = pattern else {
+        return None;
+    };
+    let labels = field_labels_in_range(
+        source,
+        pattern_range,
+        path.range.end(),
+        fields.iter().map(|field| field.name.0.as_str()),
+    );
+    labels.get(field_index).map(|label| label.range)
+}
+
+fn use_alias_symbols(hir: &HirFile, source: &str) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    for (_, item) in hir.item_tree.uses.iter() {
+        collect_use_alias_symbols(&item.tree, source, &mut symbols);
+    }
+    symbols
+}
+
+fn collect_use_alias_symbols(tree: &HirUseTree, source: &str, symbols: &mut Vec<Symbol>) {
+    match &tree.kind {
+        HirUseTreeKind::Simple { alias: Some(alias) } => {
+            if let Some(range) = last_identifier_named_in_range(source, tree.range, &alias.0) {
+                symbols.push(Symbol {
+                    origin: range,
+                    detail: format!("use {} as {}", tree.prefix.display(), alias.0),
+                    definition: Some(range),
+                    implementations: Vec::new(),
+                });
+            }
+        }
+        HirUseTreeKind::List(children) => {
+            for child in children {
+                collect_use_alias_symbols(child, source, symbols);
+            }
+        }
+        HirUseTreeKind::Simple { alias: None } | HirUseTreeKind::Glob => {}
+    }
+}
+
+fn explicit_alias_range(hir: &HirFile, source: &str, use_range: TextRange) -> Option<TextRange> {
+    hir.item_tree
+        .uses
+        .iter()
+        .find_map(|(_, item)| explicit_alias_range_in_tree(&item.tree, source, use_range))
+}
+
+fn explicit_alias_range_in_tree(
+    tree: &HirUseTree,
+    source: &str,
+    use_range: TextRange,
+) -> Option<TextRange> {
+    if tree.range == use_range
+        && let HirUseTreeKind::Simple { alias: Some(alias) } = &tree.kind
+    {
+        return last_identifier_named_in_range(source, tree.range, &alias.0);
+    }
+    let HirUseTreeKind::List(children) = &tree.kind else {
+        return None;
+    };
+    children
+        .iter()
+        .find_map(|child| explicit_alias_range_in_tree(child, source, use_range))
+}
+
+#[derive(Clone)]
+struct FieldLabel {
+    name: String,
+    range: TextRange,
+    shorthand: bool,
+}
+
+fn resolved_field_occurrences(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    source: &str,
+) -> Vec<ResolvedFieldOccurrence> {
+    let mut occurrences = Vec::new();
+    for (body_id, body) in hir.bodies.iter() {
+        for (expr_id, expr) in body.exprs.iter() {
+            let Expr::Struct { path, fields, .. } = expr else {
+                continue;
+            };
+            let Some(definitions) = fields_for_struct_expression(hir, expr) else {
+                continue;
+            };
+            let Some(range) = body.source_map.expr_ranges.get(&expr_id).copied() else {
+                continue;
+            };
+            let labels = field_labels_in_range(
+                source,
+                range,
+                path.range.end(),
+                fields.iter().map(|field| field.name.0.as_str()),
+            );
+            push_resolved_field_labels(definitions, labels, &mut occurrences);
+        }
+        for (pat_id, pattern) in body.pats.iter() {
+            let Pattern::Struct { path, fields } = pattern else {
+                continue;
+            };
+            let Some(definitions) = fields_for_struct_pattern(hir, types, body_id, pat_id, path)
+            else {
+                continue;
+            };
+            let Some(range) = body.source_map.pat_ranges.get(&pat_id).copied() else {
+                continue;
+            };
+            let labels = field_labels_in_range(
+                source,
+                range,
+                path.range.end(),
+                fields.iter().map(|field| field.name.0.as_str()),
+            );
+            push_resolved_field_labels(definitions, labels, &mut occurrences);
+        }
+    }
+    occurrences
+}
+
+fn push_resolved_field_labels(
+    definitions: &[HirStructField],
+    labels: Vec<FieldLabel>,
+    occurrences: &mut Vec<ResolvedFieldOccurrence>,
+) {
+    for label in labels {
+        let Some(field) = definitions.iter().find(|field| field.name.0 == label.name) else {
+            continue;
+        };
+        occurrences.push(ResolvedFieldOccurrence {
+            definition: field.name_range,
+            range: label.range,
+            shorthand: label.shorthand.then_some(ShorthandField {
+                name: label.name,
+                definition: field.name_range,
+            }),
+        });
+    }
+}
+
+fn fields_for_struct_expression<'a>(hir: &'a HirFile, expr: &Expr) -> Option<&'a [HirStructField]> {
+    let Expr::Struct { resolved, .. } = expr else {
+        return None;
+    };
+    match resolved.as_ref()? {
+        ResolvedName::Struct(id) => Some(&hir.item_tree.structs[*id].fields),
+        ResolvedName::EnumVariant(enum_id, index) => {
+            let HirVariantKind::Struct(fields) =
+                &hir.item_tree.enums[*enum_id].variants.get(*index)?.kind
+            else {
+                return None;
+            };
+            Some(fields)
+        }
+        _ => None,
+    }
+}
+
+fn fields_for_struct_pattern<'a>(
+    hir: &'a HirFile,
+    types: &TypeCheckResult,
+    body: BodyId,
+    pattern: hir::body::PatId,
+    path: &hir::item_tree::HirPath,
+) -> Option<&'a [HirStructField]> {
+    match dereferenced_type(types.pattern_types.get(&(body, pattern))?) {
+        Type::Struct(id, _) => Some(&hir.item_tree.structs[*id].fields),
+        Type::Enum(id, _) => {
+            let name = &path.segments.last()?.0;
+            let variant = hir.item_tree.enums[*id]
+                .variants
+                .iter()
+                .find(|variant| variant.name.0 == *name)?;
+            let HirVariantKind::Struct(fields) = &variant.kind else {
+                return None;
+            };
+            Some(fields)
+        }
+        _ => None,
+    }
+}
+
+fn dereferenced_type(mut ty: &Type) -> &Type {
+    while let Type::Ref(inner, _) | Type::Ptr { inner, .. } = ty {
+        ty = inner;
+    }
+    ty
+}
+
+fn field_label_symbol(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    analysis: &DocumentAnalysis,
+    origin: TextRange,
+) -> Option<Symbol> {
+    let field = resolved_field_occurrences(hir, types, &analysis.source)
+        .into_iter()
+        .find(|field| analysis.local_range(field.range) == Some(origin))?;
+    field_symbol_for_definition(hir, field.definition, origin)
+}
+
+fn field_symbol_for_definition(
+    hir: &HirFile,
+    definition: TextRange,
+    origin: TextRange,
+) -> Option<Symbol> {
+    for (_, strukt) in hir.item_tree.structs.iter() {
+        if let Some(field) = strukt
+            .fields
+            .iter()
+            .find(|field| field.name_range == definition)
+        {
+            return Some(field_symbol(field, origin));
+        }
+    }
+    for (_, enumeration) in hir.item_tree.enums.iter() {
+        for variant in &enumeration.variants {
+            let HirVariantKind::Struct(fields) = &variant.kind else {
+                continue;
+            };
+            if let Some(field) = fields.iter().find(|field| field.name_range == definition) {
+                return Some(field_symbol(field, origin));
+            }
+        }
+    }
+    None
+}
+
+fn field_labels_in_range<'a>(
+    source: &str,
+    container: TextRange,
+    fields_start: TextSize,
+    expected: impl Iterator<Item = &'a str>,
+) -> Vec<FieldLabel> {
+    let start = usize::from(fields_start.max(container.start()));
+    let end = usize::from(container.end());
+    let Some(text) = source.get(start..end) else {
+        return Vec::new();
+    };
+    let expected = expected.collect::<Vec<_>>();
+    let tokens = frontend::lexer::lex(text);
+    let mut labels = Vec::with_capacity(expected.len());
+    let mut braces = 0usize;
+    let mut parentheses = 0usize;
+    let mut brackets = 0usize;
+    let mut expecting_field = false;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            SyntaxKind::LBrace => {
+                braces += 1;
+                if braces == 1 {
+                    expecting_field = true;
+                }
+            }
+            SyntaxKind::RBrace => {
+                if braces == 1 {
+                    break;
+                }
+                braces = braces.saturating_sub(1);
+            }
+            SyntaxKind::LParen if braces > 0 => parentheses += 1,
+            SyntaxKind::RParen if braces > 0 => parentheses = parentheses.saturating_sub(1),
+            SyntaxKind::LBracket if braces > 0 => brackets += 1,
+            SyntaxKind::RBracket if braces > 0 => brackets = brackets.saturating_sub(1),
+            SyntaxKind::Comma if braces == 1 && parentheses == 0 && brackets == 0 => {
+                expecting_field = true;
+            }
+            SyntaxKind::Ident
+                if braces == 1
+                    && parentheses == 0
+                    && brackets == 0
+                    && expecting_field
+                    && expected.get(labels.len()).copied() == Some(token.text(text)) =>
+            {
+                let shorthand = tokens[index + 1..]
+                    .iter()
+                    .find(|next| {
+                        !matches!(next.kind, SyntaxKind::Whitespace | SyntaxKind::LineComment)
+                    })
+                    .is_none_or(|next| next.kind != SyntaxKind::Colon);
+                labels.push(FieldLabel {
+                    name: token.text(text).into(),
+                    range: TextRange::new(
+                        TextSize::from((start + token.span.start) as u32),
+                        TextSize::from((start + token.span.end) as u32),
+                    ),
+                    shorthand,
+                });
+                expecting_field = false;
+            }
+            _ => {}
+        }
+    }
+    labels
+}
+
+fn pattern_path_symbol(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    analysis: &DocumentAnalysis,
+    origin: TextRange,
+) -> Option<Symbol> {
+    for (body_id, body) in hir.bodies.iter() {
+        for (pat_id, pattern) in body.pats.iter() {
+            let path = match pattern {
+                Pattern::Path { path }
+                | Pattern::TupleStruct { path, .. }
+                | Pattern::Struct { path, .. } => path,
+                _ => continue,
+            };
+            let ranges = path_segment_ranges(&analysis.source, path.range, &path.segments);
+            let Some(index) = ranges
+                .iter()
+                .position(|range| analysis.local_range(*range) == Some(origin))
+            else {
+                continue;
+            };
+            let Some(definition) =
+                pattern_path_definition(hir, types, body_id, pat_id, path, index)
+            else {
+                continue;
+            };
+            return symbol_for_definition(
+                hir,
+                types,
+                Some(body_id),
+                definition,
+                origin,
+                &analysis.source,
+            );
+        }
+    }
+    None
+}
+
+fn pattern_path_definition(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    body: BodyId,
+    pattern: hir::body::PatId,
+    path: &hir::item_tree::HirPath,
+    index: usize,
+) -> Option<DefRef> {
+    let ty = dereferenced_type(types.pattern_types.get(&(body, pattern))?);
+    match ty {
+        Type::Struct(struct_id, _) if index + 1 == path.segments.len() => (path.segments.last()?
+            == &hir.item_tree.structs[*struct_id].name)
+            .then_some(DefRef::Struct(*struct_id)),
+        Type::Enum(enum_id, _) => {
+            let enumeration = &hir.item_tree.enums[*enum_id];
+            if index + 1 == path.segments.len() {
+                let variant = enumeration
+                    .variants
+                    .iter()
+                    .position(|variant| Some(&variant.name) == path.segments.last())?;
+                return Some(DefRef::EnumVariant {
+                    enum_id: *enum_id,
+                    index: variant,
+                });
+            }
+            if path.segments.get(index) == Some(&enumeration.name) {
+                return Some(DefRef::Enum(*enum_id));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn collect_pattern_path_occurrences(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    source: &str,
+    target: TextRange,
+    occurrences: &mut Vec<SymbolOccurrence>,
+) {
+    for (body_id, body) in hir.bodies.iter() {
+        for (pat_id, pattern) in body.pats.iter() {
+            let path = match pattern {
+                Pattern::Path { path }
+                | Pattern::TupleStruct { path, .. }
+                | Pattern::Struct { path, .. } => path,
+                _ => continue,
+            };
+            let ranges = path_segment_ranges(source, path.range, &path.segments);
+            for (index, range) in ranges.into_iter().enumerate() {
+                let Some(definition) =
+                    pattern_path_definition(hir, types, body_id, pat_id, path, index)
+                else {
+                    continue;
+                };
+                let Some(symbol) =
+                    symbol_for_definition(hir, types, Some(body_id), definition, range, source)
+                else {
+                    continue;
+                };
+                if symbol.definition == Some(target) {
+                    occurrences.push(SymbolOccurrence {
+                        range,
+                        is_declaration: false,
+                        shorthand: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn collect_use_path_occurrences(
+    hir: &HirFile,
+    graph: &ScopeGraph,
+    types: &TypeCheckResult,
+    source: &str,
+    target: TextRange,
+    occurrences: &mut Vec<SymbolOccurrence>,
+) {
+    occurrences.extend(
+        resolved_use_path_symbols(hir, graph, types, source)
+            .into_iter()
+            .filter(|symbol| symbol.definition == Some(target))
+            .map(|symbol| SymbolOccurrence {
+                range: symbol.origin,
+                is_declaration: false,
+                shorthand: None,
+            }),
+    );
+}
+
+fn use_path_symbol(
+    hir: &HirFile,
+    graph: &ScopeGraph,
+    types: &TypeCheckResult,
+    analysis: &DocumentAnalysis,
+    origin: TextRange,
+) -> Option<Symbol> {
+    let mut symbol = resolved_use_path_symbols(hir, graph, types, &analysis.source)
+        .into_iter()
+        .find(|symbol| analysis.local_range(symbol.origin) == Some(origin))?;
+    symbol.origin = origin;
+    Some(symbol)
+}
+
+fn resolved_use_path_symbols(
+    hir: &HirFile,
+    graph: &ScopeGraph,
+    types: &TypeCheckResult,
+    source: &str,
+) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    for (_, item) in hir.item_tree.uses.iter() {
+        collect_use_tree_path_symbols(&item.tree, &[], hir, graph, types, source, &mut symbols);
+    }
+    symbols
+}
+
+fn collect_use_tree_path_symbols(
+    tree: &HirUseTree,
+    inherited: &[(Name, TextRange)],
+    hir: &HirFile,
+    graph: &ScopeGraph,
+    types: &TypeCheckResult,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+) {
+    let mut path = inherited.to_vec();
+    let ranges = path_segment_ranges(source, tree.prefix.range, &tree.prefix.segments);
+    path.extend(tree.prefix.segments.iter().cloned().zip(ranges));
+    match &tree.kind {
+        HirUseTreeKind::Simple { .. } => {
+            let Some((anchor, rewrite_to)) = use_alias_definition(graph, tree.range) else {
+                return;
+            };
+            if rewrite_to.len() != path.len() {
+                return;
+            }
+            for (index, (_, range)) in path.iter().enumerate() {
+                let Some(symbol) = resolve_path_from(graph, anchor, &rewrite_to[..=index])
+                    .into_iter()
+                    .find_map(|definition| {
+                        symbol_for_definition(hir, types, None, definition, *range, source)
+                    })
+                else {
+                    continue;
+                };
+                symbols.push(symbol);
+            }
+        }
+        HirUseTreeKind::List(children) => {
+            for child in children {
+                collect_use_tree_path_symbols(child, &path, hir, graph, types, source, symbols);
+            }
+        }
+        HirUseTreeKind::Glob => {}
+    }
+}
+
+fn use_alias_definition(
+    graph: &ScopeGraph,
+    use_range: TextRange,
+) -> Option<(scope_graph::NodeId, Vec<Name>)> {
+    graph.nodes.iter().find_map(|(_, node)| {
+        let Node::PopSymbol {
+            define:
+                DefRef::UseAlias {
+                    rewrite_to,
+                    anchor,
+                    use_range: candidate,
+                },
+            ..
+        } = node
+        else {
+            return None;
+        };
+        (*candidate == use_range).then(|| (*anchor, rewrite_to.clone()))
+    })
 }
 
 fn inferred_expression_symbol(
@@ -525,7 +1692,7 @@ fn symbol_for_definition(
             let item = &hir.item_tree.structs[id];
             Some(Symbol {
                 origin,
-                detail: format_nominal("struct", &item.name, &item.generics),
+                detail: format_struct(item),
                 definition: Some(item.name_range),
                 implementations: Vec::new(),
             })
@@ -534,7 +1701,7 @@ fn symbol_for_definition(
             let item = &hir.item_tree.enums[id];
             Some(Symbol {
                 origin,
-                detail: format_nominal("enum", &item.name, &item.generics),
+                detail: format_enum(item),
                 definition: Some(item.name_range),
                 implementations: Vec::new(),
             })
@@ -573,23 +1740,10 @@ fn symbol_for_definition(
         }
         DefRef::PatternBinding { name, id } => {
             let body = body?;
-            let pattern_range = hir.bodies[body]
-                .source_map
-                .pat_ranges
-                .get(&id.pattern)
-                .copied()?;
-            let name_range = identifier_named_in_range(source, pattern_range, &name.0)?;
-            let ty = types
-                .pattern_binding_types
-                .get(&(body, id))
-                .map(|ty| ty.display(hir))
-                .unwrap_or_else(|| "_".into());
-            Some(Symbol {
-                origin,
-                detail: format!("let {}: {ty}", name.0),
-                definition: Some(name_range),
-                implementations: Vec::new(),
-            })
+            let name_range = pattern_binding_name_range(hir, body, id, source)?;
+            Some(pattern_binding_symbol(
+                hir, types, body, id, &name, origin, name_range,
+            ))
         }
         DefRef::Param { fn_id, index } => {
             let parameter = &hir.item_tree.functions[fn_id].params[index];
@@ -627,7 +1781,11 @@ fn symbol_for_definition(
             let variant = enumeration.variants.get(index)?;
             Some(Symbol {
                 origin,
-                detail: format!("variant {}::{}", enumeration.name.0, variant.name.0),
+                detail: format!(
+                    "variant {}::{}",
+                    enumeration.name.0,
+                    format_enum_variant(variant)
+                ),
                 definition: Some(variant.name_range),
                 implementations: Vec::new(),
             })
@@ -820,6 +1978,22 @@ fn identifier_named_in_range(source: &str, range: TextRange, name: &str) -> Opti
         })
 }
 
+fn last_identifier_named_in_range(source: &str, range: TextRange, name: &str) -> Option<TextRange> {
+    let start = usize::from(range.start());
+    let end = usize::from(range.end());
+    let text = source.get(start..end)?;
+    frontend::lexer::lex(text)
+        .into_iter()
+        .rev()
+        .find(|token| token.kind == SyntaxKind::Ident && token.text(text) == name)
+        .map(|token| {
+            TextRange::new(
+                TextSize::from((start + token.span.start) as u32),
+                TextSize::from((start + token.span.end) as u32),
+            )
+        })
+}
+
 fn last_identifier_range(source: &str, range: TextRange) -> Option<TextRange> {
     let start = usize::from(range.start());
     let end = usize::from(range.end());
@@ -904,4 +2078,97 @@ fn format_nominal(kind: &str, name: &Name, generics: &[Name]) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+fn format_struct(strukt: &HirStruct) -> String {
+    let visibility = if strukt.visibility.is_public() {
+        "pub "
+    } else {
+        ""
+    };
+    let mut detail = format!(
+        "{visibility}{}",
+        format_nominal("struct", &strukt.name, &strukt.generics)
+    );
+    if strukt.fields.is_empty() {
+        detail.push_str(" {}");
+        return detail;
+    }
+
+    detail.push_str(" {\n");
+    for field in strukt.fields.iter().take(HOVER_DECLARATION_ITEM_LIMIT) {
+        detail.push_str("    ");
+        detail.push_str(&format_struct_field(field));
+        detail.push_str(",\n");
+    }
+    if strukt.fields.len() > HOVER_DECLARATION_ITEM_LIMIT {
+        detail.push_str("    /* ... */\n");
+    }
+    detail.push('}');
+    detail
+}
+
+fn format_enum(enumeration: &HirEnum) -> String {
+    let visibility = if enumeration.visibility.is_public() {
+        "pub "
+    } else {
+        ""
+    };
+    let mut detail = format!(
+        "{visibility}{}",
+        format_nominal("enum", &enumeration.name, &enumeration.generics)
+    );
+    if enumeration.variants.is_empty() {
+        detail.push_str(" {}");
+        return detail;
+    }
+
+    detail.push_str(" {\n");
+    for variant in enumeration
+        .variants
+        .iter()
+        .take(HOVER_DECLARATION_ITEM_LIMIT)
+    {
+        detail.push_str("    ");
+        detail.push_str(&format_enum_variant(variant));
+        detail.push_str(",\n");
+    }
+    if enumeration.variants.len() > HOVER_DECLARATION_ITEM_LIMIT {
+        detail.push_str("    /* ... */\n");
+    }
+    detail.push('}');
+    detail
+}
+
+fn format_enum_variant(variant: &HirEnumVariant) -> String {
+    match &variant.kind {
+        HirVariantKind::Unit => variant.name.0.clone(),
+        HirVariantKind::Tuple(fields) => format!(
+            "{}({})",
+            variant.name.0,
+            fields
+                .iter()
+                .map(HirTypeRef::display)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        HirVariantKind::Struct(fields) => format!(
+            "{} {{ {} }}",
+            variant.name.0,
+            fields
+                .iter()
+                .map(format_struct_field)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn format_struct_field(field: &HirStructField) -> String {
+    let visibility = if field.visibility.is_public() {
+        "pub "
+    } else {
+        ""
+    };
+    format!("{visibility}{}: {}", field.name.0, field.ty.display())
 }

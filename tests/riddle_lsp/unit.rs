@@ -1,6 +1,7 @@
 use lsp_types::{
-    DiagnosticSeverity, GotoDefinitionResponse, HoverContents, InlayHintLabel, Position, Range,
-    SemanticToken, SemanticTokens, TextDocumentContentChangeEvent,
+    DiagnosticSeverity, DocumentChanges, GotoDefinitionResponse, HoverContents, InlayHintLabel,
+    Position, PrepareRenameResponse, Range, SemanticToken, SemanticTokens,
+    TextDocumentContentChangeEvent,
 };
 use riddle_lsp::{
     parse_args,
@@ -13,8 +14,9 @@ use riddle_lsp::{
         collect_workspace_diagnostics_cancellable, collect_workspace_diagnostics_with_sessions,
         completion_items_for_document, completion_items_for_source, definition_for_document,
         definition_for_source, documents_for_uri, hover_for_source, implementation_for_source,
-        inlay_hints_for_document, inlay_hints_for_source, semantic_token_delta,
-        semantic_tokens_for_document, semantic_tokens_for_source,
+        inlay_hints_for_document, inlay_hints_for_source, prepare_rename_for_source,
+        references_for_document, references_for_source, rename_for_document, rename_for_source,
+        semantic_token_delta, semantic_tokens_for_document, semantic_tokens_for_source,
         semantic_tokens_for_source_with_options, to_lsp, to_lsp_mapped,
     },
 };
@@ -34,9 +36,9 @@ const DOCUMENTED_ERROR_CODES: &[&str] = &[
     "E0011", "E0012", "E0013", "E0020", "E0022", "E0023", "E0024", "E0025", "E0026", "E0027",
     "E0028", "E0029", "E0030", "E0031", "E0032", "E0033", "E0034", "E0035", "E0036", "E0037",
     "E0038", "E0039", "E0040", "E0041", "E0042", "E0043", "E0044", "E0045", "E0047", "E0048",
-    "E0049", "E0050", "E0051", "E0052", "E0053", "E0054", "E0055", "E0056", "E0072", "E0100",
-    "E0200", "E0300", "E0301", "E0302", "E0303", "E0304", "E0305", "E0306", "E0307", "E0308",
-    "E0391",
+    "E0049", "E0050", "E0051", "E0052", "E0053", "E0054", "E0055", "E0056", "E0061", "E0062",
+    "E0063", "E0072", "E0100", "E0200", "E0300", "E0301", "E0302", "E0303", "E0304", "E0305",
+    "E0306", "E0307", "E0308", "E0391",
 ];
 const SOURCE_UNREACHABLE_CODES: &[&str] = &["E0048", "E0049", "E0200"];
 
@@ -1301,6 +1303,67 @@ fn hover_shows_resolved_function_and_local_types() {
 }
 
 #[test]
+fn hover_shows_complete_type_declarations() {
+    let source = r#"enum Foo {
+    A,
+    B(i32),
+    C((i32, &Foo)),
+}
+
+struct Record {
+    first: i32,
+    second: bool,
+    third: Foo,
+    fourth: &Foo,
+    fifth: (i32, Foo),
+    sixth: i32,
+}
+
+type a = Foo;"#;
+
+    for offset in [source.find("Foo {").unwrap(), source.rfind("Foo;").unwrap()] {
+        let hover = hover_for_source(
+            source,
+            position(source, offset + 1),
+            CompileOptions { use_std: false },
+        )
+        .unwrap();
+        let HoverContents::Markup(contents) = hover.contents else {
+            panic!("expected markup hover")
+        };
+        assert_eq!(
+            contents.value,
+            "```riddle\nenum Foo {\n    A,\n    B(i32),\n    C((i32, &Foo)),\n}\n```"
+        );
+    }
+
+    let struct_hover = hover_for_source(
+        source,
+        position(source, source.find("Record {").unwrap() + 1),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let HoverContents::Markup(struct_contents) = struct_hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert_eq!(
+        struct_contents.value,
+        "```riddle\nstruct Record {\n    first: i32,\n    second: bool,\n    third: Foo,\n    fourth: &Foo,\n    fifth: (i32, Foo),\n    /* ... */\n}\n```"
+    );
+
+    let alias_hover = hover_for_source(
+        source,
+        position(source, source.find("a =").unwrap()),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let HoverContents::Markup(alias_contents) = alias_hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert_eq!(alias_contents.value, "```riddle\ntype a = Foo\n```");
+}
+
+#[test]
 fn definition_and_implementation_follow_trait_dispatch() {
     let source = "trait Render { fun render(&self) -> i32; } struct View {} impl Render for View { fun render(&self) -> i32 { 1 } } fun run(value: View) -> i32 { value.render() }";
     let call = source.rfind("render()").unwrap();
@@ -1390,6 +1453,292 @@ fn definition_maps_project_symbols_to_unopened_modules() {
             ),
         )
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn references_respect_shadowing_declarations_and_utf16_positions() {
+    let source = "fun main() { \"😀\"; let value = 1; value; { let value = 2; value; } value; }";
+    let occurrences = source
+        .match_indices("value")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    let cursor = position(source, occurrences[4] + 2);
+
+    let with_declaration =
+        references_for_source(source, cursor, true, CompileOptions { use_std: false }).unwrap();
+    assert_eq!(
+        with_declaration
+            .iter()
+            .map(|location| location.range.start)
+            .collect::<Vec<_>>(),
+        [occurrences[0], occurrences[1], occurrences[4]].map(|offset| position(source, offset))
+    );
+
+    let without_declaration =
+        references_for_source(source, cursor, false, CompileOptions { use_std: false }).unwrap();
+    assert_eq!(
+        without_declaration
+            .iter()
+            .map(|location| location.range.start)
+            .collect::<Vec<_>>(),
+        [occurrences[1], occurrences[4]].map(|offset| position(source, offset))
+    );
+
+    let prepared =
+        prepare_rename_for_source(source, cursor, CompileOptions { use_std: false }).unwrap();
+    assert_eq!(
+        prepared,
+        PrepareRenameResponse::RangeWithPlaceholder {
+            range: Range::new(
+                position(source, occurrences[4]),
+                position(source, occurrences[4] + "value".len()),
+            ),
+            placeholder: "value".into(),
+        }
+    );
+    assert!(
+        rename_for_source(source, cursor, "struct", CompileOptions { use_std: false },).is_err()
+    );
+}
+
+#[test]
+fn references_and_rename_cover_fields_shorthand_and_trait_methods() {
+    let source = r#"struct Point { x: i32 }
+trait Read { fun read(&self) -> i32; }
+impl Read for Point { fun read(&self) -> i32 { self.x } }
+fun run(value: Point, x: i32) -> i32 {
+    let point = Point { x };
+    point.x + value.read()
+}"#;
+    let field_definition = source.find("x: i32").unwrap();
+    let field_references = references_for_source(
+        source,
+        position(source, field_definition + 1),
+        true,
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    assert_eq!(field_references.len(), 4, "{field_references:#?}");
+
+    let field_edit = rename_for_source(
+        source,
+        position(source, field_definition + 1),
+        "y",
+        CompileOptions { use_std: false },
+    )
+    .unwrap()
+    .unwrap();
+    let Some(DocumentChanges::Edits(field_documents)) = field_edit.document_changes else {
+        panic!("expected document edits")
+    };
+    assert_eq!(field_documents.len(), 1);
+    let replacements = field_documents[0]
+        .edits
+        .iter()
+        .map(|edit| match edit {
+            lsp_types::OneOf::Left(edit) => edit.new_text.as_str(),
+            lsp_types::OneOf::Right(_) => panic!("unexpected annotated edit"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replacements.iter().filter(|text| **text == "y").count(), 3);
+    assert_eq!(
+        replacements.iter().filter(|text| **text == "y: x").count(),
+        1
+    );
+
+    let trait_method = source.find("read(&self)").unwrap();
+    let method_references = references_for_source(
+        source,
+        position(source, trait_method + 2),
+        true,
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    assert_eq!(method_references.len(), 3, "{method_references:#?}");
+    let method_edit = rename_for_source(
+        source,
+        position(source, trait_method + 2),
+        "inspect",
+        CompileOptions { use_std: false },
+    )
+    .unwrap()
+    .unwrap();
+    let Some(DocumentChanges::Edits(method_documents)) = method_edit.document_changes else {
+        panic!("expected document edits")
+    };
+    assert_eq!(method_documents[0].edits.len(), 3);
+    assert!(method_documents[0].edits.iter().all(|edit| {
+        matches!(edit, lsp_types::OneOf::Left(edit) if edit.new_text == "inspect")
+    }));
+}
+
+#[test]
+fn explicit_import_aliases_are_renamed_independently() {
+    let source = "mod api { pub fun value() -> i32 { 1 } } use crate::api::{value as fetch}; fun main() -> i32 { fetch() }";
+    let alias_use = source.rfind("fetch()").unwrap();
+    let alias_references = references_for_source(
+        source,
+        position(source, alias_use + 2),
+        true,
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    assert_eq!(alias_references.len(), 2, "{alias_references:#?}");
+
+    let value_definition = source.find("value()").unwrap();
+    let value_references = references_for_source(
+        source,
+        position(source, value_definition + 2),
+        true,
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    assert_eq!(value_references.len(), 2, "{value_references:#?}");
+    let import_value = source.find("{value as").unwrap() + 1;
+    assert_eq!(
+        references_for_source(
+            source,
+            position(source, import_value + 2),
+            true,
+            CompileOptions { use_std: false },
+        )
+        .unwrap(),
+        value_references
+    );
+
+    let edit = rename_for_source(
+        source,
+        position(source, alias_use + 2),
+        "load",
+        CompileOptions { use_std: false },
+    )
+    .unwrap()
+    .unwrap();
+    let Some(DocumentChanges::Edits(documents)) = edit.document_changes else {
+        panic!("expected document edits")
+    };
+    assert_eq!(documents[0].edits.len(), 2);
+    assert!(
+        documents[0].edits.iter().all(|edit| {
+            matches!(edit, lsp_types::OneOf::Left(edit) if edit.new_text == "load")
+        })
+    );
+}
+
+#[test]
+fn project_rename_uses_overlays_and_versions_only_open_documents() {
+    let root = temp_root("project-rename");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_source =
+        "mod util;\nmod consumer;\nfun main() -> i32 { util::value() + consumer::read() }\n";
+    fs::write(&main, main_source).unwrap();
+    let util = root.join("src/util.rid");
+    fs::write(&util, "pub fun stale() -> i32 { 0 }\n").unwrap();
+    let util_overlay = "pub fun value() -> i32 { 1 }\n";
+    let consumer = root.join("src/consumer.rid");
+    let consumer_source = "pub fun read() -> i32 { crate::util::value() }\n";
+    fs::write(&consumer, consumer_source).unwrap();
+
+    let main_uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let util_uri = lsp_types::Url::from_file_path(&util).unwrap();
+    let consumer_uri =
+        lsp_types::Url::from_file_path(fs::canonicalize(&consumer).unwrap()).unwrap();
+    let docs = HashMap::from([
+        (
+            main_uri.clone(),
+            Document {
+                text: main_source.into(),
+                version: Some(7),
+            },
+        ),
+        (
+            util_uri.clone(),
+            Document {
+                text: util_overlay.into(),
+                version: Some(9),
+            },
+        ),
+    ]);
+    let cursor = position(main_source, main_source.find("value()").unwrap() + 2);
+    let sessions = AnalysisSessions::default();
+
+    let references = references_for_document(
+        &main_uri,
+        &docs,
+        cursor,
+        true,
+        CompileOptions { use_std: false },
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(references.len(), 3, "{references:#?}");
+    assert!(
+        references
+            .iter()
+            .any(|location| location.uri == consumer_uri)
+    );
+
+    let edit = rename_for_document(
+        &main_uri,
+        &docs,
+        cursor,
+        "answer",
+        CompileOptions { use_std: false },
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let Some(DocumentChanges::Edits(mut documents)) = edit.document_changes else {
+        panic!("expected document edits")
+    };
+    documents.sort_by(|left, right| {
+        left.text_document
+            .uri
+            .as_str()
+            .cmp(right.text_document.uri.as_str())
+    });
+    assert_eq!(documents.len(), 3);
+    assert_eq!(
+        documents
+            .iter()
+            .find(|document| document.text_document.uri == main_uri)
+            .unwrap()
+            .text_document
+            .version,
+        Some(7)
+    );
+    assert_eq!(
+        documents
+            .iter()
+            .find(|document| document.text_document.uri == util_uri)
+            .unwrap()
+            .text_document
+            .version,
+        Some(9)
+    );
+    assert_eq!(
+        documents
+            .iter()
+            .find(|document| document.text_document.uri == consumer_uri)
+            .unwrap()
+            .text_document
+            .version,
+        None
+    );
+    assert!(documents.iter().all(|document| {
+        document
+            .edits
+            .iter()
+            .all(|edit| matches!(edit, lsp_types::OneOf::Left(edit) if edit.new_text == "answer"))
+    }));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2037,6 +2386,27 @@ fn reachable_diagnostic_producers_have_exact_primary_and_lsp_spans() {
             "use missing::*;\nfun main() {}",
             "missing::*",
             "missing::*",
+        ),
+        (
+            "E0061",
+            "`?` requires a Result value",
+            "fun main() { 1?; }",
+            "1?",
+            "1?",
+        ),
+        (
+            "E0062",
+            "can only be used in a function returning Result",
+            "enum Result<T, E> { Ok(T), Err(E) } fun main() -> i32 { let value: Result<i32, i32> = Result::Ok(1); value?; 0 }",
+            "value?",
+            "value?",
+        ),
+        (
+            "E0063",
+            "cannot convert",
+            "enum Result<T, E> { Ok(T), Err(E) } struct Inner {} struct Outer {} fun read() -> Result<i32, Inner> { Result::Ok(1) } fun main() -> Result<i32, Outer> { let value = read()?; Result::Ok(value) }",
+            "read()?",
+            "read()?",
         ),
         (
             "E0072",

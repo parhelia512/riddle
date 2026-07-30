@@ -273,6 +273,7 @@ pub enum HirUseTreeKind {
 pub struct HirPath {
     pub anchor: PathAnchor,
     pub segments: Vec<Name>,
+    pub segment_type_args: Vec<(usize, Vec<HirTypeRef>)>,
     pub type_args: Vec<HirTypeRef>,
     pub range: TextRange,
 }
@@ -281,6 +282,7 @@ impl PartialEq for HirPath {
     fn eq(&self, other: &Self) -> bool {
         self.anchor == other.anchor
             && self.segments == other.segments
+            && self.segment_type_args == other.segment_type_args
             && self.type_args == other.type_args
     }
 }
@@ -291,6 +293,7 @@ impl Hash for HirPath {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.anchor.hash(state);
         self.segments.hash(state);
+        self.segment_type_args.hash(state);
         self.type_args.hash(state);
     }
 }
@@ -356,6 +359,21 @@ impl HirPath {
                 s.push_str("::");
             }
             s.push_str(&seg.0);
+            if let Some((_, args)) = self
+                .segment_type_args
+                .iter()
+                .find(|(segment, _)| *segment == i)
+            {
+                s.push_str("::<");
+                s.push_str(
+                    &args
+                        .iter()
+                        .map(HirTypeRef::display)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                s.push('>');
+            }
         }
         if !self.type_args.is_empty() {
             let args = self
@@ -369,6 +387,13 @@ impl HirPath {
             s.push('>');
         }
         s
+    }
+
+    pub fn type_args_for_segment(&self, index: usize) -> &[HirTypeRef] {
+        self.segment_type_args
+            .iter()
+            .find_map(|(segment, args)| (*segment == index).then_some(args.as_slice()))
+            .unwrap_or_default()
     }
 
     /// `crate`, `super`, `self`, and `::xxx` are all considered non-pure simple names.

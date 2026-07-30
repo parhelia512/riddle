@@ -1,9 +1,24 @@
+use crate::std::iter::{IntoIterator, Iterator};
+use crate::std::option::Option;
 use crate::std::vector::Vector;
 
 // SAFETY: the caller must guarantee that value contains valid UTF-8.
 unsafe fun from_utf8_unchecked(value: &[u8]) -> &str {
     // SAFETY: &[u8] and &str use the same pointer and length metadata.
     unsafe { value as &str }
+}
+
+// SAFETY: the caller must guarantee that value is a valid Unicode scalar value.
+unsafe fun char_from_u32_unchecked(value: u32) -> char {
+    // SAFETY: char and u32 have the same runtime representation.
+    let values = [value];
+    let slice: &[u32] = &values;
+    unsafe { *(slice.as_ptr() as *const char) }
+}
+
+pub struct StrIter {
+    bytes: &[u8],
+    index: usize,
 }
 
 pub struct String {
@@ -62,5 +77,66 @@ impl str {
 
     pub fun as_bytes(&self) -> &[u8] {
         self as &[u8]
+    }
+}
+
+impl Iterator for StrIter {
+    type Item = char;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        let first = match self.bytes.get(self.index) {
+            Option::Some(value) => *value,
+            Option::None => { return Option::None; },
+        };
+
+        if first < 128u8 {
+            self.index += 1usize;
+            return Option::Some(unsafe { char_from_u32_unchecked(first as u32) });
+        }
+
+        let second = match self.bytes.get(self.index + 1usize) {
+            Option::Some(value) => *value,
+            Option::None => { return Option::None; },
+        };
+        if first < 224u8 {
+            self.index += 2usize;
+            let value = (((first & 31u8) as u32) << 6u32) | ((second & 63u8) as u32);
+            return Option::Some(unsafe { char_from_u32_unchecked(value) });
+        }
+
+        let third = match self.bytes.get(self.index + 2usize) {
+            Option::Some(value) => *value,
+            Option::None => { return Option::None; },
+        };
+        if first < 240u8 {
+            self.index += 3usize;
+            let value = (((first & 15u8) as u32) << 12u32)
+                | (((second & 63u8) as u32) << 6u32)
+                | ((third & 63u8) as u32);
+            return Option::Some(unsafe { char_from_u32_unchecked(value) });
+        }
+
+        let fourth = match self.bytes.get(self.index + 3usize) {
+            Option::Some(value) => *value,
+            Option::None => { return Option::None; },
+        };
+        self.index += 4usize;
+        let value = (((first & 7u8) as u32) << 18u32)
+            | (((second & 63u8) as u32) << 12u32)
+            | (((third & 63u8) as u32) << 6u32)
+            | ((fourth & 63u8) as u32);
+        Option::Some(unsafe { char_from_u32_unchecked(value) })
+    }
+}
+
+impl IntoIterator for &str {
+    type Item = char;
+    type IntoIter = StrIter;
+
+    fun into_iter(self) -> Self::IntoIter {
+        StrIter {
+            bytes: self.as_bytes(),
+            index: 0usize,
+        }
     }
 }

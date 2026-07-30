@@ -181,6 +181,10 @@ impl Backend for CBackend {
                 writeln!(out, "  unsigned char _riddle_zst;").unwrap();
             }
             for (name, ty) in &s.fields {
+                if matches!(ty, Type::Unit | Type::Never | Type::Void) {
+                    writeln!(out, "  unsigned char {};", c_source_name('m', name)).unwrap();
+                    continue;
+                }
                 let (pre, suf) = c_decl_parts(ty);
                 writeln!(out, "  {} {}{};", pre, c_source_name('m', name), suf).unwrap();
             }
@@ -261,6 +265,24 @@ impl Backend for CBackend {
             writeln!(out).unwrap();
         }
 
+        if self.needs_runtime
+            && let Some(main) = module
+                .function_order
+                .iter()
+                .map(|fid| &module.functions[*fid])
+                .find(|function| function.name == "main")
+        {
+            if !main.params.is_empty() {
+                return Err("runtime-backed `main` cannot take parameters".into());
+            }
+            let user_main = self.c_function_name("main")?;
+            writeln!(out, "int main(void) {{").unwrap();
+            writeln!(out, "  int rgc_stack_anchor = 0;").unwrap();
+            writeln!(out, "  rgc_init(&rgc_stack_anchor);").unwrap();
+            writeln!(out, "  return (int){user_main}();").unwrap();
+            writeln!(out, "}}").unwrap();
+        }
+
         Ok(out)
     }
 
@@ -306,14 +328,6 @@ impl CBackend {
         }
         writeln!(out, ") {{").unwrap();
 
-        if self.needs_runtime && func.name == "main" {
-            writeln!(out, "#if defined(__linux__) && defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))").unwrap();
-            writeln!(out, "  rgc_init(__builtin_frame_address(0));").unwrap();
-            writeln!(out, "#else").unwrap();
-            writeln!(out, "  int rgc_stack_anchor = 0;").unwrap();
-            writeln!(out, "  rgc_init(&rgc_stack_anchor);").unwrap();
-            writeln!(out, "#endif").unwrap();
-        }
         self.predeclare_phi_vars(func, out);
 
         for (bid, block) in func.blocks.iter() {
@@ -520,6 +534,7 @@ impl CBackend {
                     let rhs_name = self.name(*rhs).to_owned();
                     let expr = match &inst.ty {
                         Type::Int(ty) => integer_binop_expr(*ty, *op, &lhs_name, &rhs_name),
+                        Type::Float(ty) => float_binop_expr(*ty, *op, &lhs_name, &rhs_name),
                         _ => format!("({} {} {})", lhs_name, binop_c(*op), rhs_name),
                     };
                     if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
@@ -614,6 +629,7 @@ impl CBackend {
                 let src = self.value_expr(*value);
                 let expr = match (op, target_ty) {
                     (CastOp::IntToInt, Type::Int(ty)) => integer_cast_expr(*ty, &src),
+                    (CastOp::IntToChar, Type::Char) => format!("(({}){})", ct, src),
                     (CastOp::FloatToInt, Type::Int(ty)) => float_to_int_expr(*ty, &src),
                     _ => format!("(({}){})", ct, src),
                 };
@@ -1037,6 +1053,9 @@ impl CBackend {
     }
 
     fn c_function_name(&self, name: &str) -> Result<String, String> {
+        if self.needs_runtime && name == "main" {
+            return Ok(c_source_name('f', name));
+        }
         if !self.c_exports.contains(name) {
             return Ok(c_function_name(name));
         }
@@ -1619,6 +1638,17 @@ fn integer_binop_expr(ty: IntTy, op: BinOp, lhs: &str, rhs: &str) -> String {
             }
         }
     }
+}
+
+fn float_binop_expr(ty: FloatTy, op: BinOp, lhs: &str, rhs: &str) -> String {
+    if op == BinOp::Mod {
+        let function = match ty {
+            FloatTy::F32 => "fmodf",
+            FloatTy::F64 => "fmod",
+        };
+        return format!("{}({}, {})", function, lhs, rhs);
+    }
+    format!("({} {} {})", lhs, binop_c(op), rhs)
 }
 
 fn integer_unop_expr(ty: IntTy, op: UnOp, operand: &str) -> String {

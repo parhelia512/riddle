@@ -385,6 +385,7 @@ impl<'a> SummaryAnalyzer<'a> {
 
             Expr::Unsafe { body } => self.analyze_expr(*body),
             Expr::Cast { base, .. } => self.analyze_expr(*base),
+            Expr::Try { operand } => self.analyze_expr(*operand),
         };
 
         if !self.expr_may_carry_provenance(expr_id) {

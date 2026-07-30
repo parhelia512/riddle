@@ -24,7 +24,9 @@ pub mod test_support {
     };
     pub use crate::inlay_hints::{inlay_hints_for_document, inlay_hints_for_source};
     pub use crate::navigation::{
-        definition_for_document, definition_for_source, hover_for_source, implementation_for_source,
+        definition_for_document, definition_for_source, hover_for_source,
+        implementation_for_source, prepare_rename_for_source, references_for_document,
+        references_for_source, rename_for_document, rename_for_source,
     };
     pub use crate::semantic_tokens::{
         MOD_DECLARATION, MOD_DEFAULT_LIBRARY, MOD_MUTABLE, MOD_STATIC, TOKEN_COMMENT, TOKEN_ENUM,

@@ -688,6 +688,14 @@ impl<'s> Parser<'s> {
             self.error(format!("expected path segment, found {:?}", self.current()));
         }
 
+        if self.at(SyntaxKind::ColonColon)
+            && self.nth(1) == SyntaxKind::Less
+            && self.type_arg_list_followed_by(1, SyntaxKind::ColonColon)
+        {
+            self.bump(); // ::
+            self.type_arg_list();
+        }
+
         m.complete(self, SyntaxKind::PathSegment);
     }
 
@@ -1214,6 +1222,18 @@ impl<'s> Parser<'s> {
                 self.expression();
                 self.expect(SyntaxKind::RBracket);
                 lhs = m.complete(self, SyntaxKind::IndexExpr);
+                continue;
+            }
+
+            // try propagation
+            if op == SyntaxKind::Question {
+                const TRY_BP: u8 = 15;
+                if TRY_BP < min_bp {
+                    break;
+                }
+                let m = lhs.precede(self);
+                self.bump();
+                lhs = m.complete(self, SyntaxKind::TryExpr);
                 continue;
             }
 
