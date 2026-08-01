@@ -6,6 +6,7 @@ use crate::{
     Type,
     lang_items::{CompositeKind, LangItem, LangItemRegistry, RegisterResult},
     lowering::substitute_type,
+    types::{FloatTy, IntTy},
 };
 
 #[derive(Debug, Clone)]
@@ -84,7 +85,17 @@ impl TraitEnv {
         trait_id: TraitId,
         assumptions: &[TraitBound],
     ) -> bool {
-        self.type_implements_inner(ty, trait_id, &[], assumptions, 0)
+        self.type_implements_with_args_assuming(ty, trait_id, &[], assumptions)
+    }
+
+    pub(crate) fn type_implements_with_args_assuming(
+        &self,
+        ty: &Type,
+        trait_id: TraitId,
+        trait_args: &[Type],
+        assumptions: &[TraitBound],
+    ) -> bool {
+        self.type_implements_inner(ty, trait_id, trait_args, assumptions, 0)
     }
 
     fn type_implements_inner(
@@ -97,6 +108,27 @@ impl TraitEnv {
     ) -> bool {
         if depth > 64 {
             return false;
+        }
+        match ty {
+            Type::InferInt => {
+                return self.type_implements_inner(
+                    &Type::Int(IntTy::I32),
+                    trait_id,
+                    trait_args,
+                    assumptions,
+                    depth,
+                );
+            }
+            Type::InferFloat => {
+                return self.type_implements_inner(
+                    &Type::Float(FloatTy::F64),
+                    trait_id,
+                    trait_args,
+                    assumptions,
+                    depth,
+                );
+            }
+            _ => {}
         }
         if assumptions.iter().any(|bound| {
             bound.trait_id == trait_id

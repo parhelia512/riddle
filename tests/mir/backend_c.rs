@@ -45,6 +45,36 @@ fn c_simple_function() {
 }
 
 #[test]
+fn c_export_uses_c_string_abi_and_preserves_internal_str_layout() {
+    let module = lower(
+        r#"
+        #[c_export]
+        fun macro_wrapper(input: &str) {}
+
+        fun ordinary(input: &str) {}
+        "#,
+    );
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(
+        generated.contains("void macro_wrapper(const char *p0);"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("void macro_wrapper (const char *"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("riddle_str export_str") && generated.contains("= (riddle_str){"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!("void {}(riddle_str p0);", c_function("ordinary"))),
+        "{generated}"
+    );
+}
+
+#[test]
 fn c_slice_borrow_carries_length_and_indexes_elements() {
     let (_, type_result, analysis, module) = compile(
         r#"
@@ -1426,6 +1456,43 @@ fn c_backend_dispatches_trait_bound_method_in_generic_function() {
 }
 
 #[test]
+fn c_backend_dispatches_generic_raw_pointer_trait_impl() {
+    let module = lower(
+        r#"
+        trait Value {
+            fun value(&self) -> i32;
+        }
+
+        impl<T> Value for *mut T {
+            fun value(&self) -> i32 { 7 }
+        }
+
+        fun read<T: Value>(value: T) -> i32 {
+            value.value()
+        }
+
+        fun main() -> i32 {
+            let pointer = 0usize as *mut i32;
+            read(pointer)
+        }
+        "#,
+    );
+    let mut backend = CBackend::new();
+    let result = backend.compile(&module).unwrap();
+
+    assert!(
+        result.contains(&c_function("value__ptr_i32")),
+        "missing raw pointer impl monomorph:\n{}",
+        result
+    );
+    assert!(
+        result.contains(&format!("{}(", c_function("value__ptr_i32"))),
+        "generic body should call the concrete raw pointer impl:\n{}",
+        result
+    );
+}
+
+#[test]
 fn c_backend_uses_trait_default_method_unless_overridden() {
     let module = lower(
         r#"
@@ -1716,9 +1783,14 @@ fn c_backend_uses_strict_c11_representations_for_zero_sized_values() {
         r#"
         struct Empty {}
 
+        fun take_unit(value: ()) {}
+
         fun main() {
             let empty = Empty {};
             let values: [i32; 0] = [];
+            let unit = ();
+            let units = [(), ()];
+            take_unit(unit);
         }
         "#,
     );
@@ -1732,6 +1804,17 @@ fn c_backend_uses_strict_c11_representations_for_zero_sized_values() {
     );
     assert!(!generated.contains("[0]"), "{generated}");
     assert!(!generated.contains("{  }"), "{generated}");
+    assert!(
+        generated.contains("typedef unsigned char riddle_unit;"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!(
+            "void {}(riddle_unit p0);",
+            c_function("take_unit")
+        )),
+        "{generated}"
+    );
 }
 
 #[test]

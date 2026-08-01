@@ -142,6 +142,8 @@ impl Backend for CBackend {
             "typedef struct {{ void* ptr; size_t len; }} riddle_slice;"
         )
         .unwrap();
+        // ponytail: C needs an addressable unit token until generic ZST storage is supported.
+        writeln!(out, "typedef unsigned char riddle_unit;").unwrap();
         writeln!(out).unwrap();
 
         let structs = collect_structs(module);
@@ -163,7 +165,7 @@ impl Backend for CBackend {
             writeln!(
                 out,
                 "typedef {} (*{})({});",
-                ctype_of(&signature.ret),
+                c_callable_return_type(&signature.ret),
                 fn_ptr_name(&signature),
                 if params.is_empty() {
                     "void".into()
@@ -200,7 +202,7 @@ impl Backend for CBackend {
                 .params
                 .iter()
                 .enumerate()
-                .map(|(index, p)| c_param_decl(&p.ty, &format!("p{index}")))
+                .map(|(index, p)| c_function_param_decl(func, &p.ty, &format!("p{index}")))
                 .collect();
             let sname = self.c_function_name(&func.name)?;
             writeln!(
@@ -247,7 +249,7 @@ impl Backend for CBackend {
             writeln!(
                 out,
                 "extern {} {}({});",
-                ctype_of_ffi(&ext.ret_type),
+                c_ffi_return_type(&ext.ret_type),
                 ext.name,
                 if params.is_empty() {
                     "void".into()
@@ -301,9 +303,19 @@ impl CBackend {
         self.counter = 0;
         self.use_counts = count_uses(func);
 
+        let mut exported_strings = Vec::new();
         for p in &func.params {
             let ct = ctype_of(&p.ty);
-            self.set(p.value, c_source_name('v', &p.name), ct);
+            let abi_name = c_source_name('v', &p.name);
+            if func.uses_c_string_abi
+                && matches!(&p.ty, Type::Ref(inner, _) if **inner == Type::Str)
+            {
+                let internal_name = fresh_c(&mut self.counter, "export_str");
+                self.set(p.value, internal_name.clone(), ct);
+                exported_strings.push((abi_name, internal_name));
+            } else {
+                self.set(p.value, abi_name, ct);
+            }
             self.record_struct_type(p.value, &p.ty);
         }
 
@@ -311,7 +323,7 @@ impl CBackend {
         let param_strs: Vec<String> = func
             .params
             .iter()
-            .map(|p| c_param_decl(&p.ty, &c_source_name('v', &p.name)))
+            .map(|p| c_function_param_decl(func, &p.ty, &c_source_name('v', &p.name)))
             .collect();
 
         let sname = self.c_function_name(&func.name)?;
@@ -327,6 +339,14 @@ impl CBackend {
             }
         }
         writeln!(out, ") {{").unwrap();
+
+        for (abi_name, internal_name) in exported_strings {
+            writeln!(
+                out,
+                "  riddle_str {internal_name} = (riddle_str){{ {abi_name}, {abi_name} ? strlen({abi_name}) : 0 }};"
+            )
+            .unwrap();
+        }
 
         self.predeclare_phi_vars(func, out);
 
@@ -345,11 +365,17 @@ impl CBackend {
                 Terminator::Pending => {
                     return Err(format!("block {bid_raw} has no terminator"));
                 }
-                Terminator::Return(val) => match val {
-                    Some(v) => writeln!(out, "  return {};", self.name(*v)).unwrap(),
-                    None if func.name == "main" => writeln!(out, "  return 0;").unwrap(),
-                    None => writeln!(out, "  return;").unwrap(),
-                },
+                Terminator::Return(val) => {
+                    if func.name == "main" && matches!(func.ret_type, Type::Unit) {
+                        writeln!(out, "  return 0;").unwrap();
+                    } else if matches!(func.ret_type, Type::Unit | Type::Never | Type::Void) {
+                        writeln!(out, "  return;").unwrap();
+                    } else if let Some(value) = val {
+                        writeln!(out, "  return {};", self.name(*value)).unwrap();
+                    } else {
+                        writeln!(out, "  return;").unwrap();
+                    }
+                }
                 Terminator::Branch(target) => {
                     self.emit_phi_assignments(func, *target, bid, out, "  ");
                     let tid = target.into_raw();
@@ -423,7 +449,7 @@ impl CBackend {
                         }
                     }
                     ConstValue::Char(val) => format!("UINT32_C({})", u32::from(*val)),
-                    ConstValue::Unit => String::new(),
+                    ConstValue::Unit => "((riddle_unit)0)".into(),
                 };
                 self.set_inline(v, expr, ct);
             }
@@ -956,7 +982,10 @@ impl CBackend {
                     })
                     .collect();
                 // void return — emit call as a statement, no assignment
-                if matches!(&inst.ty, Type::Unit | Type::Never | Type::Void) {
+                if matches!(&inst.ty, Type::Unit) {
+                    writeln!(out, "  {}({});", callee_name, args_str.join(", ")).unwrap();
+                    self.set_inline(v, "((riddle_unit)0)".into(), "riddle_unit".into());
+                } else if matches!(&inst.ty, Type::Never | Type::Void) {
                     writeln!(out, "  {}({});", callee_name, args_str.join(", ")).unwrap();
                     self.set(v, "".into(), "void".into());
                 } else if is_extern && is_fat_repr(&inst.ty) {
@@ -1008,7 +1037,10 @@ impl CBackend {
                     .map(|arg| self.name(*arg).to_owned())
                     .collect::<Vec<_>>()
                     .join(", ");
-                if matches!(&inst.ty, Type::Unit | Type::Never | Type::Void) {
+                if matches!(&inst.ty, Type::Unit) {
+                    writeln!(out, "  {}({});", callee, args).unwrap();
+                    self.set_inline(v, "((riddle_unit)0)".into(), "riddle_unit".into());
+                } else if matches!(&inst.ty, Type::Never | Type::Void) {
                     writeln!(out, "  {}({});", callee, args).unwrap();
                     self.set(v, "".into(), "void".into());
                 } else {
@@ -1295,7 +1327,15 @@ fn c_return_type(func: &Function) -> String {
     if func.name == "main" && matches!(func.ret_type, Type::Unit) {
         "int".into()
     } else {
-        ctype_of(&func.ret_type)
+        c_callable_return_type(&func.ret_type)
+    }
+}
+
+fn c_callable_return_type(ty: &Type) -> String {
+    if matches!(ty, Type::Unit | Type::Never | Type::Void) {
+        "void".into()
+    } else {
+        ctype_of(ty)
     }
 }
 
@@ -1335,7 +1375,8 @@ fn ctype_of(ty: &Type) -> String {
         Type::Tuple(elements) => c_type_name(&tuple_name(elements)),
         Type::Enum(e) => c_type_name(&format!("enum::{}", e.name)),
         Type::FnPtr(signature) => fn_ptr_name(signature),
-        Type::Unit | Type::Never | Type::Void => "void".into(),
+        Type::Unit => "riddle_unit".into(),
+        Type::Never | Type::Void => "void".into(),
     }
 }
 
@@ -1411,6 +1452,14 @@ fn ctype_of_ffi(ty: &Type) -> String {
         // MIR and inserts the compatible pointer conversion at call sites.
         Type::Ptr(_) => "void*".into(),
         _ => ctype_of(ty),
+    }
+}
+
+fn c_ffi_return_type(ty: &Type) -> String {
+    if matches!(ty, Type::Unit | Type::Never | Type::Void) {
+        "void".into()
+    } else {
+        ctype_of_ffi(ty)
     }
 }
 
@@ -1546,6 +1595,14 @@ fn c_decl_parts(ty: &Type) -> (String, String) {
 fn c_param_decl(ty: &Type, name: &str) -> String {
     let (pre, suf) = c_decl_parts(ty);
     format!("{} {}{}", pre, name, suf)
+}
+
+fn c_function_param_decl(func: &Function, ty: &Type, name: &str) -> String {
+    if func.uses_c_string_abi && matches!(ty, Type::Ref(inner, _) if **inner == Type::Str) {
+        format!("const char *{name}")
+    } else {
+        c_param_decl(ty, name)
+    }
 }
 
 fn integer_binop_expr(ty: IntTy, op: BinOp, lhs: &str, rhs: &str) -> String {

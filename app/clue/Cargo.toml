@@ -5,11 +5,15 @@ edition.workspace = true
 
 [dependencies]
 anyhow = "1.0"
+ast = { path = "../../crates/ast" }
 clap = { version = "4.6.4", features = ["derive"] }
+frontend = { path = "../../crates/frontend" }
 gc = { path = "../../crates/gc" }
 riddlec = { path = "../riddlec" }
+rowan = "0.16.1"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+type-checker = { path = "../../crates/type-checker" }
 
 [[test]]
 name = "commands"

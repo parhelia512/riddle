@@ -14,6 +14,7 @@ pub struct Function {
     pub blocks: Arena<Block>,
     pub entry: BlockId,
     pub is_c_export: bool,
+    pub uses_c_string_abi: bool,
 
     /// Global counter for the next unreserved Value number.
     pub next_value: u32,
@@ -39,6 +40,7 @@ impl Function {
             blocks,
             entry,
             is_c_export: false,
+            uses_c_string_abi: false,
             next_value: 0,
         }
     }

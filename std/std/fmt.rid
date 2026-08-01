@@ -51,6 +51,10 @@ pub trait Display {
     fun fmt(&self, formatter: &mut Formatter) -> Result;
 }
 
+pub trait Debug {
+    fun fmt(&self, formatter: &mut Formatter) -> Result;
+}
+
 impl Display for &str {
     fun fmt(&self, formatter: &mut Formatter) -> Result {
         formatter.write_str(*self)
@@ -85,6 +89,76 @@ impl Display for u64 { fun fmt(&self, formatter: &mut Formatter) -> Result { wri
 impl Display for usize { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
 impl Display for f32 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_float(formatter, *self as f64) } }
 impl Display for f64 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_float(formatter, *self) } }
+
+impl Debug for &str {
+    fun fmt(&self, formatter: &mut Formatter) -> Result {
+        write_debug_str(formatter, *self)
+    }
+}
+
+impl Debug for () { fun fmt(&self, formatter: &mut Formatter) -> Result { formatter.write_str("()") } }
+impl<T> Debug for *mut T {
+    fun fmt(&self, formatter: &mut Formatter) -> Result {
+        // ponytail: add the numeric address when pointer-to-integer casts exist.
+        formatter.write_str("<pointer>")
+    }
+}
+impl Debug for bool { fun fmt(&self, formatter: &mut Formatter) -> Result { write_debug_bool(formatter, *self) } }
+impl Debug for char { fun fmt(&self, formatter: &mut Formatter) -> Result { write_debug_char(formatter, *self) } }
+impl Debug for i8 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self as i64) } }
+impl Debug for i16 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self as i64) } }
+impl Debug for i32 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self as i64) } }
+impl Debug for i64 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self) } }
+impl Debug for isize { fun fmt(&self, formatter: &mut Formatter) -> Result { write_signed(formatter, *self as i64) } }
+impl Debug for u8 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
+impl Debug for u16 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
+impl Debug for u32 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
+impl Debug for u64 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self) } }
+impl Debug for usize { fun fmt(&self, formatter: &mut Formatter) -> Result { write_unsigned(formatter, *self as u64) } }
+impl Debug for f32 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_float(formatter, *self as f64) } }
+impl Debug for f64 { fun fmt(&self, formatter: &mut Formatter) -> Result { write_float(formatter, *self) } }
+
+pub fun write_debug<T: Debug>(value: &T, formatter: &mut Formatter) -> Result {
+    value.fmt(formatter)
+}
+
+fun write_debug_bool(formatter: &mut Formatter, value: bool) -> Result {
+    if value {
+        formatter.write_str("true")
+    } else {
+        formatter.write_str("false")
+    }
+}
+
+fun write_debug_str(formatter: &mut Formatter, value: &str) -> Result {
+    formatter.write_char('"')?;
+    for character in value {
+        match character {
+            '\\' => formatter.write_str("\\\\")?,
+            '"' => formatter.write_str("\\\"")?,
+            '\n' => formatter.write_str("\\n")?,
+            '\r' => formatter.write_str("\\r")?,
+            '\t' => formatter.write_str("\\t")?,
+            '\0' => formatter.write_str("\\0")?,
+            character => formatter.write_char(character)?,
+        }
+    }
+    formatter.write_char('"')
+}
+
+fun write_debug_char(formatter: &mut Formatter, value: char) -> Result {
+    formatter.write_char('\'')?;
+    match value {
+        '\\' => formatter.write_str("\\\\")?,
+        '\'' => formatter.write_str("\\'")?,
+        '\n' => formatter.write_str("\\n")?,
+        '\r' => formatter.write_str("\\r")?,
+        '\t' => formatter.write_str("\\t")?,
+        '\0' => formatter.write_str("\\0")?,
+        value => formatter.write_char(value)?,
+    }
+    formatter.write_char('\'')
+}
 
 fun write_signed(formatter: &mut Formatter, value: i64) -> Result {
     if value < 0i64 {

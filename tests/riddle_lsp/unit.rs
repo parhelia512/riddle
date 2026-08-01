@@ -8,15 +8,16 @@ use riddle_lsp::{
     test_support::{
         AnalysisSessions, DiagnosticSessions, Document, MOD_DECLARATION, MOD_DEFAULT_LIBRARY,
         MOD_MUTABLE, MOD_STATIC, RequestRevisions, TOKEN_COMMENT, TOKEN_ENUM, TOKEN_FUNCTION,
-        TOKEN_INTERFACE, TOKEN_KEYWORD, TOKEN_METHOD, TOKEN_PARAMETER, TOKEN_STRING, TOKEN_STRUCT,
-        TOKEN_TYPE, TOKEN_VARIABLE, apply_content_changes, collect_diagnostics,
+        TOKEN_INTERFACE, TOKEN_KEYWORD, TOKEN_MACRO, TOKEN_METHOD, TOKEN_PARAMETER, TOKEN_STRING,
+        TOKEN_STRUCT, TOKEN_TYPE, TOKEN_VARIABLE, apply_content_changes, collect_diagnostics,
         collect_document_diagnostics, collect_workspace_diagnostics,
         collect_workspace_diagnostics_cancellable, collect_workspace_diagnostics_with_sessions,
         completion_items_for_document, completion_items_for_source, definition_for_document,
-        definition_for_source, documents_for_uri, hover_for_source, implementation_for_source,
-        inlay_hints_for_document, inlay_hints_for_source, prepare_rename_for_source,
-        references_for_document, references_for_source, rename_for_document, rename_for_source,
-        semantic_token_delta, semantic_tokens_for_document, semantic_tokens_for_source,
+        definition_for_source, documents_for_uri, hover_for_document, hover_for_source,
+        implementation_for_source, inlay_hints_for_document, inlay_hints_for_source,
+        prepare_rename_for_document, prepare_rename_for_source, references_for_document,
+        references_for_source, rename_for_document, rename_for_source, semantic_token_delta,
+        semantic_tokens_for_document, semantic_tokens_for_source,
         semantic_tokens_for_source_with_options, to_lsp, to_lsp_mapped,
     },
 };
@@ -25,9 +26,11 @@ use rowan::TextRange;
 use std::{
     cell::Cell,
     collections::HashMap,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::PathBuf,
-    process,
+    process::{self, Command},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -51,6 +54,17 @@ fn temp_root(name: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+fn c_compiler_available() -> bool {
+    env::var_os("CC")
+        .into_iter()
+        .chain(
+            ["cc", "gcc", "clang", "clang-cl", "cl"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .any(|compiler| Command::new(compiler).arg("--version").output().is_ok())
 }
 
 fn semantic_tokens(source: &str) -> SemanticTokens {
@@ -587,7 +601,7 @@ fn completion_filters_member_candidates_after_the_dot() {
 
 #[test]
 fn completion_recovers_incomplete_let_member_access() {
-    let source = "use std::Vector;\n\nfun main() {\n    let c: Vector<i32> = Vector::new();\n    let d = c.\n}";
+    let source = "use std::vector::Vector;\n\nfun main() {\n    let c: Vector<i32> = Vector::new();\n    let d = c.\n}";
     let items = completion_items_for_source(
         source,
         position(source, source.find("c.\n").unwrap() + "c.".len()),
@@ -649,6 +663,39 @@ fn completion_includes_std_prelude_imports() {
         items.iter().any(|item| item.label == "Vector"),
         "{items:#?}"
     );
+}
+
+#[test]
+fn completion_includes_standard_print_macros() {
+    let source = "fun main() { p!(); }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("p!").unwrap() + 1),
+        CompileOptions::default(),
+    );
+
+    assert!(
+        items.iter().any(|item| {
+            item.label == "print" && item.detail.as_deref() == Some("standard macro")
+        })
+    );
+    assert!(items.iter().any(|item| {
+        item.label == "println" && item.detail.as_deref() == Some("standard macro")
+    }));
+}
+
+#[test]
+fn completion_includes_standard_debug_derive() {
+    let source = "#[derive(De)] struct Value {}";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("De").unwrap() + 2),
+        CompileOptions::default(),
+    );
+
+    assert!(items.iter().any(|item| {
+        item.label == "Debug" && item.detail.as_deref() == Some("standard derive macro")
+    }));
 }
 
 #[test]
@@ -866,7 +913,8 @@ fn project_member_completion_uses_active_module_coordinates() {
 #[test]
 fn completion_preserves_std_member_items_through_document_sessions() {
     let uri = lsp_types::Url::parse("file:///riddle-lsp-completion.rid").unwrap();
-    let text = "use std::Vector; fun main() { let c: Vector<i32> = Vector::new(); let d = c.i }";
+    let text =
+        "use std::vector::Vector; fun main() { let c: Vector<i32> = Vector::new(); let d = c.i }";
     let docs = HashMap::from([(
         uri.clone(),
         Document {
@@ -929,6 +977,317 @@ fn project_semantic_tokens_resolve_cross_module_functions() {
             && token.start == make.character
             && token.token_type == TOKEN_FUNCTION
     }));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_lsp_tracks_imported_proc_macros() {
+    if !c_compiler_available() {
+        eprintln!("skipping proc-macro LSP test: no C compiler found");
+        return;
+    }
+    let root = temp_root("project-proc-macro-lsp");
+    fs::create_dir_all(root.join("macros/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("macros/Clue.toml"),
+        r#"[package]
+name = "macros"
+
+[lib]
+path = "src/lib.rid"
+proc-macro = true
+
+[dependencies]
+"#,
+    )
+    .unwrap();
+    let macro_source = r#"#[proc_macro_derive(Debug)]
+pub fun derive_debug(input: TokenStream) -> TokenStream { TokenStream::new() }
+
+#[proc_macro]
+pub fun answer(input: TokenStream) -> TokenStream {
+    TokenStream::from_str("1").unwrap_or(TokenStream::new())
+}
+
+#[proc_macro_attribute]
+pub fun passthrough(args: TokenStream, item: TokenStream) -> TokenStream { item }
+"#;
+    let macro_path = root.join("macros/src/lib.rid");
+    fs::write(&macro_path, macro_source).unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+macros = { path = "../macros" }
+"#,
+    )
+    .unwrap();
+    let source = r#"mod ordinary { pub fun plain() -> i32 { 2 } }
+use {macros::Debug as Inspect, macros::answer, macros::passthrough, ordinary::plain};
+
+#[derive(Inspect)]
+struct Value {}
+
+#[passthrough]
+fun value() -> i32 { 2 }
+
+fun main() -> i32 { answer!() + plain() }
+"#;
+    let main_path = root.join("app/src/main.rid");
+    fs::write(&main_path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&main_path).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: source.into(),
+            version: Some(3),
+        },
+    )]);
+    let sessions = AnalysisSessions::default();
+    let options = CompileOptions { use_std: false };
+
+    let tokens = semantic_tokens_for_document(&uri, &docs, options, &sessions).unwrap();
+    let positions = semantic_token_positions(&tokens);
+    for offset in source
+        .match_indices("Inspect")
+        .chain(source.match_indices("answer"))
+        .chain(source.match_indices("passthrough"))
+        .map(|(offset, _)| offset)
+    {
+        let expected = position(source, offset);
+        assert!(
+            positions.iter().any(|token| {
+                token.line == expected.line
+                    && token.start == expected.character
+                    && token.token_type == TOKEN_MACRO
+            }),
+            "missing macro token at {expected:?}: {positions:#?}"
+        );
+    }
+
+    let inspect_use = source.rfind("Inspect").unwrap();
+    let hover = hover_for_document(
+        &uri,
+        &docs,
+        position(source, inspect_use + 2),
+        options,
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let HoverContents::Markup(contents) = hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(contents.value.contains("derive proc macro Inspect"));
+
+    let definition = definition_for_document(
+        &uri,
+        &docs,
+        position(source, inspect_use + 2),
+        options,
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(definition) = definition else {
+        panic!("expected one macro definition")
+    };
+    assert_eq!(
+        definition.uri,
+        lsp_types::Url::from_file_path(fs::canonicalize(&macro_path).unwrap()).unwrap()
+    );
+    let function_name = macro_source.find("derive_debug").unwrap();
+    assert_eq!(
+        definition.range,
+        Range::new(
+            position(macro_source, function_name),
+            position(macro_source, function_name + "derive_debug".len()),
+        )
+    );
+
+    let answer_use = source.rfind("answer").unwrap();
+    let references = references_for_document(
+        &uri,
+        &docs,
+        position(source, answer_use + 2),
+        true,
+        options,
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(references.len(), 2, "{references:#?}");
+    let prepared = prepare_rename_for_document(
+        &uri,
+        &docs,
+        position(source, answer_use + 2),
+        options,
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        prepared,
+        PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } if placeholder == "answer"
+    ));
+    let edit = rename_for_document(
+        &uri,
+        &docs,
+        position(source, answer_use + 2),
+        "respond",
+        options,
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let Some(DocumentChanges::Edits(documents)) = edit.document_changes else {
+        panic!("expected macro rename edits")
+    };
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].edits.len(), 2);
+
+    let plain_use = source.rfind("plain").unwrap();
+    let plain_definition = definition_for_document(
+        &uri,
+        &docs,
+        position(source, plain_use + 2),
+        options,
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(plain_definition) = plain_definition else {
+        panic!("expected one ordinary definition")
+    };
+    let plain_declaration = source.find("plain").unwrap();
+    assert_eq!(
+        plain_definition.range,
+        Range::new(
+            position(source, plain_declaration),
+            position(source, plain_declaration + "plain".len()),
+        )
+    );
+
+    let incomplete = source.replace("#[derive(Inspect)]", "#[derive(Ins)]");
+    let completion_docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: incomplete.clone(),
+            version: Some(4),
+        },
+    )]);
+    let cursor = incomplete.find("Ins)]").unwrap() + "Ins".len();
+    let items = completion_items_for_document(
+        &uri,
+        &completion_docs,
+        position(&incomplete, cursor),
+        options,
+        &AnalysisSessions::default(),
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        items.iter().any(|item| item.label == "Inspect"),
+        "{items:#?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_lsp_tracks_standard_print_macros() {
+    let root = temp_root("project-standard-macro-lsp");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+"#,
+    )
+    .unwrap();
+    let source = r#"#[derive(Debug)]
+struct Value { number: i32 }
+
+fun main() -> i32 {
+    println!("value={:?}", Value { number: 1 });
+    0
+}
+"#;
+    let main_path = root.join("src/main.rid");
+    fs::write(&main_path, source).unwrap();
+    let uri = lsp_types::Url::from_file_path(&main_path).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: source.into(),
+            version: Some(1),
+        },
+    )]);
+    let sessions = AnalysisSessions::default();
+
+    let tokens =
+        semantic_tokens_for_document(&uri, &docs, CompileOptions::default(), &sessions).unwrap();
+    let expected = position(source, source.find("println").unwrap());
+    let positions = semantic_token_positions(&tokens);
+    assert!(
+        positions.iter().any(|token| {
+            token.line == expected.line
+                && token.start == expected.character
+                && token.token_type == TOKEN_MACRO
+        }),
+        "missing standard macro token at {expected:?}: {positions:#?}"
+    );
+
+    let derive = position(source, source.find("Debug").unwrap());
+    assert!(
+        positions.iter().any(|token| {
+            token.line == derive.line
+                && token.start == derive.character
+                && token.token_type == TOKEN_MACRO
+        }),
+        "missing standard derive token at {derive:?}: {positions:#?}"
+    );
+
+    let hover = hover_for_document(
+        &uri,
+        &docs,
+        position(source, source.find("println").unwrap() + 2),
+        CompileOptions::default(),
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let HoverContents::Markup(contents) = hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(contents.value.contains("standard macro println!(...)"));
+
+    let hover = hover_for_document(
+        &uri,
+        &docs,
+        position(source, source.find("Debug").unwrap() + 2),
+        CompileOptions::default(),
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let HoverContents::Markup(contents) = hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(contents.value.contains("standard derive macro Debug"));
     let _ = fs::remove_dir_all(root);
 }
 

@@ -32,6 +32,13 @@ fn report_with(result: &CompileResult, mut emit: impl FnMut(&DiagnosticExt)) -> 
         count += 1;
     }
 
+    for d in &result.macro_diagnostics {
+        emit(&d.to_ext());
+        if d.severity == type_checker::Severity::Error {
+            count += 1;
+        }
+    }
+
     for d in &result.hir_diagnostics {
         emit(&d.to_ext());
         if d.severity == type_checker::Severity::Error {
@@ -128,6 +135,12 @@ pub fn report_verbose(result: &CompileResult, _source: Option<&str>, _source_nam
         return;
     }
 
+    if result.macro_diagnostics.is_empty() {
+        println!("macro expansion: ok");
+    } else {
+        println!("macro expansion: failed");
+    }
+
     if result.hir_diagnostics.is_empty() {
         println!("hir lower: ok");
     } else {
@@ -200,7 +213,15 @@ fn print_rust_style(
         .labels
         .iter()
         .find(|label| label.style == type_checker::LabelStyle::Primary);
-    let gutter_width = if let (Some(source), Some(primary)) = (source, primary) {
+    let location = source.zip(primary).filter(|(source, primary)| {
+        let start = usize::from(primary.range.start());
+        let end = usize::from(primary.range.end());
+        start <= end
+            && end <= source.len()
+            && source.is_char_boundary(start)
+            && source.is_char_boundary(end)
+    });
+    let gutter_width = if let Some((source, primary)) = location {
         let trim_start = trim_leading_trivia(source, primary.range.start(), primary.range.end());
         let line_col = offset_to_line_col(source, trim_start);
         let _ = writeln!(

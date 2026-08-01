@@ -86,7 +86,7 @@ fn main() {
     let mut generated_code = String::new();
 
     for file in &opts.files {
-        let loaded = match pipeline::load_source_file(file) {
+        let mut loaded = match pipeline::load_source_file(file) {
             Ok(loaded) => loaded,
             Err(e) => {
                 eprintln!("riddlec: cannot read `{}`: {e}", file.display());
@@ -94,17 +94,35 @@ fn main() {
                 continue;
             }
         };
-        let compile = if opts.backend.is_some() {
-            pipeline::compile_with_options
-        } else {
-            pipeline::check_with_options
+        let expansion = riddlec::proc_macro::expand_standard_macros(&loaded.source);
+        loaded.apply_expansion(expansion.source, &expansion.mappings);
+        let options = pipeline::CompileOptions {
+            use_std: opts.use_std,
         };
-        let result = compile(
-            &loaded.source,
-            pipeline::CompileOptions {
-                use_std: opts.use_std,
-            },
-        );
+        #[allow(clippy::single_range_in_vec_init)]
+        let package_ranges = [0..loaded.source.len()];
+        let mut result = if let Some(parse) = expansion.parse.as_ref() {
+            if opts.backend.is_some() {
+                pipeline::compile_parsed_package_with_options(
+                    &loaded.source,
+                    parse,
+                    &package_ranges,
+                    options,
+                )
+            } else {
+                pipeline::check_parsed_package_with_options(
+                    &loaded.source,
+                    parse,
+                    &package_ranges,
+                    options,
+                )
+            }
+        } else if opts.backend.is_some() {
+            pipeline::compile_package_with_options(&loaded.source, &package_ranges, options)
+        } else {
+            pipeline::check_package_with_options(&loaded.source, &package_ranges, options)
+        };
+        result.macro_diagnostics = expansion.diagnostics;
 
         if opts.verbose {
             if opts.files.len() > 1 {

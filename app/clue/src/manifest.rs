@@ -19,16 +19,19 @@ pub(crate) fn new_manifest(package_name: &str, kind: ProjectKind) -> String {
         Value::String(
             match kind {
                 ProjectKind::Binary => "src/main.rid",
-                ProjectKind::Library => "src/lib.rid",
+                ProjectKind::Library | ProjectKind::ProcMacro => "src/lib.rid",
             }
             .into(),
         ),
     );
+    if kind == ProjectKind::ProcMacro {
+        target.insert("proc-macro".into(), Value::Boolean(true));
+    }
 
     let package = document("package", Value::Table(package));
     let target = match kind {
         ProjectKind::Binary => document("bin", Value::Array(vec![Value::Table(target)])),
-        ProjectKind::Library => document("lib", Value::Table(target)),
+        ProjectKind::Library | ProjectKind::ProcMacro => document("lib", Value::Table(target)),
     };
     let dependencies = document("dependencies", Value::Table(Table::new()));
     format!("{package}\n{target}\n{dependencies}")
@@ -75,9 +78,11 @@ pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
     })?;
     let name = string_field(package, "name", "package")?;
     validate_package_name(&name).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+    let target = target_path(root, &value, kind)?;
+    let target_kind = target.as_ref().map(|(_, kind)| *kind).unwrap_or(kind);
     let (entry, kind) = match optional_string_field(package, "entry", "package")? {
-        Some(path) => (root.join(path), kind),
-        None => target_path(root, &value, kind)?.unwrap_or((entry_file(root, &name, kind)?, kind)),
+        Some(path) => (root.join(path), target_kind),
+        None => target.unwrap_or((entry_file(root, &name, target_kind)?, target_kind)),
     };
     if !entry.is_file() {
         return Err(Error::new(
@@ -106,7 +111,7 @@ fn runtime_source(root: &Path, value: &Value, kind: ProjectKind) -> io::Result<O
     let Some(runtime) = table(value, "runtime") else {
         return Ok(None);
     };
-    if kind == ProjectKind::Library {
+    if kind != ProjectKind::Binary {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "[runtime] is only supported for binary packages",
@@ -150,11 +155,16 @@ fn target_path(
         )));
     }
     if let Some(lib) = table(value, "lib") {
+        let kind = if optional_bool_field(lib, "proc-macro", "lib")?.unwrap_or(false) {
+            ProjectKind::ProcMacro
+        } else {
+            ProjectKind::Library
+        };
         return Ok(Some((
             root.join(
                 optional_string_field(lib, "path", "lib")?.unwrap_or_else(|| "src/lib.rid".into()),
             ),
-            ProjectKind::Library,
+            kind,
         )));
     }
     Ok(None)
@@ -191,7 +201,7 @@ fn entry_file(root: &Path, package_name: &str, kind: ProjectKind) -> io::Result<
             root.join(format!("{package_name}.rid")),
             root.join("main.rid"),
         ],
-        ProjectKind::Library => vec![
+        ProjectKind::Library | ProjectKind::ProcMacro => vec![
             root.join("src/lib.rid"),
             root.join(format!("{package_name}.rid")),
             root.join("lib.rid"),
@@ -232,6 +242,18 @@ fn optional_string_field(table: &Table, key: &str, owner: &str) -> io::Result<Op
                 format!("`{owner}.{key}` must be a string"),
             )
         })
+}
+
+fn optional_bool_field(table: &Table, key: &str, owner: &str) -> io::Result<Option<bool>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    value.as_bool().map(Some).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("`{owner}.{key}` must be a boolean"),
+        )
+    })
 }
 
 fn unsupported_dependency(name: &str) -> Error {

@@ -685,7 +685,9 @@ fn standard_library_basics_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"fun main() -> i32 {
+        r#"use std::io::print;
+
+fun main() -> i32 {
     let value: Option<i32> = Some(2);
     let error: Result<i32, bool> = Err(true);
     print(&(-42));
@@ -723,7 +725,10 @@ fn rust_style_display_fmt_compiles_and_runs() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Label {
+        r#"use std::fmt::{Display, Formatter};
+use std::io::{print, println};
+
+struct Label {
     text: &str,
 }
 
@@ -762,6 +767,197 @@ fun main() -> i32 {
 }
 
 #[test]
+fn rust_style_print_macros_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping print macro runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("print-macros");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"use std::fmt::{Display, Formatter};
+
+struct Label {
+    value: i32,
+}
+
+impl Display for Label {
+    fun fmt(&self, formatter: &mut Formatter) -> std::fmt::Result {
+        self.value.fmt(formatter)
+    }
+}
+
+fun next(value: &mut i32) -> i32 {
+    *value += 1;
+    *value
+}
+
+fun main() -> i32 {
+    print!();
+    print!("value={} {{ok}} ", Label { value: 7 });
+    let mut calls = 0;
+    println!("{} {}", next(&mut calls), next(&mut calls),);
+    println!();
+    if calls == 2 { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .replace("\r\n", "\n")
+            .ends_with("value=7 {ok} 1 2\n\n")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn standard_debug_derive_compiles_and_runs() {
+    if c_compiler().is_none() {
+        eprintln!("skipping Debug derive runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("debug-derive");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"#[derive(Debug)]
+struct Point { x: i32, y: i32 }
+
+#[derive(Debug)]
+struct Wrapper<T> { value: T, active: bool }
+
+#[derive(Debug)]
+enum Message {
+    Quit,
+    Move(i32, i32),
+    Paint { color: Point, visible: bool },
+}
+
+fun main() -> i32 {
+    println!("{:?}", Point { x: 3, y: 4 });
+    println!("{:?}", Wrapper {
+        value: Point { x: 8, y: 9 },
+        active: true,
+    });
+    println!("{:?}", Message::Quit);
+    println!("{:?}", Message::Move(10, 20));
+    println!("{:?}", Message::Paint {
+        color: Point { x: 1, y: 2 },
+        visible: false,
+    });
+    println!("{:?} {:?}", "line\n", '\t');
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .replace("\r\n", "\n")
+            .ends_with(
+                "Point { x: 3, y: 4 }\n\
+Wrapper { value: Point { x: 8, y: 9 }, active: true }\n\
+Quit\n\
+Move(10, 20)\n\
+Paint { color: Point { x: 1, y: 2 }, visible: false }\n\
+\"line\\n\" '\\t'\n"
+            )
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn standard_containers_derive_debug_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping std container Debug test: no C compiler found");
+        return;
+    }
+    let root = temp_root("std-container-debug");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"use std::collections::{HashMap, HashSet, TreeMap, TreeSet};
+
+fun main() -> i32 {
+    let option = Some(1);
+    let result: Result<i32, i32> = Ok(2);
+    let text = String::from_str("three");
+
+    let mut vector = Vector::new();
+    vector.push(4);
+
+    let mut hash_map = HashMap::new();
+    hash_map.insert(5, 6);
+    let mut hash_set = HashSet::new();
+    hash_set.insert(7);
+
+    let mut tree_map = TreeMap::new();
+    tree_map.insert(8, 9);
+    let mut tree_set = TreeSet::new();
+    tree_set.insert(10);
+
+    println!("{:?}", option);
+    println!("{:?}", result);
+    println!("{:?}", text);
+    println!("{:?}", vector);
+    println!("{:?}", hash_map);
+    println!("{:?}", hash_set);
+    println!("{:?}", tree_map);
+    println!("{:?}", tree_set);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "Some(1)",
+        "Ok(2)",
+        "String { bytes: Vector { data:",
+        "Vector { data:",
+        "HashMap { buckets:",
+        "HashSet { values:",
+        "TreeMap { nodes:",
+        "TreeSet { values:",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing `{expected}` in:\n{stdout}"
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn tree_collections_compile_and_run() {
     if c_compiler().is_none() {
         eprintln!("skipping tree collection runtime test: no C compiler found");
@@ -772,7 +968,10 @@ fn tree_collections_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Payload { value: i32 }
+        r#"use std::collections::{TreeMap, TreeSet};
+use std::io::print;
+
+struct Payload { value: i32 }
 
 impl Drop for Payload {
     fun drop(&mut self) { print(&self.value); }
@@ -842,7 +1041,11 @@ fn hash_collections_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Key { value: i32 }
+        r#"use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+use std::io::print;
+
+struct Key { value: i32 }
 struct Payload { value: i32 }
 
 impl Drop for Payload {
@@ -917,7 +1120,9 @@ fn deterministic_drop_runs_in_native_binary() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Guard { id: i32 }
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
@@ -959,7 +1164,9 @@ fn match_pattern_binding_drops_at_arm_end() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Guard { id: i32 }
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
 
 enum MaybeGuard {
     Some(Guard),
@@ -1007,7 +1214,9 @@ fn moved_destructured_binding_is_not_dropped_twice() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Guard { id: i32 }
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
@@ -1050,7 +1259,9 @@ fn closures_capture_destructured_bindings() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"fun main() -> i32 {
+        r#"use std::io::print;
+
+fun main() -> i32 {
     let (a, b) = (10, 20);
     let sum = fun() -> i32 { a + b };
     let (mut c, d) = (1, 2);
@@ -1086,7 +1297,9 @@ fn destructuring_let_binds_tuple_and_struct_elements() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Point { x: i32, y: i32 }
+        r#"use std::io::print;
+
+struct Point { x: i32, y: i32 }
 
 fun main() -> i32 {
     let ((a, b), c) = ((1, 2), 3);
@@ -1122,7 +1335,9 @@ fn reference_patterns_match_rust_binding_modes_at_runtime() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Point { x: i32, y: i32 }
+        r#"use std::io::print;
+
+struct Point { x: i32, y: i32 }
 
 enum Maybe {
     Some(i32),
@@ -1188,7 +1403,9 @@ fn moved_match_binding_is_not_dropped_twice() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Guard { id: i32 }
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
 
 enum MaybeGuard {
     Some(Guard),
@@ -1238,7 +1455,9 @@ fn match_partial_move_drops_each_field_once() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Guard { id: i32 }
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
 
 struct Pair { left: Guard, right: Guard }
 
@@ -1286,7 +1505,9 @@ fn array_for_break_drops_current_and_remaining_items_once() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Guard { id: i32 }
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
@@ -1334,7 +1555,9 @@ fn generic_for_break_drops_item_before_iterator() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Guard { id: i32 }
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
 struct Once { yielded: bool }
 
 impl Drop for Guard {
@@ -1523,7 +1746,9 @@ fn string_and_vector_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"fun main() -> i32 {
+        r#"use std::io::print;
+
+fun main() -> i32 {
     let mut values: Vector<i32> = Vector::new();
     let mut index = 0;
     while index < 10 {
@@ -1606,7 +1831,9 @@ fn vector_indexing_compiles_and_runs() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"fun main() -> i32 {
+        r#"use std::io::print;
+
+fun main() -> i32 {
     let mut values: Vector<i32> = Vector::new();
     values.push(10);
     values.push(20);
@@ -1737,7 +1964,9 @@ fn vector_drops_owned_elements() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Guard { id: i32 }
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
@@ -1940,6 +2169,434 @@ math = { path = "../math" }
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(root.join("app/.clue/build/app.c").is_file());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn proc_macro_dependency_expands_and_runs() {
+    if c_compiler().is_none() {
+        eprintln!("skipping proc-macro runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("proc-macro");
+    fs::create_dir_all(root.join("macros/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("macros/Clue.toml"),
+        r#"[package]
+name = "macros"
+
+[lib]
+path = "src/lib.rid"
+proc-macro = true
+
+[dependencies]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("macros/src/lib.rid"),
+        r####"use std::io::println;
+
+#[proc_macro_derive(Answer, attributes(answer))]
+pub fun derive_answer(input: TokenStream) -> TokenStream {
+    let mut saw_struct = false;
+    let mut saw_name = false;
+    let mut saw_field = false;
+    let mut saw_colon = false;
+    let mut saw_text = false;
+    let mut saw_array = false;
+    let mut saw_number = false;
+    let mut field_token_count_ok = false;
+    for tree in &input {
+        match tree {
+            TokenTree::Ident(ident) => {
+                if ident.as_str() == "struct" {
+                    saw_struct = ident.span().end() > ident.span().start();
+                }
+                if ident.as_str() == "Marker" {
+                    saw_name = ident.span().start() > 0usize;
+                }
+            },
+            TokenTree::Group(group) => {
+                match group.delimiter() {
+                    Delimiter::Bracket => {
+                        for attribute_tree in group.stream() {
+                            match attribute_tree {
+                                TokenTree::Group(arguments) => {
+                                    for argument in arguments.stream() {
+                                        match argument {
+                                            TokenTree::Literal(literal) => {
+                                                if literal.as_str() == "r#\"token text\"#" {
+                                                    saw_text = literal.span().end() > literal.span().start();
+                                                }
+                                            },
+                                            _ => {},
+                                        }
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                    Delimiter::Brace => {
+                        field_token_count_ok = group.stream().len() == 3usize;
+                        for field_tree in group.stream() {
+                            match field_tree {
+                                TokenTree::Ident(ident) => {
+                                    if ident.as_str() == "value" {
+                                        saw_field = true;
+                                    }
+                                },
+                                TokenTree::Punct(punct) => {
+                                    if punct.as_char() == ':' {
+                                        saw_colon = match punct.spacing() {
+                                            Spacing::Alone => true,
+                                            Spacing::Joint => false,
+                                        };
+                                    }
+                                },
+                                TokenTree::Group(field_type) => {
+                                    match field_type.delimiter() {
+                                        Delimiter::Bracket => {
+                                            saw_array = true;
+                                            for type_tree in field_type.stream() {
+                                                match type_tree {
+                                                    TokenTree::Literal(literal) => {
+                                                        if literal.as_str() == "3" {
+                                                            saw_number = true;
+                                                        }
+                                                    },
+                                                    _ => {},
+                                                }
+                                            }
+                                        },
+                                        _ => {},
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            },
+            _ => {},
+        }
+    }
+    if input.len() != 5usize {
+        Diagnostic::error(Span::call_site(), "unexpected top-level token count").emit();
+        return TokenStream::new();
+    }
+    if !saw_struct || !saw_name {
+        Diagnostic::error(Span::call_site(), "missing item identifiers").emit();
+        return TokenStream::new();
+    }
+    if !saw_field || !saw_colon || !field_token_count_ok {
+        Diagnostic::error(Span::call_site(), "missing field tokens").emit();
+        return TokenStream::new();
+    }
+    if !saw_text {
+        Diagnostic::error(Span::call_site(), "missing attribute literal").emit();
+        return TokenStream::new();
+    }
+    if !saw_array || !saw_number {
+        Diagnostic::error(Span::call_site(), "missing nested type tokens").emit();
+        return TokenStream::new();
+    }
+    let message = "macro log";
+    println(&message);
+    TokenStream::from_str("fun generated_answer() -> i32 { let text = \"token text\"; 42 }")
+        .unwrap_or(TokenStream::new())
+}
+
+#[proc_macro]
+pub fun answer(input: TokenStream) -> TokenStream {
+    if input.to_string().as_str() != "1" {
+        Diagnostic::error(Span::call_site(), "function macro received the wrong input").emit();
+        return TokenStream::new();
+    }
+    let mut output = TokenStream::from_str("2").unwrap_or(TokenStream::new());
+    let shared = output.clone();
+    output.push(TokenTree::Punct(Punct::new(';', Spacing::Alone)));
+    if output.len() != 2usize || shared.len() != 1usize {
+        Diagnostic::error(Span::call_site(), "TokenStream clone is not copy-on-write").emit();
+        return TokenStream::new();
+    }
+    match TokenStream::from_str("(") {
+        Result::Ok(_) => {
+            Diagnostic::error(Span::call_site(), "invalid tokens were accepted").emit();
+            TokenStream::new()
+        },
+        Result::Err(_) => shared,
+    }
+}
+
+#[proc_macro_attribute]
+pub fun replace(args: TokenStream, item: TokenStream) -> TokenStream {
+    if args.to_string().as_str() != "8" || item.is_empty() {
+        Diagnostic::error(Span::call_site(), "attribute macro inputs were not separated").emit();
+        return TokenStream::new();
+    }
+    TokenStream::from_str("fun attribute_answer() -> i32 { 8 }")
+        .unwrap_or(TokenStream::new())
+}
+"####,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+macros = { path = "../macros" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        r####"use macros::{Answer, answer, replace};
+
+#[answer(r#"token text"#)]
+#[derive(Answer)]
+struct Marker {
+    // comments are not token trees
+    value: [i32; 3]
+}
+
+#[replace(8)]
+fun removed() -> i32 { 0 }
+
+fun main() -> i32 {
+    if generated_answer() + answer!(1) + attribute_answer() == 52 { 0 } else { 1 }
+}
+"####,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        root.join(if cfg!(windows) {
+            "macros/.clue/build/macros.proc-macro-host.exe"
+        } else {
+            "macros/.clue/build/macros.proc-macro-host"
+        })
+        .is_file()
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("macro log"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn proc_macro_packages_can_use_function_macros_from_dependencies() {
+    if c_compiler().is_none() {
+        eprintln!("skipping nested proc-macro test: no C compiler found");
+        return;
+    }
+    let root = temp_root("nested-proc-macro");
+    fs::create_dir_all(root.join("quote/src")).unwrap();
+    fs::create_dir_all(root.join("macros/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("quote/Clue.toml"),
+        r#"[package]
+name = "quote"
+
+[lib]
+path = "src/lib.rid"
+proc-macro = true
+
+[dependencies]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("quote/src/lib.rid"),
+        r#"#[proc_macro]
+pub fun make_answer(input: TokenStream) -> TokenStream {
+    TokenStream::from_str("TokenStream::from_str(\"41\").unwrap_or(TokenStream::new())")
+        .unwrap_or(TokenStream::new())
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("macros/Clue.toml"),
+        r#"[package]
+name = "macros"
+
+[lib]
+path = "src/lib.rid"
+proc-macro = true
+
+[dependencies]
+quote = { path = "../quote" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("macros/src/lib.rid"),
+        r#"use quote::make_answer;
+
+#[proc_macro]
+pub fun answer(input: TokenStream) -> TokenStream { make_answer!() }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+macros = { path = "../macros" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        "use macros::answer;\nfun main() -> i32 { if answer!() == 41 { 0 } else { 1 } }\n",
+    )
+    .unwrap();
+
+    for package in ["quote", "macros"] {
+        let checked = clue(&["check", package], &root);
+        assert!(
+            checked.status.success(),
+            "checking {package} failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn proc_macro_failures_point_at_the_derive() {
+    if c_compiler().is_none() {
+        eprintln!("skipping proc-macro failure test: no C compiler found");
+        return;
+    }
+    let root = temp_root("proc-macro-failures");
+    fs::create_dir_all(root.join("macros/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("macros/Clue.toml"),
+        r#"[package]
+name = "macros"
+
+[lib]
+path = "src/lib.rid"
+proc-macro = true
+
+[dependencies]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("macros/src/lib.rid"),
+        r#"#[proc_macro_derive(Reject)]
+pub fun reject(_input: TokenStream) -> TokenStream {
+    let diagnostic = Diagnostic::error(Span::call_site(), "rejected by macro");
+    diagnostic.emit();
+    TokenStream::new()
+}
+
+#[proc_macro_derive(RejectField)]
+pub fun reject_field(input: TokenStream) -> TokenStream {
+    let mut span = Span::call_site();
+    for tree in &input {
+        match tree {
+            TokenTree::Group(group) => {
+                for field in group.stream() {
+                    match field {
+                        TokenTree::Ident(ident) => {
+                            if ident.as_str() == "bad" {
+                                span = ident.span();
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    Diagnostic::error(span, "rejected field").emit();
+    TokenStream::new()
+}
+
+#[proc_macro_derive(Invalid)]
+pub fun invalid(_input: TokenStream) -> TokenStream {
+    TokenStream::from_str("let generated = 1;").unwrap_or(TokenStream::new())
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+macros = { path = "../macros" }
+"#,
+    )
+    .unwrap();
+
+    for (derive, expected) in [
+        ("Reject", "rejected by macro"),
+        ("Invalid", "must contain only top-level items"),
+        ("Missing", "unknown proc-macro derive"),
+    ] {
+        fs::write(
+            root.join("app/src/main.rid"),
+            format!("#[derive(macros::{derive})]\nstruct Value {{}}\nfun main() -> i32 {{ 0 }}\n"),
+        )
+        .unwrap();
+        let output = clue(&["check", "app"], &root);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{derive} unexpectedly passed");
+        assert!(stderr.contains(expected), "{derive}: {stderr}");
+        assert!(stderr.contains("main.rid:1"), "{derive}: {stderr}");
+    }
+
+    fs::write(
+        root.join("app/src/main.rid"),
+        "#[derive(macros::RejectField)]\nstruct Value {\n    ok: i32,\n    bad: i32,\n}\nfun main() -> i32 { 0 }\n",
+    )
+    .unwrap();
+    let output = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "RejectField unexpectedly passed");
+    assert!(stderr.contains("rejected field"), "{stderr}");
+    assert!(stderr.contains("main.rid:4"), "{stderr}");
     let _ = fs::remove_dir_all(root);
 }
 

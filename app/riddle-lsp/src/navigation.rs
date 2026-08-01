@@ -14,7 +14,12 @@ use lsp_types::{
     MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position, PrepareRenameResponse,
     TextDocumentEdit, TextEdit, WorkspaceEdit,
 };
-use riddlec::pipeline::CompileOptions;
+use riddlec::{
+    pipeline::CompileOptions,
+    proc_macro::{
+        ProcMacroKind, ProcMacroOccurrence, STANDARD_DERIVE_MACROS, STANDARD_FUNCTION_MACROS,
+    },
+};
 use rowan::{TextRange, TextSize};
 use scope_graph::{
     DefRef, Node, RefOrigin, ScopeGraph,
@@ -236,6 +241,8 @@ fn standalone_analysis(source: &str, options: CompileOptions) -> DocumentAnalysi
         result: riddlec::pipeline::check_with_options(source, options),
         source: source.into(),
         source_map: None,
+        macro_occurrences: Vec::new(),
+        macro_source_map: None,
         path: None,
     }
 }
@@ -245,6 +252,40 @@ fn hover_from_analysis(
     analysis: &DocumentAnalysis,
     position: Position,
 ) -> Option<Hover> {
+    if let Some(occurrence) = macro_at(&document.text, analysis, position) {
+        let origin = analysis.local_macro_range(&occurrence.range)?;
+        let standard = occurrence.package == "std"
+            && (STANDARD_FUNCTION_MACROS.contains(&occurrence.macro_name.as_str())
+                || STANDARD_DERIVE_MACROS.contains(&occurrence.macro_name.as_str()));
+        let kind = match occurrence.kind {
+            ProcMacroKind::Derive => "derive",
+            ProcMacroKind::Attribute => "attribute",
+            ProcMacroKind::FunctionLike => "function-like",
+        };
+        let value = if standard && occurrence.kind == ProcMacroKind::Derive {
+            format!(
+                "```riddle\nstandard derive macro {}\n```\n\n`#[derive({})]`",
+                occurrence.name, occurrence.macro_name
+            )
+        } else if standard {
+            format!(
+                "```riddle\nstandard macro {}!(...)\n```\n\n`std::{}!`",
+                occurrence.name, occurrence.macro_name
+            )
+        } else {
+            format!(
+                "```riddle\n{kind} proc macro {}\n```\n\n`{}::{}`",
+                occurrence.name, occurrence.package, occurrence.macro_name
+            )
+        };
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: Some(LineIndex::new(&document.text).range(&document.text, origin)?),
+        });
+    }
     let symbol = symbol_at(&document.text, analysis, position)?;
     let range = LineIndex::new(&document.text).range(&document.text, symbol.origin)?;
     Some(Hover {
@@ -262,6 +303,10 @@ fn definition_from_analysis(
     analysis: &DocumentAnalysis,
     position: Position,
 ) -> Option<GotoDefinitionResponse> {
+    if let Some(occurrence) = macro_at(&document.text, analysis, position) {
+        let location = macro_definition_location(analysis, occurrence)?;
+        return Some(GotoDefinitionResponse::Scalar(location));
+    }
     let symbol = symbol_at(&document.text, analysis, position)?;
     let location = location_for_range(uri, analysis, symbol.definition?)?;
     Some(GotoDefinitionResponse::Scalar(location))
@@ -310,6 +355,17 @@ fn references_from_analysis(
     position: Position,
     include_declaration: bool,
 ) -> Option<Vec<Location>> {
+    if let Some(target) = macro_at(&document.text, analysis, position) {
+        let mut locations = analysis
+            .macro_occurrences
+            .iter()
+            .filter(|occurrence| same_macro_binding(target, occurrence))
+            .filter(|occurrence| include_declaration || !occurrence.is_declaration)
+            .filter_map(|occurrence| macro_occurrence_location(analysis, occurrence))
+            .collect::<Vec<_>>();
+        sort_and_dedup_locations(&mut locations);
+        return Some(locations);
+    }
     let target = symbol_at(&document.text, analysis, position)?.definition?;
     let mut locations = symbol_occurrences(analysis, target)
         .into_iter()
@@ -325,6 +381,17 @@ fn prepare_rename_from_analysis(
     analysis: &DocumentAnalysis,
     position: Position,
 ) -> Option<PrepareRenameResponse> {
+    if let Some(occurrence) = macro_at(&document.text, analysis, position) {
+        occurrence.binding.as_ref()?;
+        let origin = analysis.local_macro_range(&occurrence.range)?;
+        let placeholder = document
+            .text
+            .get(usize::from(origin.start())..usize::from(origin.end()))?;
+        return Some(PrepareRenameResponse::RangeWithPlaceholder {
+            range: LineIndex::new(&document.text).range(&document.text, origin)?,
+            placeholder: placeholder.into(),
+        });
+    }
     let symbol = symbol_at(&document.text, analysis, position)?;
     let target = symbol.definition?;
     renamable_target(analysis, target)?;
@@ -345,6 +412,23 @@ fn rename_from_analysis(
     position: Position,
     new_name: &str,
 ) -> Option<WorkspaceEdit> {
+    if let Some(target) = macro_at(&document.text, analysis, position) {
+        target.binding.as_ref()?;
+        let mut documents = BTreeMap::<String, (lsp_types::Url, Vec<TextEdit>)>::new();
+        for occurrence in analysis
+            .macro_occurrences
+            .iter()
+            .filter(|occurrence| same_macro_binding(target, occurrence))
+        {
+            let location = macro_occurrence_location(analysis, occurrence)?;
+            documents
+                .entry(location.uri.as_str().into())
+                .or_insert_with(|| (location.uri.clone(), Vec::new()))
+                .1
+                .push(TextEdit::new(location.range, new_name.into()));
+        }
+        return workspace_edit(documents, docs);
+    }
     let target = symbol_at(&document.text, analysis, position)?.definition?;
     renamable_target(analysis, target)?;
     let mut documents = BTreeMap::<String, (lsp_types::Url, Vec<TextEdit>)>::new();
@@ -364,6 +448,13 @@ fn rename_from_analysis(
             .push(TextEdit::new(location.range, replacement));
     }
 
+    workspace_edit(documents, docs)
+}
+
+fn workspace_edit(
+    documents: BTreeMap<String, (lsp_types::Url, Vec<TextEdit>)>,
+    docs: &HashMap<lsp_types::Url, Document>,
+) -> Option<WorkspaceEdit> {
     let edits = documents
         .into_values()
         .map(|(uri, mut edits)| {
@@ -388,6 +479,72 @@ fn rename_from_analysis(
         document_changes: Some(DocumentChanges::Edits(edits)),
         ..WorkspaceEdit::default()
     })
+}
+
+fn macro_at<'a>(
+    document_source: &str,
+    analysis: &'a DocumentAnalysis,
+    position: Position,
+) -> Option<&'a ProcMacroOccurrence> {
+    let offset = offset_for_position(document_source, position)?;
+    let origin = identifier_range_at(document_source, offset)?;
+    analysis
+        .macro_occurrences
+        .iter()
+        .find(|occurrence| analysis.local_macro_range(&occurrence.range) == Some(origin))
+}
+
+fn same_macro_binding(left: &ProcMacroOccurrence, right: &ProcMacroOccurrence) -> bool {
+    match (&left.binding, &right.binding) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => {
+            left.package == right.package
+                && left.macro_name == right.macro_name
+                && left.kind == right.kind
+        }
+        _ => false,
+    }
+}
+
+fn macro_occurrence_location(
+    analysis: &DocumentAnalysis,
+    occurrence: &ProcMacroOccurrence,
+) -> Option<Location> {
+    macro_source_location(analysis, &occurrence.range)
+}
+
+fn macro_definition_location(
+    analysis: &DocumentAnalysis,
+    occurrence: &ProcMacroOccurrence,
+) -> Option<Location> {
+    if let Some(definition) = &occurrence.definition {
+        return Some(Location::new(
+            lsp_types::Url::from_file_path(&definition.path).ok()?,
+            LineIndex::new(&definition.source).range(
+                &definition.source,
+                TextRange::new(
+                    (definition.range.start as u32).into(),
+                    (definition.range.end as u32).into(),
+                ),
+            )?,
+        ));
+    }
+    macro_source_location(analysis, occurrence.binding.as_ref()?)
+}
+
+fn macro_source_location(
+    analysis: &DocumentAnalysis,
+    range: &std::ops::Range<usize>,
+) -> Option<Location> {
+    let source_map = analysis.macro_source_map.as_ref()?;
+    let mapped = source_map.map_range(TextRange::new(
+        (range.start as u32).into(),
+        (range.end as u32).into(),
+    ))?;
+    Some(Location::new(
+        lsp_types::Url::from_file_path(mapped.path).ok()?,
+        LineIndex::new(mapped.source).range(mapped.source, mapped.range)?,
+    ))
 }
 
 fn sort_and_dedup_locations(locations: &mut Vec<Location>) {

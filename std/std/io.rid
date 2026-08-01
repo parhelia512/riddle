@@ -1,4 +1,6 @@
-use crate::std::fmt::{Display, Formatter};
+use crate::std::fmt::{write_debug, Debug, Display, Formatter};
+use crate::std::panic::panic;
+
 fun expect_written(result: crate::std::fmt::Result) {
     if result.is_err() {
         panic("failed to write to stdout");
@@ -14,4 +16,9 @@ pub fun println<T: Display>(value: &T) {
     let mut formatter = Formatter {};
     expect_written(value.fmt(&mut formatter));
     expect_written(formatter.write_char('\n'));
+}
+
+pub fun print_debug<T: Debug>(value: &T) {
+    let mut formatter = Formatter {};
+    expect_written(write_debug(value, &mut formatter));
 }

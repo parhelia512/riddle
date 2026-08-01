@@ -368,35 +368,42 @@ fn moving_return_value_clears_its_drop_flag() {
             let guard = Guard {};
             return guard;
         }
+
+        fun take_implicit() -> Guard {
+            let guard = Guard {};
+            guard
+        }
         "#,
     );
 
-    let take = module
-        .functions
-        .values()
-        .find(|function| function.name == "take")
-        .expect("missing take");
-    let mut false_values = std::collections::HashSet::new();
-    let mut cleared_flag = false;
-    for (_, block) in take.blocks.iter() {
-        for (index, inst) in block.insts.iter().enumerate() {
-            let value = mir::value::Value(block.start_value + index as u32);
-            match &inst.kind {
-                mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
-                    false_values.insert(value);
+    for name in ["take", "take_implicit"] {
+        let function = module
+            .functions
+            .values()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let mut false_values = std::collections::HashSet::new();
+        let mut cleared_flag = false;
+        for (_, block) in function.blocks.iter() {
+            for (index, inst) in block.insts.iter().enumerate() {
+                let value = mir::value::Value(block.start_value + index as u32);
+                match &inst.kind {
+                    mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
+                        false_values.insert(value);
+                    }
+                    mir::instr::InstKind::Store(value, _place) if false_values.contains(value) => {
+                        cleared_flag = true;
+                    }
+                    _ => {}
                 }
-                mir::instr::InstKind::Store(value, _place) if false_values.contains(value) => {
-                    cleared_flag = true;
-                }
-                _ => {}
             }
         }
-    }
 
-    assert!(
-        cleared_flag,
-        "moving a Drop local must clear its drop flag: {take:#?}"
-    );
+        assert!(
+            cleared_flag,
+            "moving a Drop local must clear its drop flag: {function:#?}"
+        );
+    }
 }
 
 #[test]
@@ -2466,6 +2473,63 @@ fn non_escaping_reference_temporary_uses_stack_storage() {
             .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_))),
         "a local-only reference temporary must not escape: {func:#?}"
     );
+}
+
+#[test]
+fn reference_to_unit_enum_variant_materializes_storage() {
+    let module = lower(
+        r#"
+        enum State { Ready }
+
+        fun inspect(value: &State) {}
+
+        fun main() {
+            inspect(&State::Ready);
+        }
+        "#,
+    );
+    let main = module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == "main")
+        .unwrap();
+    assert!(
+        main.blocks
+            .values()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::Alloca(_))),
+        "a referenced unit enum temporary needs storage: {main:#?}"
+    );
+}
+
+#[test]
+fn colliding_trait_method_symbols_are_disambiguated() {
+    let module = lower(
+        r#"
+        trait First { fun fmt(&self) -> i32; }
+        trait Second { fun fmt(&self) -> i32; }
+
+        impl First for i32 { fun fmt(&self) -> i32 { 1 } }
+        impl Second for i32 { fun fmt(&self) -> i32 { 2 } }
+
+        fun first<T: First>(value: &T) -> i32 { value.fmt() }
+        fun second<T: Second>(value: &T) -> i32 { value.fmt() }
+
+        fun main() -> i32 {
+            let value = 0;
+            first(&value) + second(&value)
+        }
+        "#,
+    );
+    let names = module
+        .function_order
+        .iter()
+        .map(|id| module.functions[*id].name.as_str())
+        .filter(|name| name.starts_with("fmt__"))
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert_ne!(names[0], names[1]);
 }
 
 #[test]

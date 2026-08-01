@@ -21,6 +21,7 @@ pub struct StrIter {
     index: usize,
 }
 
+#[derive(Debug)]
 pub struct String {
     bytes: Vector<u8>,
 }

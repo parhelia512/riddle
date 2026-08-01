@@ -143,6 +143,75 @@ pub(crate) fn run(
     })
 }
 
+pub(crate) fn build_proc_macro_host(
+    package: &crate::project::ProcMacroPackage,
+    exports: &[crate::proc_macro::HostMacroExport],
+    expanded_source: &str,
+) -> anyhow::Result<PathBuf> {
+    let host = TargetTriple::host().map_err(anyhow::Error::msg)?;
+    let target = target::load(host, true)?;
+    let build_dir = package.root.join(".clue").join("build");
+    fs::create_dir_all(&build_dir)?;
+    let compiler = CCompiler::detect(&build_dir, target.clone())?;
+
+    let source = crate::proc_macro::host_source(expanded_source, exports);
+    let bridge = crate::proc_macro::host_runtime_c(exports);
+    let c_path = build_dir.join(format!("{}.proc-macro.c", package.name));
+    let runtime_path = build_dir.join(format!("{}.proc-macro.runtime.c", package.name));
+    let bridge_path = build_dir.join(format!("{}.proc-macro.host.c", package.name));
+    let hash_path = build_dir.join(format!("{}.proc-macro.hash", package.name));
+    let executable = build_dir.join(format!(
+        "{}.proc-macro-host{}",
+        package.name,
+        host.executable_suffix()
+    ));
+    let hash = fingerprint(
+        &format!("{}\n{bridge}", package.manifest_fingerprint),
+        &source,
+        Some(gc::RUNTIME_C),
+        Some(&compiler),
+        &target,
+    );
+    if c_path.is_file()
+        && runtime_path.is_file()
+        && bridge_path.is_file()
+        && executable.is_file()
+        && fs::read_to_string(&hash_path).unwrap_or_default() == hash
+    {
+        return Ok(executable);
+    }
+
+    let analysis = pipeline::compile_with_options(&source, pipeline::CompileOptions::default());
+    let errors = riddlec::diagnostics::report(
+        &analysis,
+        Some(&source),
+        &package.entry.display().to_string(),
+    );
+    if errors > 0 || !analysis.success() {
+        bail!("failed to compile proc-macro package `{}`", package.name);
+    }
+    let module = analysis
+        .mir_module
+        .as_ref()
+        .context("successful proc-macro compilation did not produce MIR")?;
+    fs::write(
+        &c_path,
+        pipeline::generate_c(module).map_err(anyhow::Error::msg)?,
+    )?;
+    fs::write(&runtime_path, gc::RUNTIME_C)?;
+    fs::write(&bridge_path, bridge)?;
+    compiler.compile(
+        &[
+            c_path.as_path(),
+            runtime_path.as_path(),
+            bridge_path.as_path(),
+        ],
+        &executable,
+    )?;
+    fs::write(hash_path, hash)?;
+    Ok(executable)
+}
+
 fn fingerprint(
     manifest: &str,
     source: &str,

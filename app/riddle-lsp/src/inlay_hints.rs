@@ -21,6 +21,8 @@ pub fn inlay_hints_for_source(source: &str, range: Range) -> Vec<InlayHint> {
             result,
             source: source.into(),
             source_map: None,
+            macro_occurrences: Vec::new(),
+            macro_source_map: None,
             path: None,
         },
         range,

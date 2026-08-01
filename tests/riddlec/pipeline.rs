@@ -1,4 +1,7 @@
 use riddlec::pipeline::*;
+use riddlec::proc_macro::{
+    ProcMacroExpansion, ProcMacroProvider, ProcMacroTokenStream, ProcMacroTokenTree, expand_source,
+};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -210,6 +213,144 @@ fn source_map_points_into_external_module() {
     assert_eq!(mapped_eof.path, mapped.path);
     assert_eq!(usize::from(mapped_eof.range.start()), mapped.source.len());
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_map_points_generated_macro_code_at_the_derive() {
+    struct Provider;
+    impl ProcMacroProvider for Provider {
+        fn expand(
+            &mut self,
+            _package: &str,
+            _macro_name: &str,
+            _kind: riddlec::proc_macro::ProcMacroKind,
+            _input: &ProcMacroTokenStream,
+            _second_input: Option<&ProcMacroTokenStream>,
+            call_site: std::ops::Range<usize>,
+        ) -> Result<ProcMacroExpansion, String> {
+            let mut output =
+                ProcMacroTokenStream::from_source("const GENERATED: i32 = 1;", 0).unwrap();
+            output.set_span(call_site);
+            Ok(ProcMacroExpansion {
+                output,
+                diagnostics: Vec::new(),
+            })
+        }
+    }
+
+    let root = temp_source_root("proc-macro-source-map");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("main.rid");
+    fs::write(&path, "#[derive(macros::Generated)]\nstruct Value {}\n").unwrap();
+    let mut loaded = load_source_file(&path).unwrap();
+    let expansion = expand_source(&loaded.source, &mut Provider);
+    loaded.apply_expansion(expansion.source, &expansion.mappings);
+    let start = loaded.source.find("GENERATED").unwrap();
+    let mapped = loaded
+        .source_map
+        .map_range(rowan::TextRange::new(
+            (start as u32).into(),
+            ((start + "GENERATED".len()) as u32).into(),
+        ))
+        .unwrap();
+
+    assert_eq!(mapped.path, fs::canonicalize(&path).unwrap());
+    assert_eq!(
+        &mapped.source[usize::from(mapped.range.start())..usize::from(mapped.range.end())],
+        "#[derive(macros::Generated)]"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_map_preserves_spans_copied_into_macro_output() {
+    fn find_ident_span(
+        stream: &ProcMacroTokenStream,
+        expected: &str,
+    ) -> Option<std::ops::Range<usize>> {
+        for tree in &stream.trees {
+            match tree {
+                ProcMacroTokenTree::Ident { text, span } if text == expected => {
+                    return Some(span.clone());
+                }
+                ProcMacroTokenTree::Group { stream, .. } => {
+                    if let Some(span) = find_ident_span(stream, expected) {
+                        return Some(span);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn set_ident_span(
+        stream: &mut ProcMacroTokenStream,
+        expected: &str,
+        replacement: &std::ops::Range<usize>,
+    ) {
+        for tree in &mut stream.trees {
+            match tree {
+                ProcMacroTokenTree::Ident { text, span } if text == expected => {
+                    *span = replacement.clone();
+                }
+                ProcMacroTokenTree::Group { stream, .. } => {
+                    set_ident_span(stream, expected, replacement);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    struct Provider;
+    impl ProcMacroProvider for Provider {
+        fn expand(
+            &mut self,
+            _package: &str,
+            _macro_name: &str,
+            _kind: riddlec::proc_macro::ProcMacroKind,
+            input: &ProcMacroTokenStream,
+            _second_input: Option<&ProcMacroTokenStream>,
+            call_site: std::ops::Range<usize>,
+        ) -> Result<ProcMacroExpansion, String> {
+            let copied = find_ident_span(input, "copied").unwrap();
+            let mut output =
+                ProcMacroTokenStream::from_source("const COPIED: i32 = 1;", 0).unwrap();
+            output.set_span(call_site);
+            set_ident_span(&mut output, "COPIED", &copied);
+            Ok(ProcMacroExpansion {
+                output,
+                diagnostics: Vec::new(),
+            })
+        }
+    }
+
+    let root = temp_source_root("proc-macro-token-source-map");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("main.rid");
+    fs::write(
+        &path,
+        "#[derive(macros::Generated)]\nstruct Value {\n    copied: i32,\n}\n",
+    )
+    .unwrap();
+    let mut loaded = load_source_file(&path).unwrap();
+    let expansion = expand_source(&loaded.source, &mut Provider);
+    loaded.apply_expansion(expansion.source, &expansion.mappings);
+    let start = loaded.source.find("COPIED").unwrap();
+    let mapped = loaded
+        .source_map
+        .map_range(rowan::TextRange::new(
+            (start as u32).into(),
+            ((start + "COPIED".len()) as u32).into(),
+        ))
+        .unwrap();
+
+    assert_eq!(mapped.path, fs::canonicalize(&path).unwrap());
+    assert_eq!(
+        &mapped.source[usize::from(mapped.range.start())..usize::from(mapped.range.end())],
+        "copied"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -526,6 +667,8 @@ fn undeclared_directory_modules_are_not_loaded() {
 fn std_range_iterator_type_checks() {
     let result = compile(
         r#"
+            use std::ops::range;
+
             fun main() {
                 let mut iter = range(0, 3);
                 let first = iter.next();
@@ -920,8 +1063,8 @@ fn std_supports_float_remainder_and_scalar_protocols() {
             fun main() -> f64 {
                 let value: i64 = 42;
                 let flag = true;
-                print(&value);
-                print(&flag);
+                print!("{}", value);
+                print!("{}", flag);
                 value as f64 % 5.0
             }
             "#,
@@ -942,6 +1085,8 @@ fn std_supports_float_remainder_and_scalar_protocols() {
 fn std_rejects_legacy_display_write_method() {
     let result = compile(
         r#"
+            use std::fmt::Display;
+
             struct Legacy {}
 
             impl Display for Legacy {
@@ -968,6 +1113,11 @@ fn std_rejects_legacy_display_write_method() {
 fn std_exposes_default_hash_parse_collections_and_time() {
     let result = compile(
         r#"
+            use std::collections::{HashMap, HashSet, TreeMap, TreeSet};
+            use std::hash::Hash;
+            use std::parse::parse_i32;
+            use std::time::time_now;
+
             fun main() -> i32 {
                 let value: i32 = Default::default();
                 let hash = value.hash();
@@ -1030,6 +1180,40 @@ fn std_does_not_expose_legacy_map_and_set_names() {
         "{:#?}",
         result.type_result.diagnostics
     );
+}
+
+#[test]
+fn std_collections_require_the_collections_module() {
+    let implicit = compile(
+        r#"
+            fun main() {
+                let map: HashMap<i32, i32> = HashMap::new();
+            }
+            "#,
+    );
+    assert!(
+        implicit
+            .type_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("unknown type `HashMap<i32, i32>`")),
+        "{:#?}",
+        implicit.type_result.diagnostics
+    );
+
+    for (module, item, ty) in [
+        ("hash_map", "HashMap", "HashMap<i32, i32>"),
+        ("hash_set", "HashSet", "HashSet<i32>"),
+        ("tree_map", "TreeMap", "TreeMap<i32, i32>"),
+        ("tree_set", "TreeSet", "TreeSet<i32>"),
+    ] {
+        let source =
+            format!("use std::{module}::{item}; fun main() {{ let value: {ty} = {item}::new(); }}");
+        let result = compile(&source);
+        assert!(!result.success(), "legacy module `{module}` still resolves");
+    }
 }
 
 #[test]
@@ -1362,6 +1546,8 @@ fn unit_uses_empty_tuple_syntax() {
 fn std_prelude_reexports_core_items() {
     let result = compile(
         r#"
+            use std::ops::range;
+
             fun main() {
                 let value: Option<i32> = Option::Some(1);
                 let mut iter = range(0, 3);
@@ -1643,7 +1829,8 @@ fn unit_return_does_not_hide_non_exhaustive_payload_match() {
 fn std_modules_expose_core_items() {
     let result = compile(
         r#"
-            use std::Vector;
+            use std::ops::Range;
+            use std::vector::Vector;
 
             fun main() {
                 let value = std::option::Option::Some(1);
@@ -1689,6 +1876,8 @@ fn std_array_into_iterator_accepts_non_copy_items() {
 fn std_range_for_loop_lowers_to_mir_loop() {
     let result = compile(
         r#"
+            use std::ops::range;
+
             fun main() {
                 let mut sum = 0;
                 for item in range(0, 3) {

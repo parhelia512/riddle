@@ -174,6 +174,160 @@ fn checks_generic_function_calls() {
 }
 
 #[test]
+fn generic_call_inference_uses_later_arguments() {
+    let result = check(
+        r#"
+        unsafe extern "C" {
+            safe fun fail() -> !;
+        }
+
+        fun make<T>() -> T {
+            fail()
+        }
+
+        fun same<T>(left: T, right: T) -> T {
+            right
+        }
+
+        fun main() -> i32 {
+            same(make(), 1)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn generic_call_inference_keeps_nested_constructor_expected_type() {
+    let result = check(
+        r#"
+        unsafe extern "C" {
+            safe fun fail() -> !;
+        }
+
+        enum Option<T> {
+            Some(T),
+        }
+
+        fun make<T>() -> T { fail() }
+        fun consume<T>(value: Option<T>, f: impl Fn(T) -> i32) {}
+        fun identity(value: i32) -> i32 { value }
+
+        fun main() {
+            consume(Option::Some(make()), identity);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn callable_bounds_constrain_generic_function_items() {
+    let result = check(
+        r#"
+        fun identity<T>(value: T) -> T { value }
+        fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
+        fun main() -> i32 { apply(identity, 42) }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn generic_method_inference_uses_expected_return_and_later_arguments() {
+    let result = check(
+        r#"
+        unsafe extern "C" {
+            safe fun fail() -> !;
+        }
+
+        struct Ops {}
+
+        impl Ops {
+            fun make<T>(&self) -> T {
+                fail()
+            }
+
+            fun same<T>(&self, left: T, right: T) -> T {
+                right
+            }
+        }
+
+        fun main() -> i32 {
+            let ops = Ops {};
+            let value: i32 = ops.make();
+            ops.same(ops.make(), value)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn try_expression_expected_success_type_infers_its_operand() {
+    let result = check(
+        r#"
+        unsafe extern "C" {
+            safe fun fail() -> !;
+        }
+
+        enum Result<T, E> {
+            Ok(T),
+            Err(E),
+        }
+
+        fun make<T>() -> Result<T, bool> {
+            fail()
+        }
+
+        fun consume(value: impl Fn(i32) -> i32) {}
+
+        fun main() -> Result<i32, bool> {
+            consume(make()?);
+            Ok(1)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+    assert!(
+        result.generic_calls.values().any(|call| {
+            call.args.len() == 1
+                && !matches!(
+                    call.args[0],
+                    Type::Unknown | Type::Error | Type::InferVar(_)
+                )
+        }),
+        "{:#?}",
+        result.generic_calls
+    );
+}
+
+#[test]
+fn index_access_expected_type_constrains_generic_element() {
+    let result = check(
+        r#"
+        unsafe extern "C" {
+            safe fun fail() -> !;
+        }
+
+        fun make<T>() -> [T; 1] { fail() }
+        fun consume(value: impl Fn(i32) -> i32) {}
+
+        fun main() {
+            consume(make()[0]);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn rejects_impl_type_arguments_on_associated_function() {
     let result = check(
         r#"

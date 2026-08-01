@@ -97,4 +97,28 @@ mod tests {
         let generic = parser.set_source("fun main() { let f = fun<T>(value: T) { value }; }");
         assert!(!generic.errors.is_empty());
     }
+
+    #[test]
+    fn parses_function_like_macro_calls_in_supported_positions() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r#"
+            make_item!();
+            fun value(input: make_type!()) -> make_type!() {
+                let make_pattern!() = make_expr!();
+                make_expr!()
+            }
+            "#,
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert_eq!(
+            parse
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == crate::syntax_kind::SyntaxKind::MacroCall)
+                .count(),
+            6
+        );
+    }
 }

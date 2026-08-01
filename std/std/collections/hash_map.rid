@@ -3,6 +3,7 @@ use crate::std::hash::Hash;
 use crate::std::option::Option;
 use crate::std::vector::Vector;
 
+#[derive(Debug)]
 enum HashBucket {
     Empty,
     Occupied(usize),
@@ -21,6 +22,7 @@ fun occupy_hash_bucket(
     }
 }
 
+#[derive(Debug)]
 pub struct HashMap<K, V> {
     buckets: Vector<HashBucket>,
     keys: Vector<K>,

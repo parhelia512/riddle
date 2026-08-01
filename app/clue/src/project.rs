@@ -14,6 +14,7 @@ const DEFAULT_LIB: &str = "pub fun add(x: i32, y: i32) -> i32 {\n    x + y\n}\n"
 pub enum ProjectKind {
     Binary,
     Library,
+    ProcMacro,
 }
 
 pub fn init(path: &Path, kind: ProjectKind) -> anyhow::Result<()> {
@@ -40,7 +41,7 @@ fn create(path: &Path, kind: ProjectKind) -> anyhow::Result<()> {
 
     let source_path = root.join("src").join(match kind {
         ProjectKind::Binary => "main.rid",
-        ProjectKind::Library => "lib.rid",
+        ProjectKind::Library | ProjectKind::ProcMacro => "lib.rid",
     });
     let manifest_path = root.join(CLUE_PROJECT_FILE_NAME);
     if manifest_path.exists() || source_path.exists() {
@@ -52,7 +53,7 @@ fn create(path: &Path, kind: ProjectKind) -> anyhow::Result<()> {
         &source_path,
         match kind {
             ProjectKind::Binary => DEFAULT_MAIN,
-            ProjectKind::Library => DEFAULT_LIB,
+            ProjectKind::Library | ProjectKind::ProcMacro => DEFAULT_LIB,
         },
     )?;
     write_new(&manifest_path, &manifest::new_manifest(name, kind))?;
@@ -93,6 +94,7 @@ fn update_gitignore(path: &Path) -> anyhow::Result<()> {
 
 #[derive(Clone)]
 pub(crate) struct LoadedPackage {
+    pub root: PathBuf,
     pub name: String,
     pub entry: PathBuf,
     pub kind: ProjectKind,
@@ -100,8 +102,20 @@ pub(crate) struct LoadedPackage {
     pub runtime_source: Option<PathBuf>,
     pub manifest_fingerprint: String,
     pub source: pipeline::LoadedSource,
+    pub macro_parse: Option<frontend::tree_builder::Parse>,
     pub package_ranges: Vec<Range<usize>>,
     pub watched_files: Vec<PathBuf>,
+    pub proc_macros: Vec<ProcMacroPackage>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcMacroPackage {
+    pub root: PathBuf,
+    pub alias: String,
+    pub name: String,
+    pub entry: PathBuf,
+    pub source: pipeline::LoadedSource,
+    pub manifest_fingerprint: String,
 }
 
 pub(crate) fn load_with_overlays(
@@ -130,6 +144,7 @@ fn load_inner(
     let mut files = Vec::new();
     let mut source_map = pipeline::SourceMap::default();
     let mut package_ranges = Vec::new();
+    let mut proc_macros = Vec::new();
     let mut watched_files = vec![root.join(CLUE_PROJECT_FILE_NAME)];
     let mut manifest_fingerprint = manifest.fingerprint.clone();
     for dependency in &manifest.dependencies {
@@ -160,6 +175,19 @@ fn load_inner(
         }
 
         manifest_fingerprint.push_str(&dependency_package.manifest_fingerprint);
+        proc_macros.extend(dependency_package.proc_macros.iter().cloned());
+        if dependency_package.kind == ProjectKind::ProcMacro {
+            watched_files.extend(dependency_package.watched_files.iter().cloned());
+            proc_macros.push(ProcMacroPackage {
+                root: dependency_package.root,
+                alias: dependency.alias.clone(),
+                name: dependency_package.name,
+                entry: dependency_package.entry,
+                source: dependency_package.source,
+                manifest_fingerprint: dependency_package.manifest_fingerprint,
+            });
+            continue;
+        }
         let dependency_ranges = dependency_package.package_ranges;
         watched_files.extend(dependency_package.watched_files);
         let pipeline::LoadedSource {
@@ -196,6 +224,7 @@ fn load_inner(
     package_ranges.push(own_start..source.len());
     stack.remove(&root);
     Ok(LoadedPackage {
+        root,
         name: manifest.name,
         entry: manifest.entry,
         kind: manifest.kind,
@@ -207,8 +236,10 @@ fn load_inner(
             files,
             source_map,
         },
+        macro_parse: None,
         package_ranges,
         watched_files,
+        proc_macros,
     })
 }
 

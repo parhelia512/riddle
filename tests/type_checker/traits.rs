@@ -340,6 +340,45 @@ fn operator_traits_accept_defaulted_and_heterogeneous_rhs() {
 }
 
 #[test]
+fn binary_expected_output_selects_heterogeneous_operator_impl() {
+    let result = check(
+        r#"
+        unsafe extern "C" {
+            safe fun fail() -> !;
+        }
+
+        #[lang = "add"]
+        trait Add<Rhs = Self> {
+            type Output;
+            fun add(self, rhs: Rhs) -> Self::Output;
+        }
+
+        struct Left {}
+        struct First {}
+        struct Second {}
+
+        impl Add<First> for Left {
+            type Output = i32;
+            fun add(self, rhs: First) -> i32 { 0 }
+        }
+
+        impl Add<Second> for Left {
+            type Output = bool;
+            fun add(self, rhs: Second) -> bool { true }
+        }
+
+        fun make<T>() -> T { fail() }
+
+        fun main() -> bool {
+            Left {} + make()
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn trait_type_arguments_respect_required_and_defaulted_parameters() {
     let result = check(
         r#"
@@ -1425,11 +1464,43 @@ fn accepts_where_clause_on_impl_bound() {
     );
 
     let msgs = messages(&result);
-    assert!(
+    assert_eq!(
         msgs.iter()
-            .any(|msg| msg.contains("does not satisfy bound `Wrap`")),
+            .filter(|msg| msg.contains("does not satisfy bound `Wrap`"))
+            .count(),
+        1,
         "{msgs:?}"
     );
+}
+
+#[test]
+fn generic_bound_proves_nested_generic_impl_bound() {
+    let result = check(
+        r#"
+        trait Debug {}
+
+        struct Vector<T> { value: T }
+
+        impl Debug for i32 {}
+
+        impl<T> Debug for Vector<T>
+        where T: Debug
+        {}
+
+        fun write_debug<T: Debug>(value: &T) {}
+
+        fun forward<T: Debug>(value: &Vector<T>) {
+            write_debug(value);
+        }
+
+        fun main() {
+            let value = Vector { value: 1 };
+            forward(&value);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
 }
 
 #[test]

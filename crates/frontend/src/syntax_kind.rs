@@ -270,6 +270,7 @@ pub enum SyntaxKind {
     UnsafeExpr,
     CastExpr,
     TryExpr,
+    MacroCall,
     PtrType,
     ErrorNode,
 

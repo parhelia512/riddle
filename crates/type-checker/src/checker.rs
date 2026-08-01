@@ -30,12 +30,28 @@ pub struct TypeChecker<'a> {
     pub(crate) last_occurs_error: Option<(u32, Type)>,
     pending_lambdas: Vec<PendingLambda>,
     pub(crate) pending_delayed_bindings: Vec<(BodyId, PatternBindingId, Option<TextRange>)>,
+    pub(crate) pending_generic_calls: Vec<PendingGenericCall>,
 }
 
 struct PendingLambda {
     body_id: BodyId,
     expr: ExprId,
     params: Vec<(String, Option<TextRange>, Type)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingGenericCall {
+    pub(crate) body_id: BodyId,
+    pub(crate) callee: ExprId,
+    pub(crate) function: FunctionId,
+    pub(crate) inferred_names: Vec<String>,
+    pub(crate) subst: HashMap<String, Type>,
+    pub(crate) generic_arg_spans: HashMap<String, TextRange>,
+    pub(crate) callee_span: Option<TextRange>,
+    pub(crate) span: Option<TextRange>,
+    pub(crate) kind: &'static str,
+    pub(crate) caller: Option<FunctionId>,
+    pub(crate) check_sized: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +85,7 @@ impl<'a> TypeChecker<'a> {
             last_occurs_error: None,
             pending_lambdas: Vec::new(),
             pending_delayed_bindings: Vec::new(),
+            pending_generic_calls: Vec::new(),
         }
     }
 
@@ -579,7 +596,7 @@ impl<'a> TypeChecker<'a> {
                 );
             }
             dependencies.insert(const_id, deps);
-            self.finish_inference(body_id);
+            self.finish_inference(&ctx);
         }
 
         let mut states = HashMap::<ConstId, u8>::new();
@@ -703,6 +720,7 @@ impl<'a> TypeChecker<'a> {
             self.check_type_bounds_inner(&ctx, &param_ty, Some(param.ty_range));
         }
         let actual = self.check_expr_expected(&mut ctx, body.root_block, &return_ty);
+        self.record_value_use(&mut ctx, body.root_block, crate::result::ValueUse::Move);
 
         if !actual.is_never() {
             self.expect_assignable(
@@ -712,7 +730,7 @@ impl<'a> TypeChecker<'a> {
                 ctx.expr_range(body.root_block),
             );
         }
-        self.finish_inference(body_id);
+        self.finish_inference(&ctx);
     }
 
     pub(crate) fn fresh_infer(&mut self) -> Type {
@@ -1024,7 +1042,9 @@ impl<'a> TypeChecker<'a> {
         });
     }
 
-    fn finish_inference(&mut self, body_id: BodyId) {
+    fn finish_inference(&mut self, ctx: &BodyCtx<'_>) {
+        let body_id = ctx.body_id;
+        self.finish_pending_generic_calls(ctx);
         let exprs = self
             .result
             .expr_types

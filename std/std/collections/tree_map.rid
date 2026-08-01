@@ -2,6 +2,7 @@ use crate::std::cmp::{Ord, Ordering};
 use crate::std::option::Option;
 use crate::std::vector::Vector;
 
+#[derive(Debug)]
 struct TreeNode<K> {
     key: K,
     parent: Option<usize>,
@@ -10,6 +11,7 @@ struct TreeNode<K> {
     red: bool,
 }
 
+#[derive(Debug)]
 pub struct TreeMap<K, V> {
     nodes: Vector<TreeNode<K>>,
     values: Vector<V>,

@@ -1450,7 +1450,11 @@ impl<'s> Parser<'s> {
             | SyntaxKind::ColonColon => {
                 let m = self.start();
                 self.path();
-                Some(m.complete(self, SyntaxKind::NameRef))
+                if self.at(SyntaxKind::Bang) {
+                    Some(self.finish_macro_call(m))
+                } else {
+                    Some(m.complete(self, SyntaxKind::NameRef))
+                }
             }
 
             SyntaxKind::LBrace => Some(self.block()),
@@ -1660,13 +1664,37 @@ impl<'s> Parser<'s> {
             | SyntaxKind::ColonColon => {
                 let m = self.start();
                 self.path();
-                if self.at(SyntaxKind::Less) {
-                    self.type_arg_list();
+                if self.at(SyntaxKind::Bang) {
+                    self.finish_macro_call(m);
+                } else {
+                    if self.at(SyntaxKind::Less) {
+                        self.type_arg_list();
+                    }
+                    m.complete(self, SyntaxKind::NamedType);
                 }
-                m.complete(self, SyntaxKind::NamedType);
             }
             _ => self.error(format!("expected type, found {:?}", self.current())),
         }
+    }
+
+    fn finish_macro_call(&mut self, marker: Marker) -> CompletedMarker {
+        self.expect(SyntaxKind::Bang);
+        match self.current() {
+            SyntaxKind::LParen => {
+                self.balanced_group(SyntaxKind::LParen, SyntaxKind::RParen);
+            }
+            SyntaxKind::LBrace => {
+                self.balanced_group(SyntaxKind::LBrace, SyntaxKind::RBrace);
+            }
+            SyntaxKind::LBracket => {
+                self.balanced_group(SyntaxKind::LBracket, SyntaxKind::RBracket);
+            }
+            _ => self.error(format!(
+                "expected a delimited token tree after `!`, found {:?}",
+                self.current()
+            )),
+        }
+        marker.complete(self, SyntaxKind::MacroCall)
     }
 
     // == new items ==
@@ -2186,6 +2214,11 @@ impl<'s> Parser<'s> {
             | SyntaxKind::ColonColon => {
                 let m = self.start();
                 self.path();
+
+                if self.at(SyntaxKind::Bang) {
+                    self.finish_macro_call(m);
+                    return;
+                }
 
                 match self.current() {
                     SyntaxKind::LParen => {

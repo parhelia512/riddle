@@ -1,4 +1,4 @@
-use rowan::{GreenNodeBuilder, Language};
+use rowan::{GreenNodeBuilder, GreenToken, Language, NodeOrToken, TextRange, TextSize};
 
 use super::{
     lexer::Token,
@@ -6,6 +6,7 @@ use super::{
     syntax_kind::{RiddleLang, SyntaxKind, SyntaxNode},
 };
 
+#[derive(Debug, Clone)]
 pub struct Parse {
     pub green: rowan::GreenNode,
     pub errors: Vec<ParseError>,
@@ -18,6 +19,25 @@ impl Parse {
 
     pub fn debug_tree(&self) -> String {
         format!("{:#?}", self.syntax())
+    }
+}
+
+pub fn append_parse(left: &Parse, separator: &str, right: &Parse) -> Parse {
+    let index = left.green.children().count();
+    let children = std::iter::once(NodeOrToken::Token(GreenToken::new(
+        RiddleLang::kind_to_raw(SyntaxKind::Whitespace),
+        separator,
+    )))
+    .chain(right.green.children().map(|child| child.to_owned()));
+    let offset = left.green.text_len() + TextSize::of(separator);
+    let mut errors = left.errors.clone();
+    errors.extend(right.errors.iter().cloned().map(|mut error| {
+        error.span = TextRange::new(error.span.start() + offset, error.span.end() + offset);
+        error
+    }));
+    Parse {
+        green: left.green.splice_children(index..index, children),
+        errors,
     }
 }
 

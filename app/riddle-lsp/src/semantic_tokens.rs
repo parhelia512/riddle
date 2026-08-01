@@ -11,7 +11,7 @@ use riddlec::pipeline::CompileOptions;
 use rowan::{TextRange, TextSize};
 
 use crate::{
-    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document},
+    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document, analyze_standalone_source},
     completion::BUILTIN_TYPES,
     server::Document,
     session::AnalysisSessions,
@@ -67,6 +67,7 @@ pub const TOKEN_INTERFACE: u32 = 11;
 pub const TOKEN_PROPERTY: u32 = 12;
 pub const TOKEN_NAMESPACE: u32 = 13;
 pub const TOKEN_PARAMETER: u32 = 14;
+pub const TOKEN_MACRO: u32 = 15;
 pub const MOD_DECLARATION: u32 = 1 << 0;
 pub const MOD_MUTABLE: u32 = 1 << 1;
 pub const MOD_STATIC: u32 = 1 << 2;
@@ -90,6 +91,7 @@ pub(crate) fn semantic_tokens_legend() -> SemanticTokensLegend {
             SemanticTokenType::PROPERTY,
             SemanticTokenType::NAMESPACE,
             SemanticTokenType::PARAMETER,
+            SemanticTokenType::MACRO,
         ],
         token_modifiers: vec![
             SemanticTokenModifier::DECLARATION,
@@ -111,17 +113,14 @@ pub fn semantic_tokens_for_source_with_options(
     compile_options: CompileOptions,
     default_library_source: bool,
 ) -> SemanticTokens {
-    let result = riddlec::pipeline::resolve_with_options(source, compile_options);
-    semantic_tokens_from_analysis(
+    let analysis = analyze_standalone_source(
         source,
-        &DocumentAnalysis {
-            result,
-            source: source.into(),
-            source_map: None,
-            path: None,
-        },
-        default_library_source,
-    )
+        compile_options,
+        &mut riddlec::pipeline::CheckSession::new(),
+        AnalysisDepth::Resolve,
+        None,
+    );
+    semantic_tokens_from_analysis(source, &analysis, default_library_source)
 }
 
 pub fn semantic_tokens_for_document(
@@ -167,6 +166,22 @@ fn semantic_tokens_from_analysis(
             token_type,
             token_modifiers_bitset,
             resolved: false,
+        });
+    }
+
+    for occurrence in &analysis.macro_occurrences {
+        let Some(range) = analysis.local_macro_range(&occurrence.range) else {
+            continue;
+        };
+        raw_tokens.push(RawSemanticToken {
+            range,
+            token_type: TOKEN_MACRO,
+            token_modifiers_bitset: if occurrence.is_declaration {
+                MOD_DECLARATION
+            } else {
+                0
+            },
+            resolved: true,
         });
     }
 
@@ -522,6 +537,7 @@ fn remove_overlapping_tokens(raw_tokens: Vec<RawSemanticToken>) -> Vec<RawSemant
                     | TOKEN_ENUM
                     | TOKEN_INTERFACE
                     | TOKEN_PARAMETER
+                    | TOKEN_MACRO
             )
         });
     preferred.sort_by_key(|token| {
@@ -536,10 +552,13 @@ fn remove_overlapping_tokens(raw_tokens: Vec<RawSemanticToken>) -> Vec<RawSemant
 
     let mut kept_preferred: Vec<RawSemanticToken> = Vec::new();
     for token in preferred {
-        if kept_preferred
-            .last()
-            .is_some_and(|kept| ranges_overlap(kept.range, token.range))
+        if let Some(kept) = kept_preferred
+            .last_mut()
+            .filter(|kept| ranges_overlap(kept.range, token.range))
         {
+            if preferred_token_priority(&token) > preferred_token_priority(kept) {
+                *kept = token;
+            }
             continue;
         }
         kept_preferred.push(token);
@@ -569,6 +588,17 @@ fn remove_overlapping_tokens(raw_tokens: Vec<RawSemanticToken>) -> Vec<RawSemant
     kept_preferred.extend(kept_fallback);
     kept_preferred.sort_by_key(|token| (token.range.start(), token.range.end()));
     kept_preferred
+}
+
+fn preferred_token_priority(
+    token: &RawSemanticToken,
+) -> (bool, bool, std::cmp::Reverse<TextSize>, u32) {
+    (
+        token.token_type == TOKEN_MACRO,
+        token.resolved,
+        std::cmp::Reverse(token.range.len()),
+        token.token_modifiers_bitset.count_ones(),
+    )
 }
 
 fn encode_semantic_tokens(source: &str, raw_tokens: Vec<RawSemanticToken>) -> SemanticTokens {

@@ -192,7 +192,7 @@ fn parse_full(source: &str) -> Parse {
     tree_builder::build_tree(events, tokens, source, lex_errors)
 }
 
-fn parse_fragment(source: &str, entry: ReparseEntry) -> Option<Parse> {
+pub fn parse_fragment(source: &str, entry: ReparseEntry) -> Option<Parse> {
     let tokens = lexer::lex(source);
     let mut lex_errors = lexer_error_diagnostics(source, &tokens);
     let parser = Parser::new(source, tokens);
@@ -202,6 +202,24 @@ fn parse_fragment(source: &str, entry: ReparseEntry) -> Option<Parse> {
         return None;
     }
     Some(tree_builder::build_tree(event, tokens, source, lex_errors))
+}
+
+pub fn parse_tokens(source: &str, tokens: Vec<lexer::Token>) -> Parse {
+    let parser = Parser::new(source, tokens);
+    let (events, tokens, errors, source) = parser.parse();
+    tree_builder::build_tree(events, tokens, source, errors)
+}
+
+pub fn parse_token_fragment(
+    source: &str,
+    tokens: Vec<lexer::Token>,
+    entry: ReparseEntry,
+) -> Option<Parse> {
+    let parser = Parser::new(source, tokens);
+    let (events, tokens, errors, source) = parser.reparse(entry)?;
+    errors
+        .is_empty()
+        .then(|| tree_builder::build_tree(events, tokens, source, errors))
 }
 
 /// Emit diagnostics for tokens the lexer couldn't recognise.

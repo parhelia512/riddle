@@ -64,6 +64,77 @@ fn checks_generic_struct_literals_and_field_access() {
 }
 
 #[test]
+fn field_access_expected_type_constrains_generic_base() {
+    let result = check(
+        r#"
+        unsafe extern "C" {
+            safe fun fail() -> !;
+        }
+
+        struct Box<T> {
+            value: T,
+        }
+
+        fun make<T>() -> Box<T> { Box { value: fail() } }
+        fun consume(value: impl Fn(i32) -> i32) {}
+
+        fun main() {
+            consume(make().value);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn infers_associated_function_generics_from_bound_aggregate_fields() {
+    let result = check(
+        r#"
+        struct Inner<K, V> {}
+
+        impl<K, V> Inner<K, V> {
+            fun new() -> Inner<K, V> {
+                Inner {}
+            }
+        }
+
+        struct Outer<T> {
+            inner: Inner<T, bool>,
+        }
+
+        impl<T> Outer<T> {
+            fun new() -> Outer<T> {
+                Outer { inner: Inner::new() }
+            }
+        }
+
+        enum NamedOuter<T> {
+            Value { inner: Inner<T, bool> },
+        }
+
+        impl<T> NamedOuter<T> {
+            fun new() -> NamedOuter<T> {
+                NamedOuter::Value { inner: Inner::new() }
+            }
+        }
+
+        enum TupleOuter<T> {
+            Value(Inner<T, bool>),
+        }
+
+        impl<T> TupleOuter<T> {
+            fun new() -> TupleOuter<T> {
+                TupleOuter::Value(Inner::new())
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn checks_generic_impl_receiver_substitution() {
     let result = check(
         r#"

@@ -41,6 +41,27 @@ fn accepts_no_std() {
 }
 
 #[test]
+fn expands_standard_print_macros() {
+    let root = temp_root("print-macros");
+    fs::create_dir_all(&root).unwrap();
+    let input = root.join("main.rid");
+    fs::write(
+        &input,
+        "fun main() -> i32 { print!(\"value={}\", 7); println!(); 0 }\n",
+    )
+    .unwrap();
+
+    let output = run(&[&input]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn accepts_supported_target_and_rejects_unknown_target() {
     let root = temp_root("target");
     fs::create_dir_all(&root).unwrap();
@@ -133,5 +154,44 @@ fn diagnostics_keep_rust_style_hierarchy() {
         stderr.ends_with("error: aborting due to 1 previous error\n"),
         "{stderr}"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn debug_format_bound_diagnostic_points_to_user_source() {
+    let root = temp_root("debug-format-diagnostic");
+    fs::create_dir_all(&root).unwrap();
+    let input = root.join("main.rid");
+    fs::write(
+        &input,
+        "enum Foo { A() }\nfun main() {\n    let value = Foo::A();\n    println!(\"{:?}\", value);\n}\n",
+    )
+    .unwrap();
+
+    let output = run(&[&input]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.starts_with("error[E0035]: `Foo` doesn't implement `Debug`\n"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("println!(\"{:?}\", value);"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "`Foo` cannot be formatted using `{:?}` because it doesn't implement `Debug`"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("required by this formatting parameter"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("consider annotating `Foo` with `#[derive(Debug)]`"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("print_debug"), "{stderr}");
+    assert!(!stderr.contains(r"\\?\"), "{stderr}");
     let _ = fs::remove_dir_all(root);
 }

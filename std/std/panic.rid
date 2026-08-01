@@ -1,0 +1,7 @@
+unsafe extern "C" {
+    safe fun abort() -> !;
+}
+
+pub fun panic(message: &str) -> ! {
+    abort()
+}

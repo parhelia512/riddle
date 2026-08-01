@@ -1,6 +1,9 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
-use riddlec::pipeline::{CompileOptions, CompileResult};
+use riddlec::pipeline::{CheckSession, CompileOptions, CompileResult, LoadedSource};
 use rowan::TextRange;
 
 use crate::{
@@ -19,6 +22,8 @@ pub(crate) struct DocumentAnalysis {
     pub(crate) result: CompileResult,
     pub(crate) source: String,
     pub(crate) source_map: Option<riddlec::pipeline::SourceMap>,
+    pub(crate) macro_occurrences: Vec<riddlec::proc_macro::ProcMacroOccurrence>,
+    pub(crate) macro_source_map: Option<riddlec::pipeline::SourceMap>,
     pub(crate) path: Option<PathBuf>,
 }
 
@@ -28,7 +33,80 @@ impl DocumentAnalysis {
             return range_is_in_source(range, self.source.len()).then_some(range);
         };
         let mapped = source_map.map_range(range)?;
-        (Some(mapped.path) == self.path.as_deref()).then_some(mapped.range)
+        self.path
+            .as_deref()
+            .is_none_or(|path| mapped.path == path)
+            .then_some(mapped.range)
+    }
+
+    pub(crate) fn local_macro_range(&self, range: &std::ops::Range<usize>) -> Option<TextRange> {
+        let source_map = self.macro_source_map.as_ref()?;
+        let mapped = source_map.map_range(TextRange::new(
+            (range.start as u32).into(),
+            (range.end as u32).into(),
+        ))?;
+        self.path
+            .as_deref()
+            .is_none_or(|path| mapped.path == path)
+            .then_some(mapped.range)
+    }
+}
+
+pub(crate) fn analyze_standalone_source(
+    source: &str,
+    options: CompileOptions,
+    session: &mut CheckSession,
+    depth: AnalysisDepth,
+    path: Option<PathBuf>,
+) -> DocumentAnalysis {
+    let mut loaded =
+        LoadedSource::single_file(path.as_deref().unwrap_or_else(|| Path::new("")), source);
+    let macro_source_map = loaded.source_map.clone();
+    let riddlec::proc_macro::ExpandedSource {
+        source,
+        parse,
+        mappings,
+        macro_occurrences,
+        diagnostics,
+        ..
+    } = riddlec::proc_macro::expand_standard_macros(source);
+    loaded.apply_expansion(source, &mappings);
+    #[allow(clippy::single_range_in_vec_init)]
+    let package_ranges = [0..loaded.source.len()];
+    let mut result = match (depth, parse.as_ref()) {
+        (AnalysisDepth::Resolve, Some(parse)) => session
+            .resolve_parsed_package_with_options_cancellable(
+                &loaded.source,
+                parse,
+                &package_ranges,
+                options,
+                || false,
+            )
+            .expect("non-cancellable pipeline cannot be cancelled"),
+        (AnalysisDepth::Resolve, None) => {
+            session.resolve_package_with_options(&loaded.source, &package_ranges, options)
+        }
+        (AnalysisDepth::Check, Some(parse)) => session
+            .check_parsed_package_with_options_cancellable(
+                &loaded.source,
+                parse,
+                &package_ranges,
+                options,
+                || false,
+            )
+            .expect("non-cancellable pipeline cannot be cancelled"),
+        (AnalysisDepth::Check, None) => {
+            session.check_package_with_options(&loaded.source, &package_ranges, options)
+        }
+    };
+    result.macro_diagnostics = diagnostics;
+    DocumentAnalysis {
+        result,
+        source: loaded.source,
+        source_map: Some(loaded.source_map),
+        macro_occurrences,
+        macro_source_map: Some(macro_source_map),
+        path,
     }
 }
 
@@ -70,6 +148,8 @@ pub(crate) fn analyze_document(
             result: analysis.result,
             source: analysis.source.source,
             source_map: Some(analysis.source.source_map),
+            macro_occurrences: analysis.macro_occurrences,
+            macro_source_map: Some(analysis.macro_source_map),
             path: Some(normalized_path(path)),
         });
     }
@@ -78,14 +158,12 @@ pub(crate) fn analyze_document(
     let mut session = session
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let result = match depth {
-        AnalysisDepth::Resolve => session.resolve_with_options(&document.text, options),
-        AnalysisDepth::Check => session.check_with_options(&document.text, options),
-    };
-    Ok(DocumentAnalysis {
-        result,
-        source: document.text.clone(),
-        source_map: None,
-        path: None,
-    })
+    let path = uri.to_file_path().ok().map(normalized_path);
+    Ok(analyze_standalone_source(
+        &document.text,
+        options,
+        &mut session,
+        depth,
+        path,
+    ))
 }

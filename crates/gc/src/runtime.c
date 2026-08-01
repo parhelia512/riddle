@@ -248,6 +248,132 @@ void rgc_free(void *ptr) {
     // object list, switch to a doubly linked list if frees ever dominate.
 }
 
+typedef struct {
+    uint8_t level;
+    size_t start;
+    size_t end;
+    char *message;
+    size_t len;
+} RiddleProcDiagnostic;
+
+static char *riddle_proc_output = NULL;
+static size_t riddle_proc_output_len = 0;
+static size_t riddle_proc_call_site_start_value = 0;
+static size_t riddle_proc_call_site_end_value = 0;
+static RiddleProcDiagnostic *riddle_proc_diagnostics = NULL;
+static size_t riddle_proc_diagnostic_len = 0;
+static size_t riddle_proc_diagnostic_cap = 0;
+
+static char *riddle_proc_copy(const uint8_t *value, size_t len) {
+    if (!value && len != 0u) {
+        rgc_panic();
+    }
+    const uint8_t *source = value ? value : (const uint8_t *)"";
+    if (len == SIZE_MAX) {
+        rgc_panic();
+    }
+    char *copy = (char *)malloc(len + 1u);
+    if (!copy) {
+        rgc_panic();
+    }
+    memcpy(copy, source, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+void riddle_proc_begin(size_t call_site_start, size_t call_site_end) {
+    free(riddle_proc_output);
+    riddle_proc_output = NULL;
+    riddle_proc_output_len = 0;
+    riddle_proc_call_site_start_value = call_site_start;
+    riddle_proc_call_site_end_value = call_site_end;
+    for (size_t i = 0; i < riddle_proc_diagnostic_len; ++i) {
+        free(riddle_proc_diagnostics[i].message);
+    }
+    riddle_proc_diagnostic_len = 0;
+}
+
+size_t riddle_proc_call_site_start(void) {
+    return riddle_proc_call_site_start_value;
+}
+
+size_t riddle_proc_call_site_end(void) {
+    return riddle_proc_call_site_end_value;
+}
+
+void riddle_proc_emit_diagnostic(
+    uint8_t level,
+    size_t start,
+    size_t end,
+    const uint8_t *message,
+    size_t len
+) {
+    if (riddle_proc_diagnostic_len == riddle_proc_diagnostic_cap) {
+        size_t next_cap = riddle_proc_diagnostic_cap ? riddle_proc_diagnostic_cap * 2u : 4u;
+        if (next_cap < riddle_proc_diagnostic_cap
+            || next_cap > SIZE_MAX / sizeof(RiddleProcDiagnostic)) {
+            rgc_panic();
+        }
+        RiddleProcDiagnostic *next = (RiddleProcDiagnostic *)realloc(
+            riddle_proc_diagnostics,
+            next_cap * sizeof(RiddleProcDiagnostic)
+        );
+        if (!next) {
+            rgc_panic();
+        }
+        riddle_proc_diagnostics = next;
+        riddle_proc_diagnostic_cap = next_cap;
+    }
+    riddle_proc_diagnostics[riddle_proc_diagnostic_len].level = level;
+    riddle_proc_diagnostics[riddle_proc_diagnostic_len].start = start;
+    riddle_proc_diagnostics[riddle_proc_diagnostic_len].end = end;
+    riddle_proc_diagnostics[riddle_proc_diagnostic_len].message = riddle_proc_copy(message, len);
+    riddle_proc_diagnostics[riddle_proc_diagnostic_len].len = len;
+    ++riddle_proc_diagnostic_len;
+}
+
+void riddle_proc_set_output(const uint8_t *value, size_t len) {
+    free(riddle_proc_output);
+    riddle_proc_output = riddle_proc_copy(value, len);
+    riddle_proc_output_len = len;
+}
+
+const char *riddle_proc_output_value(void) {
+    return riddle_proc_output ? riddle_proc_output : "";
+}
+
+size_t riddle_proc_output_length(void) {
+    return riddle_proc_output_len;
+}
+
+size_t riddle_proc_diagnostic_count(void) {
+    return riddle_proc_diagnostic_len;
+}
+
+uint8_t riddle_proc_diagnostic_level(size_t index) {
+    return index < riddle_proc_diagnostic_len ? riddle_proc_diagnostics[index].level : 0u;
+}
+
+size_t riddle_proc_diagnostic_start(size_t index) {
+    return index < riddle_proc_diagnostic_len
+        ? riddle_proc_diagnostics[index].start
+        : riddle_proc_call_site_start_value;
+}
+
+size_t riddle_proc_diagnostic_end(size_t index) {
+    return index < riddle_proc_diagnostic_len
+        ? riddle_proc_diagnostics[index].end
+        : riddle_proc_call_site_end_value;
+}
+
+const char *riddle_proc_diagnostic_message(size_t index) {
+    return index < riddle_proc_diagnostic_len ? riddle_proc_diagnostics[index].message : "";
+}
+
+size_t riddle_proc_diagnostic_message_length(size_t index) {
+    return index < riddle_proc_diagnostic_len ? riddle_proc_diagnostics[index].len : 0u;
+}
+
 void *rgc_realloc(void *ptr, size_t size) {
     // rgc_alloc may trigger a collection; ptr stays reachable through this
     // frame (conservative stack scan) and stays linked until rgc_free below.

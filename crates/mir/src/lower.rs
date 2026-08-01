@@ -295,7 +295,9 @@ impl<'a> LowerCtx<'a> {
             .unwrap_or(Type::Unit);
 
         let mut func = Function::new(name.clone(), ret_type);
-        func.is_c_export = self.hir.item_tree.extern_function_ids.contains(&fid);
+        func.uses_c_string_abi = func_item.attrs.iter().any(|attr| attr.name.0 == "c_export");
+        func.is_c_export =
+            self.hir.item_tree.extern_function_ids.contains(&fid) || func.uses_c_string_abi;
         let mut param_values: Vec<Value> = Vec::new();
 
         for param in &func_item.params {
@@ -4081,7 +4083,7 @@ impl<'a> LowerCtx<'a> {
                         .or_else(|| self.binding_place(builder, *id))
                         .unwrap_or_else(|| builder.unit_const())
                 }
-                _ => builder.unit_const(),
+                _ => self.materialize_temporary_place(builder, param_values, body, expr_id),
             },
             Expr::IndexAccess { base, index } => {
                 let base_val = self.lower_place_base(builder, param_values, body, *base);
@@ -4111,25 +4113,33 @@ impl<'a> LowerCtx<'a> {
                 operand,
                 op: HirUnOp::Deref,
             } => self.lower_expr(builder, param_values, body, *operand),
-            _ => {
-                let ty = self
-                    .current_body
-                    .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
-                    .map(|ty| self.convert_type(ty))
-                    .unwrap_or(Type::Unit);
-                let value = self.lower_expr(builder, param_values, body, expr_id);
-                let place = if self
-                    .current_body
-                    .is_some_and(|body_id| self.analysis.temporary_escapes(body_id, expr_id))
-                {
-                    builder.heap_alloc(ty)
-                } else {
-                    builder.alloca(ty)
-                };
-                builder.store(value, place);
-                place
-            }
+            _ => self.materialize_temporary_place(builder, param_values, body, expr_id),
         }
+    }
+
+    fn materialize_temporary_place(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        expr_id: ExprId,
+    ) -> Value {
+        let ty = self
+            .current_body
+            .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
+            .map(|ty| self.convert_type(ty))
+            .unwrap_or(Type::Unit);
+        let value = self.lower_expr(builder, param_values, body, expr_id);
+        let place = if self
+            .current_body
+            .is_some_and(|body_id| self.analysis.temporary_escapes(body_id, expr_id))
+        {
+            builder.heap_alloc(ty)
+        } else {
+            builder.alloca(ty)
+        };
+        builder.store(value, place);
+        place
     }
 
     fn lower_place_base(
@@ -5658,7 +5668,7 @@ impl<'a> LowerCtx<'a> {
                 return Some(name.clone());
             }
 
-            let mono_name = format!("{}__{}", self.hir.item_tree.functions[fid].name.0, suffix);
+            let mono_name = format!("{}__{}", self.method_symbol_base(fid), suffix);
             self.mono_methods.insert(key, mono_name.clone());
             let mut tc_subst = HashMap::from([("Self".into(), receiver_ty)]);
             tc_subst.extend(
@@ -5743,7 +5753,7 @@ impl<'a> LowerCtx<'a> {
         if let Some(name) = self.mono_methods.get(&key) {
             return Some(name.clone());
         }
-        let original_name = self.hir.item_tree.functions[fid].name.0.clone();
+        let original_name = self.method_symbol_base(fid);
         let mono_name = format!("{}__{}", original_name, suffix);
         self.mono_methods.insert(key, mono_name.clone());
         let old_subst = std::mem::replace(&mut self.generic_subst, subst.types);
@@ -5874,7 +5884,7 @@ impl<'a> LowerCtx<'a> {
         if let Some(self_ty) = self_tc_ty {
             tc_subst.insert("Self".into(), self_ty);
         }
-        let mono_name = format!("{}__{}", function.name.0, suffix);
+        let mono_name = format!("{}__{}", self.method_symbol_base(fid), suffix);
         self.mono_functions.insert(key, mono_name.clone());
 
         let old_subst = std::mem::replace(&mut self.generic_subst, subst);
@@ -5972,6 +5982,32 @@ impl<'a> LowerCtx<'a> {
             .unwrap_or_else(|| self.hir.item_tree.functions[fid].name.0.clone())
     }
 
+    fn method_symbol_base(&self, fid: hir::item_tree::FunctionId) -> String {
+        let name = self.hir.item_tree.functions[fid].name.0.clone();
+        let needs_trait_identity = self.impl_for_method(fid).is_some_and(|imp| {
+            let trait_args: &[hir::item_tree::HirTypeRef] = match &imp.trait_ty {
+                Some(hir::item_tree::HirTypeRef::Named(path)) => &path.type_args,
+                _ => &[],
+            };
+            self.method_impls.iter().any(|(other_fid, other_impl)| {
+                let other = &self.hir.item_tree.impls[*other_impl];
+                let other_trait_args: &[hir::item_tree::HirTypeRef] = match &other.trait_ty {
+                    Some(hir::item_tree::HirTypeRef::Named(path)) => &path.type_args,
+                    _ => &[],
+                };
+                *other_fid != fid
+                    && self.hir.item_tree.functions[*other_fid].name.0 == name
+                    && other.self_ty == imp.self_ty
+                    && other_trait_args == trait_args
+            })
+        });
+        if needs_trait_identity {
+            format!("{name}__trait{}", fid.into_raw().into_u32())
+        } else {
+            name
+        }
+    }
+
     fn static_method_name(&self, fid: hir::item_tree::FunctionId) -> Option<String> {
         let imp = self.impl_for_method(fid)?;
         if !imp.generics.is_empty() || !imp.const_generics.is_empty() {
@@ -5990,10 +6026,7 @@ impl<'a> LowerCtx<'a> {
             .chain(trait_args)
             .collect::<Vec<_>>()
             .join("_");
-        Some(format!(
-            "{}__{}",
-            self.hir.item_tree.functions[fid].name.0, suffix
-        ))
+        Some(format!("{}__{}", self.method_symbol_base(fid), suffix))
     }
 
     fn impl_self_mir_type(&self, fid: hir::item_tree::FunctionId) -> Option<Type> {
@@ -6201,6 +6234,31 @@ impl<'a> LowerCtx<'a> {
                     );
                 }
                 Some(subst)
+            }
+            type_checker::Type::Ptr { inner, mutable } => {
+                let hir::item_tree::HirTypeRef::Ptr {
+                    inner: pattern_inner,
+                    mutable: pattern_mut,
+                } = &imp.self_ty
+                else {
+                    return None;
+                };
+                if mutable != pattern_mut {
+                    return None;
+                }
+                let generics = imp
+                    .generics
+                    .iter()
+                    .map(|name| name.0.as_str())
+                    .collect::<HashSet<_>>();
+                self.collect_hir_type_subst(
+                    pattern_inner,
+                    inner,
+                    &generics,
+                    &mut subst.types,
+                    &mut subst.tc_types,
+                )
+                .then_some(subst)
             }
             _ => None,
         }

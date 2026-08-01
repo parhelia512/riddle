@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use frontend::syntax_kind::SyntaxKind;
 use hir::body::{BodyId, Expr, Stmt};
@@ -6,7 +9,10 @@ use hir::item_tree::{
     HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem, Visibility,
 };
 use lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
-use riddlec::pipeline::{CompileOptions, CompileResult};
+use riddlec::{
+    pipeline::{CompileOptions, CompileResult},
+    proc_macro::{ProcMacroKind, STANDARD_DERIVE_MACROS, STANDARD_FUNCTION_MACROS},
+};
 use rowan::{TextRange, TextSize};
 use scope_graph::resolve::{exported_definitions, resolve_path_at_reference, visible_definitions};
 use scope_graph::{DefRef, Node, NodeId, RefOrigin, ScopeGraph};
@@ -45,6 +51,7 @@ struct CompletionSite {
     end: usize,
     prefix: String,
     context: CompletionContext,
+    macro_kind: Option<ProcMacroKind>,
 }
 
 pub fn completion_items_for_document(
@@ -136,7 +143,7 @@ pub fn completion_items_for_document(
                 // Restore the original (non-marked) overlay so the fallback
                 // session sees the unmodified source.
                 let mut fb_overlays = overlays.clone();
-                fb_overlays.insert(path, document.text.clone());
+                fb_overlays.insert(path.clone(), document.text.clone());
                 clue::resolve_project_with_session_cancellable(
                     &root,
                     &fb_overlays,
@@ -152,11 +159,16 @@ pub fn completion_items_for_document(
             if cancelled() {
                 return Ok(None);
             }
-            return Ok(Some(completion_items_from_result(
+            let mut items = completion_items_from_result(
                 &analysis.result,
                 &site,
                 fallback_result.as_ref().and_then(|a| a.result.hir.as_ref()),
-            )));
+            );
+            collect_standard_macro_completions(&site, &mut items);
+            collect_macro_completions(&analysis, &path, &site, &mut items);
+            items.sort_by(|left, right| left.label.cmp(&right.label));
+            items.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
+            return Ok(Some(items));
         }
     }
 
@@ -214,11 +226,15 @@ pub fn completion_items_for_document(
     if cancelled() {
         return Ok(None);
     }
-    Ok(Some(completion_items_from_result(
+    let mut items = completion_items_from_result(
         &result,
         &site,
         fallback_result.as_ref().and_then(|r| r.hir.as_ref()),
-    )))
+    );
+    collect_standard_macro_completions(&site, &mut items);
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+    items.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
+    Ok(Some(items))
 }
 
 #[cfg(feature = "test-support")]
@@ -246,11 +262,13 @@ pub fn completion_items_for_source(
         .zip(resolved.scope_graph.as_ref())
         .is_some_and(|(_, graph)| completion_marker_reference(graph).is_none()))
     .then(|| riddlec::pipeline::resolve_with_options(source, compile_options));
-    completion_items_from_result(
+    let mut items = completion_items_from_result(
         &resolved,
         &site,
         fallback.as_ref().and_then(|result| result.hir.as_ref()),
-    )
+    );
+    collect_standard_macro_completions(&site, &mut items);
+    items
 }
 
 fn completion_site(source: &str, position: lsp_types::Position) -> Option<CompletionSite> {
@@ -272,7 +290,117 @@ fn completion_site(source: &str, position: lsp_types::Position) -> Option<Comple
         end,
         prefix: source[start..offset].into(),
         context,
+        macro_kind: macro_completion_kind(source, start, end),
     })
+}
+
+fn macro_completion_kind(source: &str, start: usize, end: usize) -> Option<ProcMacroKind> {
+    let mut marked = source.to_string();
+    marked.replace_range(start..end, COMPLETION_MARKER);
+    let tokens = frontend::lexer::lex(&marked);
+    let (events, tokens, errors, parsed_source) =
+        frontend::parser::Parser::new(&marked, tokens).parse();
+    let parse = frontend::tree_builder::build_tree(events, tokens, parsed_source, errors);
+    let marker_range = TextRange::new(
+        TextSize::from(start as u32),
+        TextSize::from((start + COMPLETION_MARKER.len()) as u32),
+    );
+    let marker = parse
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.text_range() == marker_range)?;
+    for node in marker.parent_ancestors() {
+        match node.kind() {
+            SyntaxKind::MacroCall => return Some(ProcMacroKind::FunctionLike),
+            SyntaxKind::Attribute => {
+                let compact = node
+                    .text()
+                    .to_string()
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>();
+                return Some(if compact.starts_with("#[derive(") {
+                    ProcMacroKind::Derive
+                } else {
+                    ProcMacroKind::Attribute
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn collect_macro_completions(
+    analysis: &clue::ProjectAnalysis,
+    path: &Path,
+    site: &CompletionSite,
+    items: &mut Vec<CompletionItem>,
+) {
+    let Some(kind) = site.macro_kind else {
+        return;
+    };
+    let path = crate::text::normalized_path(path.to_owned());
+    for occurrence in analysis
+        .macro_occurrences
+        .iter()
+        .filter(|occurrence| occurrence.is_declaration && occurrence.kind == kind)
+    {
+        let range = TextRange::new(
+            (occurrence.range.start as u32).into(),
+            (occurrence.range.end as u32).into(),
+        );
+        let Some(mapped) = analysis.macro_source_map.map_range(range) else {
+            continue;
+        };
+        if crate::text::normalized_path(mapped.path.to_owned()) != path
+            || !occurrence
+                .name
+                .to_lowercase()
+                .starts_with(&site.prefix.to_lowercase())
+        {
+            continue;
+        }
+        let detail = match kind {
+            ProcMacroKind::Derive => "derive proc macro",
+            ProcMacroKind::Attribute => "attribute proc macro",
+            ProcMacroKind::FunctionLike => "function-like proc macro",
+        };
+        items.push(completion_item(
+            &occurrence.name,
+            CompletionItemKind::FUNCTION,
+            Some(detail.into()),
+        ));
+    }
+}
+
+fn collect_standard_macro_completions(site: &CompletionSite, items: &mut Vec<CompletionItem>) {
+    match site.macro_kind {
+        Some(ProcMacroKind::FunctionLike) => {
+            for name in STANDARD_FUNCTION_MACROS {
+                if name.to_lowercase().starts_with(&site.prefix.to_lowercase()) {
+                    items.push(completion_item(
+                        name,
+                        CompletionItemKind::FUNCTION,
+                        Some("standard macro".into()),
+                    ));
+                }
+            }
+        }
+        Some(ProcMacroKind::Derive) => {
+            for name in STANDARD_DERIVE_MACROS {
+                if name.to_lowercase().starts_with(&site.prefix.to_lowercase()) {
+                    items.push(completion_item(
+                        name,
+                        CompletionItemKind::FUNCTION,
+                        Some("standard derive macro".into()),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_type_position(source: &str, start: usize, end: usize) -> bool {

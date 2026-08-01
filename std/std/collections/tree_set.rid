@@ -1,14 +1,14 @@
 use crate::std::cmp::Ord;
-use crate::std::tree_map::TreeMap;
+use crate::std::collections::tree_map::TreeMap;
 
+#[derive(Debug)]
 pub struct TreeSet<T> {
-    values: TreeMap<T, bool>,
+    values: TreeMap<T, ()>,
 }
 
 impl<T> TreeSet<T> {
     pub fun new() -> TreeSet<T> {
-        let values: TreeMap<T, bool> = TreeMap::new();
-        TreeSet { values }
+        TreeSet { values: TreeMap::new() }
     }
 
     pub fun len(&self) -> usize {
@@ -21,7 +21,7 @@ impl<T> TreeSet<T> {
 
     pub fun insert(&mut self, value: T)
     where T: Ord {
-        self.values.insert(value, true);
+        self.values.insert(value, ());
     }
 
     pub fun contains(&self, value: &T) -> bool

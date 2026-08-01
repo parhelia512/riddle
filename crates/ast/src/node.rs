@@ -83,6 +83,7 @@ ast_node!(NameRefExpr, NameRef);
 ast_node!(UnsafeExpr, UnsafeExpr);
 ast_node!(CastExpr, CastExpr);
 ast_node!(TryExpr, TryExpr);
+ast_node!(MacroCall, MacroCall);
 
 // paths
 ast_node!(Path, Path);
@@ -224,6 +225,37 @@ impl Attribute {
 
     pub fn raw_text(&self) -> String {
         self.syntax.text().to_string()
+    }
+}
+
+impl MacroCall {
+    pub fn path(&self) -> Option<Path> {
+        support::child(&self.syntax)
+    }
+
+    pub fn delimiter_tokens(&self) -> Option<(SyntaxToken, SyntaxToken)> {
+        let tokens = self
+            .syntax
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .collect::<Vec<_>>();
+        let opening = tokens.iter().find(|token| {
+            matches!(
+                token.kind(),
+                SyntaxKind::LParen | SyntaxKind::LBrace | SyntaxKind::LBracket
+            )
+        })?;
+        let closing_kind = match opening.kind() {
+            SyntaxKind::LParen => SyntaxKind::RParen,
+            SyntaxKind::LBrace => SyntaxKind::RBrace,
+            SyntaxKind::LBracket => SyntaxKind::RBracket,
+            _ => unreachable!(),
+        };
+        let closing = tokens
+            .iter()
+            .rev()
+            .find(|token| token.kind() == closing_kind)?;
+        Some((opening.clone(), closing.clone()))
     }
 }
 

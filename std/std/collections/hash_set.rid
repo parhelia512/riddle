@@ -1,7 +1,8 @@
 use crate::std::cmp::Eq;
 use crate::std::hash::Hash;
-use crate::std::hash_map::HashMap;
+use crate::std::collections::hash_map::HashMap;
 
+#[derive(Debug)]
 pub struct HashSet<T> {
     values: HashMap<T, bool>,
 }

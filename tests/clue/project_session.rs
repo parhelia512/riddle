@@ -2,10 +2,31 @@ use clue::{ProjectSession, resolve_project_with_session};
 use riddlec::pipeline::CompileOptions;
 use std::{
     collections::HashMap,
+    ffi::OsString,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+fn has_c_compiler() -> bool {
+    std::env::var_os("CC")
+        .into_iter()
+        .chain(
+            ["cc", "gcc", "clang", "clang-cl", "cl"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .any(|compiler| {
+            let is_msvc = Path::new(&compiler)
+                .file_stem()
+                .is_some_and(|name| name == "cl" || name == "clang-cl");
+            Command::new(&compiler)
+                .arg(if is_msvc { "/?" } else { "--version" })
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+}
 
 fn temp_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -91,5 +112,64 @@ fn project_accepts_an_unsaved_module_overlay() {
         "{:#?}",
         analysis.result.hir_diagnostics
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_session_invalidates_proc_macro_overlays() {
+    if !has_c_compiler() {
+        eprintln!("skipping proc-macro overlay test: no C compiler found");
+        return;
+    }
+    let root = temp_root("proc-macro-overlay");
+    fs::create_dir_all(root.join("macros/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("macros/Clue.toml"),
+        "[package]\nname = \"macros\"\n\n[lib]\nproc-macro = true\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let macro_source = root.join("macros/src/lib.rid");
+    fs::write(
+        &macro_source,
+        "#[proc_macro_derive(Value)]\npub fun derive(_input: TokenStream) -> TokenStream { TokenStream::new() }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        "[package]\nname = \"app\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[dependencies]\nmacros = { path = \"../macros\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        "#[derive(macros::Value)]\nstruct Value {}\nfun main() -> i32 { generated() }\n",
+    )
+    .unwrap();
+
+    let macro_version = |value| {
+        format!(
+            "#[proc_macro_derive(Value)]\npub fun derive(_input: TokenStream) -> TokenStream {{ TokenStream::from_str(\"fun generated() -> i32 {{ {value} }}\").unwrap_or(TokenStream::new()) }}\n"
+        )
+    };
+    let mut session = ProjectSession::default();
+    let first = resolve_project_with_session(
+        &root.join("app"),
+        &HashMap::from([(macro_source.clone(), macro_version(1))]),
+        CompileOptions::default(),
+        &mut session,
+    )
+    .unwrap();
+    let first_revision = session.revision();
+    assert!(first.source.source.contains("generated () -> i32 {1}"));
+
+    let second = resolve_project_with_session(
+        &root.join("app"),
+        &HashMap::from([(macro_source, macro_version(2))]),
+        CompileOptions::default(),
+        &mut session,
+    )
+    .unwrap();
+    assert!(session.revision() > first_revision);
+    assert!(second.source.source.contains("generated () -> i32 {2}"));
     let _ = fs::remove_dir_all(root);
 }

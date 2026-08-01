@@ -2,7 +2,7 @@ use crate::std::iter::{IntoIterator, Iterator};
 use crate::std::mem::size_of;
 use crate::std::option::Option;
 use crate::std::ops::{Index, IndexMut};
-use crate::std::prelude::panic;
+use crate::std::panic::panic;
 
 // The buffer lives in the GC heap so stored references to escaping values are
 // traced; Drop still releases it deterministically via rgc_free.
@@ -11,6 +11,7 @@ unsafe extern "C" {
     safe fun rgc_free(data: *mut u8);
 }
 
+#[derive(Debug)]
 pub struct Vector<T> {
     data: *mut T,
     len: usize,
