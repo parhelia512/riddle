@@ -217,7 +217,7 @@ impl<'a> Analyzer<'a> {
 
     fn analyze_body(&mut self, function_id: FunctionId, body_id: BodyId) {
         let body = &self.hir.bodies[body_id];
-        let mut ctx = BodyCtx::new(body_id, body);
+        let mut ctx = BodyCtx::new(function_id, body_id, body);
         ctx.seed_params(
             self.hir.item_tree.functions[function_id]
                 .params
@@ -439,10 +439,35 @@ impl<'a> Analyzer<'a> {
             }
 
             Expr::While { condition, body } => {
+                let loop_entry = ctx.clone();
                 self.move_check_expr(ctx, *condition);
                 self.apply_recorded_value_use(ctx, *condition);
+                let mut condition_exit = ctx.clone();
                 self.move_check_expr(ctx, *body);
                 self.apply_recorded_value_use(ctx, *body);
+
+                let mut loop_head = loop_entry.clone();
+                let mut loop_exit = ctx.clone();
+                loop {
+                    let mut next_head = loop_entry.clone();
+                    next_head.merge_move_state_from(&loop_exit);
+                    if next_head.same_move_state(&loop_head) {
+                        break;
+                    }
+                    loop_head = next_head;
+
+                    let mut iteration = loop_entry.clone();
+                    iteration.copy_move_state_from(&loop_head);
+                    let diagnostic_count = self.result.diagnostics.len();
+                    self.move_check_expr(&mut iteration, *condition);
+                    self.apply_recorded_value_use(&mut iteration, *condition);
+                    condition_exit = iteration.clone();
+                    self.move_check_expr(&mut iteration, *body);
+                    self.apply_recorded_value_use(&mut iteration, *body);
+                    self.retain_new_loop_move_diagnostics(diagnostic_count);
+                    loop_exit = iteration;
+                }
+                ctx.copy_move_state_from(&condition_exit);
             }
 
             Expr::For {
@@ -472,11 +497,35 @@ impl<'a> Analyzer<'a> {
                     self.check_pattern_move_from_drop(ctx, *pat, &item_ty);
                 }
                 self.check_explicit_reference_pattern_move(ctx, *pat);
+                let loop_entry = ctx.clone();
                 ctx.push_scope();
                 self.bind_pattern_names(ctx, *pat);
                 self.bind_pattern_origins(ctx, *pat, &item_value);
                 self.move_check_expr(ctx, *body);
                 ctx.pop_scope();
+
+                let mut loop_head = loop_entry.clone();
+                let mut loop_exit = ctx.clone();
+                loop {
+                    let mut next_head = loop_entry.clone();
+                    next_head.merge_move_state_from(&loop_exit);
+                    if next_head.same_move_state(&loop_head) {
+                        break;
+                    }
+                    loop_head = next_head;
+
+                    let mut iteration = loop_entry.clone();
+                    iteration.copy_move_state_from(&loop_head);
+                    let diagnostic_count = self.result.diagnostics.len();
+                    iteration.push_scope();
+                    self.bind_pattern_names(&mut iteration, *pat);
+                    self.bind_pattern_origins(&mut iteration, *pat, &item_value);
+                    self.move_check_expr(&mut iteration, *body);
+                    self.retain_new_loop_move_diagnostics(diagnostic_count);
+                    iteration.pop_scope();
+                    loop_exit = iteration;
+                }
+                ctx.copy_move_state_from(&loop_head);
                 ctx.pop_scope();
             }
 
@@ -703,6 +752,7 @@ impl<'a> Analyzer<'a> {
                     self.check_explicit_reference_pattern_move(ctx, pat);
                     self.apply_recorded_value_use(ctx, init);
                 }
+                self.reset_pattern_moves(ctx, pat);
             }
             Stmt::Expr { expr } => {
                 self.move_check_expr(ctx, *expr);
@@ -857,31 +907,38 @@ impl<'a> Analyzer<'a> {
             .get(&(ctx.body_id, expr_id))
             .into_iter()
             .flat_map(|info| &info.captures)
-            .find_map(|capture| match &capture.place.source {
-                CaptureSource::Pattern(id)
-                    if capture.mode != CaptureMode::Value
-                        && self.local_has_explicit_drop(ctx, *id) =>
-                {
-                    Some(*id)
-                }
-                _ => None,
+            .find_map(|capture| {
+                let root = match &capture.place.source {
+                    CaptureSource::Pattern(id) => AccessRoot::Pattern(*id),
+                    CaptureSource::Param(index) => AccessRoot::Param(*index),
+                    CaptureSource::LambdaParam { lambda, index } => AccessRoot::LambdaParam {
+                        lambda: *lambda,
+                        index: *index,
+                    },
+                };
+                (capture.mode != CaptureMode::Value && self.root_has_explicit_drop(ctx, root))
+                    .then_some(root)
             });
         let owner = captured_owner.or_else(|| {
             ctx.expr_origins
                 .get(&expr_id)
                 .into_iter()
                 .flatten()
-                .find_map(|origin| match origin.place.root {
-                    AccessRoot::Pattern(id) if self.local_has_explicit_drop(ctx, id) => Some(id),
-                    _ => None,
+                .find_map(|origin| {
+                    self.root_has_explicit_drop(ctx, origin.place.root)
+                        .then_some(origin.place.root)
                 })
         });
         let Some(owner) = owner else { return };
-        let labels = ctx
-            .source_map
-            .pat_ranges
-            .get(&owner.pattern)
-            .copied()
+        let owner_range = match owner {
+            AccessRoot::Pattern(id) => ctx.source_map.pat_ranges.get(&id.pattern).copied(),
+            AccessRoot::Param(index) => self.hir.item_tree.functions[ctx.function_id]
+                .params
+                .get(index)
+                .map(|param| param.name_range),
+            AccessRoot::LambdaParam { .. } => None,
+        };
+        let labels = owner_range
             .map(|range| {
                 vec![(
                     range,
@@ -898,11 +955,29 @@ impl<'a> Analyzer<'a> {
         );
     }
 
-    fn local_has_explicit_drop(&self, ctx: &BodyCtx<'_>, binding: PatternBindingId) -> bool {
-        self.type_result
-            .pattern_binding_types
-            .get(&(ctx.body_id, binding))
-            .is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty))
+    fn root_has_explicit_drop(&self, ctx: &BodyCtx<'_>, root: AccessRoot) -> bool {
+        let ty = match root {
+            AccessRoot::Pattern(binding) => self
+                .type_result
+                .pattern_binding_types
+                .get(&(ctx.body_id, binding)),
+            AccessRoot::Param(index) => {
+                ctx.body
+                    .exprs
+                    .iter()
+                    .find_map(|(expr_id, expr)| match expr {
+                        Expr::Path {
+                            resolved: Some(ResolvedName::Param(param)),
+                            ..
+                        } if *param == index => {
+                            self.type_result.expr_types.get(&(ctx.body_id, expr_id))
+                        }
+                        _ => None,
+                    })
+            }
+            AccessRoot::LambdaParam { .. } => None,
+        };
+        ty.is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty))
     }
 
     fn apply_capture_effects(&mut self, ctx: &mut BodyCtx<'_>, lambda: ExprId, info: &LambdaInfo) {
@@ -1031,7 +1106,7 @@ impl<'a> Analyzer<'a> {
         body: ExprId,
         info: &LambdaInfo,
     ) {
-        let mut ctx = BodyCtx::new(outer.body_id, outer.body);
+        let mut ctx = BodyCtx::new(outer.function_id, outer.body_id, outer.body);
         ctx.seed_params(
             params
                 .iter()
@@ -1039,6 +1114,12 @@ impl<'a> Analyzer<'a> {
                 .chain(info.captures.iter().map(|capture| capture.name.as_str())),
         );
         self.move_check_expr(&mut ctx, body);
+        if let Expr::Block {
+            tail: Some(tail), ..
+        } = &ctx.body.exprs[body]
+        {
+            self.check_returned_drop_borrow(&ctx, *tail);
+        }
     }
 
     fn place_from_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<Place> {
@@ -1675,7 +1756,14 @@ impl<'a> Analyzer<'a> {
     fn bind_pattern_names(&self, ctx: &mut BodyCtx<'_>, pat: hir::body::PatId) {
         match &ctx.body.pats[pat] {
             hir::body::Pattern::Binding { name, .. } => {
-                ctx.bindings.insert_available(name.0.clone());
+                self.bind_pattern_name(
+                    ctx,
+                    PatternBindingId {
+                        pattern: pat,
+                        field: None,
+                    },
+                    &name.0,
+                );
             }
             hir::body::Pattern::Reference { pattern, .. } => {
                 self.bind_pattern_names(ctx, *pattern);
@@ -1691,16 +1779,44 @@ impl<'a> Analyzer<'a> {
                 }
             }
             hir::body::Pattern::Struct { fields, .. } => {
-                for f in fields {
+                for (index, f) in fields.iter().enumerate() {
                     if let Some(p) = f.pat {
                         self.bind_pattern_names(ctx, p);
                     } else {
-                        ctx.bindings.insert_available(f.name.0.clone());
+                        self.bind_pattern_name(
+                            ctx,
+                            PatternBindingId {
+                                pattern: pat,
+                                field: Some(index),
+                            },
+                            &f.name.0,
+                        );
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    fn bind_pattern_name(&self, ctx: &mut BodyCtx<'_>, id: PatternBindingId, name: &str) {
+        ctx.bindings.insert_available(name.to_string());
+        self.reset_binding_move(ctx, id);
+    }
+
+    fn reset_pattern_moves(&self, ctx: &mut BodyCtx<'_>, pat: PatId) {
+        let mut bindings = Vec::new();
+        initialization::collect_pattern_bindings(ctx.body, pat, &mut bindings);
+        for (id, _) in bindings {
+            self.reset_binding_move(ctx, id);
+        }
+    }
+
+    fn reset_binding_move(&self, ctx: &mut BodyCtx<'_>, id: PatternBindingId) {
+        let place = Place::root(id);
+        ctx.moved_places
+            .retain(|moved| !place_overlaps(moved, &place));
+        ctx.moved_sites
+            .retain(|moved, _| !place_overlaps(moved, &place));
     }
 
     fn bind_pattern_origins(&mut self, ctx: &mut BodyCtx<'_>, pat: PatId, value: &OriginValue) {
@@ -2144,6 +2260,21 @@ impl<'a> Analyzer<'a> {
             notes,
         });
     }
+
+    fn retain_new_loop_move_diagnostics(&mut self, start: usize) {
+        let replayed = self.result.diagnostics.split_off(start);
+        for diagnostic in replayed {
+            let primary = diagnostic.labels.first().map(|label| label.range);
+            let duplicate = self.result.diagnostics.iter().any(|existing| {
+                existing.code == diagnostic.code
+                    && existing.message == diagnostic.message
+                    && existing.labels.first().map(|label| label.range) == primary
+            });
+            if diagnostic.code == "E0100" && !duplicate {
+                self.result.diagnostics.push(diagnostic);
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2162,7 +2293,9 @@ struct BorrowRecord {
     parents: HashSet<LoanId>,
 }
 
+#[derive(Clone)]
 struct BodyCtx<'a> {
+    function_id: FunctionId,
     body_id: BodyId,
     body: &'a Body,
     source_map: &'a SourceMap,
@@ -2187,8 +2320,9 @@ struct BodyCtx<'a> {
 }
 
 impl<'a> BodyCtx<'a> {
-    fn new(body_id: BodyId, body: &'a Body) -> Self {
+    fn new(function_id: FunctionId, body_id: BodyId, body: &'a Body) -> Self {
         Self {
+            function_id,
             body_id,
             body,
             source_map: &body.source_map,
@@ -2229,6 +2363,22 @@ impl<'a> BodyCtx<'a> {
                 loan.active = false;
             }
         }
+    }
+
+    fn copy_move_state_from(&mut self, other: &Self) {
+        self.bindings = other.bindings.clone();
+        self.moved_places = other.moved_places.clone();
+        self.moved_sites = other.moved_sites.clone();
+    }
+
+    fn merge_move_state_from(&mut self, other: &Self) {
+        self.bindings.merge_moved_from(&other.bindings);
+        self.moved_places.extend(other.moved_places.iter().cloned());
+        self.moved_sites.extend(other.moved_sites.clone());
+    }
+
+    fn same_move_state(&self, other: &Self) -> bool {
+        self.bindings == other.bindings && self.moved_places == other.moved_places
     }
 
     fn seed_reference_params<'b>(
@@ -2417,7 +2567,7 @@ impl<'a> BodyCtx<'a> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MoveBindings {
     scopes: Vec<HashMap<String, bool>>,
 }

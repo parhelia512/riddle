@@ -121,6 +121,43 @@ fn validates_cast_source_and_target_types() {
 }
 
 #[test]
+fn validates_reference_to_raw_pointer_casts() {
+    let accepted = check(
+        r#"
+        fun accepted(shared: &i32, mutable: &mut i32) {
+            let shared_const = shared as *const i32;
+            let mutable_const = mutable as *const i32;
+            let mutable_raw = mutable as *mut i32;
+        }
+        "#,
+    );
+    assert!(
+        accepted
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0012"),
+        "{:#?}",
+        accepted.diagnostics
+    );
+
+    let rejected = check(
+        r#"
+        fun rejected(shared: &i32) {
+            let mutable = shared as *mut i32;
+            let wrong_pointee = shared as *const u8;
+            let integer = shared as usize;
+        }
+        "#,
+    );
+    let diagnostics = rejected
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0012")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 3, "{:#?}", rejected.diagnostics);
+}
+
+#[test]
 fn reports_return_type_mismatch() {
     let result = check(
         r#"

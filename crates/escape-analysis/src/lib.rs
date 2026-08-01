@@ -315,23 +315,28 @@ impl<'a> EscapeAnalyzer<'a> {
             }
 
             Expr::Unary { operand, op } => {
-                if let Some(fid) = self
+                match self
                     .type_result
                     .operator_calls
                     .get(&(ctx.body_id, expr_id))
-                    .and_then(|call| match call {
-                        OperatorCall::Function(fid) => Some(*fid),
-                        OperatorCall::Trait(_) => None,
-                    })
+                    .cloned()
                 {
-                    let by_ref = self.hir.item_tree.functions[fid]
-                        .params
-                        .first()
-                        .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
-                    let returned = self.handle_call_operand(ctx, Some(fid), 0, *operand, by_ref);
-                    ctx.set_expr_source_value(expr_id, returned);
-                } else {
-                    self.mark_escaping_exprs(ctx, *operand);
+                    Some(OperatorCall::Function(fid)) => {
+                        let by_ref = self.hir.item_tree.functions[fid]
+                            .params
+                            .first()
+                            .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
+                        let returned =
+                            self.handle_call_operand(ctx, Some(fid), 0, *operand, by_ref);
+                        ctx.set_expr_source_value(expr_id, returned);
+                    }
+                    Some(OperatorCall::Trait(_)) => {
+                        let returned = self.handle_trait_operator_args(ctx, expr_id, &[*operand]);
+                        ctx.set_expr_source_value(expr_id, returned);
+                    }
+                    None => {
+                        self.mark_escaping_exprs(ctx, *operand);
+                    }
                 }
                 if *op == UnaryOp::Deref && self.expr_may_carry_reference(ctx, expr_id) {
                     self.record_ref_chain(ctx, expr_id, *operand);
@@ -428,20 +433,24 @@ impl<'a> EscapeAnalyzer<'a> {
             }
 
             Expr::Binary { lhs, rhs, .. } => {
-                if let Some(fid) = self
+                match self
                     .type_result
                     .operator_calls
                     .get(&(ctx.body_id, expr_id))
-                    .and_then(|call| match call {
-                        OperatorCall::Function(fid) => Some(*fid),
-                        OperatorCall::Trait(_) => None,
-                    })
+                    .cloned()
                 {
-                    let returned = self.handle_operator_args(ctx, fid, *lhs, *rhs);
-                    ctx.set_expr_source_value(expr_id, returned);
-                } else {
-                    self.mark_escaping_exprs(ctx, *lhs);
-                    self.mark_escaping_exprs(ctx, *rhs);
+                    Some(OperatorCall::Function(fid)) => {
+                        let returned = self.handle_operator_args(ctx, fid, *lhs, *rhs);
+                        ctx.set_expr_source_value(expr_id, returned);
+                    }
+                    Some(OperatorCall::Trait(_)) => {
+                        let returned = self.handle_trait_operator_args(ctx, expr_id, &[*lhs, *rhs]);
+                        ctx.set_expr_source_value(expr_id, returned);
+                    }
+                    None => {
+                        self.mark_escaping_exprs(ctx, *lhs);
+                        self.mark_escaping_exprs(ctx, *rhs);
+                    }
                 }
                 ctx.escaping_exprs.contains(lhs) || ctx.escaping_exprs.contains(rhs)
             }
@@ -689,6 +698,24 @@ impl<'a> EscapeAnalyzer<'a> {
         let mut returned = self.handle_call_operand(ctx, Some(fid), 0, lhs, receiver_by_ref);
         returned.merge(self.handle_call_operand(ctx, Some(fid), 1, rhs, false));
         returned
+    }
+
+    fn handle_trait_operator_args(
+        &mut self,
+        ctx: &mut EscapeCtx<'_>,
+        result: ExprId,
+        operands: &[ExprId],
+    ) -> SourceValue {
+        let mut returned = SourceValue::default();
+        for operand in operands {
+            self.mark_escaping_exprs(ctx, *operand);
+            returned.merge(ctx.expr_source_value(*operand));
+        }
+        if self.expr_may_carry_reference(ctx, result) {
+            returned
+        } else {
+            SourceValue::default()
+        }
     }
 
     fn handle_call_operand(

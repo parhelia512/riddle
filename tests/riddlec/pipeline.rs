@@ -864,6 +864,46 @@ fn vector_mutation_is_rejected_while_element_reference_is_live() {
 }
 
 #[test]
+fn while_statement_does_not_consume_following_dereference_assignment() {
+    let result = compile(
+        r#"
+            fun first(values: &mut Vector<i32>) -> &mut i32 {
+                &mut values[0]
+            }
+
+            fun main() {
+                let mut values: Vector<i32> = Vector::new();
+                values.push(1);
+                let reference = first(&mut values);
+                let mut index = 0;
+                while index < 100 {
+                    values.push(100 + index);
+                    index += 1;
+                }
+                *reference = 999;
+            }
+            "#,
+    );
+
+    assert!(result.parse_errors.is_empty(), "{:#?}", result.parse_errors);
+    assert!(
+        result.type_result.diagnostics.is_empty(),
+        "{:#?}",
+        result.type_result.diagnostics
+    );
+    assert_eq!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>(),
+        ["E0302"],
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
 fn vector_mutation_is_rejected_while_shared_element_reference_is_live() {
     let result = compile(
         r#"
@@ -883,6 +923,63 @@ fn vector_mutation_is_rejected_while_shared_element_reference_is_live() {
             .analysis_diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "E0300"),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn returned_reference_cannot_borrow_drop_parameter() {
+    let result = compile(
+        r#"
+            fun first(values: Vector<i32>) -> &i32 {
+                &values[0]
+            }
+
+            fun main() {
+                let mut values: Vector<i32> = Vector::new();
+                values.push(42);
+                let reference = first(values);
+                *reference;
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(result.mir_module.is_none());
+    assert!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0306"),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn closure_returned_reference_cannot_borrow_drop_local() {
+    let result = compile(
+        r#"
+            fun main() {
+                let make = fun() -> &i32 {
+                    let mut values: Vector<i32> = Vector::new();
+                    values.push(42);
+                    &values[0]
+                };
+                let reference = make();
+                *reference;
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(result.mir_module.is_none());
+    assert!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0306"),
         "{:#?}",
         result.analysis_diagnostics
     );
@@ -1265,6 +1362,38 @@ fn string_mutation_is_rejected_while_str_view_is_live() {
 }
 
 #[test]
+fn nested_non_generic_struct_return_keeps_reference_borrowed() {
+    let result = compile(
+        r#"
+            struct Inner { text: &String }
+            struct Wrapper { inner: Inner }
+
+            fun wrap(text: &String) -> Wrapper {
+                Wrapper { inner: Inner { text } }
+            }
+
+            fun main() {
+                let mut text = String::from_str("hello");
+                let wrapper = wrap(&text);
+                text.push_str(" world");
+                wrapper.inner.text.len();
+            }
+            "#,
+    );
+
+    assert!(!result.success());
+    assert!(result.mir_module.is_none());
+    assert!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0300"),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
 fn vector_mutation_is_allowed_after_element_reference_last_use() {
     let result = compile(
         r#"
@@ -1598,6 +1727,64 @@ fn std_option_and_result_copy_depends_on_payloads() {
             .any(|diagnostic| diagnostic.message.contains("use of moved value: `option`")),
         "{:#?}",
         moved.analysis_diagnostics
+    );
+}
+
+#[test]
+fn loop_backedges_reject_repeated_outer_moves_but_refresh_for_bindings() {
+    for source in [
+        r#"
+            struct Token { value: i32 }
+            fun take(value: Token) {}
+
+            fun main() {
+                let token = Token { value: 1 };
+                let mut index = 0;
+                while index < 2 {
+                    take(token);
+                    index += 1;
+                }
+            }
+            "#,
+        r#"
+            struct Token { value: i32 }
+            fun take(value: Token) {}
+
+            fun main() {
+                let token = Token { value: 1 };
+                for index in [0, 1] {
+                    take(token);
+                }
+            }
+            "#,
+    ] {
+        let result = compile(source);
+        assert!(
+            result.analysis_diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "E0100"
+                    && diagnostic.message.contains("use of moved value: `token`")
+            }),
+            "{:#?}",
+            result.analysis_diagnostics
+        );
+    }
+
+    let fresh_binding = compile(
+        r#"
+            struct Token { value: i32 }
+            fun take(value: Token) {}
+
+            fun main() {
+                for token in [Token { value: 1 }, Token { value: 2 }] {
+                    take(token);
+                }
+            }
+            "#,
+    );
+    assert!(
+        fresh_binding.success(),
+        "{:#?}",
+        fresh_binding.analysis_diagnostics
     );
 }
 

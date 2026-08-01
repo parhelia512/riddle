@@ -113,15 +113,23 @@ pub enum ReparseEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExprRestrictions {
     allow_struct_expr: bool,
+    stop_infix_after_block: bool,
 }
 
 impl ExprRestrictions {
     const NONE: Self = Self {
         allow_struct_expr: true,
+        stop_infix_after_block: false,
     };
 
     const NO_STRUCT_EXPR: Self = Self {
         allow_struct_expr: false,
+        stop_infix_after_block: false,
+    };
+
+    const STATEMENT: Self = Self {
+        allow_struct_expr: true,
+        stop_infix_after_block: true,
     };
 }
 
@@ -441,18 +449,6 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Bang
                 | SyntaxKind::Fun
                 | SyntaxKind::Move
-        )
-    }
-
-    fn at_expr_with_block_start(&self) -> bool {
-        matches!(
-            self.current(),
-            SyntaxKind::LBrace
-                | SyntaxKind::If
-                | SyntaxKind::While
-                | SyntaxKind::For
-                | SyntaxKind::Match
-                | SyntaxKind::Unsafe
         )
     }
 
@@ -928,9 +924,7 @@ impl<'s> Parser<'s> {
                 continue;
             }
 
-            let starts_with_block = self.at_expr_with_block_start();
-
-            let expr = match self.expression() {
+            let expr = match self.statement_expression() {
                 Some(expr) => expr,
                 None => continue,
             };
@@ -946,7 +940,7 @@ impl<'s> Parser<'s> {
                 break;
             }
 
-            if starts_with_block {
+            if is_expr_with_block(expr.kind(self)) {
                 let stmt = expr.precede(self);
                 stmt.complete(self, SyntaxKind::ExprStmt);
                 continue;
@@ -972,9 +966,7 @@ impl<'s> Parser<'s> {
     }
 
     fn expr_stmt(&mut self) {
-        let starts_with_block = self.at_expr_with_block_start();
-
-        let expr = match self.expression() {
+        let expr = match self.statement_expression() {
             Some(expr) => expr,
             None => {
                 if !self.at(SyntaxKind::Eof) {
@@ -994,7 +986,7 @@ impl<'s> Parser<'s> {
             return;
         }
 
-        if starts_with_block {
+        if is_expr_with_block(expr.kind(self)) {
             m.complete(self, SyntaxKind::ExprStmt);
             return;
         }
@@ -1010,6 +1002,10 @@ impl<'s> Parser<'s> {
 
     fn expression(&mut self) -> Option<CompletedMarker> {
         self.expr_bp(0)
+    }
+
+    fn statement_expression(&mut self) -> Option<CompletedMarker> {
+        self.expr_bp_restricted(0, ExprRestrictions::STATEMENT)
     }
 
     fn expression_no_struct(&mut self) -> Option<CompletedMarker> {
@@ -1141,6 +1137,9 @@ impl<'s> Parser<'s> {
         self.attrs();
         // prefix
         let mut lhs = self.lhs(restrictions)?;
+        let mut bare_block = restrictions.stop_infix_after_block
+            && min_bp == 0
+            && is_expr_with_block(lhs.kind(self));
 
         loop {
             let op = self.current();
@@ -1156,6 +1155,7 @@ impl<'s> Parser<'s> {
                 self.type_arg_list();
                 self.arg_list();
                 lhs = m.complete(self, SyntaxKind::CallExpr);
+                bare_block = false;
                 continue;
             }
 
@@ -1169,6 +1169,7 @@ impl<'s> Parser<'s> {
                 self.type_arg_list();
                 self.arg_list();
                 lhs = m.complete(self, SyntaxKind::CallExpr);
+                bare_block = false;
                 continue;
             }
 
@@ -1182,6 +1183,7 @@ impl<'s> Parser<'s> {
                 self.type_arg_list();
                 self.struct_expr_field_list();
                 lhs = m.complete(self, SyntaxKind::StructExpr);
+                bare_block = false;
                 continue;
             }
 
@@ -1195,6 +1197,7 @@ impl<'s> Parser<'s> {
                 let m = lhs.precede(self);
                 self.arg_list();
                 lhs = m.complete(self, SyntaxKind::CallExpr);
+                bare_block = false;
                 continue;
             }
 
@@ -1208,6 +1211,7 @@ impl<'s> Parser<'s> {
                 self.bump();
                 self.expect(SyntaxKind::Ident);
                 lhs = m.complete(self, SyntaxKind::FieldExpr);
+                bare_block = false;
                 continue;
             }
 
@@ -1222,6 +1226,7 @@ impl<'s> Parser<'s> {
                 self.expression();
                 self.expect(SyntaxKind::RBracket);
                 lhs = m.complete(self, SyntaxKind::IndexExpr);
+                bare_block = false;
                 continue;
             }
 
@@ -1234,6 +1239,7 @@ impl<'s> Parser<'s> {
                 let m = lhs.precede(self);
                 self.bump();
                 lhs = m.complete(self, SyntaxKind::TryExpr);
+                bare_block = false;
                 continue;
             }
 
@@ -1249,6 +1255,7 @@ impl<'s> Parser<'s> {
                 let m = lhs.precede(self);
                 self.struct_expr_field_list();
                 lhs = m.complete(self, SyntaxKind::StructExpr);
+                bare_block = false;
                 continue;
             }
 
@@ -1262,11 +1269,15 @@ impl<'s> Parser<'s> {
                 self.bump(); // 'as'
                 self.ty();
                 lhs = m.complete(self, SyntaxKind::CastExpr);
+                bare_block = false;
                 continue;
             }
 
             // infix
             // binary
+            if bare_block {
+                break;
+            }
             let (l_bp, r_bp) = match infix_binding_power(op) {
                 Some(bp) => bp,
                 None => break,
@@ -2280,6 +2291,18 @@ impl<'s> Parser<'s> {
 }
 
 // == pratt binding power ==
+
+fn is_expr_with_block(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Block
+            | SyntaxKind::IfStmt
+            | SyntaxKind::WhileStmt
+            | SyntaxKind::ForExpr
+            | SyntaxKind::MatchExpr
+            | SyntaxKind::UnsafeExpr
+    )
+}
 
 /// prefix binding power for `rhs`
 fn prefix_binding_power(op: SyntaxKind) -> u8 {

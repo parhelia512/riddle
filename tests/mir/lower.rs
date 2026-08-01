@@ -3171,6 +3171,98 @@ fn overloaded_operator_uses_parameter_escape_summary() {
 }
 
 #[test]
+fn generic_trait_operator_result_preserves_reference_escape() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        #[lang = "add"]
+        trait Add {
+            type Output;
+            fun add(self, rhs: Self) -> Self::Output;
+        }
+
+        struct S { r: &i32 }
+
+        impl Add for S {
+            type Output = S;
+            fun add(self, rhs: Self) -> Self::Output { self }
+        }
+
+        fun f<T: Add<Output = T>>(value: T) -> T {
+            value + value
+        }
+
+        fun make() -> S {
+            let x = 573;
+            let s = S { r: &x };
+            f(s)
+        }
+        "#,
+    );
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let make = module
+        .functions
+        .values()
+        .find(|function| function.name == "make")
+        .expect("missing make");
+    assert!(
+        make.blocks.iter().any(|(_, block)| block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))),
+        "the referenced local must be promoted: {make:#?}"
+    );
+}
+
+#[test]
+fn reference_to_raw_pointer_cast_preserves_address() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        fun read_address() -> i32 {
+            let x = 42;
+            let pointer = &x as *const i32;
+            unsafe { *pointer }
+        }
+        "#,
+    );
+    assert!(
+        type_result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        type_result.diagnostics
+    );
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let function = module
+        .functions
+        .values()
+        .find(|function| function.name == "read_address")
+        .expect("missing read_address");
+    assert!(
+        function
+            .blocks
+            .iter()
+            .any(|(_, block)| block.insts.iter().any(|inst| matches!(
+                inst.kind,
+                mir::instr::InstKind::Cast(mir::instr::CastOp::PtrToPtr, _, _)
+            ))),
+        "the cast must preserve the reference address: {function:#?}"
+    );
+}
+
+#[test]
 fn pattern_bindings_preserve_reference_sources() {
     let (_, type_result, _, module) = compile(
         r#"

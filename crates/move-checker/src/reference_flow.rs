@@ -6,9 +6,10 @@ use hir::{
         BinaryOp, Body, BodyId, Expr, ExprId, PatId, Pattern, PatternBindingId, ResolvedName, Stmt,
         StmtId, UnaryOp,
     },
-    item_tree::FunctionId,
+    item_tree::{EnumId, FunctionId, StructId},
     place::Projection,
 };
+use rowan::TextRange;
 use type_checker::{CapturePlace, CaptureSource, PatternBindingMode, Type, TypeCheckResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -718,26 +719,12 @@ fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> b
         Type::Struct(id, args) => {
             args.iter()
                 .any(|arg| type_may_carry_flow(hir, arg, through_raw_pointer))
-                || hir.item_tree.structs[*id]
-                    .fields
-                    .iter()
-                    .any(|field| hir_type_may_carry_flow(&field.ty, through_raw_pointer))
+                || hir_struct_may_carry_flow(hir, *id, through_raw_pointer, &mut HashSet::new())
         }
         Type::Enum(id, args) => {
             args.iter()
                 .any(|arg| type_may_carry_flow(hir, arg, through_raw_pointer))
-                || hir.item_tree.enums[*id]
-                    .variants
-                    .iter()
-                    .any(|variant| match &variant.kind {
-                        hir::item_tree::HirVariantKind::Unit => false,
-                        hir::item_tree::HirVariantKind::Tuple(fields) => fields
-                            .iter()
-                            .any(|field| hir_type_may_carry_flow(field, through_raw_pointer)),
-                        hir::item_tree::HirVariantKind::Struct(fields) => fields
-                            .iter()
-                            .any(|field| hir_type_may_carry_flow(&field.ty, through_raw_pointer)),
-                    })
+                || hir_enum_may_carry_flow(hir, *id, through_raw_pointer, &mut HashSet::new())
         }
         Type::Param(..) | Type::InferVar(..) | Type::Unknown | Type::Error => true,
         Type::FunctionItem { .. } => false,
@@ -762,32 +749,97 @@ fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> b
     }
 }
 
-fn hir_type_may_carry_flow(ty: &hir::item_tree::HirTypeRef, through_raw_pointer: bool) -> bool {
+fn hir_struct_may_carry_flow(
+    hir: &HirFile,
+    id: StructId,
+    through_raw_pointer: bool,
+    visiting: &mut HashSet<TextRange>,
+) -> bool {
+    hir.item_tree.structs[id]
+        .fields
+        .iter()
+        .any(|field| hir_type_may_carry_flow(hir, &field.ty, through_raw_pointer, visiting))
+}
+
+fn hir_enum_may_carry_flow(
+    hir: &HirFile,
+    id: EnumId,
+    through_raw_pointer: bool,
+    visiting: &mut HashSet<TextRange>,
+) -> bool {
+    hir.item_tree.enums[id]
+        .variants
+        .iter()
+        .any(|variant| match &variant.kind {
+            hir::item_tree::HirVariantKind::Unit => false,
+            hir::item_tree::HirVariantKind::Tuple(fields) => fields
+                .iter()
+                .any(|field| hir_type_may_carry_flow(hir, field, through_raw_pointer, visiting)),
+            hir::item_tree::HirVariantKind::Struct(fields) => fields.iter().any(|field| {
+                hir_type_may_carry_flow(hir, &field.ty, through_raw_pointer, visiting)
+            }),
+        })
+}
+
+fn hir_type_may_carry_flow(
+    hir: &HirFile,
+    ty: &hir::item_tree::HirTypeRef,
+    through_raw_pointer: bool,
+    visiting: &mut HashSet<TextRange>,
+) -> bool {
     match ty {
         hir::item_tree::HirTypeRef::Ref(..) => true,
         hir::item_tree::HirTypeRef::Ptr { .. } => through_raw_pointer,
         hir::item_tree::HirTypeRef::Tuple(elements) => elements
             .iter()
-            .any(|element| hir_type_may_carry_flow(element, through_raw_pointer)),
+            .any(|element| hir_type_may_carry_flow(hir, element, through_raw_pointer, visiting)),
         hir::item_tree::HirTypeRef::Slice(inner) | hir::item_tree::HirTypeRef::Array(inner, _) => {
-            hir_type_may_carry_flow(inner, through_raw_pointer)
+            hir_type_may_carry_flow(hir, inner, through_raw_pointer, visiting)
         }
         hir::item_tree::HirTypeRef::ImplTrait {
             trait_ty, callable, ..
         } => {
-            hir_type_may_carry_flow(trait_ty, through_raw_pointer)
+            hir_type_may_carry_flow(hir, trait_ty, through_raw_pointer, visiting)
                 || callable.as_ref().is_some_and(|signature| {
-                    signature
-                        .params
-                        .iter()
-                        .any(|param| hir_type_may_carry_flow(param, through_raw_pointer))
-                        || hir_type_may_carry_flow(&signature.ret, through_raw_pointer)
+                    signature.params.iter().any(|param| {
+                        hir_type_may_carry_flow(hir, param, through_raw_pointer, visiting)
+                    }) || hir_type_may_carry_flow(
+                        hir,
+                        &signature.ret,
+                        through_raw_pointer,
+                        visiting,
+                    )
                 })
         }
-        hir::item_tree::HirTypeRef::Named(path) => path
-            .type_args
-            .iter()
-            .any(|arg| hir_type_may_carry_flow(arg, through_raw_pointer)),
+        hir::item_tree::HirTypeRef::Named(path) => {
+            if path
+                .type_args
+                .iter()
+                .any(|arg| hir_type_may_carry_flow(hir, arg, through_raw_pointer, visiting))
+            {
+                return true;
+            }
+            if !visiting.insert(path.range) {
+                return false;
+            }
+            let carries_flow = match hir.type_resolutions.get(&path.range) {
+                Some(ResolvedName::Struct(id)) => {
+                    hir_struct_may_carry_flow(hir, *id, through_raw_pointer, visiting)
+                }
+                Some(ResolvedName::Enum(id)) => {
+                    hir_enum_may_carry_flow(hir, *id, through_raw_pointer, visiting)
+                }
+                Some(ResolvedName::TypeAlias(id)) => hir.item_tree.type_aliases[*id]
+                    .ty
+                    .as_ref()
+                    .is_some_and(|ty| {
+                        hir_type_may_carry_flow(hir, ty, through_raw_pointer, visiting)
+                    }),
+                _ => false,
+            };
+            visiting.remove(&path.range);
+            carries_flow
+        }
         hir::item_tree::HirTypeRef::Never
         | hir::item_tree::HirTypeRef::Const(_)
         | hir::item_tree::HirTypeRef::Unknown

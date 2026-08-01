@@ -6185,10 +6185,6 @@ fn is_supported_cast(source: &Type, target: &Type) -> bool {
     if is_unsafe_dst_layout_cast(source, target) || is_str_to_byte_slice_cast(source, target) {
         return true;
     }
-    let source = match source {
-        Type::Ref(inner, _) => inner.as_ref(),
-        source => source,
-    };
     matches!(
         (source, target),
         (
@@ -6201,6 +6197,22 @@ fn is_supported_cast(source: &Type, target: &Type) -> bool {
             | (Type::Int(IntTy::U8), Type::Char)
             | (Type::Char, Type::Int(_))
             | (Type::Ptr { .. }, Type::Ptr { .. })
+    ) || matches!(
+        (source, target),
+        (
+            Type::Ref(source, source_mutable),
+            Type::Ptr {
+                mutable: target_mutable,
+                inner: target,
+            },
+        ) if (source == target
+            || matches!(
+                (source.as_ref(), target.as_ref()),
+                (Type::InferInt, Type::Int(IntTy::I32))
+                    | (Type::InferFloat, Type::Float(FloatTy::F64))
+            ))
+            && source.is_sized()
+            && (!*target_mutable || *source_mutable)
     )
 }
 

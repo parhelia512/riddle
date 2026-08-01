@@ -103,6 +103,7 @@ pub fn lower_hir(
                 && func.attrs.iter().any(|attr| attr.name.0 == "builtin"))
             || !func.generics.is_empty()
             || !func.implicit_generics.is_empty()
+            || !func.const_generics.is_empty()
             || ctx
                 .impl_for_method(fid)
                 .map(|imp| !imp.generics.is_empty() || !imp.const_generics.is_empty())
@@ -196,6 +197,11 @@ struct DropSlot {
 enum DropProjection {
     Field(usize),
     Index(usize),
+}
+
+enum RuntimeDropProjection {
+    Exact(DropProjection),
+    Index(Value, IntTy),
 }
 
 /// Where a `let` binding's data lives: a stable slot it can take the address
@@ -1680,7 +1686,7 @@ impl<'a> LowerCtx<'a> {
                     let value = builder.load(ptr, mir_type);
                     self.clear_drop_flags_if_moved(builder, body, expr_id);
                     self.clear_dynamic_index_drop_flags_if_moved(
-                        builder, body, expr_id, *base, *index, index_val,
+                        builder, body, expr_id, *index, index_val,
                     );
                     value
                 }
@@ -1724,13 +1730,6 @@ impl<'a> LowerCtx<'a> {
                     let len = builder.extract_value(base_val, 1, Type::Int(IntTy::Usize));
                     builder.struct_value(vec![data, len], mir_type)
                 } else {
-                    // auto-unwrap Ref
-                    let (base_val, base_mir_ty) = if let Type::Ref(inner, _) = &base_mir_ty {
-                        (builder.load(base_val, *inner.clone()), *inner.clone())
-                    } else {
-                        (base_val, base_mir_ty)
-                    };
-
                     let cast_op = determine_cast_op(&base_mir_ty, &mir_type);
                     builder.cast(cast_op, base_val, mir_type)
                 }
@@ -4585,7 +4584,8 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn index_len(&self, builder: &mut Builder, base: Value, expr: ExprId) -> Option<Value> {
-        let mut ty = self.adjusted_expr_type(expr)?;
+        let ty = self.substitute_tc_type(self.adjusted_expr_type(expr)?);
+        let mut ty = &ty;
         while let type_checker::Type::Ref(inner, _) = ty {
             ty = inner;
         }
@@ -5107,45 +5107,66 @@ impl<'a> LowerCtx<'a> {
         builder: &mut Builder,
         body: &Body,
         expr_id: ExprId,
-        base: ExprId,
         index: ExprId,
         index_value: Value,
     ) {
         let Some(body_id) = self.current_body else {
             return;
         };
-        if !self.moved_exprs.contains(&(body_id, expr_id))
-            || matches!(body.exprs[index], Expr::IntLiteral { .. })
-        {
+        if !self.moved_exprs.contains(&(body_id, expr_id)) {
             return;
         }
-        let Some((source, projection)) = self.drop_place_from_expr(body, base) else {
+        let Some((source, projection)) =
+            self.drop_place_from_expr_with_runtime_indices(body, expr_id, (index, index_value))
+        else {
             return;
         };
-        let mut flags_by_index = BTreeMap::<usize, HashSet<Value>>::new();
-        for slot in self.drop_slots.get(&source).into_iter().flatten() {
-            if slot.projection.starts_with(projection.as_slice())
-                && let Some(DropProjection::Index(item)) = slot.projection.get(projection.len())
-            {
-                flags_by_index.entry(*item).or_default().insert(slot.flag);
-            }
-        }
-        let index_ty = self
-            .type_result
-            .expr_types
-            .get(&(body_id, index))
-            .map(|ty| self.convert_type(ty))
-            .and_then(|ty| match ty {
-                Type::Int(width) => Some(width),
-                _ => None,
+        let dynamic_indices = projection
+            .iter()
+            .filter_map(|projection| match projection {
+                RuntimeDropProjection::Index(value, ty) => Some((*value, *ty)),
+                RuntimeDropProjection::Exact(_) => None,
             })
-            .unwrap_or(IntTy::Usize);
-        for (item, flags) in flags_by_index {
+            .collect::<Vec<_>>();
+        if dynamic_indices.is_empty() {
+            return;
+        }
+
+        let mut flags_by_indices = BTreeMap::<Vec<usize>, HashSet<Value>>::new();
+        'slots: for slot in self.drop_slots.get(&source).into_iter().flatten() {
+            if slot.projection.len() < projection.len() {
+                continue;
+            }
+            let mut indices = Vec::new();
+            for (expected, actual) in projection.iter().zip(&slot.projection) {
+                match (expected, actual) {
+                    (RuntimeDropProjection::Exact(expected), actual) if expected == actual => {}
+                    (RuntimeDropProjection::Index(_, _), DropProjection::Index(index)) => {
+                        indices.push(*index);
+                    }
+                    _ => continue 'slots,
+                }
+            }
+            flags_by_indices
+                .entry(indices)
+                .or_default()
+                .insert(slot.flag);
+        }
+        for (indices, flags) in flags_by_indices {
+            let condition = dynamic_indices.iter().zip(indices).fold(
+                None,
+                |condition, ((index_value, index_ty), expected_index)| {
+                    let expected = builder.iconst(expected_index as u64, *index_ty);
+                    let matches = builder.cmp(CmpOp::Eq, *index_value, expected);
+                    self.and_pattern_conditions(builder, condition, Some(matches))
+                },
+            );
+            let Some(condition) = condition else {
+                continue;
+            };
             let clear = builder.func.new_block_labeled("move_array_element");
             let next = builder.func.new_block_labeled("move_array_continue");
-            let expected = builder.iconst(item as u64, index_ty);
-            let matches = builder.cmp(CmpOp::Eq, index_value, expected);
-            builder.set_cond_branch(matches, clear, next);
+            builder.set_cond_branch(condition, clear, next);
             builder.switch_to_block(clear);
             for flag in flags {
                 let inactive = builder.bconst(false);
@@ -5153,6 +5174,69 @@ impl<'a> LowerCtx<'a> {
             }
             builder.set_branch(next);
             builder.switch_to_block(next);
+        }
+    }
+
+    fn drop_place_from_expr_with_runtime_indices(
+        &self,
+        body: &Body,
+        expr_id: ExprId,
+        current_index: (ExprId, Value),
+    ) -> Option<(CaptureSource, Vec<RuntimeDropProjection>)> {
+        match &body.exprs[expr_id] {
+            Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                ..
+            } => Some((CaptureSource::Pattern(*id), Vec::new())),
+            Expr::Path {
+                resolved: Some(ResolvedName::Param(index)),
+                ..
+            } => Some((CaptureSource::Param(*index), Vec::new())),
+            Expr::Path {
+                resolved: Some(ResolvedName::LambdaParam { lambda, index }),
+                ..
+            } => Some((
+                CaptureSource::LambdaParam {
+                    lambda: *lambda,
+                    index: *index,
+                },
+                Vec::new(),
+            )),
+            Expr::FieldAccess { base, field } => {
+                let (source, mut projection) =
+                    self.drop_place_from_expr_with_runtime_indices(body, *base, current_index)?;
+                projection.push(RuntimeDropProjection::Exact(DropProjection::Field(
+                    self.resolve_field_index(*base, field),
+                )));
+                Some((source, projection))
+            }
+            Expr::IndexAccess { base, index } => {
+                let (source, mut projection) =
+                    self.drop_place_from_expr_with_runtime_indices(body, *base, current_index)?;
+                if let Expr::IntLiteral { value, .. } = body.exprs[*index] {
+                    projection.push(RuntimeDropProjection::Exact(DropProjection::Index(
+                        value as usize,
+                    )));
+                } else {
+                    let value = if *index == current_index.0 {
+                        current_index.1
+                    } else {
+                        *self.expr_cache.get(index)?
+                    };
+                    let index_ty = self
+                        .current_body
+                        .and_then(|body_id| self.type_result.expr_types.get(&(body_id, *index)))
+                        .map(|ty| self.convert_type(ty))
+                        .and_then(|ty| match ty {
+                            Type::Int(width) => Some(width),
+                            _ => None,
+                        })
+                        .unwrap_or(IntTy::Usize);
+                    projection.push(RuntimeDropProjection::Index(value, index_ty));
+                }
+                Some((source, projection))
+            }
+            _ => None,
         }
     }
 
@@ -5817,9 +5901,15 @@ impl<'a> LowerCtx<'a> {
             .as_ref()
             .map(|imp| imp.generics.as_slice())
             .unwrap_or_default();
+        let outer_const_generics = imp
+            .as_ref()
+            .map(|imp| imp.const_generics.as_slice())
+            .unwrap_or_default();
         if outer_generics.is_empty()
+            && outer_const_generics.is_empty()
             && function.generics.is_empty()
             && function.implicit_generics.is_empty()
+            && function.const_generics.is_empty()
         {
             return None;
         }
@@ -5827,27 +5917,43 @@ impl<'a> LowerCtx<'a> {
             .iter()
             .map(|arg| self.substitute_tc_type(arg))
             .collect::<Vec<_>>();
-        let args = tc_args
+        let type_names = outer_generics
             .iter()
-            .map(|arg| self.convert_type(arg))
+            .chain(function.generics.iter())
+            .chain(function.implicit_generics.iter())
+            .map(|name| name.0.clone())
             .collect::<Vec<_>>();
-        let mut subst = outer_generics
+        let const_names = outer_const_generics
             .iter()
-            .zip(args.iter())
-            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .chain(function.const_generics.iter())
+            .map(|name| name.0.clone())
+            .collect::<Vec<_>>();
+        let tc_subst = type_names
+            .iter()
+            .chain(const_names.iter())
+            .zip(tc_args.iter())
+            .map(|(name, ty)| (name.clone(), ty.clone()))
             .collect::<HashMap<_, _>>();
-        subst.extend(
-            function
-                .generics
-                .iter()
-                .chain(function.implicit_generics.iter())
-                .zip(args.iter().skip(outer_generics.len()))
-                .map(|(name, ty)| (name.0.clone(), ty.clone())),
-        );
         let outer_tc_subst = outer_generics
             .iter()
             .zip(tc_args.iter())
             .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .chain(
+                outer_const_generics
+                    .iter()
+                    .zip(tc_args.iter().skip(type_names.len()))
+                    .map(|(name, ty)| (name.0.clone(), ty.clone())),
+            )
+            .collect::<HashMap<_, _>>();
+        let mut subst = type_names
+            .iter()
+            .zip(tc_args.iter())
+            .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
+            .collect::<HashMap<_, _>>();
+        let const_subst = const_names
+            .iter()
+            .zip(tc_args.iter().skip(type_names.len()))
+            .filter_map(|(name, ty)| tc_const_arg_to_usize(ty).map(|value| (name.clone(), value)))
             .collect::<HashMap<_, _>>();
         let self_tc_ty = imp
             .as_ref()
@@ -5856,31 +5962,32 @@ impl<'a> LowerCtx<'a> {
         if let Some(self_ty) = &self_mir_ty {
             subst.insert("Self".into(), self_ty.clone());
         }
-        let suffix = if let Some(self_ty) = &self_mir_ty {
-            std::iter::once(mono_type_name(self_ty))
-                .chain(args.iter().skip(outer_generics.len()).map(mono_type_name))
-                .collect::<Vec<_>>()
-                .join("_")
-        } else {
-            args.iter()
-                .map(mono_type_name)
-                .collect::<Vec<_>>()
-                .join("_")
-        };
+        let mut suffix_args = self_mir_ty
+            .as_ref()
+            .map(|ty| vec![mono_type_name(ty)])
+            .unwrap_or_default();
+        let outer_const_start = type_names.len();
+        let outer_const_end = outer_const_start + outer_const_generics.len();
+        for (index, arg) in tc_args.iter().enumerate() {
+            if self_mir_ty.is_some()
+                && (index < outer_generics.len()
+                    || (outer_const_start..outer_const_end).contains(&index))
+            {
+                continue;
+            }
+            suffix_args.push(
+                tc_const_arg_to_usize(arg)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| mono_type_name(&self.convert_type(arg))),
+            );
+        }
+        let suffix = suffix_args.join("_");
         let key = (fid, suffix.clone());
         if let Some(name) = self.mono_functions.get(&key) {
             return Some(name.clone());
         }
 
-        let mut tc_subst = outer_tc_subst;
-        tc_subst.extend(
-            function
-                .generics
-                .iter()
-                .chain(function.implicit_generics.iter())
-                .zip(tc_args.iter().skip(outer_generics.len()))
-                .map(|(name, ty)| (name.0.clone(), ty.clone())),
-        );
+        let mut tc_subst = tc_subst;
         if let Some(self_ty) = self_tc_ty {
             tc_subst.insert("Self".into(), self_ty);
         }
@@ -5889,6 +5996,7 @@ impl<'a> LowerCtx<'a> {
 
         let old_subst = std::mem::replace(&mut self.generic_subst, subst);
         let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
+        let old_const_subst = std::mem::replace(&mut self.generic_const_subst, const_subst);
         let old_expr_cache = std::mem::take(&mut self.expr_cache);
         let old_scope_map = std::mem::take(&mut self.scope_map);
         let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
@@ -5913,6 +6021,7 @@ impl<'a> LowerCtx<'a> {
         self.current_body = old_current_body;
         self.generic_subst = old_subst;
         self.generic_tc_subst = old_tc_subst;
+        self.generic_const_subst = old_const_subst;
         self.module.add_function(func);
         Some(mono_name)
     }
@@ -5984,7 +6093,20 @@ impl<'a> LowerCtx<'a> {
 
     fn method_symbol_base(&self, fid: hir::item_tree::FunctionId) -> String {
         let name = self.hir.item_tree.functions[fid].name.0.clone();
-        let needs_trait_identity = self.impl_for_method(fid).is_some_and(|imp| {
+        let collides_with_free_function =
+            self.hir
+                .item_tree
+                .functions
+                .iter()
+                .any(|(other_fid, function)| {
+                    other_fid != fid
+                        && !self.method_impls.contains_key(&other_fid)
+                        && !self.default_methods.contains_key(&other_fid)
+                        && function.name.0 == name
+                });
+        if collides_with_free_function {
+            format!("method::{}::{name}", fid.into_raw().into_u32())
+        } else if self.impl_for_method(fid).is_some_and(|imp| {
             let trait_args: &[hir::item_tree::HirTypeRef] = match &imp.trait_ty {
                 Some(hir::item_tree::HirTypeRef::Named(path)) => &path.type_args,
                 _ => &[],
@@ -6000,8 +6122,7 @@ impl<'a> LowerCtx<'a> {
                     && other.self_ty == imp.self_ty
                     && other_trait_args == trait_args
             })
-        });
-        if needs_trait_identity {
+        }) {
             format!("{name}__trait{}", fid.into_raw().into_u32())
         } else {
             name
@@ -7082,6 +7203,7 @@ fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
         (Type::Char, Type::Int(_)) => CastOp::IntToInt,
         (Type::Int(_), Type::Bool) => CastOp::IntToBool,
         (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
+        (Type::Ref(source, _), Type::Ptr(target)) if source == target => CastOp::PtrToPtr,
         (Type::Ptr(_), Type::Ptr(_)) => CastOp::PtrToPtr,
         _ => unreachable!("unsupported cast reached MIR lowering: {source:?} as {target:?}"),
     }

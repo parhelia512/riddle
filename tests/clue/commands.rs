@@ -1134,6 +1134,7 @@ fun main() -> i32 {
     let first = Guard { id: 1 };
     {
         let second = Guard { id: 2 };
+        drop(second);
     }
     print(&0);
     0
@@ -1150,6 +1151,60 @@ fun main() -> i32 {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.ends_with(b"201"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn nested_dynamic_array_move_drops_selected_element_once() {
+    if c_compiler().is_none() {
+        eprintln!("skipping nested array Drop runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("nested-array-move-drop");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
+
+impl Drop for Guard {
+    fun drop(&mut self) {
+        print(&self.id);
+    }
+}
+
+fun main() -> i32 {
+    let matrix = [
+        [Guard { id: 1 }, Guard { id: 2 }],
+        [Guard { id: 3 }, Guard { id: 4 }],
+    ];
+    let row: usize = 1;
+    let column: usize = 0;
+    let selected = matrix[row][column];
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let drops = output.stdout.rsplit(|byte| *byte == b'\n').next().unwrap();
+    for id in b'1'..=b'4' {
+        assert_eq!(
+            drops.iter().filter(|&&byte| byte == id).count(),
+            1,
+            "each Guard must be dropped once: {:?}",
+            drops
+        );
+    }
     let _ = fs::remove_dir_all(root);
 }
 

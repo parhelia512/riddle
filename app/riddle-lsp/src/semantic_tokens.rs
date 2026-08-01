@@ -10,8 +10,10 @@ use lsp_types::{
 use riddlec::pipeline::CompileOptions;
 use rowan::{TextRange, TextSize};
 
+#[cfg(feature = "test-support")]
+use crate::analysis::analyze_standalone_source;
 use crate::{
-    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document, analyze_standalone_source},
+    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document},
     completion::BUILTIN_TYPES,
     server::Document,
     session::AnalysisSessions,

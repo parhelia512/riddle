@@ -1761,6 +1761,14 @@ fn c_backend_checks_safe_array_and_slice_indexes() {
             values[index]
         }
 
+        fun generic_get<const N: usize>(values: [i32; N], index: usize) -> i32 {
+            values[index]
+        }
+
+        fun instantiate_generic_get() -> i32 {
+            generic_get([10, 20], 99usize)
+        }
+
         fun raw_get(values: *const i32, index: usize) -> i32 {
             unsafe { values[index] }
         }
@@ -1772,7 +1780,7 @@ fn c_backend_checks_safe_array_and_slice_indexes() {
     let generated = CBackend::new().compile(&module).unwrap();
     assert_eq!(
         generated.matches("index out of bounds").count(),
-        2,
+        3,
         "{generated}"
     );
 }

@@ -121,4 +121,28 @@ mod tests {
             6
         );
     }
+
+    #[test]
+    fn block_statement_ends_before_following_prefix_dereference() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r#"
+            fun main() {
+                let mut value = 0;
+                while false {}
+                *value = 1;
+            }
+            "#,
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert_eq!(
+            parse
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == crate::syntax_kind::SyntaxKind::ExprStmt)
+                .count(),
+            2
+        );
+    }
 }

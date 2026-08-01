@@ -469,7 +469,11 @@ impl Checker<'_> {
     }
 }
 
-fn collect_pattern_bindings(body: &Body, pat: PatId, bindings: &mut Vec<(PatternBindingId, bool)>) {
+pub(super) fn collect_pattern_bindings(
+    body: &Body,
+    pat: PatId,
+    bindings: &mut Vec<(PatternBindingId, bool)>,
+) {
     match &body.pats[pat] {
         Pattern::Binding { is_mut, .. } => bindings.push((
             PatternBindingId {
