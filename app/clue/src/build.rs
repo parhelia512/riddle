@@ -62,15 +62,20 @@ pub(crate) fn run(
     let c_path = build_dir.join(format!("{}.c", analysis.package_name));
     let custom_runtime_path = analysis.runtime_source.as_ref().map(|path| root.join(path));
     let runtime_source = if compiler.is_some() {
-        Some(match &custom_runtime_path {
-            Some(path) => fs::read_to_string(path)
-                .with_context(|| format!("failed to read runtime source `{}`", path.display()))?,
-            None => match &target.runtime_source {
+        Some(if !analysis.gc_enabled {
+            gc::NO_GC_RUNTIME_C.to_owned()
+        } else {
+            match &custom_runtime_path {
                 Some(path) => fs::read_to_string(path).with_context(|| {
-                    format!("failed to read target runtime `{}`", path.display())
+                    format!("failed to read runtime source `{}`", path.display())
                 })?,
-                None => gc::RUNTIME_C.to_owned(),
-            },
+                None => match &target.runtime_source {
+                    Some(path) => fs::read_to_string(path).with_context(|| {
+                        format!("failed to read target runtime `{}`", path.display())
+                    })?,
+                    None => gc::RUNTIME_C.to_owned(),
+                },
+            }
         })
     } else {
         None
@@ -98,7 +103,8 @@ pub(crate) fn run(
             .mir_module
             .as_ref()
             .context("successful compilation did not produce MIR")?;
-        let c_code = pipeline::generate_c(module).map_err(anyhow::Error::msg)?;
+        let c_code = pipeline::generate_c_with_gc(module, analysis.gc_enabled)
+            .map_err(anyhow::Error::msg)?;
         fs::write(&c_path, c_code)?;
         if analysis.runtime_source.is_none()
             && let (Some(path), Some(source)) = (&runtime_path, &runtime_source)
@@ -134,6 +140,7 @@ pub(crate) fn run(
                 .context("binary build did not select a runtime")?,
         ],
         &executable,
+        &[],
     )?;
     fs::write(&hash_path, hash)?;
     println!("clue: built {}", executable.display());
@@ -207,9 +214,18 @@ pub(crate) fn build_proc_macro_host(
             bridge_path.as_path(),
         ],
         &executable,
+        proc_macro_host_defines(&compiler),
     )?;
     fs::write(hash_path, hash)?;
     Ok(executable)
+}
+
+fn proc_macro_host_defines(compiler: &CCompiler) -> &'static [&'static str] {
+    if compiler.flavor == Flavor::Msvc {
+        &["putchar=riddle_proc_putchar"]
+    } else {
+        &[]
+    }
 }
 
 fn fingerprint(
@@ -352,7 +368,7 @@ impl CCompiler {
             return false;
         }
         let success = self
-            .command(&[source.as_path()], &executable)
+            .command(&[source.as_path()], &executable, &[])
             .output()
             .is_ok_and(|output| output.status.success() && executable.is_file());
         let _ = fs::remove_file(&source);
@@ -374,9 +390,14 @@ impl CCompiler {
         hasher.finish()
     }
 
-    fn compile(&self, sources: &[&Path], executable: &Path) -> anyhow::Result<()> {
+    fn compile(
+        &self,
+        sources: &[&Path],
+        executable: &Path,
+        defines: &[&str],
+    ) -> anyhow::Result<()> {
         let status = self
-            .command(sources, executable)
+            .command(sources, executable, defines)
             .status()
             .with_context(|| {
                 format!(
@@ -393,7 +414,7 @@ impl CCompiler {
         Ok(())
     }
 
-    fn command(&self, sources: &[&Path], executable: &Path) -> Command {
+    fn command(&self, sources: &[&Path], executable: &Path, defines: &[&str]) -> Command {
         let mut command = Command::new(&self.program);
         let host = TargetTriple::host().ok();
         let cross = host.is_some_and(|host| host != self.target.triple);
@@ -405,6 +426,9 @@ impl CCompiler {
                     command.arg("-fuse-ld=lld");
                 }
                 self.apply_unix_target_options(&mut command);
+                for define in defines {
+                    command.arg(format!("-D{define}"));
+                }
                 command.args(sources).arg("-o").arg(executable);
             }
             Flavor::Msvc => {
@@ -414,6 +438,9 @@ impl CCompiler {
                     command.arg("-fuse-ld=lld");
                 }
                 self.apply_msvc_target_options(&mut command);
+                for define in defines {
+                    command.arg(format!("/D{define}"));
+                }
                 command
                     .args(sources)
                     .arg(format!("/Fe{}", executable.display()));

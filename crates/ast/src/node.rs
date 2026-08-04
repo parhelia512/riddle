@@ -1,5 +1,5 @@
 use super::support::{self, AstNode};
-use frontend::syntax_kind::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
+use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 
 // ── ast_node! macro ────────────────────────────────────────────────────
 
@@ -1024,7 +1024,9 @@ impl FieldExpr {
     }
 
     pub fn field_name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
+        support::token(&self.syntax, |kind| {
+            matches!(kind, SyntaxKind::Ident | SyntaxKind::Number)
+        })
     }
 }
 

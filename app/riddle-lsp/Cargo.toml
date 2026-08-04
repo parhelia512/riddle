@@ -2,6 +2,7 @@
 name = "riddle-lsp"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 clap = { version = "4.6.4", features = ["derive", "string"] }
@@ -13,6 +14,7 @@ riddlec = { path = "../riddlec" }
 rowan = "0.16.1"
 scope-graph = { path = "../../crates/scope-graph" }
 serde_json = "1"
+syntax = { path = "../../crates/syntax" }
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sync", "time"] }
 tower-lsp = "0.20.0"
 type-checker = { path = "../../crates/type-checker" }

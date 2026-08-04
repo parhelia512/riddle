@@ -3,9 +3,9 @@ use rowan::{NodeOrToken, TextRange, TextSize};
 use super::{
     lexer,
     parser::{ParseError, Parser, ReparseEntry},
-    syntax_kind::{SyntaxKind, SyntaxNode, SyntaxToken},
     tree_builder::{self, Parse},
 };
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReparseMode {
@@ -224,7 +224,7 @@ pub fn parse_token_fragment(
 
 /// Emit diagnostics for tokens the lexer couldn't recognise.
 fn lexer_error_diagnostics(source: &str, tokens: &[lexer::Token]) -> Vec<ParseError> {
-    use crate::syntax_kind::SyntaxKind;
+    use syntax::SyntaxKind;
     tokens
         .iter()
         .filter(|t| t.kind == SyntaxKind::ErrorNode)

@@ -2,8 +2,10 @@
 name = "type-checker"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
-frontend = { path = "../frontend" }
 hir = { path = "../hir" }
 rowan = "0.16.1"
+syntax = { path = "../syntax" }
+ty = { path = "../ty" }

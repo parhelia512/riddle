@@ -3,8 +3,8 @@ use rowan::{GreenNodeBuilder, GreenToken, Language, NodeOrToken, TextRange, Text
 use super::{
     lexer::Token,
     parser::{Event, ParseError},
-    syntax_kind::{RiddleLang, SyntaxKind, SyntaxNode},
 };
+use syntax::{RiddleLang, SyntaxKind, SyntaxNode};
 
 #[derive(Debug, Clone)]
 pub struct Parse {

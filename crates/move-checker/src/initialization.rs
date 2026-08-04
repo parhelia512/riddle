@@ -5,7 +5,7 @@ use hir::{
     body::{BinaryOp, Body, Expr, ExprId, PatId, Pattern, PatternBindingId, ResolvedName, Stmt},
 };
 use rowan::TextRange;
-use type_checker::{Diagnostic, LabelStyle, Severity, SourceLabel, Type, TypeCheckResult};
+use ty::{Diagnostic, LabelStyle, Severity, SourceLabel, Type, TypeCheckResult};
 
 use crate::AnalysisResult;
 

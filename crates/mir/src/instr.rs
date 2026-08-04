@@ -127,6 +127,9 @@ pub enum InstKind {
     /// Used when escape analysis determines the value may outlive the stack frame.
     HeapAlloc(Type),
 
+    /// Release a compiler-owned heap allocation after its contents are dropped.
+    HeapFree(Value),
+
     /// Load from pointer: `result = load ptr`
     Load(Value),
 

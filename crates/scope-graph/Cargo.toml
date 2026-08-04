@@ -2,9 +2,10 @@
 name = "scope-graph"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
-frontend = { path = "../frontend" }
 hir = { path = "../hir" }
 la-arena = "0.3"
 rowan = "0.16.1"
+syntax = { path = "../syntax" }

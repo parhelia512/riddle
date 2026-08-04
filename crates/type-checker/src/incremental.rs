@@ -3,7 +3,6 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use frontend::syntax_kind::SyntaxNode;
 use hir::{
     HirFile,
     body::{Body, BodyId, ExprId, PatId, PatternBindingId},
@@ -14,6 +13,7 @@ use hir::{
     },
 };
 use rowan::{TextRange, TextSize};
+use syntax::SyntaxNode;
 
 use crate::{
     TypeCheckResult,

@@ -1,0 +1,553 @@
+use super::*;
+
+#[test]
+fn completion_filters_keywords_globals_and_locals_by_prefix() {
+    let source = "struct Widget {}\nfun helper() {}\nfun main(value: i32) { let local = 1; loc }";
+    let local_position = position(source, source.rfind("loc").unwrap() + 3);
+    let local =
+        completion_items_for_source(source, local_position, CompileOptions { use_std: false });
+
+    assert_eq!(
+        local
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["local"]
+    );
+
+    let helper_start = source.find("helper() {}").unwrap();
+    let helper_position = position(source, helper_start + 3);
+    let globals =
+        completion_items_for_source(source, helper_position, CompileOptions { use_std: false });
+    let helper = globals.iter().find(|item| item.label == "helper").unwrap();
+    let helper_label = helper.label_details.as_ref().unwrap();
+    assert_eq!(helper_label.detail.as_deref(), Some("()"));
+    assert_eq!(helper_label.description.as_deref(), Some("()"));
+
+    let keyword_source = "fun main() { ret }";
+    let keywords = completion_items_for_source(
+        keyword_source,
+        position(keyword_source, keyword_source.find("ret").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(keywords.iter().any(|item| item.label == "return"));
+}
+
+#[test]
+fn completion_matches_free_functions_case_insensitively() {
+    let source = "fun Foo() {} fun main() { f }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("f }").unwrap() + 1),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "Foo"), "{items:#?}");
+}
+
+#[test]
+fn completion_includes_struct_and_enum_names_in_type_positions() {
+    let source = "struct Point {}\nenum State { Ready }\nfun inspect(value: ) {}";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find(") {}").unwrap()),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        items.iter().any(|item| {
+            item.label == "Point" && item.kind == Some(lsp_types::CompletionItemKind::STRUCT)
+        }),
+        "{items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item.label == "State" && item.kind == Some(lsp_types::CompletionItemKind::ENUM)
+        }),
+        "{items:#?}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| { item.kind == Some(lsp_types::CompletionItemKind::KEYWORD) }),
+        "{items:#?}"
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "inspect"),
+        "{items:#?}"
+    );
+    for unsupported in ["i128", "u128", "f16", "f128"] {
+        assert!(
+            !items.iter().any(|item| item.label == unsupported),
+            "unexpected unsupported type {unsupported}: {items:#?}"
+        );
+    }
+}
+
+#[test]
+fn completion_keeps_private_imports_and_generics_in_type_positions() {
+    let imported =
+        "mod models { pub struct Widget {} } use crate::models::Widget; fun inspect(value: Wid) {}";
+    let imported_items = completion_items_for_source(
+        imported,
+        position(imported, imported.rfind("Wid").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(
+        imported_items.iter().any(|item| item.label == "Widget"),
+        "{imported_items:#?}"
+    );
+
+    let generic = "fun inspect<T>(value: T) {}";
+    let generic_items = completion_items_for_source(
+        generic,
+        position(generic, generic.rfind("T").unwrap() + 1),
+        CompileOptions { use_std: false },
+    );
+    assert!(
+        generic_items.iter().any(|item| item.label == "T"),
+        "{generic_items:#?}"
+    );
+}
+
+#[test]
+fn completion_keeps_expression_candidates_after_struct_field_colons() {
+    let source =
+        "struct Foo { field: i32 }\nfun main() { let value = 1; let item = Foo { field: val }; }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("val }").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "value"), "{items:#?}");
+}
+
+#[test]
+fn completion_resolves_fields_and_instance_methods() {
+    let source = "struct Point { x: i32, y: i32 }\nimpl Point { fun origin() -> Point { Point { x: 0, y: 0 } } fun magnitude(&self) -> i32 { self.x } fun offset(&self, value: i32) -> i32 { value } }\nfun main() { let point = Point { x: 1, y: 2 }; point. }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("point.").unwrap() + "point.".len()),
+        CompileOptions { use_std: false },
+    );
+    let labels = items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(labels.contains(&"x"), "{items:#?}");
+    assert!(labels.contains(&"y"), "{items:#?}");
+    assert!(labels.contains(&"magnitude"), "{items:#?}");
+    assert!(labels.contains(&"offset"), "{items:#?}");
+    assert!(!labels.contains(&"origin"), "{items:#?}");
+
+    let magnitude = items.iter().find(|item| item.label == "magnitude").unwrap();
+    let magnitude_label = magnitude.label_details.as_ref().unwrap();
+    assert_eq!(magnitude_label.detail.as_deref(), Some("(&self)"));
+    assert_eq!(magnitude_label.description.as_deref(), Some("i32"));
+    assert_eq!(magnitude.insert_text.as_deref(), Some("magnitude"));
+
+    let offset = items.iter().find(|item| item.label == "offset").unwrap();
+    let offset_label = offset.label_details.as_ref().unwrap();
+    assert_eq!(offset_label.detail.as_deref(), Some("(&self, value: i32)"));
+    assert_eq!(offset_label.description.as_deref(), Some("i32"));
+}
+
+#[test]
+fn completion_hides_private_fields_outside_the_defining_module() {
+    let source = "mod model { pub struct Point { x: i32, pub y: i32 } pub fun make() -> Point { Point { x: 1, y: 2 } } } fun main() { model::make(). }";
+    let items = completion_items_for_source(
+        source,
+        position(
+            source,
+            source.rfind("model::make().").unwrap() + "model::make().".len(),
+        ),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "y"), "{items:#?}");
+    assert!(!items.iter().any(|item| item.label == "x"), "{items:#?}");
+}
+
+#[test]
+fn completion_hides_private_methods_outside_the_defining_module() {
+    let member_source = "mod model { pub struct Thing {} impl Thing { fun secret(&self) {} pub fun shown(&self) {} } pub fun make() -> Thing { Thing {} } } fun main() { model::make(). }";
+    let member_items = completion_items_for_source(
+        member_source,
+        position(
+            member_source,
+            member_source.rfind("model::make().").unwrap() + "model::make().".len(),
+        ),
+        CompileOptions { use_std: false },
+    );
+    assert!(member_items.iter().any(|item| item.label == "shown"));
+    assert!(!member_items.iter().any(|item| item.label == "secret"));
+
+    let associated_source = "mod model { pub struct Thing {} impl Thing { fun secret() {} pub fun shown() {} } } fun main() { model::Thing:: }";
+    let associated_items = completion_items_for_source(
+        associated_source,
+        position(
+            associated_source,
+            associated_source.rfind("::").unwrap() + 2,
+        ),
+        CompileOptions { use_std: false },
+    );
+    assert!(associated_items.iter().any(|item| item.label == "shown"));
+    assert!(!associated_items.iter().any(|item| item.label == "secret"));
+}
+
+#[test]
+fn completion_filters_member_candidates_after_the_dot() {
+    let source = "struct Foo { bar: i32 }\nfun main() { let c = Foo { bar: 1 }; c.b }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("c.b").unwrap() + "c.b".len()),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "bar"), "{items:#?}");
+}
+
+#[test]
+fn completion_recovers_incomplete_let_member_access() {
+    let source = "use std::vector::Vector;\n\nfun main() {\n    let c: Vector<i32> = Vector::new();\n    let d = c.\n}";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("c.\n").unwrap() + "c.".len()),
+        CompileOptions::default(),
+    );
+
+    assert!(items.iter().any(|item| item.label == "len"), "{items:#?}");
+}
+
+#[test]
+fn completion_resolves_slice_methods() {
+    let source = "fun inspect(values: &[i32]) { values. }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("values.").unwrap() + "values.".len()),
+        CompileOptions::default(),
+    );
+
+    assert!(items.iter().any(|item| item.label == "len"), "{items:#?}");
+    assert!(items.iter().any(|item| item.label == "get"), "{items:#?}");
+    assert!(items.iter().any(|item| item.label == "iter"), "{items:#?}");
+}
+
+#[test]
+fn completion_resolves_std_associated_functions() {
+    let source = "fun main() { let value = Vector::ne; }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("ne;").unwrap() + 2),
+        CompileOptions::default(),
+    );
+
+    assert!(
+        items.iter().any(|item| {
+            item.label == "new"
+                && item.label_details.as_ref().is_some_and(|label| {
+                    label.detail.as_deref() == Some("()")
+                        && label
+                            .description
+                            .as_deref()
+                            .is_some_and(|description| description.contains("Vector"))
+                })
+                && item.kind == Some(lsp_types::CompletionItemKind::FUNCTION)
+        }),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn completion_includes_std_prelude_imports() {
+    let source = "fun main() { Vec }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("Vec").unwrap() + 3),
+        CompileOptions::default(),
+    );
+
+    assert!(
+        items.iter().any(|item| item.label == "Vector"),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn completion_includes_standard_print_macros() {
+    let source = "fun main() { p!(); }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("p!").unwrap() + 1),
+        CompileOptions::default(),
+    );
+
+    assert!(
+        items.iter().any(|item| {
+            item.label == "print" && item.detail.as_deref() == Some("standard macro")
+        })
+    );
+    assert!(items.iter().any(|item| {
+        item.label == "println" && item.detail.as_deref() == Some("standard macro")
+    }));
+}
+
+#[test]
+fn completion_includes_standard_debug_derive() {
+    let source = "#[derive(De)] struct Value {}";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("De").unwrap() + 2),
+        CompileOptions::default(),
+    );
+
+    assert!(items.iter().any(|item| {
+        item.label == "Debug" && item.detail.as_deref() == Some("standard derive macro")
+    }));
+}
+
+#[test]
+fn completion_respects_nested_block_scope() {
+    let source = "fun main() { if true { let hidden = 1; } hid }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("hid").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        !items.iter().any(|item| item.label == "hidden"),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn completion_includes_for_and_match_pattern_bindings() {
+    let for_source = "fun main() { for item in [1] { ite } }";
+    let for_items = completion_items_for_source(
+        for_source,
+        position(for_source, for_source.find("ite }").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(
+        for_items.iter().any(|item| item.label == "item"),
+        "{for_items:#?}"
+    );
+
+    let match_source = "enum Value { Item(i32) } fun main(value: Value) { match value { Value::Item(inner) => { inn } } }";
+    let match_items = completion_items_for_source(
+        match_source,
+        position(match_source, match_source.find("inn }").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(
+        match_items.iter().any(|item| item.label == "inner"),
+        "{match_items:#?}"
+    );
+}
+
+#[test]
+fn completion_includes_private_imports() {
+    let source =
+        "mod models { pub struct Widget {} } use crate::models::Widget; fun main() { Wid }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("Wid").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        items.iter().any(|item| item.label == "Widget"),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn completion_resolves_associated_items_through_import_aliases() {
+    let source = "mod models { pub struct Widget {} impl Widget { pub fun build() {} } } use crate::models::Widget as Alias; fun main() { Alias::bu }";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.rfind("bu }").unwrap() + 2),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(items.iter().any(|item| item.label == "build"), "{items:#?}");
+}
+
+#[test]
+fn completion_loads_unopened_project_modules() {
+    let root = temp_root("project-completion");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "mod util;\nfun main() { util::va }\n";
+    fs::write(&main, main_text).unwrap();
+    fs::write(root.join("src/util.rid"), "pub fun value() {}\n").unwrap();
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: main_text.into(),
+            version: Some(1),
+        },
+    )]);
+    let sessions = AnalysisSessions::default();
+
+    let fallback_sessions = AnalysisSessions::default();
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(main_text, main_text.find("va }").unwrap() + 2),
+        CompileOptions::default(),
+        &sessions,
+        &fallback_sessions,
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(items.iter().any(|item| item.label == "value"), "{items:#?}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completion_uses_unsaved_project_module_overlays() {
+    let root = temp_root("project-completion-overlay");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "mod util;\nfun main() { util::fr }\n";
+    fs::write(&main, main_text).unwrap();
+    let util = root.join("src/util.rid");
+    fs::write(&util, "pub fun stale() {}\n").unwrap();
+    let main_uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let util_uri = lsp_types::Url::from_file_path(&util).unwrap();
+    let docs = HashMap::from([
+        (
+            main_uri.clone(),
+            Document {
+                text: main_text.into(),
+                version: Some(1),
+            },
+        ),
+        (
+            util_uri,
+            Document {
+                text: "pub fun fresh() {}\n".into(),
+                version: Some(2),
+            },
+        ),
+    ]);
+    let sessions = AnalysisSessions::default();
+
+    let items = completion_items_for_document(
+        &main_uri,
+        &docs,
+        position(main_text, main_text.find("fr }").unwrap() + 2),
+        CompileOptions::default(),
+        &sessions,
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(items.iter().any(|item| item.label == "fresh"), "{items:#?}");
+    assert!(
+        !items.iter().any(|item| item.label == "stale"),
+        "{items:#?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_member_completion_uses_active_module_coordinates() {
+    let root = temp_root("project-member-completion-coordinates");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.rid"),
+        "mod padding;\nmod model;\nfun main() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/padding.rid"),
+        format!("// {}\n", "padding".repeat(80)),
+    )
+    .unwrap();
+    let model = root.join("src/model.rid");
+    let model_text = "pub struct Point { field: i32 }\npub fun complete() { let point = Point { field: 1 }; point.fi }\n";
+    fs::write(&model, model_text).unwrap();
+    let uri = lsp_types::Url::from_file_path(&model).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: model_text.into(),
+            version: Some(1),
+        },
+    )]);
+
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(
+            model_text,
+            model_text.find("point.fi").unwrap() + "point.fi".len(),
+        ),
+        CompileOptions { use_std: false },
+        &AnalysisSessions::default(),
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(items.iter().any(|item| item.label == "field"), "{items:#?}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completion_preserves_std_member_items_through_document_sessions() {
+    let uri = lsp_types::Url::parse("file:///riddle-lsp-completion.rid").unwrap();
+    let text =
+        "use std::vector::Vector; fun main() { let c: Vector<i32> = Vector::new(); let d = c.i }";
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: text.into(),
+            version: Some(1),
+        },
+    )]);
+    let sessions = AnalysisSessions::default();
+
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(text, text.find("c.i").unwrap() + 3),
+        CompileOptions::default(),
+        &sessions,
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        items.iter().any(|item| item.label == "is_empty"),
+        "{items:#?}"
+    );
+}

@@ -8,12 +8,12 @@ use std::{
 
 use ast::{self, support::AstNode};
 use frontend::incremental::IncrementalParser;
-use frontend::syntax_kind::SyntaxNode;
 use frontend::{ParseError, tree_builder::Parse};
 use hir::lower_root;
 use mir::backend::{Backend, c::CBackend};
 use mir::{self, Module};
 use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
+use syntax::SyntaxNode;
 use type_checker::{self, IncrementalTypeChecker, TypeCheckResult, check_hir};
 
 const RAW_STD_PRELUDE: &str = include_str!(concat!(env!("OUT_DIR"), "/std.rid"));
@@ -350,6 +350,7 @@ impl CheckSession {
         run_standalone_pipeline_with_state_cancellable(
             source,
             options,
+            true,
             PipelineDepth::Check,
             &mut self.parser,
             Some(&mut self.type_checker),
@@ -367,6 +368,7 @@ impl CheckSession {
         run_standalone_pipeline_with_state_cancellable(
             source,
             options,
+            true,
             PipelineDepth::Check,
             &mut self.parser,
             Some(&mut self.type_checker),
@@ -384,6 +386,7 @@ impl CheckSession {
             source,
             package_ranges,
             options,
+            true,
             PipelineDepth::Resolve,
             None,
             &mut self.parser,
@@ -398,10 +401,28 @@ impl CheckSession {
         options: CompileOptions,
         cancelled: impl Fn() -> bool,
     ) -> Option<CompileResult> {
+        self.resolve_package_with_options_and_gc_cancellable(
+            source,
+            package_ranges,
+            options,
+            true,
+            cancelled,
+        )
+    }
+
+    pub fn resolve_package_with_options_and_gc_cancellable(
+        &mut self,
+        source: &str,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+        gc_enabled: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
         run_pipeline_with_state_cancellable(
             source,
             package_ranges,
             options,
+            gc_enabled,
             PipelineDepth::Resolve,
             None,
             &mut self.parser,
@@ -418,10 +439,30 @@ impl CheckSession {
         options: CompileOptions,
         cancelled: impl Fn() -> bool,
     ) -> Option<CompileResult> {
+        self.resolve_parsed_package_with_options_and_gc_cancellable(
+            source,
+            parse,
+            package_ranges,
+            options,
+            true,
+            cancelled,
+        )
+    }
+
+    pub fn resolve_parsed_package_with_options_and_gc_cancellable(
+        &mut self,
+        source: &str,
+        parse: &Parse,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+        gc_enabled: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
         run_pipeline_with_state_cancellable(
             source,
             package_ranges,
             options,
+            gc_enabled,
             PipelineDepth::Resolve,
             Some(parse),
             &mut self.parser,
@@ -434,6 +475,7 @@ impl CheckSession {
         run_standalone_pipeline_with_state_cancellable(
             source,
             options,
+            true,
             PipelineDepth::Resolve,
             &mut self.parser,
             None,
@@ -451,6 +493,7 @@ impl CheckSession {
         run_standalone_pipeline_with_state_cancellable(
             source,
             options,
+            true,
             PipelineDepth::Resolve,
             &mut self.parser,
             None,
@@ -468,6 +511,7 @@ impl CheckSession {
             source,
             package_ranges,
             options,
+            true,
             PipelineDepth::Check,
             None,
             &mut self.parser,
@@ -482,10 +526,28 @@ impl CheckSession {
         options: CompileOptions,
         cancelled: impl Fn() -> bool,
     ) -> Option<CompileResult> {
+        self.check_package_with_options_and_gc_cancellable(
+            source,
+            package_ranges,
+            options,
+            true,
+            cancelled,
+        )
+    }
+
+    pub fn check_package_with_options_and_gc_cancellable(
+        &mut self,
+        source: &str,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+        gc_enabled: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
         run_pipeline_with_state_cancellable(
             source,
             package_ranges,
             options,
+            gc_enabled,
             PipelineDepth::Check,
             None,
             &mut self.parser,
@@ -502,10 +564,30 @@ impl CheckSession {
         options: CompileOptions,
         cancelled: impl Fn() -> bool,
     ) -> Option<CompileResult> {
+        self.check_parsed_package_with_options_and_gc_cancellable(
+            source,
+            parse,
+            package_ranges,
+            options,
+            true,
+            cancelled,
+        )
+    }
+
+    pub fn check_parsed_package_with_options_and_gc_cancellable(
+        &mut self,
+        source: &str,
+        parse: &Parse,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+        gc_enabled: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
         run_pipeline_with_state_cancellable(
             source,
             package_ranges,
             options,
+            gc_enabled,
             PipelineDepth::Check,
             Some(parse),
             &mut self.parser,
@@ -779,7 +861,15 @@ fn normalized_path(path: &Path) -> PathBuf {
 }
 
 pub fn generate_c(module: &Module) -> Result<String, String> {
-    let mut backend = CBackend::new();
+    generate_c_with_gc(module, true)
+}
+
+pub fn generate_c_with_gc(module: &Module, gc_enabled: bool) -> Result<String, String> {
+    let mut backend = if gc_enabled {
+        CBackend::new()
+    } else {
+        CBackend::without_gc()
+    };
     backend.compile(module)
 }
 
@@ -789,11 +879,27 @@ pub fn compile(source: &str) -> CompileResult {
 }
 
 pub fn compile_with_options(source: &str, options: CompileOptions) -> CompileResult {
-    run_pipeline(source, options, PipelineDepth::Build)
+    compile_with_options_and_gc(source, options, true)
+}
+
+pub fn compile_with_options_and_gc(
+    source: &str,
+    options: CompileOptions,
+    gc_enabled: bool,
+) -> CompileResult {
+    run_pipeline(source, options, gc_enabled, PipelineDepth::Build)
 }
 
 pub fn check_with_options(source: &str, options: CompileOptions) -> CompileResult {
-    run_pipeline(source, options, PipelineDepth::Check)
+    check_with_options_and_gc(source, options, true)
+}
+
+pub fn check_with_options_and_gc(
+    source: &str,
+    options: CompileOptions,
+    gc_enabled: bool,
+) -> CompileResult {
+    run_pipeline(source, options, gc_enabled, PipelineDepth::Check)
 }
 
 pub fn compile_package_with_options(
@@ -801,10 +907,20 @@ pub fn compile_package_with_options(
     package_ranges: &[Range<usize>],
     options: CompileOptions,
 ) -> CompileResult {
+    compile_package_with_options_and_gc(source, package_ranges, options, true)
+}
+
+pub fn compile_package_with_options_and_gc(
+    source: &str,
+    package_ranges: &[Range<usize>],
+    options: CompileOptions,
+    gc_enabled: bool,
+) -> CompileResult {
     run_pipeline_with_state(
         source,
         package_ranges,
         options,
+        gc_enabled,
         PipelineDepth::Build,
         None,
         &mut IncrementalParser::new(),
@@ -818,10 +934,21 @@ pub fn compile_parsed_package_with_options(
     package_ranges: &[Range<usize>],
     options: CompileOptions,
 ) -> CompileResult {
+    compile_parsed_package_with_options_and_gc(source, parse, package_ranges, options, true)
+}
+
+pub fn compile_parsed_package_with_options_and_gc(
+    source: &str,
+    parse: &Parse,
+    package_ranges: &[Range<usize>],
+    options: CompileOptions,
+    gc_enabled: bool,
+) -> CompileResult {
     run_pipeline_with_state(
         source,
         package_ranges,
         options,
+        gc_enabled,
         PipelineDepth::Build,
         Some(parse),
         &mut IncrementalParser::new(),
@@ -834,10 +961,20 @@ pub fn check_package_with_options(
     package_ranges: &[Range<usize>],
     options: CompileOptions,
 ) -> CompileResult {
+    check_package_with_options_and_gc(source, package_ranges, options, true)
+}
+
+pub fn check_package_with_options_and_gc(
+    source: &str,
+    package_ranges: &[Range<usize>],
+    options: CompileOptions,
+    gc_enabled: bool,
+) -> CompileResult {
     run_pipeline_with_state(
         source,
         package_ranges,
         options,
+        gc_enabled,
         PipelineDepth::Check,
         None,
         &mut IncrementalParser::new(),
@@ -851,10 +988,21 @@ pub fn check_parsed_package_with_options(
     package_ranges: &[Range<usize>],
     options: CompileOptions,
 ) -> CompileResult {
+    check_parsed_package_with_options_and_gc(source, parse, package_ranges, options, true)
+}
+
+pub fn check_parsed_package_with_options_and_gc(
+    source: &str,
+    parse: &Parse,
+    package_ranges: &[Range<usize>],
+    options: CompileOptions,
+    gc_enabled: bool,
+) -> CompileResult {
     run_pipeline_with_state(
         source,
         package_ranges,
         options,
+        gc_enabled,
         PipelineDepth::Check,
         Some(parse),
         &mut IncrementalParser::new(),
@@ -863,7 +1011,7 @@ pub fn check_parsed_package_with_options(
 }
 
 pub fn resolve_with_options(source: &str, options: CompileOptions) -> CompileResult {
-    run_pipeline(source, options, PipelineDepth::Resolve)
+    run_pipeline(source, options, true, PipelineDepth::Resolve)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -873,10 +1021,16 @@ enum PipelineDepth {
     Build,
 }
 
-fn run_pipeline(source: &str, options: CompileOptions, depth: PipelineDepth) -> CompileResult {
+fn run_pipeline(
+    source: &str,
+    options: CompileOptions,
+    gc_enabled: bool,
+    depth: PipelineDepth,
+) -> CompileResult {
     run_standalone_pipeline_with_state_cancellable(
         source,
         options,
+        gc_enabled,
         depth,
         &mut IncrementalParser::new(),
         None,
@@ -888,6 +1042,7 @@ fn run_pipeline(source: &str, options: CompileOptions, depth: PipelineDepth) -> 
 fn run_standalone_pipeline_with_state_cancellable(
     source: &str,
     options: CompileOptions,
+    gc_enabled: bool,
     depth: PipelineDepth,
     parser: &mut IncrementalParser,
     incremental_type_checker: Option<&mut IncrementalTypeChecker>,
@@ -903,6 +1058,7 @@ fn run_standalone_pipeline_with_state_cancellable(
         &expansion.source,
         &package_ranges,
         options,
+        gc_enabled,
         depth,
         expansion.parse.as_ref(),
         parser,
@@ -917,6 +1073,7 @@ fn run_pipeline_with_state(
     source: &str,
     package_ranges: &[Range<usize>],
     options: CompileOptions,
+    gc_enabled: bool,
     depth: PipelineDepth,
     preparsed: Option<&Parse>,
     parser: &mut IncrementalParser,
@@ -926,6 +1083,7 @@ fn run_pipeline_with_state(
         source,
         package_ranges,
         options,
+        gc_enabled,
         depth,
         preparsed,
         parser,
@@ -940,6 +1098,7 @@ fn run_pipeline_with_state_cancellable(
     source: &str,
     package_ranges: &[Range<usize>],
     options: CompileOptions,
+    gc_enabled: bool,
     depth: PipelineDepth,
     preparsed: Option<&Parse>,
     parser: &mut IncrementalParser,
@@ -1083,7 +1242,10 @@ fn run_pipeline_with_state_cancellable(
     if cancelled() {
         return None;
     }
-    let analysis_diagnostics = analysis.diagnostics.clone();
+    let mut analysis_diagnostics = analysis.diagnostics.clone();
+    if !gc_enabled {
+        analysis_diagnostics.extend(escape_result.reference_escape_diagnostics(&hir));
+    }
 
     // Only Error-severity diagnostics block compilation.
     // Notes (like E0200 heap promotion) and warnings are informational.
@@ -1100,8 +1262,15 @@ fn run_pipeline_with_state_cancellable(
             .any(|d| d.severity == type_checker::Severity::Error);
 
     // 7. Lower HIR → MIR
-    let mir_module = (success && depth == PipelineDepth::Build)
-        .then(|| mir::lower_hir(&hir, &type_result, &escape_result, &analysis.moved_exprs));
+    let mir_module = (success && depth == PipelineDepth::Build).then(|| {
+        mir::lower_hir(
+            &hir,
+            &type_result,
+            &escape_result,
+            &analysis.moved_exprs,
+            gc_enabled,
+        )
+    });
 
     Some(CompileResult {
         hir: Some(hir),

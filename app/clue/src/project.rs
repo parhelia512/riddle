@@ -100,6 +100,7 @@ pub(crate) struct LoadedPackage {
     pub kind: ProjectKind,
     pub build_target: Option<String>,
     pub runtime_source: Option<PathBuf>,
+    pub gc_enabled: bool,
     pub manifest_fingerprint: String,
     pub source: pipeline::LoadedSource,
     pub macro_parse: Option<frontend::tree_builder::Parse>,
@@ -230,6 +231,7 @@ fn load_inner(
         kind: manifest.kind,
         build_target: manifest.build_target,
         runtime_source: manifest.runtime_source,
+        gc_enabled: manifest.gc_enabled,
         manifest_fingerprint,
         source: pipeline::LoadedSource {
             source,

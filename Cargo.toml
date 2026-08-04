@@ -12,6 +12,8 @@ members = [
     "crates/mir",
     "crates/move-checker",
     "crates/scope-graph",
+    "crates/syntax",
+    "crates/ty",
     "crates/type-checker",
 ]
 default-members = [
@@ -27,6 +29,8 @@ default-members = [
     "crates/mir",
     "crates/move-checker",
     "crates/scope-graph",
+    "crates/syntax",
+    "crates/ty",
     "crates/type-checker",
 ]
 
@@ -39,6 +43,7 @@ name = "riddle"
 version.workspace = true
 edition.workspace = true
 publish = false
+autotests = false
 
 [dependencies]
 clap = { version = "4.6.4", features = ["derive", "string"] }
@@ -81,9 +86,22 @@ tower-lsp = "0.20.0"
 type-checker = { path = "crates/type-checker" }
 
 [[test]]
+# Cross-crate compiler integration suites owned by the root package.
+name = "mir"
+path = "tests/mir/main.rs"
+
+[[test]]
+name = "move_checker"
+path = "tests/move_checker/main.rs"
+
+[[test]]
 name = "riddle_lsp"
 path = "tests/riddle_lsp/unit.rs"
 
 [[test]]
-name = "mir"
-path = "tests/mir/main.rs"
+name = "scope_graph"
+path = "tests/scope_graph/main.rs"
+
+[[test]]
+name = "type_checker"
+path = "tests/type_checker/main.rs"

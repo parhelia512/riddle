@@ -6,8 +6,8 @@ use ast::{
     self, ElseBranch,
     support::{AstNode, trimmed_range},
 };
-use frontend::syntax_kind::{SyntaxKind, SyntaxToken};
 use rowan::{TextRange, ast::SyntaxNodePtr};
+use syntax::{SyntaxKind, SyntaxToken};
 
 use super::{
     HirFile,

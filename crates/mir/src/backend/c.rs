@@ -24,11 +24,19 @@ pub struct CBackend {
     direct_storage: HashSet<u32>,
     c_exports: HashSet<String>,
     needs_runtime: bool,
+    no_gc: bool,
 }
 
 impl CBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn without_gc() -> Self {
+        Self {
+            no_gc: true,
+            ..Self::default()
+        }
     }
 
     fn ensure(&mut self, v: Value) {
@@ -126,9 +134,16 @@ impl Backend for CBackend {
         writeln!(out, "#define RIDDLE_ISIZE_FROM_BITS(v) ((uintptr_t)(v) <= (uintptr_t)PTRDIFF_MAX ? (ptrdiff_t)(uintptr_t)(v) : (ptrdiff_t)(-1 - (ptrdiff_t)(UINTPTR_MAX - (uintptr_t)(v))))").unwrap();
         writeln!(out).unwrap();
         if self.needs_runtime {
-            writeln!(out, "void rgc_init(void *stack_bottom);").unwrap();
-            writeln!(out, "void *rgc_alloc(size_t size);").unwrap();
-            writeln!(out, "void rgc_collect(void);").unwrap();
+            if self.no_gc {
+                writeln!(out, "void *riddle_alloc(size_t size);").unwrap();
+                writeln!(out, "void *riddle_realloc(void *ptr, size_t size);").unwrap();
+                writeln!(out, "void riddle_free(void *ptr);").unwrap();
+            } else {
+                writeln!(out, "void rgc_init(void *stack_bottom);").unwrap();
+                writeln!(out, "void *rgc_alloc(size_t size);").unwrap();
+                writeln!(out, "void rgc_free(void *ptr);").unwrap();
+                writeln!(out, "void rgc_collect(void);").unwrap();
+            }
             writeln!(out).unwrap();
         }
 
@@ -239,7 +254,8 @@ impl Backend for CBackend {
                     ext.name
                 ));
             }
-            if !is_valid_c_extern_name(&ext.name) {
+            let extern_name = self.extern_name(&ext.name)?;
+            if !is_valid_c_extern_name(extern_name) {
                 return Err(format!(
                     "C extern function `{}` is not a valid C identifier",
                     ext.name
@@ -250,7 +266,7 @@ impl Backend for CBackend {
                 out,
                 "extern {} {}({});",
                 c_ffi_return_type(&ext.ret_type),
-                ext.name,
+                extern_name,
                 if params.is_empty() {
                     "void".into()
                 } else {
@@ -279,8 +295,10 @@ impl Backend for CBackend {
             }
             let user_main = self.c_function_name("main")?;
             writeln!(out, "int main(void) {{").unwrap();
-            writeln!(out, "  int rgc_stack_anchor = 0;").unwrap();
-            writeln!(out, "  rgc_init(&rgc_stack_anchor);").unwrap();
+            if !self.no_gc {
+                writeln!(out, "  int rgc_stack_anchor = 0;").unwrap();
+                writeln!(out, "  rgc_init(&rgc_stack_anchor);").unwrap();
+            }
             writeln!(out, "  return (int){user_main}();").unwrap();
             writeln!(out, "}}").unwrap();
         }
@@ -294,6 +312,21 @@ impl Backend for CBackend {
 }
 
 impl CBackend {
+    fn extern_name<'a>(&self, name: &'a str) -> Result<&'a str, String> {
+        if !self.no_gc {
+            return Ok(name);
+        }
+        match name {
+            "rgc_alloc" => Ok("riddle_alloc"),
+            "rgc_realloc" => Ok("riddle_realloc"),
+            "rgc_free" => Ok("riddle_free"),
+            name if name.starts_with("rgc_") => Err(format!(
+                "GC is disabled; runtime symbol `{name}` is unavailable"
+            )),
+            _ => Ok(name),
+        }
+    }
+
     fn compile_function(&mut self, func: &Function, out: &mut String) -> Result<(), String> {
         self.names.clear();
         self.ctypes.clear();
@@ -462,8 +495,30 @@ impl CBackend {
                 self.set(v, name.clone(), ct.clone());
                 writeln!(
                     out,
-                    "  {} {} = ({})rgc_alloc(sizeof({}));",
-                    ct, name, ct, inner_ct
+                    "  {} {} = ({}){}(sizeof({}));",
+                    ct,
+                    name,
+                    ct,
+                    if self.no_gc {
+                        "riddle_alloc"
+                    } else {
+                        "rgc_alloc"
+                    },
+                    inner_ct
+                )
+                .unwrap();
+            }
+
+            InstKind::HeapFree(ptr) => {
+                writeln!(
+                    out,
+                    "  {}({});",
+                    if self.no_gc {
+                        "riddle_free"
+                    } else {
+                        "rgc_free"
+                    },
+                    self.name(*ptr)
                 )
                 .unwrap();
             }
@@ -957,7 +1012,7 @@ impl CBackend {
                 let callee_name = match callee {
                     FuncRef::Local(n) => self.c_function_name(n)?,
                     FuncRef::Intrinsic(n) => n.clone(),
-                    FuncRef::Extern(n) => n.clone(),
+                    FuncRef::Extern(n) => self.extern_name(n)?.to_owned(),
                 };
                 // For extern calls, extract .ptr from fat pointer arguments
                 let is_extern = matches!(callee, FuncRef::Extern(_));
@@ -1024,7 +1079,8 @@ impl CBackend {
             InstKind::FunctionRef(function) => {
                 let name = match function {
                     FuncRef::Local(name) => self.c_function_name(name)?,
-                    FuncRef::Intrinsic(name) | FuncRef::Extern(name) => name.clone(),
+                    FuncRef::Intrinsic(name) => name.clone(),
+                    FuncRef::Extern(name) => self.extern_name(name)?.to_owned(),
                 };
                 self.set_inline(v, name, ctype_of(&inst.ty));
             }
@@ -1314,6 +1370,7 @@ fn inst_operands(inst: &Inst) -> Vec<Value> {
             values.extend(args);
             values
         }
+        InstKind::HeapFree(ptr) => vec![*ptr],
         _ => vec![], // Const, HeapAlloc, Alloca: no operands
     }
 }

@@ -1,0 +1,817 @@
+use super::*;
+
+impl<'a> LowerCtx<'a> {
+    pub(super) fn resolve_field_index(&self, base: ExprId, field_name: &hir::Name) -> usize {
+        let Some(body_id) = self.current_body else {
+            return 0;
+        };
+        resolve_field_index(self.hir, self.type_result, body_id, base, field_name)
+    }
+
+    pub(super) fn capture_place_from_expr(
+        &self,
+        body: &Body,
+        expr_id: ExprId,
+    ) -> Option<CapturePlace> {
+        match &body.exprs[expr_id] {
+            Expr::Path {
+                resolved: Some(resolved),
+                ..
+            } => {
+                let source = match resolved {
+                    ResolvedName::PatternBinding(id) => CaptureSource::Pattern(*id),
+                    ResolvedName::Param(index) => CaptureSource::Param(*index),
+                    ResolvedName::LambdaParam { lambda, index } => CaptureSource::LambdaParam {
+                        lambda: *lambda,
+                        index: *index,
+                    },
+                    _ => return None,
+                };
+                Some(CapturePlace::root(source))
+            }
+            Expr::FieldAccess { base, field } => {
+                let mut place = self.capture_place_from_expr(body, *base)?;
+                let base_ty = self
+                    .current_body
+                    .and_then(|body_id| self.type_result.expr_types.get(&(body_id, *base)));
+                if matches!(
+                    base_ty,
+                    Some(type_checker::Type::Struct(..) | type_checker::Type::Tuple(_))
+                ) {
+                    place
+                        .projections
+                        .push(Projection::Field(self.resolve_field_index(*base, field)));
+                }
+                Some(place)
+            }
+            Expr::IndexAccess { base, index } => {
+                let mut place = self.capture_place_from_expr(body, *base)?;
+                if let Expr::IntLiteral { value, .. } = body.exprs[*index]
+                    && let Ok(index) = usize::try_from(value)
+                {
+                    place.projections.push(Projection::Index(Some(index)));
+                }
+                Some(place)
+            }
+            Expr::Unary {
+                operand,
+                op: HirUnOp::Deref,
+            } => self.capture_place_from_expr(body, *operand),
+            _ => None,
+        }
+    }
+
+    /// Resolve a path as an lvalue (storage location) without loading.
+    /// For mut bindings: returns the alloca pointer directly.
+    /// For non-mut bindings / params: returns the value as-is (SSA values are
+    /// immutable, so treating them as both value and location is safe).
+    pub(super) fn lower_lvalue(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        expr_id: ExprId,
+    ) -> Value {
+        if let Expr::IndexAccess { base, index } = &body.exprs[expr_id]
+            && let Some(place) =
+                self.lower_trait_index_place(builder, param_values, body, expr_id, *base, *index)
+        {
+            return place;
+        }
+        if let Some(access) = self
+            .capture_place_from_expr(body, expr_id)
+            .and_then(|place| self.capture_access_for_place(builder, &place))
+            && self
+                .current_body
+                .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
+                .map(|ty| self.convert_type(ty))
+                .is_some_and(|ty| ty == access.ty)
+        {
+            return access.place;
+        }
+        let expr = &body.exprs[expr_id];
+        match expr {
+            Expr::Path { resolved, .. } => match resolved {
+                Some(ResolvedName::Param(idx)) => self
+                    .parameter_place(builder, &CaptureSource::Param(*idx))
+                    .or_else(|| param_values.get(*idx).copied())
+                    .unwrap_or_else(|| builder.unit_const()),
+                Some(ResolvedName::LambdaParam { lambda, index }) => {
+                    let source = CaptureSource::LambdaParam {
+                        lambda: *lambda,
+                        index: *index,
+                    };
+                    self.parameter_place(builder, &source)
+                        .or_else(|| {
+                            (self.current_lambda == Some(*lambda))
+                                .then(|| param_values.get(*index).copied())
+                                .flatten()
+                        })
+                        .unwrap_or_else(|| builder.unit_const())
+                }
+                Some(ResolvedName::PatternBinding(id)) => self
+                    .binding_place(builder, *id)
+                    .or_else(|| self.scope_map.get(id).copied())
+                    .unwrap_or_else(|| builder.unit_const()),
+                _ => self.materialize_temporary_place(builder, param_values, body, expr_id),
+            },
+            Expr::IndexAccess { base, index } => {
+                let base_val = self.lower_place_base(builder, param_values, body, *base);
+                let index_val = self.lower_expr(builder, param_values, body, *index);
+                let mir_type = self
+                    .current_body
+                    .and_then(|bid| self.type_result.expr_types.get(&(bid, expr_id)))
+                    .map(|t| self.convert_type(t))
+                    .unwrap_or(Type::Unit);
+                if let Some(len) = self.index_len(builder, base_val, *base) {
+                    builder.checked_index_ptr(base_val, index_val, len, mir_type)
+                } else {
+                    builder.index_ptr(base_val, index_val, mir_type)
+                }
+            }
+            Expr::FieldAccess { base, field } => {
+                let base_val = self.lower_place_base(builder, param_values, body, *base);
+                let field_idx = self.resolve_field_index(*base, field);
+                let field_ty = self
+                    .current_body
+                    .and_then(|bid| self.type_result.expr_types.get(&(bid, expr_id)))
+                    .map(|t| self.convert_type(t))
+                    .unwrap_or(Type::Unit);
+                builder.field_ptr(base_val, field_idx, field_ty)
+            }
+            Expr::Unary {
+                operand,
+                op: HirUnOp::Deref,
+            } => self.lower_expr(builder, param_values, body, *operand),
+            _ => self.materialize_temporary_place(builder, param_values, body, expr_id),
+        }
+    }
+
+    pub(super) fn materialize_temporary_place(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        expr_id: ExprId,
+    ) -> Value {
+        let tc_ty = self
+            .current_body
+            .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
+            .cloned()
+            .unwrap_or(type_checker::Type::Unknown);
+        let ty = self.convert_type(&tc_ty);
+        let value = self.lower_expr(builder, param_values, body, expr_id);
+        let extends_to_block = self
+            .current_body
+            .is_some_and(|body_id| self.analysis.temporary_escapes(body_id, expr_id));
+        let place = if extends_to_block {
+            self.reference_storage(builder, ty)
+        } else {
+            builder.alloca(ty)
+        };
+        builder.store(value, place);
+        self.register_temporary_drop_place(builder, expr_id, place, &tc_ty, extends_to_block);
+        place
+    }
+
+    pub(super) fn expression_requires_temporary_place(&self, body: &Body, expr_id: ExprId) -> bool {
+        self.capture_place_from_expr(body, expr_id).is_none()
+            && self.temporary_drop_place_from_expr(body, expr_id).is_none()
+            && self
+                .current_body
+                .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
+                .is_some_and(|ty| self.type_needs_drop(ty, 0))
+    }
+
+    pub(super) fn register_discarded_temporary(
+        &mut self,
+        builder: &mut Builder,
+        expr_id: ExprId,
+        value: Value,
+    ) {
+        let Some(tc_ty) = self
+            .current_body
+            .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
+            .cloned()
+        else {
+            return;
+        };
+        if !self.type_needs_drop(&tc_ty, 0) {
+            return;
+        }
+        let place = builder.alloca(self.convert_type(&tc_ty));
+        builder.store(value, place);
+        self.register_temporary_drop_place(builder, expr_id, place, &tc_ty, false);
+    }
+
+    pub(super) fn register_temporary_drop_place(
+        &mut self,
+        builder: &mut Builder,
+        expr_id: ExprId,
+        place: Value,
+        ty: &type_checker::Type,
+        extends_to_block: bool,
+    ) {
+        if !self.type_needs_drop(ty, 0) {
+            return;
+        }
+        let slots = self.create_drop_slots(builder, place, ty, Vec::new());
+        self.temporary_drop_slots.insert(expr_id, slots.clone());
+        let target = if extends_to_block {
+            self.drop_scopes.last_mut()
+        } else {
+            self.temporary_drop_scopes
+                .last_mut()
+                .or_else(|| self.drop_scopes.last_mut())
+        };
+        if let Some(scope) = target {
+            scope.extend(slots.into_iter().rev());
+        }
+    }
+
+    pub(super) fn lower_place_base(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        base: ExprId,
+    ) -> Value {
+        let indirect = self
+            .current_body
+            .and_then(|body_id| self.type_result.expr_types.get(&(body_id, base)))
+            .is_some_and(|ty| {
+                matches!(
+                    ty,
+                    type_checker::Type::Ref(..) | type_checker::Type::Ptr { .. }
+                )
+            });
+        if indirect {
+            self.lower_expr(builder, param_values, body, base)
+        } else {
+            self.lower_lvalue(builder, param_values, body, base)
+        }
+    }
+
+    // 语句降级
+
+    pub(super) fn lower_stmt(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        stmt_id: StmtId,
+    ) {
+        let stmt = &body.stmts[stmt_id];
+        match stmt {
+            Stmt::Let { pat, init, ty, .. } => {
+                self.temporary_drop_scopes.push(Vec::new());
+                let (pat, init) = (*pat, *init);
+                let value_ty = init
+                    .and_then(|init_expr| self.adjusted_expr_type(init_expr))
+                    .cloned()
+                    .or_else(|| {
+                        self.current_body
+                            .and_then(|body_id| self.type_result.pattern_types.get(&(body_id, pat)))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| self.lower_hir_type_for_pattern(ty, &self.generic_tc_subst));
+                let needs_drop = self.type_needs_drop(&value_ty, 0);
+                let delayed = init.is_none();
+                // A destructuring `let` keeps one slot for the whole value and
+                // hands out projections, so the slot has to satisfy whichever
+                // of its bindings is the most demanding.
+                let bindings = let_pattern_bindings(body, pat);
+                let is_mut = bindings.iter().any(|(_, is_mut)| *is_mut);
+                let escapes = self.current_body.is_some_and(|bid| {
+                    bindings
+                        .iter()
+                        .any(|(id, _)| self.analysis.escapes(bid, *id))
+                });
+                let needs_address = self.current_body.is_some_and(|bid| {
+                    bindings
+                        .iter()
+                        .any(|(id, _)| self.analysis.local_needs_address(bid, *id))
+                });
+                let root = PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                };
+
+                let val = if escapes {
+                    // Use the checked binding type for delayed declarations.
+                    let alloc_ty = init
+                        .and_then(|init_expr| self.adjusted_expr_type(init_expr))
+                        .map(|t| self.convert_type(t))
+                        .unwrap_or_else(|| self.convert_type(&value_ty));
+                    let ptr = self.reference_storage(builder, alloc_ty);
+                    if let Some(init_expr) = init {
+                        let init_val = self.lower_expr(builder, param_values, body, init_expr);
+                        builder.store(init_val, ptr);
+                    }
+                    self.storage_bindings.insert(root);
+                    ptr
+                } else if delayed || is_mut || needs_address || needs_drop {
+                    // Mutable and captured-by-reference bindings need stable stack storage.
+                    let alloc_ty = init
+                        .and_then(|init_expr| self.adjusted_expr_type(init_expr))
+                        .map(|t| self.convert_type(t))
+                        .unwrap_or_else(|| self.convert_type(&value_ty));
+                    let ptr = builder.alloca(alloc_ty);
+                    if let Some(init_expr) = init {
+                        let init_val = self.lower_expr(builder, param_values, body, init_expr);
+                        builder.store(init_val, ptr);
+                    }
+                    self.storage_bindings.insert(root);
+                    ptr
+                } else if let Some(init_expr) = init {
+                    self.lower_expr(builder, param_values, body, init_expr)
+                } else {
+                    builder.unit_const()
+                };
+                self.scope_map.insert(root, val);
+                let slots = if needs_drop {
+                    let slots = self.create_drop_slots(builder, val, &value_ty, Vec::new());
+                    if delayed {
+                        for slot in &slots {
+                            let inactive = builder.bconst(false);
+                            let flag = self.drop_slot_flag_place(builder, slot);
+                            builder.store(inactive, flag);
+                        }
+                    }
+                    slots
+                } else {
+                    Vec::new()
+                };
+
+                let mut bound = vec![(root, Vec::new())];
+                if !matches!(body.pats[pat], Pattern::Binding { .. }) {
+                    let source = if self.storage_bindings.contains(&root) {
+                        LetSource::Place(val)
+                    } else {
+                        LetSource::Value(val)
+                    };
+                    bound.clear();
+                    self.bind_let_pattern(
+                        builder,
+                        body,
+                        pat,
+                        source,
+                        &value_ty,
+                        Vec::new(),
+                        &mut bound,
+                    );
+                }
+                // Drop flags hang off each binding, not off the slot, so moving
+                // one element out of a destructured `let` only disarms its own
+                // fields.
+                for (id, projection) in bound {
+                    let owned = slots
+                        .iter()
+                        .filter(|slot| slot.projection.starts_with(&projection))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !owned.is_empty() {
+                        self.register_drop_slots(CaptureSource::Pattern(id), &owned);
+                    }
+                }
+                if let Some(scope) = self.drop_scopes.last_mut() {
+                    scope.extend(slots.into_iter().rev());
+                }
+                if builder.needs_return() {
+                    self.emit_current_temporary_drop_scope(builder);
+                }
+                self.temporary_drop_scopes.pop();
+            }
+            Stmt::Expr { expr } => {
+                self.temporary_drop_scopes.push(Vec::new());
+                let value = self.lower_expr(builder, param_values, body, *expr);
+                if builder.needs_return() {
+                    self.register_discarded_temporary(builder, *expr, value);
+                    self.emit_current_temporary_drop_scope(builder);
+                }
+                self.temporary_drop_scopes.pop();
+            }
+            Stmt::Return { value } => {
+                self.temporary_drop_scopes.push(Vec::new());
+                let rv = value.map(|v| self.lower_expr(builder, param_values, body, v));
+                self.emit_temporary_drop_scopes_since(builder, 0);
+                self.emit_drop_scopes_since(builder, 0);
+                builder.set_return(rv);
+                self.temporary_drop_scopes.pop();
+            }
+            Stmt::Break => {
+                let target = *self
+                    .loop_targets
+                    .last()
+                    .expect("break statement outside a checked loop");
+                self.emit_temporary_drop_scopes_since(builder, target.temporary_drop_depth);
+                self.emit_drop_scopes_since(builder, target.drop_depth);
+                builder.set_branch(target.break_block);
+            }
+            Stmt::Continue => {
+                let target = *self
+                    .loop_targets
+                    .last()
+                    .expect("continue statement outside a checked loop");
+                self.emit_temporary_drop_scopes_since(builder, target.temporary_drop_depth);
+                self.emit_drop_scopes_since(builder, target.drop_depth);
+                builder.set_branch(target.continue_block);
+            }
+            Stmt::Item { .. } => {}
+        }
+    }
+
+    /// Bind the elements of a destructuring `let`. The whole initializer already
+    /// lives in one slot, so each binding is a projection of it rather than a
+    /// separate allocation — that keeps `&a` valid for `let (a, b) = pair`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bind_let_pattern(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        pat: PatId,
+        source: LetSource,
+        value_ty: &type_checker::Type,
+        projection: Vec<DropProjection>,
+        bound: &mut Vec<(PatternBindingId, Vec<DropProjection>)>,
+    ) {
+        let (source, value_ty) = self.adjust_let_pattern_source(builder, pat, source, value_ty);
+        let value_ty = &value_ty;
+        match body.pats[pat].clone() {
+            Pattern::Binding { .. } => self.bind_let_element(
+                builder,
+                body,
+                PatternBindingId {
+                    pattern: pat,
+                    field: None,
+                },
+                source,
+                value_ty,
+                projection,
+                bound,
+            ),
+            Pattern::Reference { pattern, .. } => {
+                let type_checker::Type::Ref(inner, _) = value_ty else {
+                    return;
+                };
+                let reference = match source {
+                    LetSource::Place(place) => builder.load(place, self.convert_type(value_ty)),
+                    LetSource::Value(value) => value,
+                };
+                let inner_value = builder.load(reference, self.convert_type(inner));
+                self.bind_let_pattern(
+                    builder,
+                    body,
+                    pattern,
+                    LetSource::Value(inner_value),
+                    inner,
+                    projection,
+                    bound,
+                );
+            }
+            Pattern::Tuple { elements } => {
+                let type_checker::Type::Tuple(element_types) = value_ty else {
+                    return;
+                };
+                let element_types = element_types.clone();
+                for (index, child) in elements.into_iter().enumerate() {
+                    let Some(child_ty) = element_types.get(index) else {
+                        break;
+                    };
+                    let child_source = self.project(builder, source, index, child_ty);
+                    let mut child_projection = projection.clone();
+                    child_projection.push(DropProjection::Field(index));
+                    self.bind_let_pattern(
+                        builder,
+                        body,
+                        child,
+                        child_source,
+                        child_ty,
+                        child_projection,
+                        bound,
+                    );
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                let type_checker::Type::Struct(struct_id, args) = value_ty else {
+                    return;
+                };
+                let field_types = self.struct_pattern_field_types(*struct_id, args);
+                for (binding_index, field) in fields.into_iter().enumerate() {
+                    let Some((index, (_, child_ty))) = field_types
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (name, _))| *name == field.name.0)
+                    else {
+                        continue;
+                    };
+                    let child_ty = child_ty.clone();
+                    let child_source = self.project(builder, source, index, &child_ty);
+                    let mut child_projection = projection.clone();
+                    child_projection.push(DropProjection::Field(index));
+                    match field.pat {
+                        Some(child) => self.bind_let_pattern(
+                            builder,
+                            body,
+                            child,
+                            child_source,
+                            &child_ty,
+                            child_projection,
+                            bound,
+                        ),
+                        None => self.bind_let_element(
+                            builder,
+                            body,
+                            PatternBindingId {
+                                pattern: pat,
+                                field: Some(binding_index),
+                            },
+                            child_source,
+                            &child_ty,
+                            child_projection,
+                            bound,
+                        ),
+                    }
+                }
+            }
+            // ponytail: enum patterns are refutable and rejected by E0057, and
+            // Riddle has no tuple structs, so nothing else can reach a `let`.
+            Pattern::Wildcard
+            | Pattern::Literal(_)
+            | Pattern::Path { .. }
+            | Pattern::TupleStruct { .. } => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bind_let_element(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        id: PatternBindingId,
+        source: LetSource,
+        value_ty: &type_checker::Type,
+        projection: Vec<DropProjection>,
+        bound: &mut Vec<(PatternBindingId, Vec<DropProjection>)>,
+    ) {
+        let mode = self.pattern_binding_mode(id);
+        let binding_ty = self.pattern_binding_type(id, value_ty);
+        match mode {
+            PatternBindingMode::Move => match source {
+                LetSource::Place(place) => {
+                    self.storage_bindings.insert(id);
+                    self.scope_map.insert(id, place);
+                }
+                LetSource::Value(value) => {
+                    self.bind_let_value(builder, body, id, value, &binding_ty);
+                }
+            },
+            PatternBindingMode::Ref | PatternBindingMode::RefMut => {
+                let place = match source {
+                    LetSource::Place(place) => place,
+                    LetSource::Value(value) => {
+                        self.materialize_pattern_place(builder, value, None, value_ty)
+                    }
+                };
+                let op = if mode == PatternBindingMode::RefMut {
+                    UnOp::MutRef
+                } else {
+                    UnOp::Ref
+                };
+                let value = builder.unop(op, place, self.convert_type(&binding_ty));
+                self.bind_let_value(builder, body, id, value, &binding_ty);
+            }
+        }
+        if mode == PatternBindingMode::Move {
+            bound.push((id, projection));
+        }
+    }
+
+    pub(super) fn bind_let_value(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        id: PatternBindingId,
+        value: Value,
+        value_ty: &type_checker::Type,
+    ) {
+        let is_mut = id.field.is_none()
+            && matches!(body.pats[id.pattern], Pattern::Binding { is_mut: true, .. });
+        let escapes = self
+            .current_body
+            .is_some_and(|body_id| self.analysis.escapes(body_id, id));
+        let needs_address = self
+            .current_body
+            .is_some_and(|body_id| self.analysis.local_needs_address(body_id, id));
+        let place = if escapes {
+            Some(self.reference_storage(builder, self.convert_type(value_ty)))
+        } else if is_mut || needs_address || self.type_needs_drop(value_ty, 0) {
+            Some(builder.alloca(self.convert_type(value_ty)))
+        } else {
+            None
+        };
+        if let Some(place) = place {
+            builder.store(value, place);
+            self.storage_bindings.insert(id);
+            self.scope_map.insert(id, place);
+        } else {
+            self.scope_map.insert(id, value);
+        }
+    }
+
+    pub(super) fn adjust_let_pattern_source(
+        &mut self,
+        builder: &mut Builder,
+        pat: PatId,
+        mut source: LetSource,
+        value_ty: &type_checker::Type,
+    ) -> (LetSource, type_checker::Type) {
+        let target = self.pattern_type(pat).unwrap_or_else(|| value_ty.clone());
+        let mut current = value_ty.clone();
+        while current != target {
+            let type_checker::Type::Ref(inner, _) = &current else {
+                break;
+            };
+            let reference = match source {
+                LetSource::Place(place) => builder.load(place, self.convert_type(&current)),
+                LetSource::Value(value) => value,
+            };
+            current = inner.as_ref().clone();
+            source = LetSource::Place(reference);
+        }
+        (source, current)
+    }
+
+    pub(super) fn project(
+        &mut self,
+        builder: &mut Builder,
+        source: LetSource,
+        index: usize,
+        field_ty: &type_checker::Type,
+    ) -> LetSource {
+        let mir_ty = self.convert_type(field_ty);
+        match source {
+            LetSource::Place(place) => LetSource::Place(builder.field_ptr(place, index, mir_ty)),
+            LetSource::Value(value) => {
+                LetSource::Value(builder.extract_value(value, index, mir_ty))
+            }
+        }
+    }
+
+    pub(super) fn adjusted_expr_type(&self, expr: ExprId) -> Option<&type_checker::Type> {
+        let body = self.current_body?;
+        self.type_result
+            .expr_coercions
+            .get(&(body, expr))
+            .or_else(|| self.type_result.expr_types.get(&(body, expr)))
+    }
+
+    pub(super) fn lower_const_value(
+        &mut self,
+        builder: &mut Builder,
+        const_id: hir::item_tree::ConstId,
+    ) -> Value {
+        let Some(body_id) = self.hir.const_bodies.get(&const_id).copied() else {
+            return builder.unit_const();
+        };
+        if !self.active_consts.insert(const_id) {
+            return builder.unit_const();
+        }
+
+        let body = &self.hir.bodies[body_id];
+        let old_expr_cache = std::mem::take(&mut self.expr_cache);
+        let old_body = self.current_body.replace(body_id);
+        let value = self.lower_expr(builder, &[], body, body.root_block);
+        self.current_body = old_body;
+        self.expr_cache = old_expr_cache;
+        self.active_consts.remove(&const_id);
+        value
+    }
+
+    pub(super) fn index_len(
+        &self,
+        builder: &mut Builder,
+        base: Value,
+        expr: ExprId,
+    ) -> Option<Value> {
+        let ty = self.substitute_tc_type(self.adjusted_expr_type(expr)?);
+        let mut ty = &ty;
+        while let type_checker::Type::Ref(inner, _) = ty {
+            ty = inner;
+        }
+        match ty {
+            type_checker::Type::Array(_, type_checker::ConstArg::Value(len)) => {
+                Some(builder.iconst(*len as u64, IntTy::Usize))
+            }
+            type_checker::Type::Slice(_) => {
+                Some(builder.extract_value(base, 1, Type::Int(IntTy::Usize)))
+            }
+            _ => None,
+        }
+    }
+
+    // 类型转换
+
+    pub(super) fn substitute_tc_type(&self, ty: &type_checker::Type) -> type_checker::Type {
+        use type_checker::{ConstArg as TcConstArg, Type as TcType};
+
+        match ty {
+            TcType::Param(name) => self
+                .generic_tc_subst
+                .get(name)
+                .map(|ty| self.substitute_tc_type(ty))
+                .unwrap_or_else(|| ty.clone()),
+            TcType::Ref(inner, mutable) => {
+                TcType::Ref(Box::new(self.substitute_tc_type(inner)), *mutable)
+            }
+            TcType::Ptr { mutable, inner } => TcType::Ptr {
+                mutable: *mutable,
+                inner: Box::new(self.substitute_tc_type(inner)),
+            },
+            TcType::Tuple(elements) => TcType::Tuple(
+                elements
+                    .iter()
+                    .map(|element| self.substitute_tc_type(element))
+                    .collect(),
+            ),
+            TcType::Slice(inner) => TcType::Slice(Box::new(self.substitute_tc_type(inner))),
+            TcType::Array(inner, len) => {
+                let len = match len {
+                    TcConstArg::Param(name) => self
+                        .generic_tc_subst
+                        .get(name)
+                        .and_then(|ty| match ty {
+                            TcType::Const(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| len.clone()),
+                    _ => len.clone(),
+                };
+                TcType::Array(Box::new(self.substitute_tc_type(inner)), len)
+            }
+            TcType::Struct(id, args) => TcType::Struct(
+                *id,
+                args.iter()
+                    .map(|arg| self.substitute_tc_type(arg))
+                    .collect(),
+            ),
+            TcType::Enum(id, args) => TcType::Enum(
+                *id,
+                args.iter()
+                    .map(|arg| self.substitute_tc_type(arg))
+                    .collect(),
+            ),
+            TcType::FunctionItem { function, args } => TcType::FunctionItem {
+                function: *function,
+                args: args
+                    .iter()
+                    .map(|arg| self.substitute_tc_type(arg))
+                    .collect(),
+            },
+            TcType::Closure { id, signature } => TcType::Closure {
+                id: *id,
+                signature: type_checker::CallableSignature {
+                    is_unsafe: signature.is_unsafe,
+                    kind: signature.kind,
+                    params: signature
+                        .params
+                        .iter()
+                        .map(|param| self.substitute_tc_type(param))
+                        .collect(),
+                    ret: Box::new(self.substitute_tc_type(&signature.ret)),
+                },
+            },
+            TcType::OpaqueCallable { id, signature } => TcType::OpaqueCallable {
+                id: *id,
+                signature: type_checker::CallableSignature {
+                    is_unsafe: signature.is_unsafe,
+                    kind: signature.kind,
+                    params: signature
+                        .params
+                        .iter()
+                        .map(|param| self.substitute_tc_type(param))
+                        .collect(),
+                    ret: Box::new(self.substitute_tc_type(&signature.ret)),
+                },
+            },
+            TcType::CallableConstraint(signature) => {
+                TcType::CallableConstraint(type_checker::CallableSignature {
+                    is_unsafe: signature.is_unsafe,
+                    kind: signature.kind,
+                    params: signature
+                        .params
+                        .iter()
+                        .map(|param| self.substitute_tc_type(param))
+                        .collect(),
+                    ret: Box::new(self.substitute_tc_type(&signature.ret)),
+                })
+            }
+            TcType::Const(TcConstArg::Param(name)) => self
+                .generic_tc_subst
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| ty.clone()),
+            _ => ty.clone(),
+        }
+    }
+}

@@ -2,6 +2,8 @@
 name = "riddlec"
 version.workspace = true
 edition.workspace = true
+publish = false
+autotests = false
 
 [dependencies]
 ast = { path = "../../crates/ast" }
@@ -13,8 +15,10 @@ mir = { path = "../../crates/mir" }
 move-checker = { path = "../../crates/move-checker" }
 rowan = "0.16.1"
 scope-graph = { path = "../../crates/scope-graph" }
+syntax = { path = "../../crates/syntax" }
 type-checker = { path = "../../crates/type-checker" }
 
 [[test]]
+# Riddlec integration suites live in the workspace tests/ tree.
 name = "riddlec"
 path = "../../tests/riddlec/main.rs"

@@ -3,7 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use frontend::syntax_kind::SyntaxKind;
 use hir::body::{BodyId, Expr, Stmt};
 use hir::item_tree::{
     HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem, Visibility,
@@ -16,6 +15,7 @@ use riddlec::{
 use rowan::{TextRange, TextSize};
 use scope_graph::resolve::{exported_definitions, resolve_path_at_reference, visible_definitions};
 use scope_graph::{DefRef, Node, NodeId, RefOrigin, ScopeGraph};
+use syntax::SyntaxKind;
 
 use crate::{
     server::Document,

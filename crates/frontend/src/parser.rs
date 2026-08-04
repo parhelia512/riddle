@@ -1,6 +1,7 @@
 use rowan::TextRange;
 
-use super::{lexer::Token, syntax_kind::SyntaxKind};
+use super::lexer::Token;
+use syntax::SyntaxKind;
 
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -1209,7 +1210,11 @@ impl<'s> Parser<'s> {
                 }
                 let m = lhs.precede(self);
                 self.bump();
-                self.expect(SyntaxKind::Ident);
+                if self.at(SyntaxKind::Ident) || self.at(SyntaxKind::Number) {
+                    self.bump();
+                } else {
+                    self.expect(SyntaxKind::Ident);
+                }
                 lhs = m.complete(self, SyntaxKind::FieldExpr);
                 bare_block = false;
                 continue;

@@ -4,7 +4,7 @@ use ast::{
     self, ExternFnDecl, FuncDecl, Param, StructDecl, StructField, StructFieldList, Type,
     support::{AstNode, trimmed_range},
 };
-use frontend::syntax_kind::{SyntaxKind, SyntaxToken};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 use super::{
     Name,
@@ -200,14 +200,14 @@ fn generic_bound_param_name(ty: &HirTypeRef) -> Name {
     }
 }
 
-pub fn lower_attrs(node: &frontend::syntax_kind::SyntaxNode) -> Vec<HirAttr> {
+pub fn lower_attrs(node: &SyntaxNode) -> Vec<HirAttr> {
     ast::attrs_for_node(node)
         .into_iter()
         .map(lower_attr)
         .collect()
 }
 
-pub fn lower_internal_attrs(node: &frontend::syntax_kind::SyntaxNode) -> Vec<HirInternalAttr> {
+pub fn lower_internal_attrs(node: &SyntaxNode) -> Vec<HirInternalAttr> {
     node.descendants()
         .filter_map(ast::Attribute::cast)
         .filter_map(|attr| {

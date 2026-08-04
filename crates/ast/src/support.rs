@@ -1,5 +1,5 @@
-use frontend::syntax_kind::{SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::TextRange;
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 pub fn token(parent: &SyntaxNode, predicate: impl Fn(SyntaxKind) -> bool) -> Option<SyntaxToken> {
     parent

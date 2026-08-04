@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use la_arena::{Arena, Idx};
 use rowan::{TextRange, ast::SyntaxNodePtr};
 
-use frontend::syntax_kind::RiddleLang;
+use syntax::RiddleLang;
 
 use super::{
     Name,

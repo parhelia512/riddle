@@ -1,6 +1,6 @@
 use logos::Logos;
 
-use super::syntax_kind::SyntaxKind;
+use syntax::SyntaxKind;
 
 #[derive(Debug, Clone)]
 pub struct Token {

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use rowan::ast::SyntaxNodePtr;
 
-use frontend::syntax_kind::{RiddleLang, SyntaxNode};
 use hir::{
     HirFile, Name,
     body::{Body, BodyId, BodyItem, Expr, ExprId, PatId, Pattern, PatternBindingId, Stmt, StmtId},
@@ -11,6 +10,7 @@ use hir::{
         StructId, TopLevelItem,
     },
 };
+use syntax::{RiddleLang, SyntaxNode};
 
 use super::{DefRef, EdgeId, EdgeKind, Fragment, Node, NodeId, RefOrigin, ScopeGraph, ScopeKind};
 

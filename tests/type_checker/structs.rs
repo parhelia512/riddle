@@ -20,6 +20,22 @@ fn checks_struct_literals_and_field_access() {
 }
 
 #[test]
+fn checks_tuple_field_access() {
+    let result = check(
+        r#"
+        fun first() -> i32 { (1, true).0 }
+
+        fun second() -> bool {
+            let values = (1, true);
+            values.1
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
 fn checks_struct_literal_shorthand_and_associated_function_call() {
     let result = check(
         r#"

@@ -10,7 +10,7 @@ use hir::{
     place::Projection,
 };
 use rowan::TextRange;
-use type_checker::{CapturePlace, CaptureSource, PatternBindingMode, Type, TypeCheckResult};
+use ty::{CapturePlace, CaptureSource, PatternBindingMode, Type, TypeCheckResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FlowKind {
@@ -211,7 +211,8 @@ impl<'a> SummaryAnalyzer<'a> {
     fn analyze_function(mut self, fid: FunctionId) -> FunctionSummary {
         let tail = self.analyze_expr(self.body.root_block);
         self.returned.merge(tail);
-        let param_count = self.hir.item_tree.functions[fid].params.len();
+        let function = &self.hir.item_tree.functions[fid];
+        let param_count = function.params.len();
         self.returned.retain_params(param_count);
         self.returned
     }

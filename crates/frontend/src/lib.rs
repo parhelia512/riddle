@@ -1,7 +1,6 @@
 pub mod incremental;
 pub mod lexer;
 pub mod parser;
-pub mod syntax_kind;
 pub mod tree_builder;
 
 pub use parser::ParseError;
@@ -116,7 +115,7 @@ mod tests {
             parse
                 .syntax()
                 .descendants()
-                .filter(|node| node.kind() == crate::syntax_kind::SyntaxKind::MacroCall)
+                .filter(|node| node.kind() == syntax::SyntaxKind::MacroCall)
                 .count(),
             6
         );
@@ -140,9 +139,34 @@ mod tests {
             parse
                 .syntax()
                 .descendants()
-                .filter(|node| node.kind() == crate::syntax_kind::SyntaxKind::ExprStmt)
+                .filter(|node| node.kind() == syntax::SyntaxKind::ExprStmt)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn parses_tuple_field_access() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r#"
+            fun main() {
+                let values = (1, true);
+                values.0;
+                values.1;
+                values.0.value;
+            }
+            "#,
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert_eq!(
+            parse
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == syntax::SyntaxKind::FieldExpr)
+                .count(),
+            4
         );
     }
 }

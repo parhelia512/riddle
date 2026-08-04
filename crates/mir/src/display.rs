@@ -177,6 +177,7 @@ impl fmt::Display for InstFmt<'_> {
             InstKind::SizeOf(ty) => write!(f, "size_of {}", TypeFmt(ty)),
             InstKind::Alloca(_) => write!(f, "alloca"),
             InstKind::HeapAlloc(_) => write!(f, "heap_alloc"),
+            InstKind::HeapFree(ptr) => write!(f, "heap_free v{}", ptr.0),
             InstKind::Load(p) => write!(f, "load v{}", p.0),
             InstKind::Store(v, p) => write!(f, "store v{} -> v{}", v.0, p.0),
             InstKind::FieldPtr(b, idx) => write!(f, "field_ptr v{}, #{}", b.0, idx),

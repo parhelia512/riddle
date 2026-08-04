@@ -491,6 +491,155 @@ fn runtime_source_must_exist() {
 }
 
 #[test]
+fn runtime_gc_can_be_disabled_for_a_binary() {
+    let root = temp_root("runtime-no-gc");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let manifest_path = root.join("app/Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\ngc = false\n"),
+    )
+    .unwrap();
+
+    let check = clue(&["check", "app"], &root);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn disabled_gc_conflicts_with_a_custom_runtime() {
+    let root = temp_root("runtime-no-gc-custom");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let project = root.join("app");
+    fs::write(project.join("runtime.c"), "void unused(void) {}\n").unwrap();
+    let manifest_path = project.join("Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\ngc = false\nsource = \"runtime.c\"\n"),
+    )
+    .unwrap();
+
+    let check = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(!check.status.success());
+    assert!(stderr.contains("cannot be combined"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn no_gc_rejects_reference_escape_in_clue() {
+    let root = temp_root("no-gc-reference-escape");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let project = root.join("app");
+    let manifest_path = project.join("Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\ngc = false\n"),
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/main.rid"),
+        r#"struct Data { value: i32 }
+
+fun escaped() -> &Data {
+    let value = Data { value: 42 };
+    &value
+}
+
+fun main() { escaped(); }
+"#,
+    )
+    .unwrap();
+
+    let check = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(!check.status.success());
+    assert!(stderr.contains("E0310"), "{stderr}");
+    assert!(stderr.contains("GC is disabled"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn no_gc_build_has_no_collector_and_runs_owned_values() {
+    if c_compiler().is_none() {
+        eprintln!("skipping no-GC native test: no C compiler found");
+        return;
+    }
+    let root = temp_root("no-gc-native");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let project = root.join("app");
+    let manifest_path = project.join("Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\ngc = false\n"),
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/main.rid"),
+        r#"fun make(base: i32) -> impl Fn(i32) -> i32 {
+    move fun(value: i32) { base + value }
+}
+
+fun main() -> i32 {
+    let mut values: Vector<i32> = Vector::new();
+    values.push(40);
+    let add = make(values[0]);
+    let result = add(2);
+    println!("{}", result);
+    if result == 42 { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let build = clue(&["build", "app"], &root);
+    assert!(
+        build.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let generated = fs::read_to_string(project.join(".clue/build/app.c")).unwrap();
+    let runtime = fs::read_to_string(project.join(".clue/build/app.runtime.c")).unwrap();
+    for source in [&generated, &runtime] {
+        assert!(!source.contains("rgc_"), "unexpected GC ABI in source");
+        assert!(
+            !source.contains("RgcHeader"),
+            "unexpected GC header in source"
+        );
+    }
+    assert!(generated.contains("riddle_alloc"));
+    assert!(generated.contains("riddle_free"));
+
+    let executable = project.join(if cfg!(windows) {
+        ".clue/build/app.exe"
+    } else {
+        ".clue/build/app"
+    });
+    let run = Command::new(&executable).output().unwrap();
+    assert!(
+        run.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn library_packages_cannot_select_a_runtime() {
     let root = temp_root("library-runtime");
     fs::create_dir_all(&root).unwrap();
@@ -1151,6 +1300,107 @@ fun main() -> i32 {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.ends_with(b"201"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn short_circuit_and_temporary_drops_run_in_native_binary() {
+    if c_compiler().is_none() {
+        eprintln!("skipping short-circuit/temporary Drop test: no C compiler found");
+        return;
+    }
+    let root = temp_root("short-circuit-temporary-drop");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"use std::io::print;
+
+struct Guard { id: i32 }
+struct Pair { first: Guard, second: Guard }
+struct Condition { value: bool, id: i32 }
+
+impl Drop for Guard {
+    fun drop(&mut self) { print(&self.id); }
+}
+
+impl Drop for Condition {
+    fun drop(&mut self) { print(&self.id); }
+}
+
+impl Condition {
+    fun get(&self) -> bool { self.value }
+}
+
+fun make_pair(first: i32, second: i32) -> Pair {
+    Pair { first: Guard { id: first }, second: Guard { id: second } }
+}
+
+fun make_condition(value: bool, id: i32) -> Condition {
+    Condition { value: value, id: id }
+}
+
+fun mark(calls: &mut i32) -> bool {
+    *calls += 1;
+    true
+}
+
+fun main() -> i32 {
+    let mut calls = 0;
+    false && mark(&mut calls);
+    true || mark(&mut calls);
+    false && panic("and rhs must not run");
+    true || panic("or rhs must not run");
+    make_pair(1, 2).first;
+    make_pair(3, 4);
+    let mut iteration = 0;
+    while make_condition(iteration == 0, 5 + iteration).get() {
+        iteration += 1;
+    }
+    print(&0);
+    if calls == 0 { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"1234560"), "{:?}", output.stdout);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn inferred_lambda_parameter_move_is_rejected_by_clue_check() {
+    let root = temp_root("inferred-lambda-move");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"fun main() {
+    let consume_twice = fun(value) {
+        let first = value;
+        let second = value;
+        second
+    };
+    let mut values: Vector<i32> = Vector::new();
+    values.push(1);
+    let result = consume_twice(values);
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["check", "app"], &root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[E0100]"), "{stderr}");
+    assert!(stderr.contains("use of moved value: `value`"), "{stderr}");
     let _ = fs::remove_dir_all(root);
 }
 

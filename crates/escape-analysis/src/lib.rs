@@ -8,8 +8,9 @@ use hir::{
     },
     item_tree::{FunctionId, HirTypeRef},
 };
-use type_checker::{
-    CaptureMode, CaptureSource, OperatorCall, PatternBindingMode, Type, TypeCheckResult,
+use ty::{
+    CaptureMode, CaptureSource, Diagnostic, LabelStyle, OperatorCall, PatternBindingMode, Severity,
+    SourceLabel, Type, TypeCheckResult,
 };
 
 /// Result of escape analysis: which locals, parameters, and temporaries need stable storage.
@@ -20,6 +21,10 @@ pub struct EscapeResult {
     escaping_params: HashSet<(BodyId, usize)>,
     escaping_lambda_params: HashSet<(BodyId, ExprId, usize)>,
     escaping_lambdas: HashSet<(BodyId, ExprId)>,
+    lifetime_escaping_locals: HashSet<(BodyId, PatternBindingId)>,
+    lifetime_escaping_temporaries: HashSet<(BodyId, ExprId)>,
+    lifetime_escaping_params: HashSet<(BodyId, usize)>,
+    lifetime_escaping_lambda_params: HashSet<(BodyId, ExprId, usize)>,
     address_taken_locals: HashSet<(BodyId, PatternBindingId)>,
     address_taken_params: HashSet<(BodyId, usize)>,
     address_taken_lambda_params: HashSet<(BodyId, ExprId, usize)>,
@@ -64,6 +69,87 @@ impl EscapeResult {
         self.address_taken_lambda_params
             .contains(&(body_id, lambda, index))
     }
+
+    pub fn reference_escape_diagnostics(&self, hir: &HirFile) -> Vec<Diagnostic> {
+        let mut ranges = Vec::new();
+        for (body_id, binding) in &self.lifetime_escaping_locals {
+            if let Some(range) = hir.bodies[*body_id]
+                .source_map
+                .pat_ranges
+                .get(&binding.pattern)
+                .copied()
+            {
+                ranges.push(range);
+            }
+        }
+        for (body_id, expr) in &self.lifetime_escaping_temporaries {
+            if let Some(range) = hir.bodies[*body_id]
+                .source_map
+                .expr_ranges
+                .get(expr)
+                .copied()
+            {
+                ranges.push(range);
+            }
+        }
+        for (body_id, index) in &self.lifetime_escaping_params {
+            if let Some(range) = hir
+                .function_bodies
+                .iter()
+                .find_map(|(function, body)| (*body == *body_id).then_some(*function))
+                .and_then(|function| {
+                    hir.item_tree.functions[function]
+                        .params
+                        .get(*index)
+                        .map(|param| param.name_range)
+                })
+            {
+                ranges.push(range);
+            }
+        }
+        for (body_id, lambda, index) in &self.lifetime_escaping_lambda_params {
+            let body = &hir.bodies[*body_id];
+            let range = match &body.exprs[*lambda] {
+                Expr::Lambda { params, .. } => params
+                    .get(*index)
+                    .and_then(|param| param.name_range)
+                    .or_else(|| body.source_map.expr_ranges.get(lambda).copied()),
+                _ => body.source_map.expr_ranges.get(lambda).copied(),
+            };
+            if let Some(range) = range {
+                ranges.push(range);
+            }
+        }
+        ranges.retain(|range| {
+            hir.package_ranges
+                .iter()
+                .any(|package| package.start() <= range.start() && range.end() <= package.end())
+        });
+        ranges.sort_by_key(|range| (range.start(), range.end()));
+        ranges.dedup();
+
+        ranges
+            .into_iter()
+            .map(|range| Diagnostic {
+                code: "E0310",
+                severity: Severity::Error,
+                message: "reference to stack-owned value cannot escape when GC is disabled".into(),
+                labels: vec![SourceLabel {
+                    range,
+                    message: "this value would need to outlive its stack storage".into(),
+                    style: LabelStyle::Primary,
+                }],
+                help: Some(
+                    "return or capture owned data, or keep the reference within its owner's scope"
+                        .into(),
+                ),
+                notes: vec![
+                    "references received from a caller may still be forwarded without extending their lifetime"
+                        .into(),
+                ],
+            })
+            .collect()
+    }
 }
 
 /// Run escape analysis on all function bodies with inter-procedural
@@ -79,6 +165,7 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
                 fid,
                 FnSummary {
                     escaping: all_params,
+                    lifetime_escaping: HashSet::new(),
                     returned: HashSet::new(),
                     returned_fields: Vec::new(),
                 },
@@ -101,6 +188,10 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
         analyzer.result.escaping_params.clear();
         analyzer.result.escaping_lambda_params.clear();
         analyzer.result.escaping_lambdas.clear();
+        analyzer.result.lifetime_escaping_locals.clear();
+        analyzer.result.lifetime_escaping_temporaries.clear();
+        analyzer.result.lifetime_escaping_params.clear();
+        analyzer.result.lifetime_escaping_lambda_params.clear();
         analyzer.result.address_taken_locals.clear();
         analyzer.result.address_taken_params.clear();
         analyzer.result.address_taken_lambda_params.clear();
@@ -118,6 +209,7 @@ pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeRe
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FnSummary {
     escaping: HashSet<usize>,
+    lifetime_escaping: HashSet<usize>,
     returned: HashSet<usize>,
     returned_fields: Vec<ReturnSummary>,
 }
@@ -214,7 +306,7 @@ impl<'a> EscapeAnalyzer<'a> {
 
         for (fid, _) in self.hir.item_tree.functions.iter() {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
-                let escaped_params = self.analyze_one_body(body_id);
+                let escaped_params = self.analyze_one_body(fid, body_id);
                 let prev = self.fn_summaries.get(&fid).cloned().unwrap_or_default();
                 if escaped_params != prev {
                     changed = true;
@@ -227,7 +319,7 @@ impl<'a> EscapeAnalyzer<'a> {
         changed
     }
 
-    fn analyze_one_body(&mut self, body_id: BodyId) -> FnSummary {
+    fn analyze_one_body(&mut self, _fid: FunctionId, body_id: BodyId) -> FnSummary {
         let body = &self.hir.bodies[body_id];
         let mut ctx = EscapeCtx::new(body_id, body);
 
@@ -260,6 +352,26 @@ impl<'a> EscapeAnalyzer<'a> {
         for lambda in &ctx.escaping_lambdas {
             self.result.escaping_lambdas.insert((body_id, *lambda));
         }
+        for binding in &ctx.lifetime_escaping_locals {
+            self.result
+                .lifetime_escaping_locals
+                .insert((body_id, *binding));
+        }
+        for expr in &ctx.lifetime_escaping_temporaries {
+            self.result
+                .lifetime_escaping_temporaries
+                .insert((body_id, *expr));
+        }
+        for index in &ctx.lifetime_escaping_params {
+            self.result
+                .lifetime_escaping_params
+                .insert((body_id, *index));
+        }
+        for (lambda, index) in &ctx.lifetime_escaping_lambda_params {
+            self.result
+                .lifetime_escaping_lambda_params
+                .insert((body_id, *lambda, *index));
+        }
         for binding in &ctx.address_taken_locals {
             self.result.address_taken_locals.insert((body_id, *binding));
         }
@@ -280,6 +392,7 @@ impl<'a> EscapeAnalyzer<'a> {
             .collect();
         FnSummary {
             escaping: ctx.escaping_params,
+            lifetime_escaping: ctx.lifetime_escaping_param_values,
             returned: ctx.returned_params,
             returned_fields,
         }
@@ -293,12 +406,18 @@ impl<'a> EscapeAnalyzer<'a> {
         let expr = &ctx.body.exprs[expr_id];
         let escapes = match expr {
             Expr::Block { stmts, tail } => {
+                let mut locals = HashSet::new();
                 for stmt in stmts {
+                    if let Stmt::Let { pat, .. } = &ctx.body.stmts[*stmt] {
+                        Self::collect_pattern_bindings(ctx.body, *pat, &mut locals);
+                    }
                     self.escape_check_stmt(ctx, *stmt);
                 }
                 if let Some(tail) = tail {
                     self.mark_escaping_exprs(ctx, *tail);
-                    ctx.set_expr_source_value(expr_id, ctx.expr_source_value(*tail));
+                    let value = ctx.expr_source_value(*tail);
+                    Self::mark_scoped_lifetime_sources(ctx, &value.sources, &locals);
+                    ctx.set_expr_source_value(expr_id, value);
                     ctx.escaping_exprs.contains(tail)
                 } else {
                     false
@@ -596,7 +715,9 @@ impl<'a> EscapeAnalyzer<'a> {
 
             Expr::Try { operand } => {
                 self.mark_escaping_exprs(ctx, *operand);
-                ctx.set_expr_source_value(expr_id, ctx.expr_source_value(*operand));
+                if self.expr_may_carry_reference(ctx, expr_id) {
+                    ctx.set_expr_source_value(expr_id, ctx.expr_source_value(*operand));
+                }
                 ctx.escaping_exprs.contains(operand)
             }
         };
@@ -747,6 +868,9 @@ impl<'a> EscapeAnalyzer<'a> {
         if summary.escaping.contains(&param_index) {
             Self::mark_source_sink(ctx, &value.sources);
         }
+        if summary.lifetime_escaping.contains(&param_index) && !auto_borrow {
+            Self::mark_lifetime_sources(ctx, &value.sources, true);
+        }
         if summary.returned.contains(&param_index) {
             value
         } else {
@@ -836,6 +960,7 @@ impl<'a> EscapeAnalyzer<'a> {
         let Some(sources) = ctx.expr_sources.get(&expr_id).cloned() else {
             return;
         };
+        Self::mark_lifetime_sources(ctx, &sources, false);
         let mut pending: Vec<RefSource> = sources.into_iter().collect();
         let mut seen = HashSet::new();
         while let Some(source) = pending.pop() {
@@ -933,6 +1058,7 @@ impl<'a> EscapeAnalyzer<'a> {
             match source {
                 RefSource::Local(binding) if locals.contains(&binding) => {
                     ctx.escaping_locals.insert(binding);
+                    ctx.lifetime_escaping_locals.insert(binding);
                 }
                 RefSource::LocalValue(binding) if locals.contains(&binding) => {
                     if let Some(nested) = ctx.binding_sources.get(&binding) {
@@ -941,12 +1067,14 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
                 RefSource::Temporary(expr) => {
                     ctx.escaping_temporaries.insert(expr);
+                    ctx.lifetime_escaping_temporaries.insert(expr);
                     if let Some(nested) = ctx.expr_sources.get(&expr) {
                         pending.extend(nested.iter().copied());
                     }
                 }
                 RefSource::LambdaParamPlace(owner, index) if owner == lambda => {
                     ctx.escaping_lambda_param_places.insert((owner, index));
+                    ctx.lifetime_escaping_lambda_params.insert((owner, index));
                 }
                 RefSource::LambdaParamValue(owner, _) if owner == lambda => {}
                 RefSource::Lambda(inner) => {
@@ -962,6 +1090,85 @@ impl<'a> EscapeAnalyzer<'a> {
             .entry(lambda)
             .or_default()
             .extend(returned);
+    }
+
+    fn mark_lifetime_sources(
+        ctx: &mut EscapeCtx<'_>,
+        sources: &RefSources,
+        include_param_values: bool,
+    ) {
+        let mut pending: Vec<RefSource> = sources.iter().copied().collect();
+        let mut seen = HashSet::new();
+        while let Some(source) = pending.pop() {
+            if !seen.insert(source) {
+                continue;
+            }
+            match source {
+                RefSource::Local(binding) => {
+                    ctx.lifetime_escaping_locals.insert(binding);
+                }
+                RefSource::LocalValue(binding) => {
+                    if let Some(nested) = ctx.binding_sources.get(&binding) {
+                        pending.extend(nested.iter().copied());
+                    }
+                }
+                RefSource::Temporary(expr) => {
+                    ctx.lifetime_escaping_temporaries.insert(expr);
+                    if let Some(nested) = ctx.expr_sources.get(&expr) {
+                        pending.extend(nested.iter().copied());
+                    }
+                }
+                RefSource::ParamPlace(index) => {
+                    ctx.lifetime_escaping_params.insert(index);
+                }
+                RefSource::LambdaParamPlace(lambda, index) => {
+                    ctx.lifetime_escaping_lambda_params.insert((lambda, index));
+                }
+                RefSource::ParamValue(index) if include_param_values => {
+                    ctx.lifetime_escaping_param_values.insert(index);
+                }
+                RefSource::ParamValue(_)
+                | RefSource::LambdaParamValue(..)
+                | RefSource::Lambda(_) => {}
+            }
+        }
+    }
+
+    fn mark_scoped_lifetime_sources(
+        ctx: &mut EscapeCtx<'_>,
+        sources: &RefSources,
+        locals: &HashSet<PatternBindingId>,
+    ) {
+        let mut pending: Vec<RefSource> = sources.iter().copied().collect();
+        let mut seen = HashSet::new();
+        while let Some(source) = pending.pop() {
+            if !seen.insert(source) {
+                continue;
+            }
+            match source {
+                RefSource::Local(binding) if locals.contains(&binding) => {
+                    ctx.lifetime_escaping_locals.insert(binding);
+                }
+                RefSource::LocalValue(binding) => {
+                    pending.extend(
+                        ctx.binding_sources
+                            .get(&binding)
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                }
+                RefSource::Temporary(expr) => {
+                    pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied());
+                }
+                RefSource::Local(_)
+                | RefSource::ParamPlace(_)
+                | RefSource::ParamValue(_)
+                | RefSource::LambdaParamPlace(..)
+                | RefSource::LambdaParamValue(..)
+                | RefSource::Lambda(_) => {}
+            }
+        }
     }
 
     fn mark_source_sink(ctx: &mut EscapeCtx<'_>, sources: &RefSources) -> bool {
@@ -1327,6 +1534,11 @@ struct EscapeCtx<'a> {
     escaping_param_places: HashSet<usize>,
     escaping_lambda_param_places: HashSet<(ExprId, usize)>,
     escaping_lambdas: HashSet<ExprId>,
+    lifetime_escaping_locals: HashSet<PatternBindingId>,
+    lifetime_escaping_temporaries: HashSet<ExprId>,
+    lifetime_escaping_params: HashSet<usize>,
+    lifetime_escaping_param_values: HashSet<usize>,
+    lifetime_escaping_lambda_params: HashSet<(ExprId, usize)>,
     address_taken_locals: HashSet<PatternBindingId>,
     address_taken_params: HashSet<usize>,
     address_taken_lambda_params: HashSet<(ExprId, usize)>,
@@ -1356,6 +1568,11 @@ impl<'a> EscapeCtx<'a> {
             escaping_param_places: HashSet::new(),
             escaping_lambda_param_places: HashSet::new(),
             escaping_lambdas: HashSet::new(),
+            lifetime_escaping_locals: HashSet::new(),
+            lifetime_escaping_temporaries: HashSet::new(),
+            lifetime_escaping_params: HashSet::new(),
+            lifetime_escaping_param_values: HashSet::new(),
+            lifetime_escaping_lambda_params: HashSet::new(),
             address_taken_locals: HashSet::new(),
             address_taken_params: HashSet::new(),
             address_taken_lambda_params: HashSet::new(),

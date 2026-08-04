@@ -2,12 +2,12 @@ use la_arena::{Arena, Idx};
 use rowan::ast::SyntaxNodePtr;
 use std::collections::HashMap;
 
-use frontend::syntax_kind::RiddleLang;
 use hir::{
     Name,
     body::{BodyId, ExprId, PatternBindingId},
     item_tree::{ConstId, EnumId, FunctionId, ModuleId, StructId, TraitId, TypeAliasId},
 };
+use syntax::RiddleLang;
 
 pub mod builder;
 pub mod resolve;

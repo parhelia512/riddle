@@ -29,6 +29,7 @@ pub struct TypeChecker<'a> {
     infer_values: HashMap<u32, Type>,
     pub(crate) last_occurs_error: Option<(u32, Type)>,
     pending_lambdas: Vec<PendingLambda>,
+    pub(crate) pending_move_uses: HashSet<(BodyId, ExprId)>,
     pub(crate) pending_delayed_bindings: Vec<(BodyId, PatternBindingId, Option<TextRange>)>,
     pub(crate) pending_generic_calls: Vec<PendingGenericCall>,
 }
@@ -84,6 +85,7 @@ impl<'a> TypeChecker<'a> {
             infer_values: HashMap::new(),
             last_occurs_error: None,
             pending_lambdas: Vec::new(),
+            pending_move_uses: HashSet::new(),
             pending_delayed_bindings: Vec::new(),
             pending_generic_calls: Vec::new(),
         }
@@ -853,6 +855,20 @@ impl<'a> TypeChecker<'a> {
             .zip(args.iter())
             .map(|(name, ty)| (name.to_string(), ty.clone()))
             .collect::<HashMap<_, _>>();
+        let output = function
+            .ret_type
+            .as_ref()
+            .map(|ret| {
+                crate::lowering::substitute_type(
+                    &self.lower_type_ref_with_params_at(
+                        ret,
+                        &params,
+                        function.ret_type_range.or(Some(function.name_range)),
+                    ),
+                    &subst,
+                )
+            })
+            .unwrap_or(Type::Unit);
         CallableSignature {
             is_unsafe: function.is_unsafe,
             kind: ClosureKind::Fn,
@@ -870,22 +886,7 @@ impl<'a> TypeChecker<'a> {
                     )
                 })
                 .collect(),
-            ret: Box::new(
-                function
-                    .ret_type
-                    .as_ref()
-                    .map(|ret| {
-                        crate::lowering::substitute_type(
-                            &self.lower_type_ref_with_params_at(
-                                ret,
-                                &params,
-                                function.ret_type_range.or(Some(function.name_range)),
-                            ),
-                            &subst,
-                        )
-                    })
-                    .unwrap_or(Type::Unit),
-            ),
+            ret: Box::new(output),
         }
     }
 
@@ -1054,6 +1055,28 @@ impl<'a> TypeChecker<'a> {
             .collect::<Vec<_>>();
         for (key, ty) in exprs {
             self.result.expr_types.insert(key, ty);
+        }
+        let pending_moves = self
+            .pending_move_uses
+            .iter()
+            .filter(|(checked_body, _)| *checked_body == body_id)
+            .copied()
+            .collect::<Vec<_>>();
+        self.pending_move_uses
+            .retain(|(checked_body, _)| *checked_body != body_id);
+        for key in pending_moves {
+            if self
+                .result
+                .expr_types
+                .get(&key)
+                .is_some_and(|ty| !self.result.trait_env.type_is_copy(ty))
+            {
+                self.result
+                    .value_uses
+                    .entry(key)
+                    .and_modify(|current| *current = current.merge(crate::result::ValueUse::Move))
+                    .or_insert(crate::result::ValueUse::Move);
+            }
         }
         let generic_calls = self
             .result

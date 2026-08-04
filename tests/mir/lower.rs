@@ -1,6 +1,116 @@
 use crate::{compile, lower};
 
 #[test]
+fn logical_operators_lower_to_short_circuit_control_flow() {
+    let module = lower(
+        r#"
+        fun rhs() -> bool { true }
+        fun both() -> bool { false && rhs() }
+        fun either() -> bool { true || rhs() }
+        "#,
+    );
+
+    for name in ["both", "either"] {
+        let function = module
+            .functions
+            .values()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert!(
+            function.blocks.iter().any(|(_, block)| matches!(
+                block.terminator,
+                mir::instr::Terminator::CondBranch(..)
+            )),
+            "{name} must branch before evaluating its right operand: {function:#?}"
+        );
+        assert!(
+            function.blocks.iter().any(|(_, block)| block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, mir::instr::InstKind::Phi(..)))),
+            "{name} must merge the short-circuit result: {function:#?}"
+        );
+        assert!(
+            !function.blocks[function.entry]
+                .insts
+                .iter()
+                .any(|inst| matches!(
+                    &inst.kind,
+                    mir::instr::InstKind::Call(mir::value::FuncRef::Local(callee), _)
+                        if callee == "rhs"
+                )),
+            "{name} eagerly evaluates its right operand: {function:#?}"
+        );
+    }
+}
+
+#[test]
+fn discarded_temporaries_drop_moved_and_remaining_fields() {
+    let (_, types, moves, module) = compile(
+        r#"
+        #[lang = "drop"]
+        trait Drop { fun drop(&mut self); }
+
+        struct Guard { id: i32 }
+        struct Pair { first: Guard, second: Guard }
+
+        impl Drop for Guard { fun drop(&mut self) {} }
+
+        fun make_pair() -> Pair {
+            Pair { first: Guard { id: 1 }, second: Guard { id: 2 } }
+        }
+
+        fun main() {
+            make_pair().first;
+            make_pair();
+        }
+        "#,
+    );
+    assert!(types.diagnostics.is_empty(), "{:#?}", types.diagnostics);
+    assert!(moves.diagnostics.is_empty(), "{:#?}", moves.diagnostics);
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let drops = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| &block.insts)
+        .filter(|inst| {
+            matches!(
+                &inst.kind,
+                mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                    if name == "drop__Guard"
+            )
+        })
+        .count();
+    assert_eq!(
+        drops, 5,
+        "drop glue must cover the discarded field and both source aggregates: {main:#?}"
+    );
+    let mut false_values = std::collections::HashSet::new();
+    let moved_field_is_inactive = main.blocks.iter().any(|(_, block)| {
+        block.insts.iter().enumerate().any(|(index, inst)| {
+            let value = mir::value::Value(block.start_value + index as u32);
+            match inst.kind {
+                mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
+                    false_values.insert(value);
+                    false
+                }
+                mir::instr::InstKind::Store(value, _) => false_values.contains(&value),
+                _ => false,
+            }
+        })
+    });
+    assert!(
+        moved_field_is_inactive,
+        "the moved field's source drop flag must be cleared: {main:#?}"
+    );
+}
+
+#[test]
 fn drop_locals_in_reverse_declaration_order() {
     let module = lower(
         r#"
@@ -3527,6 +3637,21 @@ fn lambda_returned_from_lambda_uses_heap_environment() {
                 ))
             })),
         "an inner lambda returned across the outer lambda frame must escape"
+    );
+
+    let drop = module
+        .functions
+        .values()
+        .find(|function| {
+            function.name.starts_with("__riddle_lambda_") && function.name.ends_with("_drop")
+        })
+        .expect("missing escaping closure drop function");
+    assert!(
+        drop.blocks.iter().any(|(_, block)| block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapFree(_)))),
+        "escaping closure drop adapter must release its environment: {drop:#?}"
     );
 }
 

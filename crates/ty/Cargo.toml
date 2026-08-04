@@ -1,0 +1,9 @@
+[package]
+name = "ty"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+hir = { path = "../hir" }
+rowan = "0.16.1"

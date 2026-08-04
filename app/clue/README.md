@@ -34,6 +34,15 @@ clue run [path] [--target <triple>] [-- <args>...]
 source = "runtime/custom_gc.c"
 ```
 
+要完全移除 GC、根扫描和 `rgc_*` ABI，可以启用所有权内存模式：
+
+```toml
+[runtime]
+gc = false
+```
+
+该模式使用 `riddle_alloc`、`riddle_realloc` 和 `riddle_free` 管理有所有者的堆值，并在所有者结束时确定性释放。编译器会拒绝需要让栈上值活过其作用域的引用逃逸（E0310）。`gc = false` 不能与 `source` 同时使用。
+
 运行时选择属于最终二进制包，库项目不能声明 `[runtime]`。
 
 ## 目标平台

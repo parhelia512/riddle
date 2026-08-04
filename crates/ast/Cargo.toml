@@ -2,7 +2,8 @@
 name = "ast"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
-frontend = { path = "../frontend" }
 rowan = "0.16.1"
+syntax = { path = "../syntax" }

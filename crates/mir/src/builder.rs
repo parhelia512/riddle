@@ -106,6 +106,10 @@ impl<'f> Builder<'f> {
         self.emit(InstKind::HeapAlloc(ptr_ty.clone()), ptr_ty)
     }
 
+    pub fn heap_free(&mut self, ptr: Value) {
+        self.emit_void(InstKind::HeapFree(ptr));
+    }
+
     pub fn load(&mut self, ptr: Value, ty: Type) -> Value {
         self.emit(InstKind::Load(ptr), ty)
     }

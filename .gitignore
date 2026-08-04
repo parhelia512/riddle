@@ -16,6 +16,7 @@ Cargo.lock
 # C
 *.c
 !crates/gc/src/runtime.c
+!crates/gc/src/async_runtime.c
 
 # Editors
 .vscode/
@@ -49,4 +50,5 @@ Cargo.lock
 /.agents
 /.codex
 /.omo
+/.reasonix
 **/superpowers/

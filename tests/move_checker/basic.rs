@@ -1492,6 +1492,34 @@ fn anonymous_function_parameters_follow_move_rules() {
 }
 
 #[test]
+fn inferred_anonymous_function_parameters_follow_move_rules() {
+    let result = analyze(
+        r#"
+        struct Point { x: i32 }
+
+        fun main() {
+            let consume_twice = fun(value) {
+                let first = value;
+                let second = value;
+                second
+            };
+            consume_twice(Point { x: 1 });
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0100"
+                && diagnostic.message.contains("use of moved value")
+                && diagnostic.message.contains("value")
+        }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn value_capture_moves_non_copy_binding() {
     let result = analyze(
         r#"

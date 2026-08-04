@@ -50,6 +50,7 @@ pub struct Manifest {
     pub kind: ProjectKind,
     pub build_target: Option<String>,
     pub runtime_source: Option<PathBuf>,
+    pub gc_enabled: bool,
     pub fingerprint: String,
     pub dependencies: Vec<Dependency>,
 }
@@ -90,7 +91,7 @@ pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
             format!("entry file `{}` does not exist", entry.display()),
         ));
     }
-    let runtime_source = runtime_source(root, &value, kind)?;
+    let (runtime_source, gc_enabled) = runtime_config(root, &value, kind)?;
     let build_target = table(&value, "build")
         .map(|build| optional_string_field(build, "target", "build"))
         .transpose()?
@@ -102,14 +103,19 @@ pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
         kind,
         build_target,
         runtime_source,
+        gc_enabled,
         fingerprint: value.to_string(),
         dependencies: dependencies(&value)?,
     })
 }
 
-fn runtime_source(root: &Path, value: &Value, kind: ProjectKind) -> io::Result<Option<PathBuf>> {
+fn runtime_config(
+    root: &Path,
+    value: &Value,
+    kind: ProjectKind,
+) -> io::Result<(Option<PathBuf>, bool)> {
     let Some(runtime) = table(value, "runtime") else {
-        return Ok(None);
+        return Ok((None, true));
     };
     if kind != ProjectKind::Binary {
         return Err(Error::new(
@@ -117,7 +123,17 @@ fn runtime_source(root: &Path, value: &Value, kind: ProjectKind) -> io::Result<O
             "[runtime] is only supported for binary packages",
         ));
     }
-    let source = PathBuf::from(string_field(runtime, "source", "runtime")?);
+    let gc_enabled = optional_bool_field(runtime, "gc", "runtime")?.unwrap_or(true);
+    let source = optional_string_field(runtime, "source", "runtime")?.map(PathBuf::from);
+    if !gc_enabled && source.is_some() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "`runtime.gc = false` cannot be combined with `runtime.source`",
+        ));
+    }
+    let Some(source) = source else {
+        return Ok((None, gc_enabled));
+    };
     let resolved = root.join(&source);
     if !resolved.is_file() {
         return Err(Error::new(
@@ -125,7 +141,7 @@ fn runtime_source(root: &Path, value: &Value, kind: ProjectKind) -> io::Result<O
             format!("runtime source `{}` does not exist", resolved.display()),
         ));
     }
-    Ok(Some(source))
+    Ok((Some(source), gc_enabled))
 }
 
 pub(crate) fn validate_package_name(name: &str) -> anyhow::Result<()> {

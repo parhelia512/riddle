@@ -794,6 +794,62 @@ fn c_heap_alloc() {
 }
 
 #[test]
+fn c_backend_no_gc_uses_the_owned_allocator_without_gc_symbols() {
+    let module = lower(
+        r#"
+        struct Data { value: i32 }
+
+        fun escape() -> &Data {
+            let local = Data { value: 1 };
+            &local
+        }
+
+        fun main() { escape(); }
+        "#,
+    );
+    let generated = CBackend::without_gc().compile(&module).unwrap();
+
+    assert!(generated.contains("riddle_alloc"), "{generated}");
+    assert!(!generated.contains("rgc_"), "{generated}");
+    assert!(!generated.contains("RgcHeader"), "{generated}");
+    assert!(!generated.contains("stack_anchor"), "{generated}");
+}
+
+#[test]
+fn c_backend_no_gc_maps_the_standard_allocator_abi() {
+    let module = lower(
+        r#"
+        unsafe extern "C" {
+            safe fun rgc_realloc(data: *mut u8, size: usize) -> *mut u8;
+            safe fun rgc_free(data: *mut u8);
+        }
+
+        fun main() {
+            let data = rgc_realloc(0usize as *mut u8, 16usize);
+            rgc_free(data);
+        }
+        "#,
+    );
+    let generated = CBackend::without_gc().compile(&module).unwrap();
+
+    assert!(generated.contains("riddle_realloc"), "{generated}");
+    assert!(generated.contains("riddle_free"), "{generated}");
+    assert!(!generated.contains("rgc_"), "{generated}");
+}
+
+#[test]
+fn c_backend_no_gc_rejects_collector_symbols() {
+    let module = lower(
+        r#"
+        unsafe extern "C" { safe fun rgc_collect(); }
+        fun main() { rgc_collect(); }
+        "#,
+    );
+    let error = CBackend::without_gc().compile(&module).unwrap_err();
+    assert!(error.contains("GC is disabled"), "{error}");
+}
+
+#[test]
 fn c_backend_heap_allocates_escaping_reference_temporaries() {
     let module = lower(
         r#"

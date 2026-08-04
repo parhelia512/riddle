@@ -11,7 +11,7 @@ use hir::{
     item_tree::{FunctionId, HirTypeRef},
     place::Place,
 };
-use type_checker::{
+use ty::{
     CaptureMode, CapturePlace, CaptureSource, ClosureKind, Diagnostic, LabelStyle, LambdaInfo,
     PatternBindingMode, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult, ValueUse,
 };
@@ -1182,16 +1182,22 @@ impl<'a> Analyzer<'a> {
         field: &hir::Name,
     ) -> Option<usize> {
         let ty = self.type_result.expr_types.get(&(body_id, base))?;
-        let struct_id = match ty {
-            Type::Ref(inner, _) => match inner.as_ref() {
-                Type::Struct(sid, _) => Some(*sid),
-                _ => None,
-            },
-            Type::Struct(sid, _) => Some(*sid),
+        let ty = match ty {
+            Type::Ref(inner, _) => inner.as_ref(),
+            ty => ty,
+        };
+        match ty {
+            Type::Struct(struct_id, _) => self.hir.item_tree.structs[*struct_id]
+                .fields
+                .iter()
+                .position(|candidate| candidate.name == *field),
+            Type::Tuple(elements) => field
+                .0
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index < elements.len()),
             _ => None,
-        }?;
-        let strukt = &self.hir.item_tree.structs[struct_id];
-        strukt.fields.iter().position(|f| f.name == *field)
+        }
     }
 
     fn has_any_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {

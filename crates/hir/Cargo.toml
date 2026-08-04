@@ -2,9 +2,10 @@
 name = "hir"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 ast = { path = "../ast" }
-frontend = { path = "../frontend" }
 la-arena = "0.3"
 rowan = "0.16.1"
+syntax = { path = "../syntax" }

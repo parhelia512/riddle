@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 
-use frontend::syntax_kind::SyntaxKind;
 use hir::{
     HirFile, Name,
     body::{BodyId, Expr, Pattern, PatternBindingId, ResolvedName},
@@ -25,6 +24,7 @@ use scope_graph::{
     DefRef, Node, RefOrigin, ScopeGraph,
     resolve::{resolve_path_at_reference, resolve_path_from, visible_definitions},
 };
+use syntax::SyntaxKind;
 use type_checker::{Type, TypeCheckResult};
 
 use crate::{

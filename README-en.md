@@ -1,37 +1,35 @@
-<p align="center">
+<div align="center">
   <img src="resources/logo.svg" alt="Riddle" width="180">
-</p>
 
-<h1 align="center">Riddle</h1>
+  [GitHub][github] | [Documentation][docs] | [Changelog][changelog] | [中文](README.md)
+</div>
 
-<h3 align="center">
-    <a href="README-en.md">English</a> | <a href="README.md">中文</a>
-</h3>
+This is the main source code repository for [Riddle][github]. It contains the
+compiler (`riddlec`), project tooling (`clue`), and a language server
+(`riddle-lsp`).
 
-Riddle is an experimental programming language inspired by Rust and Go. Version
-`v0.2.0` provides type checking, a move checker, borrow and escape analysis,
-unsafe semantics, a bundled standard library, a C backend, project tooling, and
-an LSP.
+Riddle is an experimental programming language inspired by Rust and Go. As of
+`v0.2.0`, it provides type checking, a move checker, borrow and escape
+analysis, unsafe semantics, a bundled standard library, a C backend, project
+tooling, and an LSP. This is a technology preview: the language and toolchain
+may still change without compatibility guarantees.
 
-This is a technology preview. The language and toolchain may still change
-without compatibility guarantees. Tutorials and implemented capabilities are
-available in [The Riddle Book](https://riddle-lang.github.io/docs/).
+## Why Riddle?
 
-## Language Features
+- **Reliability:** Values move by default. `Copy`, borrow checking, and
+  field-level partial moves are enforced at compile time; `std::ops::Drop`
+  provides deterministic destruction for local variables, parameters, pattern
+  bindings, iteration items, aggregate fields, and closure environments, with
+  drop flags preventing double destruction after moves.
 
-- Values move by default, with `Copy`, borrow checking, and field-level partial
-  moves; after destructuring a struct in `match`, unmoved sibling fields remain
-  usable.
-- `std::ops::Drop` provides deterministic destruction for local variables,
-  parameters, pattern bindings, iteration items, aggregate fields, and closure
-  environments, with drop flags preventing double destruction after moves.
-- Non-escaping values stay on the stack when possible. Escape analysis promotes
-  values to a conservative, non-moving GC heap when references outlive the
-  current stack frame; storage location does not change move, borrow, or drop
-  semantics.
-- Generics and traits, closures, recursive pattern matching,
-  `IntoIterator` / `Iterator`-driven `for` loops, `unsafe`, C FFI, and C11 code
-  generation are supported.
+- **Performance:** Non-escaping values stay on the stack. Only values whose
+  references outlive the current stack frame are promoted by escape analysis to
+  a conservative, non-moving GC heap. Storage location never changes move,
+  borrow, or drop semantics, and the C11 backend emits plain, linkable C.
+
+- **Productivity:** Generics and traits, closures, recursive pattern matching,
+  `IntoIterator` / `Iterator`-driven `for` loops, `unsafe`, and C FFI are all supported — paired with
+  `clue` project tooling and an editor LSP, from project creation to running.
 
 ## Tools
 
@@ -41,35 +39,6 @@ available in [The Riddle Book](https://riddle-lang.github.io/docs/).
 
 The [`editors`](./editors) directory contains `riddle-lsp` integrations for
 Helix, VS Code, Zed, and IntelliJ IDEA 2026.1+.
-
-## Installation
-
-Prebuilt releases are available from [GitHub Releases](https://github.com/riddle-lang/riddle/releases).
-Extract the archive for your platform and add its binary directory to `PATH`.
-
-Building from source requires a recent Rust stable toolchain:
-
-```bash
-git clone --depth 1 https://github.com/riddle-lang/riddle.git
-cd riddle
-cargo install --path . --features install-bins --force --target-dir "${TMPDIR:-/tmp}/riddle-install"
-```
-
-The PowerShell equivalent is:
-
-```powershell
-git clone --depth 1 https://github.com/riddle-lang/riddle.git
-Set-Location riddle
-cargo install --path . --features install-bins --force --target-dir "$env:TEMP\riddle-install"
-```
-
-Both methods install `clue`, `riddle-lsp`, and `riddlec`.
-
-To validate only the installable binaries, select the root distribution package so the workspace's development packages do not emit duplicate binaries:
-
-```bash
-cargo build -p riddle --release --features install-bins --bins
-```
 
 ## Quick Start
 
@@ -85,6 +54,38 @@ clue run
 strictly; otherwise it searches for `cc`, `gcc`, `clang`, and versioned command
 names, plus `clang-cl` and `cl` on Windows. A candidate must compile and link
 C11 successfully. `clue run` performs the same build before running the program.
+
+## Installation
+
+Prebuilt releases are available from [GitHub Releases][releases]: extract the
+archive for your platform and add its binary directory to `PATH`.
+
+Building from source requires a recent Rust stable toolchain.
+
+Bash:
+
+```bash
+git clone --depth 1 https://github.com/riddle-lang/riddle.git
+cd riddle
+cargo install --path . --features install-bins --force --target-dir "${TMPDIR:-/tmp}/riddle-install"
+```
+
+PowerShell:
+
+```powershell
+git clone --depth 1 https://github.com/riddle-lang/riddle.git
+Set-Location riddle
+cargo install --path . --features install-bins --force --target-dir "$env:TEMP\riddle-install"
+```
+
+Both methods install `clue`, `riddle-lsp`, and `riddlec`.
+
+To build only the installable binaries, target the root distribution package so
+the workspace's development packages do not emit duplicate binaries:
+
+```bash
+cargo build -p riddle --release --features install-bins --bins
+```
 
 ## Cross-compilation
 
@@ -109,13 +110,27 @@ is accepted:
 - `aarch64-pc-windows-msvc`
 - `aarch64-apple-darwin`
 
-A target component and a ready C toolchain are separate states. `ridup target
-add` installs the Riddle runtime and offers to install matching LLVM/Clang, but
-linking still needs the target platform libraries: a Linux sysroot, the Windows
-SDK and MSVC libraries for MSVC targets, or an Apple SDK for macOS. Ridup does
-not report a target as ready while these requirements are missing. `clue run`
-only runs the host target; run a cross-built artifact on its target system.
+A target component and a working C toolchain are two separate states. `ridup
+target add` installs the Riddle runtime and offers to install matching
+LLVM/Clang, but linking still needs the target platform libraries: a Linux
+sysroot, the Windows SDK and MSVC libraries for MSVC targets, or an Apple SDK
+for macOS. Ridup does not mark a target as ready until these requirements are
+met. `clue run` only runs the host target; run a cross-built artifact on its
+target system.
+
+## Getting Help
+
+Tutorials and implemented capabilities are documented in
+[The Riddle Book][docs]; report bugs, ask questions, or contribute via
+[GitHub Issues][issues]. The Riddle Book source lives in the `docs/` directory
+of this repository.
 
 ## License
 
 Riddle is distributed under the [Apache License 2.0](./LICENSE).
+
+[github]: https://github.com/riddle-lang/riddle
+[docs]: https://riddle-lang.github.io/docs/
+[releases]: https://github.com/riddle-lang/riddle/releases
+[issues]: https://github.com/riddle-lang/riddle/issues
+[changelog]: CHANGELOG.md

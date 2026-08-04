@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use frontend::syntax_kind::SyntaxKind;
 use hir::body::{Expr, ResolvedName};
 use hir::item_tree::FunctionId;
 use lsp_types::{
@@ -9,6 +8,7 @@ use lsp_types::{
 };
 use riddlec::pipeline::CompileOptions;
 use rowan::{TextRange, TextSize};
+use syntax::SyntaxKind;
 
 #[cfg(feature = "test-support")]
 use crate::analysis::analyze_standalone_source;

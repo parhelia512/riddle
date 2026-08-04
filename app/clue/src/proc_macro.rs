@@ -142,8 +142,13 @@ size_t riddle_proc_diagnostic_end(size_t index);
 const char *riddle_proc_diagnostic_message(size_t index);
 size_t riddle_proc_diagnostic_message_length(size_t index);
 
+#if defined(_MSC_VER)
+int riddle_proc_putchar(int value) {
+#else
 int putchar(int value) {
-    return fputc(value, stderr);
+#endif
+    unsigned char byte = (unsigned char)value;
+    return fwrite(&byte, 1u, 1u, stderr) == 1u ? (int)byte : EOF;
 }
 
 "#,

@@ -1,23 +1,20 @@
-<p align="center">
+<div align="center">
   <img src="resources/logo.svg" alt="Riddle" width="180">
-</p>
 
-<h1 align="center">Riddle</h1>
+  [GitHub][github] | [文档][docs] | [更新日志][changelog] | [English](README-en.md)
+</div>
 
-<h3 align="center">
-    <a href="README-en.md">English</a> | <a href="README.md">中文</a>
-</h3>
+这是 [Riddle][github] 的主源码仓库，包含编译器（`riddlec`）、项目工具（`clue`）和语言服务器（`riddle-lsp`）。
 
-Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.0` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。
+Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.0` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。当前版本仍处于技术预览阶段：语言和工具链仍可能发生不兼容变化。
 
-当前版本是技术预览：语言和工具链仍可能发生不兼容变化。教程与已实现能力见 [The Riddle Book](https://riddle-lang.github.io/docs/)。
+## 为什么选择 Riddle？
 
-## 语言能力
+- **可靠性**：值默认移动，`Copy`、借用检查与字段级部分移动在编译期保证内存语义；`std::ops::Drop` 提供确定性析构，覆盖局部变量、参数、模式绑定、迭代项、聚合体字段和闭包环境，并由 drop flag 防止移动后重复析构。
 
-- 值默认移动，支持 `Copy`、借用检查和字段级部分移动；结构体经 `match` 解构后，未移动的兄弟字段仍可继续使用；
-- `std::ops::Drop` 提供确定性析构，覆盖局部变量、参数、模式绑定、迭代元素、聚合字段和闭包环境，并用 drop flag 防止移动后重复析构；
-- 非逃逸值优先留在栈上，引用越过当前栈帧时由逃逸分析提升到保守式非移动 GC 堆；存储位置不会改变移动、借用和析构语义；
-- 支持泛型与 trait、闭包、递归模式匹配、`IntoIterator` / `Iterator` 驱动的 `for`、`unsafe`、C FFI 和 C11 代码生成。
+- **性能**：未逃逸的值优先留在栈上；只有当引用超出当前栈帧时，逃逸分析才会把值提升到保守式非移动 GC 堆。存储位置不会改变移动、借用与析构语义，C11 后端则把程序编译成可直接链接的普通 C。
+
+- **生产力**：泛型与 trait、闭包、递归模式匹配、由 `IntoIterator` / `Iterator` 驱动的 `for` 循环、`unsafe` 与 C FFI 一应俱全；配合 `clue` 项目工具和 LSP，从创建项目到运行一路顺畅。
 
 ## 工具
 
@@ -25,13 +22,25 @@ Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.0` 提供
 - `clue`：创建、检查、构建和运行 Riddle 项目；
 - `riddle-lsp`：为编辑器提供诊断和语义高亮。
 
-仓库中的 [`editors`](./editors) 目录提供 Helix、VS Code、Zed 和 IntelliJ IDEA 2026.1+ 的 `riddle-lsp` 适配。
+仓库中的 [`editors`](./editors) 目录为 Helix、VS Code、Zed 和 IntelliJ IDEA 2026.1+ 提供 `riddle-lsp` 适配。
+
+## 快速开始
+
+```bash
+clue new hello
+cd hello
+clue check
+clue build
+clue run
+```
+
+`clue build` 会保留 `.clue/build/hello.c`。设置 `CC` 时，Clue 只会使用该编译器；否则会自动寻找系统中的 `cc`、`gcc`、`clang` 及其带版本号的命令，Windows 上还支持 `clang-cl` 和 `cl`。候选编译器必须能完成 C11 编译与链接。`clue run` 会先执行同样的构建，再运行程序。
 
 ## 安装
 
-预编译版本可从 [GitHub Releases](https://github.com/riddle-lang/riddle/releases) 下载。解压对应平台的 zip，并把二进制所在目录加入 `PATH`。
+可从 [GitHub Releases][releases] 下载预编译版本：解压对应平台的 zip，并将二进制所在的目录加入 `PATH`。
 
-从源码安装需要较新的 Rust stable。
+从源码构建需要较新的 Rust stable 工具链。
 
 Bash：
 
@@ -49,36 +58,24 @@ Set-Location riddle
 cargo install --path . --features install-bins --force --target-dir "$env:TEMP\riddle-install"
 ```
 
-两种方式都会安装 `clue`、`riddle-lsp` 和 `riddlec`。
+上述两种方式都会安装 `clue`、`riddle-lsp` 和 `riddlec` 三个二进制。
 
-如果只验证这三个安装二进制的构建，请限定根发行包，避免 workspace 中的同名开发包重复输出：
+如果只想构建这三个可安装二进制，请指定根发行包（root distribution package），避免 workspace 中同名开发包重复输出：
 
 ```bash
 cargo build -p riddle --release --features install-bins --bins
 ```
 
-## 快速开始
-
-```bash
-clue new hello
-cd hello
-clue check
-clue build
-clue run
-```
-
-`clue build` 会保留 `.clue/build/hello.c`。设置 `CC` 时 Clue 会严格使用它；否则自动寻找系统中的 `cc`、`gcc`、`clang` 及其版本化命令，Windows 还支持 `clang-cl` 和 `cl`。候选必须能完成 C11 编译和链接。`clue run` 会先完成相同构建，再运行该程序。
-
 ## 交叉编译
 
-`clue check`、`clue build` 和 `riddlec` 接受 `--target <triple>`。Clue 的目标选择优先级是命令行、`RIDDLE_TARGET`、`Clue.toml` 中的 `[build].target`、宿主平台。使用 ridup 时可以安装目标组件：
+`clue check`、`clue build` 和 `riddlec` 均接受 `--target <triple>`。目标选择优先级依次为命令行参数、`RIDDLE_TARGET` 环境变量、`Clue.toml` 中的 `[build].target`，最后回退到宿主平台。目标组件可通过 ridup 安装：
 
 ```powershell
 ridup target add aarch64-unknown-linux-gnu
 clue build --target aarch64-unknown-linux-gnu
 ```
 
-首版严格限制为以下 7 个目标，不接受其他 triple：
+首个发布版仅支持以下 7 个目标，不接受其他 triple：
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
@@ -88,8 +85,18 @@ clue build --target aarch64-unknown-linux-gnu
 - `aarch64-pc-windows-msvc`
 - `aarch64-apple-darwin`
 
-目标组件和 C 工具链是两个独立状态。`ridup target add` 安装 Riddle runtime，并询问是否安装匹配的 LLVM/Clang；真正链接仍需要目标平台的系统库：Linux 需要 sysroot，Windows MSVC 目标需要 Windows SDK 和 MSVC 库，macOS 需要 Apple SDK。ridup 不会把缺少这些组件的目标报告为可用。`clue run` 只运行宿主目标；交叉产物需要复制到目标系统运行。
+目标组件与可用的 C 工具链是两个相互独立的状态。`ridup target add` 会安装 Riddle runtime，并询问是否安装配套的 LLVM/Clang；实际链接仍需要目标平台的系统库：Linux 需要 sysroot，Windows MSVC 目标需要 Windows SDK 与 MSVC 库，macOS 需要 Apple SDK。缺少这些组件时，ridup 不会把目标标记为可用。`clue run` 只能运行宿主目标；交叉编译产物需复制到目标系统上运行。
+
+## 获取帮助
+
+教程与已实现的能力参见 [The Riddle Book][docs]；报告 bug、提问或贡献代码请到 [GitHub Issues][issues]。Riddle Book 的源码位于本仓库的 `docs/` 目录。
 
 ## 许可证
 
 Riddle 使用 [Apache License 2.0](./LICENSE)。
+
+[github]: https://github.com/riddle-lang/riddle
+[docs]: https://riddle-lang.github.io/docs/
+[releases]: https://github.com/riddle-lang/riddle/releases
+[issues]: https://github.com/riddle-lang/riddle/issues
+[changelog]: CHANGELOG.md

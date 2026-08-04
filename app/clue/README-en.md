@@ -44,6 +44,19 @@ and `rgc_collect`:
 source = "runtime/custom_gc.c"
 ```
 
+To remove GC, root scanning, and the `rgc_*` ABI entirely, enable owned-memory
+mode:
+
+```toml
+[runtime]
+gc = false
+```
+
+This mode uses `riddle_alloc`, `riddle_realloc`, and `riddle_free` for owned heap
+values and releases them deterministically when their owner ends. The compiler
+rejects references that would require stack storage to outlive its scope
+(E0310). `gc = false` cannot be combined with `source`.
+
 Runtime selection belongs to the final binary package; library packages cannot
 declare `[runtime]`.
 

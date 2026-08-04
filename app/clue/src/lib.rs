@@ -23,6 +23,7 @@ pub struct ProjectAnalysis {
     pub kind: ProjectKind,
     build_target: Option<String>,
     runtime_source: Option<PathBuf>,
+    gc_enabled: bool,
     package_name: String,
     manifest_fingerprint: String,
 }
@@ -191,20 +192,24 @@ pub fn resolve_project_with_session_cancellable(
     let result = if let Some(parse) = &package.macro_parse {
         session
             .checker
-            .resolve_parsed_package_with_options_cancellable(
+            .resolve_parsed_package_with_options_and_gc_cancellable(
                 &package.source.source,
                 parse,
                 &package.package_ranges,
                 options,
+                package.gc_enabled,
                 &cancelled,
             )
     } else {
-        session.checker.resolve_package_with_options_cancellable(
-            &package.source.source,
-            &package.package_ranges,
-            options,
-            &cancelled,
-        )
+        session
+            .checker
+            .resolve_package_with_options_and_gc_cancellable(
+                &package.source.source,
+                &package.package_ranges,
+                options,
+                package.gc_enabled,
+                &cancelled,
+            )
     };
     let Some(mut result) = result else {
         return Ok(None);
@@ -219,6 +224,7 @@ pub fn resolve_project_with_session_cancellable(
         kind: package.kind,
         build_target: package.build_target,
         runtime_source: package.runtime_source,
+        gc_enabled: package.gc_enabled,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
     }))
@@ -252,20 +258,24 @@ pub fn check_project_with_session_cancellable(
     let result = if let Some(parse) = &package.macro_parse {
         session
             .checker
-            .check_parsed_package_with_options_cancellable(
+            .check_parsed_package_with_options_and_gc_cancellable(
                 &package.source.source,
                 parse,
                 &package.package_ranges,
                 options,
+                package.gc_enabled,
                 &cancelled,
             )
     } else {
-        session.checker.check_package_with_options_cancellable(
-            &package.source.source,
-            &package.package_ranges,
-            options,
-            &cancelled,
-        )
+        session
+            .checker
+            .check_package_with_options_and_gc_cancellable(
+                &package.source.source,
+                &package.package_ranges,
+                options,
+                package.gc_enabled,
+                &cancelled,
+            )
     };
     let Some(mut result) = result else {
         return Ok(None);
@@ -280,6 +290,7 @@ pub fn check_project_with_session_cancellable(
         kind: package.kind,
         build_target: package.build_target,
         runtime_source: package.runtime_source,
+        gc_enabled: package.gc_enabled,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
     }))
@@ -294,27 +305,31 @@ fn analyze_project_impl(
     let mut package = project::load_with_overlays(path, overlays)?;
     let macro_analysis = expand_proc_macros(&mut package)?;
     let mut result = match (&package.macro_parse, build) {
-        (Some(parse), true) => riddlec::pipeline::compile_parsed_package_with_options(
+        (Some(parse), true) => riddlec::pipeline::compile_parsed_package_with_options_and_gc(
             &package.source.source,
             parse,
             &package.package_ranges,
             options,
+            package.gc_enabled,
         ),
-        (Some(parse), false) => riddlec::pipeline::check_parsed_package_with_options(
+        (Some(parse), false) => riddlec::pipeline::check_parsed_package_with_options_and_gc(
             &package.source.source,
             parse,
             &package.package_ranges,
             options,
+            package.gc_enabled,
         ),
-        (None, true) => riddlec::pipeline::compile_package_with_options(
+        (None, true) => riddlec::pipeline::compile_package_with_options_and_gc(
             &package.source.source,
             &package.package_ranges,
             options,
+            package.gc_enabled,
         ),
-        (None, false) => riddlec::pipeline::check_package_with_options(
+        (None, false) => riddlec::pipeline::check_package_with_options_and_gc(
             &package.source.source,
             &package.package_ranges,
             options,
+            package.gc_enabled,
         ),
     };
     result.macro_diagnostics = macro_analysis.diagnostics;
@@ -327,6 +342,7 @@ fn analyze_project_impl(
         kind: package.kind,
         build_target: package.build_target,
         runtime_source: package.runtime_source,
+        gc_enabled: package.gc_enabled,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
     })

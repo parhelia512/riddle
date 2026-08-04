@@ -37,6 +37,83 @@ fn temp_source_root(name: &str) -> PathBuf {
     ))
 }
 
+#[test]
+fn no_gc_rejects_a_reference_to_local_stack_storage() {
+    let result = compile_with_options_and_gc(
+        r#"
+        struct Data { value: i32 }
+
+        fun escaped() -> &Data {
+            let local = Data { value: 1 };
+            &local
+        }
+        "#,
+        CompileOptions { use_std: false },
+        false,
+    );
+
+    let diagnostic = result
+        .analysis_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0310")
+        .expect("missing no-GC reference escape diagnostic");
+    assert!(diagnostic.message.contains("GC is disabled"));
+    assert!(result.mir_module.is_none());
+}
+
+#[test]
+fn no_gc_allows_forwarding_an_input_reference() {
+    let result = compile_with_options_and_gc(
+        "fun identity(value: &i32) -> &i32 { value }",
+        CompileOptions { use_std: false },
+        false,
+    );
+
+    assert!(result.success(), "{:?}", result.analysis_diagnostics);
+    assert!(result.mir_module.is_some());
+}
+
+#[test]
+fn no_gc_allows_an_owned_escaping_closure() {
+    let result = compile_with_options_and_gc(
+        r#"
+        fun make() -> impl Fn() -> i32 {
+            let value = 42;
+            move fun() -> i32 { value }
+        }
+        "#,
+        CompileOptions { use_std: false },
+        false,
+    );
+
+    assert!(result.success(), "{:?}", result.analysis_diagnostics);
+    assert!(result.mir_module.is_some());
+}
+
+#[test]
+fn no_gc_rejects_a_borrowed_escaping_closure() {
+    let result = compile_with_options_and_gc(
+        r#"
+        fun make() -> impl Fn() -> i32 {
+            let value = 42;
+            fun() -> i32 { value }
+        }
+        "#,
+        CompileOptions { use_std: false },
+        false,
+    );
+
+    assert!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0310"),
+        "{:#?}",
+        result.analysis_diagnostics
+    );
+    assert!(result.mir_module.is_none());
+}
+
 fn assert_same_check_result(left: &CompileResult, right: &CompileResult) {
     let parse_errors = |result: &CompileResult| {
         result
