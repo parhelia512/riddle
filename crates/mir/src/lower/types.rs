@@ -249,16 +249,53 @@ impl LowerCtx<'_> {
         }
         let alias_name = path.segments[1].0.as_str();
         let imp = self.impl_for_method(self.current_function?)?;
-        let alias_id = imp
+        if let Some(alias_id) = imp
             .type_aliases
             .iter()
-            .find(|alias_id| self.hir.item_tree.type_aliases[**alias_id].name.0 == alias_name)?;
-        Some(
-            self.hir.item_tree.type_aliases[*alias_id]
-                .ty
-                .as_ref()
-                .map_or(Type::Unit, |ty| self.convert_hir_type(ty)),
-        )
+            .find(|alias_id| self.hir.item_tree.type_aliases[**alias_id].name.0 == alias_name)
+        {
+            return Some(
+                self.hir.item_tree.type_aliases[*alias_id]
+                    .ty
+                    .as_ref()
+                    .map_or(Type::Unit, |ty| self.convert_hir_type(ty)),
+            );
+        }
+        // The alias lives in a sibling impl (e.g. `impl<T> Index for Vector<T>`),
+        // so match the concrete Self against all impls, like the type-checker's
+        // `lower_self_associated_type` does.
+        let self_ty = self.generic_subst.get("Self")?;
+        let self_tc_ty = self.substitute_tc_type(&self.lower_hir_type_for_pattern(
+            &imp.self_ty,
+            &self.generic_tc_subst,
+        ));
+        self.hir.item_tree.impls.iter().find_map(|(_, candidate)| {
+            let alias_id = candidate
+                .type_aliases
+                .iter()
+                .find(|alias_id| {
+                    self.hir.item_tree.type_aliases[**alias_id].name.0 == alias_name
+                })?;
+            if !self.impl_type_matches(candidate, &self_tc_ty) {
+                return None;
+            }
+            let subst = self.impl_mir_subst(candidate, &self_tc_ty)?;
+            let mut type_subst = subst
+                .types
+                .iter()
+                .map(|(name, ty)| (name.as_str(), ty))
+                .collect::<HashMap<_, _>>();
+            type_subst.insert("Self", self_ty);
+            let const_subst = subst
+                .consts
+                .iter()
+                .map(|(name, value)| (name.as_str(), *value))
+                .collect::<HashMap<_, _>>();
+            let alias = &self.hir.item_tree.type_aliases[*alias_id];
+            Some(alias.ty.as_ref().map_or(Type::Unit, |ty| {
+                self.convert_hir_type_with_substs(ty, &type_subst, &const_subst)
+            }))
+        })
     }
 
     pub(super) fn convert_struct_type(

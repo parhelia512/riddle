@@ -152,6 +152,7 @@ fn build_analysis(
         &executable,
         &[],
         false,
+        &[],
     )?;
     fs::write(&hash_path, hash)?;
     println!("clue: built {}", executable.display());
@@ -228,6 +229,9 @@ pub fn build_proc_macro_library(
         &library,
         &["putchar=riddle_proc_putchar"],
         true,
+        // ponytail: glibc folds `putchar` into `putc(c, stdout)` at -O2 after
+        // macro expansion, bypassing the -D rename; -fno-inline stops it.
+        &["-fno-inline"],
     )?;
     fs::write(hash_path, hash)?;
     Ok(library)
@@ -372,7 +376,7 @@ impl CCompiler {
             return false;
         }
         let success = self
-            .command(&[source.as_path()], &executable, &[], false)
+            .command(&[source.as_path()], &executable, &[], false, &[])
             .output()
             .is_ok_and(|output| output.status.success() && executable.is_file());
         let _ = fs::remove_file(&source);
@@ -400,9 +404,10 @@ impl CCompiler {
         executable: &Path,
         defines: &[&str],
         shared_library: bool,
+        extra_args: &[&str],
     ) -> anyhow::Result<()> {
         let status = self
-            .command(sources, executable, defines, shared_library)
+            .command(sources, executable, defines, shared_library, extra_args)
             .status()
             .with_context(|| {
                 format!(
@@ -425,6 +430,7 @@ impl CCompiler {
         executable: &Path,
         defines: &[&str],
         shared_library: bool,
+        extra_args: &[&str],
     ) -> Command {
         let mut command = Command::new(&self.program);
         let host = TargetTriple::host().ok();
@@ -459,6 +465,7 @@ impl CCompiler {
                 for define in defines {
                     command.arg(format!("-D{define}"));
                 }
+                command.args(extra_args);
                 command.args(sources).arg("-o").arg(executable);
             }
             Flavor::Msvc => {
@@ -475,6 +482,9 @@ impl CCompiler {
                 self.apply_msvc_target_options(&mut command);
                 for define in defines {
                     command.arg(format!("/D{define}"));
+                }
+                if self.clang {
+                    command.args(extra_args);
                 }
                 command
                     .args(sources)
@@ -673,7 +683,7 @@ mod tests {
                 c_toolchain: Default::default(),
             },
         }
-        .command(&[Path::new("input.c")], Path::new("output"), &[], true)
+        .command(&[Path::new("input.c")], Path::new("output"), &[], true, &[])
         .get_args()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect()
