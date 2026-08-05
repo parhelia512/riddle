@@ -740,7 +740,10 @@ impl CBackend {
         } else {
             format!("({} {} {})", lhs_name, cmpop_c(op), rhs_name)
         };
-        if self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1 {
+        let derefs_memory = lhs_type == "riddle_str" && matches!(op, CmpOp::Eq | CmpOp::Neq);
+        // ponytail: str comparisons must evaluate at the definition point — inlining the
+        // memcmp at a later use site (across a drop block) reads freed memory.
+        if self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1 && !derefs_memory {
             self.set_inline(value, expr, "bool".into());
         } else {
             let name = fresh_c(&mut self.counter, "cmp");
