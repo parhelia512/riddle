@@ -1,4 +1,4 @@
-name: Debug macOS proc-macro
+name: Debug proc-macro
 
 on:
   workflow_dispatch:
@@ -14,3 +14,14 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - run: cargo test --workspace --target aarch64-apple-darwin
+
+  win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo test --workspace --target x86_64-pc-windows-msvc

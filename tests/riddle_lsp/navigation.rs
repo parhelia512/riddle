@@ -434,7 +434,11 @@ fn project_rename_uses_overlays_and_versions_only_open_documents() {
             .cmp(right.text_document.uri.as_str())
     });
     assert_eq!(documents.len(), 3);
-    assert_eq!(document_edit_version(&documents, &main_uri), Some(7));
+    assert_eq!(
+        document_edit_version(&documents, &main_uri),
+        Some(7),
+        "main_uri={main_uri} util_uri={util_uri} consumer_uri={consumer_uri} documents={documents:#?}"
+    );
     assert_eq!(document_edit_version(&documents, &util_uri), Some(9));
     assert_eq!(document_edit_version(&documents, &consumer_uri), None);
     assert!(documents.iter().all(|document| {
