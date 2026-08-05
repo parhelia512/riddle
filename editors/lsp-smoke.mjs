@@ -1,17 +1,18 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const command = process.argv[2] ?? 'riddle-lsp';
-const uri = 'file:///riddle-lsp-smoke.rid';
-const stableUri = 'file:///riddle-lsp-stable.rid';
-const fixUri = 'file:///riddle-lsp-fix.rid';
-const completionUri = 'file:///riddle-lsp-completion.rid';
-const generalCompletionUri = 'file:///riddle-lsp-general-completion.rid';
-const navigationUri = 'file:///riddle-lsp-navigation.rid';
+const smokeRoot = realpathSync.native(mkdtempSync(join(tmpdir(), 'riddle-lsp-smoke-')));
+const uri = pathToFileURL(join(smokeRoot, 'riddle-lsp-smoke.rid')).href;
+const stableUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-stable.rid')).href;
+const fixUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-fix.rid')).href;
+const completionUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-completion.rid')).href;
+const generalCompletionUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-general-completion.rid')).href;
+const navigationUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-navigation.rid')).href;
 const navigationText = [
   'trait Show { fun show(&self) -> i32; }',
   'struct Value {}',
@@ -24,7 +25,7 @@ const navigationText = [
   '}',
   'type Alias = Foo;',
 ].join('\n');
-const projectRoot = mkdtempSync(join(tmpdir(), 'riddle-lsp-smoke-'));
+const projectRoot = join(smokeRoot, 'project');
 const projectMainText = 'mod util;\nfun main() { let callable = util::make; callable; }\n';
 const projectUtilText = 'pub fun make() -> i32 { 1 }\n';
 mkdirSync(join(projectRoot, 'src'), { recursive: true });
@@ -847,5 +848,5 @@ try {
     new Promise((resolve) => setTimeout(resolve, 2_000)),
   ]);
   if (exited === undefined && server.exitCode === null) server.kill();
-  rmSync(projectRoot, { recursive: true, force: true });
+  rmSync(smokeRoot, { recursive: true, force: true });
 }
