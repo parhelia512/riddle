@@ -1,10 +1,9 @@
 use std::fmt;
 
 use crate::func::Function;
-use crate::instr::*;
+use crate::instr::{ConstValue, InstKind, Terminator};
 use crate::module::Module;
 use crate::types::Type;
-use crate::value::Value;
 
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -65,7 +64,7 @@ fn fmt_func(f: &mut fmt::Formatter<'_>, func: &Function, indent: usize) -> fmt::
         let _phi_params = String::new();
         for (i, inst) in block.insts.iter().enumerate() {
             if let InstKind::Phi(pairs) = &inst.kind {
-                let v = Value(block.start_value + i as u32);
+                let v = block.value_at(i);
                 let pair_strs: Vec<String> = pairs
                     .iter()
                     .map(|(val, bid)| format!("%{} from block{}", val.0, bid.into_raw()))
@@ -86,7 +85,7 @@ fn fmt_func(f: &mut fmt::Formatter<'_>, func: &Function, indent: usize) -> fmt::
             if matches!(&inst.kind, InstKind::Phi(_)) {
                 continue; // phi 已在上面处理
             }
-            let v = Value(block.start_value + i as u32);
+            let v = block.value_at(i);
             if inst.ty == Type::Void {
                 writeln!(f, "  {}  {}", pad, InstFmt(&inst.kind))?;
             } else {
@@ -102,12 +101,12 @@ fn fmt_func(f: &mut fmt::Formatter<'_>, func: &Function, indent: usize) -> fmt::
         }
 
         // 终止指令
-        write!(f, "  {}  ", pad)?;
+        write!(f, "  {pad}  ")?;
         match &block.terminator {
             Terminator::Pending => writeln!(f, "<pending>")?,
             Terminator::Branch(target) => {
                 let tl = func.blocks[*target].label.as_deref().unwrap_or("?");
-                writeln!(f, "br block_{}", tl)?;
+                writeln!(f, "br block_{tl}")?;
             }
             Terminator::CondBranch(cond, then_block, else_block) => {
                 let tl = func.blocks[*then_block].label.as_deref().unwrap_or("?");
@@ -122,7 +121,7 @@ fn fmt_func(f: &mut fmt::Formatter<'_>, func: &Function, indent: usize) -> fmt::
         }
     }
 
-    writeln!(f, "{}}}", pad)?;
+    writeln!(f, "{pad}}}")?;
     Ok(())
 }
 
@@ -132,8 +131,8 @@ struct TypeFmt<'a>(&'a Type);
 impl fmt::Display for TypeFmt<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Type::Int(ty) => write!(f, "{:?}", ty),
-            Type::Float(ty) => write!(f, "{:?}", ty),
+            Type::Int(ty) => write!(f, "{ty:?}"),
+            Type::Float(ty) => write!(f, "{ty:?}"),
             Type::Bool => write!(f, "bool"),
             Type::Str => write!(f, "str"),
             Type::Char => write!(f, "char"),
@@ -190,7 +189,7 @@ impl fmt::Display for InstFmt<'_> {
                 let args_str: Vec<String> = args.iter().map(|a| format!("v{}", a.0)).collect();
                 write!(f, "call {:?}({})", callee, args_str.join(", "))
             }
-            InstKind::FunctionRef(function) => write!(f, "function_ref {:?}", function),
+            InstKind::FunctionRef(function) => write!(f, "function_ref {function:?}"),
             InstKind::CallIndirect(callee, args) => {
                 let args = args
                     .iter()
@@ -225,12 +224,12 @@ impl fmt::Display for InstFmt<'_> {
 
 fn fmt_const(f: &mut fmt::Formatter<'_>, c: &ConstValue) -> fmt::Result {
     match c {
-        ConstValue::Int(v, w) => write!(f, "iconst({:?}) {:?}", w, v),
-        ConstValue::NegativeInt(v, w) => write!(f, "iconst({:?}) -{:?}", w, v),
-        ConstValue::Float(v, w) => write!(f, "fconst({:?}) {:?}", w, v),
-        ConstValue::Bool(v) => write!(f, "bconst {}", v),
-        ConstValue::String(v) => write!(f, "sconst {:?}", v),
-        ConstValue::Char(v) => write!(f, "cconst {:?}", v),
+        ConstValue::Int(v, w) => write!(f, "iconst({w:?}) {v:?}"),
+        ConstValue::NegativeInt(v, w) => write!(f, "iconst({w:?}) -{v:?}"),
+        ConstValue::Float(v, w) => write!(f, "fconst({w:?}) {v:?}"),
+        ConstValue::Bool(v) => write!(f, "bconst {v}"),
+        ConstValue::String(v) => write!(f, "sconst {v:?}"),
+        ConstValue::Char(v) => write!(f, "cconst {v:?}"),
         ConstValue::Unit => write!(f, "unit"),
     }
 }

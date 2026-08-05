@@ -54,7 +54,7 @@ impl FlowState {
     }
 }
 
-pub(crate) fn check(hir: &HirFile, type_result: &TypeCheckResult, result: &mut AnalysisResult) {
+pub fn check(hir: &HirFile, type_result: &TypeCheckResult, result: &mut AnalysisResult) {
     for (function_id, _) in hir.item_tree.functions.iter() {
         let Some(body_id) = hir.function_bodies.get(&function_id).copied() else {
             continue;
@@ -112,7 +112,7 @@ impl Checker<'_> {
                     && let Some(init) = state.bindings.get(&id)
                     && *init != InitState::Initialized
                 {
-                    self.uninitialized(path.display(), self.expr_range(expr_id));
+                    self.uninitialized(&path.display(), self.expr_range(expr_id));
                 }
                 state
             }
@@ -134,81 +134,15 @@ impl Checker<'_> {
             }
 
             Expr::Unary { operand, .. } => self.analyze_expr(operand, state),
-            Expr::Block { stmts, tail } => {
-                let mut state = state;
-                for stmt in stmts {
-                    state = self.analyze_stmt(stmt, state);
-                    if !state.reachable {
-                        break;
-                    }
-                }
-                tail.map(|tail| self.analyze_expr(tail, state.clone()))
-                    .unwrap_or(state)
-            }
+            Expr::Block { stmts, tail } => self.analyze_block(&stmts, tail, state),
             Expr::If {
                 cond,
                 then_branch,
                 else_branch,
-            } => {
-                let state = self.analyze_expr(cond, state);
-                if !state.reachable {
-                    state
-                } else {
-                    let then_state = self.analyze_expr(then_branch, state.clone());
-                    let else_state = else_branch
-                        .map(|branch| self.analyze_expr(branch, state.clone()))
-                        .unwrap_or(state);
-                    FlowState::merge_paths(then_state, else_state)
-                }
-            }
-            Expr::While { condition, body } => {
-                self.loop_depth += 1;
-                let condition_state = self.analyze_expr(condition, state);
-                let body_state = if condition_state.reachable {
-                    self.analyze_expr(body, condition_state.clone())
-                } else {
-                    condition_state.clone()
-                };
-                self.loop_depth -= 1;
-                FlowState::merge_paths(condition_state, body_state)
-            }
-            Expr::For {
-                pat,
-                iterable,
-                body,
-            } => {
-                let iterable_state = self.analyze_expr(iterable, state);
-                if !iterable_state.reachable {
-                    iterable_state
-                } else {
-                    self.loop_depth += 1;
-                    let body_state = self.analyze_expr(body, iterable_state.clone());
-                    self.loop_depth -= 1;
-                    let _ = pat;
-                    FlowState::merge_paths(iterable_state, body_state)
-                }
-            }
-            Expr::Match { scrutinee, arms } => {
-                let state = self.analyze_expr(scrutinee, state);
-                if !state.reachable {
-                    state
-                } else {
-                    let mut merged = FlowState {
-                        bindings: HashMap::new(),
-                        reachable: false,
-                    };
-                    for arm in arms {
-                        let mut arm_state = state.clone();
-                        self.bind_pattern(arm.pat, &mut arm_state);
-                        if let Some(guard) = arm.guard {
-                            arm_state = self.analyze_expr(guard, arm_state);
-                        }
-                        arm_state = self.analyze_expr(arm.body, arm_state);
-                        merged = FlowState::merge_paths(merged, arm_state);
-                    }
-                    if merged.reachable { merged } else { state }
-                }
-            }
+            } => self.analyze_if(cond, then_branch, else_branch, state),
+            Expr::While { condition, body } => self.analyze_while(condition, body, state),
+            Expr::For { iterable, body, .. } => self.analyze_for(iterable, body, state),
+            Expr::Match { scrutinee, arms } => self.analyze_match(scrutinee, &arms, state),
             Expr::Array { elements } | Expr::Tuple { elements } => elements
                 .into_iter()
                 .try_fold(state, |state, element| {
@@ -258,6 +192,10 @@ impl Checker<'_> {
             }
         };
 
+        self.finish_expr(expr_id, state)
+    }
+
+    fn finish_expr(&self, expr_id: ExprId, state: FlowState) -> FlowState {
         if state.reachable
             && self
                 .type_result
@@ -272,6 +210,89 @@ impl Checker<'_> {
         } else {
             state
         }
+    }
+
+    fn analyze_block(
+        &mut self,
+        stmts: &[hir::body::StmtId],
+        tail: Option<ExprId>,
+        mut state: FlowState,
+    ) -> FlowState {
+        for stmt in stmts {
+            state = self.analyze_stmt(*stmt, state);
+            if !state.reachable {
+                break;
+            }
+        }
+        tail.map(|tail| self.analyze_expr(tail, state.clone()))
+            .unwrap_or(state)
+    }
+
+    fn analyze_if(
+        &mut self,
+        cond: ExprId,
+        then_branch: ExprId,
+        else_branch: Option<ExprId>,
+        state: FlowState,
+    ) -> FlowState {
+        let state = self.analyze_expr(cond, state);
+        if !state.reachable {
+            return state;
+        }
+        let then_state = self.analyze_expr(then_branch, state.clone());
+        let else_state = else_branch
+            .map(|branch| self.analyze_expr(branch, state.clone()))
+            .unwrap_or(state);
+        FlowState::merge_paths(then_state, else_state)
+    }
+
+    fn analyze_while(&mut self, condition: ExprId, body: ExprId, state: FlowState) -> FlowState {
+        self.loop_depth += 1;
+        let condition_state = self.analyze_expr(condition, state);
+        let body_state = if condition_state.reachable {
+            self.analyze_expr(body, condition_state.clone())
+        } else {
+            condition_state.clone()
+        };
+        self.loop_depth -= 1;
+        FlowState::merge_paths(condition_state, body_state)
+    }
+
+    fn analyze_for(&mut self, iterable: ExprId, body: ExprId, state: FlowState) -> FlowState {
+        let iterable_state = self.analyze_expr(iterable, state);
+        if !iterable_state.reachable {
+            return iterable_state;
+        }
+        self.loop_depth += 1;
+        let body_state = self.analyze_expr(body, iterable_state.clone());
+        self.loop_depth -= 1;
+        FlowState::merge_paths(iterable_state, body_state)
+    }
+
+    fn analyze_match(
+        &mut self,
+        scrutinee: ExprId,
+        arms: &[hir::body::MatchArm],
+        state: FlowState,
+    ) -> FlowState {
+        let state = self.analyze_expr(scrutinee, state);
+        if !state.reachable {
+            return state;
+        }
+        let mut merged = FlowState {
+            bindings: HashMap::new(),
+            reachable: false,
+        };
+        for arm in arms {
+            let mut arm_state = state.clone();
+            self.bind_pattern(arm.pat, &mut arm_state);
+            if let Some(guard) = arm.guard {
+                arm_state = self.analyze_expr(guard, arm_state);
+            }
+            arm_state = self.analyze_expr(arm.body, arm_state);
+            merged = FlowState::merge_paths(merged, arm_state);
+        }
+        if merged.reachable { merged } else { state }
     }
 
     fn analyze_stmt(&mut self, stmt_id: hir::body::StmtId, mut state: FlowState) -> FlowState {
@@ -337,16 +358,16 @@ impl Checker<'_> {
 
         if compound {
             if current == InitState::Initialized && !is_mut {
-                self.immutable_assignment(name, self.expr_range(lhs));
+                self.immutable_assignment(&name, self.expr_range(lhs));
             }
             return state;
         }
 
         if !direct {
             if current != InitState::Initialized {
-                self.uninitialized(name, self.expr_range(lhs));
+                self.uninitialized(&name, self.expr_range(lhs));
             } else if !is_mut {
-                self.immutable_assignment(name, self.expr_range(lhs));
+                self.immutable_assignment(&name, self.expr_range(lhs));
             }
             return state;
         }
@@ -354,15 +375,15 @@ impl Checker<'_> {
         match current {
             InitState::Uninitialized => {
                 if self.loop_depth > 0 && !is_mut {
-                    self.immutable_assignment(name, self.expr_range(lhs));
+                    self.immutable_assignment(&name, self.expr_range(lhs));
                 }
                 state.bindings.insert(binding, InitState::Initialized);
             }
             InitState::Initialized | InitState::MaybeInitialized => {
-                if !is_mut {
-                    self.immutable_assignment(name, self.expr_range(lhs));
-                } else {
+                if is_mut {
                     state.bindings.insert(binding, InitState::Initialized);
+                } else {
+                    self.immutable_assignment(&name, self.expr_range(lhs));
                 }
             }
         }
@@ -421,8 +442,7 @@ impl Checker<'_> {
             Pattern::Struct { fields, .. } => id
                 .field
                 .and_then(|index| fields.get(index))
-                .map(|field| field.name.0.clone())
-                .unwrap_or_else(|| "_".into()),
+                .map_or_else(|| "_".into(), |field| field.name.0.clone()),
             _ => "_".into(),
         }
     }
@@ -431,7 +451,7 @@ impl Checker<'_> {
         self.body.source_map.expr_ranges.get(&expr_id).copied()
     }
 
-    fn uninitialized(&mut self, name: String, span: Option<TextRange>) {
+    fn uninitialized(&mut self, name: &str, span: Option<TextRange>) {
         self.diagnostic(
             "E0059",
             format!("use of uninitialized binding `{name}`"),
@@ -439,7 +459,7 @@ impl Checker<'_> {
         );
     }
 
-    fn immutable_assignment(&mut self, name: String, span: Option<TextRange>) {
+    fn immutable_assignment(&mut self, name: &str, span: Option<TextRange>) {
         self.diagnostic(
             "E0031",
             format!("cannot assign to `{name}`, as it is not declared as mutable"),
@@ -469,7 +489,7 @@ impl Checker<'_> {
     }
 }
 
-pub(super) fn collect_pattern_bindings(
+pub fn collect_pattern_bindings(
     body: &Body,
     pat: PatId,
     bindings: &mut Vec<(PatternBindingId, bool)>,

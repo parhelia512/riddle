@@ -1,4 +1,21 @@
-use super::{document::*, scope::*, standard::*, token_stream::*, *};
+use super::{
+    AstNode, Diagnostic, ExpandedSource, HashMap, HashSet, MAX_DERIVE_EXPANSION_DEPTH,
+    ProcMacroDefinition, ProcMacroDiagnostic, ProcMacroExpansion, ProcMacroKind,
+    ProcMacroOccurrence, ProcMacroProvider, Range, STANDARD_DERIVE_MACROS,
+    STANDARD_FUNCTION_MACROS, STANDARD_MACRO_PACKAGE, Severity, StandardMacroProvider, SyntaxKind,
+    SyntaxNode, ast,
+    document::{
+        DocumentToken, ParsedDocument, TokenDocument, checked_output_span,
+        document_tokens_from_output, token_stream_from_document,
+    },
+    lexer,
+    scope::{
+        build_macro_reexports, collect_scoped_statements, diagnostic, parse_derive_invocations,
+        parse_derive_paths, parse_proc_macro_use_resolved, range,
+    },
+    standard::{expand_standard_derive_macro, expand_standard_print_macro},
+    token_stream::{ProcMacroDelimiter, ProcMacroTokenStream, ProcMacroTokenTree},
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct ImportedMacro {
@@ -64,6 +81,21 @@ enum ExpansionAction {
     },
 }
 
+struct ExpansionActionContext<'a> {
+    document: &'a mut TokenDocument,
+    parsed: &'a ParsedDocument,
+    provider: &'a mut dyn ProcMacroProvider,
+    source_len: usize,
+    output_depth: usize,
+    diagnostics: &'a mut Vec<Diagnostic>,
+}
+
+struct PreparedDeriveAction {
+    full_range: Range<usize>,
+    input: ProcMacroTokenStream,
+    imported: Vec<ImportedMacro>,
+}
+
 pub fn expand_source(source: &str, provider: &mut dyn ProcMacroProvider) -> ExpandedSource {
     let mut document = TokenDocument::from_source(source);
     let mut diagnostics = Vec::new();
@@ -108,47 +140,28 @@ pub fn expand_source(source: &str, provider: &mut dyn ProcMacroProvider) -> Expa
             continue;
         }
 
+        let context = ExpansionActionContext {
+            document: &mut document,
+            parsed: &parsed,
+            provider,
+            source_len: source.len(),
+            output_depth: depth + 1,
+            diagnostics: &mut diagnostics,
+        };
         let progressed = match action {
             ExpansionAction::Derive {
                 item,
                 attribute,
                 macros,
-            } => expand_derive_action(
-                &mut document,
-                &parsed,
-                item,
-                attribute,
-                &macros,
-                provider,
-                source.len(),
-                depth + 1,
-                &mut diagnostics,
-            ),
+            } => expand_derive_action(context, &item, &attribute, &macros),
             ExpansionAction::Attribute {
                 item,
                 attribute,
                 macros,
-            } => expand_attribute_action(
-                &mut document,
-                &parsed,
-                item,
-                attribute,
-                &macros,
-                provider,
-                source.len(),
-                depth + 1,
-                &mut diagnostics,
-            ),
-            ExpansionAction::FunctionLike { call, macros } => expand_function_action(
-                &mut document,
-                &parsed,
-                call,
-                &macros,
-                provider,
-                source.len(),
-                depth + 1,
-                &mut diagnostics,
-            ),
+            } => expand_attribute_action(context, &item, &attribute, &macros),
+            ExpansionAction::FunctionLike { call, macros } => {
+                expand_function_action(context, &call, &macros)
+            }
         };
         if !progressed {
             break;
@@ -254,7 +267,7 @@ fn next_expansion_action(
         .min_by_key(|action| action.range().start)
 }
 
-pub(super) fn is_attribute_item(kind: SyntaxKind) -> bool {
+pub(super) const fn is_attribute_item(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         SyntaxKind::FuncDecl
@@ -397,6 +410,11 @@ pub(super) fn collect_macro_occurrences(
         ));
     }
 
+    normalize_macro_occurrences(&mut occurrences);
+    occurrences
+}
+
+fn normalize_macro_occurrences(occurrences: &mut Vec<ProcMacroOccurrence>) {
     occurrences.sort_by_key(|occurrence| {
         (
             occurrence.range.start,
@@ -409,7 +427,6 @@ pub(super) fn collect_macro_occurrences(
             && left.kind == right.kind
             && left.is_declaration == right.is_declaration
     });
-    occurrences
 }
 
 pub(super) fn macro_occurrence(
@@ -905,97 +922,44 @@ pub(super) fn replacement_tokens(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn expand_derive_action(
-    document: &mut TokenDocument,
-    parsed: &ParsedDocument,
-    item: SyntaxNode,
-    attribute: ast::Attribute,
+fn expand_derive_action(
+    mut context: ExpansionActionContext<'_>,
+    item: &SyntaxNode,
+    attribute: &ast::Attribute,
     macros: &MacroScope,
-    provider: &mut dyn ProcMacroProvider,
-    source_len: usize,
-    output_depth: usize,
-    diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
     let call_range = range(attribute.syntax().text_range());
-    let call_site = document.origin_in(parsed, call_range.clone());
-    if !matches!(item.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl) {
-        diagnostics.push(diagnostic(
-            call_site,
-            "derive macros may only be applied to structs or enums".into(),
-            Severity::Error,
-        ));
-        erase_range(document, parsed, call_range, output_depth);
+    let call_site = context
+        .document
+        .origin_in(context.parsed, call_range.clone());
+    let Some(prepared) = prepare_derive_action(
+        &mut context,
+        item,
+        attribute,
+        macros,
+        &call_range,
+        &call_site,
+    ) else {
         return true;
-    }
-
-    let attrs = ast::attrs_for_node(&item);
-    let full_range = item_range_with_attrs(&item, &attrs);
-    let derive_ranges = attrs
-        .iter()
-        .filter(|attr| attr.name().is_some_and(|name| name.text() == "derive"))
-        .map(|attr| range(attr.syntax().text_range()))
-        .collect::<Vec<_>>();
-    let input_tokens = document.tokens_in_without(parsed, full_range.clone(), &derive_ranges);
-    let input = match token_stream_from_document(&input_tokens) {
-        Ok(input) => input,
-        Err(message) => {
-            diagnostics.push(diagnostic(call_site, message, Severity::Error));
-            erase_range(document, parsed, call_range, output_depth);
-            return true;
-        }
     };
-    let paths = match parse_derive_paths(&attribute.raw_text()) {
-        Ok(paths) => paths,
-        Err(message) => {
-            diagnostics.push(diagnostic(call_site, message, Severity::Error));
-            erase_range(document, parsed, call_range, output_depth);
-            return true;
-        }
-    };
-
-    let imported = paths
-        .into_iter()
-        .filter_map(|path| {
-            let path = match path {
-                DeriveMacroPath::Imported(name) => vec![name],
-                DeriveMacroPath::Qualified {
-                    package,
-                    macro_name,
-                } => vec![package, macro_name],
-            };
-            let imported = match resolve_macro(&path, ProcMacroKind::Derive, macros, provider) {
-                Ok(imported) => imported,
-                Err(message) => {
-                    diagnostics.push(diagnostic(call_site.clone(), message, Severity::Error));
-                    return None;
-                }
-            };
-            Some(imported)
-        })
-        .collect::<Vec<_>>();
-    let helpers = imported
-        .iter()
-        .flat_map(|imported| imported.helper_attributes.iter().cloned())
-        .collect::<HashSet<_>>();
-    if !validate_derive_helper_attributes(
+    let PreparedDeriveAction {
+        full_range,
+        input,
+        imported,
+    } = prepared;
+    let ExpansionActionContext {
         document,
         parsed,
-        &item,
-        &attrs,
-        &helpers,
-        macros,
         provider,
+        source_len,
+        output_depth,
         diagnostics,
-    ) {
-        erase_range(document, parsed, call_range, output_depth);
-        return true;
-    }
+    } = context;
 
     let mut generated = Vec::new();
     for imported in imported {
         let expansion = if imported.package == STANDARD_MACRO_PACKAGE {
-            match expand_standard_derive_macro(&imported.macro_name, &item, &call_site) {
+            match expand_standard_derive_macro(&imported.macro_name, item, &call_site) {
                 Ok(output) => Ok(ProcMacroExpansion {
                     output,
                     diagnostics: Vec::new(),
@@ -1012,55 +976,15 @@ pub(super) fn expand_derive_action(
                 call_site.clone(),
             )
         };
-        match expansion {
-            Ok(expansion) => {
-                let has_error = append_macro_diagnostics(
-                    diagnostics,
-                    expansion.diagnostics,
-                    &call_site,
-                    source_len,
-                );
-                if !has_error {
-                    match document_tokens_from_output(
-                        &expansion.output,
-                        &call_site,
-                        source_len,
-                        output_depth,
-                    ) {
-                        Ok(mut output) => {
-                            if let Err(message) = validate_item_output(
-                                &output,
-                                "derive macro output must contain only top-level items",
-                            ) {
-                                diagnostics.push(diagnostic(
-                                    call_site.clone(),
-                                    message,
-                                    Severity::Error,
-                                ));
-                                continue;
-                            }
-                            if !generated.is_empty() && !output.is_empty() {
-                                generated.push(space_token(call_site.clone(), output_depth));
-                            }
-                            generated.append(&mut output);
-                        }
-                        Err(message) => diagnostics.push(diagnostic(
-                            call_site.clone(),
-                            message,
-                            Severity::Error,
-                        )),
-                    }
-                }
-            }
-            Err(message) => diagnostics.push(diagnostic(
-                call_site.clone(),
-                format!(
-                    "failed to expand {}::{}: {message}",
-                    imported.package, imported.macro_name
-                ),
-                Severity::Error,
-            )),
-        }
+        append_derive_expansion(
+            expansion,
+            &imported,
+            &call_site,
+            source_len,
+            output_depth,
+            diagnostics,
+            &mut generated,
+        );
     }
 
     let mut replacement = document.tokens_in_replacing(
@@ -1084,18 +1008,179 @@ pub(super) fn expand_derive_action(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn expand_attribute_action(
-    document: &mut TokenDocument,
-    parsed: &ParsedDocument,
-    item: SyntaxNode,
-    attribute: ast::Attribute,
-    macros: &MacroScope,
-    provider: &mut dyn ProcMacroProvider,
+fn append_derive_expansion(
+    expansion: Result<ProcMacroExpansion, String>,
+    imported: &ImportedMacro,
+    call_site: &Range<usize>,
     source_len: usize,
     output_depth: usize,
     diagnostics: &mut Vec<Diagnostic>,
+    generated: &mut Vec<DocumentToken>,
+) {
+    let expansion = match expansion {
+        Ok(expansion) => expansion,
+        Err(message) => {
+            diagnostics.push(diagnostic(
+                call_site.clone(),
+                format!(
+                    "failed to expand {}::{}: {message}",
+                    imported.package, imported.macro_name
+                ),
+                Severity::Error,
+            ));
+            return;
+        }
+    };
+    if append_macro_diagnostics(diagnostics, expansion.diagnostics, call_site, source_len) {
+        return;
+    }
+    let mut output =
+        match document_tokens_from_output(&expansion.output, call_site, source_len, output_depth) {
+            Ok(output) => output,
+            Err(message) => {
+                diagnostics.push(diagnostic(call_site.clone(), message, Severity::Error));
+                return;
+            }
+        };
+    if let Err(message) = validate_item_output(
+        &output,
+        "derive macro output must contain only top-level items",
+    ) {
+        diagnostics.push(diagnostic(call_site.clone(), message, Severity::Error));
+        return;
+    }
+    if !generated.is_empty() && !output.is_empty() {
+        generated.push(space_token(call_site.clone(), output_depth));
+    }
+    generated.append(&mut output);
+}
+
+fn prepare_derive_action(
+    context: &mut ExpansionActionContext<'_>,
+    item: &SyntaxNode,
+    attribute: &ast::Attribute,
+    macros: &MacroScope,
+    call_range: &Range<usize>,
+    call_site: &Range<usize>,
+) -> Option<PreparedDeriveAction> {
+    if !matches!(item.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl) {
+        context.diagnostics.push(diagnostic(
+            call_site.clone(),
+            "derive macros may only be applied to structs or enums".into(),
+            Severity::Error,
+        ));
+        erase_range(
+            context.document,
+            context.parsed,
+            call_range.clone(),
+            context.output_depth,
+        );
+        return None;
+    }
+
+    let attrs = ast::attrs_for_node(item);
+    let full_range = item_range_with_attrs(item, &attrs);
+    let derive_ranges = attrs
+        .iter()
+        .filter(|attr| attr.name().is_some_and(|name| name.text() == "derive"))
+        .map(|attr| range(attr.syntax().text_range()))
+        .collect::<Vec<_>>();
+    let input_tokens =
+        context
+            .document
+            .tokens_in_without(context.parsed, full_range.clone(), &derive_ranges);
+    let input = match token_stream_from_document(&input_tokens) {
+        Ok(input) => input,
+        Err(message) => {
+            context
+                .diagnostics
+                .push(diagnostic(call_site.clone(), message, Severity::Error));
+            erase_range(
+                context.document,
+                context.parsed,
+                call_range.clone(),
+                context.output_depth,
+            );
+            return None;
+        }
+    };
+    let paths = match parse_derive_paths(&attribute.raw_text()) {
+        Ok(paths) => paths,
+        Err(message) => {
+            context
+                .diagnostics
+                .push(diagnostic(call_site.clone(), message, Severity::Error));
+            erase_range(
+                context.document,
+                context.parsed,
+                call_range.clone(),
+                context.output_depth,
+            );
+            return None;
+        }
+    };
+
+    let mut imported = Vec::new();
+    for path in paths {
+        let path = match path {
+            DeriveMacroPath::Imported(name) => vec![name],
+            DeriveMacroPath::Qualified {
+                package,
+                macro_name,
+            } => vec![package, macro_name],
+        };
+        match resolve_macro(&path, ProcMacroKind::Derive, macros, context.provider) {
+            Ok(resolved) => imported.push(resolved),
+            Err(message) => {
+                context
+                    .diagnostics
+                    .push(diagnostic(call_site.clone(), message, Severity::Error));
+            }
+        }
+    }
+    let helpers = imported
+        .iter()
+        .flat_map(|imported| imported.helper_attributes.iter().cloned())
+        .collect::<HashSet<_>>();
+    if !validate_derive_helper_attributes(
+        context.document,
+        context.parsed,
+        item,
+        &attrs,
+        &helpers,
+        macros,
+        context.provider,
+        context.diagnostics,
+    ) {
+        erase_range(
+            context.document,
+            context.parsed,
+            call_range.clone(),
+            context.output_depth,
+        );
+        return None;
+    }
+    Some(PreparedDeriveAction {
+        full_range,
+        input,
+        imported,
+    })
+}
+
+fn expand_attribute_action(
+    context: ExpansionActionContext<'_>,
+    item: &SyntaxNode,
+    attribute: &ast::Attribute,
+    macros: &MacroScope,
 ) -> bool {
+    let ExpansionActionContext {
+        document,
+        parsed,
+        provider,
+        source_len,
+        output_depth,
+        diagnostics,
+    } = context;
     let attribute_range = range(attribute.syntax().text_range());
     let call_site = document.origin_in(parsed, attribute_range.clone());
     let (path, args) = match parse_attribute_invocation(&attribute.raw_text()) {
@@ -1114,8 +1199,8 @@ pub(super) fn expand_attribute_action(
             return true;
         }
     };
-    let attrs = ast::attrs_for_node(&item);
-    let full_range = item_range_with_attrs(&item, &attrs);
+    let attrs = ast::attrs_for_node(item);
+    let full_range = item_range_with_attrs(item, &attrs);
     let item_tokens = document.tokens_in_without(
         parsed,
         full_range.clone(),
@@ -1186,17 +1271,19 @@ pub(super) fn expand_attribute_action(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn expand_function_action(
-    document: &mut TokenDocument,
-    parsed: &ParsedDocument,
-    call: ast::MacroCall,
+fn expand_function_action(
+    context: ExpansionActionContext<'_>,
+    call: &ast::MacroCall,
     macros: &MacroScope,
-    provider: &mut dyn ProcMacroProvider,
-    source_len: usize,
-    output_depth: usize,
-    diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
+    let ExpansionActionContext {
+        document,
+        parsed,
+        provider,
+        source_len,
+        output_depth,
+        diagnostics,
+    } = context;
     let call_range = range(call.syntax().text_range());
     let call_site = document.origin_in(parsed, call_range.clone());
     let path = call
@@ -1270,8 +1357,28 @@ pub(super) fn expand_function_action(
         erased_token(document, parsed, call_range.clone(), output_depth),
     );
 
+    replace_function_output(
+        document,
+        parsed,
+        call,
+        call_range,
+        replacement,
+        call_site,
+        diagnostics,
+    )
+}
+
+fn replace_function_output(
+    document: &mut TokenDocument,
+    parsed: &ParsedDocument,
+    call: &ast::MacroCall,
+    call_range: Range<usize>,
+    replacement: Vec<DocumentToken>,
+    call_site: Range<usize>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
     let mut candidate = document.clone();
-    candidate.replace(parsed, call_range.clone(), replacement.clone());
+    candidate.replace(parsed, call_range, replacement.clone());
     if candidate.parse().parse.errors.is_empty() {
         *document = candidate;
         return true;
@@ -1294,287 +1401,4 @@ pub(super) fn expand_function_action(
         Severity::Error,
     ));
     false
-}
-
-#[allow(dead_code)]
-pub(super) fn expand_source_legacy(
-    source: &str,
-    provider: &mut dyn ProcMacroProvider,
-) -> ExpandedSource {
-    expand_source_at_depth(source, provider, 0, &MacroScope::default())
-}
-
-pub(super) fn expand_source_at_depth(
-    source: &str,
-    provider: &mut dyn ProcMacroProvider,
-    depth: usize,
-    inherited_macros: &MacroScope,
-) -> ExpandedSource {
-    let mut parser = IncrementalParser::new();
-    let parse = parser.set_source(source);
-    if !parse.errors.is_empty() {
-        return ExpandedSource {
-            source: source.into(),
-            ..ExpandedSource::default()
-        };
-    }
-
-    let root = ast::Root::cast(parse.syntax()).expect("parsed root should be a root node");
-    let mut insertions = Vec::new();
-    let mut diagnostics = Vec::new();
-
-    let mut statements = Vec::new();
-    let mut erased_imports = Vec::new();
-    collect_scoped_statements(
-        root.stmts().collect(),
-        inherited_macros,
-        provider,
-        None,
-        &[],
-        &mut statements,
-        &mut erased_imports,
-        &mut diagnostics,
-    );
-    for ScopedStatement {
-        statement: stmt,
-        macros,
-    } in statements
-    {
-        let attrs = ast::attrs_for_node(stmt.syntax());
-        let derive_attrs = attrs
-            .iter()
-            .filter(|attr| attr.name().is_some_and(|name| name.text() == "derive"))
-            .collect::<Vec<_>>();
-        if derive_attrs.is_empty() {
-            continue;
-        }
-        let insertion_call_site = range(derive_attrs[0].syntax().text_range());
-        if !matches!(&stmt, ast::Stmt::StructDecl(_) | ast::Stmt::EnumDecl(_)) {
-            diagnostics.push(diagnostic(
-                insertion_call_site,
-                "derive macros may only be applied to structs or enums".into(),
-                Severity::Error,
-            ));
-            continue;
-        }
-
-        let mut input = ProcMacroTokenStream::default();
-        let mut input_error = None;
-        for attr in &attrs {
-            if attr.name().is_some_and(|name| name.text() != "derive") {
-                let attr_range = range(attr.syntax().text_range());
-                match ProcMacroTokenStream::from_source(
-                    &source[attr_range.clone()],
-                    attr_range.start,
-                ) {
-                    Ok(tokens) => input.extend(tokens),
-                    Err(message) => input_error = Some(message),
-                }
-            }
-        }
-        let item_range = range(stmt.syntax().text_range());
-        match ProcMacroTokenStream::from_source(&source[item_range.clone()], item_range.start) {
-            Ok(tokens) => input.extend(tokens),
-            Err(message) => input_error = Some(message),
-        }
-        if let Some(message) = input_error {
-            diagnostics.push(diagnostic(
-                insertion_call_site,
-                format!("failed to tokenize derive input: {message}"),
-                Severity::Error,
-            ));
-            continue;
-        }
-
-        let mut generated = String::new();
-        let mut generated_spans = Vec::new();
-        for attr in derive_attrs {
-            let call_site = range(attr.syntax().text_range());
-            let paths = match parse_derive_paths(&attr.raw_text()) {
-                Ok(paths) => paths,
-                Err(message) => {
-                    diagnostics.push(diagnostic(call_site.clone(), message, Severity::Error));
-                    continue;
-                }
-            };
-            for path in paths {
-                let (package, macro_name) = match path {
-                    DeriveMacroPath::Qualified {
-                        package,
-                        macro_name,
-                    } => (package, macro_name),
-                    DeriveMacroPath::Imported(local_name) => {
-                        let Some(imported) = macros.get(&local_name) else {
-                            diagnostics.push(diagnostic(
-                                call_site.clone(),
-                                format!(
-                                    "cannot find derive macro `{local_name}` in this scope; import it with `use package::{local_name};`"
-                                ),
-                                Severity::Error,
-                            ));
-                            continue;
-                        };
-                        if imported.kind != ProcMacroKind::Derive {
-                            diagnostics.push(diagnostic(
-                                call_site.clone(),
-                                format!("`{local_name}` is not a derive macro"),
-                                Severity::Error,
-                            ));
-                            continue;
-                        }
-                        (imported.package.clone(), imported.macro_name.clone())
-                    }
-                };
-                if depth >= MAX_DERIVE_EXPANSION_DEPTH {
-                    diagnostics.push(diagnostic(
-                        call_site.clone(),
-                        format!(
-                            "derive expansion exceeded the maximum depth of {MAX_DERIVE_EXPANSION_DEPTH}"
-                        ),
-                        Severity::Error,
-                    ));
-                    continue;
-                }
-                match provider.expand(
-                    &package,
-                    &macro_name,
-                    ProcMacroKind::Derive,
-                    &input,
-                    None,
-                    call_site.clone(),
-                ) {
-                    Ok(expansion) => {
-                        let has_error = expansion
-                            .diagnostics
-                            .iter()
-                            .any(|diagnostic| diagnostic.severity == Severity::Error);
-                        diagnostics.extend(expansion.diagnostics.into_iter().map(|d| {
-                            let span = if valid_span(&d.span, source.len()) {
-                                d.span
-                            } else {
-                                call_site.clone()
-                            };
-                            diagnostic(span, d.message, d.severity)
-                        }));
-                        if !expansion.output.is_empty() && !has_error {
-                            let mut rendered = expansion.output.render();
-                            if let Some(message) = validate_output(&rendered.source) {
-                                diagnostics.push(diagnostic(
-                                    call_site.clone(),
-                                    message,
-                                    Severity::Error,
-                                ));
-                            } else {
-                                let nested = expand_source_at_depth(
-                                    &rendered.source,
-                                    provider,
-                                    depth + 1,
-                                    &macros,
-                                );
-                                let nested_has_error = nested
-                                    .diagnostics
-                                    .iter()
-                                    .any(|diagnostic| diagnostic.severity == Severity::Error);
-                                diagnostics.extend(nested.diagnostics.into_iter().map(|inner| {
-                                    let span = rendered_span_for_diagnostic(&rendered, &inner)
-                                        .unwrap_or_else(|| call_site.clone());
-                                    diagnostic(span, inner.message, inner.severity)
-                                }));
-                                if nested_has_error {
-                                    continue;
-                                }
-                                shift_rendered_spans(&mut rendered.spans, &nested.insertions);
-                                rendered.source = nested.source;
-                                if !generated.is_empty() {
-                                    generated.push('\n');
-                                }
-                                let output_start = generated.len();
-                                generated_spans.extend(rendered.spans.into_iter().map(|span| {
-                                    GeneratedSpanMapping {
-                                        generated: span.generated.start + output_start
-                                            ..span.generated.end + output_start,
-                                        original: span.original,
-                                    }
-                                }));
-                                generated.push_str(&rendered.source);
-                            }
-                        }
-                    }
-                    Err(message) => diagnostics.push(diagnostic(
-                        call_site.clone(),
-                        format!("failed to expand `{package}::{macro_name}`: {message}"),
-                        Severity::Error,
-                    )),
-                }
-            }
-        }
-
-        if !generated.is_empty() {
-            for span in &mut generated_spans {
-                span.generated.start += 1;
-                span.generated.end += 1;
-            }
-            insertions.push(GeneratedInsertion {
-                at: usize::from(stmt.syntax().text_range().end()),
-                text: format!("\n{generated}\n"),
-                call_site: insertion_call_site,
-                spans: generated_spans,
-            });
-        }
-    }
-
-    insertions.sort_by_key(|insertion| insertion.at);
-    let source_without_macro_imports = erase_imports(source, &erased_imports);
-    let mut expanded = String::with_capacity(source.len());
-    let mut cursor = 0usize;
-    for insertion in &insertions {
-        expanded.push_str(&source_without_macro_imports[cursor..insertion.at]);
-        expanded.push_str(&insertion.text);
-        cursor = insertion.at;
-    }
-    expanded.push_str(&source_without_macro_imports[cursor..]);
-
-    ExpandedSource {
-        source: expanded,
-        parse: None,
-        mappings: Vec::new(),
-        insertions,
-        macro_occurrences: Vec::new(),
-        diagnostics,
-    }
-}
-
-pub(super) fn rendered_span_for_diagnostic(
-    rendered: &RenderedTokenStream,
-    diagnostic: &Diagnostic,
-) -> Option<Range<usize>> {
-    let label = diagnostic.labels.first()?;
-    let start = usize::from(label.range.start());
-    let end = usize::from(label.range.end());
-    rendered
-        .spans
-        .iter()
-        .filter(|span| span.generated.start <= start && end <= span.generated.end)
-        .min_by_key(|span| span.generated.len())
-        .map(|span| span.original.clone())
-}
-
-pub(super) fn shift_rendered_spans(
-    spans: &mut [RenderedTokenSpan],
-    insertions: &[GeneratedInsertion],
-) {
-    for span in spans {
-        let start_shift = insertions
-            .iter()
-            .filter(|insertion| insertion.at <= span.generated.start)
-            .map(|insertion| insertion.text.len())
-            .sum::<usize>();
-        let end_shift = insertions
-            .iter()
-            .filter(|insertion| insertion.at < span.generated.end)
-            .map(|insertion| insertion.text.len())
-            .sum::<usize>();
-        span.generated.start += start_shift;
-        span.generated.end += end_shift;
-    }
 }

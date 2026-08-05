@@ -33,22 +33,22 @@ pub enum Type {
     Char,
     Unit,
     Never,
-    Ref(Box<Type>, bool), // (inner, mutable)
+    Ref(Box<Self>, bool), // (inner, mutable)
     /// Raw pointer type: `*const T` or `*mut T`.
     Ptr {
         mutable: bool,
-        inner: Box<Type>,
+        inner: Box<Self>,
     },
-    Tuple(Vec<Type>),
-    Slice(Box<Type>),
-    Array(Box<Type>, ConstArg),
-    Struct(StructId, Vec<Type>),
-    Enum(EnumId, Vec<Type>),
+    Tuple(Vec<Self>),
+    Slice(Box<Self>),
+    Array(Box<Self>, ConstArg),
+    Struct(StructId, Vec<Self>),
+    Enum(EnumId, Vec<Self>),
     Param(String),
     Const(ConstArg),
     FunctionItem {
         function: FunctionId,
-        args: Vec<Type>,
+        args: Vec<Self>,
     },
     Closure {
         id: ClosureId,
@@ -100,14 +100,16 @@ pub enum ClosureKind {
 }
 
 impl ClosureKind {
-    pub fn accepts(self, actual: Self) -> bool {
+    #[must_use]
+    pub const fn accepts(self, actual: Self) -> bool {
         matches!(
             (self, actual),
             (Self::FnOnce, _) | (Self::FnMut, Self::Fn | Self::FnMut) | (Self::Fn, Self::Fn)
         )
     }
 
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Fn => "Fn",
             Self::FnMut => "FnMut",
@@ -117,26 +119,27 @@ impl ClosureKind {
 }
 
 impl Type {
+    #[must_use]
     pub fn display(&self, hir: &HirFile) -> String {
         match self {
-            Type::Int(ty) => ty.as_str().to_string(),
-            Type::Float(ty) => ty.as_str().to_string(),
-            Type::InferInt => "i32".to_string(),
-            Type::InferFloat => "f64".to_string(),
-            Type::Bool => "bool".to_string(),
-            Type::Str => "str".to_string(),
-            Type::Char => "char".to_string(),
-            Type::Unit => "()".to_string(),
-            Type::Never => "!".to_string(),
-            Type::Ref(inner, mutable) => {
+            Self::Int(ty) => ty.as_str().to_string(),
+            Self::Float(ty) => ty.as_str().to_string(),
+            Self::InferInt => "i32".to_string(),
+            Self::InferFloat => "f64".to_string(),
+            Self::Bool => "bool".to_string(),
+            Self::Str => "str".to_string(),
+            Self::Char => "char".to_string(),
+            Self::Unit => "()".to_string(),
+            Self::Never => "!".to_string(),
+            Self::Ref(inner, mutable) => {
                 let kw = if *mutable { "&mut " } else { "&" };
                 format!("{}{}", kw, inner.display(hir))
             }
-            Type::Ptr { mutable, inner } => {
+            Self::Ptr { mutable, inner } => {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", inner.display(hir))
             }
-            Type::Tuple(elements) => {
+            Self::Tuple(elements) => {
                 let inner = elements
                     .iter()
                     .map(|ty| ty.display(hir))
@@ -144,9 +147,9 @@ impl Type {
                     .join(", ");
                 format!("({inner})")
             }
-            Type::Slice(inner) => format!("[{}]", inner.display(hir)),
-            Type::Array(inner, len) => format!("[{}; {}]", inner.display(hir), len.display()),
-            Type::Struct(id, args) => {
+            Self::Slice(inner) => format!("[{}]", inner.display(hir)),
+            Self::Array(inner, len) => format!("[{}; {}]", inner.display(hir), len.display()),
+            Self::Struct(id, args) => {
                 let HirStruct { name, .. } = &hir.item_tree.structs[*id];
                 if args.is_empty() {
                     name.0.clone()
@@ -159,7 +162,7 @@ impl Type {
                     format!("{}<{}>", name.0, args)
                 }
             }
-            Type::Enum(id, args) => {
+            Self::Enum(id, args) => {
                 let enum_data = &hir.item_tree.enums[*id];
                 if args.is_empty() {
                     enum_data.name.0.clone()
@@ -172,136 +175,146 @@ impl Type {
                     format!("{}<{}>", enum_data.name.0, args)
                 }
             }
-            Type::FunctionItem { function: id, .. } => {
+            Self::FunctionItem { function: id, .. } => {
                 let function = &hir.item_tree.functions[*id];
                 let prefix = if function.is_unsafe { "unsafe " } else { "" };
                 format!("{prefix}fun {}", function.name.0)
             }
-            Type::Closure { signature, .. } => {
+            Self::Closure { signature, .. } => {
                 format_callable_signature(signature, "anonymous ", hir)
             }
-            Type::OpaqueCallable { signature, .. } => {
+            Self::OpaqueCallable { signature, .. } => {
                 format_callable_signature(signature, "impl ", hir)
             }
-            Type::CallableConstraint(signature) => format_callable_signature(signature, "", hir),
-            Type::InferVar(_) => "_".to_string(),
-            Type::Param(name) => name.clone(),
-            Type::Const(value) => value.display(),
-            Type::Unknown => "_".to_string(),
-            Type::Error => "<error>".to_string(),
+            Self::CallableConstraint(signature) => format_callable_signature(signature, "", hir),
+            Self::InferVar(_) | Self::Unknown => "_".to_string(),
+            Self::Param(name) => name.clone(),
+            Self::Const(value) => value.display(),
+            Self::Error => "<error>".to_string(),
         }
     }
 
-    pub fn is_unknown_like(&self) -> bool {
-        matches!(self, Type::Unknown | Type::Error | Type::InferVar(_))
+    #[must_use]
+    pub const fn is_unknown_like(&self) -> bool {
+        matches!(self, Self::Unknown | Self::Error | Self::InferVar(_))
     }
 
-    pub fn is_numeric(&self) -> bool {
+    #[must_use]
+    pub const fn is_numeric(&self) -> bool {
         matches!(
             self,
-            Type::Int(_) | Type::Float(_) | Type::InferInt | Type::InferFloat
+            Self::Int(_) | Self::Float(_) | Self::InferInt | Self::InferFloat
         )
     }
 
-    pub fn is_integer(&self) -> bool {
-        matches!(self, Type::Int(_) | Type::InferInt)
+    #[must_use]
+    pub const fn is_integer(&self) -> bool {
+        matches!(self, Self::Int(_) | Self::InferInt)
     }
 
-    pub fn is_bitwise_scalar(&self) -> bool {
-        self.is_integer() || matches!(self, Type::Bool)
+    #[must_use]
+    pub const fn is_bitwise_scalar(&self) -> bool {
+        self.is_integer() || matches!(self, Self::Bool)
     }
 
-    pub fn is_ordered_scalar(&self) -> bool {
-        self.is_numeric() || matches!(self, Type::Char)
+    #[must_use]
+    pub const fn is_ordered_scalar(&self) -> bool {
+        self.is_numeric() || matches!(self, Self::Char)
     }
 
-    pub fn is_never(&self) -> bool {
-        matches!(self, Type::Never)
+    #[must_use]
+    pub const fn is_never(&self) -> bool {
+        matches!(self, Self::Never)
     }
 
     /// Returns `true` if this type has a known size at compile time.
     /// Unsized types (`str` and `[T]`) can only exist behind a pointer/reference.
     pub fn is_sized(&self) -> bool {
         match self {
-            Type::Str | Type::Slice(_) => false,
-            Type::Tuple(elements) => elements.iter().all(Type::is_sized),
-            Type::Array(inner, _) => inner.is_sized(),
-            Type::Struct(_, args) | Type::Enum(_, args) => args.iter().all(Type::is_sized),
-            Type::CallableConstraint(signature)
-            | Type::Closure { signature, .. }
-            | Type::OpaqueCallable { signature, .. } => {
-                signature.params.iter().all(Type::is_sized) && signature.ret.is_sized()
+            Self::Str | Self::Slice(_) => false,
+            Self::Tuple(elements) => elements.iter().all(Self::is_sized),
+            Self::Array(inner, _) => inner.is_sized(),
+            Self::Struct(_, args) | Self::Enum(_, args) | Self::FunctionItem { args, .. } => {
+                args.iter().all(Self::is_sized)
             }
-            Type::FunctionItem { args, .. } => args.iter().all(Type::is_sized),
+            Self::CallableConstraint(signature)
+            | Self::Closure { signature, .. }
+            | Self::OpaqueCallable { signature, .. } => {
+                signature.params.iter().all(Self::is_sized) && signature.ret.is_sized()
+            }
             _ => true,
         }
     }
 
     pub fn is_valid_value_type(&self) -> bool {
         match self {
-            Type::Str | Type::Slice(_) => false,
-            Type::Ref(inner, _) | Type::Ptr { inner, .. } => {
-                matches!(inner.as_ref(), Type::Str | Type::Slice(_)) || inner.is_valid_value_type()
+            Self::Str | Self::Slice(_) => false,
+            Self::Ref(inner, _) | Self::Ptr { inner, .. } => {
+                matches!(inner.as_ref(), Self::Str | Self::Slice(_)) || inner.is_valid_value_type()
             }
-            Type::Tuple(elements) => elements.iter().all(Type::is_valid_value_type),
-            Type::Array(inner, _) => inner.is_valid_value_type(),
-            Type::Struct(_, args) | Type::Enum(_, args) => {
-                args.iter().all(Type::is_valid_value_type)
+            Self::Tuple(elements) => elements.iter().all(Self::is_valid_value_type),
+            Self::Array(inner, _) => inner.is_valid_value_type(),
+            Self::Struct(_, args) | Self::Enum(_, args) => {
+                args.iter().all(Self::is_valid_value_type)
             }
-            Type::CallableConstraint(signature)
-            | Type::Closure { signature, .. }
-            | Type::OpaqueCallable { signature, .. } => {
-                signature.params.iter().all(Type::is_valid_value_type)
+            Self::CallableConstraint(signature)
+            | Self::Closure { signature, .. }
+            | Self::OpaqueCallable { signature, .. } => {
+                signature.params.iter().all(Self::is_valid_value_type)
                     && signature.ret.is_valid_value_type()
             }
-            Type::FunctionItem { args, .. } => args.iter().all(Type::is_valid_value_type),
+            Self::FunctionItem { args, .. } => args.iter().all(Self::is_valid_value_type),
             _ => true,
         }
     }
 
     /// Compiler-intrinsic `Copy` candidates – types that are `Copy`
     /// regardless of whether a `Copy` trait is defined.
-    pub fn is_fundamentally_copy(&self) -> bool {
+    #[must_use]
+    pub const fn is_fundamentally_copy(&self) -> bool {
         matches!(
             self,
-            Type::Int(_)
-                | Type::Float(_)
-                | Type::InferInt
-                | Type::InferFloat
-                | Type::Bool
-                | Type::Char
-                | Type::Unit
-                | Type::Never
-                | Type::Ref(_, false)
-                | Type::Ptr { .. }
-                | Type::FunctionItem { .. }
-                | Type::InferVar(_)
-                | Type::Unknown
-                | Type::Error
+            Self::Int(_)
+                | Self::Float(_)
+                | Self::InferInt
+                | Self::InferFloat
+                | Self::Bool
+                | Self::Char
+                | Self::Unit
+                | Self::Never
+                | Self::Ref(_, false)
+                | Self::Ptr { .. }
+                | Self::FunctionItem { .. }
+                | Self::InferVar(_)
+                | Self::Unknown
+                | Self::Error
         )
     }
 
-    pub fn closure_kind(&self) -> Option<ClosureKind> {
+    #[must_use]
+    pub const fn closure_kind(&self) -> Option<ClosureKind> {
         match self {
-            Type::CallableConstraint(signature) => Some(signature.kind),
-            Type::Closure { signature, .. } | Type::OpaqueCallable { signature, .. } => {
+            Self::CallableConstraint(signature) => Some(signature.kind),
+            Self::Closure { signature, .. } | Self::OpaqueCallable { signature, .. } => {
                 Some(signature.kind)
             }
-            Type::FunctionItem { .. } => Some(ClosureKind::Fn),
+            Self::FunctionItem { .. } => Some(ClosureKind::Fn),
             _ => None,
         }
     }
 
-    pub fn callable_signature(&self) -> Option<&CallableSignature> {
+    #[must_use]
+    pub const fn callable_signature(&self) -> Option<&CallableSignature> {
         match self {
-            Type::CallableConstraint(signature)
-            | Type::Closure { signature, .. }
-            | Type::OpaqueCallable { signature, .. } => Some(signature),
+            Self::CallableConstraint(signature)
+            | Self::Closure { signature, .. }
+            | Self::OpaqueCallable { signature, .. } => Some(signature),
             _ => None,
         }
     }
 
-    pub fn or(self, fallback: Type) -> Type {
+    #[must_use]
+    pub fn or(self, fallback: Self) -> Self {
         if self.is_unknown_like() {
             fallback
         } else {
@@ -325,28 +338,32 @@ fn format_callable_signature(signature: &CallableSignature, prefix: &str, hir: &
 }
 
 impl ConstArg {
+    #[must_use]
     pub fn display(&self) -> String {
         match self {
-            ConstArg::Value(value) => value.to_string(),
-            ConstArg::Param(name) => name.clone(),
-            ConstArg::Unknown => "_".to_string(),
-            ConstArg::Error => "<error>".to_string(),
+            Self::Value(value) => value.to_string(),
+            Self::Param(name) => name.clone(),
+            Self::Unknown => "_".to_string(),
+            Self::Error => "<error>".to_string(),
         }
     }
 
-    pub fn as_usize(&self) -> Option<usize> {
+    #[must_use]
+    pub const fn as_usize(&self) -> Option<usize> {
         match self {
-            ConstArg::Value(value) => Some(*value),
+            Self::Value(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub fn is_unknown_like(&self) -> bool {
-        matches!(self, ConstArg::Unknown | ConstArg::Error)
+    #[must_use]
+    pub const fn is_unknown_like(&self) -> bool {
+        matches!(self, Self::Unknown | Self::Error)
     }
 }
 
 impl IntTy {
+    #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "i8" => Some(Self::I8),
@@ -363,7 +380,8 @@ impl IntTy {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::I8 => "i8",
             Self::I16 => "i16",
@@ -378,13 +396,14 @@ impl IntTy {
         }
     }
 
+    #[must_use]
     pub fn contains_u64(self, value: u64) -> bool {
         match self {
-            Self::I8 => value <= i8::MAX as u64,
-            Self::I16 => value <= i16::MAX as u64,
-            Self::I32 => value <= i32::MAX as u64,
-            Self::I64 => value <= i64::MAX as u64,
-            Self::Isize => value <= isize::MAX as u64,
+            Self::I8 => i8::try_from(value).is_ok(),
+            Self::I16 => i16::try_from(value).is_ok(),
+            Self::I32 => i32::try_from(value).is_ok(),
+            Self::I64 => i64::try_from(value).is_ok(),
+            Self::Isize => isize::try_from(value).is_ok(),
             Self::U8 => u8::try_from(value).is_ok(),
             Self::U16 => u16::try_from(value).is_ok(),
             Self::U32 => u32::try_from(value).is_ok(),
@@ -393,7 +412,8 @@ impl IntTy {
         }
     }
 
-    pub fn contains_negative_magnitude(self, value: u64) -> bool {
+    #[must_use]
+    pub const fn contains_negative_magnitude(self, value: u64) -> bool {
         match self {
             Self::I8 => value <= (i8::MAX as u64) + 1,
             Self::I16 => value <= (i16::MAX as u64) + 1,
@@ -406,6 +426,7 @@ impl IntTy {
 }
 
 impl FloatTy {
+    #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "f32" => Some(Self::F32),
@@ -414,7 +435,8 @@ impl FloatTy {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::F32 => "f32",
             Self::F64 => "f64",

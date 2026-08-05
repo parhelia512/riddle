@@ -14,21 +14,18 @@ fn display_const_int() {
     builder.set_return(None);
 
     let module = make_module(func);
-    let output = format!("{}", module);
+    let output = format!("{module}");
     assert!(
         output.contains("iconst"),
-        "output should contain 'iconst': {}",
-        output
+        "output should contain 'iconst': {output}"
     );
     assert!(
         output.contains("42"),
-        "output should contain '42': {}",
-        output
+        "output should contain '42': {output}"
     );
     assert!(
         output.contains("return"),
-        "output should contain 'return': {}",
-        output
+        "output should contain 'return': {output}"
     );
 }
 
@@ -42,11 +39,10 @@ fn display_binop() {
     builder.set_return(None);
 
     let module = make_module(func);
-    let output = format!("{}", module);
+    let output = format!("{module}");
     assert!(
         output.contains("Add"),
-        "output should contain 'Add': {}",
-        output
+        "output should contain 'Add': {output}"
     );
 }
 
@@ -57,11 +53,10 @@ fn display_function_name() {
     builder.set_return(None);
 
     let module = make_module(func);
-    let output = format!("{}", module);
+    let output = format!("{module}");
     assert!(
         output.contains("my_func"),
-        "output should contain function name: {}",
-        output
+        "output should contain function name: {output}"
     );
 }
 
@@ -77,16 +72,14 @@ fn display_block_labels() {
     builder.set_cond_branch(Value(0), then_block, else_block);
 
     let module = make_module(func);
-    let output = format!("{}", module);
+    let output = format!("{module}");
     assert!(
         output.contains("block_then"),
-        "output should contain 'block_then': {}",
-        output
+        "output should contain 'block_then': {output}"
     );
     assert!(
         output.contains("block_else"),
-        "output should contain 'block_else': {}",
-        output
+        "output should contain 'block_else': {output}"
     );
 }
 
@@ -98,11 +91,10 @@ fn display_heap_alloc() {
     builder.set_return(None);
 
     let module = make_module(func);
-    let output = format!("{}", module);
+    let output = format!("{module}");
     assert!(
         output.contains("heap_alloc"),
-        "output should contain 'heap_alloc': {}",
-        output
+        "output should contain 'heap_alloc': {output}"
     );
 }
 
@@ -125,11 +117,10 @@ fn display_phi_node() {
     func.set_terminator(func.entry, Terminator::Branch(merge_block));
 
     let module = make_module(func);
-    let output = format!("{}", module);
+    let output = format!("{module}");
     assert!(
         output.contains("phi"),
-        "output should contain 'phi': {}",
-        output
+        "output should contain 'phi': {output}"
     );
 }
 

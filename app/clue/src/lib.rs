@@ -7,6 +7,7 @@ mod target;
 use anyhow::bail;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::SystemTime;
@@ -42,14 +43,13 @@ struct CachedProject {
 }
 
 impl ProjectSession {
-    fn load(
+    fn load<S: BuildHasher>(
         &mut self,
         path: &Path,
-        overlays: &HashMap<PathBuf, String>,
+        overlays: &HashMap<PathBuf, String, S>,
     ) -> anyhow::Result<project::LoadedPackage> {
         let normalized_overlays = normalized_overlays(overlays);
-        let mut topology_changed = false;
-        if let Some(cached) = &self.cached {
+        let topology_changed = if let Some(cached) = &self.cached {
             let relevant_overlays =
                 relevant_overlays(&normalized_overlays, &cached.package.watched_files);
             if relevant_overlays == cached.overlays
@@ -57,8 +57,10 @@ impl ProjectSession {
             {
                 return Ok(cached.package.clone());
             }
-            topology_changed = relevant_overlays.keys().ne(cached.overlays.keys());
-        }
+            relevant_overlays.keys().ne(cached.overlays.keys())
+        } else {
+            false
+        };
 
         let package = project::load_with_overlays(path, overlays)?;
         if topology_changed {
@@ -73,11 +75,16 @@ impl ProjectSession {
         Ok(package)
     }
 
-    pub fn revision(&self) -> u64 {
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
         self.revision
     }
 
-    pub fn inputs_are_current(&self, overlays: &HashMap<PathBuf, String>) -> bool {
+    #[must_use]
+    pub fn inputs_are_current<S: BuildHasher>(
+        &self,
+        overlays: &HashMap<PathBuf, String, S>,
+    ) -> bool {
         let normalized_overlays = normalized_overlays(overlays);
         self.cached.as_ref().is_some_and(|cached| {
             relevant_overlays(&normalized_overlays, &cached.package.watched_files)
@@ -87,7 +94,9 @@ impl ProjectSession {
     }
 }
 
-fn normalized_overlays(overlays: &HashMap<PathBuf, String>) -> HashMap<PathBuf, String> {
+fn normalized_overlays<S: BuildHasher>(
+    overlays: &HashMap<PathBuf, String, S>,
+) -> HashMap<PathBuf, String> {
     overlays
         .iter()
         .map(|(path, source)| (normalized_path(path), source.clone()))
@@ -141,32 +150,52 @@ fn normalized_path(path: &Path) -> PathBuf {
     })
 }
 
-pub fn analyze_project(
+/// Analyzes a project using the default compiler options.
+///
+/// # Errors
+///
+/// Returns an error when the project cannot be loaded or process macros cannot be expanded.
+pub fn analyze_project<S: BuildHasher>(
     path: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
 ) -> anyhow::Result<ProjectAnalysis> {
     analyze_project_with_options(path, overlays, riddlec::pipeline::CompileOptions::default())
 }
 
-pub fn analyze_project_with_options(
+/// Analyzes a project using explicit compiler options.
+///
+/// # Errors
+///
+/// Returns an error when the project cannot be loaded or process macros cannot be expanded.
+pub fn analyze_project_with_options<S: BuildHasher>(
     path: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
     options: riddlec::pipeline::CompileOptions,
 ) -> anyhow::Result<ProjectAnalysis> {
     analyze_project_impl(path, overlays, options, true)
 }
 
-pub fn check_project_with_options(
+/// Checks a project without generating code.
+///
+/// # Errors
+///
+/// Returns an error when the project cannot be loaded or process macros cannot be expanded.
+pub fn check_project_with_options<S: BuildHasher>(
     path: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
     options: riddlec::pipeline::CompileOptions,
 ) -> anyhow::Result<ProjectAnalysis> {
     analyze_project_impl(path, overlays, options, false)
 }
 
-pub fn resolve_project_with_session(
+/// Resolves a project using an incremental session.
+///
+/// # Errors
+///
+/// Returns an error when project loading, macro expansion, or analysis fails.
+pub fn resolve_project_with_session<S: BuildHasher>(
     path: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
     options: riddlec::pipeline::CompileOptions,
     session: &mut ProjectSession,
 ) -> anyhow::Result<ProjectAnalysis> {
@@ -174,9 +203,14 @@ pub fn resolve_project_with_session(
         .ok_or_else(|| anyhow::anyhow!("project analysis cancelled"))
 }
 
-pub fn resolve_project_with_session_cancellable(
+/// Resolves a project using an incremental session and cancellation callback.
+///
+/// # Errors
+///
+/// Returns an error when project loading, macro expansion, or analysis fails.
+pub fn resolve_project_with_session_cancellable<S: BuildHasher>(
     path: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
     options: riddlec::pipeline::CompileOptions,
     session: &mut ProjectSession,
     cancelled: impl Fn() -> bool,
@@ -230,9 +264,14 @@ pub fn resolve_project_with_session_cancellable(
     }))
 }
 
-pub fn check_project_with_session(
+/// Checks a project using an incremental session.
+///
+/// # Errors
+///
+/// Returns an error when project loading, macro expansion, or analysis fails.
+pub fn check_project_with_session<S: BuildHasher>(
     path: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
     options: riddlec::pipeline::CompileOptions,
     session: &mut ProjectSession,
 ) -> anyhow::Result<ProjectAnalysis> {
@@ -240,9 +279,14 @@ pub fn check_project_with_session(
         .ok_or_else(|| anyhow::anyhow!("project analysis cancelled"))
 }
 
-pub fn check_project_with_session_cancellable(
+/// Checks a project using an incremental session and cancellation callback.
+///
+/// # Errors
+///
+/// Returns an error when project loading, macro expansion, or analysis fails.
+pub fn check_project_with_session_cancellable<S: BuildHasher>(
     path: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
     options: riddlec::pipeline::CompileOptions,
     session: &mut ProjectSession,
     cancelled: impl Fn() -> bool,
@@ -296,9 +340,9 @@ pub fn check_project_with_session_cancellable(
     }))
 }
 
-fn analyze_project_impl(
+fn analyze_project_impl<S: BuildHasher>(
     path: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
     options: riddlec::pipeline::CompileOptions,
     build: bool,
 ) -> anyhow::Result<ProjectAnalysis> {
@@ -424,7 +468,9 @@ fn prepare_proc_macro_analysis(
     }
     package.source.source = source;
 
-    let offset = rowan::TextSize::from(offset as u32);
+    let offset = rowan::TextSize::from(
+        u32::try_from(offset).expect("combined package offset should fit in u32"),
+    );
     for diagnostic in diagnostics {
         for label in &mut diagnostic.labels {
             label.range =
@@ -462,10 +508,20 @@ fn remap_package_ranges(
     }
 }
 
+/// Checks a package for the host target.
+///
+/// # Errors
+///
+/// Returns an error when loading, target resolution, or compilation fails.
 pub fn check(path: &Path) -> anyhow::Result<()> {
     check_for_target(path, None)
 }
 
+/// Checks a package for an optional explicit target.
+///
+/// # Errors
+///
+/// Returns an error when loading, target resolution, or compilation fails.
 pub fn check_for_target(path: &Path, explicit_target: Option<TargetTriple>) -> anyhow::Result<()> {
     let analysis = check_project_with_options(
         path,
@@ -485,18 +541,38 @@ pub fn check_for_target(path: &Path, explicit_target: Option<TargetTriple>) -> a
     Ok(())
 }
 
+/// Builds a package for the host target.
+///
+/// # Errors
+///
+/// Returns an error when project analysis, code generation, or linking fails.
 pub fn build(path: &Path) -> anyhow::Result<()> {
     build_for_target(path, None)
 }
 
+/// Builds a package for an optional explicit target.
+///
+/// # Errors
+///
+/// Returns an error when project analysis, code generation, or linking fails.
 pub fn build_for_target(path: &Path, explicit_target: Option<TargetTriple>) -> anyhow::Result<()> {
     build::run(path, explicit_target).map(|_| ())
 }
 
+/// Builds and runs a package for the host target.
+///
+/// # Errors
+///
+/// Returns an error when the package cannot be built or the executable cannot be started.
 pub fn run(path: &Path, args: &[OsString]) -> anyhow::Result<ExitStatus> {
     run_for_target(path, args, None)
 }
 
+/// Builds and runs a package for an optional explicit target.
+///
+/// # Errors
+///
+/// Returns an error when the package cannot be built, cannot run on the host, or cannot start.
 pub fn run_for_target(
     path: &Path,
     args: &[OsString],

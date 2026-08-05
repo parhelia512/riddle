@@ -70,14 +70,15 @@ pub enum PatternBindingMode {
 }
 
 impl PatternBindingMode {
-    pub fn through_reference(self, mutable: bool) -> Self {
+    #[must_use]
+    pub const fn through_reference(self, mutable: bool) -> Self {
         match (self, mutable) {
-            (Self::Ref, _) | (Self::RefMut, false) => Self::Ref,
+            (Self::Ref, _) | (Self::RefMut | Self::Move, false) => Self::Ref,
             (_, true) => Self::RefMut,
-            (Self::Move, false) => Self::Ref,
         }
     }
 
+    #[must_use]
     pub fn binding_type(self, ty: Type) -> Type {
         match self {
             Self::Move => ty,
@@ -103,7 +104,8 @@ pub enum ValueUse {
 }
 
 impl ValueUse {
-    pub fn merge(self, other: Self) -> Self {
+    #[must_use]
+    pub const fn merge(self, other: Self) -> Self {
         use ValueUse::{Copy, Move, Mutable, Shared};
         match (self, other) {
             (Move, _) | (_, Move) => Move,
@@ -128,13 +130,15 @@ pub struct CapturePlace {
 }
 
 impl CapturePlace {
-    pub fn root(source: CaptureSource) -> Self {
+    #[must_use]
+    pub const fn root(source: CaptureSource) -> Self {
         Self {
             source,
             projections: Vec::new(),
         }
     }
 
+    #[must_use]
     pub fn is_prefix_of(&self, other: &Self) -> bool {
         self.source == other.source
             && self.projections.len() <= other.projections.len()

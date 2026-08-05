@@ -66,6 +66,21 @@ cargo install --path . --features install-bins --force --target-dir "$env:TEMP\r
 cargo build -p riddle --release --features install-bins --bins
 ```
 
+## 开发与验证
+
+修改源码后，使用以下命令验证完整 workspace：
+
+```bash
+cargo test --workspace --all-targets
+cargo check -p riddle --features install-bins --bins
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings -D clippy::pedantic -D clippy::nursery -D clippy::cargo -A clippy::multiple_crate_versions
+```
+
+`install-bins` 只用于根发行包。不要在 workspace 测试命令中添加 `--all-features`，否则根发行包与成员 crate 的 `clue`、`riddlec` 会产生同名输出警告；上面的独立 `cargo check` 会覆盖这三个安装入口。
+
+Clippy 只排除 `multiple_crate_versions`：当前 Cargo 依赖元数据同时包含 `hashbrown 0.14/0.17` 和 `syn 2/3`。这不会关闭任何源码 lint，也不应通过新增 `#[allow(clippy::...)]` 绕过源码问题。依赖更新后先用 `cargo tree -d` 审计活动依赖，再移除 `-A clippy::multiple_crate_versions` 重跑 Clippy；无告警时即可删除该例外。
+
 ## 交叉编译
 
 `clue check`、`clue build` 和 `riddlec` 均接受 `--target <triple>`。目标选择优先级依次为命令行参数、`RIDDLE_TARGET` 环境变量、`Clue.toml` 中的 `[build].target`，最后回退到宿主平台。目标组件可通过 ridup 安装：

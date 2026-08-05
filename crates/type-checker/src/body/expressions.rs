@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BinaryOp, BodyCtx, Expr, ExprId, HirStructField, HirTypeRef, IntTy, ResolvedName, Stmt, StmtId,
+    StructId, TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse, Visibility, is_supported_cast,
+    is_unsafe_dst_layout_cast, struct_field_is_visible_for_owner, substitute_type,
+    type_contains_unresolved_const_param, type_ref_contains_error,
+};
 
 impl TypeChecker<'_> {
     pub(super) fn struct_field_is_visible(
@@ -126,7 +131,7 @@ impl TypeChecker<'_> {
                     }
                     self.bind_let_pattern(ctx, pat, &local_ty, stmt_id, true);
                 } else {
-                    let delayed_bindings = self.mark_delayed_pattern(ctx, pat);
+                    let delayed_bindings = Self::mark_delayed_pattern(ctx, pat);
                     if matches!(ty, HirTypeRef::Unknown) {
                         for binding in delayed_bindings {
                             self.pending_delayed_bindings.push((
@@ -150,9 +155,9 @@ impl TypeChecker<'_> {
             }
             Stmt::Return { value } => {
                 let expected = ctx.return_ty.clone();
-                let actual = value
-                    .map(|expr| self.check_expr_expected(ctx, expr, &expected))
-                    .unwrap_or(Type::Unit);
+                let actual = value.map_or(Type::Unit, |expr| {
+                    self.check_expr_expected(ctx, expr, &expected)
+                });
                 self.expect_assignable(&expected, &actual, "return value", ctx.stmt_range(stmt_id));
                 if let Some(value) = *value {
                     self.record_value_use(ctx, value, ValueUse::Move);
@@ -193,7 +198,7 @@ impl TypeChecker<'_> {
     ) -> Type {
         let ty = self.check_expr_inner(ctx, expr_id, Some(expected));
         let ty = self.finish_value_expr(ctx, expr_id, ty);
-        if self.is_slice_coercion(expected, &ty) {
+        if Self::is_slice_coercion(expected, &ty) {
             self.result
                 .expr_coercions
                 .insert((ctx.body_id, expr_id), expected.clone());
@@ -249,25 +254,23 @@ impl TypeChecker<'_> {
             Expr::StringLiteral { .. } => Type::Ref(Box::new(Type::Str), false),
             Expr::CharLiteral { .. } => Type::Char,
             Expr::BoolLiteral { .. } => Type::Bool,
-            Expr::Path { path, resolved } => {
-                if let Some(binding_ty) = path
-                    .as_single_name()
-                    .and_then(|name| ctx.bindings.get(&name.0))
-                    .cloned()
-                {
-                    binding_ty
-                } else if path
-                    .as_single_name()
-                    .and_then(|name| ctx.generic_params.get(&name.0))
-                    .is_some_and(|ty| matches!(ty, Type::Const(_)))
-                {
-                    Type::Int(IntTy::Usize)
-                } else if let Some(ResolvedName::EnumVariant(enum_id, _)) = resolved {
-                    self.enum_variant_type(*enum_id, expected)
-                } else {
-                    self.type_of_resolved_name(ctx, resolved.as_ref())
-                }
-            }
+            Expr::Path { path, resolved } => path
+                .as_single_name()
+                .and_then(|name| ctx.bindings.get(&name.0))
+                .cloned()
+                .unwrap_or_else(|| {
+                    if path
+                        .as_single_name()
+                        .and_then(|name| ctx.generic_params.get(&name.0))
+                        .is_some_and(|ty| matches!(ty, Type::Const(_)))
+                    {
+                        Type::Int(IntTy::Usize)
+                    } else if let Some(ResolvedName::EnumVariant(enum_id, _)) = resolved {
+                        self.enum_variant_type(*enum_id, expected)
+                    } else {
+                        self.type_of_resolved_name(ctx, resolved.as_ref())
+                    }
+                }),
             Expr::Struct {
                 resolved,
                 fields,
@@ -292,15 +295,49 @@ impl TypeChecker<'_> {
                 for stmt in stmts {
                     self.check_stmt(ctx, *stmt);
                 }
-                let ty = tail
-                    .map(|expr| match expected {
-                        Some(expected) => self.check_expr_expected(ctx, expr, expected),
-                        None => self.check_expr(ctx, expr),
-                    })
-                    .unwrap_or(Type::Unit);
+                let ty = tail.map_or(Type::Unit, |expr| match expected {
+                    Some(expected) => self.check_expr_expected(ctx, expr, expected),
+                    None => self.check_expr(ctx, expr),
+                });
                 ctx.pop_scope();
                 ty
             }
+            Expr::If { .. }
+            | Expr::While { .. }
+            | Expr::For { .. }
+            | Expr::Match { .. }
+            | Expr::Array { .. }
+            | Expr::Tuple { .. }
+            | Expr::ArrayRepeat { .. } => self.check_control_expr(ctx, expr_id, expected, span),
+            Expr::Call { .. }
+            | Expr::Lambda { .. }
+            | Expr::FieldAccess { .. }
+            | Expr::Unsafe { .. }
+            | Expr::IndexAccess { .. }
+            | Expr::Cast { .. }
+            | Expr::Try { .. } => self.check_operation_expr(ctx, expr_id, expected, span),
+        };
+
+        let ty = if ty.is_never() || self.expr_always_returns(ctx, expr_id) {
+            Type::Never
+        } else {
+            ty
+        };
+
+        self.result
+            .expr_types
+            .insert((ctx.body_id, expr_id), ty.clone());
+        ty
+    }
+
+    fn check_control_expr(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        match &ctx.body.exprs[expr_id] {
             Expr::If {
                 cond,
                 then_branch,
@@ -319,12 +356,10 @@ impl TypeChecker<'_> {
                     Some(expected) => self.check_expr_expected(ctx, *then_branch, expected),
                     None => self.check_expr(ctx, *then_branch),
                 };
-                let else_ty = else_branch
-                    .map(|expr| match expected {
-                        Some(expected) => self.check_expr_expected(ctx, expr, expected),
-                        None => self.check_expr(ctx, expr),
-                    })
-                    .unwrap_or(Type::Unit);
+                let else_ty = else_branch.map_or(Type::Unit, |expr| match expected {
+                    Some(expected) => self.check_expr_expected(ctx, expr, expected),
+                    None => self.check_expr(ctx, expr),
+                });
                 if let Some(expected @ Type::OpaqueCallable { .. }) = expected {
                     self.expect_assignable(expected, &then_ty, "opaque callable return", span);
                     self.expect_assignable(expected, &else_ty, "opaque callable return", span);
@@ -380,6 +415,18 @@ impl TypeChecker<'_> {
             Expr::ArrayRepeat { value, len } => {
                 self.check_array_repeat(ctx, *value, *len, expected, span)
             }
+            _ => unreachable!("control expression expected"),
+        }
+    }
+
+    fn check_operation_expr(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        match &ctx.body.exprs[expr_id] {
             Expr::Call {
                 callee,
                 args,
@@ -442,18 +489,8 @@ impl TypeChecker<'_> {
                 target_ty
             }
             Expr::Try { operand } => self.check_try(ctx, expr_id, *operand, expected, span),
-        };
-
-        let ty = if ty.is_never() || self.expr_always_returns(ctx, expr_id) {
-            Type::Never
-        } else {
-            ty
-        };
-
-        self.result
-            .expr_types
-            .insert((ctx.body_id, expr_id), ty.clone());
-        ty
+            _ => unreachable!("operation expression expected"),
+        }
     }
 
     pub(super) fn check_try(
@@ -473,10 +510,11 @@ impl TypeChecker<'_> {
             }
             _ => None,
         };
-        let operand_ty = operand_expected
-            .as_ref()
-            .map(|expected| self.check_expr_expected(ctx, operand, expected))
-            .unwrap_or_else(|| self.check_expr(ctx, operand));
+        let operand_ty = if let Some(expected) = &operand_expected {
+            self.check_expr_expected(ctx, operand, expected)
+        } else {
+            self.check_expr(ctx, operand)
+        };
         let operand_ty = self.resolve_type(&operand_ty);
         self.record_value_use(ctx, operand, ValueUse::Move);
 
@@ -510,77 +548,80 @@ impl TypeChecker<'_> {
 
         let source_error = &result_args[1];
         let target_error = &return_args[1];
-        if !self.bound_types_match(target_error, source_error) {
-            let Some(into_trait) = self.find_trait_by_name("Into") else {
-                self.diagnostic(
-                    "E0063",
-                    format!(
-                        "cannot convert `{}` into the enclosing Result error type `{}`",
-                        source_error.display(self.hir),
-                        target_error.display(self.hir)
-                    ),
-                    span,
-                );
-                return result_args[0].clone();
-            };
-            let Some(method) = self.find_trait_impl_method(
-                source_error,
-                Some(target_error),
-                None,
-                into_trait,
-                "into",
-            ) else {
-                self.diagnostic(
-                    "E0063",
-                    format!(
-                        "cannot convert `{}` into the enclosing Result error type `{}`",
-                        source_error.display(self.hir),
-                        target_error.display(self.hir)
-                    ),
-                    span,
-                );
-                return result_args[0].clone();
-            };
-            let converted = method
-                .function
-                .ret_type
-                .as_ref()
-                .map(|ty| {
-                    substitute_type(
-                        &self.lower_type_ref_with_params_at(
-                            ty,
-                            &method.subst,
-                            method
-                                .function
-                                .ret_type_range
-                                .or(Some(method.function.name_range)),
-                        ),
-                        &method.subst,
-                    )
-                })
-                .unwrap_or(Type::Unit);
-            if !self.bound_types_match(target_error, &converted) {
-                self.diagnostic(
-                    "E0063",
-                    format!(
-                        "`Into::into` returns `{}`, not the enclosing Result error type `{}`",
-                        converted.display(self.hir),
-                        target_error.display(self.hir)
-                    ),
-                    span,
-                );
-            } else {
-                self.result.trait_method_calls.insert(
-                    (ctx.body_id, expr_id),
-                    TraitMethodCall {
-                        trait_id: into_trait,
-                        method: "into".into(),
-                    },
-                );
-            }
+        if !Self::bound_types_match(target_error, source_error) {
+            self.check_try_error_conversion(ctx, expr_id, source_error, target_error, span);
         }
 
         result_args[0].clone()
+    }
+
+    fn check_try_error_conversion(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        expr_id: ExprId,
+        source_error: &Type,
+        target_error: &Type,
+        span: Option<rowan::TextRange>,
+    ) {
+        let Some(into_trait) = self.find_trait_by_name("Into") else {
+            self.report_try_conversion_error(source_error, target_error, span);
+            return;
+        };
+        let Some(method) =
+            self.find_trait_impl_method(source_error, Some(target_error), None, into_trait, "into")
+        else {
+            self.report_try_conversion_error(source_error, target_error, span);
+            return;
+        };
+        let converted = method.function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            substitute_type(
+                &self.lower_type_ref_with_params_at(
+                    ty,
+                    &method.subst,
+                    method
+                        .function
+                        .ret_type_range
+                        .or(Some(method.function.name_range)),
+                ),
+                &method.subst,
+            )
+        });
+        if Self::bound_types_match(target_error, &converted) {
+            self.result.trait_method_calls.insert(
+                (ctx.body_id, expr_id),
+                TraitMethodCall {
+                    trait_id: into_trait,
+                    method: "into".into(),
+                },
+            );
+        } else {
+            self.diagnostic(
+                "E0063",
+                format!(
+                    "`Into::into` returns `{}`, not the enclosing Result error type `{}`",
+                    converted.display(self.hir),
+                    target_error.display(self.hir)
+                ),
+                span,
+            );
+        }
+    }
+
+    fn report_try_conversion_error(
+        &mut self,
+        source_error: &Type,
+        target_error: &Type,
+        span: Option<rowan::TextRange>,
+    ) {
+        self.diagnostic(
+            "E0063",
+            format!(
+                "cannot convert `{}` into the enclosing Result error type `{}`",
+                source_error.display(self.hir),
+                target_error.display(self.hir)
+            ),
+            span,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -607,7 +648,7 @@ impl TypeChecker<'_> {
         if let Some(base_op) = op.compound_base() {
             let lhs_ty = self.check_expr(ctx, lhs);
             let rhs_ty = self.check_expr(ctx, rhs);
-            if !self.is_builtin_binary_operator(base_op, &lhs_ty, &rhs_ty)
+            if !Self::is_builtin_binary_operator(base_op, &lhs_ty, &rhs_ty)
                 && !lhs_ty.is_unknown_like()
                 && self
                     .check_overloaded_assign(
@@ -618,7 +659,8 @@ impl TypeChecker<'_> {
                 self.check_assign_mut(ctx, lhs, span);
                 return Type::Unit;
             }
-            let result_ty = self.check_binary_types(ctx, lhs, rhs, base_op, &lhs_ty, &rhs_ty, span);
+            let result_ty =
+                self.check_binary_types(ctx, (lhs, rhs), base_op, (&lhs_ty, &rhs_ty), span);
             self.expect_assignable(&lhs_ty, &result_ty, "assignment", span);
             self.check_assign_mut(ctx, lhs, span);
             self.record_value_use(ctx, rhs, ValueUse::Move);
@@ -637,7 +679,7 @@ impl TypeChecker<'_> {
             BinaryOp::Eq | BinaryOp::Neq => self.check_place_expr(ctx, rhs),
             _ => self.check_expr(ctx, rhs),
         };
-        let is_overload_candidate = !self.is_builtin_binary_operator(op, &lhs_ty, &rhs_ty);
+        let is_overload_candidate = !Self::is_builtin_binary_operator(op, &lhs_ty, &rhs_ty);
         if is_overload_candidate
             && !lhs_ty.is_unknown_like()
             && let Some(ty) = self.check_overloaded_binary(
@@ -668,7 +710,7 @@ impl TypeChecker<'_> {
         }
         let lhs_ty = self.resolve_type(&lhs_ty);
         let rhs_ty = self.resolve_type(&rhs_ty);
-        let result = self.check_binary_types(ctx, lhs, rhs, op, &lhs_ty, &rhs_ty, span);
+        let result = self.check_binary_types(ctx, (lhs, rhs), op, (&lhs_ty, &rhs_ty), span);
         self.record_value_use(ctx, lhs, ValueUse::Copy);
         self.record_value_use(ctx, rhs, ValueUse::Copy);
         result

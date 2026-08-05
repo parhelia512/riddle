@@ -1,4 +1,12 @@
-use super::{expand::*, *};
+use super::{
+    AstNode, Diagnostic, Entry, LabelStyle, PROC_MACRO_ERROR, ProcMacroDelimiter,
+    ProcMacroProvider, ProcMacroTokenStream, ProcMacroTokenTree, Range, Severity, SourceLabel,
+    TextRange, ast,
+    expand::{
+        DeriveMacroPath, ImportedMacro, MacroReexports, MacroScope, ProcMacroUse, ScopedStatement,
+        UseBinding,
+    },
+};
 
 pub(super) fn build_macro_reexports(
     root: &ast::Root,
@@ -131,7 +139,7 @@ pub(super) fn collect_scoped_statements(
             ast::Stmt::ModDecl(module) => {
                 let children = module
                     .items()
-                    .map(|items| items.collect::<Vec<_>>())
+                    .map(std::iter::Iterator::collect::<Vec<_>>)
                     .unwrap_or_default();
                 let mut child_path = module_path.to_vec();
                 if let Some(name) = module.name() {
@@ -245,10 +253,8 @@ pub(super) fn parse_proc_macro_use_resolved(
                     imported.binding = None;
                     (name.clone(), imported)
                 }));
-                ordinary.push(binding);
-            } else {
-                ordinary.push(binding);
             }
+            ordinary.push(binding);
             continue;
         }
 
@@ -264,26 +270,36 @@ pub(super) fn parse_proc_macro_use_resolved(
             continue;
         };
         let mut imported = imported;
-        imported.binding = binding.local_range.clone();
+        imported.binding.clone_from(&binding.local_range);
         imports.push((
             binding.alias.clone().unwrap_or_else(|| name.clone()),
             imported,
         ));
     }
 
+    finish_proc_macro_use(imports, &ordinary, &errors, use_decl.is_pub())
+}
+
+fn finish_proc_macro_use(
+    imports: Vec<(String, ImportedMacro)>,
+    ordinary: &[UseBinding],
+    errors: &[String],
+    public: bool,
+) -> ProcMacroUse {
     if imports.is_empty() && errors.is_empty() {
         return ProcMacroUse::Ordinary;
     }
-    let replacement = render_use_bindings(&ordinary, use_decl.is_pub());
-    if !errors.is_empty() {
-        return ProcMacroUse::Invalid {
+    let replacement = render_use_bindings(ordinary, public);
+    if errors.is_empty() {
+        ProcMacroUse::Imports {
+            imports,
+            replacement,
+        }
+    } else {
+        ProcMacroUse::Invalid {
             message: errors.join("; "),
             replacement,
-        };
-    }
-    ProcMacroUse::Imports {
-        imports,
-        replacement,
+        }
     }
 }
 
@@ -377,21 +393,6 @@ pub(super) fn flatten_use_tree(
     });
 }
 
-pub(super) fn erase_imports(source: &str, ranges: &[Range<usize>]) -> String {
-    if ranges.is_empty() {
-        return source.into();
-    }
-    let mut bytes = source.as_bytes().to_vec();
-    for range in ranges {
-        for byte in &mut bytes[range.clone()] {
-            if !matches!(*byte, b'\n' | b'\r') {
-                *byte = b' ';
-            }
-        }
-    }
-    String::from_utf8(bytes).expect("blanking imports should preserve UTF-8")
-}
-
 pub(super) fn parse_derive_paths(raw: &str) -> Result<Vec<DeriveMacroPath>, String> {
     parse_derive_invocations(raw)
         .map(|invocations| invocations.into_iter().map(|(path, _)| path).collect())
@@ -481,39 +482,6 @@ pub(super) fn token_punct(tree: Option<&ProcMacroTokenTree>) -> Option<char> {
     }
 }
 
-pub(super) fn validate_output(output: &str) -> Option<String> {
-    let mut parser = IncrementalParser::new();
-    let parse = parser.set_source(output);
-    if let Some(error) = parse.errors.first() {
-        return Some(format!(
-            "derive macro output is not valid Riddle: {}",
-            error.message
-        ));
-    }
-    let root = ast::Root::cast(parse.syntax()).expect("parsed output should have a root");
-    if root.stmts().any(|stmt| !is_item(&stmt)) {
-        return Some("derive macro output must contain only top-level items".into());
-    }
-    None
-}
-
-pub(super) fn is_item(stmt: &ast::Stmt) -> bool {
-    matches!(
-        stmt,
-        ast::Stmt::FuncDecl(_)
-            | ast::Stmt::StructDecl(_)
-            | ast::Stmt::EnumDecl(_)
-            | ast::Stmt::TraitDecl(_)
-            | ast::Stmt::ImplDecl(_)
-            | ast::Stmt::ConstDecl(_)
-            | ast::Stmt::TypeAliasDecl(_)
-            | ast::Stmt::ModDecl(_)
-            | ast::Stmt::UseDecl(_)
-            | ast::Stmt::ExternBlock(_)
-            | ast::Stmt::ExternFnDecl(_)
-    )
-}
-
 pub(super) fn diagnostic(range: Range<usize>, message: String, severity: Severity) -> Diagnostic {
     Diagnostic {
         code: PROC_MACRO_ERROR,
@@ -530,10 +498,10 @@ pub(super) fn diagnostic(range: Range<usize>, message: String, severity: Severit
 }
 
 pub(super) fn text_range(range: &Range<usize>) -> TextRange {
-    TextRange::new((range.start as u32).into(), (range.end as u32).into())
+    crate::text_range(range.start, range.end)
 }
 
-pub(super) fn valid_span(span: &Range<usize>, source_len: usize) -> bool {
+pub(super) const fn valid_span(span: &Range<usize>, source_len: usize) -> bool {
     span.start <= span.end && span.end <= source_len
 }
 

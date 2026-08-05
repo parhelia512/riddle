@@ -5,16 +5,25 @@ use riddlec::proc_macro::{
 use std::{
     cell::Cell,
     collections::HashMap,
+    fmt::Write as _,
     fs, io,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+fn text_size(value: usize) -> rowan::TextSize {
+    rowan::TextSize::from(u32::try_from(value).expect("test offset should fit in u32"))
+}
+
+fn text_range(start: usize, end: usize) -> rowan::TextRange {
+    rowan::TextRange::new(text_size(start), text_size(end))
+}
+
 fn c_symbol(kind: char, name: &str) -> String {
-    let suffix = name
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut suffix = String::with_capacity(name.len() * 2);
+    for byte in name.bytes() {
+        write!(suffix, "{byte:02x}").expect("writing to a String should not fail");
+    }
     format!("riddle_{kind}_{suffix}")
 }
 
@@ -40,14 +49,14 @@ fn temp_source_root(name: &str) -> PathBuf {
 #[test]
 fn no_gc_rejects_a_reference_to_local_stack_storage() {
     let result = compile_with_options_and_gc(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun escaped() -> &Data {
             let local = Data { value: 1 };
             &local
         }
-        "#,
+        ",
         CompileOptions { use_std: false },
         false,
     );
@@ -76,12 +85,12 @@ fn no_gc_allows_forwarding_an_input_reference() {
 #[test]
 fn no_gc_allows_an_owned_escaping_closure() {
     let result = compile_with_options_and_gc(
-        r#"
+        r"
         fun make() -> impl Fn() -> i32 {
             let value = 42;
             move fun() -> i32 { value }
         }
-        "#,
+        ",
         CompileOptions { use_std: false },
         false,
     );
@@ -93,12 +102,12 @@ fn no_gc_allows_an_owned_escaping_closure() {
 #[test]
 fn no_gc_rejects_a_borrowed_escaping_closure() {
     let result = compile_with_options_and_gc(
-        r#"
+        r"
         fun make() -> impl Fn() -> i32 {
             let value = 42;
             fun() -> i32 { value }
         }
-        "#,
+        ",
         CompileOptions { use_std: false },
         false,
     );
@@ -147,7 +156,7 @@ fn check_session_matches_stateless_checks_across_edits() {
 
 #[test]
 fn check_session_shifts_cached_diagnostics_with_their_bodies() {
-    let source = r#"
+    let source = r"
 struct Wrap<T> { inner: T }
 struct Bad { value: str }
 trait Flag { fun value() -> bool; }
@@ -156,7 +165,7 @@ impl Flag for Marker {}
 fun f<T>(x: T) -> T { g(Wrap { inner: x }) }
 fun g<T>(x: T) -> T { f(Wrap { inner: x }) }
 fun bad() { let value: bool = 1; }
-"#;
+";
     let options = CompileOptions { use_std: false };
     let mut session = CheckSession::new();
     let first = session.check_with_options(source, options);
@@ -267,10 +276,7 @@ fn source_map_points_into_external_module() {
     let start = loaded.source.find("missing").unwrap();
     let mapped = loaded
         .source_map
-        .map_range(rowan::TextRange::new(
-            (start as u32).into(),
-            ((start + "missing".len()) as u32).into(),
-        ))
+        .map_range(text_range(start, start + "missing".len()))
         .unwrap();
 
     assert_eq!(
@@ -285,7 +291,7 @@ fn source_map_points_into_external_module() {
         loaded.source.find("pub fun").unwrap() + "pub fun value() -> i32 { missing }\n".len();
     let mapped_eof = loaded
         .source_map
-        .map_range(rowan::TextRange::empty((generated_eof as u32).into()))
+        .map_range(rowan::TextRange::empty(text_size(generated_eof)))
         .unwrap();
     assert_eq!(mapped_eof.path, mapped.path);
     assert_eq!(usize::from(mapped_eof.range.start()), mapped.source.len());
@@ -326,10 +332,7 @@ fn source_map_points_generated_macro_code_at_the_derive() {
     let start = loaded.source.find("GENERATED").unwrap();
     let mapped = loaded
         .source_map
-        .map_range(rowan::TextRange::new(
-            (start as u32).into(),
-            ((start + "GENERATED".len()) as u32).into(),
-        ))
+        .map_range(text_range(start, start + "GENERATED".len()))
         .unwrap();
 
     assert_eq!(mapped.path, fs::canonicalize(&path).unwrap());
@@ -417,10 +420,7 @@ fn source_map_preserves_spans_copied_into_macro_output() {
     let start = loaded.source.find("COPIED").unwrap();
     let mapped = loaded
         .source_map
-        .map_range(rowan::TextRange::new(
-            (start as u32).into(),
-            ((start + "COPIED".len()) as u32).into(),
-        ))
+        .map_range(text_range(start, start + "COPIED".len()))
         .unwrap();
 
     assert_eq!(mapped.path, fs::canonicalize(&path).unwrap());
@@ -489,14 +489,14 @@ fn mut_belongs_on_the_binding_not_the_let_pattern() {
 #[test]
 fn destructuring_let_patterns_parse() {
     let result = compile(
-        r#"
+        r"
             struct Point { x: i32, y: i32 }
             fun main() {
                 let (mut a, b) = (1i32, 2i32);
                 let Point { x, y } = Point { x: 3i32, y: 4i32 };
                 a = a + b + x + y;
             }
-        "#,
+        ",
     );
 
     assert!(result.parse_errors.is_empty(), "{:#?}", result.parse_errors);
@@ -506,11 +506,11 @@ fn destructuring_let_patterns_parse() {
 #[test]
 fn reference_patterns_parse() {
     let result = compile(
-        r#"
+        r"
             fun shared(value: &i32) { let &copy = value; }
             fun mutable(value: &mut i32) { let &mut copy = value; }
             fun nested(value: & &mut i32) { let &&mut copy = value; }
-        "#,
+        ",
     );
 
     assert!(result.parse_errors.is_empty(), "{:#?}", result.parse_errors);
@@ -743,14 +743,14 @@ fn undeclared_directory_modules_are_not_loaded() {
 #[test]
 fn std_range_iterator_type_checks() {
     let result = compile(
-        r#"
+        r"
             use std::ops::range;
 
             fun main() {
                 let mut iter = range(0, 3);
                 let first = iter.next();
             }
-            "#,
+            ",
     );
 
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);
@@ -777,7 +777,7 @@ fn incremental_pipeline_stops_when_cancelled_between_stages() {
 #[test]
 fn std_basic_value_methods_compile() {
     let result = compile(
-        r#"
+        r"
             struct Token {
                 value: i32,
             }
@@ -805,7 +805,7 @@ fn std_basic_value_methods_compile() {
                     0
                 }
             }
-            "#,
+            ",
     );
 
     assert!(
@@ -830,13 +830,13 @@ fn str_and_slice_have_no_layout_fields() {
                 let length = text.len;
             }
             "#,
-        r#"
+        r"
             fun main() {
                 let values: [i32; 1] = [1];
                 let slice: &[i32] = &values;
                 let pointer = slice.ptr;
             }
-            "#,
+            ",
     ] {
         let result = compile(source);
         assert!(!result.success(), "{source}");
@@ -916,7 +916,7 @@ fn std_string_and_vector_compile_without_string_runtime_helpers() {
 #[test]
 fn vector_mutation_is_rejected_while_element_reference_is_live() {
     let result = compile(
-        r#"
+        r"
             fun main() {
                 let mut values: Vector<i32> = Vector::new();
                 values.push(1);
@@ -925,7 +925,7 @@ fn vector_mutation_is_rejected_while_element_reference_is_live() {
                 values.push(2);
                 *reference = 3;
             }
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -943,7 +943,7 @@ fn vector_mutation_is_rejected_while_element_reference_is_live() {
 #[test]
 fn while_statement_does_not_consume_following_dereference_assignment() {
     let result = compile(
-        r#"
+        r"
             fun first(values: &mut Vector<i32>) -> &mut i32 {
                 &mut values[0]
             }
@@ -959,7 +959,7 @@ fn while_statement_does_not_consume_following_dereference_assignment() {
                 }
                 *reference = 999;
             }
-            "#,
+            ",
     );
 
     assert!(result.parse_errors.is_empty(), "{:#?}", result.parse_errors);
@@ -983,7 +983,7 @@ fn while_statement_does_not_consume_following_dereference_assignment() {
 #[test]
 fn vector_mutation_is_rejected_while_shared_element_reference_is_live() {
     let result = compile(
-        r#"
+        r"
             fun main() {
                 let mut values: Vector<i32> = Vector::new();
                 values.push(1);
@@ -992,7 +992,7 @@ fn vector_mutation_is_rejected_while_shared_element_reference_is_live() {
                 values.push(2);
                 *reference;
             }
-            "#,
+            ",
     );
 
     assert!(
@@ -1008,7 +1008,7 @@ fn vector_mutation_is_rejected_while_shared_element_reference_is_live() {
 #[test]
 fn returned_reference_cannot_borrow_drop_parameter() {
     let result = compile(
-        r#"
+        r"
             fun first(values: Vector<i32>) -> &i32 {
                 &values[0]
             }
@@ -1019,7 +1019,7 @@ fn returned_reference_cannot_borrow_drop_parameter() {
                 let reference = first(values);
                 *reference;
             }
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -1037,7 +1037,7 @@ fn returned_reference_cannot_borrow_drop_parameter() {
 #[test]
 fn closure_returned_reference_cannot_borrow_drop_local() {
     let result = compile(
-        r#"
+        r"
             fun main() {
                 let make = fun() -> &i32 {
                     let mut values: Vector<i32> = Vector::new();
@@ -1047,7 +1047,7 @@ fn closure_returned_reference_cannot_borrow_drop_local() {
                 let reference = make();
                 *reference;
             }
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -1065,7 +1065,7 @@ fn closure_returned_reference_cannot_borrow_drop_local() {
 #[test]
 fn dereferencing_non_copy_reference_cannot_move_value_out() {
     let result = compile(
-        r#"
+        r"
             struct Point { x: i32, y: i32 }
 
             fun forward(value: &mut Point) -> &mut Point { value }
@@ -1074,7 +1074,7 @@ fn dereferencing_non_copy_reference_cannot_move_value_out() {
                 let mut point = Point { x: 3, y: 4 };
                 let moved = *forward(&mut point);
             }
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -1094,7 +1094,7 @@ fn dereferencing_non_copy_reference_cannot_move_value_out() {
 #[test]
 fn implicit_reference_field_deref_cannot_move_non_copy_value_out() {
     let result = compile(
-        r#"
+        r"
             struct Token { value: i32 }
             struct Wrap { token: Token }
 
@@ -1103,7 +1103,7 @@ fn implicit_reference_field_deref_cannot_move_non_copy_value_out() {
                 let reference: &Wrap = &wrap;
                 let moved = reference.token;
             }
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -1123,7 +1123,7 @@ fn implicit_reference_field_deref_cannot_move_non_copy_value_out() {
 #[test]
 fn implicit_reference_field_deref_keeps_copy_value_readable() {
     let result = compile(
-        r#"
+        r"
             struct Wrap { value: i32 }
 
             fun main() -> i32 {
@@ -1131,7 +1131,7 @@ fn implicit_reference_field_deref_keeps_copy_value_readable() {
                 let reference: &Wrap = &wrap;
                 reference.value
             }
-            "#,
+            ",
     );
 
     assert!(result.success(), "{:#?}", result.analysis_diagnostics);
@@ -1140,7 +1140,7 @@ fn implicit_reference_field_deref_keeps_copy_value_readable() {
 #[test]
 fn implicit_reference_index_deref_cannot_move_non_copy_value_out() {
     let result = compile(
-        r#"
+        r"
             struct Token { value: i32 }
 
             fun main() {
@@ -1148,7 +1148,7 @@ fn implicit_reference_index_deref_cannot_move_non_copy_value_out() {
                 let reference: &[Token; 1] = &values;
                 let moved = reference[0usize];
             }
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -1167,7 +1167,7 @@ fn implicit_reference_index_deref_cannot_move_non_copy_value_out() {
 #[test]
 fn try_propagates_result_and_converts_error() {
     let result = compile_with_options(
-        r#"
+        r"
             enum Result<T, E> { Ok(T), Err(E) }
             trait Into<T> { fun into(self) -> T; }
 
@@ -1196,7 +1196,7 @@ fn try_propagates_result_and_converts_error() {
                     Result::Err(_) => 0,
                 }
             }
-            "#,
+            ",
         CompileOptions { use_std: false },
     );
 
@@ -1258,7 +1258,7 @@ fn std_supports_float_remainder_and_scalar_protocols() {
 #[test]
 fn std_rejects_legacy_display_write_method() {
     let result = compile(
-        r#"
+        r"
             use std::fmt::Display;
 
             struct Legacy {}
@@ -1268,7 +1268,7 @@ fn std_rejects_legacy_display_write_method() {
             }
 
             fun main() {}
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -1329,10 +1329,10 @@ fn std_exposes_default_hash_parse_collections_and_time() {
 #[test]
 fn std_does_not_expose_legacy_map_and_set_names() {
     let result = compile(
-        r#"
+        r"
             fun legacy(map: Map<i32, i32>, set: Set<i32>) {}
             fun main() {}
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -1359,11 +1359,11 @@ fn std_does_not_expose_legacy_map_and_set_names() {
 #[test]
 fn std_collections_require_the_collections_module() {
     let implicit = compile(
-        r#"
+        r"
             fun main() {
                 let map: HashMap<i32, i32> = HashMap::new();
             }
-            "#,
+            ",
     );
     assert!(
         implicit
@@ -1393,7 +1393,7 @@ fn std_collections_require_the_collections_module() {
 #[test]
 fn dereferencing_copy_reference_reads_a_copy() {
     let result = compile(
-        r#"
+        r"
             struct Point { x: i32, y: i32 }
             impl Copy for Point {}
 
@@ -1407,7 +1407,7 @@ fn dereferencing_copy_reference_reads_a_copy() {
                 let mut reference = forward(&mut point);
                 reference.x = 1;
             }
-            "#,
+            ",
     );
 
     assert!(result.success(), "{:#?}", result.analysis_diagnostics);
@@ -1473,7 +1473,7 @@ fn nested_non_generic_struct_return_keeps_reference_borrowed() {
 #[test]
 fn vector_mutation_is_allowed_after_element_reference_last_use() {
     let result = compile(
-        r#"
+        r"
             fun main() {
                 let mut values: Vector<i32> = Vector::new();
                 values.push(1);
@@ -1482,7 +1482,7 @@ fn vector_mutation_is_allowed_after_element_reference_last_use() {
                 *reference = 3;
                 values.push(2);
             }
-            "#,
+            ",
     );
 
     assert!(result.success(), "{:#?}", result.analysis_diagnostics);
@@ -1493,7 +1493,7 @@ fn mutable_reference_parameters_accept_mutable_method_calls() {
     // A `&mut T` binding is reborrowed for a `&mut self` receiver; only
     // auto-referencing a place requires that place to be declared mutable.
     let result = compile(
-        r#"
+        r"
             fun fill(target: &mut Vector<i32>) {
                 target.push(7);
             }
@@ -1506,7 +1506,7 @@ fn mutable_reference_parameters_accept_mutable_method_calls() {
                 let mut values: Vector<i32> = Vector::new();
                 fill(&mut values);
             }
-            "#,
+            ",
     );
 
     assert!(
@@ -1520,12 +1520,12 @@ fn mutable_reference_parameters_accept_mutable_method_calls() {
 #[test]
 fn immutable_bindings_still_reject_mutable_method_calls() {
     let result = compile(
-        r#"
+        r"
             fun main() {
                 let values: Vector<i32> = Vector::new();
                 values.push(1);
             }
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -1543,7 +1543,7 @@ fn immutable_bindings_still_reject_mutable_method_calls() {
 #[test]
 fn std_clone_and_comparison_methods_are_callable() {
     let result = compile(
-        r#"
+        r"
             fun main() -> i32 {
                 let value: i32 = 7;
                 let cloned = value.clone();
@@ -1552,7 +1552,7 @@ fn std_clone_and_comparison_methods_are_callable() {
                 let partial = value.partial_cmp(&cloned);
                 if equal { cloned } else { 0 }
             }
-            "#,
+            ",
     );
 
     assert!(
@@ -1573,7 +1573,7 @@ fn std_clone_and_comparison_methods_are_callable() {
 #[test]
 fn std_operator_trait_methods_emit_native_c_without_wrappers() {
     let result = compile(
-        r#"
+        r"
             fun main() -> i64 {
                 let mut value: i64 = 64i64;
                 let added = value.add(2i64);
@@ -1600,7 +1600,7 @@ fn std_operator_trait_methods_emit_native_c_without_wrappers() {
 
                 if true.not() { value } else { value + negated }
             }
-            "#,
+            ",
     );
 
     assert!(
@@ -1647,11 +1647,11 @@ fn std_operator_trait_methods_emit_native_c_without_wrappers() {
 #[test]
 fn compile_can_skip_std() {
     let result = compile_with_options(
-        r#"
+        r"
             fun main() {
                 let value = range(0, 3);
             }
-            "#,
+            ",
         CompileOptions { use_std: false },
     );
 
@@ -1669,11 +1669,11 @@ fn compile_can_skip_std() {
 #[test]
 fn compile_without_std_accepts_basic_program() {
     let result = compile_with_options(
-        r#"
+        r"
             fun main() {
                 let value = 1;
             }
-            "#,
+            ",
         CompileOptions { use_std: false },
     );
 
@@ -1733,7 +1733,7 @@ fn rejects_non_finite_float_literals() {
 #[test]
 fn unit_uses_empty_tuple_syntax() {
     let result = compile_with_options(
-        r#"
+        r"
             fun identity(value: ()) -> () {
                 value
             }
@@ -1741,7 +1741,7 @@ fn unit_uses_empty_tuple_syntax() {
             fun main() {
                 identity(());
             }
-            "#,
+            ",
         CompileOptions { use_std: false },
     );
 
@@ -1751,7 +1751,7 @@ fn unit_uses_empty_tuple_syntax() {
 #[test]
 fn std_prelude_reexports_core_items() {
     let result = compile(
-        r#"
+        r"
             use std::ops::range;
 
             fun main() {
@@ -1759,7 +1759,7 @@ fn std_prelude_reexports_core_items() {
                 let mut iter = range(0, 3);
                 let first = iter.next();
             }
-            "#,
+            ",
     );
 
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);
@@ -1768,7 +1768,7 @@ fn std_prelude_reexports_core_items() {
 #[test]
 fn std_option_and_result_copy_depends_on_payloads() {
     let copy = compile(
-        r#"
+        r"
             fun main() {
                 let option: Option<i32> = Some(1);
                 let first_option = option;
@@ -1777,7 +1777,7 @@ fn std_option_and_result_copy_depends_on_payloads() {
                 let first_result = result;
                 let second_result = result;
             }
-            "#,
+            ",
     );
     assert!(copy.success(), "{:#?}", copy.analysis_diagnostics);
     assert!(
@@ -1787,7 +1787,7 @@ fn std_option_and_result_copy_depends_on_payloads() {
     );
 
     let moved = compile(
-        r#"
+        r"
             struct Token { value: i32 }
 
             fun main() {
@@ -1795,7 +1795,7 @@ fn std_option_and_result_copy_depends_on_payloads() {
                 let first = option;
                 let second = option;
             }
-            "#,
+            ",
     );
     assert!(
         moved
@@ -1810,7 +1810,7 @@ fn std_option_and_result_copy_depends_on_payloads() {
 #[test]
 fn loop_backedges_reject_repeated_outer_moves_but_refresh_for_bindings() {
     for source in [
-        r#"
+        r"
             struct Token { value: i32 }
             fun take(value: Token) {}
 
@@ -1822,8 +1822,8 @@ fn loop_backedges_reject_repeated_outer_moves_but_refresh_for_bindings() {
                     index += 1;
                 }
             }
-            "#,
-        r#"
+            ",
+        r"
             struct Token { value: i32 }
             fun take(value: Token) {}
 
@@ -1833,7 +1833,7 @@ fn loop_backedges_reject_repeated_outer_moves_but_refresh_for_bindings() {
                     take(token);
                 }
             }
-            "#,
+            ",
     ] {
         let result = compile(source);
         assert!(
@@ -1847,7 +1847,7 @@ fn loop_backedges_reject_repeated_outer_moves_but_refresh_for_bindings() {
     }
 
     let fresh_binding = compile(
-        r#"
+        r"
             struct Token { value: i32 }
             fun take(value: Token) {}
 
@@ -1856,7 +1856,7 @@ fn loop_backedges_reject_repeated_outer_moves_but_refresh_for_bindings() {
                     take(token);
                 }
             }
-            "#,
+            ",
     );
     assert!(
         fresh_binding.success(),
@@ -1868,7 +1868,7 @@ fn loop_backedges_reject_repeated_outer_moves_but_refresh_for_bindings() {
 #[test]
 fn copy_impl_requires_every_payload_to_be_copy() {
     let invalid = compile(
-        r#"
+        r"
             struct Token { value: i32 }
             struct Wrapper<T> { value: T }
             enum TokenState { Empty, Full(Token) }
@@ -1877,7 +1877,7 @@ fn copy_impl_requires_every_payload_to_be_copy() {
             impl Copy for TokenState {}
 
             fun main() {}
-            "#,
+            ",
     );
 
     let copy_errors = invalid
@@ -1907,7 +1907,7 @@ fn copy_impl_requires_every_payload_to_be_copy() {
 #[test]
 fn copy_impl_accepts_nested_conditional_copy_fields() {
     let result = compile(
-        r#"
+        r"
             struct Nested<T> { value: Option<T> }
 
             impl<T: Copy> Copy for Nested<T> {}
@@ -1917,7 +1917,7 @@ fn copy_impl_accepts_nested_conditional_copy_fields() {
                 let first = value;
                 let second = value;
             }
-            "#,
+            ",
     );
 
     assert!(
@@ -1931,7 +1931,7 @@ fn copy_impl_accepts_nested_conditional_copy_fields() {
 #[test]
 fn enum_match_lowers_variants_guards_bindings_and_values() {
     let result = compile(
-        r#"
+        r"
             enum Message {
                 Quit,
                 Number(i32),
@@ -1951,7 +1951,7 @@ fn enum_match_lowers_variants_guards_bindings_and_values() {
                 let pair = Message::Pair { right: 22, left: 20 };
                 select(pair)
             }
-            "#,
+            ",
     );
 
     assert!(
@@ -1970,7 +1970,7 @@ fn enum_match_lowers_variants_guards_bindings_and_values() {
 #[test]
 fn enum_constructor_uses_the_flattened_payload_offset() {
     let result = compile(
-        r#"
+        r"
             enum Value {
                 First(i32),
                 Second(i32),
@@ -1982,7 +1982,7 @@ fn enum_constructor_uses_the_flattened_payload_offset() {
                     Value::Second(value) => value,
                 }
             }
-            "#,
+            ",
     );
 
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);
@@ -2028,7 +2028,7 @@ fn literal_match_preserves_values_and_string_comparison() {
 #[test]
 fn non_exhaustive_enum_match_is_rejected() {
     let result = compile(
-        r#"
+        r"
             enum State { Ready, Done }
 
             fun main() -> i32 {
@@ -2036,7 +2036,7 @@ fn non_exhaustive_enum_match_is_rejected() {
                     State::Ready => 1,
                 }
             }
-            "#,
+            ",
     );
 
     assert!(!result.success());
@@ -2054,7 +2054,7 @@ fn non_exhaustive_enum_match_is_rejected() {
 #[test]
 fn unit_return_does_not_hide_non_exhaustive_payload_match() {
     let result = compile(
-        r#"
+        r"
             enum State { Ready, Done(i32) }
 
             fun consume(state: State) {
@@ -2067,7 +2067,7 @@ fn unit_return_does_not_hide_non_exhaustive_payload_match() {
             fun main() {
                 consume(State::Ready);
             }
-        "#,
+        ",
     );
 
     assert!(!result.success());
@@ -2092,7 +2092,7 @@ fn unit_return_does_not_hide_non_exhaustive_payload_match() {
 #[test]
 fn std_modules_expose_core_items() {
     let result = compile(
-        r#"
+        r"
             use std::ops::Range;
             use std::vector::Vector;
 
@@ -2102,7 +2102,7 @@ fn std_modules_expose_core_items() {
                 let first = iter.next();
                 let values: Vector<i32> = Vector::new();
             }
-            "#,
+            ",
     );
 
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);
@@ -2111,7 +2111,7 @@ fn std_modules_expose_core_items() {
 #[test]
 fn std_array_into_iterator_accepts_non_copy_items() {
     let result = compile(
-        r#"
+        r"
             struct Token {
                 value: i32,
             }
@@ -2125,7 +2125,7 @@ fn std_array_into_iterator_accepts_non_copy_items() {
                     let next = item.value + 1;
                 }
             }
-            "#,
+            ",
     );
 
     assert!(
@@ -2139,7 +2139,7 @@ fn std_array_into_iterator_accepts_non_copy_items() {
 #[test]
 fn std_range_for_loop_lowers_to_mir_loop() {
     let result = compile(
-        r#"
+        r"
             use std::ops::range;
 
             fun main() {
@@ -2148,7 +2148,7 @@ fn std_range_for_loop_lowers_to_mir_loop() {
                     sum += item;
                 }
             }
-            "#,
+            ",
     );
 
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);

@@ -1,6 +1,8 @@
 use crate::func::Function;
-use crate::instr::*;
-use crate::types::*;
+use crate::instr::{
+    BinOp, CastOp, CmpOp, ConstValue, FloatWidth, Inst, InstKind, IntWidth, Terminator, UnOp,
+};
+use crate::types::{FloatTy, IntTy, Type};
 use crate::value::{BlockId, FuncRef, Value};
 
 /// Convenience API for constructing MIR functions.
@@ -13,7 +15,7 @@ pub struct Builder<'f> {
 }
 
 impl<'f> Builder<'f> {
-    pub fn new(func: &'f mut Function) -> Self {
+    pub const fn new(func: &'f mut Function) -> Self {
         let entry = func.entry;
         Self {
             func,
@@ -21,7 +23,7 @@ impl<'f> Builder<'f> {
         }
     }
 
-    pub fn switch_to_block(&mut self, block: BlockId) {
+    pub const fn switch_to_block(&mut self, block: BlockId) {
         self.current_block = block;
     }
 
@@ -200,6 +202,7 @@ impl<'f> Builder<'f> {
     }
 
     /// Returns true if the current block has no terminator yet.
+    #[must_use]
     pub fn needs_return(&self) -> bool {
         matches!(
             self.func.blocks[self.current_block].terminator,
@@ -220,7 +223,7 @@ impl<'f> Builder<'f> {
     }
 }
 
-fn int_to_width(ty: IntTy) -> IntWidth {
+const fn int_to_width(ty: IntTy) -> IntWidth {
     match ty {
         IntTy::I8 | IntTy::U8 => IntWidth::I8,
         IntTy::I16 | IntTy::U16 => IntWidth::I16,
@@ -229,7 +232,7 @@ fn int_to_width(ty: IntTy) -> IntWidth {
     }
 }
 
-fn float_to_width(ty: FloatTy) -> FloatWidth {
+const fn float_to_width(ty: FloatTy) -> FloatWidth {
     match ty {
         FloatTy::F32 => FloatWidth::F32,
         FloatTy::F64 => FloatWidth::F64,

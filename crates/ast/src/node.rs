@@ -131,20 +131,23 @@ impl Root {
 // ── Statements ─────────────────────────────────────────────────────────
 
 impl ModDecl {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
     /// Returns `None` for `mod foo;` and the nested items for `mod foo { ... }`.
+    #[must_use]
     pub fn items(&self) -> Option<impl Iterator<Item = Stmt> + '_> {
         let has_brace = self
             .syntax
             .children_with_tokens()
-            .filter_map(|it| it.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .any(|t| t.kind() == SyntaxKind::LBrace);
         if has_brace {
             Some(support::children::<Stmt>(&self.syntax))
@@ -155,25 +158,29 @@ impl ModDecl {
 }
 
 impl UseDecl {
+    #[must_use]
     pub fn use_tree(&self) -> Option<UseTree> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 }
 
 impl UseTree {
+    #[must_use]
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn alias(&self) -> Option<SyntaxToken> {
         let mut iter = self
             .syntax
             .children_with_tokens()
-            .filter_map(|it| it.into_token());
+            .filter_map(rowan::NodeOrToken::into_token);
         while let Some(t) = iter.next() {
             if t.kind() == SyntaxKind::As {
                 return iter.find(|t| t.kind() == SyntaxKind::Ident);
@@ -182,13 +189,15 @@ impl UseTree {
         None
     }
 
+    #[must_use]
     pub fn is_glob(&self) -> bool {
         self.syntax
             .children_with_tokens()
-            .filter_map(|it| it.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .any(|t| t.kind() == SyntaxKind::Star)
     }
 
+    #[must_use]
     pub fn subtree_list(&self) -> Option<UseTreeList> {
         support::child(&self.syntax)
     }
@@ -201,16 +210,18 @@ impl UseTreeList {
 }
 
 impl Attribute {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn string_value(&self) -> Option<String> {
         let mut after_eq = false;
         for token in self
             .syntax
             .children_with_tokens()
-            .filter_map(|it| it.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
         {
             if token.kind() == SyntaxKind::Eq {
                 after_eq = true;
@@ -223,21 +234,24 @@ impl Attribute {
         None
     }
 
+    #[must_use]
     pub fn raw_text(&self) -> String {
         self.syntax.text().to_string()
     }
 }
 
 impl MacroCall {
+    #[must_use]
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn delimiter_tokens(&self) -> Option<(SyntaxToken, SyntaxToken)> {
         let tokens = self
             .syntax
             .children_with_tokens()
-            .filter_map(|element| element.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .collect::<Vec<_>>();
         let opening = tokens.iter().find(|token| {
             matches!(
@@ -259,6 +273,7 @@ impl MacroCall {
     }
 }
 
+#[must_use]
 pub fn attrs_for_node(node: &SyntaxNode) -> Vec<Attribute> {
     let Some(parent) = node.parent() else {
         return Vec::new();
@@ -271,9 +286,8 @@ pub fn attrs_for_node(node: &SyntaxNode) -> Vec<Attribute> {
             rowan::NodeOrToken::Node(candidate) if candidate.kind() == SyntaxKind::Attribute => {
                 pending.push(Attribute { syntax: candidate });
             }
-            rowan::NodeOrToken::Node(_) => pending.clear(),
             rowan::NodeOrToken::Token(token) if token.kind().is_trivia() => {}
-            rowan::NodeOrToken::Token(_) => pending.clear(),
+            rowan::NodeOrToken::Node(_) | rowan::NodeOrToken::Token(_) => pending.clear(),
         }
     }
 
@@ -317,104 +331,127 @@ fn raw_string_body(text: &str) -> Option<&str> {
 impl VarDecl {
     /// The bound pattern. `let x = 1` yields a binding pattern, so mutability
     /// and destructuring both live here rather than on the statement.
+    #[must_use]
     pub fn pattern(&self) -> Option<Pattern> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn init(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 }
 
 impl FuncDecl {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    #[must_use]
     pub fn is_unsafe(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Unsafe).is_some()
     }
 
+    #[must_use]
     pub fn is_safe(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Safe).is_some()
     }
 
+    #[must_use]
     pub fn generic_params(&self) -> Option<GenericParams> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn where_clause(&self) -> Option<WhereClause> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn param_list(&self) -> Option<ParamList> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn return_type(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn body(&self) -> Option<Block> {
         support::child(&self.syntax)
     }
 }
 
 impl ReturnStmt {
+    #[must_use]
     pub fn value(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 }
 
 impl ExprStmt {
+    #[must_use]
     pub fn expr(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 }
 
 impl StructDecl {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    #[must_use]
     pub fn generic_params(&self) -> Option<GenericParams> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn where_clause(&self) -> Option<WhereClause> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn field_list(&self) -> Option<StructFieldList> {
         support::child(&self.syntax)
     }
 }
 
 impl EnumDecl {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    #[must_use]
     pub fn generic_params(&self) -> Option<GenericParams> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn where_clause(&self) -> Option<WhereClause> {
         support::child(&self.syntax)
     }
@@ -425,6 +462,7 @@ impl EnumDecl {
 }
 
 impl EnumVariant {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
@@ -433,24 +471,29 @@ impl EnumVariant {
         support::children(&self.syntax)
     }
 
+    #[must_use]
     pub fn field_list(&self) -> Option<StructFieldList> {
         support::child(&self.syntax)
     }
 }
 
 impl TraitDecl {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    #[must_use]
     pub fn generic_params(&self) -> Option<GenericParams> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn supertraits(&self) -> Vec<GenericBound> {
         let elements = self.syntax.children_with_tokens().collect::<Vec<_>>();
         let Some(colon) = elements.iter().position(
@@ -477,30 +520,36 @@ impl TraitDecl {
 }
 
 impl ImplDecl {
+    #[must_use]
     pub fn generic_params(&self) -> Option<GenericParams> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn where_clause(&self) -> Option<WhereClause> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn self_type(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn trait_type(&self) -> Option<Type> {
         support::nth_child(&self.syntax, 1)
     }
 
+    #[must_use]
     pub fn has_for(&self) -> bool {
         self.syntax
             .children_with_tokens()
-            .filter_map(|it| it.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .any(|token| token.kind() == SyntaxKind::For)
     }
 
@@ -518,32 +567,39 @@ impl ImplDecl {
 }
 
 impl ConstDecl {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    #[must_use]
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn value(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 }
 
 impl TypeAliasDecl {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    #[must_use]
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
@@ -557,7 +613,7 @@ impl GenericParams {
         let mut seen_outer_less = false;
 
         for element in self.syntax.children_with_tokens() {
-            match element.as_token().map(|token| token.kind()) {
+            match element.as_token().map(rowan::SyntaxToken::kind) {
                 Some(SyntaxKind::Less) if !seen_outer_less => {
                     seen_outer_less = true;
                 }
@@ -729,10 +785,10 @@ fn parse_bound_type_args(elements: &[SyntaxElement]) -> Vec<Type> {
 fn top_level_token(elements: &[SyntaxElement], target: SyntaxKind) -> Option<usize> {
     let mut depth = 0usize;
     for (index, element) in elements.iter().enumerate() {
-        match element.as_token().map(|token| token.kind()) {
+        match element.as_token().map(rowan::SyntaxToken::kind) {
             Some(SyntaxKind::Less | SyntaxKind::LParen | SyntaxKind::LBracket) => depth += 1,
             Some(SyntaxKind::Greater | SyntaxKind::RParen | SyntaxKind::RBracket) => {
-                depth = depth.saturating_sub(1)
+                depth = depth.saturating_sub(1);
             }
             Some(kind) if kind == target && depth == 0 => return Some(index),
             _ => {}
@@ -786,7 +842,7 @@ fn split_elements(elements: &[SyntaxElement], separator: SyntaxKind) -> Vec<Vec<
     let mut current = Vec::new();
     let mut depth = 0usize;
     for element in elements {
-        match element.as_token().map(|token| token.kind()) {
+        match element.as_token().map(rowan::SyntaxToken::kind) {
             Some(SyntaxKind::Less | SyntaxKind::LParen | SyntaxKind::LBracket) => {
                 depth += 1;
                 current.push(element.clone());
@@ -818,8 +874,7 @@ fn next_non_trivia(elements: &[SyntaxElement], start: usize) -> Option<usize> {
         .find_map(|(index, element)| {
             let is_trivia = element
                 .as_token()
-                .map(|token| token.kind().is_trivia())
-                .unwrap_or(false);
+                .is_some_and(|token| token.kind().is_trivia());
             (!is_trivia).then_some(index)
         })
 }
@@ -831,16 +886,19 @@ impl Block {
         support::children(&self.syntax)
     }
 
+    #[must_use]
     pub fn tail_expr(&self) -> Option<Expr> {
         support::last_child(&self.syntax)
     }
 }
 
 impl LambdaExpr {
+    #[must_use]
     pub fn is_move(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Move).is_some()
     }
 
+    #[must_use]
     pub fn param_list(&self) -> Option<ParamList> {
         support::child(&self.syntax)
     }
@@ -853,16 +911,19 @@ impl LambdaExpr {
             .find_map(Type::cast)
     }
 
+    #[must_use]
     pub fn body(&self) -> Option<Block> {
         support::child(&self.syntax)
     }
 }
 
 impl IfStmt {
+    #[must_use]
     pub fn condition(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn then_branch(&self) -> Option<Block> {
         support::child(&self.syntax)
     }
@@ -871,7 +932,7 @@ impl IfStmt {
         if let Some(else_block) = support::nth_child::<Block>(&self.syntax, 1) {
             return Some(ElseBranch::Block(else_block));
         }
-        let if_stmt: Option<IfStmt> = support::child(&self.syntax);
+        let if_stmt: Option<Self> = support::child(&self.syntax);
         if_stmt.map(ElseBranch::IfStmt)
     }
 }
@@ -883,38 +944,46 @@ pub enum ElseBranch {
 }
 
 impl WhileStmt {
+    #[must_use]
     pub fn condition(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn body(&self) -> Option<Block> {
         support::child(&self.syntax)
     }
 }
 
 impl ForExpr {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn iterable(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn body(&self) -> Option<Block> {
         support::child(&self.syntax)
     }
 }
 
 impl BinaryExpr {
+    #[must_use]
     pub fn lhs(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn rhs(&self) -> Option<Expr> {
         support::nth_child(&self.syntax, 1)
     }
 
+    #[must_use]
     pub fn op_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, |kind| {
             matches!(
@@ -954,10 +1023,12 @@ impl BinaryExpr {
 }
 
 impl UnaryExpr {
+    #[must_use]
     pub fn operand(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn op_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, |kind| {
             matches!(
@@ -972,15 +1043,17 @@ impl UnaryExpr {
         })
     }
 
+    #[must_use]
     pub fn is_mut(&self) -> bool {
         self.syntax
             .children_with_tokens()
-            .filter_map(|e| e.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .any(|t| t.kind() == SyntaxKind::Mut)
     }
 }
 
 impl ParenExpr {
+    #[must_use]
     pub fn inner(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
@@ -989,12 +1062,14 @@ impl ParenExpr {
         support::children(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_tuple(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Comma).is_some()
     }
 }
 
 impl CallExpr {
+    #[must_use]
     pub fn callee(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
@@ -1007,6 +1082,7 @@ impl CallExpr {
             .unwrap_or_default()
     }
 
+    #[must_use]
     pub fn arg_list(&self) -> Option<ArgList> {
         support::child(&self.syntax)
     }
@@ -1019,10 +1095,12 @@ impl ArgList {
 }
 
 impl FieldExpr {
+    #[must_use]
     pub fn base(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn field_name(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, |kind| {
             matches!(kind, SyntaxKind::Ident | SyntaxKind::Number)
@@ -1031,16 +1109,19 @@ impl FieldExpr {
 }
 
 impl IndexExpr {
+    #[must_use]
     pub fn base(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn index(&self) -> Option<Expr> {
         support::nth_child(&self.syntax, 1)
     }
 }
 
 impl StructExpr {
+    #[must_use]
     pub fn path(&self) -> Option<Path> {
         support::child::<NameRefExpr>(&self.syntax)?.path()
     }
@@ -1059,16 +1140,19 @@ impl StructExpr {
 }
 
 impl StructExprField {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn value(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 }
 
 impl MatchExpr {
+    #[must_use]
     pub fn scrutinee(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
@@ -1079,16 +1163,19 @@ impl MatchExpr {
 }
 
 impl MatchArm {
+    #[must_use]
     pub fn pattern(&self) -> Option<Pattern> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn guard(&self) -> Option<Expr> {
         let mut exprs = support::children::<Expr>(&self.syntax);
         let first = exprs.next();
         if exprs.next().is_some() { first } else { None }
     }
 
+    #[must_use]
     pub fn body(&self) -> Option<Expr> {
         support::last_child(&self.syntax)
     }
@@ -1099,38 +1186,41 @@ impl ArrayExpr {
         support::children(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_repeat(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Semi).is_some()
     }
 
+    #[must_use]
     pub fn repeat_value(&self) -> Option<Expr> {
         support::nth_child(&self.syntax, 0)
     }
 
+    #[must_use]
     pub fn repeat_len(&self) -> Option<Expr> {
         support::nth_child(&self.syntax, 1)
     }
 }
 
 impl NumberExpr {
+    #[must_use]
     pub fn value_token(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Number)
     }
 
+    #[must_use]
     pub fn value(&self) -> Option<u64> {
         let text = self.value_token()?;
         let text = text.text();
         let text_no_underscores: String = text.chars().filter(|&c| c != '_').collect();
         let text = &text_no_underscores;
-        let (radix, digits) = if let Some(rest) = text.strip_prefix("0x") {
-            (16, rest)
-        } else if let Some(rest) = text.strip_prefix("0o") {
-            (8, rest)
-        } else if let Some(rest) = text.strip_prefix("0b") {
-            (2, rest)
-        } else {
-            (10, text.as_str())
+        let (radix, prefix_len) = match text.as_bytes() {
+            [b'0', b'x', ..] => (16, 2),
+            [b'0', b'o', ..] => (8, 2),
+            [b'0', b'b', ..] => (2, 2),
+            _ => (10, 0),
         };
+        let digits = &text[prefix_len..];
         let is_digit = |ch: char| match radix {
             16 => ch.is_ascii_hexdigit(),
             _ => ch.is_ascii_digit(),
@@ -1143,10 +1233,12 @@ impl NumberExpr {
 }
 
 impl FloatLitExpr {
+    #[must_use]
     pub fn value_token(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Float)
     }
 
+    #[must_use]
     pub fn value(&self) -> Option<f64> {
         let text = self.value_token()?;
         let text = text.text();
@@ -1159,18 +1251,21 @@ impl FloatLitExpr {
 }
 
 impl StringLitExpr {
+    #[must_use]
     pub fn value_token(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::String)
     }
 }
 
 impl CharLitExpr {
+    #[must_use]
     pub fn value_token(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Char)
     }
 }
 
 impl BoolLitExpr {
+    #[must_use]
     pub fn value(&self) -> Option<bool> {
         let t = support::token(&self.syntax, |k| {
             matches!(k, SyntaxKind::True | SyntaxKind::False)
@@ -1180,28 +1275,33 @@ impl BoolLitExpr {
 }
 
 impl NameRefExpr {
+    #[must_use]
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
 }
 
 impl UnsafeExpr {
+    #[must_use]
     pub fn body(&self) -> Option<Block> {
         support::child(&self.syntax)
     }
 }
 
 impl CastExpr {
+    #[must_use]
     pub fn base(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 }
 
 impl TryExpr {
+    #[must_use]
     pub fn operand(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
@@ -1214,6 +1314,7 @@ impl Path {
         support::children(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_absolute(&self) -> bool {
         self.syntax
             .children_with_tokens()
@@ -1221,13 +1322,13 @@ impl Path {
                 rowan::NodeOrToken::Node(_) => true,
                 rowan::NodeOrToken::Token(t) => !t.kind().is_trivia(),
             })
-            .and_then(|it| it.into_token())
-            .map(|t| t.kind() == SyntaxKind::ColonColon)
-            .unwrap_or(false)
+            .and_then(rowan::NodeOrToken::into_token)
+            .is_some_and(|t| t.kind() == SyntaxKind::ColonColon)
     }
 }
 
 impl PathSegment {
+    #[must_use]
     pub fn name_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, |k| {
             matches!(
@@ -1249,6 +1350,7 @@ impl PathSegment {
 // ── Types ──────────────────────────────────────────────────────────────
 
 impl NamedType {
+    #[must_use]
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
@@ -1269,27 +1371,31 @@ impl TypeArgList {
 }
 
 impl RefType {
+    #[must_use]
     pub fn inner(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_mut(&self) -> bool {
         self.syntax
             .children_with_tokens()
-            .filter_map(|e| e.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .any(|t| t.kind() == SyntaxKind::Mut)
     }
 }
 
 impl PtrType {
+    #[must_use]
     pub fn inner(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_mut(&self) -> bool {
         self.syntax
             .children_with_tokens()
-            .filter_map(|e| e.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .any(|t| t.kind() == SyntaxKind::Mut)
     }
 }
@@ -1301,16 +1407,19 @@ impl TupleType {
 }
 
 impl ArrayType {
+    #[must_use]
     pub fn element(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn len_expr(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
 }
 
 impl ConstType {
+    #[must_use]
     pub fn value(&self) -> Option<usize> {
         support::token_of(&self.syntax, SyntaxKind::Number)?
             .text()
@@ -1320,6 +1429,7 @@ impl ConstType {
 }
 
 impl ImplTraitType {
+    #[must_use]
     pub fn bound(&self) -> Option<GenericBound> {
         let elements = self.syntax.children_with_tokens().collect::<Vec<_>>();
         parse_generic_bounds(&elements).into_iter().next()
@@ -1333,6 +1443,7 @@ impl CallableTraitArgs {
             .filter(move |ty: &Type| Some(ty.syntax().text_range()) != ret)
     }
 
+    #[must_use]
     pub fn return_type(&self) -> Option<Type> {
         support::last_child(&self.syntax)
     }
@@ -1341,6 +1452,7 @@ impl CallableTraitArgs {
 // ── Patterns ───────────────────────────────────────────────────────────
 
 impl LiteralPat {
+    #[must_use]
     pub fn literal_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, |k| {
             matches!(
@@ -1363,20 +1475,24 @@ impl TuplePat {
 }
 
 impl StructPattern {
+    #[must_use]
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn sub_pattern(&self) -> Option<Pattern> {
         support::child(&self.syntax)
     }
 }
 
 impl EnumPattern {
+    #[must_use]
     pub fn path(&self) -> Option<Path> {
         support::child(&self.syntax)
     }
@@ -1385,10 +1501,12 @@ impl EnumPattern {
         support::children(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_tuple(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::LParen).is_some()
     }
 
+    #[must_use]
     pub fn is_struct(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::LBrace).is_some()
     }
@@ -1407,24 +1525,29 @@ impl ParamList {
 }
 
 impl Param {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, |k| {
             matches!(k, SyntaxKind::Ident | SyntaxKind::SelfKw)
         })
     }
 
+    #[must_use]
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_self_receiver(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::SelfKw).is_some()
     }
 
+    #[must_use]
     pub fn is_ref(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Amp).is_some()
     }
 
+    #[must_use]
     pub fn is_mut(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Mut).is_some()
     }
@@ -1437,14 +1560,17 @@ impl StructFieldList {
 }
 
 impl StructField {
+    #[must_use]
     pub fn is_pub(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Pub).is_some()
     }
 
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn ty(&self) -> Option<Type> {
         support::child(&self.syntax)
     }
@@ -1459,10 +1585,12 @@ impl ExternBlock {
 }
 
 impl ExternFnDecl {
+    #[must_use]
     pub fn is_unsafe(&self) -> bool {
         support::token_of(&self.syntax, SyntaxKind::Unsafe).is_some()
     }
 
+    #[must_use]
     pub fn func_decl(&self) -> Option<FuncDecl> {
         support::child(&self.syntax)
     }
@@ -1488,57 +1616,62 @@ pub enum Pattern {
 impl AstNode for Pattern {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
-            SyntaxKind::WildcardPattern => Some(Pattern::Wildcard(WildcardPat { syntax: node })),
-            SyntaxKind::LiteralPattern => Some(Pattern::Literal(LiteralPat { syntax: node })),
-            SyntaxKind::TuplePattern => Some(Pattern::Tuple(TuplePat { syntax: node })),
-            SyntaxKind::StructPattern => Some(Pattern::Struct(StructPattern { syntax: node })),
-            SyntaxKind::EnumPattern => Some(Pattern::Enum(EnumPattern { syntax: node })),
-            SyntaxKind::BindingPattern => Some(Pattern::Binding(BindingPat { syntax: node })),
-            SyntaxKind::ReferencePattern => Some(Pattern::Reference(ReferencePat { syntax: node })),
+            SyntaxKind::WildcardPattern => Some(Self::Wildcard(WildcardPat { syntax: node })),
+            SyntaxKind::LiteralPattern => Some(Self::Literal(LiteralPat { syntax: node })),
+            SyntaxKind::TuplePattern => Some(Self::Tuple(TuplePat { syntax: node })),
+            SyntaxKind::StructPattern => Some(Self::Struct(StructPattern { syntax: node })),
+            SyntaxKind::EnumPattern => Some(Self::Enum(EnumPattern { syntax: node })),
+            SyntaxKind::BindingPattern => Some(Self::Binding(BindingPat { syntax: node })),
+            SyntaxKind::ReferencePattern => Some(Self::Reference(ReferencePat { syntax: node })),
             _ => None,
         }
     }
 
     fn syntax(&self) -> &SyntaxNode {
         match self {
-            Pattern::Wildcard(it) => it.syntax(),
-            Pattern::Literal(it) => it.syntax(),
-            Pattern::Tuple(it) => it.syntax(),
-            Pattern::Struct(it) => it.syntax(),
-            Pattern::Enum(it) => it.syntax(),
-            Pattern::Binding(it) => it.syntax(),
-            Pattern::Reference(it) => it.syntax(),
+            Self::Wildcard(it) => it.syntax(),
+            Self::Literal(it) => it.syntax(),
+            Self::Tuple(it) => it.syntax(),
+            Self::Struct(it) => it.syntax(),
+            Self::Enum(it) => it.syntax(),
+            Self::Binding(it) => it.syntax(),
+            Self::Reference(it) => it.syntax(),
         }
     }
 }
 
 impl ReferencePat {
+    #[must_use]
     pub fn pattern(&self) -> Option<Pattern> {
         support::child(&self.syntax)
     }
 
+    #[must_use]
     pub fn is_mut(&self) -> bool {
         self.syntax
             .children_with_tokens()
-            .filter_map(|element| element.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .any(|token| token.kind() == SyntaxKind::Mut)
     }
 }
 
 impl BindingPat {
+    #[must_use]
     pub fn name(&self) -> Option<SyntaxToken> {
         support::token_of(&self.syntax, SyntaxKind::Ident)
     }
 
+    #[must_use]
     pub fn is_mut(&self) -> bool {
         self.syntax
             .children_with_tokens()
-            .filter_map(|element| element.into_token())
+            .filter_map(rowan::NodeOrToken::into_token)
             .any(|token| token.kind() == SyntaxKind::Mut)
     }
 }
 
 impl Pattern {
+    #[must_use]
     pub fn cast(node: SyntaxNode) -> Option<Self> {
         <Self as AstNode>::cast(node)
     }
@@ -1569,49 +1702,50 @@ pub enum Stmt {
 impl AstNode for Stmt {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
-            SyntaxKind::VarDecl => Some(Stmt::VarDecl(VarDecl { syntax: node })),
-            SyntaxKind::FuncDecl => Some(Stmt::FuncDecl(FuncDecl { syntax: node })),
-            SyntaxKind::StructDecl => Some(Stmt::StructDecl(StructDecl { syntax: node })),
-            SyntaxKind::EnumDecl => Some(Stmt::EnumDecl(EnumDecl { syntax: node })),
-            SyntaxKind::TraitDecl => Some(Stmt::TraitDecl(TraitDecl { syntax: node })),
-            SyntaxKind::ImplDecl => Some(Stmt::ImplDecl(ImplDecl { syntax: node })),
-            SyntaxKind::ConstDecl => Some(Stmt::ConstDecl(ConstDecl { syntax: node })),
-            SyntaxKind::TypeAliasDecl => Some(Stmt::TypeAliasDecl(TypeAliasDecl { syntax: node })),
-            SyntaxKind::BreakStmt => Some(Stmt::BreakStmt(BreakStmt { syntax: node })),
-            SyntaxKind::ContinueStmt => Some(Stmt::ContinueStmt(ContinueStmt { syntax: node })),
-            SyntaxKind::ReturnStmt => Some(Stmt::ReturnStmt(ReturnStmt { syntax: node })),
-            SyntaxKind::ExprStmt => Some(Stmt::ExprStmt(ExprStmt { syntax: node })),
-            SyntaxKind::ModDecl => Some(Stmt::ModDecl(ModDecl { syntax: node })),
-            SyntaxKind::UseDecl => Some(Stmt::UseDecl(UseDecl { syntax: node })),
-            SyntaxKind::ExternBlock => Some(Stmt::ExternBlock(ExternBlock { syntax: node })),
-            SyntaxKind::ExternFnDecl => Some(Stmt::ExternFnDecl(ExternFnDecl { syntax: node })),
+            SyntaxKind::VarDecl => Some(Self::VarDecl(VarDecl { syntax: node })),
+            SyntaxKind::FuncDecl => Some(Self::FuncDecl(FuncDecl { syntax: node })),
+            SyntaxKind::StructDecl => Some(Self::StructDecl(StructDecl { syntax: node })),
+            SyntaxKind::EnumDecl => Some(Self::EnumDecl(EnumDecl { syntax: node })),
+            SyntaxKind::TraitDecl => Some(Self::TraitDecl(TraitDecl { syntax: node })),
+            SyntaxKind::ImplDecl => Some(Self::ImplDecl(ImplDecl { syntax: node })),
+            SyntaxKind::ConstDecl => Some(Self::ConstDecl(ConstDecl { syntax: node })),
+            SyntaxKind::TypeAliasDecl => Some(Self::TypeAliasDecl(TypeAliasDecl { syntax: node })),
+            SyntaxKind::BreakStmt => Some(Self::BreakStmt(BreakStmt { syntax: node })),
+            SyntaxKind::ContinueStmt => Some(Self::ContinueStmt(ContinueStmt { syntax: node })),
+            SyntaxKind::ReturnStmt => Some(Self::ReturnStmt(ReturnStmt { syntax: node })),
+            SyntaxKind::ExprStmt => Some(Self::ExprStmt(ExprStmt { syntax: node })),
+            SyntaxKind::ModDecl => Some(Self::ModDecl(ModDecl { syntax: node })),
+            SyntaxKind::UseDecl => Some(Self::UseDecl(UseDecl { syntax: node })),
+            SyntaxKind::ExternBlock => Some(Self::ExternBlock(ExternBlock { syntax: node })),
+            SyntaxKind::ExternFnDecl => Some(Self::ExternFnDecl(ExternFnDecl { syntax: node })),
             _ => None,
         }
     }
 
     fn syntax(&self) -> &SyntaxNode {
         match self {
-            Stmt::VarDecl(it) => it.syntax(),
-            Stmt::FuncDecl(it) => it.syntax(),
-            Stmt::StructDecl(it) => it.syntax(),
-            Stmt::EnumDecl(it) => it.syntax(),
-            Stmt::TraitDecl(it) => it.syntax(),
-            Stmt::ImplDecl(it) => it.syntax(),
-            Stmt::ConstDecl(it) => it.syntax(),
-            Stmt::TypeAliasDecl(it) => it.syntax(),
-            Stmt::BreakStmt(it) => it.syntax(),
-            Stmt::ContinueStmt(it) => it.syntax(),
-            Stmt::ReturnStmt(it) => it.syntax(),
-            Stmt::ExprStmt(it) => it.syntax(),
-            Stmt::ModDecl(it) => it.syntax(),
-            Stmt::UseDecl(it) => it.syntax(),
-            Stmt::ExternBlock(it) => it.syntax(),
-            Stmt::ExternFnDecl(it) => it.syntax(),
+            Self::VarDecl(it) => it.syntax(),
+            Self::FuncDecl(it) => it.syntax(),
+            Self::StructDecl(it) => it.syntax(),
+            Self::EnumDecl(it) => it.syntax(),
+            Self::TraitDecl(it) => it.syntax(),
+            Self::ImplDecl(it) => it.syntax(),
+            Self::ConstDecl(it) => it.syntax(),
+            Self::TypeAliasDecl(it) => it.syntax(),
+            Self::BreakStmt(it) => it.syntax(),
+            Self::ContinueStmt(it) => it.syntax(),
+            Self::ReturnStmt(it) => it.syntax(),
+            Self::ExprStmt(it) => it.syntax(),
+            Self::ModDecl(it) => it.syntax(),
+            Self::UseDecl(it) => it.syntax(),
+            Self::ExternBlock(it) => it.syntax(),
+            Self::ExternFnDecl(it) => it.syntax(),
         }
     }
 }
 
 impl Stmt {
+    #[must_use]
     pub fn cast(node: SyntaxNode) -> Option<Self> {
         <Self as AstNode>::cast(node)
     }
@@ -1649,63 +1783,64 @@ pub enum Expr {
 impl AstNode for Expr {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
-            SyntaxKind::BinaryExpr => Some(Expr::BinaryExpr(BinaryExpr { syntax: node })),
-            SyntaxKind::UnaryExpr => Some(Expr::UnaryExpr(UnaryExpr { syntax: node })),
-            SyntaxKind::ParenExpr => Some(Expr::ParenExpr(ParenExpr { syntax: node })),
-            SyntaxKind::CallExpr => Some(Expr::CallExpr(CallExpr { syntax: node })),
-            SyntaxKind::LambdaExpr => Some(Expr::LambdaExpr(LambdaExpr { syntax: node })),
-            SyntaxKind::FieldExpr => Some(Expr::FieldExpr(FieldExpr { syntax: node })),
-            SyntaxKind::IndexExpr => Some(Expr::IndexExpr(IndexExpr { syntax: node })),
-            SyntaxKind::StructExpr => Some(Expr::StructExpr(StructExpr { syntax: node })),
-            SyntaxKind::Block => Some(Expr::Block(Block { syntax: node })),
-            SyntaxKind::IfStmt => Some(Expr::IfStmt(IfStmt { syntax: node })),
-            SyntaxKind::WhileStmt => Some(Expr::WhileStmt(WhileStmt { syntax: node })),
-            SyntaxKind::ForExpr => Some(Expr::ForExpr(ForExpr { syntax: node })),
-            SyntaxKind::MatchExpr => Some(Expr::MatchExpr(MatchExpr { syntax: node })),
-            SyntaxKind::ArrayExpr => Some(Expr::ArrayExpr(ArrayExpr { syntax: node })),
-            SyntaxKind::NumberLit => Some(Expr::Number(NumberExpr { syntax: node })),
-            SyntaxKind::FloatLit => Some(Expr::Float(FloatLitExpr { syntax: node })),
-            SyntaxKind::StringLit => Some(Expr::StringLit(StringLitExpr { syntax: node })),
-            SyntaxKind::CharLit => Some(Expr::CharLit(CharLitExpr { syntax: node })),
-            SyntaxKind::BoolLit => Some(Expr::BoolLit(BoolLitExpr { syntax: node })),
-            SyntaxKind::UnsafeExpr => Some(Expr::UnsafeExpr(UnsafeExpr { syntax: node })),
-            SyntaxKind::CastExpr => Some(Expr::CastExpr(CastExpr { syntax: node })),
-            SyntaxKind::TryExpr => Some(Expr::TryExpr(TryExpr { syntax: node })),
-            SyntaxKind::NameRef => Some(Expr::NameRef(NameRefExpr { syntax: node })),
+            SyntaxKind::BinaryExpr => Some(Self::BinaryExpr(BinaryExpr { syntax: node })),
+            SyntaxKind::UnaryExpr => Some(Self::UnaryExpr(UnaryExpr { syntax: node })),
+            SyntaxKind::ParenExpr => Some(Self::ParenExpr(ParenExpr { syntax: node })),
+            SyntaxKind::CallExpr => Some(Self::CallExpr(CallExpr { syntax: node })),
+            SyntaxKind::LambdaExpr => Some(Self::LambdaExpr(LambdaExpr { syntax: node })),
+            SyntaxKind::FieldExpr => Some(Self::FieldExpr(FieldExpr { syntax: node })),
+            SyntaxKind::IndexExpr => Some(Self::IndexExpr(IndexExpr { syntax: node })),
+            SyntaxKind::StructExpr => Some(Self::StructExpr(StructExpr { syntax: node })),
+            SyntaxKind::Block => Some(Self::Block(Block { syntax: node })),
+            SyntaxKind::IfStmt => Some(Self::IfStmt(IfStmt { syntax: node })),
+            SyntaxKind::WhileStmt => Some(Self::WhileStmt(WhileStmt { syntax: node })),
+            SyntaxKind::ForExpr => Some(Self::ForExpr(ForExpr { syntax: node })),
+            SyntaxKind::MatchExpr => Some(Self::MatchExpr(MatchExpr { syntax: node })),
+            SyntaxKind::ArrayExpr => Some(Self::ArrayExpr(ArrayExpr { syntax: node })),
+            SyntaxKind::NumberLit => Some(Self::Number(NumberExpr { syntax: node })),
+            SyntaxKind::FloatLit => Some(Self::Float(FloatLitExpr { syntax: node })),
+            SyntaxKind::StringLit => Some(Self::StringLit(StringLitExpr { syntax: node })),
+            SyntaxKind::CharLit => Some(Self::CharLit(CharLitExpr { syntax: node })),
+            SyntaxKind::BoolLit => Some(Self::BoolLit(BoolLitExpr { syntax: node })),
+            SyntaxKind::UnsafeExpr => Some(Self::UnsafeExpr(UnsafeExpr { syntax: node })),
+            SyntaxKind::CastExpr => Some(Self::CastExpr(CastExpr { syntax: node })),
+            SyntaxKind::TryExpr => Some(Self::TryExpr(TryExpr { syntax: node })),
+            SyntaxKind::NameRef => Some(Self::NameRef(NameRefExpr { syntax: node })),
             _ => None,
         }
     }
 
     fn syntax(&self) -> &SyntaxNode {
         match self {
-            Expr::BinaryExpr(it) => it.syntax(),
-            Expr::UnaryExpr(it) => it.syntax(),
-            Expr::ParenExpr(it) => it.syntax(),
-            Expr::CallExpr(it) => it.syntax(),
-            Expr::LambdaExpr(it) => it.syntax(),
-            Expr::FieldExpr(it) => it.syntax(),
-            Expr::IndexExpr(it) => it.syntax(),
-            Expr::StructExpr(it) => it.syntax(),
-            Expr::Block(it) => it.syntax(),
-            Expr::IfStmt(it) => it.syntax(),
-            Expr::WhileStmt(it) => it.syntax(),
-            Expr::ForExpr(it) => it.syntax(),
-            Expr::MatchExpr(it) => it.syntax(),
-            Expr::ArrayExpr(it) => it.syntax(),
-            Expr::Number(it) => it.syntax(),
-            Expr::Float(it) => it.syntax(),
-            Expr::StringLit(it) => it.syntax(),
-            Expr::CharLit(it) => it.syntax(),
-            Expr::BoolLit(it) => it.syntax(),
-            Expr::NameRef(it) => it.syntax(),
-            Expr::UnsafeExpr(it) => it.syntax(),
-            Expr::CastExpr(it) => it.syntax(),
-            Expr::TryExpr(it) => it.syntax(),
+            Self::BinaryExpr(it) => it.syntax(),
+            Self::UnaryExpr(it) => it.syntax(),
+            Self::ParenExpr(it) => it.syntax(),
+            Self::CallExpr(it) => it.syntax(),
+            Self::LambdaExpr(it) => it.syntax(),
+            Self::FieldExpr(it) => it.syntax(),
+            Self::IndexExpr(it) => it.syntax(),
+            Self::StructExpr(it) => it.syntax(),
+            Self::Block(it) => it.syntax(),
+            Self::IfStmt(it) => it.syntax(),
+            Self::WhileStmt(it) => it.syntax(),
+            Self::ForExpr(it) => it.syntax(),
+            Self::MatchExpr(it) => it.syntax(),
+            Self::ArrayExpr(it) => it.syntax(),
+            Self::Number(it) => it.syntax(),
+            Self::Float(it) => it.syntax(),
+            Self::StringLit(it) => it.syntax(),
+            Self::CharLit(it) => it.syntax(),
+            Self::BoolLit(it) => it.syntax(),
+            Self::NameRef(it) => it.syntax(),
+            Self::UnsafeExpr(it) => it.syntax(),
+            Self::CastExpr(it) => it.syntax(),
+            Self::TryExpr(it) => it.syntax(),
         }
     }
 }
 
 impl Expr {
+    #[must_use]
     pub fn cast(node: SyntaxNode) -> Option<Self> {
         <Self as AstNode>::cast(node)
     }
@@ -1728,33 +1863,34 @@ pub enum Type {
 impl AstNode for Type {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
-            SyntaxKind::NeverType => Some(Type::Never(NeverType { syntax: node })),
-            SyntaxKind::RefType => Some(Type::Ref(RefType { syntax: node })),
-            SyntaxKind::NamedType => Some(Type::Named(NamedType { syntax: node })),
-            SyntaxKind::PtrType => Some(Type::Ptr(PtrType { syntax: node })),
-            SyntaxKind::TupleType => Some(Type::Tuple(TupleType { syntax: node })),
-            SyntaxKind::ArrayType => Some(Type::Array(ArrayType { syntax: node })),
-            SyntaxKind::ConstType => Some(Type::Const(ConstType { syntax: node })),
-            SyntaxKind::ImplTraitType => Some(Type::ImplTrait(ImplTraitType { syntax: node })),
+            SyntaxKind::NeverType => Some(Self::Never(NeverType { syntax: node })),
+            SyntaxKind::RefType => Some(Self::Ref(RefType { syntax: node })),
+            SyntaxKind::NamedType => Some(Self::Named(NamedType { syntax: node })),
+            SyntaxKind::PtrType => Some(Self::Ptr(PtrType { syntax: node })),
+            SyntaxKind::TupleType => Some(Self::Tuple(TupleType { syntax: node })),
+            SyntaxKind::ArrayType => Some(Self::Array(ArrayType { syntax: node })),
+            SyntaxKind::ConstType => Some(Self::Const(ConstType { syntax: node })),
+            SyntaxKind::ImplTraitType => Some(Self::ImplTrait(ImplTraitType { syntax: node })),
             _ => None,
         }
     }
 
     fn syntax(&self) -> &SyntaxNode {
         match self {
-            Type::Named(it) => it.syntax(),
-            Type::Never(it) => it.syntax(),
-            Type::Ref(it) => it.syntax(),
-            Type::Ptr(it) => it.syntax(),
-            Type::Tuple(it) => it.syntax(),
-            Type::Array(it) => it.syntax(),
-            Type::Const(it) => it.syntax(),
-            Type::ImplTrait(it) => it.syntax(),
+            Self::Named(it) => it.syntax(),
+            Self::Never(it) => it.syntax(),
+            Self::Ref(it) => it.syntax(),
+            Self::Ptr(it) => it.syntax(),
+            Self::Tuple(it) => it.syntax(),
+            Self::Array(it) => it.syntax(),
+            Self::Const(it) => it.syntax(),
+            Self::ImplTrait(it) => it.syntax(),
         }
     }
 }
 
 impl Type {
+    #[must_use]
     pub fn cast(node: SyntaxNode) -> Option<Self> {
         <Self as AstNode>::cast(node)
     }

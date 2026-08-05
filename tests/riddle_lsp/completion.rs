@@ -101,7 +101,7 @@ fn completion_keeps_private_imports_and_generics_in_type_positions() {
     let generic = "fun inspect<T>(value: T) {}";
     let generic_items = completion_items_for_source(
         generic,
-        position(generic, generic.rfind("T").unwrap() + 1),
+        position(generic, generic.rfind('T').unwrap() + 1),
         CompileOptions { use_std: false },
     );
     assert!(

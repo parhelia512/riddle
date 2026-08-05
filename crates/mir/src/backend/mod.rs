@@ -9,6 +9,10 @@ pub trait Backend {
     type Error: std::fmt::Debug;
 
     /// Compile an MIR module into target code (returned as a string).
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend-specific error when code generation fails.
     fn compile(&mut self, module: &Module) -> Result<String, Self::Error>;
 
     /// Human-readable name of the backend (for diagnostics / logging).

@@ -1,6 +1,10 @@
-use super::*;
+use super::{
+    BTreeMap, Body, BodyId, Builder, CapturePlace, CaptureSource, CmpOp, DropProjection, DropSlot,
+    Expr, ExprId, FuncRef, HashSet, IntTy, LowerCtx, Projection, ResolvedName,
+    RuntimeDropProjection, Type, UnOp, Value, closure_drop_function_type, closure_env_type,
+};
 
-impl<'a> LowerCtx<'a> {
+impl LowerCtx<'_> {
     pub(super) fn emit_current_drop_scope(&mut self, builder: &mut Builder) {
         if let Some(depth) = self.drop_scopes.len().checked_sub(1) {
             self.emit_drop_scopes_since(builder, depth);
@@ -115,7 +119,7 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    pub(super) fn drop_slot_flag_place(&self, _builder: &mut Builder, slot: &DropSlot) -> Value {
+    pub(super) const fn drop_slot_flag_place(_builder: &mut Builder, slot: &DropSlot) -> Value {
         slot.flag
     }
 
@@ -348,7 +352,7 @@ impl<'a> LowerCtx<'a> {
             .collect::<Vec<_>>();
         let flags = slots
             .iter()
-            .map(|slot| self.drop_slot_flag_place(builder, slot))
+            .map(|slot| Self::drop_slot_flag_place(builder, slot))
             .collect::<HashSet<_>>();
         for flag in flags {
             let inactive = builder.bconst(false);
@@ -370,7 +374,7 @@ impl<'a> LowerCtx<'a> {
             .collect::<Vec<_>>();
         let flags = slots
             .iter()
-            .map(|slot| self.drop_slot_flag_place(builder, slot))
+            .map(|slot| Self::drop_slot_flag_place(builder, slot))
             .collect::<HashSet<_>>();
         for flag in flags {
             let inactive = builder.bconst(false);
@@ -404,7 +408,7 @@ impl<'a> LowerCtx<'a> {
             .collect::<Vec<_>>();
         let flags = slots
             .iter()
-            .map(|slot| self.drop_slot_flag_place(builder, slot))
+            .map(|slot| Self::drop_slot_flag_place(builder, slot))
             .collect::<HashSet<_>>();
         for flag in flags {
             let inactive = builder.bconst(false);
@@ -448,7 +452,7 @@ impl<'a> LowerCtx<'a> {
                     return None;
                 };
                 let (source, mut projection) = self.drop_place_from_expr(body, *base)?;
-                projection.push(DropProjection::Index(value as usize));
+                projection.push(DropProjection::Index(usize::try_from(value).ok()?));
                 Some((source, projection))
             }
             _ => None,
@@ -475,7 +479,7 @@ impl<'a> LowerCtx<'a> {
                 };
                 let (temporary, mut projection) =
                     self.temporary_drop_place_from_expr(body, *base)?;
-                projection.push(DropProjection::Index(value as usize));
+                projection.push(DropProjection::Index(usize::try_from(value).ok()?));
                 Some((temporary, projection))
             }
             _ => self
@@ -543,7 +547,7 @@ impl<'a> LowerCtx<'a> {
                     _ => continue 'slots,
                 }
             }
-            let flag = self.drop_slot_flag_place(builder, slot);
+            let flag = Self::drop_slot_flag_place(builder, slot);
             flags_by_indices.entry(indices).or_default().insert(flag);
         }
         for (indices, flags) in flags_by_indices {
@@ -552,7 +556,7 @@ impl<'a> LowerCtx<'a> {
                 |condition, ((index_value, index_ty), expected_index)| {
                     let expected = builder.iconst(expected_index as u64, *index_ty);
                     let matches = builder.cmp(CmpOp::Eq, *index_value, expected);
-                    self.and_pattern_conditions(builder, condition, Some(matches))
+                    Self::and_pattern_conditions(builder, condition, Some(matches))
                 },
             );
             let Some(condition) = condition else {
@@ -622,7 +626,7 @@ impl<'a> LowerCtx<'a> {
                     self.drop_place_from_expr_with_runtime_indices(body, *base, current_index)?;
                 if let Expr::IntLiteral { value, .. } = body.exprs[*index] {
                     projection.push(RuntimeDropProjection::Exact(DropProjection::Index(
-                        value as usize,
+                        usize::try_from(value).ok()?,
                     )));
                 } else {
                     let value = if *index == current_index.0 {
@@ -675,7 +679,7 @@ impl<'a> LowerCtx<'a> {
                     )?;
                 if let Expr::IntLiteral { value, .. } = body.exprs[*index] {
                     projection.push(RuntimeDropProjection::Exact(DropProjection::Index(
-                        value as usize,
+                        usize::try_from(value).ok()?,
                     )));
                 } else {
                     let value = if *index == current_index.0 {
@@ -704,7 +708,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(super) fn clear_indexed_drop_slots(
-        &self,
         builder: &mut Builder,
         slots: &[DropSlot],
         index_value: Value,
@@ -720,7 +723,7 @@ impl<'a> LowerCtx<'a> {
                     DropProjection::Field(_) => None,
                 })
             {
-                let flag = self.drop_slot_flag_place(builder, slot);
+                let flag = Self::drop_slot_flag_place(builder, slot);
                 flags_by_index.entry(index).or_default().insert(flag);
             }
         }

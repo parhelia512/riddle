@@ -12,7 +12,7 @@ mod text;
 
 pub use cli::{Options, parse_args};
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
 #[doc(hidden)]
 pub mod test_support {
     pub use crate::completion::{completion_items_for_document, completion_items_for_source};

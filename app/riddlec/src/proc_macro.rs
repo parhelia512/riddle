@@ -1,9 +1,5 @@
 use ast::{self, support::AstNode};
-use frontend::{
-    incremental::{IncrementalParser, parse_tokens},
-    lexer,
-    tree_builder::Parse,
-};
+use frontend::{incremental::parse_tokens, lexer, tree_builder::Parse};
 use rowan::TextRange;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -88,6 +84,11 @@ pub trait ProcMacroProvider {
         None
     }
 
+    /// Expands one process-macro invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot execute or decode the macro.
     fn expand(
         &mut self,
         package: &str,

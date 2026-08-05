@@ -15,10 +15,10 @@ fn diagnostics_with_code(result: &TypeCheckResult, code: &str) -> Vec<Diagnostic
 fn incremental_reports_unsized_declarations() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         struct Bad { value: str }
         fun main() {}
-        "#,
+        ",
     );
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
@@ -38,11 +38,11 @@ fn incremental_reports_unsized_declarations() {
 fn incremental_rechecks_const_initializers_when_functions_are_reused() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         const BAD: i32 = true;
 
         fun stable() -> i32 { 1 }
-        "#,
+        ",
     );
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
@@ -92,7 +92,7 @@ fn incremental_public_check_invalidates_moved_spans() {
 fn incremental_type_checker_reuses_unchanged_bodies() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         fun stable() -> i32 {
             1
         }
@@ -101,7 +101,7 @@ fn incremental_type_checker_reuses_unchanged_bodies() {
             let value: bool = true;
             value
         }
-        "#,
+        ",
     );
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
@@ -136,7 +136,7 @@ fn incremental_type_checker_reuses_unchanged_bodies() {
 fn incremental_replay_preserves_pattern_types() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         struct Token {}
         enum MaybeToken { Some(Token), None }
 
@@ -148,7 +148,7 @@ fn incremental_replay_preserves_pattern_types() {
         }
 
         fun edited() { 0; }
-        "#,
+        ",
     );
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
@@ -185,7 +185,7 @@ fn incremental_replay_preserves_pattern_types() {
 fn incremental_trait_impl_edit_updates_contract_diagnostics() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         trait Flag {
             fun value() -> bool;
         }
@@ -195,7 +195,7 @@ fn incremental_trait_impl_edit_updates_contract_diagnostics() {
         impl Flag for Marker {
             fun value() -> bool { 1 == 1 }
         }
-        "#,
+        ",
     );
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
@@ -226,13 +226,13 @@ fn incremental_trait_impl_edit_updates_contract_diagnostics() {
 fn incremental_function_safety_edit_invalidates_callers() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         fun operation() {}
 
         fun main() {
             operation();
         }
-        "#,
+        ",
     );
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
@@ -257,14 +257,14 @@ fn incremental_function_safety_edit_invalidates_callers() {
 fn incremental_field_visibility_edit_invalidates_callers() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         mod model {
             pub struct Point { pub value: i32 }
             pub fun make() -> Point { Point { value: 1 } }
         }
 
         fun main() -> i32 { model::make().value }
-        "#,
+        ",
     );
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 
@@ -291,7 +291,7 @@ fn incremental_field_visibility_edit_invalidates_callers() {
 fn incremental_generic_recursion_matches_full_check_before_and_after_reuse() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         struct Wrap<T> { inner: T }
 
         fun f<T>(x: T) -> T {
@@ -305,7 +305,7 @@ fn incremental_generic_recursion_matches_full_check_before_and_after_reuse() {
         fun edited() {
             0;
         }
-        "#,
+        ",
     );
     assert!(parse.errors.is_empty(), "{:?}", parse.errors);
 

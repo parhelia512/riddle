@@ -32,7 +32,7 @@ enum BorrowKind {
 }
 
 impl BorrowKind {
-    fn from_flow(kind: FlowKind, inherited: Self) -> Self {
+    const fn from_flow(kind: FlowKind, inherited: Self) -> Self {
         match kind {
             FlowKind::Inherit => inherited,
             FlowKind::Shared => Self::Shared,
@@ -66,7 +66,7 @@ struct AccessPlace {
 }
 
 impl AccessPlace {
-    fn new(root: AccessRoot) -> Self {
+    const fn new(root: AccessRoot) -> Self {
         Self {
             root,
             projections: Vec::new(),
@@ -96,11 +96,11 @@ type Origins = HashSet<Origin>;
 #[derive(Debug, Clone, Default)]
 struct OriginValue {
     origins: Origins,
-    fields: Vec<OriginValue>,
+    fields: Vec<Self>,
 }
 
 impl OriginValue {
-    fn from_origins(origins: Origins) -> Self {
+    const fn from_origins(origins: Origins) -> Self {
         Self {
             origins,
             fields: Vec::new(),
@@ -183,6 +183,7 @@ pub struct AnalysisResult {
 
 /// Run move/borrow checking. Escape analysis identifies storage duration only;
 /// heap allocation does not relax move or borrow rules.
+#[must_use]
 pub fn analyze(hir: &HirFile, type_result: &TypeCheckResult) -> AnalysisResult {
     let reference_flow = ReferenceFlow::build(hir, type_result);
     let mut result = AnalysisResult::default();
@@ -206,7 +207,7 @@ struct Analyzer<'a> {
     result: AnalysisResult,
 }
 
-impl<'a> Analyzer<'a> {
+impl Analyzer<'_> {
     fn analyze_all_bodies(&mut self) {
         for (fid, _) in self.hir.item_tree.functions.iter() {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
@@ -258,436 +259,525 @@ impl<'a> Analyzer<'a> {
             | Expr::CharLiteral { .. }
             | Expr::BoolLiteral { .. } => {}
 
-            Expr::Path { path, resolved } => {
-                let value = match resolved {
-                    Some(ResolvedName::PatternBinding(id)) => ctx.local_origin_value(*id),
-                    Some(ResolvedName::Param(index)) => OriginValue::from_origins(
-                        ctx.param_origins.get(index).cloned().unwrap_or_default(),
-                    ),
-                    _ => OriginValue::default(),
-                };
-                ctx.set_expr_origin_value(expr_id, value);
-                if let Some(name) = path.as_single_name()
-                    && let Some(moved) = ctx.bindings.get(&name.0)
-                {
-                    if *moved {
-                        let extra = resolved
-                            .as_ref()
-                            .and_then(|resolved| {
-                                if let ResolvedName::PatternBinding(id) = resolved {
-                                    let p = Place::root(*id);
-                                    Some(self.move_site_labels(ctx, &p))
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        self.diag_with_labels(
-                            format!("use of moved value: `{}`", name.0),
-                            span,
-                            "E0100",
-                            &extra,
-                        );
-                    }
-                    if let Some(ResolvedName::PatternBinding(id)) = resolved {
-                        ctx.release_local_if_dead(*id);
-                    }
-                    return;
-                }
-                if let Some(ResolvedName::PatternBinding(id)) = resolved {
-                    let place = Place::root(*id);
-                    if ctx.moved_places.iter().any(|m| place_overlaps(m, &place)) {
-                        let label = path.as_single_name().map(|n| n.0.as_str()).unwrap_or("_");
-                        let extra = self.move_site_labels(ctx, &place);
-                        self.diag_with_labels(
-                            format!("use of moved value: `{}`", label),
-                            span,
-                            "E0100",
-                            &extra,
-                        );
-                    }
-                    ctx.release_local_if_dead(*id);
-                }
+            Expr::Path { .. } => self.move_check_path(ctx, expr_id, span),
+
+            Expr::Struct { .. } => self.move_check_struct(ctx, expr_id),
+
+            Expr::Binary { .. } => self.move_check_binary(ctx, expr_id, span),
+
+            Expr::Unary { .. } => self.move_check_unary(ctx, expr_id, span),
+
+            Expr::Block { .. } => self.move_check_block(ctx, expr_id),
+
+            Expr::If { .. } => self.move_check_if(ctx, expr_id),
+
+            Expr::While { .. } => self.move_check_while(ctx, expr_id),
+
+            Expr::For { .. } => self.move_check_for(ctx, expr_id),
+
+            Expr::Match { .. } => self.move_check_match(ctx, expr_id),
+
+            Expr::Array { .. } | Expr::Tuple { .. } | Expr::ArrayRepeat { .. } => {
+                self.move_check_aggregate(ctx, expr_id);
             }
 
-            Expr::Struct { fields, .. } => {
-                let mut origins = Origins::new();
-                for field in fields {
-                    self.move_check_expr(ctx, field.value);
-                    self.apply_recorded_value_use(ctx, field.value);
-                    origins.extend(ctx.expr_origin_value(field.value).origins);
-                }
-                let value = if self.expr_may_carry_reference(ctx, expr_id) {
-                    OriginValue::from_origins(origins)
-                } else {
-                    for field in fields {
-                        self.deactivate_unretained(ctx, field.value, &HashSet::new());
-                    }
-                    OriginValue::default()
-                };
-                ctx.set_expr_origin_value(expr_id, value);
+            Expr::Call { .. } => self.move_check_call(ctx, expr_id, span),
+
+            Expr::Lambda { .. } => self.move_check_lambda(ctx, expr_id),
+
+            Expr::Unsafe { .. } | Expr::Cast { .. } | Expr::Try { .. } => {
+                self.move_check_passthrough(ctx, expr_id);
             }
 
-            Expr::Binary { lhs, rhs, op } => {
-                let direct_assignment = (*op == hir::body::BinaryOp::Assign)
-                    .then(|| self.local_assignment(ctx, *lhs))
-                    .flatten()
-                    .filter(|(_, direct)| *direct)
-                    .map(|(binding, _)| binding);
-                if let Some(binding) = direct_assignment {
-                    ctx.release_local_if_dead(binding);
-                } else {
-                    self.move_check_expr(ctx, *lhs);
-                }
-                self.move_check_expr(ctx, *rhs);
-                if op.is_assignment() {
-                    if let Some(lhs_place) = self.place_from_expr(ctx, *lhs)
-                        && self.has_any_borrow(ctx, &lhs_place)
-                    {
-                        let name = self.expr_name(ctx, *lhs);
-                        self.diag(
-                            format!("cannot assign to `{}` while borrowed", name),
-                            span,
-                            "E0303",
-                        );
-                    }
-                    if let Some((binding, direct)) = self.local_assignment(ctx, *lhs) {
-                        let mut value = ctx.expr_origin_value(*rhs);
-                        if !direct {
-                            value.origins.extend(
-                                ctx.local_origins
-                                    .get(&binding)
-                                    .into_iter()
-                                    .flatten()
-                                    .cloned(),
-                            );
-                            value.fields.clear();
+            Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => {
+                self.move_check_projection(ctx, expr_id, span);
+            }
+        }
+    }
+
+    fn move_check_path(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId, span: Option<TextRange>) {
+        let Expr::Path { path, resolved } = ctx.body.exprs[expr_id].clone() else {
+            unreachable!("expected path expression");
+        };
+        let value = match &resolved {
+            Some(ResolvedName::PatternBinding(id)) => ctx.local_origin_value(*id),
+            Some(ResolvedName::Param(index)) => {
+                OriginValue::from_origins(ctx.param_origins.get(index).cloned().unwrap_or_default())
+            }
+            _ => OriginValue::default(),
+        };
+        ctx.set_expr_origin_value(expr_id, value);
+        if let Some(name) = path.as_single_name()
+            && let Some(moved) = ctx.bindings.get(&name.0)
+        {
+            if *moved {
+                let extra = resolved
+                    .as_ref()
+                    .and_then(|resolved| match resolved {
+                        ResolvedName::PatternBinding(id) => {
+                            Some(Self::move_site_labels(ctx, &Place::root(*id)))
                         }
-                        ctx.bind_origin_value(binding, value);
-                    }
-                    self.apply_recorded_value_use(ctx, *rhs);
-                    if let Some(binding) = direct_assignment {
-                        let place = Place::root(binding);
-                        ctx.bindings.mark_available(&self.expr_name(ctx, *lhs));
-                        ctx.moved_places
-                            .retain(|moved| !place_overlaps(moved, &place));
-                        ctx.moved_sites
-                            .retain(|moved, _| !place_overlaps(moved, &place));
-                    }
-                }
-                let origins = if op.is_assignment() {
-                    ctx.expr_origins.get(rhs).cloned().unwrap_or_default()
-                } else {
-                    self.apply_recorded_value_use(ctx, *lhs);
-                    self.apply_recorded_value_use(ctx, *rhs);
-                    self.deactivate_unretained(ctx, *lhs, &HashSet::new());
-                    self.deactivate_unretained(ctx, *rhs, &HashSet::new());
-                    Origins::new()
-                };
-                ctx.expr_origins.insert(expr_id, origins);
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                self.diag_with_labels(
+                    format!("use of moved value: `{}`", name.0),
+                    span,
+                    "E0100",
+                    &extra,
+                );
             }
-
-            Expr::Unary { operand, op } => {
-                self.move_check_expr(ctx, *operand);
-                let origins = match op {
-                    UnaryOp::Ref => self.create_borrow(ctx, *operand, BorrowKind::Shared, span),
-                    UnaryOp::MutRef => self.create_borrow(ctx, *operand, BorrowKind::Mutable, span),
-                    UnaryOp::Deref => ctx.expr_origins.get(operand).cloned().unwrap_or_default(),
-                    _ => Origins::new(),
-                };
-                let origins = if self.expr_may_carry_reference(ctx, expr_id) {
-                    origins
-                } else {
-                    self.deactivate_unretained(ctx, *operand, &HashSet::new());
-                    Origins::new()
-                };
-                ctx.expr_origins.insert(expr_id, origins);
-                self.apply_recorded_value_use(ctx, *operand);
+            if let Some(ResolvedName::PatternBinding(id)) = resolved {
+                ctx.release_local_if_dead(id);
             }
-
-            Expr::Block { stmts, tail } => {
-                ctx.push_scope();
-                for stmt in stmts {
-                    self.move_check_stmt(ctx, *stmt);
-                }
-                if let Some(tail) = tail {
-                    self.move_check_expr(ctx, *tail);
-                    ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*tail));
-                    self.apply_recorded_value_use(ctx, *tail);
-                }
-                ctx.pop_scope();
+            return;
+        }
+        if let Some(ResolvedName::PatternBinding(id)) = resolved {
+            let place = Place::root(id);
+            if ctx
+                .moved_places
+                .iter()
+                .any(|moved| place_overlaps(moved, &place))
+            {
+                let label = path.as_single_name().map_or("_", |name| name.0.as_str());
+                let extra = Self::move_site_labels(ctx, &place);
+                self.diag_with_labels(
+                    format!("use of moved value: `{label}`"),
+                    span,
+                    "E0100",
+                    &extra,
+                );
             }
+            ctx.release_local_if_dead(id);
+        }
+    }
 
-            Expr::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                self.move_check_expr(ctx, *cond);
-                self.apply_recorded_value_use(ctx, *cond);
-                self.move_check_expr(ctx, *then_branch);
-                self.apply_recorded_value_use(ctx, *then_branch);
-                if let Some(e) = else_branch {
-                    self.move_check_expr(ctx, *e);
-                    self.apply_recorded_value_use(ctx, *e);
-                }
-                let mut value = ctx.expr_origin_value(*then_branch);
-                if let Some(e) = else_branch {
-                    value.merge(ctx.expr_origin_value(*e));
-                }
-                ctx.set_expr_origin_value(expr_id, value);
+    fn move_check_struct(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let Expr::Struct { fields, .. } = ctx.body.exprs[expr_id].clone() else {
+            unreachable!("expected struct expression");
+        };
+        let mut origins = Origins::new();
+        for field in &fields {
+            self.move_check_expr(ctx, field.value);
+            self.apply_recorded_value_use(ctx, field.value);
+            origins.extend(ctx.expr_origin_value(field.value).origins);
+        }
+        let value = if self.expr_may_carry_reference(ctx, expr_id) {
+            OriginValue::from_origins(origins)
+        } else {
+            for field in &fields {
+                Self::deactivate_unretained(ctx, field.value, &HashSet::new());
             }
+            OriginValue::default()
+        };
+        ctx.set_expr_origin_value(expr_id, value);
+    }
 
-            Expr::While { condition, body } => {
-                let loop_entry = ctx.clone();
-                self.move_check_expr(ctx, *condition);
-                self.apply_recorded_value_use(ctx, *condition);
-                let mut condition_exit = ctx.clone();
-                self.move_check_expr(ctx, *body);
-                self.apply_recorded_value_use(ctx, *body);
-
-                let mut loop_head = loop_entry.clone();
-                let mut loop_exit = ctx.clone();
-                loop {
-                    let mut next_head = loop_entry.clone();
-                    next_head.merge_move_state_from(&loop_exit);
-                    if next_head.same_move_state(&loop_head) {
-                        break;
-                    }
-                    loop_head = next_head;
-
-                    let mut iteration = loop_entry.clone();
-                    iteration.copy_move_state_from(&loop_head);
-                    let diagnostic_count = self.result.diagnostics.len();
-                    self.move_check_expr(&mut iteration, *condition);
-                    self.apply_recorded_value_use(&mut iteration, *condition);
-                    condition_exit = iteration.clone();
-                    self.move_check_expr(&mut iteration, *body);
-                    self.apply_recorded_value_use(&mut iteration, *body);
-                    self.retain_new_loop_move_diagnostics(diagnostic_count);
-                    loop_exit = iteration;
-                }
-                ctx.copy_move_state_from(&condition_exit);
+    fn move_check_binary(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        span: Option<TextRange>,
+    ) {
+        let Expr::Binary { lhs, rhs, op } = ctx.body.exprs[expr_id] else {
+            unreachable!("expected binary expression");
+        };
+        let direct_assignment = (op == hir::body::BinaryOp::Assign)
+            .then(|| Self::local_assignment(ctx, lhs))
+            .flatten()
+            .filter(|(_, direct)| *direct)
+            .map(|(binding, _)| binding);
+        if let Some(binding) = direct_assignment {
+            ctx.release_local_if_dead(binding);
+        } else {
+            self.move_check_expr(ctx, lhs);
+        }
+        self.move_check_expr(ctx, rhs);
+        if op.is_assignment() {
+            if let Some(lhs_place) = self.place_from_expr(ctx, lhs)
+                && Self::has_any_borrow(ctx, &lhs_place)
+            {
+                let name = Self::expr_name(ctx, lhs);
+                self.diag(
+                    format!("cannot assign to `{name}` while borrowed"),
+                    span,
+                    "E0303",
+                );
             }
-
-            Expr::For {
-                pat,
-                iterable,
-                body,
-            } => {
-                ctx.push_scope();
-                self.move_check_expr(ctx, *iterable);
-                let item_value = ctx.expr_origin_value(*iterable).iterated();
-                self.apply_recorded_value_use(ctx, *iterable);
-                let item_ty = self
-                    .type_result
-                    .for_loops
-                    .get(&(ctx.body_id, expr_id))
-                    .map(|info| info.item_ty.clone())
-                    .or_else(|| {
-                        self.type_result
-                            .expr_types
-                            .get(&(ctx.body_id, *iterable))
-                            .and_then(|ty| match ty {
-                                Type::Array(item, _) => Some((**item).clone()),
-                                _ => None,
-                            })
-                    });
-                if let Some(item_ty) = item_ty {
-                    self.check_pattern_move_from_drop(ctx, *pat, &item_ty);
+            if let Some((binding, direct)) = Self::local_assignment(ctx, lhs) {
+                let mut value = ctx.expr_origin_value(rhs);
+                if !direct {
+                    value.origins.extend(
+                        ctx.local_origins
+                            .get(&binding)
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    value.fields.clear();
                 }
-                self.check_explicit_reference_pattern_move(ctx, *pat);
-                let loop_entry = ctx.clone();
-                ctx.push_scope();
-                self.bind_pattern_names(ctx, *pat);
-                self.bind_pattern_origins(ctx, *pat, &item_value);
-                self.move_check_expr(ctx, *body);
-                ctx.pop_scope();
-
-                let mut loop_head = loop_entry.clone();
-                let mut loop_exit = ctx.clone();
-                loop {
-                    let mut next_head = loop_entry.clone();
-                    next_head.merge_move_state_from(&loop_exit);
-                    if next_head.same_move_state(&loop_head) {
-                        break;
-                    }
-                    loop_head = next_head;
-
-                    let mut iteration = loop_entry.clone();
-                    iteration.copy_move_state_from(&loop_head);
-                    let diagnostic_count = self.result.diagnostics.len();
-                    iteration.push_scope();
-                    self.bind_pattern_names(&mut iteration, *pat);
-                    self.bind_pattern_origins(&mut iteration, *pat, &item_value);
-                    self.move_check_expr(&mut iteration, *body);
-                    self.retain_new_loop_move_diagnostics(diagnostic_count);
-                    iteration.pop_scope();
-                    loop_exit = iteration;
-                }
-                ctx.copy_move_state_from(&loop_head);
-                ctx.pop_scope();
+                ctx.bind_origin_value(binding, value);
             }
+            self.apply_recorded_value_use(ctx, rhs);
+            if let Some(binding) = direct_assignment {
+                let place = Place::root(binding);
+                ctx.bindings.mark_available(&Self::expr_name(ctx, lhs));
+                ctx.moved_places
+                    .retain(|moved| !place_overlaps(moved, &place));
+                ctx.moved_sites
+                    .retain(|moved, _| !place_overlaps(moved, &place));
+            }
+        }
+        let origins = if op.is_assignment() {
+            ctx.expr_origins.get(&rhs).cloned().unwrap_or_default()
+        } else {
+            self.apply_recorded_value_use(ctx, lhs);
+            self.apply_recorded_value_use(ctx, rhs);
+            Self::deactivate_unretained(ctx, lhs, &HashSet::new());
+            Self::deactivate_unretained(ctx, rhs, &HashSet::new());
+            Origins::new()
+        };
+        ctx.expr_origins.insert(expr_id, origins);
+    }
 
-            Expr::Match { scrutinee, arms } => {
-                self.move_check_expr(ctx, *scrutinee);
-                let scrutinee_value = ctx.expr_origin_value(*scrutinee);
-                let scrutinee_ty = self
-                    .type_result
+    fn move_check_unary(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        span: Option<TextRange>,
+    ) {
+        let Expr::Unary { operand, op } = ctx.body.exprs[expr_id] else {
+            unreachable!("expected unary expression");
+        };
+        self.move_check_expr(ctx, operand);
+        let origins = match op {
+            UnaryOp::Ref => self.create_borrow(ctx, operand, BorrowKind::Shared, span),
+            UnaryOp::MutRef => self.create_borrow(ctx, operand, BorrowKind::Mutable, span),
+            UnaryOp::Deref => ctx.expr_origins.get(&operand).cloned().unwrap_or_default(),
+            _ => Origins::new(),
+        };
+        let origins = if self.expr_may_carry_reference(ctx, expr_id) {
+            origins
+        } else {
+            Self::deactivate_unretained(ctx, operand, &HashSet::new());
+            Origins::new()
+        };
+        ctx.expr_origins.insert(expr_id, origins);
+        self.apply_recorded_value_use(ctx, operand);
+    }
+
+    fn move_check_block(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let Expr::Block { stmts, tail } = ctx.body.exprs[expr_id].clone() else {
+            unreachable!("expected block expression");
+        };
+        ctx.push_scope();
+        for stmt in stmts {
+            self.move_check_stmt(ctx, stmt);
+        }
+        if let Some(tail) = tail {
+            self.move_check_expr(ctx, tail);
+            ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(tail));
+            self.apply_recorded_value_use(ctx, tail);
+        }
+        ctx.pop_scope();
+    }
+
+    fn move_check_if(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } = ctx.body.exprs[expr_id]
+        else {
+            unreachable!("expected if expression");
+        };
+        self.move_check_expr(ctx, cond);
+        self.apply_recorded_value_use(ctx, cond);
+        self.move_check_expr(ctx, then_branch);
+        self.apply_recorded_value_use(ctx, then_branch);
+        if let Some(else_branch) = else_branch {
+            self.move_check_expr(ctx, else_branch);
+            self.apply_recorded_value_use(ctx, else_branch);
+        }
+        let mut value = ctx.expr_origin_value(then_branch);
+        if let Some(else_branch) = else_branch {
+            value.merge(ctx.expr_origin_value(else_branch));
+        }
+        ctx.set_expr_origin_value(expr_id, value);
+    }
+
+    fn move_check_while(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let Expr::While { condition, body } = ctx.body.exprs[expr_id] else {
+            unreachable!("expected while expression");
+        };
+        let loop_entry = ctx.clone();
+        self.move_check_expr(ctx, condition);
+        self.apply_recorded_value_use(ctx, condition);
+        let mut condition_exit = ctx.clone();
+        self.move_check_expr(ctx, body);
+        self.apply_recorded_value_use(ctx, body);
+        let mut loop_head = loop_entry.clone();
+        let mut loop_exit = ctx.clone();
+        loop {
+            let mut next_head = loop_entry.clone();
+            next_head.merge_move_state_from(&loop_exit);
+            if next_head.same_move_state(&loop_head) {
+                break;
+            }
+            loop_head = next_head;
+            let mut iteration = loop_entry.clone();
+            iteration.copy_move_state_from(&loop_head);
+            let diagnostic_count = self.result.diagnostics.len();
+            self.move_check_expr(&mut iteration, condition);
+            self.apply_recorded_value_use(&mut iteration, condition);
+            condition_exit = iteration.clone();
+            self.move_check_expr(&mut iteration, body);
+            self.apply_recorded_value_use(&mut iteration, body);
+            self.retain_new_loop_move_diagnostics(diagnostic_count);
+            loop_exit = iteration;
+        }
+        ctx.copy_move_state_from(&condition_exit);
+    }
+
+    fn move_check_for(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let Expr::For {
+            pat,
+            iterable,
+            body,
+        } = ctx.body.exprs[expr_id]
+        else {
+            unreachable!("expected for expression");
+        };
+        ctx.push_scope();
+        self.move_check_expr(ctx, iterable);
+        let item_value = ctx.expr_origin_value(iterable).iterated();
+        self.apply_recorded_value_use(ctx, iterable);
+        let item_ty = self
+            .type_result
+            .for_loops
+            .get(&(ctx.body_id, expr_id))
+            .map(|info| info.item_ty.clone())
+            .or_else(|| {
+                self.type_result
                     .expr_types
-                    .get(&(ctx.body_id, *scrutinee))
-                    .cloned()
-                    .unwrap_or(Type::Unknown);
-                let scrutinee_place = self.place_from_expr(ctx, *scrutinee);
-                let base_bindings = ctx.bindings.clone();
-                let base_moved_places = ctx.moved_places.clone();
-                let base_moved_sites = ctx.moved_sites.clone();
-                let mut merged_bindings = base_bindings.clone();
-                let mut merged_moved_places = base_moved_places.clone();
-                let mut merged_moved_sites = base_moved_sites.clone();
-                for arm in arms {
-                    ctx.bindings = base_bindings.clone();
-                    ctx.moved_places = base_moved_places.clone();
-                    ctx.moved_sites = base_moved_sites.clone();
-                    self.check_pattern_move_from_drop(ctx, arm.pat, &scrutinee_ty);
-                    self.check_explicit_reference_pattern_move(ctx, arm.pat);
-                    ctx.push_scope();
-                    self.bind_pattern_names(ctx, arm.pat);
-                    self.bind_pattern_origins(ctx, arm.pat, &scrutinee_value);
-                    if let Some(g) = arm.guard {
-                        let old_guard = std::mem::replace(&mut ctx.in_match_guard, true);
-                        self.move_check_expr(ctx, g);
-                        ctx.in_match_guard = old_guard;
-                    }
-                    if let Some(root) = &scrutinee_place {
-                        for place in self.pattern_move_places(ctx, arm.pat, root) {
-                            if self.has_any_borrow(ctx, &place) {
-                                self.diag(
-                                    "cannot move a pattern field while borrowed".into(),
-                                    ctx.source_map.pat_ranges.get(&arm.pat).copied(),
-                                    "E0304",
-                                );
-                                continue;
-                            }
-                            ctx.moved_places.insert(place.clone());
-                            ctx.moved_sites.insert(
-                                place,
-                                (
-                                    ctx.source_map.pat_ranges.get(&arm.pat).copied(),
-                                    "field moved by pattern here".into(),
-                                ),
-                            );
-                        }
-                    }
-                    self.move_check_expr(ctx, arm.body);
-                    self.apply_recorded_value_use(ctx, arm.body);
-                    ctx.pop_scope();
-                    merged_bindings.merge_moved_from(&ctx.bindings);
-                    merged_moved_places.extend(ctx.moved_places.iter().cloned());
-                    merged_moved_sites.extend(ctx.moved_sites.clone());
-                }
-                ctx.bindings = merged_bindings;
-                ctx.moved_places = merged_moved_places;
-                ctx.moved_sites = merged_moved_sites;
-                let mut value = OriginValue::default();
-                for arm in arms {
-                    value.merge(ctx.expr_origin_value(arm.body));
-                }
-                ctx.set_expr_origin_value(expr_id, value);
+                    .get(&(ctx.body_id, iterable))
+                    .and_then(|ty| match ty {
+                        Type::Array(item, _) => Some((**item).clone()),
+                        _ => None,
+                    })
+            });
+        if let Some(item_ty) = item_ty {
+            self.check_pattern_move_from_drop(ctx, pat, &item_ty);
+        }
+        self.check_explicit_reference_pattern_move(ctx, pat);
+        let loop_entry = ctx.clone();
+        ctx.push_scope();
+        Self::bind_pattern_names(ctx, pat);
+        self.bind_pattern_origins(ctx, pat, &item_value);
+        self.move_check_expr(ctx, body);
+        ctx.pop_scope();
+        let mut loop_head = loop_entry.clone();
+        let mut loop_exit = ctx.clone();
+        loop {
+            let mut next_head = loop_entry.clone();
+            next_head.merge_move_state_from(&loop_exit);
+            if next_head.same_move_state(&loop_head) {
+                break;
             }
+            loop_head = next_head;
+            let mut iteration = loop_entry.clone();
+            iteration.copy_move_state_from(&loop_head);
+            let diagnostic_count = self.result.diagnostics.len();
+            iteration.push_scope();
+            Self::bind_pattern_names(&mut iteration, pat);
+            self.bind_pattern_origins(&mut iteration, pat, &item_value);
+            self.move_check_expr(&mut iteration, body);
+            self.retain_new_loop_move_diagnostics(diagnostic_count);
+            iteration.pop_scope();
+            loop_exit = iteration;
+        }
+        ctx.copy_move_state_from(&loop_head);
+        ctx.pop_scope();
+    }
 
+    fn move_check_match(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let Expr::Match { scrutinee, arms } = ctx.body.exprs[expr_id].clone() else {
+            unreachable!("expected match expression");
+        };
+        self.move_check_expr(ctx, scrutinee);
+        let scrutinee_value = ctx.expr_origin_value(scrutinee);
+        let scrutinee_ty = self
+            .type_result
+            .expr_types
+            .get(&(ctx.body_id, scrutinee))
+            .cloned()
+            .unwrap_or(Type::Unknown);
+        let scrutinee_place = self.place_from_expr(ctx, scrutinee);
+        let base_bindings = ctx.bindings.clone();
+        let base_moved_places = ctx.moved_places.clone();
+        let base_moved_sites = ctx.moved_sites.clone();
+        let mut merged_bindings = base_bindings.clone();
+        let mut merged_moved_places = base_moved_places.clone();
+        let mut merged_moved_sites = base_moved_sites.clone();
+        for arm in &arms {
+            ctx.bindings.clone_from(&base_bindings);
+            ctx.moved_places.clone_from(&base_moved_places);
+            ctx.moved_sites.clone_from(&base_moved_sites);
+            self.check_pattern_move_from_drop(ctx, arm.pat, &scrutinee_ty);
+            self.check_explicit_reference_pattern_move(ctx, arm.pat);
+            ctx.push_scope();
+            Self::bind_pattern_names(ctx, arm.pat);
+            self.bind_pattern_origins(ctx, arm.pat, &scrutinee_value);
+            if let Some(guard) = arm.guard {
+                let old_guard = std::mem::replace(&mut ctx.in_match_guard, true);
+                self.move_check_expr(ctx, guard);
+                ctx.in_match_guard = old_guard;
+            }
+            if let Some(root) = &scrutinee_place {
+                for place in self.pattern_move_places(ctx, arm.pat, root) {
+                    if Self::has_any_borrow(ctx, &place) {
+                        self.diag(
+                            "cannot move a pattern field while borrowed".into(),
+                            ctx.source_map.pat_ranges.get(&arm.pat).copied(),
+                            "E0304",
+                        );
+                        continue;
+                    }
+                    ctx.moved_places.insert(place.clone());
+                    ctx.moved_sites.insert(
+                        place,
+                        (
+                            ctx.source_map.pat_ranges.get(&arm.pat).copied(),
+                            "field moved by pattern here".into(),
+                        ),
+                    );
+                }
+            }
+            self.move_check_expr(ctx, arm.body);
+            self.apply_recorded_value_use(ctx, arm.body);
+            ctx.pop_scope();
+            merged_bindings.merge_moved_from(&ctx.bindings);
+            merged_moved_places.extend(ctx.moved_places.iter().cloned());
+            merged_moved_sites.extend(ctx.moved_sites.clone());
+        }
+        ctx.bindings = merged_bindings;
+        ctx.moved_places = merged_moved_places;
+        ctx.moved_sites = merged_moved_sites;
+        let mut value = OriginValue::default();
+        for arm in &arms {
+            value.merge(ctx.expr_origin_value(arm.body));
+        }
+        ctx.set_expr_origin_value(expr_id, value);
+    }
+
+    fn move_check_aggregate(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        match ctx.body.exprs[expr_id].clone() {
             Expr::Array { elements } | Expr::Tuple { elements } => {
                 let mut fields = Vec::with_capacity(elements.len());
-                for el in elements {
-                    self.move_check_expr(ctx, *el);
-                    self.apply_recorded_value_use(ctx, *el);
-                    fields.push(ctx.expr_origin_value(*el));
+                for element in elements {
+                    self.move_check_expr(ctx, element);
+                    self.apply_recorded_value_use(ctx, element);
+                    fields.push(ctx.expr_origin_value(element));
                 }
                 ctx.set_expr_origin_value(expr_id, OriginValue::from_fields(fields));
             }
-
             Expr::ArrayRepeat { value, len } => {
-                self.move_check_expr(ctx, *value);
-                self.apply_recorded_value_use(ctx, *value);
-                self.move_check_expr(ctx, *len);
-                self.apply_recorded_value_use(ctx, *len);
+                self.move_check_expr(ctx, value);
+                self.apply_recorded_value_use(ctx, value);
+                self.move_check_expr(ctx, len);
+                self.apply_recorded_value_use(ctx, len);
                 ctx.set_expr_origin_value(
                     expr_id,
-                    OriginValue::from_fields(vec![ctx.expr_origin_value(*value)]),
+                    OriginValue::from_fields(vec![ctx.expr_origin_value(value)]),
                 );
             }
+            _ => unreachable!("expected aggregate expression"),
+        }
+    }
 
-            Expr::Call { callee, args, .. } => {
-                if let Expr::FieldAccess { base, .. } = &ctx.body.exprs[*callee]
-                    && let Some(place) = self.place_from_expr(ctx, *base)
-                    && ctx.moved_places.iter().any(|m| place_overlaps(m, &place))
-                {
-                    let extra = self.move_site_labels(ctx, &place);
-                    let label = self.expr_name(ctx, *base);
-                    self.diag_with_labels(
-                        format!("use of moved value: `{}`", label),
-                        span,
-                        "E0100",
-                        &extra,
-                    );
-                }
-                self.move_check_expr(ctx, *callee);
-                for arg in args {
-                    self.move_check_expr(ctx, *arg);
-                }
-                let (inputs, modes, fid) = self.call_signature(ctx, *callee, args);
-                let value = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, span);
-                ctx.set_expr_origin_value(expr_id, value);
-                for input in &inputs {
-                    self.apply_recorded_value_use(ctx, *input);
-                }
-                self.apply_recorded_value_use(ctx, *callee);
-            }
+    fn move_check_call(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId, span: Option<TextRange>) {
+        let Expr::Call { callee, args, .. } = ctx.body.exprs[expr_id].clone() else {
+            unreachable!("expected call expression");
+        };
+        if let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee]
+            && let Some(place) = self.place_from_expr(ctx, *base)
+            && ctx
+                .moved_places
+                .iter()
+                .any(|moved| place_overlaps(moved, &place))
+        {
+            let extra = Self::move_site_labels(ctx, &place);
+            let label = Self::expr_name(ctx, *base);
+            self.diag_with_labels(
+                format!("use of moved value: `{label}`"),
+                span,
+                "E0100",
+                &extra,
+            );
+        }
+        self.move_check_expr(ctx, callee);
+        for arg in &args {
+            self.move_check_expr(ctx, *arg);
+        }
+        let (inputs, modes, fid) = self.call_signature(ctx, callee, &args);
+        let value = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, span);
+        ctx.set_expr_origin_value(expr_id, value);
+        for input in &inputs {
+            self.apply_recorded_value_use(ctx, *input);
+        }
+        self.apply_recorded_value_use(ctx, callee);
+    }
 
-            Expr::Lambda { params, body, .. } => {
-                if let Some(info) = self
-                    .type_result
-                    .lambda_infos
-                    .get(&(ctx.body_id, expr_id))
-                    .cloned()
-                {
-                    self.apply_capture_effects(ctx, expr_id, &info);
-                    self.move_check_lambda_body(ctx, params, *body, &info);
-                }
-            }
+    fn move_check_lambda(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let Expr::Lambda { params, body, .. } = ctx.body.exprs[expr_id].clone() else {
+            unreachable!("expected lambda expression");
+        };
+        if let Some(info) = self
+            .type_result
+            .lambda_infos
+            .get(&(ctx.body_id, expr_id))
+            .cloned()
+        {
+            self.apply_capture_effects(ctx, expr_id, &info);
+            self.move_check_lambda_body(ctx, &params, body, &info);
+        }
+    }
 
-            Expr::Unsafe { body } => {
-                self.move_check_expr(ctx, *body);
-                ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*body));
-                self.apply_recorded_value_use(ctx, *body);
-            }
+    fn move_check_passthrough(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let operand = match ctx.body.exprs[expr_id] {
+            Expr::Unsafe { body } => body,
+            Expr::Cast { base, .. } => base,
+            Expr::Try { operand } => operand,
+            _ => unreachable!("expected passthrough expression"),
+        };
+        self.move_check_expr(ctx, operand);
+        ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(operand));
+        self.apply_recorded_value_use(ctx, operand);
+    }
 
-            Expr::Cast { base, .. } => {
-                self.move_check_expr(ctx, *base);
-                ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*base));
-                self.apply_recorded_value_use(ctx, *base);
-            }
-
-            Expr::Try { operand } => {
-                self.move_check_expr(ctx, *operand);
-                ctx.set_expr_origin_value(expr_id, ctx.expr_origin_value(*operand));
-                self.apply_recorded_value_use(ctx, *operand);
-            }
-
+    fn move_check_projection(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        span: Option<TextRange>,
+    ) {
+        match ctx.body.exprs[expr_id].clone() {
             Expr::FieldAccess { base, field } => {
-                // Check if base is already moved before recursing — if so,
-                // skip inner error and emit only this outer one.
-                let base_moved = self
-                    .place_from_expr(ctx, *base)
-                    .map(|p| ctx.moved_places.iter().any(|m| place_overlaps(m, &p)))
-                    .unwrap_or(false);
+                let base_moved = self.place_from_expr(ctx, base).is_some_and(|place| {
+                    ctx.moved_places
+                        .iter()
+                        .any(|moved| place_overlaps(moved, &place))
+                });
                 if !base_moved {
-                    self.move_check_expr(ctx, *base);
+                    self.move_check_expr(ctx, base);
                 }
                 if let Some(place) = self.place_from_expr(ctx, expr_id)
-                    && ctx.moved_places.iter().any(|m| place_overlaps(m, &place))
+                    && ctx
+                        .moved_places
+                        .iter()
+                        .any(|moved| place_overlaps(moved, &place))
                 {
-                    let extra = self.move_site_labels(ctx, &place);
+                    let extra = Self::move_site_labels(ctx, &place);
                     self.diag_with_labels(
                         format!("use of moved field: `{}`", field.0),
                         span,
@@ -696,25 +786,26 @@ impl<'a> Analyzer<'a> {
                     );
                 }
                 let value = if self.expr_may_carry_reference(ctx, expr_id) {
-                    let base_value = ctx.expr_origin_value(*base);
-                    self.resolve_field_index(ctx.body_id, *base, field)
-                        .map(|index| base_value.project(index))
-                        .unwrap_or_else(|| base_value.flattened())
+                    let base_value = ctx.expr_origin_value(base);
+                    self.resolve_field_index(ctx.body_id, base, &field)
+                        .map_or_else(|| base_value.flattened(), |index| base_value.project(index))
                 } else {
                     OriginValue::default()
                 };
                 ctx.set_expr_origin_value(expr_id, value);
             }
-
             Expr::IndexAccess { base, index } => {
-                self.move_check_expr(ctx, *base);
-                self.move_check_expr(ctx, *index);
-                self.check_trait_index_receiver_borrow(ctx, expr_id, *base, span);
-                self.apply_recorded_value_use(ctx, *index);
+                self.move_check_expr(ctx, base);
+                self.move_check_expr(ctx, index);
+                self.check_trait_index_receiver_borrow(ctx, expr_id, base, span);
+                self.apply_recorded_value_use(ctx, index);
                 if let Some(place) = self.place_from_expr(ctx, expr_id)
-                    && ctx.moved_places.iter().any(|m| place_overlaps(m, &place))
+                    && ctx
+                        .moved_places
+                        .iter()
+                        .any(|moved| place_overlaps(moved, &place))
                 {
-                    let extra = self.move_site_labels(ctx, &place);
+                    let extra = Self::move_site_labels(ctx, &place);
                     self.diag_with_labels(
                         "use of moved value from array".into(),
                         span,
@@ -723,12 +814,14 @@ impl<'a> Analyzer<'a> {
                     );
                 }
                 let value = if self.expr_may_carry_reference(ctx, expr_id) {
-                    let base_value = ctx.expr_origin_value(*base);
-                    match &ctx.body.exprs[*index] {
-                        Expr::IntLiteral { value: index, .. } => usize::try_from(*index)
-                            .ok()
-                            .map(|index| base_value.project(index))
-                            .unwrap_or_else(|| base_value.iterated()),
+                    let base_value = ctx.expr_origin_value(base);
+                    match &ctx.body.exprs[index] {
+                        Expr::IntLiteral { value: index, .. } => {
+                            usize::try_from(*index).ok().map_or_else(
+                                || base_value.iterated(),
+                                |index| base_value.project(index),
+                            )
+                        }
                         _ => base_value.iterated(),
                     }
                 } else {
@@ -736,6 +829,7 @@ impl<'a> Analyzer<'a> {
                 };
                 ctx.set_expr_origin_value(expr_id, value);
             }
+            _ => unreachable!("expected projection expression"),
         }
     }
 
@@ -748,11 +842,11 @@ impl<'a> Analyzer<'a> {
                     self.move_check_expr(ctx, init);
                     let value = ctx.expr_origin_value(init);
                     self.bind_pattern_origins(ctx, pat, &value);
-                    self.deactivate_unretained(ctx, init, &HashSet::new());
+                    Self::deactivate_unretained(ctx, init, &HashSet::new());
                     self.check_explicit_reference_pattern_move(ctx, pat);
                     self.apply_recorded_value_use(ctx, init);
                 }
-                self.reset_pattern_moves(ctx, pat);
+                Self::reset_pattern_moves(ctx, pat);
             }
             Stmt::Expr { expr } => {
                 self.move_check_expr(ctx, *expr);
@@ -765,8 +859,7 @@ impl<'a> Analyzer<'a> {
                     self.apply_recorded_value_use(ctx, *v);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
-            Stmt::Item { .. } => {}
+            Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
         }
     }
 
@@ -775,17 +868,7 @@ impl<'a> Analyzer<'a> {
             && let Some(name) = path.as_single_name()
             && ctx.bindings.contains(&name.0)
         {
-            let ty = self
-                .type_result
-                .expr_types
-                .get(&(ctx.body_id, expr_id))
-                .cloned()
-                .unwrap_or(Type::Unknown);
-            let closure_kind = self
-                .type_result
-                .expr_types
-                .get(&(ctx.body_id, expr_id))
-                .and_then(Type::closure_kind);
+            let (ty, closure_kind) = self.expr_move_properties(ctx, expr_id);
             if !self.trait_env.type_is_copy(&ty)
                 || matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
             {
@@ -798,10 +881,9 @@ impl<'a> Analyzer<'a> {
                     return;
                 }
                 let access_place = resolved.as_ref().and_then(access_place_from_resolved_name);
-                if access_place
-                    .as_ref()
-                    .is_some_and(|place| self.has_access_borrow_except_origins(ctx, place, expr_id))
-                {
+                if access_place.as_ref().is_some_and(|place| {
+                    Self::has_access_borrow_except_origins(ctx, place, expr_id)
+                }) {
                     self.diag(
                         format!("cannot move `{}` while borrowed", name.0),
                         ctx.expr_range(expr_id),
@@ -822,17 +904,7 @@ impl<'a> Analyzer<'a> {
             return;
         }
 
-        let ty = self
-            .type_result
-            .expr_types
-            .get(&(ctx.body_id, expr_id))
-            .cloned()
-            .unwrap_or(Type::Unknown);
-        let closure_kind = self
-            .type_result
-            .expr_types
-            .get(&(ctx.body_id, expr_id))
-            .and_then(Type::closure_kind);
+        let (ty, closure_kind) = self.expr_move_properties(ctx, expr_id);
         if self.trait_env.type_is_copy(&ty)
             && !matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
         {
@@ -861,10 +933,10 @@ impl<'a> Analyzer<'a> {
             );
             return;
         }
-        if self.has_any_borrow(ctx, &place) {
-            let name = self.expr_name(ctx, expr_id);
+        if Self::has_any_borrow(ctx, &place) {
+            let name = Self::expr_name(ctx, expr_id);
             self.diag(
-                format!("cannot move `{}` while borrowed", name),
+                format!("cannot move `{name}` while borrowed"),
                 ctx.expr_range(expr_id),
                 "E0304",
             );
@@ -875,6 +947,21 @@ impl<'a> Analyzer<'a> {
         let span = ctx.expr_range(expr_id);
         let desc = "value moved here".to_string();
         ctx.moved_sites.insert(place, (span, desc));
+    }
+
+    fn expr_move_properties(
+        &self,
+        ctx: &BodyCtx<'_>,
+        expr_id: ExprId,
+    ) -> (Type, Option<ClosureKind>) {
+        let ty = self
+            .type_result
+            .expr_types
+            .get(&(ctx.body_id, expr_id))
+            .cloned()
+            .unwrap_or(Type::Unknown);
+        let closure_kind = ty.closure_kind();
+        (ty, closure_kind)
     }
 
     fn apply_recorded_value_use(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
@@ -999,7 +1086,7 @@ impl<'a> Analyzer<'a> {
                     .iter()
                     .any(|moved| place_overlaps(moved, place))
             {
-                let extra = self.move_site_labels(ctx, place);
+                let extra = Self::move_site_labels(ctx, place);
                 self.diag_with_labels(
                     format!("use of moved value: `{}`", capture.name),
                     span,
@@ -1009,91 +1096,101 @@ impl<'a> Analyzer<'a> {
                 continue;
             }
 
-            match capture.mode {
-                CaptureMode::Shared => {
-                    if self.has_mut_access_borrow(ctx, &access_place) {
-                        self.diag(
-                            format!(
-                                "cannot capture `{}` by shared reference while mutably borrowed",
-                                capture.name
-                            ),
-                            span,
-                            "E0301",
-                        );
-                    } else {
-                        ctx.new_loan(access_place.clone(), BorrowKind::Shared, span, false);
-                    }
+            self.apply_capture_mode(ctx, capture, move_place, &access_place, span);
+        }
+    }
+
+    fn apply_capture_mode(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        capture: &ty::LambdaCapture,
+        move_place: Option<Place>,
+        access_place: &AccessPlace,
+        span: Option<TextRange>,
+    ) {
+        match capture.mode {
+            CaptureMode::Shared => {
+                if Self::has_mut_access_borrow(ctx, access_place) {
+                    self.diag(
+                        format!(
+                            "cannot capture `{}` by shared reference while mutably borrowed",
+                            capture.name
+                        ),
+                        span,
+                        "E0301",
+                    );
+                } else {
+                    ctx.new_loan(access_place.clone(), BorrowKind::Shared, span, false);
                 }
-                CaptureMode::Mutable => {
-                    if self.has_shared_access_borrow(ctx, &access_place) {
-                        self.diag(
-                            format!(
-                                "cannot capture `{}` mutably while shared-borrowed",
-                                capture.name
-                            ),
-                            span,
-                            "E0300",
-                        );
-                    } else if self.has_mut_access_borrow(ctx, &access_place) {
-                        self.diag(
-                            format!("cannot capture `{}` mutably more than once", capture.name),
-                            span,
-                            "E0302",
-                        );
-                    } else {
-                        ctx.new_loan(access_place.clone(), BorrowKind::Mutable, span, false);
-                    }
+            }
+            CaptureMode::Mutable => {
+                if Self::has_shared_access_borrow(ctx, access_place) {
+                    self.diag(
+                        format!(
+                            "cannot capture `{}` mutably while shared-borrowed",
+                            capture.name
+                        ),
+                        span,
+                        "E0300",
+                    );
+                } else if Self::has_mut_access_borrow(ctx, access_place) {
+                    self.diag(
+                        format!("cannot capture `{}` mutably more than once", capture.name),
+                        span,
+                        "E0302",
+                    );
+                } else {
+                    ctx.new_loan(access_place.clone(), BorrowKind::Mutable, span, false);
                 }
-                CaptureMode::Value => {
-                    if self.trait_env.type_is_copy(&capture.ty) {
-                        continue;
+            }
+            CaptureMode::Value => {
+                if self.trait_env.type_is_copy(&capture.ty) {
+                    return;
+                }
+                if ctx.in_match_guard && matches!(&capture.place.source, CaptureSource::Pattern(_))
+                {
+                    self.diag(
+                        format!(
+                            "cannot move pattern binding `{}` in a match guard",
+                            capture.name
+                        ),
+                        span,
+                        "E0307",
+                    );
+                    return;
+                }
+                if !capture.place.projections.is_empty()
+                    && match &capture.place.source {
+                        CaptureSource::Pattern(id) => self
+                            .type_result
+                            .pattern_binding_types
+                            .get(&(ctx.body_id, *id))
+                            .is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty)),
+                        CaptureSource::Param(_) | CaptureSource::LambdaParam { .. } => false,
                     }
-                    if ctx.in_match_guard
-                        && matches!(&capture.place.source, CaptureSource::Pattern(_))
-                    {
-                        self.diag(
-                            format!(
-                                "cannot move pattern binding `{}` in a match guard",
-                                capture.name
-                            ),
-                            span,
-                            "E0307",
-                        );
-                        continue;
-                    }
-                    if !capture.place.projections.is_empty()
-                        && match &capture.place.source {
-                            CaptureSource::Pattern(id) => self
-                                .type_result
-                                .pattern_binding_types
-                                .get(&(ctx.body_id, *id))
-                                .is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty)),
-                            CaptureSource::Param(_) | CaptureSource::LambdaParam { .. } => false,
-                        }
-                    {
-                        self.diag(
-                            "cannot move out of a field of a type that implements `Drop`".into(),
-                            span,
-                            "E0305",
-                        );
-                        continue;
-                    }
-                    if self.has_any_access_borrow(ctx, &access_place) {
-                        self.diag(
-                            format!("cannot move `{}` into closure while borrowed", capture.name),
-                            span,
-                            "E0304",
-                        );
-                        continue;
-                    }
-                    if let Some(place) = move_place {
-                        ctx.moved_places.insert(place.clone());
-                        ctx.moved_sites
-                            .insert(place, (span, "value moved into closure here".into()));
-                    }
-                    if capture.place.projections.is_empty() {
-                        ctx.bindings.mark_moved(&capture.name);
-                    }
+                {
+                    self.diag(
+                        "cannot move out of a field of a type that implements `Drop`".into(),
+                        span,
+                        "E0305",
+                    );
+                    return;
+                }
+                if Self::has_any_access_borrow(ctx, access_place) {
+                    self.diag(
+                        format!("cannot move `{}` into closure while borrowed", capture.name),
+                        span,
+                        "E0304",
+                    );
+                    return;
+                }
+                if let Some(place) = move_place {
+                    ctx.moved_places.insert(place.clone());
+                    ctx.moved_sites
+                        .insert(place, (span, "value moved into closure here".into()));
+                }
+                if capture.place.projections.is_empty() {
+                    ctx.bindings.mark_moved(&capture.name);
                 }
             }
         }
@@ -1200,14 +1297,14 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn has_any_borrow(&self, ctx: &BodyCtx<'_>, place: &Place) -> bool {
+    fn has_any_borrow(ctx: &BodyCtx<'_>, place: &Place) -> bool {
         let place = access_place_from_move_place(place);
-        self.has_any_access_borrow(ctx, &place)
+        Self::has_any_access_borrow(ctx, &place)
     }
 
     fn check_trait_index_receiver_borrow(
         &mut self,
-        ctx: &mut BodyCtx<'_>,
+        ctx: &BodyCtx<'_>,
         expr_id: ExprId,
         base: ExprId,
         span: Option<TextRange>,
@@ -1227,7 +1324,7 @@ impl<'a> Analyzer<'a> {
             return;
         };
         let targets = if self.expr_is_reference(ctx, base) {
-            self.origin_targets(ctx, base)
+            Self::origin_targets(ctx, base)
         } else {
             self.access_targets(ctx, base)
         };
@@ -1236,14 +1333,13 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn has_any_access_borrow(&self, ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
+    fn has_any_access_borrow(ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
         ctx.loans
             .values()
             .any(|loan| loan.active && access_places_overlap(&loan.place, place))
     }
 
     fn has_access_borrow_except_origins(
-        &self,
         ctx: &BodyCtx<'_>,
         place: &AccessPlace,
         expr_id: ExprId,
@@ -1285,7 +1381,7 @@ impl<'a> Analyzer<'a> {
             Expr::FieldAccess { base, field } => {
                 let index = self.resolve_field_index(ctx.body_id, *base, field);
                 let mut targets = if self.expr_is_reference(ctx, *base) {
-                    self.origin_targets(ctx, *base)
+                    Self::origin_targets(ctx, *base)
                 } else {
                     self.access_targets(ctx, *base)
                 };
@@ -1299,7 +1395,7 @@ impl<'a> Analyzer<'a> {
             }
             Expr::IndexAccess { base, index } => {
                 let mut targets = if self.expr_is_reference(ctx, *base) {
-                    self.origin_targets(ctx, *base)
+                    Self::origin_targets(ctx, *base)
                 } else {
                     self.access_targets(ctx, *base)
                 };
@@ -1315,29 +1411,25 @@ impl<'a> Analyzer<'a> {
             Expr::Unary {
                 operand,
                 op: UnaryOp::Deref,
-            } => self.origin_targets(ctx, *operand),
+            } => Self::origin_targets(ctx, *operand),
             _ => Vec::new(),
         }
     }
 
-    fn local_assignment(
-        &self,
-        ctx: &BodyCtx<'_>,
-        expr_id: ExprId,
-    ) -> Option<(PatternBindingId, bool)> {
+    fn local_assignment(ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<(PatternBindingId, bool)> {
         match &ctx.body.exprs[expr_id] {
             Expr::Path {
                 resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
             } => Some((*id, true)),
             Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
-                self.local_assignment(ctx, *base).map(|(id, _)| (id, false))
+                Self::local_assignment(ctx, *base).map(|(id, _)| (id, false))
             }
             _ => None,
         }
     }
 
-    fn origin_targets(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Vec<AccessTarget> {
+    fn origin_targets(ctx: &BodyCtx<'_>, expr_id: ExprId) -> Vec<AccessTarget> {
         let mut targets: HashMap<AccessPlace, HashSet<LoanId>> = HashMap::new();
         for origin in ctx.expr_origins.get(&expr_id).into_iter().flatten() {
             targets
@@ -1437,7 +1529,7 @@ impl<'a> Analyzer<'a> {
             };
 
             let targets = if self.expr_is_reference(ctx, *input) {
-                self.origin_targets(ctx, *input)
+                Self::origin_targets(ctx, *input)
             } else {
                 self.access_targets(ctx, *input)
             };
@@ -1466,17 +1558,20 @@ impl<'a> Analyzer<'a> {
         let summary = may_carry_reference
             .then(|| fid.and_then(|fid| self.reference_flow.summary(fid)))
             .flatten();
-        let result = if let Some(summary) = summary {
-            self.instantiate_call_summary(ctx, summary, &prepared, inputs, span)
-        } else if may_carry_reference {
-            let mut result = OriginValue::default();
-            for value in &prepared {
-                result.merge(value.flattened());
-            }
-            result
-        } else {
-            OriginValue::default()
-        };
+        let result = summary.map_or_else(
+            || {
+                if may_carry_reference {
+                    let mut result = OriginValue::default();
+                    for value in &prepared {
+                        result.merge(value.flattened());
+                    }
+                    result
+                } else {
+                    OriginValue::default()
+                }
+            },
+            |summary| self.instantiate_call_summary(ctx, summary, &prepared, inputs, span),
+        );
 
         let retained = result
             .origins
@@ -1497,7 +1592,7 @@ impl<'a> Analyzer<'a> {
         }
 
         for input in inputs {
-            self.deactivate_unretained(ctx, *input, &retained);
+            Self::deactivate_unretained(ctx, *input, &retained);
         }
 
         result
@@ -1618,12 +1713,7 @@ impl<'a> Analyzer<'a> {
             .is_none_or(|ty| type_may_carry_reference(self.hir, ty))
     }
 
-    fn deactivate_unretained(
-        &self,
-        ctx: &mut BodyCtx<'_>,
-        expr_id: ExprId,
-        retained: &HashSet<LoanId>,
-    ) {
+    fn deactivate_unretained(ctx: &mut BodyCtx<'_>, expr_id: ExprId, retained: &HashSet<LoanId>) {
         let origins = ctx.expr_origins.get(&expr_id).cloned().unwrap_or_default();
         for origin in origins {
             if retained.contains(&origin.loan) {
@@ -1670,7 +1760,7 @@ impl<'a> Analyzer<'a> {
         span: Option<TextRange>,
         expr_id: ExprId,
     ) -> bool {
-        let name = self.expr_name(ctx, expr_id);
+        let name = Self::expr_name(ctx, expr_id);
         self.borrow_conflicts_named(ctx, place, kind, parents, span, &name)
     }
 
@@ -1698,23 +1788,18 @@ impl<'a> Analyzer<'a> {
             (BorrowKind::Mutable, BorrowKind::Shared) => (
                 "E0300",
                 format!(
-                    "cannot borrow `{}` as mutable because it is also borrowed as immutable",
-                    name
+                    "cannot borrow `{name}` as mutable because it is also borrowed as immutable"
                 ),
             ),
             (BorrowKind::Shared, BorrowKind::Mutable) => (
                 "E0301",
                 format!(
-                    "cannot borrow `{}` as immutable because it is also borrowed as mutable",
-                    name
+                    "cannot borrow `{name}` as immutable because it is also borrowed as mutable"
                 ),
             ),
             (BorrowKind::Mutable, BorrowKind::Mutable) => (
                 "E0302",
-                format!(
-                    "cannot borrow `{}` as mutable more than once at a time",
-                    name
-                ),
+                format!("cannot borrow `{name}` as mutable more than once at a time"),
             ),
             (BorrowKind::Shared, BorrowKind::Shared) => unreachable!(),
         };
@@ -1732,7 +1817,7 @@ impl<'a> Analyzer<'a> {
         true
     }
 
-    fn has_shared_access_borrow(&self, ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
+    fn has_shared_access_borrow(ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
         ctx.loans.values().any(|loan| {
             loan.active
                 && loan.kind == BorrowKind::Shared
@@ -1740,7 +1825,7 @@ impl<'a> Analyzer<'a> {
         })
     }
 
-    fn has_mut_access_borrow(&self, ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
+    fn has_mut_access_borrow(ctx: &BodyCtx<'_>, place: &AccessPlace) -> bool {
         ctx.loans.values().any(|loan| {
             loan.active
                 && loan.kind == BorrowKind::Mutable
@@ -1748,21 +1833,20 @@ impl<'a> Analyzer<'a> {
         })
     }
 
-    fn expr_name(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> String {
+    fn expr_name(ctx: &BodyCtx<'_>, expr_id: ExprId) -> String {
         match &ctx.body.exprs[expr_id] {
             Expr::Path { path, .. } => path
                 .as_single_name()
-                .map(|n| n.0.as_str().to_string())
-                .unwrap_or_else(|| "_".into()),
+                .map_or_else(|| "_".into(), |n| n.0.as_str().to_string()),
             Expr::FieldAccess { field, .. } => field.0.clone(),
             _ => String::from("_"),
         }
     }
 
-    fn bind_pattern_names(&self, ctx: &mut BodyCtx<'_>, pat: hir::body::PatId) {
+    fn bind_pattern_names(ctx: &mut BodyCtx<'_>, pat: hir::body::PatId) {
         match &ctx.body.pats[pat] {
             hir::body::Pattern::Binding { name, .. } => {
-                self.bind_pattern_name(
+                Self::bind_pattern_name(
                     ctx,
                     PatternBindingId {
                         pattern: pat,
@@ -1772,24 +1856,20 @@ impl<'a> Analyzer<'a> {
                 );
             }
             hir::body::Pattern::Reference { pattern, .. } => {
-                self.bind_pattern_names(ctx, *pattern);
+                Self::bind_pattern_names(ctx, *pattern);
             }
-            hir::body::Pattern::Tuple { elements } => {
+            hir::body::Pattern::Tuple { elements }
+            | hir::body::Pattern::TupleStruct { elements, .. } => {
                 for el in elements {
-                    self.bind_pattern_names(ctx, *el);
-                }
-            }
-            hir::body::Pattern::TupleStruct { elements, .. } => {
-                for el in elements {
-                    self.bind_pattern_names(ctx, *el);
+                    Self::bind_pattern_names(ctx, *el);
                 }
             }
             hir::body::Pattern::Struct { fields, .. } => {
                 for (index, f) in fields.iter().enumerate() {
                     if let Some(p) = f.pat {
-                        self.bind_pattern_names(ctx, p);
+                        Self::bind_pattern_names(ctx, p);
                     } else {
-                        self.bind_pattern_name(
+                        Self::bind_pattern_name(
                             ctx,
                             PatternBindingId {
                                 pattern: pat,
@@ -1804,20 +1884,20 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn bind_pattern_name(&self, ctx: &mut BodyCtx<'_>, id: PatternBindingId, name: &str) {
+    fn bind_pattern_name(ctx: &mut BodyCtx<'_>, id: PatternBindingId, name: &str) {
         ctx.bindings.insert_available(name.to_string());
-        self.reset_binding_move(ctx, id);
+        Self::reset_binding_move(ctx, id);
     }
 
-    fn reset_pattern_moves(&self, ctx: &mut BodyCtx<'_>, pat: PatId) {
+    fn reset_pattern_moves(ctx: &mut BodyCtx<'_>, pat: PatId) {
         let mut bindings = Vec::new();
         initialization::collect_pattern_bindings(ctx.body, pat, &mut bindings);
         for (id, _) in bindings {
-            self.reset_binding_move(ctx, id);
+            Self::reset_binding_move(ctx, id);
         }
     }
 
-    fn reset_binding_move(&self, ctx: &mut BodyCtx<'_>, id: PatternBindingId) {
+    fn reset_binding_move(ctx: &mut BodyCtx<'_>, id: PatternBindingId) {
         let place = Place::root(id);
         ctx.moved_places
             .retain(|moved| !place_overlaps(moved, &place));
@@ -1986,7 +2066,6 @@ impl<'a> Analyzer<'a> {
                     places.push(root.clone());
                 }
             }
-            Pattern::Reference { .. } => {}
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 for (index, element) in elements.iter().enumerate() {
                     self.collect_pattern_move_places(
@@ -2013,7 +2092,10 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            Pattern::Reference { .. }
+            | Pattern::Wildcard
+            | Pattern::Literal(_)
+            | Pattern::Path { .. } => {}
         }
     }
 
@@ -2071,7 +2153,6 @@ impl<'a> Analyzer<'a> {
         let children = match &ctx.body.pats[pat] {
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => elements.clone(),
             Pattern::Struct { fields, .. } => fields.iter().filter_map(|field| field.pat).collect(),
-            Pattern::Reference { .. } => Vec::new(),
             _ => Vec::new(),
         };
         children.into_iter().find_map(|child| {
@@ -2165,18 +2246,23 @@ impl<'a> Analyzer<'a> {
             }
             Pattern::Struct { fields, .. } => {
                 fields.iter().enumerate().find_map(|(index, field)| {
-                    if let Some(field_pattern) = field.pat {
-                        self.explicit_reference_pattern_move(ctx, field_pattern, behind_reference)
-                    } else if behind_reference
-                        && binding_moves(PatternBindingId {
-                            pattern: pat,
-                            field: Some(index),
-                        })
-                    {
-                        Some(pat)
-                    } else {
-                        None
-                    }
+                    field.pat.map_or_else(
+                        || {
+                            (behind_reference
+                                && binding_moves(PatternBindingId {
+                                    pattern: pat,
+                                    field: Some(index),
+                                }))
+                            .then_some(pat)
+                        },
+                        |field_pattern| {
+                            self.explicit_reference_pattern_move(
+                                ctx,
+                                field_pattern,
+                                behind_reference,
+                            )
+                        },
+                    )
                 })
             }
             Pattern::Binding { .. }
@@ -2187,15 +2273,11 @@ impl<'a> Analyzer<'a> {
     }
 
     fn diag(&mut self, message: String, span: Option<TextRange>, code: &'static str) {
-        self.diag_with_labels(message, span, code, &[])
+        self.diag_with_labels(message, span, code, &[]);
     }
 
     /// Build secondary labels for the move site that caused this E0100 error.
-    fn move_site_labels(
-        &self,
-        ctx: &BodyCtx<'_>,
-        place: &Place,
-    ) -> Vec<(TextRange, String, LabelStyle)> {
+    fn move_site_labels(ctx: &BodyCtx<'_>, place: &Place) -> Vec<(TextRange, String, LabelStyle)> {
         // Find the most specific moved site — scan for a prefix match.
         let mut best: Option<(&Place, &(Option<TextRange>, String))> = None;
         for (moved_place, site) in &ctx.moved_sites {
@@ -2372,9 +2454,9 @@ impl<'a> BodyCtx<'a> {
     }
 
     fn copy_move_state_from(&mut self, other: &Self) {
-        self.bindings = other.bindings.clone();
-        self.moved_places = other.moved_places.clone();
-        self.moved_sites = other.moved_sites.clone();
+        self.bindings.clone_from(&other.bindings);
+        self.moved_places.clone_from(&other.moved_places);
+        self.moved_sites.clone_from(&other.moved_sites);
     }
 
     fn merge_move_state_from(&mut self, other: &Self) {
@@ -2399,8 +2481,10 @@ impl<'a> BodyCtx<'a> {
             };
             let place = AccessPlace::new(AccessRoot::Param(index));
             let loan = self.new_loan(place.clone(), kind, Some(param.name_range), true);
-            self.param_origins
-                .insert(index, [Origin { place, kind, loan }].into_iter().collect());
+            self.param_origins.insert(
+                index,
+                std::iter::once(Origin { place, kind, loan }).collect(),
+            );
         }
     }
     fn expr_range(&self, id: ExprId) -> Option<TextRange> {
@@ -2663,7 +2747,7 @@ fn access_place_from_move_place(place: &Place) -> AccessPlace {
     result
 }
 
-fn access_place_from_resolved_name(name: &ResolvedName) -> Option<AccessPlace> {
+const fn access_place_from_resolved_name(name: &ResolvedName) -> Option<AccessPlace> {
     let root = match name {
         ResolvedName::PatternBinding(id) => AccessRoot::Pattern(*id),
         ResolvedName::Param(index) => AccessRoot::Param(*index),
@@ -2709,7 +2793,7 @@ fn move_place_from_capture(capture: &CapturePlace) -> Option<Place> {
     Some(place)
 }
 
-fn hir_ref_kind(ty: &HirTypeRef) -> Option<BorrowKind> {
+const fn hir_ref_kind(ty: &HirTypeRef) -> Option<BorrowKind> {
     match ty {
         HirTypeRef::Ref(_, true) => Some(BorrowKind::Mutable),
         HirTypeRef::Ref(_, false) => Some(BorrowKind::Shared),
@@ -2717,7 +2801,7 @@ fn hir_ref_kind(ty: &HirTypeRef) -> Option<BorrowKind> {
     }
 }
 
-fn type_ref_kind(ty: &Type) -> Option<BorrowKind> {
+const fn type_ref_kind(ty: &Type) -> Option<BorrowKind> {
     match ty {
         Type::Ref(_, true) => Some(BorrowKind::Mutable),
         Type::Ref(_, false) => Some(BorrowKind::Shared),
@@ -2726,115 +2810,122 @@ fn type_ref_kind(ty: &Type) -> Option<BorrowKind> {
 }
 
 fn collect_local_uses(body: &Body) -> HashMap<PatternBindingId, usize> {
-    fn expr(body: &Body, id: ExprId, uses: &mut HashMap<PatternBindingId, usize>) {
-        match &body.exprs[id] {
-            Expr::Path {
-                resolved: Some(ResolvedName::PatternBinding(binding)),
-                ..
-            } => *uses.entry(*binding).or_default() += 1,
-            Expr::Binary { lhs, rhs, .. } => {
-                expr(body, *lhs, uses);
-                expr(body, *rhs, uses);
+    let mut uses = HashMap::new();
+    collect_expr_local_uses(body, body.root_block, &mut uses);
+    uses
+}
+
+fn collect_expr_local_uses(body: &Body, id: ExprId, uses: &mut HashMap<PatternBindingId, usize>) {
+    match &body.exprs[id] {
+        Expr::Path {
+            resolved: Some(ResolvedName::PatternBinding(binding)),
+            ..
+        } => *uses.entry(*binding).or_default() += 1,
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_local_uses(body, *lhs, uses);
+            collect_expr_local_uses(body, *rhs, uses);
+        }
+        Expr::Unary { operand, .. }
+        | Expr::FieldAccess { base: operand, .. }
+        | Expr::Unsafe { body: operand }
+        | Expr::Cast { base: operand, .. }
+        | Expr::Try { operand } => collect_expr_local_uses(body, *operand, uses),
+        Expr::Block { stmts, tail } => collect_block_local_uses(body, stmts, *tail, uses),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_expr_local_uses(body, *cond, uses);
+            collect_expr_local_uses(body, *then_branch, uses);
+            if let Some(branch) = else_branch {
+                collect_expr_local_uses(body, *branch, uses);
             }
-            Expr::Unary { operand, .. }
-            | Expr::FieldAccess { base: operand, .. }
-            | Expr::Unsafe { body: operand }
-            | Expr::Cast { base: operand, .. }
-            | Expr::Try { operand } => expr(body, *operand, uses),
-            Expr::Block { stmts, tail } => {
-                for stmt_id in stmts {
-                    match &body.stmts[*stmt_id] {
-                        Stmt::Let { init, .. } => {
-                            if let Some(init) = init {
-                                expr(body, *init, uses);
-                            }
-                        }
-                        Stmt::Expr { expr: value } => expr(body, *value, uses),
-                        Stmt::Return { value } => {
-                            if let Some(value) = value {
-                                expr(body, *value, uses);
-                            }
-                        }
-                        Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
-                    }
+        }
+        Expr::While {
+            condition,
+            body: loop_body,
+        } => {
+            collect_expr_local_uses(body, *condition, uses);
+            collect_expr_local_uses(body, *loop_body, uses);
+        }
+        Expr::For {
+            iterable,
+            body: loop_body,
+            ..
+        } => {
+            collect_expr_local_uses(body, *iterable, uses);
+            collect_expr_local_uses(body, *loop_body, uses);
+        }
+        Expr::Match { scrutinee, arms } => {
+            collect_expr_local_uses(body, *scrutinee, uses);
+            for arm in arms {
+                if let Some(guard) = arm.guard {
+                    collect_expr_local_uses(body, guard, uses);
                 }
-                if let Some(tail) = tail {
-                    expr(body, *tail, uses);
+                collect_expr_local_uses(body, arm.body, uses);
+            }
+        }
+        Expr::Array { elements } | Expr::Tuple { elements } => {
+            for element in elements {
+                collect_expr_local_uses(body, *element, uses);
+            }
+        }
+        Expr::ArrayRepeat { value, len } => {
+            collect_expr_local_uses(body, *value, uses);
+            collect_expr_local_uses(body, *len, uses);
+        }
+        Expr::Struct { fields, .. } => {
+            for field in fields {
+                collect_expr_local_uses(body, field.value, uses);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_expr_local_uses(body, *callee, uses);
+            for arg in args {
+                collect_expr_local_uses(body, *arg, uses);
+            }
+        }
+        Expr::Lambda {
+            body: lambda_body, ..
+        } => collect_expr_local_uses(body, *lambda_body, uses),
+        Expr::IndexAccess { base, index } => {
+            collect_expr_local_uses(body, *base, uses);
+            collect_expr_local_uses(body, *index, uses);
+        }
+        Expr::Missing
+        | Expr::IntLiteral { .. }
+        | Expr::FloatLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::CharLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::Path { .. } => {}
+    }
+}
+
+fn collect_block_local_uses(
+    body: &Body,
+    stmts: &[StmtId],
+    tail: Option<ExprId>,
+    uses: &mut HashMap<PatternBindingId, usize>,
+) {
+    for stmt_id in stmts {
+        match &body.stmts[*stmt_id] {
+            Stmt::Let { init, .. } => {
+                if let Some(init) = init {
+                    collect_expr_local_uses(body, *init, uses);
                 }
             }
-            Expr::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                expr(body, *cond, uses);
-                expr(body, *then_branch, uses);
-                if let Some(branch) = else_branch {
-                    expr(body, *branch, uses);
+            Stmt::Expr { expr } => collect_expr_local_uses(body, *expr, uses),
+            Stmt::Return { value } => {
+                if let Some(value) = value {
+                    collect_expr_local_uses(body, *value, uses);
                 }
             }
-            Expr::While {
-                condition,
-                body: loop_body,
-            } => {
-                expr(body, *condition, uses);
-                expr(body, *loop_body, uses);
-            }
-            Expr::For {
-                iterable,
-                body: loop_body,
-                ..
-            } => {
-                expr(body, *iterable, uses);
-                expr(body, *loop_body, uses);
-            }
-            Expr::Match { scrutinee, arms } => {
-                expr(body, *scrutinee, uses);
-                for arm in arms {
-                    if let Some(guard) = arm.guard {
-                        expr(body, guard, uses);
-                    }
-                    expr(body, arm.body, uses);
-                }
-            }
-            Expr::Array { elements } | Expr::Tuple { elements } => {
-                for element in elements {
-                    expr(body, *element, uses);
-                }
-            }
-            Expr::ArrayRepeat { value, len } => {
-                expr(body, *value, uses);
-                expr(body, *len, uses);
-            }
-            Expr::Struct { fields, .. } => {
-                for field in fields {
-                    expr(body, field.value, uses);
-                }
-            }
-            Expr::Call { callee, args, .. } => {
-                expr(body, *callee, uses);
-                for arg in args {
-                    expr(body, *arg, uses);
-                }
-            }
-            Expr::Lambda {
-                body: lambda_body, ..
-            } => expr(body, *lambda_body, uses),
-            Expr::IndexAccess { base, index } => {
-                expr(body, *base, uses);
-                expr(body, *index, uses);
-            }
-            Expr::Missing
-            | Expr::IntLiteral { .. }
-            | Expr::FloatLiteral { .. }
-            | Expr::StringLiteral { .. }
-            | Expr::CharLiteral { .. }
-            | Expr::BoolLiteral { .. }
-            | Expr::Path { .. } => {}
+            Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
         }
     }
-
-    let mut uses = HashMap::new();
-    expr(body, body.root_block, &mut uses);
-    uses
+    if let Some(tail) = tail {
+        collect_expr_local_uses(body, tail, uses);
+    }
 }

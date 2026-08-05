@@ -27,7 +27,9 @@ pub(super) fn expand_standard_debug_struct(item: &ast::StructDecl) -> Result<Str
         .name()
         .map(|name| name.text().to_string())
         .ok_or_else(|| "Debug derive input is missing a struct name".to_string())?;
-    let mut output = debug_impl_header(&name, item.generic_params(), item.where_clause());
+    let generic_params = item.generic_params();
+    let where_clause = item.where_clause();
+    let mut output = debug_impl_header(&name, generic_params.as_ref(), where_clause.as_ref());
     let fields = item
         .field_list()
         .map(|fields| {
@@ -63,7 +65,9 @@ pub(super) fn expand_standard_debug_enum(item: &ast::EnumDecl) -> Result<String,
         .name()
         .map(|name| name.text().to_string())
         .ok_or_else(|| "Debug derive input is missing an enum name".to_string())?;
-    let mut output = debug_impl_header(&name, item.generic_params(), item.where_clause());
+    let generic_params = item.generic_params();
+    let where_clause = item.where_clause();
+    let mut output = debug_impl_header(&name, generic_params.as_ref(), where_clause.as_ref());
     output.push_str("match self {");
     for variant in item.variants() {
         let variant_name = variant
@@ -150,15 +154,13 @@ pub(super) fn expand_standard_debug_enum(item: &ast::EnumDecl) -> Result<String,
 
 pub(super) fn debug_impl_header(
     name: &str,
-    generic_params: Option<ast::GenericParams>,
-    where_clause: Option<ast::WhereClause>,
+    generic_params: Option<&ast::GenericParams>,
+    where_clause: Option<&ast::WhereClause>,
 ) -> String {
     let declaration = generic_params
-        .as_ref()
         .map(|params| params.syntax().text().to_string())
         .unwrap_or_default();
     let params = generic_params
-        .as_ref()
         .map(|params| params.params().collect::<Vec<_>>())
         .unwrap_or_default();
     let type_arguments = if params.is_empty() {
@@ -345,7 +347,7 @@ fn parse_format_literal(
             }
             DecodedLiteralChar { value: '{', source } if next(1) == Some(':') => {
                 if next(2) != Some('?') || next(3) != Some('}') {
-                    return Err("only `{}` and `{:?}` format placeholders are supported".into());
+                    return Err(unsupported_format_placeholder_message());
                 }
                 arguments.push(StandardFormatArgument {
                     trait_kind: StandardFormatTrait::Debug,
@@ -359,14 +361,15 @@ fn parse_format_literal(
                 index += 4;
             }
             DecodedLiteralChar { value: '{', .. } => {
-                return Err("only `{}` and `{:?}` format placeholders are supported".into());
+                return Err(unsupported_format_placeholder_message());
             }
             DecodedLiteralChar { value: '}', .. } if next(1) == Some('}') => {
                 segments.last_mut().unwrap().push('}');
                 index += 2;
             }
             DecodedLiteralChar { value: '}', .. } => {
-                return Err("unmatched `}` in format string".into());
+                let close = '}';
+                return Err(format!("unmatched `{close}` in format string"));
             }
             character => {
                 segments.last_mut().unwrap().push(character.value);
@@ -378,6 +381,12 @@ fn parse_format_literal(
         segments,
         arguments,
     })
+}
+
+fn unsupported_format_placeholder_message() -> String {
+    let open = '{';
+    let close = '}';
+    format!("only `{open}{close}` and `{open}:?{close}` format placeholders are supported")
 }
 
 pub(super) fn literal_source_range(

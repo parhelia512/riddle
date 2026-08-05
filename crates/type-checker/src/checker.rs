@@ -16,7 +16,7 @@ use crate::{
     lang_items::{LangItem, RegisterResult},
     result::{Diagnostic, LabelStyle, Severity, SourceLabel, TypeCheckResult},
     trait_env::{TraitAssocConstraint, TraitBound},
-    types::{CallableSignature, ClosureKind, FloatTy, IntTy, OpaqueCallableId, Type},
+    types::{CallableSignature, ClosureId, ClosureKind, FloatTy, IntTy, OpaqueCallableId, Type},
 };
 
 pub struct TypeChecker<'a> {
@@ -41,7 +41,7 @@ struct PendingLambda {
 }
 
 #[derive(Clone)]
-pub(crate) struct PendingGenericCall {
+pub struct PendingGenericCall {
     pub(crate) body_id: BodyId,
     pub(crate) callee: ExprId,
     pub(crate) function: FunctionId,
@@ -56,7 +56,7 @@ pub(crate) struct PendingGenericCall {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct GenericEdge {
+pub struct GenericEdge {
     pub(crate) caller: FunctionId,
     pub(crate) callee: FunctionId,
     pub(crate) grows: bool,
@@ -69,11 +69,35 @@ enum NominalType {
     Enum(EnumId),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallableIdentity {
+    Closure(ClosureId),
+    Opaque(OpaqueCallableId),
+}
+
+const fn type_nominal_identity(ty: &Type) -> Option<NominalType> {
+    match ty {
+        Type::Struct(id, _) => Some(NominalType::Struct(*id)),
+        Type::Enum(id, _) => Some(NominalType::Enum(*id)),
+        _ => None,
+    }
+}
+
+const fn type_callable_identity(ty: &Type) -> Option<CallableIdentity> {
+    match ty {
+        Type::Closure { id, .. } => Some(CallableIdentity::Closure(*id)),
+        Type::OpaqueCallable { id, .. } => Some(CallableIdentity::Opaque(*id)),
+        _ => None,
+    }
+}
+
+#[must_use]
 pub fn check_hir(hir: &HirFile) -> TypeCheckResult {
     TypeChecker::new(hir).check()
 }
 
 impl<'a> TypeChecker<'a> {
+    #[must_use]
     pub fn new(hir: &'a HirFile) -> Self {
         Self {
             hir,
@@ -91,6 +115,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    #[must_use]
     pub fn check(mut self) -> TypeCheckResult {
         self.check_value_type_declarations();
         self.check_type_layouts();
@@ -106,61 +131,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub(crate) fn check_value_type_declarations(&mut self) {
-        let structs = self
-            .hir
-            .item_tree
-            .structs
-            .iter()
-            .map(|(_, item)| item.clone())
-            .collect::<Vec<_>>();
-        for item in structs {
-            let params = crate::lowering::generic_param_map_with_consts(
-                item.generics.iter().map(|name| name.0.as_str()),
-                item.const_generics.iter().map(|name| name.0.as_str()),
-            );
-            for field in item.fields {
-                let ty =
-                    self.lower_type_ref_with_params_at(&field.ty, &params, Some(field.ty_range));
-                self.expect_sized_value(&ty, Some(field.ty_range));
-            }
-        }
-
-        let enums = self
-            .hir
-            .item_tree
-            .enums
-            .iter()
-            .map(|(_, item)| item.clone())
-            .collect::<Vec<_>>();
-        for item in enums {
-            let params = crate::lowering::generic_param_map_with_consts(
-                item.generics.iter().map(|name| name.0.as_str()),
-                item.const_generics.iter().map(|name| name.0.as_str()),
-            );
-            for variant in item.variants {
-                let field_ranges = variant.field_ranges;
-                match variant.kind {
-                    HirVariantKind::Unit => {}
-                    HirVariantKind::Tuple(fields) => {
-                        for (field, range) in fields.into_iter().zip(field_ranges) {
-                            let ty =
-                                self.lower_type_ref_with_params_at(&field, &params, Some(range));
-                            self.expect_sized_value(&ty, Some(range));
-                        }
-                    }
-                    HirVariantKind::Struct(fields) => {
-                        for field in fields {
-                            let ty = self.lower_type_ref_with_params_at(
-                                &field.ty,
-                                &params,
-                                Some(field.ty_range),
-                            );
-                            self.expect_sized_value(&ty, Some(field.ty_range));
-                        }
-                    }
-                }
-            }
-        }
+        self.check_aggregate_value_type_declarations();
 
         let functions = self
             .hir
@@ -172,55 +143,8 @@ impl<'a> TypeChecker<'a> {
         for (id, function) in functions {
             let outer_generics = self.impl_generic_names(id);
             let outer_const_generics = self.impl_const_generic_names(id);
-            let outer_params = crate::lowering::generic_param_map_with_consts(
-                outer_generics.iter().map(String::as_str),
-                outer_const_generics.iter().map(String::as_str),
-            );
-            let mut params = crate::lowering::generic_param_map_with_consts(
-                outer_generics
-                    .iter()
-                    .map(String::as_str)
-                    .chain(function.generics.iter().map(|name| name.0.as_str()))
-                    .chain(
-                        function
-                            .implicit_generics
-                            .iter()
-                            .map(|name| name.0.as_str()),
-                    ),
-                outer_const_generics
-                    .iter()
-                    .map(String::as_str)
-                    .chain(function.const_generics.iter().map(|name| name.0.as_str())),
-            );
-            if let Some(self_ty_ref) = self.impl_self_ty_ref(id).cloned() {
-                let range = self.impl_self_ty_range(id).unwrap_or(function.name_range);
-                let self_ty =
-                    self.lower_type_ref_with_params_at(&self_ty_ref, &outer_params, Some(range));
-                let owner = self
-                    .hir
-                    .item_tree
-                    .impls
-                    .iter()
-                    .find_map(|(_, imp)| imp.methods.contains(&id).then(|| imp.clone()));
-                if let Some((imp, trait_id)) = owner.as_ref().and_then(|imp| {
-                    imp.trait_ty
-                        .as_ref()
-                        .and_then(|trait_ty| self.resolve_trait_ref(trait_ty))
-                        .map(|trait_id| (imp, trait_id))
-                }) {
-                    params = self.trait_ref_subst(
-                        trait_id,
-                        imp.trait_ty.as_ref().unwrap(),
-                        &self_ty,
-                        &params,
-                        imp.trait_ty_range,
-                    );
-                } else {
-                    params.insert("Self".into(), self_ty);
-                }
-            } else if self.trait_for_default_method(id).is_some() {
-                params.insert("Self".into(), Type::Param("Self".into()));
-            }
+            let params =
+                self.function_generic_params(id, &function, &outer_generics, &outer_const_generics);
             self.check_function_value_types(&function, &params);
         }
 
@@ -283,6 +207,64 @@ impl<'a> TypeChecker<'a> {
             let range = item.ty_range.unwrap_or(item.name_range);
             let ty = self.lower_type_ref_with_params_at(&alias, &params, Some(range));
             self.expect_sized_value(&ty, Some(range));
+        }
+    }
+
+    fn check_aggregate_value_type_declarations(&mut self) {
+        let structs = self
+            .hir
+            .item_tree
+            .structs
+            .iter()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        for item in structs {
+            let params = crate::lowering::generic_param_map_with_consts(
+                item.generics.iter().map(|name| name.0.as_str()),
+                item.const_generics.iter().map(|name| name.0.as_str()),
+            );
+            for field in item.fields {
+                let ty =
+                    self.lower_type_ref_with_params_at(&field.ty, &params, Some(field.ty_range));
+                self.expect_sized_value(&ty, Some(field.ty_range));
+            }
+        }
+
+        let enums = self
+            .hir
+            .item_tree
+            .enums
+            .iter()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        for item in enums {
+            let params = crate::lowering::generic_param_map_with_consts(
+                item.generics.iter().map(|name| name.0.as_str()),
+                item.const_generics.iter().map(|name| name.0.as_str()),
+            );
+            for variant in item.variants {
+                let field_ranges = variant.field_ranges;
+                match variant.kind {
+                    HirVariantKind::Unit => {}
+                    HirVariantKind::Tuple(fields) => {
+                        for (field, range) in fields.into_iter().zip(field_ranges) {
+                            let ty =
+                                self.lower_type_ref_with_params_at(&field, &params, Some(range));
+                            self.expect_sized_value(&ty, Some(range));
+                        }
+                    }
+                    HirVariantKind::Struct(fields) => {
+                        for field in fields {
+                            let ty = self.lower_type_ref_with_params_at(
+                                &field.ty,
+                                &params,
+                                Some(field.ty_range),
+                            );
+                            self.expect_sized_value(&ty, Some(field.ty_range));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -429,7 +411,18 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        for (_, imp) in self.hir.item_tree.impls.iter() {
+        self.register_trait_impls();
+    }
+
+    fn register_trait_impls(&mut self) {
+        let impls = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .map(|(_, imp)| imp.clone())
+            .collect::<Vec<_>>();
+        for imp in &impls {
             let Some(trait_ty) = &imp.trait_ty else {
                 continue;
             };
@@ -564,7 +557,13 @@ impl<'a> TypeChecker<'a> {
             if let Some(body_id) = self.hir.function_bodies.get(&fid).copied() {
                 let outer_generics = self.impl_generic_names(fid);
                 let outer_const_generics = self.impl_const_generic_names(fid);
-                self.check_function(fid, function, body_id, outer_generics, outer_const_generics);
+                self.check_function(
+                    fid,
+                    function,
+                    body_id,
+                    &outer_generics,
+                    &outer_const_generics,
+                );
             }
         }
     }
@@ -602,7 +601,7 @@ impl<'a> TypeChecker<'a> {
         }
 
         let mut states = HashMap::<ConstId, u8>::new();
-        for const_id in dependencies.keys().copied().collect::<Vec<_>>() {
+        for const_id in dependencies.keys().copied() {
             if const_cycle_from(const_id, &dependencies, &mut states) {
                 let konst = &self.hir.item_tree.consts[const_id];
                 self.diagnostic(
@@ -623,10 +622,65 @@ impl<'a> TypeChecker<'a> {
         function_id: FunctionId,
         function: &HirFunction,
         body_id: BodyId,
-        outer_generics: Vec<String>,
-        outer_const_generics: Vec<String>,
+        outer_generics: &[String],
+        outer_const_generics: &[String],
     ) {
         let body = &self.hir.bodies[body_id];
+        let params = self.function_generic_params(
+            function_id,
+            function,
+            outer_generics,
+            outer_const_generics,
+        );
+        let return_ty = function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            self.lower_type_ref_with_params_at(
+                ty,
+                &params,
+                function.ret_type_range.or(Some(function.name_range)),
+            )
+        });
+        let mut ctx = BodyCtx::new(
+            body_id,
+            body,
+            function_id,
+            function,
+            return_ty.clone(),
+            params,
+        );
+        self.check_type_bounds_inner(
+            &ctx,
+            &return_ty,
+            function.ret_type_range.or(Some(function.name_range)),
+        );
+        for param in &function.params {
+            let param_ty = self.lower_type_ref_with_params_at(
+                &param.ty,
+                &ctx.generic_params,
+                Some(param.ty_range),
+            );
+            self.check_type_bounds_inner(&ctx, &param_ty, Some(param.ty_range));
+        }
+        let actual = self.check_expr_expected(&mut ctx, body.root_block, &return_ty);
+        self.record_value_use(&mut ctx, body.root_block, crate::result::ValueUse::Move);
+
+        if !actual.is_never() {
+            self.expect_assignable(
+                &return_ty,
+                &actual,
+                "function return",
+                ctx.expr_range(body.root_block),
+            );
+        }
+        self.finish_inference(&ctx);
+    }
+
+    fn function_generic_params(
+        &mut self,
+        function_id: FunctionId,
+        function: &HirFunction,
+        outer_generics: &[String],
+        outer_const_generics: &[String],
+    ) -> HashMap<String, Type> {
         let outer_params = crate::lowering::generic_param_map_with_consts(
             outer_generics.iter().map(String::as_str),
             outer_const_generics.iter().map(String::as_str),
@@ -689,53 +743,10 @@ impl<'a> TypeChecker<'a> {
         } else if self.trait_for_default_method(function_id).is_some() {
             params.insert("Self".into(), Type::Param("Self".into()));
         }
-        let return_ty = function
-            .ret_type
-            .as_ref()
-            .map(|ty| {
-                self.lower_type_ref_with_params_at(
-                    ty,
-                    &params,
-                    function.ret_type_range.or(Some(function.name_range)),
-                )
-            })
-            .unwrap_or(Type::Unit);
-        let mut ctx = BodyCtx::new(
-            body_id,
-            body,
-            function_id,
-            function,
-            return_ty.clone(),
-            params,
-        );
-        self.check_type_bounds_inner(
-            &ctx,
-            &return_ty,
-            function.ret_type_range.or(Some(function.name_range)),
-        );
-        for param in &function.params {
-            let param_ty = self.lower_type_ref_with_params_at(
-                &param.ty,
-                &ctx.generic_params,
-                Some(param.ty_range),
-            );
-            self.check_type_bounds_inner(&ctx, &param_ty, Some(param.ty_range));
-        }
-        let actual = self.check_expr_expected(&mut ctx, body.root_block, &return_ty);
-        self.record_value_use(&mut ctx, body.root_block, crate::result::ValueUse::Move);
-
-        if !actual.is_never() {
-            self.expect_assignable(
-                &return_ty,
-                &actual,
-                "function return",
-                ctx.expr_range(body.root_block),
-            );
-        }
-        self.finish_inference(&ctx);
+        params
     }
 
-    pub(crate) fn fresh_infer(&mut self) -> Type {
+    pub(crate) const fn fresh_infer(&mut self) -> Type {
         let id = self.next_infer;
         self.next_infer += 1;
         Type::InferVar(id)
@@ -746,8 +757,7 @@ impl<'a> TypeChecker<'a> {
             Type::InferVar(id) => self
                 .infer_values
                 .get(id)
-                .map(|value| self.resolve_type(value))
-                .unwrap_or_else(|| ty.clone()),
+                .map_or_else(|| ty.clone(), |value| self.resolve_type(value)),
             Type::Ref(inner, mutable) => Type::Ref(Box::new(self.resolve_type(inner)), *mutable),
             Type::Ptr { mutable, inner } => Type::Ptr {
                 mutable: *mutable,
@@ -855,20 +865,16 @@ impl<'a> TypeChecker<'a> {
             .zip(args.iter())
             .map(|(name, ty)| (name.to_string(), ty.clone()))
             .collect::<HashMap<_, _>>();
-        let output = function
-            .ret_type
-            .as_ref()
-            .map(|ret| {
-                crate::lowering::substitute_type(
-                    &self.lower_type_ref_with_params_at(
-                        ret,
-                        &params,
-                        function.ret_type_range.or(Some(function.name_range)),
-                    ),
-                    &subst,
-                )
-            })
-            .unwrap_or(Type::Unit);
+        let output = function.ret_type.as_ref().map_or(Type::Unit, |ret| {
+            crate::lowering::substitute_type(
+                &self.lower_type_ref_with_params_at(
+                    ret,
+                    &params,
+                    function.ret_type_range.or(Some(function.name_range)),
+                ),
+                &subst,
+            )
+        });
         CallableSignature {
             is_unsafe: function.is_unsafe,
             kind: ClosureKind::Fn,
@@ -898,22 +904,13 @@ impl<'a> TypeChecker<'a> {
     fn unify_types_inner(&mut self, lhs: &Type, rhs: &Type) -> bool {
         let lhs = self.resolve_type(lhs);
         let rhs = self.resolve_type(rhs);
-        if let Type::CallableConstraint(expected) = &lhs
-            && !matches!(rhs, Type::CallableConstraint(_))
-            && let Some(actual) = self.callable_signature_for_type(&rhs)
-        {
-            return self.unify_callable_signature(
-                expected.is_unsafe,
-                expected.kind,
-                &expected.params,
-                &expected.ret,
-                &actual,
-            );
+        if let Some(result) = self.unify_special_types(&lhs, &rhs) {
+            return result;
         }
         match (&lhs, &rhs) {
             (Type::InferVar(id), ty) | (ty, Type::InferVar(id)) => self.bind_infer_var(*id, ty),
-            (Type::Ref(a, am), Type::Ref(b, bm)) => am == bm && self.unify_types_inner(a, b),
-            (
+            (Type::Ref(a, am), Type::Ref(b, bm))
+            | (
                 Type::Ptr {
                     mutable: am,
                     inner: a,
@@ -928,16 +925,6 @@ impl<'a> TypeChecker<'a> {
             }
             (Type::Slice(a), Type::Slice(b)) => self.unify_types_inner(a, b),
             (Type::Array(a, al), Type::Array(b, bl)) => al == bl && self.unify_types_inner(a, b),
-            (Type::Struct(a, aa), Type::Struct(b, ba)) => {
-                a == b
-                    && aa.len() == ba.len()
-                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types_inner(a, b))
-            }
-            (Type::Enum(a, aa), Type::Enum(b, ba)) => {
-                a == b
-                    && aa.len() == ba.len()
-                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types_inner(a, b))
-            }
             (
                 Type::FunctionItem {
                     function: af,
@@ -952,26 +939,6 @@ impl<'a> TypeChecker<'a> {
                     && aa.len() == ba.len()
                     && aa.iter().zip(ba).all(|(a, b)| self.unify_types_inner(a, b))
             }
-            (
-                Type::Closure {
-                    id: aid,
-                    signature: a,
-                },
-                Type::Closure {
-                    id: bid,
-                    signature: b,
-                },
-            ) => aid == bid && self.unify_same_callable_signature(a, b),
-            (
-                Type::OpaqueCallable {
-                    id: aid,
-                    signature: a,
-                },
-                Type::OpaqueCallable {
-                    id: bid,
-                    signature: b,
-                },
-            ) => aid == bid && self.unify_same_callable_signature(a, b),
             (Type::CallableConstraint(expected), Type::CallableConstraint(actual)) => self
                 .unify_callable_signature(
                     expected.is_unsafe,
@@ -980,8 +947,74 @@ impl<'a> TypeChecker<'a> {
                     &expected.ret,
                     actual,
                 ),
-            _ => lhs == rhs || self.numeric_assignable(&lhs, &rhs),
+            _ => lhs == rhs || Self::numeric_assignable(&lhs, &rhs),
         }
+    }
+
+    fn unify_special_types(&mut self, lhs: &Type, rhs: &Type) -> Option<bool> {
+        if let Type::CallableConstraint(expected) = lhs
+            && !matches!(rhs, Type::CallableConstraint(_))
+            && let Some(actual) = self.callable_signature_for_type(rhs)
+        {
+            return Some(self.unify_callable_signature(
+                expected.is_unsafe,
+                expected.kind,
+                &expected.params,
+                &expected.ret,
+                &actual,
+            ));
+        }
+        if let (
+            Some(lhs_nominal),
+            Some(rhs_nominal),
+            Type::Struct(_, lhs_args) | Type::Enum(_, lhs_args),
+            Type::Struct(_, rhs_args) | Type::Enum(_, rhs_args),
+        ) = (
+            type_nominal_identity(lhs),
+            type_nominal_identity(rhs),
+            lhs,
+            rhs,
+        ) {
+            return Some(
+                lhs_nominal == rhs_nominal
+                    && lhs_args.len() == rhs_args.len()
+                    && lhs_args
+                        .iter()
+                        .zip(rhs_args)
+                        .all(|(a, b)| self.unify_types_inner(a, b)),
+            );
+        }
+        if let (
+            Some(lhs_id),
+            Some(rhs_id),
+            Type::Closure {
+                signature: lhs_signature,
+                ..
+            }
+            | Type::OpaqueCallable {
+                signature: lhs_signature,
+                ..
+            },
+            Type::Closure {
+                signature: rhs_signature,
+                ..
+            }
+            | Type::OpaqueCallable {
+                signature: rhs_signature,
+                ..
+            },
+        ) = (
+            type_callable_identity(lhs),
+            type_callable_identity(rhs),
+            lhs,
+            rhs,
+        ) {
+            return Some(
+                lhs_id == rhs_id
+                    && self.unify_same_callable_signature(lhs_signature, rhs_signature),
+            );
+        }
+        None
     }
 
     fn unify_callable_signature(
@@ -1046,6 +1079,13 @@ impl<'a> TypeChecker<'a> {
     fn finish_inference(&mut self, ctx: &BodyCtx<'_>) {
         let body_id = ctx.body_id;
         self.finish_pending_generic_calls(ctx);
+        self.resolve_body_inference_results(body_id);
+        self.finish_pending_moves(body_id);
+        self.report_delayed_binding_errors(body_id);
+        self.report_lambda_inference_errors(body_id);
+    }
+
+    fn resolve_body_inference_results(&mut self, body_id: BodyId) {
         let exprs = self
             .result
             .expr_types
@@ -1055,28 +1095,6 @@ impl<'a> TypeChecker<'a> {
             .collect::<Vec<_>>();
         for (key, ty) in exprs {
             self.result.expr_types.insert(key, ty);
-        }
-        let pending_moves = self
-            .pending_move_uses
-            .iter()
-            .filter(|(checked_body, _)| *checked_body == body_id)
-            .copied()
-            .collect::<Vec<_>>();
-        self.pending_move_uses
-            .retain(|(checked_body, _)| *checked_body != body_id);
-        for key in pending_moves {
-            if self
-                .result
-                .expr_types
-                .get(&key)
-                .is_some_and(|ty| !self.result.trait_env.type_is_copy(ty))
-            {
-                self.result
-                    .value_uses
-                    .entry(key)
-                    .and_modify(|current| *current = current.merge(crate::result::ValueUse::Move))
-                    .or_insert(crate::result::ValueUse::Move);
-            }
         }
         let generic_calls = self
             .result
@@ -1128,6 +1146,34 @@ impl<'a> TypeChecker<'a> {
         for (key, ty) in pattern_bindings {
             self.result.pattern_binding_types.insert(key, ty);
         }
+    }
+
+    fn finish_pending_moves(&mut self, body_id: BodyId) {
+        let pending_moves = self
+            .pending_move_uses
+            .iter()
+            .filter(|(checked_body, _)| *checked_body == body_id)
+            .copied()
+            .collect::<Vec<_>>();
+        self.pending_move_uses
+            .retain(|(checked_body, _)| *checked_body != body_id);
+        for key in pending_moves {
+            if self
+                .result
+                .expr_types
+                .get(&key)
+                .is_some_and(|ty| !self.result.trait_env.type_is_copy(ty))
+            {
+                self.result
+                    .value_uses
+                    .entry(key)
+                    .and_modify(|current| *current = current.merge(crate::result::ValueUse::Move))
+                    .or_insert(crate::result::ValueUse::Move);
+            }
+        }
+    }
+
+    fn report_delayed_binding_errors(&mut self, body_id: BodyId) {
         let delayed_bindings = self
             .pending_delayed_bindings
             .iter()
@@ -1149,6 +1195,9 @@ impl<'a> TypeChecker<'a> {
                 );
             }
         }
+    }
+
+    fn report_lambda_inference_errors(&mut self, body_id: BodyId) {
         let pending = self
             .pending_lambdas
             .iter()
@@ -1229,14 +1278,6 @@ impl<'a> TypeChecker<'a> {
             tr.default_methods
                 .contains(&function_id)
                 .then_some(trait_id)
-        })
-    }
-
-    pub(crate) fn impl_self_ty_range(&self, function_id: FunctionId) -> Option<TextRange> {
-        self.hir.item_tree.impls.iter().find_map(|(_, imp)| {
-            imp.methods
-                .contains(&function_id)
-                .then_some(imp.self_ty_range)
         })
     }
 
@@ -1364,13 +1405,17 @@ impl<'a> TypeChecker<'a> {
             HirTypeRef::Tuple(elements) => elements
                 .iter()
                 .any(|ty| self.type_ref_contains_inline_type(ty, target, seen)),
-            HirTypeRef::Array(_, HirConstArg::Value(0)) => false,
-            HirTypeRef::Array(inner, _) => self.type_ref_contains_inline_type(inner, target, seen),
-            HirTypeRef::Slice(inner) => self.type_ref_contains_inline_type(inner, target, seen),
-            HirTypeRef::Never | HirTypeRef::Const(_) => false,
-            HirTypeRef::Ref(_, _) | HirTypeRef::Ptr { .. } => false,
-            HirTypeRef::ImplTrait { .. } => false,
-            HirTypeRef::Unknown | HirTypeRef::Error => false,
+            HirTypeRef::Array(_, HirConstArg::Value(0))
+            | HirTypeRef::Never
+            | HirTypeRef::Const(_)
+            | HirTypeRef::Ref(_, _)
+            | HirTypeRef::Ptr { .. }
+            | HirTypeRef::ImplTrait { .. }
+            | HirTypeRef::Unknown
+            | HirTypeRef::Error => false,
+            HirTypeRef::Array(inner, _) | HirTypeRef::Slice(inner) => {
+                self.type_ref_contains_inline_type(inner, target, seen)
+            }
         }
     }
 
@@ -1426,9 +1471,9 @@ impl<'a> TypeChecker<'a> {
             Type::Tuple(fields) => fields
                 .iter()
                 .any(|field| self.type_has_infinite_layout(field)),
-            Type::Array(_, crate::ConstArg::Value(0)) => false,
-            Type::Array(inner, _) => self.type_has_infinite_layout(inner),
-            Type::Ref(_, _) | Type::Ptr { .. } | Type::Slice(_) => false,
+            Type::Array(inner, len) => {
+                !matches!(len, crate::ConstArg::Value(0)) && self.type_has_infinite_layout(inner)
+            }
             _ => false,
         }
     }
@@ -1439,12 +1484,12 @@ impl<'a> TypeChecker<'a> {
                 continue;
             }
             let caller = self.generic_edges[i].caller;
-            let callee = self.generic_edges[i].callee;
-            if !self.reaches(callee, caller) {
+            let target = self.generic_edges[i].callee;
+            if !self.reaches(target, caller) {
                 continue;
             }
 
-            let callee_name = self.hir.item_tree.functions[callee].name.0.clone();
+            let callee_name = self.hir.item_tree.functions[target].name.0.clone();
             self.diagnostic(
                 "E0033",
                 format!("generic recursion grows type arguments while calling `{callee_name}`"),
@@ -1512,7 +1557,7 @@ impl<'a> TypeChecker<'a> {
         if rhs.is_unknown_like() {
             return lhs;
         }
-        if let Some(ty) = self.join_numeric_types(&lhs, &rhs) {
+        if let Some(ty) = Self::join_numeric_types(&lhs, &rhs) {
             ty
         } else if lhs == rhs {
             lhs
@@ -1576,9 +1621,9 @@ impl<'a> TypeChecker<'a> {
         if expected.is_unknown_like()
             || actual.is_unknown_like()
             || expected == actual
-            || self.numeric_assignable(&expected, &actual)
-            || self.is_slice_coercion(&expected, &actual)
-            || self.structural_assignable(&expected, &actual)
+            || Self::numeric_assignable(&expected, &actual)
+            || Self::is_slice_coercion(&expected, &actual)
+            || Self::structural_assignable(&expected, &actual)
         {
             return;
         }
@@ -1622,18 +1667,20 @@ impl<'a> TypeChecker<'a> {
             let message = self
                 .callable_signature_for_type(&actual)
                 .filter(|actual| actual.is_unsafe && !signature.is_unsafe)
-                .map(|_| {
-                    format!(
-                        "unsafe function does not satisfy opaque callable return bound `{}`",
-                        signature.kind.as_str()
-                    )
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "opaque callable return does not satisfy `{}`",
-                        required.display(self.hir)
-                    )
-                });
+                .map_or_else(
+                    || {
+                        format!(
+                            "opaque callable return does not satisfy `{}`",
+                            required.display(self.hir)
+                        )
+                    },
+                    |_| {
+                        format!(
+                            "unsafe function does not satisfy opaque callable return bound `{}`",
+                            signature.kind.as_str()
+                        )
+                    },
+                );
             self.diagnostic("E0035", message, span);
             return;
         }
@@ -1770,18 +1817,20 @@ impl<'a> TypeChecker<'a> {
         span: Option<TextRange>,
     ) -> Type {
         if let Some(suffix) = suffix {
-            return IntTy::parse(suffix).map(Type::Int).unwrap_or_else(|| {
-                self.diagnostic(
-                    "E0011",
-                    format!("unknown integer literal suffix `{suffix}`"),
-                    span,
-                );
-                Type::Error
-            });
+            return IntTy::parse(suffix).map_or_else(
+                || {
+                    self.diagnostic(
+                        "E0011",
+                        format!("unknown integer literal suffix `{suffix}`"),
+                        span,
+                    );
+                    Type::Error
+                },
+                Type::Int,
+            );
         }
         match expected {
             Some(Type::Int(ty)) => Type::Int(*ty),
-            Some(Type::InferInt) => Type::InferInt,
             _ => Type::InferInt,
         }
     }
@@ -1793,43 +1842,38 @@ impl<'a> TypeChecker<'a> {
         span: Option<TextRange>,
     ) -> Type {
         if let Some(suffix) = suffix {
-            return FloatTy::parse(suffix).map(Type::Float).unwrap_or_else(|| {
-                self.diagnostic(
-                    "E0011",
-                    format!("unknown float literal suffix `{suffix}`"),
-                    span,
-                );
-                Type::Error
-            });
+            return FloatTy::parse(suffix).map_or_else(
+                || {
+                    self.diagnostic(
+                        "E0011",
+                        format!("unknown float literal suffix `{suffix}`"),
+                        span,
+                    );
+                    Type::Error
+                },
+                Type::Float,
+            );
         }
         match expected {
             Some(Type::Float(ty)) => Type::Float(*ty),
-            Some(Type::InferFloat) => Type::InferFloat,
             _ => Type::InferFloat,
         }
     }
 
-    pub(crate) fn numeric_assignable(&self, expected: &Type, actual: &Type) -> bool {
+    pub(crate) const fn numeric_assignable(expected: &Type, actual: &Type) -> bool {
         matches!(
             (expected, actual),
-            (Type::Int(_), Type::InferInt)
+            (Type::Int(_) | Type::InferInt, Type::InferInt)
                 | (Type::InferInt, Type::Int(_))
-                | (Type::Float(_), Type::InferFloat)
+                | (Type::Float(_) | Type::InferFloat, Type::InferFloat)
                 | (Type::InferFloat, Type::Float(_))
-                | (Type::InferInt, Type::InferInt)
-                | (Type::InferFloat, Type::InferFloat)
         )
     }
 
-    fn structural_assignable(&self, expected: &Type, actual: &Type) -> bool {
+    fn structural_assignable(expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
-            (Type::Ref(expected_inner, expected_mut), Type::Ref(actual_inner, actual_mut)) => {
-                expected_mut == actual_mut
-                    && (expected_inner == actual_inner
-                        || self.numeric_assignable(expected_inner, actual_inner)
-                        || self.structural_assignable(expected_inner, actual_inner))
-            }
-            (
+            (Type::Ref(expected_inner, expected_mut), Type::Ref(actual_inner, actual_mut))
+            | (
                 Type::Ptr {
                     mutable: expected_mut,
                     inner: expected_inner,
@@ -1841,25 +1885,25 @@ impl<'a> TypeChecker<'a> {
             ) => {
                 expected_mut == actual_mut
                     && (expected_inner == actual_inner
-                        || self.numeric_assignable(expected_inner, actual_inner)
-                        || self.structural_assignable(expected_inner, actual_inner))
+                        || Self::numeric_assignable(expected_inner, actual_inner)
+                        || Self::structural_assignable(expected_inner, actual_inner))
             }
             (Type::Array(expected_inner, expected_len), Type::Array(actual_inner, actual_len)) => {
                 expected_len == actual_len
                     && (expected_inner == actual_inner
-                        || self.numeric_assignable(expected_inner, actual_inner)
-                        || self.structural_assignable(expected_inner, actual_inner))
+                        || Self::numeric_assignable(expected_inner, actual_inner)
+                        || Self::structural_assignable(expected_inner, actual_inner))
             }
             (Type::Slice(expected_inner), Type::Slice(actual_inner)) => {
                 expected_inner == actual_inner
-                    || self.numeric_assignable(expected_inner, actual_inner)
-                    || self.structural_assignable(expected_inner, actual_inner)
+                    || Self::numeric_assignable(expected_inner, actual_inner)
+                    || Self::structural_assignable(expected_inner, actual_inner)
             }
             _ => false,
         }
     }
 
-    pub(crate) fn is_slice_coercion(&self, expected: &Type, actual: &Type) -> bool {
+    pub(crate) fn is_slice_coercion(expected: &Type, actual: &Type) -> bool {
         matches!(
             (expected, actual),
             (
@@ -1870,13 +1914,13 @@ impl<'a> TypeChecker<'a> {
                     (expected.as_ref(), actual.as_ref()),
                     (Type::Slice(expected), Type::Array(actual, _))
                         if expected == actual
-                            || self.numeric_assignable(expected, actual)
-                            || self.structural_assignable(expected, actual)
+                            || Self::numeric_assignable(expected, actual)
+                            || Self::structural_assignable(expected, actual)
                 )
         )
     }
 
-    pub(crate) fn join_numeric_types(&self, lhs: &Type, rhs: &Type) -> Option<Type> {
+    pub(crate) fn join_numeric_types(lhs: &Type, rhs: &Type) -> Option<Type> {
         match (lhs, rhs) {
             (Type::Int(a), Type::Int(b)) if a == b => Some(Type::Int(*a)),
             (Type::Float(a), Type::Float(b)) if a == b => Some(Type::Float(*a)),
@@ -1925,12 +1969,10 @@ fn type_contains_infer_var(
                     .get(id)
                     .is_some_and(|ty| type_contains_infer_var(needle, ty, infer_values, visited))
         }
-        Type::Ref(inner, _) | Type::Slice(inner) => {
-            type_contains_infer_var(needle, inner, infer_values, visited)
-        }
-        Type::Ptr { inner, .. } | Type::Array(inner, _) => {
-            type_contains_infer_var(needle, inner, infer_values, visited)
-        }
+        Type::Ref(inner, _)
+        | Type::Slice(inner)
+        | Type::Ptr { inner, .. }
+        | Type::Array(inner, _) => type_contains_infer_var(needle, inner, infer_values, visited),
         Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => elements
             .iter()
             .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
@@ -1986,10 +2028,6 @@ fn first_non_const_expr(
             first_non_const_expr(body, *lhs, dependencies)
                 .or_else(|| first_non_const_expr(body, *rhs, dependencies))
         }
-        Expr::Unary {
-            operand,
-            op: UnaryOp::Neg | UnaryOp::Pos | UnaryOp::Not,
-        } => first_non_const_expr(body, *operand, dependencies),
         Expr::Block { stmts, tail } if stmts.is_empty() => {
             tail.and_then(|tail| first_non_const_expr(body, tail, dependencies))
         }
@@ -2001,11 +2039,15 @@ fn first_non_const_expr(
         Expr::Struct { fields, .. } => fields
             .iter()
             .find_map(|field| first_non_const_expr(body, field.value, dependencies)),
-        Expr::FieldAccess { base, .. } => first_non_const_expr(body, *base, dependencies),
+        Expr::Unary {
+            operand,
+            op: UnaryOp::Neg | UnaryOp::Pos | UnaryOp::Not,
+        }
+        | Expr::FieldAccess { base: operand, .. }
+        | Expr::Cast { base: operand, .. }
+        | Expr::Try { operand } => first_non_const_expr(body, *operand, dependencies),
         Expr::IndexAccess { base, index } => first_non_const_expr(body, *base, dependencies)
             .or_else(|| first_non_const_expr(body, *index, dependencies)),
-        Expr::Cast { base, .. } => first_non_const_expr(body, *base, dependencies),
-        Expr::Try { operand } => first_non_const_expr(body, *operand, dependencies),
         Expr::Missing
         | Expr::Binary { .. }
         | Expr::Unary { .. }
@@ -2050,7 +2092,7 @@ fn const_cycle_from(
 // registered.  Returns `None` when the trait satisfies the contract, or
 // `Some(reason)` when it does not.
 
-pub(crate) fn validate_lang_item_signature(
+pub fn validate_lang_item_signature(
     item: crate::lang_items::LangItem,
     tr: &HirTrait,
 ) -> Option<String> {
@@ -2064,27 +2106,7 @@ pub(crate) fn validate_lang_item_signature(
     });
 
     match item {
-        LangItem::Drop => {
-            if !tr.generics.is_empty() {
-                return Some("`Drop` trait must not be generic".into());
-            }
-            if !tr.supertraits.is_empty() || tr.methods.len() != 1 || !tr.type_aliases.is_empty() {
-                return Some("`Drop` must contain only `drop(&mut self)`".into());
-            }
-            let method = &tr.methods[0];
-            if method.name.0 != "drop"
-                || method.has_body
-                || !method.generics.is_empty()
-                || !method.const_generics.is_empty()
-                || method.params.len() != 1
-                || !matches!(&method.params[0].ty,
-                    HirTypeRef::Ref(inner, true) if lang_type_is_self(inner, &self_ty))
-                || method.ret_type.is_some()
-            {
-                return Some("method must have signature `fun drop(&mut self)`".into());
-            }
-            None
-        }
+        LangItem::Drop => validate_drop_signature(tr, &self_ty),
 
         // Marker traits — no method/assoc-type contract required.
         LangItem::Copy | LangItem::Eq => {
@@ -2092,33 +2114,7 @@ pub(crate) fn validate_lang_item_signature(
         }
 
         // Clone — must have `clone(&self) -> Self`.
-        LangItem::Clone => {
-            if !tr.generics.is_empty() {
-                return Some("`Clone` trait must not be generic".into());
-            }
-            let Some(method) = tr.methods.iter().find(|m| m.name.0 == "clone") else {
-                return Some("must define a method named `clone`".into());
-            };
-            if !method.generics.is_empty() || !method.const_generics.is_empty() {
-                return Some("`clone` must not carry its own generic parameters".into());
-            }
-            if method.params.len() != 1 {
-                return Some("`clone` must take exactly one parameter (`&self`)".into());
-            }
-            if !matches!(&method.params[0].ty,
-                HirTypeRef::Ref(inner, false) if lang_type_is_self(inner, &self_ty))
-            {
-                return Some("first parameter of `clone` must be `&self`".into());
-            }
-            if !method
-                .ret_type
-                .as_ref()
-                .is_some_and(|ty| lang_type_is_self(ty, &self_ty))
-            {
-                return Some("`clone` must return `Self`".into());
-            }
-            None
-        }
+        LangItem::Clone => validate_clone_signature(tr, &self_ty),
 
         // Comparison traits.
         LangItem::PartialEq => {
@@ -2200,6 +2196,56 @@ pub(crate) fn validate_lang_item_signature(
     }
 }
 
+fn validate_drop_signature(tr: &HirTrait, self_ty: &HirTypeRef) -> Option<String> {
+    if !tr.generics.is_empty() {
+        return Some("`Drop` trait must not be generic".into());
+    }
+    if !tr.supertraits.is_empty() || tr.methods.len() != 1 || !tr.type_aliases.is_empty() {
+        return Some("`Drop` must contain only `drop(&mut self)`".into());
+    }
+    let method = &tr.methods[0];
+    if method.name.0 != "drop"
+        || method.has_body
+        || !method.generics.is_empty()
+        || !method.const_generics.is_empty()
+        || method.params.len() != 1
+        || !matches!(&method.params[0].ty,
+            HirTypeRef::Ref(inner, true) if lang_type_is_self(inner, self_ty))
+        || method.ret_type.is_some()
+    {
+        return Some("method must have signature `fun drop(&mut self)`".into());
+    }
+    None
+}
+
+fn validate_clone_signature(tr: &HirTrait, self_ty: &HirTypeRef) -> Option<String> {
+    if !tr.generics.is_empty() {
+        return Some("`Clone` trait must not be generic".into());
+    }
+    let Some(method) = tr.methods.iter().find(|method| method.name.0 == "clone") else {
+        return Some("must define a method named `clone`".into());
+    };
+    if !method.generics.is_empty() || !method.const_generics.is_empty() {
+        return Some("`clone` must not carry its own generic parameters".into());
+    }
+    if method.params.len() != 1 {
+        return Some("`clone` must take exactly one parameter (`&self`)".into());
+    }
+    if !matches!(&method.params[0].ty,
+        HirTypeRef::Ref(inner, false) if lang_type_is_self(inner, self_ty))
+    {
+        return Some("first parameter of `clone` must be `&self`".into());
+    }
+    if !method
+        .ret_type
+        .as_ref()
+        .is_some_and(|ty| lang_type_is_self(ty, self_ty))
+    {
+        return Some("`clone` must return `Self`".into());
+    }
+    None
+}
+
 fn lang_type_is_self(ty: &HirTypeRef, self_ty: &HirTypeRef) -> bool {
     ty == self_ty
         || matches!(
@@ -2237,25 +2283,22 @@ fn lang_returns_unit(function: &HirFunction) -> bool {
 /// lang item (0 or 1 type param, if 1 it must default to `Self`).
 fn lang_has_valid_rhs_generic(tr: &HirTrait, self_ty: &HirTypeRef) -> bool {
     tr.generics.len() <= 1
-        && if tr.generics.is_empty() {
-            true
-        } else {
+        && tr.generics.first().is_none_or(|_| {
             tr.generic_defaults
                 .first()
                 .and_then(Option::as_ref)
                 .is_some_and(|default| lang_type_is_self(default, self_ty))
-        }
+        })
 }
 
 fn lang_type_is_rhs(tr: &HirTrait, ty: &HirTypeRef) -> bool {
-    match tr.generics.first() {
-        Some(rhs) => matches!(
+    tr.generics.first().is_none_or(|rhs| {
+        matches!(
             ty,
             HirTypeRef::Named(path)
                 if path.as_single_name().is_some_and(|name| name == rhs)
-        ),
-        None => true,
-    }
+        )
+    })
 }
 
 fn lang_ref_is_rhs(tr: &HirTrait, ty: &HirTypeRef) -> bool {

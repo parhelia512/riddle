@@ -1,4 +1,11 @@
-use super::{scope::valid_span, token_stream::*, *};
+use super::{
+    ExpandedTokenMapping, Parse, Range, SyntaxKind, lexer, parse_tokens,
+    scope::valid_span,
+    token_stream::{
+        ProcMacroDelimiter, ProcMacroSpacing, ProcMacroTokenStream, ProcMacroTokenTree,
+        is_closing_delimiter, opening_delimiter,
+    },
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct DocumentToken {
@@ -251,8 +258,7 @@ pub(super) fn parse_document_stream(
             }
             let end = chars
                 .get(char_index + 1)
-                .map(|(offset, _)| *offset)
-                .unwrap_or(token.text.len());
+                .map_or(token.text.len(), |(offset, _)| *offset);
             let span =
                 if token.original.end.saturating_sub(token.original.start) == token.text.len() {
                     token.original.start + *offset..token.original.start + end
@@ -310,43 +316,9 @@ pub(super) fn flatten_output_stream(
                 delimiter,
                 stream,
                 span,
-            } => {
-                let span = checked_output_span(span, call_site, source_len);
-                let delimiters = match delimiter {
-                    ProcMacroDelimiter::Parenthesis => {
-                        Some((SyntaxKind::LParen, "(", SyntaxKind::RParen, ")"))
-                    }
-                    ProcMacroDelimiter::Brace => {
-                        Some((SyntaxKind::LBrace, "{", SyntaxKind::RBrace, "}"))
-                    }
-                    ProcMacroDelimiter::Bracket => {
-                        Some((SyntaxKind::LBracket, "[", SyntaxKind::RBracket, "]"))
-                    }
-                    ProcMacroDelimiter::None => None,
-                };
-                if let Some((opening_kind, opening, _, _)) = delimiters {
-                    output.push(DocumentToken {
-                        kind: opening_kind,
-                        text: opening.into(),
-                        original: span.clone(),
-                        depth,
-                        generated: true,
-                    });
-                }
-                flatten_output_stream(stream, call_site, source_len, depth, output)?;
-                if output.last().is_some_and(|token| token.kind.is_trivia()) {
-                    output.pop();
-                }
-                if let Some((_, _, closing_kind, closing)) = delimiters {
-                    output.push(DocumentToken {
-                        kind: closing_kind,
-                        text: closing.into(),
-                        original: span,
-                        depth,
-                        generated: true,
-                    });
-                }
-            }
+            } => flatten_output_group(
+                *delimiter, stream, span, call_site, source_len, depth, output,
+            )?,
             ProcMacroTokenTree::Ident { text, span } => {
                 let kind = classify_word(text)
                     .ok_or_else(|| format!("invalid process macro identifier `{text}`"))?;
@@ -421,6 +393,47 @@ pub(super) fn flatten_output_stream(
             kind: SyntaxKind::Whitespace,
             text: " ".into(),
             original: call_site.clone(),
+            depth,
+            generated: true,
+        });
+    }
+    Ok(())
+}
+
+fn flatten_output_group(
+    delimiter: ProcMacroDelimiter,
+    stream: &ProcMacroTokenStream,
+    span: &Range<usize>,
+    call_site: &Range<usize>,
+    source_len: usize,
+    depth: usize,
+    output: &mut Vec<DocumentToken>,
+) -> Result<(), String> {
+    let span = checked_output_span(span, call_site, source_len);
+    let delimiters = match delimiter {
+        ProcMacroDelimiter::Parenthesis => Some((SyntaxKind::LParen, "(", SyntaxKind::RParen, ")")),
+        ProcMacroDelimiter::Brace => Some((SyntaxKind::LBrace, "{", SyntaxKind::RBrace, "}")),
+        ProcMacroDelimiter::Bracket => Some((SyntaxKind::LBracket, "[", SyntaxKind::RBracket, "]")),
+        ProcMacroDelimiter::None => None,
+    };
+    if let Some((opening_kind, opening, _, _)) = delimiters {
+        output.push(DocumentToken {
+            kind: opening_kind,
+            text: opening.into(),
+            original: span.clone(),
+            depth,
+            generated: true,
+        });
+    }
+    flatten_output_stream(stream, call_site, source_len, depth, output)?;
+    if output.last().is_some_and(|token| token.kind.is_trivia()) {
+        output.pop();
+    }
+    if let Some((_, _, closing_kind, closing)) = delimiters {
+        output.push(DocumentToken {
+            kind: closing_kind,
+            text: closing.into(),
+            original: span,
             depth,
             generated: true,
         });

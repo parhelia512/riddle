@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    hash::BuildHasher,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -13,15 +14,15 @@ use lsp_types::{
 use riddlec::pipeline::{
     CheckSession, CompileOptions, CompileResult, DiagnosticExt, IntoDiagnosticExt, SourceMap,
 };
-use rowan::{TextRange, TextSize};
+use rowan::TextRange;
 use type_checker::{LabelStyle, SourceLabel};
 
 use crate::{
     server::Document,
-    text::{LineIndex, normalized_path},
+    text::{LineIndex, normalized_path, text_range, text_size},
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedDiagnostics {
     pub uri: Url,
     pub version: Option<i32>,
@@ -82,23 +83,35 @@ struct ProjectDiagnostics {
     files: HashSet<PathBuf>,
 }
 
+struct DocumentGroups {
+    overlays: HashMap<PathBuf, String>,
+    projects: BTreeMap<PathBuf, Vec<Url>>,
+    standalone: Vec<Url>,
+}
+
 #[derive(PartialEq, Eq)]
 struct ProjectInputs {
     overlays: BTreeMap<PathBuf, String>,
     disk: BTreeMap<PathBuf, Option<(u64, Option<SystemTime>)>>,
 }
 
-#[cfg(feature = "test-support")]
-pub fn collect_workspace_diagnostics(
-    docs: &HashMap<Url, Document>,
+#[cfg(feature = "test")]
+#[must_use]
+pub fn collect_workspace_diagnostics<S: BuildHasher>(
+    docs: &HashMap<Url, Document, S>,
     options: CompileOptions,
 ) -> Vec<PublishedDiagnostics> {
     collect_workspace_diagnostics_with_sessions(docs, options, &mut DiagnosticSessions::default())
 }
 
-#[cfg(feature = "test-support")]
-pub fn collect_workspace_diagnostics_with_sessions(
-    docs: &HashMap<Url, Document>,
+#[cfg(feature = "test")]
+/// Collects workspace diagnostics using reusable analysis sessions.
+///
+/// # Panics
+///
+/// Panics if the non-cancellable analysis unexpectedly reports cancellation.
+pub fn collect_workspace_diagnostics_with_sessions<S: BuildHasher>(
+    docs: &HashMap<Url, Document, S>,
     options: CompileOptions,
     sessions: &mut DiagnosticSessions,
 ) -> Vec<PublishedDiagnostics> {
@@ -106,38 +119,17 @@ pub fn collect_workspace_diagnostics_with_sessions(
         .expect("non-cancellable analysis cannot be cancelled")
 }
 
-pub fn collect_workspace_diagnostics_cancellable(
-    docs: &HashMap<Url, Document>,
+pub fn collect_workspace_diagnostics_cancellable<S: BuildHasher>(
+    docs: &HashMap<Url, Document, S>,
     options: CompileOptions,
     sessions: &mut DiagnosticSessions,
     cancelled: impl Fn() -> bool,
 ) -> Option<Vec<PublishedDiagnostics>> {
-    let overlays = docs
-        .iter()
-        .filter_map(|(uri, document)| {
-            uri.to_file_path()
-                .ok()
-                .map(|path| (path, document.text.clone()))
-        })
-        .collect::<HashMap<PathBuf, String>>();
-    let mut projects = BTreeMap::<PathBuf, Vec<Url>>::new();
-    let mut standalone = Vec::new();
-
-    for uri in docs.keys() {
-        let Ok(path) = uri.to_file_path() else {
-            standalone.push(uri.clone());
-            continue;
-        };
-        if let Some(root) = clue::find_project_root(&path) {
-            projects.entry(root).or_default().push(uri.clone());
-        } else {
-            standalone.push(uri.clone());
-        }
-    }
-    standalone.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    for project_docs in projects.values_mut() {
-        project_docs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    }
+    let DocumentGroups {
+        overlays,
+        projects,
+        standalone,
+    } = document_groups(docs);
 
     let mut by_uri = BTreeMap::<Url, Vec<Diagnostic>>::new();
     let mut live_standalone = HashSet::new();
@@ -235,19 +227,59 @@ pub fn collect_workspace_diagnostics_cancellable(
         .projects
         .retain(|root, _| live_projects.contains(root));
 
-    Some(
-        by_uri
-            .into_iter()
-            .map(|(uri, mut diagnostics)| {
-                sort_and_dedup(&mut diagnostics);
-                PublishedDiagnostics {
-                    version: document_version(&uri, docs),
-                    uri,
-                    diagnostics,
-                }
-            })
-            .collect(),
-    )
+    Some(publish_diagnostics(by_uri, docs))
+}
+
+fn document_groups<S: BuildHasher>(docs: &HashMap<Url, Document, S>) -> DocumentGroups {
+    let overlays = docs
+        .iter()
+        .filter_map(|(uri, document)| {
+            uri.to_file_path()
+                .ok()
+                .map(|path| (path, document.text.clone()))
+        })
+        .collect();
+    let mut projects = BTreeMap::<PathBuf, Vec<Url>>::new();
+    let mut standalone = Vec::new();
+
+    for uri in docs.keys() {
+        let Ok(path) = uri.to_file_path() else {
+            standalone.push(uri.clone());
+            continue;
+        };
+        if let Some(root) = clue::find_project_root(&path) {
+            projects.entry(root).or_default().push(uri.clone());
+        } else {
+            standalone.push(uri.clone());
+        }
+    }
+    standalone.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for project_docs in projects.values_mut() {
+        project_docs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    }
+
+    DocumentGroups {
+        overlays,
+        projects,
+        standalone,
+    }
+}
+
+fn publish_diagnostics<S: BuildHasher>(
+    by_uri: BTreeMap<Url, Vec<Diagnostic>>,
+    docs: &HashMap<Url, Document, S>,
+) -> Vec<PublishedDiagnostics> {
+    by_uri
+        .into_iter()
+        .map(|(uri, mut diagnostics)| {
+            sort_and_dedup(&mut diagnostics);
+            PublishedDiagnostics {
+                version: document_version(&uri, docs),
+                uri,
+                diagnostics,
+            }
+        })
+        .collect()
 }
 
 fn standalone_diagnostics(
@@ -343,11 +375,12 @@ fn project_inputs(
     ProjectInputs { overlays, disk }
 }
 
-#[cfg(feature = "test-support")]
-pub fn collect_document_diagnostics(
+#[cfg(feature = "test")]
+#[must_use]
+pub fn collect_document_diagnostics<S: BuildHasher>(
     uri: &Url,
     _source: &str,
-    docs: &HashMap<Url, Document>,
+    docs: &HashMap<Url, Document, S>,
     options: CompileOptions,
 ) -> Vec<Diagnostic> {
     let target = published_uri(uri, docs);
@@ -358,6 +391,7 @@ pub fn collect_document_diagnostics(
         .unwrap_or_default()
 }
 
+#[must_use]
 pub fn collect_diagnostics(uri: &Url, source: &str, result: &CompileResult) -> Vec<Diagnostic> {
     let line_index = LineIndex::new(source);
     let mut diagnostics = diagnostic_exts(result)
@@ -408,7 +442,8 @@ fn diagnostic_exts(result: &CompileResult) -> impl Iterator<Item = DiagnosticExt
         )
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
 pub fn to_lsp(uri: &Url, source: &str, diagnostic: DiagnosticExt) -> Option<Diagnostic> {
     to_lsp_with_index(uri, source, &LineIndex::new(source), diagnostic)
 }
@@ -428,7 +463,8 @@ fn to_lsp_with_index(
     .map(|(_, diagnostic)| diagnostic)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
 pub fn to_lsp_mapped(
     source_map: &SourceMap,
     diagnostic: DiagnosticExt,
@@ -551,9 +587,8 @@ fn anchor_range(source: &str) -> Range {
         .unwrap_or(0);
     let end = source[start..]
         .find(['\r', '\n'])
-        .map(|offset| start + offset)
-        .unwrap_or(source.len());
-    let range = TextRange::new(TextSize::from(start as u32), TextSize::from(end as u32));
+        .map_or(source.len(), |offset| start + offset);
+    let range = text_range(start, end);
     try_range(source, normalize_range(source, range).unwrap_or(range)).unwrap_or_default()
 }
 
@@ -575,12 +610,9 @@ fn normalize_range(source: &str, range: TextRange) -> Option<TextRange> {
     let trimmed_start = start + text.len() - text.trim_start().len();
     let trimmed_end = end - (text.len() - text.trim_end().len());
     if trimmed_start >= trimmed_end {
-        return Some(TextRange::empty(TextSize::from(trimmed_start as u32)));
+        return Some(TextRange::empty(text_size(trimmed_start)));
     }
-    Some(TextRange::new(
-        TextSize::from(trimmed_start as u32),
-        TextSize::from(trimmed_end as u32),
-    ))
+    Some(text_range(trimmed_start, trimmed_end))
 }
 
 fn try_range(source: &str, range: TextRange) -> Option<Range> {
@@ -591,7 +623,7 @@ fn try_position(source: &str, offset: usize) -> Option<Position> {
     LineIndex::new(source).position(source, offset)
 }
 
-pub(crate) fn position(source: &str, offset: usize) -> Position {
+pub fn position(source: &str, offset: usize) -> Position {
     let mut offset = offset.min(source.len());
     while !source.is_char_boundary(offset) {
         offset -= 1;
@@ -599,7 +631,7 @@ pub(crate) fn position(source: &str, offset: usize) -> Position {
     try_position(source, offset).unwrap_or_default()
 }
 
-fn severity(severity: type_checker::Severity) -> DiagnosticSeverity {
+const fn severity(severity: type_checker::Severity) -> DiagnosticSeverity {
     match severity {
         type_checker::Severity::Error => DiagnosticSeverity::ERROR,
         type_checker::Severity::Warning => DiagnosticSeverity::WARNING,
@@ -616,7 +648,7 @@ fn normalized_uri(uri: &Url) -> Url {
         .unwrap_or_else(|| uri.clone())
 }
 
-fn published_uri(uri: &Url, docs: &HashMap<Url, Document>) -> Url {
+fn published_uri<S: BuildHasher>(uri: &Url, docs: &HashMap<Url, Document, S>) -> Url {
     if docs.contains_key(uri) {
         return uri.clone();
     }
@@ -629,7 +661,7 @@ fn published_uri(uri: &Url, docs: &HashMap<Url, Document>) -> Url {
         .unwrap_or(normalized)
 }
 
-fn document_version(uri: &Url, docs: &HashMap<Url, Document>) -> Option<i32> {
+fn document_version<S: BuildHasher>(uri: &Url, docs: &HashMap<Url, Document, S>) -> Option<i32> {
     docs.get(&published_uri(uri, docs))
         .and_then(|document| document.version)
 }
@@ -658,7 +690,7 @@ fn compare_related(
         .then_with(|| left.message.cmp(&right.message))
 }
 
-fn diagnostic_range_key(diagnostic: &Diagnostic) -> (u32, u32, u32, u32) {
+const fn diagnostic_range_key(diagnostic: &Diagnostic) -> (u32, u32, u32, u32) {
     let range = diagnostic.range;
     (
         range.start.line,
@@ -699,7 +731,7 @@ fn related_key(diagnostic: &Diagnostic) -> Vec<(String, u32, u32, u32, u32, Stri
         .collect()
 }
 
-fn severity_key(severity: Option<DiagnosticSeverity>) -> u8 {
+const fn severity_key(severity: Option<DiagnosticSeverity>) -> u8 {
     match severity {
         Some(DiagnosticSeverity::ERROR) => 0,
         Some(DiagnosticSeverity::WARNING) => 1,

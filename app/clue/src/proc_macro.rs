@@ -6,6 +6,7 @@ use riddlec::proc_macro::{
     ProcMacroProvider, ProcMacroTokenStream, ProcMacroTokenTree,
 };
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -18,7 +19,7 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 const PROC_MACRO_API: &str = include_str!("../../../std/std/proc_macro.rid");
 
 #[derive(Debug, Clone)]
-pub(crate) struct HostMacroExport {
+pub struct HostMacroExport {
     pub macro_name: String,
     pub function_name: String,
     pub function_name_range: std::ops::Range<usize>,
@@ -27,7 +28,7 @@ pub(crate) struct HostMacroExport {
     pub helper_attributes: Vec<String>,
 }
 
-pub(crate) fn discover_exports(source: &str) -> anyhow::Result<Vec<HostMacroExport>> {
+pub fn discover_exports(source: &str) -> anyhow::Result<Vec<HostMacroExport>> {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
     if let Some(error) = parse.errors.first() {
@@ -79,7 +80,7 @@ pub(crate) fn discover_exports(source: &str) -> anyhow::Result<Vec<HostMacroExpo
     Ok(exports)
 }
 
-pub(crate) fn host_source(source: &str, exports: &[HostMacroExport]) -> String {
+pub fn host_source(source: &str, exports: &[HostMacroExport]) -> String {
     let suffix = host_suffix(exports);
     let mut output = String::with_capacity(PROC_MACRO_API.len() + source.len() + suffix.len() + 1);
     output.push_str(host_prefix());
@@ -89,11 +90,11 @@ pub(crate) fn host_source(source: &str, exports: &[HostMacroExport]) -> String {
     output
 }
 
-pub(crate) fn host_prefix() -> &'static str {
+pub const fn host_prefix() -> &'static str {
     PROC_MACRO_API
 }
 
-pub(crate) fn host_suffix(exports: &[HostMacroExport]) -> String {
+pub fn host_suffix(exports: &[HostMacroExport]) -> String {
     let mut output = String::with_capacity(exports.len() * 180 + 120);
     output.push_str("\nunsafe extern \"C\" { safe fun riddle_proc_run() -> i32; }\n");
     for export in exports {
@@ -113,9 +114,7 @@ pub(crate) fn host_suffix(exports: &[HostMacroExport]) -> String {
     output
 }
 
-pub(crate) fn host_runtime_c(exports: &[HostMacroExport]) -> String {
-    let mut output = String::from(
-        r#"#include <stdint.h>
+const HOST_RUNTIME_PREAMBLE: &str = r"#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,15 +150,8 @@ int putchar(int value) {
     return fwrite(&byte, 1u, 1u, stderr) == 1u ? (int)byte : EOF;
 }
 
-"#,
-    );
-    for export in exports {
-        output.push_str("void ");
-        output.push_str(&export.wrapper_name);
-        output.push_str("(const char *input, const char *second_input);\n");
-    }
-    output.push_str(
-        r#"
+";
+const HOST_RUNTIME_DISPATCH_PREFIX: &str = r"
 static int read_exact(void *buffer, size_t len) {
     return len == 0u || fread(buffer, 1u, len, stdin) == len;
 }
@@ -201,22 +193,8 @@ static void dispatch_macro(
     size_t call_site_start,
     size_t call_site_end
 ) {
-"#,
-    );
-    for (index, export) in exports.iter().enumerate() {
-        if index == 0 {
-            output.push_str("    if ");
-        } else {
-            output.push_str("    else if ");
-        }
-        output.push_str("(strcmp(name, \"");
-        output.push_str(&c_escape(&export.macro_name));
-        output.push_str("\") == 0) { ");
-        output.push_str(&export.wrapper_name);
-        output.push_str("(input, second_input); }\n");
-    }
-    output.push_str(
-        r#"    else {
+";
+const HOST_RUNTIME_LOOP: &str = r#"    else {
         static const char message[] = "unknown process macro";
         riddle_proc_emit_diagnostic(
             0u,
@@ -352,9 +330,38 @@ int riddle_proc_run(void) {
         fflush(stdout);
     }
 }
-"#,
-    );
+"#;
+
+pub fn host_runtime_c(exports: &[HostMacroExport]) -> String {
+    let mut output = String::from(HOST_RUNTIME_PREAMBLE);
+    append_host_declarations(&mut output, exports);
+    output.push_str(HOST_RUNTIME_DISPATCH_PREFIX);
+    append_host_dispatch(&mut output, exports);
+    output.push_str(HOST_RUNTIME_LOOP);
     output
+}
+
+fn append_host_declarations(output: &mut String, exports: &[HostMacroExport]) {
+    for export in exports {
+        output.push_str("void ");
+        output.push_str(&export.wrapper_name);
+        output.push_str("(const char *input, const char *second_input);\n");
+    }
+}
+
+fn append_host_dispatch(output: &mut String, exports: &[HostMacroExport]) {
+    for (index, export) in exports.iter().enumerate() {
+        if index == 0 {
+            output.push_str("    if ");
+        } else {
+            output.push_str("    else if ");
+        }
+        output.push_str("(strcmp(name, \"");
+        output.push_str(&c_escape(&export.macro_name));
+        output.push_str("\") == 0) { ");
+        output.push_str(&export.wrapper_name);
+        output.push_str("(input, second_input); }\n");
+    }
 }
 
 struct ExportAttribute {
@@ -559,10 +566,10 @@ fn is_token_stream_type(ty: &ast::Type) -> bool {
 }
 
 fn wrapper_name(macro_name: &str) -> String {
-    let encoded = macro_name
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut encoded = String::with_capacity(macro_name.len() * 2);
+    for byte in macro_name.bytes() {
+        write!(encoded, "{byte:02x}").expect("writing to a String should not fail");
+    }
     format!("__riddle_proc_macro_{encoded}")
 }
 
@@ -578,7 +585,7 @@ fn c_escape(value: &str) -> String {
     escaped
 }
 
-pub(crate) struct ProcMacroHost {
+pub struct ProcMacroHost {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
@@ -634,15 +641,21 @@ impl ProcMacroHost {
         if payload_len > MAX_FRAME {
             bail!("proc-macro request exceeds the frame limit");
         }
+        let payload_len = u32::try_from(payload_len).context("proc-macro frame is too large")?;
+        let macro_name_len =
+            u32::try_from(macro_name.len()).context("proc-macro name is too large")?;
+        let input_len = u32::try_from(input.len()).context("proc-macro input is too large")?;
+        let second_input_len =
+            u32::try_from(second_input.len()).context("second proc-macro input is too large")?;
         let stdin = self
             .stdin
             .as_mut()
             .context("proc-macro host stdin is closed")?;
-        write_u32(stdin, payload_len as u32)?;
+        write_u32(stdin, payload_len)?;
         write_u32(stdin, PROTOCOL_VERSION)?;
-        write_u32(stdin, macro_name.len() as u32)?;
-        write_u32(stdin, input.len() as u32)?;
-        write_u32(stdin, second_input.len() as u32)?;
+        write_u32(stdin, macro_name_len)?;
+        write_u32(stdin, input_len)?;
+        write_u32(stdin, second_input_len)?;
         write_u32(stdin, call_site_start)?;
         write_u32(stdin, call_site_end)?;
         stdin.write_all(macro_name.as_bytes())?;
@@ -716,7 +729,7 @@ impl Drop for ProcMacroHost {
     }
 }
 
-pub(crate) struct ClueProcMacroProvider {
+pub struct ClueProcMacroProvider {
     hosts: HashMap<String, ProcMacroHost>,
     exports: HashMap<String, Vec<ProcMacroExport>>,
     definitions: HashMap<(String, String), ProcMacroDefinition>,
@@ -750,8 +763,12 @@ impl ClueProcMacroProvider {
                 crate::build::build_proc_macro_host(package, &exports, &expansion.source)?;
             for export in &exports {
                 let range = rowan::TextRange::new(
-                    (export.function_name_range.start as u32).into(),
-                    (export.function_name_range.end as u32).into(),
+                    u32::try_from(export.function_name_range.start)
+                        .context("proc-macro definition start exceeds the source range")?
+                        .into(),
+                    u32::try_from(export.function_name_range.end)
+                        .context("proc-macro definition end exceeds the source range")?
+                        .into(),
                 );
                 let mapped = package
                     .source
@@ -865,10 +882,10 @@ mod tests {
 
     #[test]
     fn validates_proc_macro_exports() {
-        let valid = r#"
+        let valid = r"
             #[proc_macro_derive(Answer, attributes(answer))]
             pub fun derive_answer(input: TokenStream) -> TokenStream { input }
-        "#;
+        ";
         let exports = discover_exports(valid).unwrap();
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].macro_name, "Answer");
@@ -882,12 +899,12 @@ mod tests {
                 .contains("must be public")
         );
 
-        let duplicate = r#"
+        let duplicate = r"
             #[proc_macro_derive(Answer)]
             pub fun first(input: TokenStream) -> TokenStream { input }
             #[proc_macro_derive(Answer)]
             pub fun second(input: TokenStream) -> TokenStream { input }
-        "#;
+        ";
         assert!(
             discover_exports(duplicate)
                 .unwrap_err()

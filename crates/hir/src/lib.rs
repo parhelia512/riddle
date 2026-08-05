@@ -38,7 +38,8 @@ pub struct HirFile {
     pub std_loaded: bool,
 }
 
-pub fn lower_root(root: Root) -> HirFile {
+#[must_use]
+pub fn lower_root(root: &Root) -> HirFile {
     let package_range = root.syntax().text_range();
     let internal_attrs = lower::lower_internal_attrs(root.syntax());
     let mut hir = HirFile {
@@ -70,6 +71,7 @@ pub fn lower_root(root: Root) -> HirFile {
 }
 
 impl HirFile {
+    #[must_use]
     pub fn package_for_range(&self, range: TextRange) -> Option<usize> {
         self.package_ranges
             .iter()
@@ -86,7 +88,7 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
                 let fid = func.lower(&mut hir.item_tree.functions);
                 items.push(TopLevelItem::Function(fid));
                 if let Some(block) = body_ast {
-                    let body = BodyLower::lower(hir, block);
+                    let body = BodyLower::lower(hir, &block);
                     let bid = hir.bodies.alloc(body);
                     hir.function_bodies.insert(fid, bid);
                 }
@@ -98,7 +100,7 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
             }
 
             ast::Stmt::ModDecl(m) => {
-                let mid = lower_mod_decl(hir, m);
+                let mid = lower_mod_decl(hir, &m);
                 items.push(TopLevelItem::Module(mid));
             }
 
@@ -136,7 +138,7 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
                     hir.item_tree.functions[fid].is_unsafe |= explicitly_unsafe;
                     items.push(TopLevelItem::Function(fid));
                     hir.item_tree.extern_function_ids.push(fid);
-                    let body = BodyLower::lower(hir, body_ast);
+                    let body = BodyLower::lower(hir, &body_ast);
                     let bid = hir.bodies.alloc(body);
                     hir.function_bodies.insert(fid, bid);
                 }
@@ -169,7 +171,7 @@ pub(crate) fn lower_items(hir: &mut HirFile, stmts: Vec<ast::Stmt>) -> Vec<TopLe
             }
 
             ast::Stmt::ImplDecl(i) => {
-                let iid = lower_impl_decl(hir, i);
+                let iid = lower_impl_decl(hir, &i);
                 items.push(TopLevelItem::Impl(iid));
             }
 
@@ -243,7 +245,7 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
                 callable: None,
                 assoc_constraints: Vec::new(),
             });
-        let body = BodyLower::lower(hir, body_ast);
+        let body = BodyLower::lower(hir, &body_ast);
         let body_id = hir.bodies.alloc(body);
         hir.function_bodies.insert(fid, body_id);
         hir.item_tree.traits[tid].default_methods.push(fid);
@@ -256,12 +258,11 @@ pub(crate) fn lower_trait_decl(hir: &mut HirFile, t: ast::TraitDecl) -> item_tre
 ///
 /// Both `body_lower` and `lower_items` use this helper so module children are always promoted into
 /// the global item tree.
-pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: ast::ModDecl) -> ModuleId {
+pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: &ast::ModDecl) -> ModuleId {
     let name_token = m.name();
     let name_range = name_token
         .as_ref()
-        .map(|token| token.text_range())
-        .unwrap_or_else(|| trimmed_range(m.syntax()));
+        .map_or_else(|| trimmed_range(m.syntax()), rowan::SyntaxToken::text_range);
     let name = lower::lower_name(name_token);
 
     // Allocate a placeholder first so the module has a stable id while lowering children.
@@ -285,16 +286,16 @@ pub(crate) fn lower_mod_decl(hir: &mut HirFile, m: ast::ModDecl) -> ModuleId {
 
 /// Lowers an `impl` block. Methods/consts/type-aliases are allocated into the global arenas; method
 /// bodies are lowered like free functions so their references participate in name resolution.
-pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree::ImplId {
+pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: &ast::ImplDecl) -> item_tree::ImplId {
     use item_tree::{HirImpl, HirTypeRef};
 
     let impl_range = trimmed_range(i.syntax());
     let first_ty_ast = i.self_type();
     let first_ty_range = first_ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
-    let first_ty = first_ty_ast.map(|ty| ty.lower());
+    let first_ty = first_ty_ast.map(lower::Lower::lower);
     let second_ty_ast = i.trait_type();
     let second_ty_range = second_ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
-    let second_ty = second_ty_ast.map(|ty| ty.lower());
+    let second_ty = second_ty_ast.map(lower::Lower::lower);
     let (self_ty, self_ty_range, trait_ty, trait_ty_range) = if i.has_for() {
         (
             second_ty.unwrap_or(HirTypeRef::Error),
@@ -330,7 +331,7 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: ast::ImplDecl) -> item_tree:
         apply_self_receiver_types(&mut hir.item_tree.functions[fid], &receivers);
         methods.push(fid);
         if let Some(block) = body_ast {
-            let body = BodyLower::lower(hir, block);
+            let body = BodyLower::lower(hir, &block);
             let bid = hir.bodies.alloc(body);
             hir.function_bodies.insert(fid, bid);
         }

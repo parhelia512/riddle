@@ -140,7 +140,7 @@ impl TypeChecker<'_> {
                 trait_id,
                 self_ty,
                 trait_args,
-                self_ty_text: self.display_type_ref(&imp.self_ty),
+                self_ty_text: Self::display_type_ref(&imp.self_ty),
                 span: imp.self_ty_range,
             });
         }
@@ -425,7 +425,7 @@ impl TypeChecker<'_> {
                     format!(
                         "trait `{}` references unknown supertrait `{}`",
                         tr.name.0,
-                        self.type_ref_source_text(&supertrait.trait_ty)
+                        Self::type_ref_source_text(&supertrait.trait_ty)
                     ),
                     Some(supertrait.trait_range),
                 );
@@ -485,14 +485,14 @@ impl TypeChecker<'_> {
             return;
         }
 
-        let self_ty_text = self.display_type_ref(&imp.self_ty);
+        let self_ty_text = Self::display_type_ref(&imp.self_ty);
         let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
             self.diagnostic(
                 "E0023",
                 format!(
                     "impl for `{}` references unknown trait `{}`",
                     self_ty_text,
-                    self.type_ref_source_text(trait_ty)
+                    Self::type_ref_source_text(trait_ty)
                 ),
                 imp.trait_ty_range.or(Some(imp.self_ty_range)),
             );
@@ -522,7 +522,7 @@ impl TypeChecker<'_> {
                 "E0037",
                 format!(
                     "impl bound `{}` is not strictly smaller than implemented type `{}`",
-                    self.type_ref_source_text(&bound.target_ty),
+                    Self::type_ref_source_text(&bound.target_ty),
                     self_ty_text
                 ),
                 Some(bound.trait_range),
@@ -531,7 +531,7 @@ impl TypeChecker<'_> {
     }
 
     fn check_impl_duplicates(&mut self, imp: &HirImpl) {
-        let impl_name = self.display_type_ref(&imp.self_ty);
+        let impl_name = Self::display_type_ref(&imp.self_ty);
 
         let mut methods = HashSet::new();
         for fid in &imp.methods {
@@ -666,14 +666,8 @@ impl TypeChecker<'_> {
         self_ty: &Type,
         required_args: &[Type],
     ) -> bool {
-        let impls = self
-            .hir
-            .item_tree
-            .impls
-            .iter()
-            .map(|(_, imp)| imp.clone())
-            .collect::<Vec<_>>();
-        impls.into_iter().any(|imp| {
+        let impls = self.hir.item_tree.impls.clone();
+        impls.iter().any(|(_, imp)| {
             let Some(trait_ty) = imp.trait_ty.as_ref() else {
                 return false;
             };
@@ -776,7 +770,7 @@ impl TypeChecker<'_> {
                 &params,
                 Some(actual_param.ty_range),
             );
-            if !self.signature_types_match(&expected_ty, &actual_ty) {
+            if !Self::signature_types_match(&expected_ty, &actual_ty) {
                 self.diagnostic(
                     "E0029",
                     format!(
@@ -792,29 +786,21 @@ impl TypeChecker<'_> {
             }
         }
 
-        let expected_ret = expected
-            .ret_type
-            .as_ref()
-            .map(|ty| {
-                self.lower_type_ref_with_params_at(
-                    ty,
-                    &params,
-                    expected.ret_type_range.or(Some(expected.name_range)),
-                )
-            })
-            .unwrap_or(Type::Unit);
-        let actual_ret = actual
-            .ret_type
-            .as_ref()
-            .map(|ty| {
-                self.lower_type_ref_with_params_at(
-                    ty,
-                    &params,
-                    actual.ret_type_range.or(Some(actual.name_range)),
-                )
-            })
-            .unwrap_or(Type::Unit);
-        if !self.signature_types_match(&expected_ret, &actual_ret) {
+        let expected_ret = expected.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            self.lower_type_ref_with_params_at(
+                ty,
+                &params,
+                expected.ret_type_range.or(Some(expected.name_range)),
+            )
+        });
+        let actual_ret = actual.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            self.lower_type_ref_with_params_at(
+                ty,
+                &params,
+                actual.ret_type_range.or(Some(actual.name_range)),
+            )
+        });
+        if !Self::signature_types_match(&expected_ret, &actual_ret) {
             self.diagnostic(
                 "E0030",
                 format!(
@@ -829,37 +815,37 @@ impl TypeChecker<'_> {
         }
     }
 
-    fn signature_types_match(&self, expected: &Type, actual: &Type) -> bool {
+    fn signature_types_match(expected: &Type, actual: &Type) -> bool {
         expected.is_unknown_like()
             || actual.is_unknown_like()
             || expected == actual
-            || self.numeric_assignable(expected, actual)
+            || Self::numeric_assignable(expected, actual)
     }
 
-    fn type_ref_source_text(&self, ty: &HirTypeRef) -> String {
+    fn type_ref_source_text(ty: &HirTypeRef) -> String {
         match ty {
             HirTypeRef::Named(path) => path.display(),
             HirTypeRef::Never => "!".to_string(),
             HirTypeRef::Ref(inner, mutable) => {
                 let kw = if *mutable { "&mut " } else { "&" };
-                format!("{}{}", kw, self.type_ref_source_text(inner))
+                format!("{}{}", kw, Self::type_ref_source_text(inner))
             }
             HirTypeRef::Tuple(elements) => {
                 let inner = elements
                     .iter()
-                    .map(|ty| self.type_ref_source_text(ty))
+                    .map(Self::type_ref_source_text)
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({inner})")
             }
-            HirTypeRef::Slice(inner) => format!("[{}]", self.type_ref_source_text(inner)),
+            HirTypeRef::Slice(inner) => format!("[{}]", Self::type_ref_source_text(inner)),
             HirTypeRef::Array(inner, len) => {
-                format!("[{}; {}]", self.type_ref_source_text(inner), len.display())
+                format!("[{}; {}]", Self::type_ref_source_text(inner), len.display())
             }
             HirTypeRef::Const(value) => value.display(),
             HirTypeRef::Ptr { mutable, inner } => {
                 let kind = if *mutable { "*mut" } else { "*const" };
-                format!("{kind} {}", self.type_ref_source_text(inner))
+                format!("{kind} {}", Self::type_ref_source_text(inner))
             }
             HirTypeRef::ImplTrait { .. } => ty.display(),
             HirTypeRef::Unknown => "_".to_string(),
@@ -910,8 +896,9 @@ fn is_fundamental(attrs: &[HirAttr]) -> bool {
 // is rejected though Rust accepts it. Thread `hir` through here to lift that.
 fn uncovered_orphan_param(ty: &Type, prefix: &str) -> Option<String> {
     match ty {
-        Type::Param(name) => name.strip_prefix(prefix).map(str::to_string),
-        Type::Const(ConstArg::Param(name)) => name.strip_prefix(prefix).map(str::to_string),
+        Type::Param(name) | Type::Const(ConstArg::Param(name)) => {
+            name.strip_prefix(prefix).map(str::to_string)
+        }
         Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
             uncovered_orphan_param(inner, prefix)
         }
@@ -946,8 +933,9 @@ fn coherence_type_is_valid(ty: &Type) -> bool {
         }
         Type::Tuple(elements) => elements.iter().all(coherence_type_is_valid),
         Type::Array(inner, len) => coherence_type_is_valid(inner) && coherence_const_is_valid(len),
-        Type::Struct(_, args) | Type::Enum(_, args) => args.iter().all(coherence_type_is_valid),
-        Type::FunctionItem { args, .. } => args.iter().all(coherence_type_is_valid),
+        Type::Struct(_, args) | Type::Enum(_, args) | Type::FunctionItem { args, .. } => {
+            args.iter().all(coherence_type_is_valid)
+        }
         Type::CallableConstraint(signature)
         | Type::Closure { signature, .. }
         | Type::OpaqueCallable { signature, .. } => {
@@ -959,7 +947,7 @@ fn coherence_type_is_valid(ty: &Type) -> bool {
     }
 }
 
-fn coherence_const_is_valid(value: &ConstArg) -> bool {
+const fn coherence_const_is_valid(value: &ConstArg) -> bool {
     !matches!(value, ConstArg::Unknown | ConstArg::Error)
 }
 
@@ -991,8 +979,9 @@ fn unify_coherence_type(
         return true;
     }
     match (&lhs, &rhs) {
-        (Type::Param(name), other) => bind_coherence_type(name, other, type_subst),
-        (other, Type::Param(name)) => bind_coherence_type(name, other, type_subst),
+        (Type::Param(name), other) | (other, Type::Param(name)) => {
+            bind_coherence_type(name, other, type_subst)
+        }
         (Type::Ref(lhs, lhs_mut), Type::Ref(rhs, rhs_mut)) => {
             lhs_mut == rhs_mut && unify_coherence_type(lhs, rhs, type_subst, const_subst)
         }
@@ -1139,8 +1128,9 @@ fn unify_coherence_const(
         return true;
     }
     match (&lhs, &rhs) {
-        (ConstArg::Param(name), value) => bind_coherence_const(name, value, subst),
-        (value, ConstArg::Param(name)) => bind_coherence_const(name, value, subst),
+        (ConstArg::Param(name), value) | (value, ConstArg::Param(name)) => {
+            bind_coherence_const(name, value, subst)
+        }
         _ => false,
     }
 }
@@ -1192,17 +1182,15 @@ fn type_ref_size(ty: &HirTypeRef, generics: &HashSet<&str>) -> usize {
                 .map(|arg| type_ref_size(arg, generics))
                 .sum::<usize>()
         }
-        HirTypeRef::Ref(inner, _) | HirTypeRef::Ptr { inner, .. } => {
-            1 + type_ref_size(inner, generics)
-        }
+        HirTypeRef::Ref(inner, _)
+        | HirTypeRef::Ptr { inner, .. }
+        | HirTypeRef::Slice(inner)
+        | HirTypeRef::Array(inner, _) => 1 + type_ref_size(inner, generics),
         HirTypeRef::Tuple(elements) => {
             1 + elements
                 .iter()
                 .map(|element| type_ref_size(element, generics))
                 .sum::<usize>()
-        }
-        HirTypeRef::Slice(inner) | HirTypeRef::Array(inner, _) => {
-            1 + type_ref_size(inner, generics)
         }
         HirTypeRef::ImplTrait { .. } => 1,
         HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => 0,

@@ -32,7 +32,7 @@ fn analyze(source: &str) -> move_checker::AnalysisResult {
 fn lower_and_resolve(parse: &Parse) -> HirFile {
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
-    let mut hir = lower_root(root);
+    let mut hir = lower_root(&root);
     let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
     diagnostic_support::assert_hir_diagnostics(

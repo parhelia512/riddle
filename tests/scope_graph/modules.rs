@@ -5,7 +5,7 @@ use scope_graph::{EdgeKind, Node};
 #[test]
 fn shadowing_stops_before_outer_scope_even_when_remaining_path_fails() {
     let sg = build(
-        r#"
+        r"
         mod x {
             struct S {}
         }
@@ -13,7 +13,7 @@ fn shadowing_stops_before_outer_scope_even_when_remaining_path_fails() {
         fun f(x: int) {
             x::S
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "x::S"), vec![vec![]]);
@@ -22,7 +22,7 @@ fn shadowing_stops_before_outer_scope_even_when_remaining_path_fails() {
 #[test]
 fn plain_paths_climb_out_of_inner_modules() {
     let sg = build(
-        r#"
+        r"
         mod outer {
             struct S {}
 
@@ -32,7 +32,7 @@ fn plain_paths_climb_out_of_inner_modules() {
                 }
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "S"), vec![vec![DefKind::Struct]]);
@@ -41,7 +41,7 @@ fn plain_paths_climb_out_of_inner_modules() {
 #[test]
 fn multi_segment_reference_uses_reverse_push_chain() {
     let sg = build(
-        r#"
+        r"
         pub mod a {
             pub mod b {
                 pub struct C {}
@@ -51,7 +51,7 @@ fn multi_segment_reference_uses_reverse_push_chain() {
         fun f() {
             crate::a::b::C
         }
-        "#,
+        ",
     );
 
     let nid = reference_node(&sg, "a::b::C").unwrap();
@@ -73,7 +73,7 @@ fn multi_segment_reference_uses_reverse_push_chain() {
         match &sg.nodes[current] {
             Node::PushSymbol { name } => chain.push(name.0.clone()),
             Node::Scope(_) => break,
-            other => panic!("unexpected node in path chain: {:?}", other),
+            other => panic!("unexpected node in path chain: {other:?}"),
         }
     }
 
@@ -85,7 +85,7 @@ fn multi_segment_reference_uses_reverse_push_chain() {
 #[test]
 fn module_paths_only_export_pub_items() {
     let sg = build(
-        r#"
+        r"
         mod m {
             pub fun open() -> i32 { 1 }
             fun hidden() -> i32 { 2 }
@@ -95,7 +95,7 @@ fn module_paths_only_export_pub_items() {
             m::open();
             m::hidden()
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "m::open"), vec![vec![DefKind::Function]]);
@@ -105,7 +105,7 @@ fn module_paths_only_export_pub_items() {
 #[test]
 fn pub_use_re_exports_item_from_module() {
     let sg = build(
-        r#"
+        r"
         mod inner {
             pub struct S {}
         }
@@ -117,7 +117,7 @@ fn pub_use_re_exports_item_from_module() {
         fun f() {
             outer::S
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "outer::S"), vec![vec![DefKind::Struct]]);

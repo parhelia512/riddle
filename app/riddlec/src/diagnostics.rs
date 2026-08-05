@@ -1,24 +1,27 @@
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 
 use crate::pipeline::{CompileResult, DiagnosticExt, IntoDiagnosticExt, LoadedSource};
 
 /// Print diagnostics to stderr in rustc-inspired format.
 /// Returns the error count.
+#[must_use]
 pub fn report(result: &CompileResult, source: Option<&str>, source_name: &str) -> usize {
     let mut stderr = io::stderr();
     let color = stderr.is_terminal();
     let errors = report_with(result, |diagnostic| {
-        print_rust_style(&mut stderr, source, source_name, diagnostic, color)
+        print_rust_style(&mut stderr, source, source_name, diagnostic, color);
     });
     print_summary(&mut stderr, errors, color);
     errors
 }
 
+#[must_use]
 pub fn report_mapped(result: &CompileResult, source: &LoadedSource, source_name: &str) -> usize {
     let mut stderr = io::stderr();
     let color = stderr.is_terminal();
     let errors = report_with(result, |diagnostic| {
-        print_mapped(&mut stderr, source, source_name, diagnostic, color)
+        print_mapped(&mut stderr, source, source_name, diagnostic, color);
     });
     print_summary(&mut stderr, errors, color);
     errors
@@ -271,26 +274,71 @@ fn print_summary(out: &mut impl Write, errors: usize, color: bool) {
     );
 }
 
-fn enabled_color(enabled: bool, code: &'static str) -> &'static str {
+const fn enabled_color(enabled: bool, code: &'static str) -> &'static str {
     if enabled { code } else { "" }
 }
 
 fn display_path(path: &std::path::Path) -> String {
     let path = path.display().to_string();
-    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{path}")
-    } else {
-        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
-    }
+    path.strip_prefix(r"\\?\UNC\").map_or_else(
+        || path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned(),
+        |path| format!(r"\\{path}"),
+    )
 }
 
 fn gutter(line_no: Option<usize>, width: usize, color: bool) -> String {
     let blue = enabled_color(color, BLUE);
     let reset = enabled_color(color, RESET);
-    match line_no {
-        Some(n) => format!(" {blue}{n:>width$} |{reset} "),
-        None => format!(" {blue}{:>width$} |{reset} ", ""),
+    line_no.map_or_else(
+        || format!(" {blue}{:>width$} |{reset} ", ""),
+        |line| format!(" {blue}{line:>width$} |{reset} "),
+    )
+}
+
+type LineLabel<'a> = (usize, Option<usize>, &'a str, bool);
+
+fn collect_line_labels<'a>(
+    source: &'a str,
+    labels: &'a [type_checker::SourceLabel],
+) -> std::collections::BTreeMap<usize, Vec<LineLabel<'a>>> {
+    let mut line_labels = std::collections::BTreeMap::new();
+    for label in labels {
+        let (trim_start, trim_end) = trim_range(source, label.range.start(), label.range.end());
+        let start = offset_to_line_col(source, trim_start);
+        let end = offset_to_line_col(source, trim_end);
+        let is_primary = matches!(label.style, type_checker::LabelStyle::Primary);
+        if start.line == end.line {
+            line_labels
+                .entry(start.line)
+                .or_insert_with(Vec::new)
+                .push((
+                    start.col - 1,
+                    Some((end.col - 1).max(start.col)),
+                    label.message.as_str(),
+                    is_primary,
+                ));
+            continue;
+        }
+        line_labels
+            .entry(start.line)
+            .or_insert_with(Vec::new)
+            .push((start.col - 1, None, label.message.as_str(), is_primary));
+        for line in (start.line + 1)..end.line {
+            line_labels
+                .entry(line)
+                .or_insert_with(Vec::new)
+                .push((0, None, "", is_primary));
+        }
+        if end.col > 1 {
+            line_labels.entry(end.line).or_insert_with(Vec::new).push((
+                0,
+                Some(end.col - 1),
+                "",
+                is_primary,
+            ));
+        }
     }
+    line_labels
 }
 
 fn annotate_source<'a>(
@@ -300,49 +348,7 @@ fn annotate_source<'a>(
     secondary_color: &str,
     reset: &str,
 ) -> (String, usize) {
-    type LineLabel<'a> = (usize, Option<usize>, &'a str, bool);
-
-    let mut line_labels: std::collections::BTreeMap<usize, Vec<LineLabel<'a>>> =
-        std::collections::BTreeMap::new();
-
-    for label in labels {
-        let (trim_start, trim_end) = trim_range(source, label.range.start(), label.range.end());
-        let start_lc = offset_to_line_col(source, trim_start);
-        let end_lc = offset_to_line_col(source, trim_end);
-        let is_primary = matches!(label.style, type_checker::LabelStyle::Primary);
-
-        if start_lc.line == end_lc.line {
-            let start = start_lc.col - 1;
-            let end = (end_lc.col - 1).max(start + 1);
-            line_labels.entry(start_lc.line).or_default().push((
-                start,
-                Some(end),
-                label.message.as_str(),
-                is_primary,
-            ));
-        } else {
-            line_labels.entry(start_lc.line).or_default().push((
-                start_lc.col - 1,
-                None,
-                label.message.as_str(),
-                is_primary,
-            ));
-            for line in (start_lc.line + 1)..end_lc.line {
-                line_labels
-                    .entry(line)
-                    .or_default()
-                    .push((0, None, "", is_primary));
-            }
-            if end_lc.col > 1 {
-                line_labels.entry(end_lc.line).or_default().push((
-                    0,
-                    Some(end_lc.col - 1),
-                    "",
-                    is_primary,
-                ));
-            }
-        }
-    }
+    let line_labels = collect_line_labels(source, labels);
 
     if line_labels.is_empty() {
         return (String::new(), 1);
@@ -364,12 +370,15 @@ fn annotate_source<'a>(
             out.push_str(" ...\n");
         }
         previous_line = Some(line_no);
-        let source_line = raw_lines.get(line_no - 1).map(|s| s.as_str()).unwrap_or("");
-        out.push_str(&format!(
-            "{}{}\n",
+        let source_line = raw_lines
+            .get(line_no - 1)
+            .map_or("", std::string::String::as_str);
+        let _ = writeln!(
+            out,
+            "{}{}",
             gutter(Some(line_no), gutter_w, !secondary_color.is_empty()),
             source_line
-        ));
+        );
 
         let source_chars: Vec<char> = source_line.chars().collect();
         let line_len = labels_for_line
@@ -404,8 +413,12 @@ fn annotate_source<'a>(
         out.push_str(&gutter(None, gutter_w, !secondary_color.is_empty()));
         for (index, marker) in markers.iter().enumerate() {
             match marker {
-                2 => out.push_str(&format!("{primary_color}^{reset}")),
-                1 => out.push_str(&format!("{secondary_color}-{reset}")),
+                2 => {
+                    let _ = write!(out, "{primary_color}^{reset}");
+                }
+                1 => {
+                    let _ = write!(out, "{secondary_color}-{reset}");
+                }
                 _ if source_chars.get(index) == Some(&'\t') => out.push('\t'),
                 _ => out.push(' '),
             }
@@ -426,7 +439,7 @@ fn annotate_source<'a>(
                         secondary_color
                     }
                 });
-            out.push_str(&format!(" {message_color}{}{reset}", messages.join("; ")));
+            let _ = write!(out, " {message_color}{}{reset}", messages.join("; "));
         }
         out.push('\n');
     }
@@ -464,10 +477,7 @@ fn trim_range(
     if new_s >= new_e {
         return (start, end);
     }
-    (
-        rowan::TextSize::from(new_s as u32),
-        rowan::TextSize::from(new_e as u32),
-    )
+    (crate::text_size(new_s), crate::text_size(new_e))
 }
 
 /// Skip leading whitespace/newlines in source range — CST ranges include
@@ -484,7 +494,7 @@ fn trim_leading_trivia(
     }
     let slice = &source[s..e];
     let trimmed = slice.len() - slice.trim_start_matches(|c: char| c.is_whitespace()).len();
-    rowan::TextSize::from((s + trimmed) as u32)
+    crate::text_size(s + trimmed)
 }
 
 fn offset_to_line_col(source: &str, offset: rowan::TextSize) -> LineCol {

@@ -8,7 +8,7 @@ use rowan::TextRange;
 
 use crate::{result::LambdaCapture, types::Type};
 
-pub(crate) struct BodyCtx<'a> {
+pub struct BodyCtx<'a> {
     pub(crate) body_id: BodyId,
     pub(crate) body: &'a Body,
     pub(crate) function_id: Option<FunctionId>,
@@ -81,7 +81,7 @@ impl<'a> BodyCtx<'a> {
         }
     }
 
-    pub(crate) fn owner_range(&self) -> TextRange {
+    pub(crate) const fn owner_range(&self) -> TextRange {
         self.owner_range
     }
 
@@ -132,7 +132,7 @@ impl<'a> BodyCtx<'a> {
     }
 }
 
-pub(crate) struct LambdaCtx {
+pub struct LambdaCtx {
     pub(crate) expr: ExprId,
     pub(crate) params: Vec<Type>,
     pub(crate) param_mutability: Vec<bool>,
@@ -144,7 +144,7 @@ pub(crate) struct LambdaCtx {
 /// One binding introduced by a pattern — from a `let`, a `match` arm, or a
 /// `for` loop. `is_mut` comes from `mut` on the binding itself.
 #[derive(Debug, Clone)]
-pub(crate) struct BindingInfo {
+pub struct BindingInfo {
     pub(crate) ty: Type,
     pub(crate) id: PatternBindingId,
     pub(crate) is_mut: bool,
@@ -153,7 +153,7 @@ pub(crate) struct BindingInfo {
 /// Scoped name → binding info. Every local variable lives here, because `let`
 /// bindings are pattern bindings too.
 #[derive(Debug, Default)]
-pub(crate) struct ScopedBindings {
+pub struct ScopedBindings {
     scopes: Vec<HashMap<String, BindingInfo>>,
 }
 

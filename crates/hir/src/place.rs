@@ -20,7 +20,8 @@ pub struct Place {
 }
 
 impl Place {
-    pub fn root(local: PatternBindingId) -> Self {
+    #[must_use]
+    pub const fn root(local: PatternBindingId) -> Self {
         Self {
             local,
             projections: Vec::new(),
@@ -28,12 +29,14 @@ impl Place {
     }
 
     /// Push a field projection.
+    #[must_use]
     pub fn field(mut self, idx: usize) -> Self {
         self.projections.push(Projection::Field(idx));
         self
     }
 
     /// Push an index projection.
+    #[must_use]
     pub fn index(mut self, idx: Option<usize>) -> Self {
         self.projections.push(Projection::Index(idx));
         self
@@ -45,7 +48,8 @@ impl Place {
     /// `x.0` is a prefix of `x.0.1` → true (x.0.1 is inside x.0).
     /// `x.0` is a prefix of `x.1`   → false (different fields).
     /// `x`   is a prefix of `x.0`   → true (root covers all fields).
-    pub fn is_prefix_of(&self, other: &Place) -> bool {
+    #[must_use]
+    pub fn is_prefix_of(&self, other: &Self) -> bool {
         self.local == other.local
             && self.projections.len() <= other.projections.len()
             && self

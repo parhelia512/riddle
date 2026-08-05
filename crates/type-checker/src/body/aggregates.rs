@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    BodyCtx, ConstArg, Expr, ExprId, ForLoopInfo, HashMap, HashSet, HirTypeRef, HirVariantKind,
+    IntTy, MatchArm, PatId, ResolvedName, TraitId, TraitMethodCall, Type, TypeChecker, ValueUse,
+    collect_subst, generic_param_map_with_consts, pattern_has_unresolved_param, substitute_type,
+};
 
 impl TypeChecker<'_> {
     pub(super) fn check_struct_expr(
@@ -103,6 +107,25 @@ impl TypeChecker<'_> {
             self.record_value_use(ctx, field.value, ValueUse::Move);
         }
 
+        self.report_missing_struct_fields(&strukt, &seen, span);
+
+        let args = strukt
+            .generics
+            .iter()
+            .chain(strukt.const_generics.iter())
+            .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+            .collect();
+        let ty = Type::Struct(*struct_id, args);
+        self.check_type_bounds(ctx, &ty, span);
+        ty
+    }
+
+    fn report_missing_struct_fields(
+        &mut self,
+        strukt: &hir::item_tree::HirStruct,
+        seen: &[&str],
+        span: Option<rowan::TextRange>,
+    ) {
         for expected in &strukt.fields {
             if !seen.contains(&expected.name.0.as_str()) {
                 self.diagnostic(
@@ -115,16 +138,6 @@ impl TypeChecker<'_> {
                 );
             }
         }
-
-        let args = strukt
-            .generics
-            .iter()
-            .chain(strukt.const_generics.iter())
-            .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
-            .collect();
-        let ty = Type::Struct(*struct_id, args);
-        self.check_type_bounds(ctx, &ty, span);
-        ty
     }
 
     pub(super) fn check_enum_struct_expr(
@@ -394,41 +407,13 @@ impl TypeChecker<'_> {
             if !has_into_iter {
                 self.diagnostic("E0035", "`IntoIterator` must define `into_iter`", span);
             }
-            if has_into_iter
-                && let Some((next_ty, some_variant)) =
-                    self.iterator_next_protocol(ctx, iterator_trait, &item_ty, span)
-                && !item_ty.is_unknown_like()
-                && !into_iter_ty.is_unknown_like()
-            {
-                if self.hir.item_tree.traits[into_iter_trait]
-                    .methods
-                    .iter()
-                    .find(|method| method.name.0 == "into_iter")
-                    .is_some_and(|method| method.is_unsafe)
-                    || self.hir.item_tree.traits[iterator_trait]
-                        .methods
-                        .iter()
-                        .find(|method| method.name.0 == "next")
-                        .is_some_and(|method| method.is_unsafe)
-                {
-                    self.require_unsafe(ctx, "calling an unsafe function", span);
-                }
-                self.result.for_loops.insert(
-                    (ctx.body_id, expr_id),
-                    ForLoopInfo {
-                        into_iter: TraitMethodCall {
-                            trait_id: into_iter_trait,
-                            method: "into_iter".into(),
-                        },
-                        next: TraitMethodCall {
-                            trait_id: iterator_trait,
-                            method: "next".into(),
-                        },
-                        item_ty: item_ty.clone(),
-                        iter_ty: into_iter_ty.clone(),
-                        next_ty,
-                        some_variant,
-                    },
+            if has_into_iter {
+                self.record_for_loop_protocol(
+                    ctx,
+                    expr_id,
+                    (into_iter_trait, iterator_trait),
+                    (&item_ty, &into_iter_ty),
+                    span,
                 );
             }
         } else {
@@ -444,6 +429,56 @@ impl TypeChecker<'_> {
         ctx.pop_scope();
 
         Type::Unit
+    }
+
+    fn record_for_loop_protocol(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        expr_id: ExprId,
+        traits: (TraitId, TraitId),
+        types: (&Type, &Type),
+        span: Option<rowan::TextRange>,
+    ) {
+        let (into_iter_trait, iterator_trait) = traits;
+        let (item_ty, into_iter_ty) = types;
+        let Some((next_ty, some_variant)) =
+            self.iterator_next_protocol(ctx, iterator_trait, item_ty, span)
+        else {
+            return;
+        };
+        if item_ty.is_unknown_like() || into_iter_ty.is_unknown_like() {
+            return;
+        }
+        let into_iter_is_unsafe = self.hir.item_tree.traits[into_iter_trait]
+            .methods
+            .iter()
+            .find(|method| method.name.0 == "into_iter")
+            .is_some_and(|method| method.is_unsafe);
+        let next_is_unsafe = self.hir.item_tree.traits[iterator_trait]
+            .methods
+            .iter()
+            .find(|method| method.name.0 == "next")
+            .is_some_and(|method| method.is_unsafe);
+        if into_iter_is_unsafe || next_is_unsafe {
+            self.require_unsafe(ctx, "calling an unsafe function", span);
+        }
+        self.result.for_loops.insert(
+            (ctx.body_id, expr_id),
+            ForLoopInfo {
+                into_iter: TraitMethodCall {
+                    trait_id: into_iter_trait,
+                    method: "into_iter".into(),
+                },
+                next: TraitMethodCall {
+                    trait_id: iterator_trait,
+                    method: "next".into(),
+                },
+                item_ty: item_ty.clone(),
+                iter_ty: into_iter_ty.clone(),
+                next_ty,
+                some_variant,
+            },
+        );
     }
 
     pub(super) fn iterator_next_protocol(
@@ -486,7 +521,7 @@ impl TypeChecker<'_> {
                         &ctx.generic_params,
                         next.ret_type_range.or(Some(next.name_range)),
                     );
-                    actual.is_unknown_like() || self.bound_types_match(item_ty, &actual)
+                    actual.is_unknown_like() || Self::bound_types_match(item_ty, &actual)
                 }
             }
         });
@@ -535,7 +570,7 @@ impl TypeChecker<'_> {
                 .copied()
                 .or(Some(option.variants[some_variant].name_range)),
         );
-        if !self.bound_types_match(item_ty, &payload_ty) {
+        if !Self::bound_types_match(item_ty, &payload_ty) {
             self.diagnostic(
                 "E0035",
                 "`Option::Some` payload must match `Iterator::Item`",
@@ -639,36 +674,20 @@ impl TypeChecker<'_> {
                 ctx.expr_range(len),
             );
         }
-        let len_value = match &ctx.body.exprs[len] {
-            Expr::IntLiteral { value, .. } => match usize::try_from(*value) {
-                Ok(value) => value,
-                Err(_) => {
-                    self.diagnostic(
-                        "E0002",
-                        "array repeat length must be an integer literal that fits `usize`",
-                        ctx.expr_range(len),
-                    );
-                    0
-                }
-            },
-            _ => {
-                self.diagnostic(
-                    "E0002",
-                    "array repeat length must be an integer literal that fits `usize`",
-                    ctx.expr_range(len),
-                );
-                0
-            }
-        };
+        let len_value = array_repeat_len(&ctx.body.exprs[len]).unwrap_or_else(|| {
+            self.diagnostic(
+                "E0002",
+                "array repeat length must be an integer literal that fits `usize`",
+                ctx.expr_range(len),
+            );
+            0
+        });
         if let Some(expected_len) = expected_len
             && expected_len != len_value
         {
             self.diagnostic(
                 "E0001",
-                format!(
-                    "array length mismatch: expected {}, got {}",
-                    expected_len, len_value
-                ),
+                format!("array length mismatch: expected {expected_len}, got {len_value}"),
                 span,
             );
         }
@@ -697,4 +716,11 @@ impl TypeChecker<'_> {
             }
         }
     }
+}
+
+fn array_repeat_len(expr: &Expr) -> Option<usize> {
+    let Expr::IntLiteral { value, .. } = expr else {
+        return None;
+    };
+    usize::try_from(*value).ok()
 }

@@ -2,8 +2,10 @@ use crate::manifest::{self, CLUE_PROJECT_FILE_NAME};
 use anyhow::{Context, bail};
 use riddlec::pipeline;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Error, ErrorKind, Write};
+use std::hash::BuildHasher;
+use std::io::{self, Error, ErrorKind, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -17,11 +19,21 @@ pub enum ProjectKind {
     ProcMacro,
 }
 
+/// Initializes a project in an existing directory.
+///
+/// # Errors
+///
+/// Returns an error when the directory or project files cannot be created.
 pub fn init(path: &Path, kind: ProjectKind) -> anyhow::Result<()> {
     fs::create_dir_all(path).with_context(|| format!("failed to create `{}`", path.display()))?;
     create(path, kind)
 }
 
+/// Creates a project in a new directory.
+///
+/// # Errors
+///
+/// Returns an error when the destination exists or project files cannot be created.
 pub fn new(path: &Path, kind: ProjectKind) -> anyhow::Result<()> {
     if path.exists() {
         bail!("destination `{}` already exists", path.display());
@@ -93,7 +105,7 @@ fn update_gitignore(path: &Path) -> anyhow::Result<()> {
 }
 
 #[derive(Clone)]
-pub(crate) struct LoadedPackage {
+pub struct LoadedPackage {
     pub root: PathBuf,
     pub name: String,
     pub entry: PathBuf,
@@ -110,7 +122,7 @@ pub(crate) struct LoadedPackage {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProcMacroPackage {
+pub struct ProcMacroPackage {
     pub root: PathBuf,
     pub alias: String,
     pub name: String,
@@ -119,17 +131,17 @@ pub(crate) struct ProcMacroPackage {
     pub manifest_fingerprint: String,
 }
 
-pub(crate) fn load_with_overlays(
+pub fn load_with_overlays<S: BuildHasher>(
     root: &Path,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
 ) -> io::Result<LoadedPackage> {
     load_inner(root, ProjectKind::Binary, overlays, &mut HashSet::new())
 }
 
-fn load_inner(
+fn load_inner<S: BuildHasher>(
     root: &Path,
     kind: ProjectKind,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
     stack: &mut HashSet<PathBuf>,
 ) -> io::Result<LoadedPackage> {
     let root = fs::canonicalize(root)?;
@@ -149,15 +161,7 @@ fn load_inner(
     let mut watched_files = vec![root.join(CLUE_PROJECT_FILE_NAME)];
     let mut manifest_fingerprint = manifest.fingerprint.clone();
     for dependency in &manifest.dependencies {
-        if !is_ident(&dependency.alias) {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "dependency name `{}` must be a valid module name",
-                    dependency.alias
-                ),
-            ));
-        }
+        validate_dependency_alias(&dependency.alias)?;
 
         let dependency_package = load_inner(
             &root.join(&dependency.path),
@@ -197,7 +201,8 @@ fn load_inner(
             source_map: dependency_map,
         } = dependency_package.source;
         files.extend(dependency_files);
-        source.push_str(&format!("mod {} {{\n", dependency.alias));
+        writeln!(source, "mod {} {{", dependency.alias)
+            .expect("writing package source to a String should not fail");
         let dependency_start = source.len();
         source.push_str(&dependency_source);
         source_map.extend(dependency_map, dependency_start);
@@ -243,6 +248,17 @@ fn load_inner(
         watched_files,
         proc_macros,
     })
+}
+
+fn validate_dependency_alias(alias: &str) -> io::Result<()> {
+    if is_ident(alias) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("dependency name `{alias}` must be a valid module name"),
+        ))
+    }
 }
 
 fn is_ident(name: &str) -> bool {

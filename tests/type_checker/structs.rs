@@ -3,7 +3,7 @@ use crate::{check, messages};
 #[test]
 fn checks_struct_literals_and_field_access() {
     let result = check(
-        r#"
+        r"
         struct Point {
             x: i32,
             y: bool,
@@ -13,7 +13,7 @@ fn checks_struct_literals_and_field_access() {
             let p = Point{x: 1, y: false};
             p.x
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -22,14 +22,14 @@ fn checks_struct_literals_and_field_access() {
 #[test]
 fn checks_tuple_field_access() {
     let result = check(
-        r#"
+        r"
         fun first() -> i32 { (1, true).0 }
 
         fun second() -> bool {
             let values = (1, true);
             values.1
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -64,7 +64,7 @@ fn checks_struct_literal_shorthand_and_associated_function_call() {
 #[test]
 fn checks_generic_struct_literals_and_field_access() {
     let result = check(
-        r#"
+        r"
         struct Box<T> {
             value: T,
         }
@@ -73,7 +73,7 @@ fn checks_generic_struct_literals_and_field_access() {
             let b: Box<i32> = Box { value: 1 };
             b.value
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -106,7 +106,7 @@ fn field_access_expected_type_constrains_generic_base() {
 #[test]
 fn infers_associated_function_generics_from_bound_aggregate_fields() {
     let result = check(
-        r#"
+        r"
         struct Inner<K, V> {}
 
         impl<K, V> Inner<K, V> {
@@ -144,7 +144,7 @@ fn infers_associated_function_generics_from_bound_aggregate_fields() {
                 TupleOuter::Value(Inner::new())
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -153,7 +153,7 @@ fn infers_associated_function_generics_from_bound_aggregate_fields() {
 #[test]
 fn checks_generic_impl_receiver_substitution() {
     let result = check(
-        r#"
+        r"
         struct Box<T> {
             value: T,
         }
@@ -168,7 +168,7 @@ fn checks_generic_impl_receiver_substitution() {
             let b: Box<i32> = Box { value: 1 };
             b.get()
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -177,7 +177,7 @@ fn checks_generic_impl_receiver_substitution() {
 #[test]
 fn checks_generic_impl_ref_return_substitution() {
     let result = check(
-        r#"
+        r"
         struct Box<T> {
             value: T,
         }
@@ -192,7 +192,7 @@ fn checks_generic_impl_ref_return_substitution() {
             let b: Box<i32> = Box { value: 1 };
             let value = b.get();
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -201,7 +201,7 @@ fn checks_generic_impl_ref_return_substitution() {
 #[test]
 fn checks_nested_generic_type_args_without_spaces() {
     let result = check(
-        r#"
+        r"
         struct Box<T> {
             value: T,
         }
@@ -210,7 +210,7 @@ fn checks_nested_generic_type_args_without_spaces() {
             let b: Box<Box<Box<i32>>> = Box { value: Box { value: Box { value: 1 } } };
             b.value.value.value
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -219,7 +219,7 @@ fn checks_nested_generic_type_args_without_spaces() {
 #[test]
 fn reports_struct_literal_field_errors() {
     let result = check(
-        r#"
+        r"
         struct Point {
             x: i32,
             y: bool,
@@ -228,7 +228,7 @@ fn reports_struct_literal_field_errors() {
         fun main() {
             Point{x: true, z: 1};
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -243,7 +243,7 @@ fn reports_struct_literal_field_errors() {
 #[test]
 fn reports_invalid_field_access() {
     let result = check(
-        r#"
+        r"
         struct Point {
             x: i32,
         }
@@ -253,7 +253,7 @@ fn reports_invalid_field_access() {
             p.y;
             (1).x;
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -267,7 +267,7 @@ fn reports_invalid_field_access() {
 #[test]
 fn rejects_private_field_access_outside_its_module() {
     let result = check(
-        r#"
+        r"
         mod model {
             pub struct Point {
                 x: i32,
@@ -293,7 +293,7 @@ fn rejects_private_field_access_outside_its_module() {
             let point = model::make();
             point.x + point.y + model::read(&point) + model::nested::read(&point)
         }
-        "#,
+        ",
     );
 
     let private = result
@@ -312,7 +312,7 @@ fn rejects_private_field_access_outside_its_module() {
 #[test]
 fn rejects_private_method_calls_outside_the_defining_module() {
     let result = check(
-        r#"
+        r"
         mod model {
             pub struct Point {}
 
@@ -333,7 +333,7 @@ fn rejects_private_method_calls_outside_the_defining_module() {
             let point = model::make();
             point.secret() + point.shown() + model::inside(&point) + model::nested::inside(&point)
         }
-        "#,
+        ",
     );
 
     let private = result
@@ -352,7 +352,7 @@ fn rejects_private_method_calls_outside_the_defining_module() {
 #[test]
 fn rejects_private_field_in_struct_literal_outside_its_module() {
     let result = check(
-        r#"
+        r"
         mod model {
             pub struct Point {
                 x: i32,
@@ -363,7 +363,7 @@ fn rejects_private_field_in_struct_literal_outside_its_module() {
         fun main() {
             model::Point { x: 1, y: 2 };
         }
-        "#,
+        ",
     );
 
     let private = result
@@ -382,7 +382,7 @@ fn rejects_private_field_in_struct_literal_outside_its_module() {
 #[test]
 fn rejects_private_field_in_struct_pattern_outside_its_module() {
     let result = check(
-        r#"
+        r"
         mod model {
             pub struct Point {
                 x: i32,
@@ -399,7 +399,7 @@ fn rejects_private_field_in_struct_pattern_outside_its_module() {
                 model::Point { x, y } => x + y,
             }
         }
-        "#,
+        ",
     );
 
     let private = result
@@ -418,7 +418,7 @@ fn rejects_private_field_in_struct_pattern_outside_its_module() {
 #[test]
 fn reports_generic_type_arg_count_mismatch() {
     let result = check(
-        r#"
+        r"
         struct Box<T> {
             value: T,
         }
@@ -426,7 +426,7 @@ fn reports_generic_type_arg_count_mismatch() {
         fun main() {
             let b: Box<i32, bool> = Box { value: 1 };
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -439,11 +439,11 @@ fn reports_generic_type_arg_count_mismatch() {
 #[test]
 fn reports_direct_recursive_struct_with_infinite_size() {
     let result = check(
-        r#"
+        r"
         struct KSK {
             x: KSK,
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diag| {
@@ -457,7 +457,7 @@ fn reports_direct_recursive_struct_with_infinite_size() {
 #[test]
 fn reports_indirect_recursive_struct_with_infinite_size() {
     let result = check(
-        r#"
+        r"
         struct A {
             b: B,
         }
@@ -465,7 +465,7 @@ fn reports_indirect_recursive_struct_with_infinite_size() {
         struct B {
             a: A,
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -482,7 +482,7 @@ fn reports_indirect_recursive_struct_with_infinite_size() {
 #[test]
 fn accepts_recursive_struct_behind_indirection() {
     let result = check(
-        r#"
+        r"
         struct Node {
             next: &Node,
         }
@@ -490,7 +490,7 @@ fn accepts_recursive_struct_behind_indirection() {
         struct RawNode {
             next: *const RawNode,
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);

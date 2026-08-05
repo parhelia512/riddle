@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::BuildHasher};
 
 use hir::body::{Expr, ResolvedName};
-use hir::item_tree::FunctionId;
+use hir::item_tree::{FunctionId, HirTrait};
 use lsp_types::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensDelta,
     SemanticTokensEdit, SemanticTokensLegend,
@@ -10,16 +10,22 @@ use riddlec::pipeline::CompileOptions;
 use rowan::{TextRange, TextSize};
 use syntax::SyntaxKind;
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
 use crate::analysis::analyze_standalone_source;
 use crate::{
     analysis::{AnalysisDepth, DocumentAnalysis, analyze_document},
     completion::BUILTIN_TYPES,
     server::Document,
     session::AnalysisSessions,
-    text::{is_identifier_continue, ranges_overlap},
+    text::{is_identifier_continue, ranges_overlap, text_range},
 };
 
+#[must_use]
+/// Computes a semantic-token delta.
+///
+/// # Panics
+///
+/// Panics if token offsets do not fit in the LSP protocol's `u32` fields.
 pub fn semantic_token_delta(
     previous: &[SemanticToken],
     current: &[SemanticToken],
@@ -47,8 +53,9 @@ pub fn semantic_token_delta(
     SemanticTokensDelta {
         result_id: Some(result_id),
         edits: vec![SemanticTokensEdit {
-            start: (prefix * 5) as u32,
-            delete_count: ((previous.len() - prefix - suffix) * 5) as u32,
+            start: u32::try_from(prefix * 5).expect("semantic token offset should fit in u32"),
+            delete_count: u32::try_from((previous.len() - prefix - suffix) * 5)
+                .expect("semantic token edit length should fit in u32"),
             data: Some(current[prefix..replacement_end].to_vec()),
         }],
     }
@@ -75,7 +82,7 @@ pub const MOD_MUTABLE: u32 = 1 << 1;
 pub const MOD_STATIC: u32 = 1 << 2;
 pub const MOD_DEFAULT_LIBRARY: u32 = 1 << 3;
 
-pub(crate) fn semantic_tokens_legend() -> SemanticTokensLegend {
+pub fn semantic_tokens_legend() -> SemanticTokensLegend {
     SemanticTokensLegend {
         token_types: vec![
             SemanticTokenType::KEYWORD,
@@ -104,12 +111,14 @@ pub(crate) fn semantic_tokens_legend() -> SemanticTokensLegend {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
 pub fn semantic_tokens_for_source(source: &str) -> SemanticTokens {
     semantic_tokens_for_source_with_options(source, CompileOptions { use_std: false }, false)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
 pub fn semantic_tokens_for_source_with_options(
     source: &str,
     compile_options: CompileOptions,
@@ -125,9 +134,14 @@ pub fn semantic_tokens_for_source_with_options(
     semantic_tokens_from_analysis(source, &analysis, default_library_source)
 }
 
-pub fn semantic_tokens_for_document(
+/// Computes semantic tokens for an open document.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn semantic_tokens_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     options: CompileOptions,
     sessions: &AnalysisSessions,
 ) -> std::result::Result<SemanticTokens, String> {
@@ -161,10 +175,7 @@ fn semantic_tokens_from_analysis(
             continue;
         }
         raw_tokens.push(RawSemanticToken {
-            range: TextRange::new(
-                (token.span.start as u32).into(),
-                (token.span.end as u32).into(),
-            ),
+            range: text_range(token.span.start, token.span.end),
             token_type,
             token_modifiers_bitset,
             resolved: false,
@@ -223,8 +234,6 @@ fn collect_hir_symbol_tokens(
 ) {
     let user_source_len = analysis.source.len();
     let mut symbol_types = HashMap::new();
-    let mut method_modifiers = HashMap::new();
-    let mut function_modifiers = HashMap::new();
 
     for (_, item) in hir.item_tree.structs.iter() {
         let in_source = analysis.local_range(item.name_range).is_some();
@@ -290,33 +299,85 @@ fn collect_hir_symbol_tokens(
                 .entry(item.name.0.as_str())
                 .or_insert((TOKEN_INTERFACE, modifiers));
         }
-        for method in &item.methods {
-            if let Some(method_range) = analysis.local_range(method.name_range) {
-                let mut modifiers = MOD_DECLARATION;
-                if method
-                    .params
-                    .first()
-                    .is_none_or(|param| param.name.0 != "self")
-                {
-                    modifiers |= MOD_STATIC;
-                }
-                if default_library_source {
-                    modifiers |= MOD_DEFAULT_LIBRARY;
-                }
-                out.push(RawSemanticToken {
-                    range: method_range,
-                    token_type: TOKEN_METHOD,
-                    token_modifiers_bitset: modifiers,
-                    resolved: true,
-                });
-            }
-        }
+        collect_trait_method_tokens(item, analysis, default_library_source, out);
     }
+    let method_modifiers =
+        collect_method_symbol_tokens(hir, analysis, default_library_source, user_source_len, out);
+    collect_named_symbol_tokens(tokens, document_source, &symbol_types, out);
+
+    let function_modifiers = collect_function_symbol_tokens(
+        hir,
+        analysis,
+        default_library_source,
+        user_source_len,
+        &method_modifiers,
+        out,
+    );
+    collect_body_symbol_tokens(hir, analysis, &method_modifiers, &function_modifiers, out);
+}
+
+fn collect_trait_method_tokens(
+    item: &HirTrait,
+    analysis: &DocumentAnalysis,
+    default_library_source: bool,
+    out: &mut Vec<RawSemanticToken>,
+) {
+    for method in &item.methods {
+        let Some(range) = analysis.local_range(method.name_range) else {
+            continue;
+        };
+        let mut modifiers = MOD_DECLARATION;
+        if method
+            .params
+            .first()
+            .is_none_or(|param| param.name.0 != "self")
+        {
+            modifiers |= MOD_STATIC;
+        }
+        if default_library_source {
+            modifiers |= MOD_DEFAULT_LIBRARY;
+        }
+        out.push(RawSemanticToken {
+            range,
+            token_type: TOKEN_METHOD,
+            token_modifiers_bitset: modifiers,
+            resolved: true,
+        });
+    }
+}
+
+fn collect_named_symbol_tokens(
+    tokens: &[frontend::lexer::Token],
+    document_source: &str,
+    symbol_types: &HashMap<&str, (u32, u32)>,
+    out: &mut Vec<RawSemanticToken>,
+) {
+    for token in tokens {
+        let Some(&(token_type, token_modifiers_bitset)) =
+            symbol_types.get(token.text(document_source))
+        else {
+            continue;
+        };
+        out.push(RawSemanticToken {
+            range: text_range(token.span.start, token.span.end),
+            token_type,
+            token_modifiers_bitset,
+            resolved: false,
+        });
+    }
+}
+
+fn collect_method_symbol_tokens(
+    hir: &hir::HirFile,
+    analysis: &DocumentAnalysis,
+    default_library_source: bool,
+    user_source_len: usize,
+    out: &mut Vec<RawSemanticToken>,
+) -> HashMap<FunctionId, u32> {
+    let mut method_modifiers = HashMap::new();
     for (_, item) in hir.item_tree.impls.iter() {
         for method_id in &item.methods {
             let method = &hir.item_tree.functions[*method_id];
-            let method_range = analysis.local_range(method.name_range);
-            let in_source = method_range.is_some();
             let mut modifiers = 0;
             if method
                 .params
@@ -329,9 +390,9 @@ fn collect_hir_symbol_tokens(
                 modifiers |= MOD_DEFAULT_LIBRARY;
             }
             method_modifiers.insert(*method_id, modifiers);
-            if in_source {
+            if let Some(range) = analysis.local_range(method.name_range) {
                 out.push(RawSemanticToken {
-                    range: method_range.unwrap(),
+                    range,
                     token_type: TOKEN_METHOD,
                     token_modifiers_bitset: MOD_DECLARATION | modifiers,
                     resolved: true,
@@ -339,23 +400,18 @@ fn collect_hir_symbol_tokens(
             }
         }
     }
-    for token in tokens {
-        let Some(&(token_type, token_modifiers_bitset)) =
-            symbol_types.get(token.text(document_source))
-        else {
-            continue;
-        };
-        out.push(RawSemanticToken {
-            range: TextRange::new(
-                (token.span.start as u32).into(),
-                (token.span.end as u32).into(),
-            ),
-            token_type,
-            token_modifiers_bitset,
-            resolved: false,
-        });
-    }
+    method_modifiers
+}
 
+fn collect_function_symbol_tokens(
+    hir: &hir::HirFile,
+    analysis: &DocumentAnalysis,
+    default_library_source: bool,
+    user_source_len: usize,
+    method_modifiers: &HashMap<FunctionId, u32>,
+    out: &mut Vec<RawSemanticToken>,
+) -> HashMap<FunctionId, u32> {
+    let mut function_modifiers = HashMap::new();
     for (function_id, function) in hir.item_tree.functions.iter() {
         let function_range = analysis.local_range(function.name_range);
         let in_source = function_range.is_some();
@@ -389,6 +445,16 @@ fn collect_hir_symbol_tokens(
         }
     }
 
+    function_modifiers
+}
+
+fn collect_body_symbol_tokens(
+    hir: &hir::HirFile,
+    analysis: &DocumentAnalysis,
+    method_modifiers: &HashMap<FunctionId, u32>,
+    function_modifiers: &HashMap<FunctionId, u32>,
+    out: &mut Vec<RawSemanticToken>,
+) {
     for (_, body) in hir.bodies.iter() {
         for (pat_id, pat) in body.pats.iter() {
             let hir::body::Pattern::Binding { name, is_mut: true } = pat else {
@@ -452,8 +518,8 @@ fn collect_hir_symbol_tokens(
             let Some((token_type, token_modifiers_bitset)) = semantic_token_for_resolution(
                 body,
                 resolved.as_ref(),
-                &method_modifiers,
-                &function_modifiers,
+                method_modifiers,
+                function_modifiers,
             ) else {
                 continue;
             };
@@ -484,16 +550,15 @@ fn semantic_token_for_resolution(
         Some(ResolvedName::Param(_) | ResolvedName::LambdaParam { .. }) => {
             Some((TOKEN_PARAMETER, 0))
         }
-        Some(ResolvedName::Function(function_id)) => {
-            if let Some(modifiers) = method_modifiers.get(function_id) {
-                Some((TOKEN_METHOD, *modifiers))
-            } else {
+        Some(ResolvedName::Function(function_id)) => method_modifiers.get(function_id).map_or_else(
+            || {
                 Some((
                     TOKEN_FUNCTION,
                     function_modifiers.get(function_id).copied().unwrap_or(0),
                 ))
-            }
-        }
+            },
+            |modifiers| Some((TOKEN_METHOD, *modifiers)),
+        ),
         Some(ResolvedName::Struct(_)) => Some((TOKEN_STRUCT, 0)),
         Some(ResolvedName::Enum(_) | ResolvedName::EnumVariant(_, _)) => Some((TOKEN_ENUM, 0)),
         Some(ResolvedName::Trait(_)) => Some((TOKEN_INTERFACE, 0)),
@@ -511,7 +576,7 @@ fn trim_source_range(source: &str, range: TextRange) -> Option<TextRange> {
     let start = start + text.len() - text.trim_start().len();
     let end = end - (text.len() - text.trim_end().len());
 
-    (start < end).then(|| TextRange::new((start as u32).into(), (end as u32).into()))
+    (start < end).then(|| text_range(start, end))
 }
 
 fn last_identifier_range(source: &str, range: TextRange) -> Option<TextRange> {
@@ -524,7 +589,7 @@ fn last_identifier_range(source: &str, range: TextRange) -> Option<TextRange> {
         .take_while(|ch| is_identifier_continue(*ch))
         .map(char::len_utf8)
         .sum::<usize>();
-    (length > 0).then(|| TextRange::new(((end - length) as u32).into(), (end as u32).into()))
+    (length > 0).then(|| text_range(end - length, end))
 }
 
 fn remove_overlapping_tokens(raw_tokens: Vec<RawSemanticToken>) -> Vec<RawSemanticToken> {
@@ -592,7 +657,7 @@ fn remove_overlapping_tokens(raw_tokens: Vec<RawSemanticToken>) -> Vec<RawSemant
     kept_preferred
 }
 
-fn preferred_token_priority(
+const fn preferred_token_priority(
     token: &RawSemanticToken,
 ) -> (bool, bool, std::cmp::Reverse<TextSize>, u32) {
     (
@@ -630,12 +695,14 @@ fn encode_semantic_tokens(source: &str, raw_tokens: Vec<RawSemanticToken>) -> Se
                 line += 1;
                 character = 0;
             } else {
-                character += ch.len_utf16() as u32;
+                character +=
+                    u32::try_from(ch.len_utf16()).expect("a char uses at most two UTF-16 units");
             }
         }
         cursor = start_offset;
 
-        let length = text.chars().map(char::len_utf16).sum::<usize>() as u32;
+        let length = u32::try_from(text.chars().map(char::len_utf16).sum::<usize>())
+            .expect("semantic token length should fit in u32");
         let delta_line = line - prev_line;
         let delta_start = if delta_line == 0 {
             character - prev_start
@@ -692,8 +759,8 @@ fn ident_token_type(tokens: &[frontend::lexer::Token], index: usize, source: &st
         Some(SyntaxKind::Struct) => Some(TOKEN_STRUCT),
         Some(SyntaxKind::Enum) => Some(TOKEN_ENUM),
         Some(SyntaxKind::Trait) => Some(TOKEN_INTERFACE),
-        Some(SyntaxKind::Mod) | Some(SyntaxKind::Use) => Some(TOKEN_NAMESPACE),
-        Some(SyntaxKind::TypeKw) | Some(SyntaxKind::Impl) => Some(TOKEN_TYPE),
+        Some(SyntaxKind::Mod | SyntaxKind::Use) => Some(TOKEN_NAMESPACE),
+        Some(SyntaxKind::TypeKw | SyntaxKind::Impl) => Some(TOKEN_TYPE),
         Some(SyntaxKind::Dot) => {
             if next == Some(SyntaxKind::LParen) {
                 Some(TOKEN_METHOD)
@@ -727,10 +794,10 @@ fn next_significant(
 }
 
 fn token_starts_uppercase(text: &str) -> bool {
-    text.chars().next().map(char::is_uppercase).unwrap_or(false)
+    text.chars().next().is_some_and(char::is_uppercase)
 }
 
-fn is_keyword(kind: SyntaxKind) -> bool {
+const fn is_keyword(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         SyntaxKind::Let
@@ -768,7 +835,7 @@ fn is_keyword(kind: SyntaxKind) -> bool {
     )
 }
 
-fn is_operator(kind: SyntaxKind) -> bool {
+const fn is_operator(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         SyntaxKind::Arrow

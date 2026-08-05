@@ -1,4 +1,7 @@
-use std::hash::{Hash, Hasher};
+use std::{
+    fmt::Write as _,
+    hash::{Hash, Hasher},
+};
 
 use la_arena::{Arena, Idx};
 use rowan::TextRange;
@@ -51,8 +54,9 @@ pub enum Visibility {
 }
 
 impl Visibility {
-    pub fn is_public(&self) -> bool {
-        matches!(self, Visibility::Public)
+    #[must_use]
+    pub const fn is_public(&self) -> bool {
+        matches!(self, Self::Public)
     }
 }
 
@@ -311,18 +315,18 @@ pub enum PathAnchor {
 pub enum HirTypeRef {
     Named(HirPath),
     Never,
-    Ref(Box<HirTypeRef>, bool), // (inner, mutable)
+    Ref(Box<Self>, bool), // (inner, mutable)
     /// Raw pointer type: `*const T` or `*mut T`.
     Ptr {
         mutable: bool,
-        inner: Box<HirTypeRef>,
+        inner: Box<Self>,
     },
-    Tuple(Vec<HirTypeRef>),
-    Slice(Box<HirTypeRef>),
-    Array(Box<HirTypeRef>, HirConstArg),
+    Tuple(Vec<Self>),
+    Slice(Box<Self>),
+    Array(Box<Self>, HirConstArg),
     Const(HirConstArg),
     ImplTrait {
-        trait_ty: Box<HirTypeRef>,
+        trait_ty: Box<Self>,
         trait_range: TextRange,
         callable: Option<HirCallableSignature>,
         hidden: Option<Name>,
@@ -389,6 +393,7 @@ impl HirPath {
         s
     }
 
+    #[must_use]
     pub fn type_args_for_segment(&self, index: usize) -> &[HirTypeRef] {
         self.segment_type_args
             .iter()
@@ -397,6 +402,7 @@ impl HirPath {
     }
 
     /// `crate`, `super`, `self`, and `::xxx` are all considered non-pure simple names.
+    #[must_use]
     pub fn as_single_name(&self) -> Option<&Name> {
         if matches!(self.anchor, PathAnchor::Plain) && self.segments.len() == 1 {
             Some(&self.segments[0])
@@ -409,28 +415,28 @@ impl HirPath {
 impl HirTypeRef {
     pub fn display(&self) -> String {
         match self {
-            HirTypeRef::Named(path) => path.display(),
-            HirTypeRef::Never => "!".to_string(),
-            HirTypeRef::Ref(inner, mutable) => {
+            Self::Named(path) => path.display(),
+            Self::Never => "!".to_string(),
+            Self::Ref(inner, mutable) => {
                 let kw = if *mutable { "&mut " } else { "&" };
                 format!("{}{}", kw, inner.display())
             }
-            HirTypeRef::Ptr { mutable, inner } => {
+            Self::Ptr { mutable, inner } => {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", inner.display())
             }
-            HirTypeRef::Tuple(elements) => {
+            Self::Tuple(elements) => {
                 let inner = elements
                     .iter()
-                    .map(HirTypeRef::display)
+                    .map(Self::display)
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({inner})")
             }
-            HirTypeRef::Slice(inner) => format!("[{}]", inner.display()),
-            HirTypeRef::Array(inner, len) => format!("[{}; {}]", inner.display(), len.display()),
-            HirTypeRef::Const(value) => value.display(),
-            HirTypeRef::ImplTrait {
+            Self::Slice(inner) => format!("[{}]", inner.display()),
+            Self::Array(inner, len) => format!("[{}; {}]", inner.display(), len.display()),
+            Self::Const(value) => value.display(),
+            Self::ImplTrait {
                 trait_ty, callable, ..
             } => {
                 let mut display = format!("impl {}", trait_ty.display());
@@ -438,26 +444,28 @@ impl HirTypeRef {
                     let params = signature
                         .params
                         .iter()
-                        .map(HirTypeRef::display)
+                        .map(Self::display)
                         .collect::<Vec<_>>()
                         .join(", ");
-                    display.push_str(&format!("({params}) -> {}", signature.ret.display()));
+                    write!(display, "({params}) -> {}", signature.ret.display())
+                        .expect("writing to a String cannot fail");
                 }
                 display
             }
-            HirTypeRef::Unknown => "_".to_string(),
-            HirTypeRef::Error => "<error>".to_string(),
+            Self::Unknown => "_".to_string(),
+            Self::Error => "<error>".to_string(),
         }
     }
 }
 
 impl HirConstArg {
+    #[must_use]
     pub fn display(&self) -> String {
         match self {
-            HirConstArg::Value(value) => value.to_string(),
-            HirConstArg::Param(name) => name.0.clone(),
-            HirConstArg::Unknown => "_".to_string(),
-            HirConstArg::Error => "<error>".to_string(),
+            Self::Value(value) => value.to_string(),
+            Self::Param(name) => name.0.clone(),
+            Self::Unknown => "_".to_string(),
+            Self::Error => "<error>".to_string(),
         }
     }
 }

@@ -13,7 +13,7 @@ mod tests {
     fn accepts_rust_style_explicit_generic_calls() {
         let mut parser = IncrementalParser::new();
         let parse = parser.set_source(
-            r#"
+            r"
             fun f<T>(x: T) {
                 g::<T>(x);
                 crate::g::<T>(x);
@@ -22,7 +22,7 @@ mod tests {
                 crate::collections::Vector::<i32>::new();
                 Vector::<i32>::convert::<u32>();
             }
-            "#,
+            ",
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
@@ -32,10 +32,10 @@ mod tests {
     fn rejects_legacy_explicit_generic_call_syntax() {
         let mut parser = IncrementalParser::new();
         let parse = parser.set_source(
-            r#"
+            r"
             fun id<T>(value: T) -> T { value }
             fun main() { id<i32>(1); }
-            "#,
+            ",
         );
 
         assert!(!parse.errors.is_empty());
@@ -45,7 +45,7 @@ mod tests {
     fn accepts_callable_bounds_move_lambdas_and_mutable_parameters() {
         let mut parser = IncrementalParser::new();
         let parse = parser.set_source(
-            r#"
+            r"
             fun apply(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
                 f(value)
             }
@@ -56,7 +56,7 @@ mod tests {
                     value
                 };
             }
-            "#,
+            ",
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
@@ -101,13 +101,13 @@ mod tests {
     fn parses_function_like_macro_calls_in_supported_positions() {
         let mut parser = IncrementalParser::new();
         let parse = parser.set_source(
-            r#"
+            r"
             make_item!();
             fun value(input: make_type!()) -> make_type!() {
                 let make_pattern!() = make_expr!();
                 make_expr!()
             }
-            "#,
+            ",
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
@@ -125,13 +125,13 @@ mod tests {
     fn block_statement_ends_before_following_prefix_dereference() {
         let mut parser = IncrementalParser::new();
         let parse = parser.set_source(
-            r#"
+            r"
             fun main() {
                 let mut value = 0;
                 while false {}
                 *value = 1;
             }
-            "#,
+            ",
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
@@ -149,14 +149,14 @@ mod tests {
     fn parses_tuple_field_access() {
         let mut parser = IncrementalParser::new();
         let parse = parser.set_source(
-            r#"
+            r"
             fun main() {
                 let values = (1, true);
                 values.0;
                 values.1;
                 values.0.value;
             }
-            "#,
+            ",
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);

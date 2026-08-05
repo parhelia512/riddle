@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
 
 use escape_analysis::EscapeResult;
 use hir::{
@@ -18,9 +18,9 @@ use type_checker::{
 
 use crate::builder::Builder;
 use crate::func::Function;
-use crate::instr::*;
+use crate::instr::{BinOp, CastOp, CmpOp, Inst, InstKind, UnOp};
 use crate::module::Module;
-use crate::types::*;
+use crate::types::{EnumVariantKind, FloatTy, FnPtrType, IntTy, StructType, Type};
 use crate::value::{BlockId, FuncRef, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +35,12 @@ enum BuiltinOperator {
 /// `analysis` determines whether each local variable escapes its scope;
 /// non-escaping locals can be stack-allocated, while escaping ones require
 /// GC-managed heap allocation in GC'd backends.
-pub fn lower_hir(
+#[must_use]
+pub fn lower_hir<S: BuildHasher>(
     hir: &HirFile,
     type_result: &TypeCheckResult,
     escape_result: &EscapeResult,
-    moved_exprs: &HashSet<(BodyId, ExprId)>,
+    moved_exprs: &HashSet<(BodyId, ExprId), S>,
     gc_enabled: bool,
 ) -> Module {
     let method_impls = hir
@@ -68,7 +69,7 @@ pub fn lower_hir(
         hir,
         type_result,
         analysis: escape_result,
-        moved_exprs,
+        moved_exprs: moved_exprs.iter().copied().collect(),
         gc_enabled,
         module: Module::new("main"),
         method_impls,
@@ -110,8 +111,7 @@ pub fn lower_hir(
             || !func.const_generics.is_empty()
             || ctx
                 .impl_for_method(fid)
-                .map(|imp| !imp.generics.is_empty() || !imp.const_generics.is_empty())
-                .unwrap_or(false)
+                .is_some_and(|imp| !imp.generics.is_empty() || !imp.const_generics.is_empty())
         {
             continue;
         }
@@ -141,8 +141,7 @@ pub fn lower_hir(
         let ret_type = func
             .ret_type
             .as_ref()
-            .map(|rt| ctx.convert_hir_type(rt))
-            .unwrap_or(Type::Unit);
+            .map_or(Type::Unit, |rt| ctx.convert_hir_type(rt));
         ctx.module.add_extern(name.clone(), params, ret_type);
     }
 
@@ -153,13 +152,13 @@ struct LowerCtx<'a> {
     hir: &'a HirFile,
     type_result: &'a TypeCheckResult,
     analysis: &'a EscapeResult,
-    moved_exprs: &'a HashSet<(BodyId, ExprId)>,
+    moved_exprs: HashSet<(BodyId, ExprId)>,
     gc_enabled: bool,
     module: Module,
     method_impls: HashMap<hir::item_tree::FunctionId, hir::item_tree::ImplId>,
     default_methods: HashMap<hir::item_tree::FunctionId, hir::item_tree::TraitId>,
     expr_cache: HashMap<ExprId, Value>,
-    /// The BodyId currently being lowered, used to look up expr_types.
+    /// The `BodyId` currently being lowered, used to look up `expr_types`.
     current_body: Option<BodyId>,
     current_function: Option<hir::item_tree::FunctionId>,
     /// Maps a `let` binding → its Value (or storage pointer, see below).
@@ -219,6 +218,21 @@ enum LetSource {
     Value(Value),
 }
 
+struct LetStorage {
+    root: PatternBindingId,
+    value: Value,
+    value_ty: type_checker::Type,
+    needs_drop: bool,
+    delayed: bool,
+}
+
+struct LetPatternInput<'a> {
+    pat: PatId,
+    source: LetSource,
+    value_ty: &'a type_checker::Type,
+    projection: Vec<DropProjection>,
+}
+
 #[derive(Clone)]
 struct PatternBindingValue {
     value: Value,
@@ -228,8 +242,16 @@ struct PatternBindingValue {
     projection: Vec<DropProjection>,
 }
 
+struct MatchBindingInput<'a> {
+    pat: PatId,
+    value: Value,
+    place: Option<Value>,
+    value_ty: &'a type_checker::Type,
+    projection: Vec<DropProjection>,
+}
+
 impl PatternBindingValue {
-    fn direct(
+    const fn direct(
         value: Value,
         ty: Type,
         tc_ty: type_checker::Type,
@@ -254,11 +276,99 @@ struct LoopTargets {
     temporary_drop_depth: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ForExprInput<'a> {
+    param_values: &'a [Value],
+    body: &'a Body,
+    expr_id: ExprId,
+    pat: PatId,
+    iterable: ExprId,
+    loop_body: ExprId,
+}
+
+struct ExprLoweringInput<'a> {
+    param_values: &'a [Value],
+    body: &'a Body,
+    expr_id: ExprId,
+    tc_type: Option<&'a type_checker::Type>,
+    mir_type: &'a Type,
+    diverges: bool,
+}
+
+struct LambdaExprInput<'a> {
+    body_id: BodyId,
+    expr_id: ExprId,
+    params: &'a [hir::body::LambdaParam],
+    body: ExprId,
+    ty: &'a Type,
+}
+
+struct LambdaFunctionInput<'a> {
+    body_id: BodyId,
+    expr_id: ExprId,
+    params: &'a [hir::body::LambdaParam],
+    body: ExprId,
+    name: &'a str,
+    call_signature: &'a FnPtrType,
+    info: &'a LambdaInfo,
+    capture_types: &'a [Type],
+    env_struct: &'a StructType,
+}
+
 #[derive(Default)]
 struct MirSubst {
     types: HashMap<String, Type>,
     tc_types: HashMap<String, type_checker::Type>,
     consts: HashMap<String, usize>,
+}
+
+struct LoweringState {
+    expr_cache: HashMap<ExprId, Value>,
+    scope_map: HashMap<PatternBindingId, Value>,
+    drop_scopes: Vec<Vec<DropSlot>>,
+    drop_slots: HashMap<CaptureSource, Vec<DropSlot>>,
+    temporary_drop_scopes: Vec<Vec<DropSlot>>,
+    temporary_drop_slots: HashMap<ExprId, Vec<DropSlot>>,
+    storage_bindings: HashSet<PatternBindingId>,
+    parameter_storage: HashMap<CaptureSource, Value>,
+    pattern_bindings: Vec<HashMap<PatternBindingId, PatternBindingValue>>,
+    capture_access: HashMap<CapturePlace, CaptureAccess>,
+    current_lambda: Option<ExprId>,
+    current_body: Option<BodyId>,
+}
+
+impl LowerCtx<'_> {
+    fn take_lowering_state(&mut self) -> LoweringState {
+        LoweringState {
+            expr_cache: std::mem::take(&mut self.expr_cache),
+            scope_map: std::mem::take(&mut self.scope_map),
+            drop_scopes: std::mem::take(&mut self.drop_scopes),
+            drop_slots: std::mem::take(&mut self.drop_slots),
+            temporary_drop_scopes: std::mem::take(&mut self.temporary_drop_scopes),
+            temporary_drop_slots: std::mem::take(&mut self.temporary_drop_slots),
+            storage_bindings: std::mem::take(&mut self.storage_bindings),
+            parameter_storage: std::mem::take(&mut self.parameter_storage),
+            pattern_bindings: std::mem::take(&mut self.pattern_bindings),
+            capture_access: std::mem::take(&mut self.capture_access),
+            current_lambda: self.current_lambda,
+            current_body: self.current_body,
+        }
+    }
+
+    fn restore_lowering_state(&mut self, state: LoweringState) {
+        self.expr_cache = state.expr_cache;
+        self.scope_map = state.scope_map;
+        self.drop_scopes = state.drop_scopes;
+        self.drop_slots = state.drop_slots;
+        self.temporary_drop_scopes = state.temporary_drop_scopes;
+        self.temporary_drop_slots = state.temporary_drop_slots;
+        self.storage_bindings = state.storage_bindings;
+        self.parameter_storage = state.parameter_storage;
+        self.pattern_bindings = state.pattern_bindings;
+        self.capture_access = state.capture_access;
+        self.current_lambda = state.current_lambda;
+        self.current_body = state.current_body;
+    }
 }
 
 enum TypePattern {
@@ -337,7 +447,7 @@ fn mono_name_from_parts(base: &str, args: &[String]) -> String {
     format!("{}_{}", base, args.join("_"))
 }
 
-fn tc_const_arg_to_usize(ty: &type_checker::Type) -> Option<usize> {
+const fn tc_const_arg_to_usize(ty: &type_checker::Type) -> Option<usize> {
     match ty {
         type_checker::Type::Const(value) => value.as_usize(),
         _ => None,
@@ -346,8 +456,8 @@ fn tc_const_arg_to_usize(ty: &type_checker::Type) -> Option<usize> {
 
 fn mono_type_name(ty: &Type) -> String {
     match ty {
-        Type::Int(i) => format!("{:?}", i).to_ascii_lowercase(),
-        Type::Float(f) => format!("{:?}", f).to_ascii_lowercase(),
+        Type::Int(i) => format!("{i:?}").to_ascii_lowercase(),
+        Type::Float(f) => format!("{f:?}").to_ascii_lowercase(),
         Type::Bool => "bool".into(),
         Type::Str => "str".into(),
         Type::Char => "char".into(),
@@ -441,11 +551,8 @@ fn builtin_operator_supports(op: BuiltinOperator, scalar: &str) -> bool {
     let float = matches!(scalar, "f32" | "f64");
     let signed = matches!(scalar, "i8" | "i16" | "i32" | "i64" | "isize");
     match op {
-        BuiltinOperator::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
-        | BuiltinOperator::Assign(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => {
-            integer || float
-        }
-        BuiltinOperator::Binary(BinOp::Mod) | BuiltinOperator::Assign(BinOp::Mod) => {
+        BuiltinOperator::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
+        | BuiltinOperator::Assign(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) => {
             integer || float
         }
         BuiltinOperator::Unary(UnOp::Neg) => signed || float,
@@ -595,20 +702,18 @@ fn returns_unit(function: &hir::item_tree::HirFunction) -> bool {
     )
 }
 
-fn convert_binop(op: &HirBinOp) -> BinOp {
+fn convert_binop(op: HirBinOp) -> BinOp {
     match op {
         HirBinOp::Add => BinOp::Add,
         HirBinOp::Sub => BinOp::Sub,
         HirBinOp::Mul => BinOp::Mul,
         HirBinOp::Div => BinOp::Div,
         HirBinOp::Mod => BinOp::Mod,
-        HirBinOp::BitAnd => BinOp::BitAnd,
-        HirBinOp::BitOr => BinOp::BitOr,
+        HirBinOp::BitAnd | HirBinOp::And => BinOp::BitAnd,
+        HirBinOp::BitOr | HirBinOp::Or => BinOp::BitOr,
         HirBinOp::BitXor => BinOp::BitXor,
         HirBinOp::Shl => BinOp::Shl,
         HirBinOp::Shr => BinOp::Shr,
-        HirBinOp::And => BinOp::BitAnd,
-        HirBinOp::Or => BinOp::BitOr,
         // comparison/assign should be handled before reaching here
         HirBinOp::Eq
         | HirBinOp::Neq
@@ -630,7 +735,7 @@ fn convert_binop(op: &HirBinOp) -> BinOp {
     }
 }
 
-fn convert_cmp_op(op: &HirBinOp) -> CmpOp {
+fn convert_cmp_op(op: HirBinOp) -> CmpOp {
     match op {
         HirBinOp::Eq => CmpOp::Eq,
         HirBinOp::Neq => CmpOp::Neq,
@@ -667,7 +772,7 @@ fn convert_cmp_op(op: &HirBinOp) -> CmpOp {
     }
 }
 
-fn comparison_trait(op: &HirBinOp) -> Option<(&'static str, &'static str)> {
+const fn comparison_trait(op: HirBinOp) -> Option<(&'static str, &'static str)> {
     Some(match op {
         HirBinOp::Eq => ("partial_eq", "eq"),
         HirBinOp::Neq => ("partial_eq", "ne"),
@@ -680,7 +785,7 @@ fn comparison_trait(op: &HirBinOp) -> Option<(&'static str, &'static str)> {
 }
 
 fn builtin_comparison_types(
-    op: &HirBinOp,
+    op: HirBinOp,
     lhs: &type_checker::Type,
     rhs: &type_checker::Type,
 ) -> bool {
@@ -736,7 +841,7 @@ fn builtin_comparison_types(
     }
 }
 
-fn convert_unop(op: &HirUnOp) -> UnOp {
+fn convert_unop(op: HirUnOp) -> UnOp {
     match op {
         HirUnOp::Neg => UnOp::Neg,
         HirUnOp::Not => UnOp::Not,
@@ -752,7 +857,6 @@ fn parse_int_suffix(suffix: Option<&str>) -> IntTy {
     match suffix {
         Some("i8") => IntTy::I8,
         Some("i16") => IntTy::I16,
-        Some("i32") => IntTy::I32,
         Some("i64") => IntTy::I64,
         Some("isize") => IntTy::Isize,
         Some("u8") => IntTy::U8,
@@ -767,22 +871,7 @@ fn parse_int_suffix(suffix: Option<&str>) -> IntTy {
 fn parse_float_suffix(suffix: Option<&str>) -> FloatTy {
     match suffix {
         Some("f32") => FloatTy::F32,
-        Some("f64") => FloatTy::F64,
         _ => FloatTy::F64, // 默认 f64
-    }
-}
-
-/// Extract the function name from a call's callee expression.
-fn callee_name(body: &Body, callee: ExprId) -> String {
-    match &body.exprs[callee] {
-        Expr::Path { path, .. } => {
-            // 路径最后一段即为函数名
-            path.segments
-                .last()
-                .map(|s| s.0.clone())
-                .unwrap_or_else(|| "unknown".into())
-        }
-        _ => "unknown".into(),
     }
 }
 
@@ -867,12 +956,11 @@ fn resolve_field_index(
 fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
     match (source, target) {
         (Type::Int(IntTy::U8), Type::Char) => CastOp::IntToChar,
-        (Type::Int(_), Type::Int(_)) => CastOp::IntToInt,
+        (Type::Int(_) | Type::Char, Type::Int(_)) => CastOp::IntToInt,
         (Type::Int(_), Type::Float(_)) => CastOp::IntToFloat,
         (Type::Float(_), Type::Int(_)) => CastOp::FloatToInt,
         (Type::Float(_), Type::Float(_)) => CastOp::FloatToFloat,
         (Type::Bool, Type::Int(_)) => CastOp::BoolToInt,
-        (Type::Char, Type::Int(_)) => CastOp::IntToInt,
         (Type::Int(_), Type::Bool) => CastOp::IntToBool,
         (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
         (Type::Ref(source, _), Type::Ptr(target)) if source == target => CastOp::PtrToPtr,

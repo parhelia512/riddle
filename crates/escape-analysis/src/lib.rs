@@ -31,35 +31,43 @@ pub struct EscapeResult {
 }
 
 impl EscapeResult {
+    #[must_use]
     pub fn escapes(&self, body_id: BodyId, binding: PatternBindingId) -> bool {
         self.escaping_locals.contains(&(body_id, binding))
     }
 
+    #[must_use]
     pub fn temporary_escapes(&self, body_id: BodyId, expr: ExprId) -> bool {
         self.escaping_temporaries.contains(&(body_id, expr))
     }
 
+    #[must_use]
     pub fn param_escapes(&self, body_id: BodyId, index: usize) -> bool {
         self.escaping_params.contains(&(body_id, index))
     }
 
+    #[must_use]
     pub fn lambda_param_escapes(&self, body_id: BodyId, lambda: ExprId, index: usize) -> bool {
         self.escaping_lambda_params
             .contains(&(body_id, lambda, index))
     }
 
+    #[must_use]
     pub fn lambda_escapes(&self, body_id: BodyId, lambda: ExprId) -> bool {
         self.escaping_lambdas.contains(&(body_id, lambda))
     }
 
+    #[must_use]
     pub fn local_needs_address(&self, body_id: BodyId, binding: PatternBindingId) -> bool {
         self.address_taken_locals.contains(&(body_id, binding))
     }
 
+    #[must_use]
     pub fn param_needs_address(&self, body_id: BodyId, index: usize) -> bool {
         self.address_taken_params.contains(&(body_id, index))
     }
 
+    #[must_use]
     pub fn lambda_param_needs_address(
         &self,
         body_id: BodyId,
@@ -70,6 +78,7 @@ impl EscapeResult {
             .contains(&(body_id, lambda, index))
     }
 
+    #[must_use]
     pub fn reference_escape_diagnostics(&self, hir: &HirFile) -> Vec<Diagnostic> {
         let mut ranges = Vec::new();
         for (body_id, binding) in &self.lifetime_escaping_locals {
@@ -152,9 +161,11 @@ impl EscapeResult {
     }
 }
 
-/// Run escape analysis on all function bodies with inter-procedural
-/// refinement: a reference passed to a local function only forces heap
-/// allocation when the callee's corresponding parameter actually escapes.
+/// Run escape analysis on all function bodies.
+///
+/// Inter-procedural refinement only forces heap allocation when the local
+/// callee's corresponding parameter actually escapes.
+#[must_use]
 pub fn analyze_escapes(hir: &HirFile, type_result: &TypeCheckResult) -> EscapeResult {
     // Initialize: conservatively assume every param of every function escapes.
     let mut initial: HashMap<FunctionId, FnSummary> = HashMap::new();
@@ -217,7 +228,7 @@ struct FnSummary {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ReturnSummary {
     params: HashSet<usize>,
-    fields: Vec<ReturnSummary>,
+    fields: Vec<Self>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -237,11 +248,11 @@ type RefSources = HashSet<RefSource>;
 #[derive(Debug, Clone, Default)]
 struct SourceValue {
     sources: RefSources,
-    fields: Vec<SourceValue>,
+    fields: Vec<Self>,
 }
 
 impl SourceValue {
-    fn from_sources(sources: RefSources) -> Self {
+    const fn from_sources(sources: RefSources) -> Self {
         Self {
             sources,
             fields: Vec::new(),
@@ -297,7 +308,7 @@ struct EscapeAnalyzer<'a> {
     fn_summaries: HashMap<FunctionId, FnSummary>,
 }
 
-impl<'a> EscapeAnalyzer<'a> {
+impl EscapeAnalyzer<'_> {
     /// Run one pass over all bodies. Returns true if any function's param
     /// summary changed (meaning another Fixpoint iteration is needed).
     fn analyze_all_bodies(&mut self) -> bool {
@@ -330,9 +341,9 @@ impl<'a> EscapeAnalyzer<'a> {
             tail: Some(tail), ..
         } = &body.exprs[body.root_block]
         {
-            self.mark_returning_sources(&mut ctx, *tail);
+            Self::mark_returning_sources(&mut ctx, *tail);
         }
-        self.propagate_escaping_to_locals(&mut ctx);
+        Self::propagate_escaping_to_locals(&mut ctx);
 
         // Record results
         for binding in &ctx.escaping_locals {
@@ -405,174 +416,18 @@ impl<'a> EscapeAnalyzer<'a> {
 
         let expr = &ctx.body.exprs[expr_id];
         let escapes = match expr {
-            Expr::Block { stmts, tail } => {
-                let mut locals = HashSet::new();
-                for stmt in stmts {
-                    if let Stmt::Let { pat, .. } = &ctx.body.stmts[*stmt] {
-                        Self::collect_pattern_bindings(ctx.body, *pat, &mut locals);
-                    }
-                    self.escape_check_stmt(ctx, *stmt);
-                }
-                if let Some(tail) = tail {
-                    self.mark_escaping_exprs(ctx, *tail);
-                    let value = ctx.expr_source_value(*tail);
-                    Self::mark_scoped_lifetime_sources(ctx, &value.sources, &locals);
-                    ctx.set_expr_source_value(expr_id, value);
-                    ctx.escaping_exprs.contains(tail)
-                } else {
-                    false
-                }
-            }
+            Expr::Block { .. } => self.mark_block_expr(ctx, expr_id),
 
-            Expr::Unary {
-                operand,
-                op: UnaryOp::Ref | UnaryOp::MutRef,
-            } => {
-                self.mark_escaping_exprs(ctx, *operand);
-                self.record_ref(ctx, expr_id, *operand);
-                false
-            }
+            Expr::Unary { .. } => self.mark_unary_expr(ctx, expr_id),
 
-            Expr::Unary { operand, op } => {
-                match self
-                    .type_result
-                    .operator_calls
-                    .get(&(ctx.body_id, expr_id))
-                    .cloned()
-                {
-                    Some(OperatorCall::Function(fid)) => {
-                        let by_ref = self.hir.item_tree.functions[fid]
-                            .params
-                            .first()
-                            .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
-                        let returned =
-                            self.handle_call_operand(ctx, Some(fid), 0, *operand, by_ref);
-                        ctx.set_expr_source_value(expr_id, returned);
-                    }
-                    Some(OperatorCall::Trait(_)) => {
-                        let returned = self.handle_trait_operator_args(ctx, expr_id, &[*operand]);
-                        ctx.set_expr_source_value(expr_id, returned);
-                    }
-                    None => {
-                        self.mark_escaping_exprs(ctx, *operand);
-                    }
-                }
-                if *op == UnaryOp::Deref && self.expr_may_carry_reference(ctx, expr_id) {
-                    self.record_ref_chain(ctx, expr_id, *operand);
-                }
-                ctx.escaping_exprs.contains(operand)
-            }
+            Expr::Struct { .. }
+            | Expr::Array { .. }
+            | Expr::Tuple { .. }
+            | Expr::ArrayRepeat { .. } => self.mark_aggregate_expr(ctx, expr_id),
 
-            Expr::Struct { fields, .. } => {
-                for field in fields {
-                    self.mark_escaping_exprs(ctx, field.value);
-                }
-                for field in fields {
-                    self.record_ref_chain(ctx, expr_id, field.value);
-                }
-                fields.iter().any(|f| ctx.escaping_exprs.contains(&f.value))
-            }
+            Expr::Path { .. } => Self::mark_path_expr(ctx, expr_id),
 
-            Expr::Array { elements } | Expr::Tuple { elements } => {
-                for el in elements {
-                    self.mark_escaping_exprs(ctx, *el);
-                }
-                for el in elements {
-                    self.record_ref_chain(ctx, expr_id, *el);
-                }
-                ctx.set_expr_source_fields(
-                    expr_id,
-                    elements
-                        .iter()
-                        .map(|element| ctx.expr_source_value(*element))
-                        .collect(),
-                );
-                elements.iter().any(|e| ctx.escaping_exprs.contains(e))
-            }
-
-            Expr::ArrayRepeat { value, len } => {
-                self.mark_escaping_exprs(ctx, *value);
-                self.mark_escaping_exprs(ctx, *len);
-                self.record_ref_chain(ctx, expr_id, *value);
-                ctx.set_expr_source_fields(expr_id, vec![ctx.expr_source_value(*value)]);
-                ctx.escaping_exprs.contains(value)
-            }
-
-            Expr::Path { resolved, .. } => match resolved {
-                Some(ResolvedName::Param(idx)) => {
-                    ctx.expr_sources
-                        .entry(expr_id)
-                        .or_default()
-                        .insert(RefSource::ParamValue(*idx));
-                    ctx.escaping_params.contains(idx)
-                }
-                Some(ResolvedName::LambdaParam { lambda, index }) => {
-                    ctx.expr_sources
-                        .entry(expr_id)
-                        .or_default()
-                        .insert(RefSource::LambdaParamValue(*lambda, *index));
-                    ctx.escaping_lambda_param_places
-                        .contains(&(*lambda, *index))
-                }
-                Some(ResolvedName::PatternBinding(id)) => {
-                    // `LocalValue` alone: reading a binding yields its value, and
-                    // `mark_sources` chases `binding_sources` from there — for a
-                    // `let` that is the initializer, for an arm the scrutinee.
-                    ctx.expr_sources
-                        .entry(expr_id)
-                        .or_default()
-                        .insert(RefSource::LocalValue(*id));
-                    if let Some(fields) = ctx.binding_source_fields.get(id).cloned() {
-                        ctx.set_expr_source_fields(expr_id, fields);
-                    }
-                    ctx.escaping_locals.contains(id)
-                }
-                _ => false,
-            },
-
-            Expr::Binary {
-                lhs,
-                rhs,
-                op: BinaryOp::Assign,
-            } => {
-                self.mark_escaping_exprs(ctx, *lhs);
-                self.mark_escaping_exprs(ctx, *rhs);
-                if let Some(sources) = ctx.expr_sources.get(rhs).cloned() {
-                    if let Some(binding) = self.direct_local_root(ctx, *lhs) {
-                        ctx.binding_sources
-                            .entry(binding)
-                            .or_default()
-                            .extend(sources);
-                        ctx.binding_source_fields.remove(&binding);
-                    } else {
-                        Self::mark_source_sink(ctx, &sources);
-                    }
-                }
-                ctx.escaping_exprs.contains(rhs)
-            }
-
-            Expr::Binary { lhs, rhs, .. } => {
-                match self
-                    .type_result
-                    .operator_calls
-                    .get(&(ctx.body_id, expr_id))
-                    .cloned()
-                {
-                    Some(OperatorCall::Function(fid)) => {
-                        let returned = self.handle_operator_args(ctx, fid, *lhs, *rhs);
-                        ctx.set_expr_source_value(expr_id, returned);
-                    }
-                    Some(OperatorCall::Trait(_)) => {
-                        let returned = self.handle_trait_operator_args(ctx, expr_id, &[*lhs, *rhs]);
-                        ctx.set_expr_source_value(expr_id, returned);
-                    }
-                    None => {
-                        self.mark_escaping_exprs(ctx, *lhs);
-                        self.mark_escaping_exprs(ctx, *rhs);
-                    }
-                }
-                ctx.escaping_exprs.contains(lhs) || ctx.escaping_exprs.contains(rhs)
-            }
+            Expr::Binary { .. } => self.mark_binary_expr(ctx, expr_id),
 
             Expr::Call { callee, args, .. } => {
                 self.mark_escaping_exprs(ctx, *callee);
@@ -581,115 +436,14 @@ impl<'a> EscapeAnalyzer<'a> {
                 false
             }
 
-            Expr::Lambda { body, .. } => {
-                let mut sources: RefSources = std::iter::once(RefSource::Lambda(expr_id)).collect();
-                if let Some(info) = self.type_result.lambda_infos.get(&(ctx.body_id, expr_id)) {
-                    for capture in &info.captures {
-                        let captured = self.capture_sources(&capture.place.source, capture.mode);
-                        if matches!(capture.mode, CaptureMode::Shared | CaptureMode::Mutable) {
-                            Self::mark_address_taken(ctx, &captured);
-                        }
-                        sources.extend(captured);
-                    }
-                }
-                ctx.expr_sources.entry(expr_id).or_default().extend(sources);
-                ctx.lambda_stack.push(expr_id);
-                self.mark_escaping_exprs(ctx, *body);
-                if let Expr::Block {
-                    tail: Some(tail), ..
-                } = &ctx.body.exprs[*body]
-                {
-                    self.record_lambda_return_sources(ctx, expr_id, *tail);
-                }
-                ctx.lambda_stack.pop();
-                false
+            Expr::Lambda { .. } => self.mark_lambda_expr(ctx, expr_id),
+
+            Expr::If { .. } | Expr::While { .. } | Expr::For { .. } | Expr::Match { .. } => {
+                self.mark_control_expr(ctx, expr_id)
             }
 
-            Expr::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                self.mark_escaping_exprs(ctx, *cond);
-                self.mark_escaping_exprs(ctx, *then_branch);
-                if let Some(eb) = else_branch {
-                    self.mark_escaping_exprs(ctx, *eb);
-                }
-                let mut value = ctx.expr_source_value(*then_branch);
-                if let Some(else_branch) = else_branch {
-                    value.merge(ctx.expr_source_value(*else_branch));
-                }
-                ctx.set_expr_source_value(expr_id, value);
-                let t = ctx.escaping_exprs.contains(then_branch);
-                let e = else_branch.is_some_and(|eb| ctx.escaping_exprs.contains(&eb));
-                t || e
-            }
-
-            Expr::While { condition, body } => {
-                self.mark_escaping_exprs(ctx, *condition);
-                self.mark_escaping_exprs(ctx, *body);
-                ctx.escaping_exprs.contains(body)
-            }
-
-            Expr::For {
-                pat,
-                iterable,
-                body,
-            } => {
-                self.mark_escaping_exprs(ctx, *iterable);
-                let value = ctx.expr_source_value(*iterable).iterated();
-                self.bind_pattern_sources(ctx, *pat, &value);
-                self.mark_escaping_exprs(ctx, *body);
-                ctx.escaping_exprs.contains(body)
-            }
-
-            Expr::Match { scrutinee, arms } => {
-                self.mark_escaping_exprs(ctx, *scrutinee);
-                let value = ctx.expr_source_value(*scrutinee);
-                for arm in arms {
-                    self.bind_pattern_sources(ctx, arm.pat, &value);
-                    if let Some(guard) = arm.guard {
-                        self.mark_escaping_exprs(ctx, guard);
-                    }
-                    self.mark_escaping_exprs(ctx, arm.body);
-                }
-                let mut value = SourceValue::default();
-                for arm in arms {
-                    value.merge(ctx.expr_source_value(arm.body));
-                }
-                ctx.set_expr_source_value(expr_id, value);
-                arms.iter()
-                    .any(|arm| ctx.escaping_exprs.contains(&arm.body))
-            }
-
-            Expr::FieldAccess { base, field } => {
-                self.mark_escaping_exprs(ctx, *base);
-                if self.expr_may_carry_reference(ctx, expr_id) {
-                    let base_value = ctx.expr_source_value(*base);
-                    let value = self
-                        .field_index(ctx, *base, field)
-                        .map(|index| base_value.project(index))
-                        .unwrap_or_else(|| base_value.flattened());
-                    ctx.set_expr_source_value(expr_id, value);
-                }
-                ctx.escaping_exprs.contains(base)
-            }
-
-            Expr::IndexAccess { base, index } => {
-                self.mark_escaping_exprs(ctx, *base);
-                self.mark_escaping_exprs(ctx, *index);
-                if self.expr_may_carry_reference(ctx, expr_id) {
-                    let base_value = ctx.expr_source_value(*base);
-                    let value = match &ctx.body.exprs[*index] {
-                        Expr::IntLiteral { value: index, .. } => usize::try_from(*index)
-                            .ok()
-                            .map(|index| base_value.project(index))
-                            .unwrap_or_else(|| base_value.iterated()),
-                        _ => base_value.iterated(),
-                    };
-                    ctx.set_expr_source_value(expr_id, value);
-                }
-                ctx.escaping_exprs.contains(base) || ctx.escaping_exprs.contains(index)
+            Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => {
+                self.mark_projection_expr(ctx, expr_id)
             }
 
             Expr::Missing
@@ -726,6 +480,302 @@ impl<'a> EscapeAnalyzer<'a> {
             ctx.escaping_exprs.insert(expr_id);
         }
         escapes
+    }
+
+    fn mark_block_expr(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
+        let Expr::Block { stmts, tail } = ctx.body.exprs[expr_id].clone() else {
+            unreachable!("expected block expression");
+        };
+        let mut locals = HashSet::new();
+        for stmt in stmts {
+            if let Stmt::Let { pat, .. } = &ctx.body.stmts[stmt] {
+                Self::collect_pattern_bindings(ctx.body, *pat, &mut locals);
+            }
+            self.escape_check_stmt(ctx, stmt);
+        }
+        let Some(tail) = tail else {
+            return false;
+        };
+        self.mark_escaping_exprs(ctx, tail);
+        let value = ctx.expr_source_value(tail);
+        Self::mark_scoped_lifetime_sources(ctx, &value.sources, &locals);
+        ctx.set_expr_source_value(expr_id, value);
+        ctx.escaping_exprs.contains(&tail)
+    }
+
+    fn mark_unary_expr(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
+        let Expr::Unary { operand, op } = ctx.body.exprs[expr_id] else {
+            unreachable!("expected unary expression");
+        };
+        if matches!(op, UnaryOp::Ref | UnaryOp::MutRef) {
+            self.mark_escaping_exprs(ctx, operand);
+            self.record_ref(ctx, expr_id, operand);
+            return false;
+        }
+        match self
+            .type_result
+            .operator_calls
+            .get(&(ctx.body_id, expr_id))
+            .cloned()
+        {
+            Some(OperatorCall::Function(fid)) => {
+                let by_ref = self.hir.item_tree.functions[fid]
+                    .params
+                    .first()
+                    .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
+                let returned = self.handle_call_operand(ctx, Some(fid), 0, operand, by_ref);
+                ctx.set_expr_source_value(expr_id, returned);
+            }
+            Some(OperatorCall::Trait(_)) => {
+                let returned = self.handle_trait_operator_args(ctx, expr_id, &[operand]);
+                ctx.set_expr_source_value(expr_id, returned);
+            }
+            None => {
+                self.mark_escaping_exprs(ctx, operand);
+            }
+        }
+        if op == UnaryOp::Deref && self.expr_may_carry_reference(ctx, expr_id) {
+            Self::record_ref_chain(ctx, expr_id, operand);
+        }
+        ctx.escaping_exprs.contains(&operand)
+    }
+
+    fn mark_aggregate_expr(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
+        match ctx.body.exprs[expr_id].clone() {
+            Expr::Struct { fields, .. } => {
+                for field in &fields {
+                    self.mark_escaping_exprs(ctx, field.value);
+                }
+                for field in &fields {
+                    Self::record_ref_chain(ctx, expr_id, field.value);
+                }
+                fields
+                    .iter()
+                    .any(|field| ctx.escaping_exprs.contains(&field.value))
+            }
+            Expr::Array { elements } | Expr::Tuple { elements } => {
+                for element in &elements {
+                    self.mark_escaping_exprs(ctx, *element);
+                }
+                for element in &elements {
+                    Self::record_ref_chain(ctx, expr_id, *element);
+                }
+                ctx.set_expr_source_fields(
+                    expr_id,
+                    elements
+                        .iter()
+                        .map(|element| ctx.expr_source_value(*element))
+                        .collect(),
+                );
+                elements
+                    .iter()
+                    .any(|element| ctx.escaping_exprs.contains(element))
+            }
+            Expr::ArrayRepeat { value, len } => {
+                self.mark_escaping_exprs(ctx, value);
+                self.mark_escaping_exprs(ctx, len);
+                Self::record_ref_chain(ctx, expr_id, value);
+                ctx.set_expr_source_fields(expr_id, vec![ctx.expr_source_value(value)]);
+                ctx.escaping_exprs.contains(&value)
+            }
+            _ => unreachable!("expected aggregate expression"),
+        }
+    }
+
+    fn mark_path_expr(ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
+        let Expr::Path { resolved, .. } = &ctx.body.exprs[expr_id] else {
+            unreachable!("expected path expression");
+        };
+        match resolved {
+            Some(ResolvedName::Param(index)) => {
+                ctx.expr_sources
+                    .entry(expr_id)
+                    .or_default()
+                    .insert(RefSource::ParamValue(*index));
+                ctx.escaping_params.contains(index)
+            }
+            Some(ResolvedName::LambdaParam { lambda, index }) => {
+                ctx.expr_sources
+                    .entry(expr_id)
+                    .or_default()
+                    .insert(RefSource::LambdaParamValue(*lambda, *index));
+                ctx.escaping_lambda_param_places
+                    .contains(&(*lambda, *index))
+            }
+            Some(ResolvedName::PatternBinding(id)) => {
+                ctx.expr_sources
+                    .entry(expr_id)
+                    .or_default()
+                    .insert(RefSource::LocalValue(*id));
+                if let Some(fields) = ctx.binding_source_fields.get(id).cloned() {
+                    ctx.set_expr_source_fields(expr_id, fields);
+                }
+                ctx.escaping_locals.contains(id)
+            }
+            _ => false,
+        }
+    }
+
+    fn mark_binary_expr(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
+        let Expr::Binary { lhs, rhs, op } = ctx.body.exprs[expr_id] else {
+            unreachable!("expected binary expression");
+        };
+        if op == BinaryOp::Assign {
+            self.mark_escaping_exprs(ctx, lhs);
+            self.mark_escaping_exprs(ctx, rhs);
+            if let Some(sources) = ctx.expr_sources.get(&rhs).cloned() {
+                if let Some(binding) = self.direct_local_root(ctx, lhs) {
+                    ctx.binding_sources
+                        .entry(binding)
+                        .or_default()
+                        .extend(sources);
+                    ctx.binding_source_fields.remove(&binding);
+                } else {
+                    Self::mark_source_sink(ctx, &sources);
+                }
+            }
+            return ctx.escaping_exprs.contains(&rhs);
+        }
+        match self
+            .type_result
+            .operator_calls
+            .get(&(ctx.body_id, expr_id))
+            .cloned()
+        {
+            Some(OperatorCall::Function(fid)) => {
+                let returned = self.handle_operator_args(ctx, fid, lhs, rhs);
+                ctx.set_expr_source_value(expr_id, returned);
+            }
+            Some(OperatorCall::Trait(_)) => {
+                let returned = self.handle_trait_operator_args(ctx, expr_id, &[lhs, rhs]);
+                ctx.set_expr_source_value(expr_id, returned);
+            }
+            None => {
+                self.mark_escaping_exprs(ctx, lhs);
+                self.mark_escaping_exprs(ctx, rhs);
+            }
+        }
+        ctx.escaping_exprs.contains(&lhs) || ctx.escaping_exprs.contains(&rhs)
+    }
+
+    fn mark_lambda_expr(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
+        let Expr::Lambda { body, .. } = ctx.body.exprs[expr_id] else {
+            unreachable!("expected lambda expression");
+        };
+        let mut sources: RefSources = std::iter::once(RefSource::Lambda(expr_id)).collect();
+        if let Some(info) = self.type_result.lambda_infos.get(&(ctx.body_id, expr_id)) {
+            for capture in &info.captures {
+                let captured = Self::capture_sources(&capture.place.source, capture.mode);
+                if matches!(capture.mode, CaptureMode::Shared | CaptureMode::Mutable) {
+                    Self::mark_address_taken(ctx, &captured);
+                }
+                sources.extend(captured);
+            }
+        }
+        ctx.expr_sources.entry(expr_id).or_default().extend(sources);
+        ctx.lambda_stack.push(expr_id);
+        self.mark_escaping_exprs(ctx, body);
+        if let Expr::Block {
+            tail: Some(tail), ..
+        } = &ctx.body.exprs[body]
+        {
+            Self::record_lambda_return_sources(ctx, expr_id, *tail);
+        }
+        ctx.lambda_stack.pop();
+        false
+    }
+
+    fn mark_control_expr(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
+        match ctx.body.exprs[expr_id].clone() {
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.mark_escaping_exprs(ctx, cond);
+                self.mark_escaping_exprs(ctx, then_branch);
+                if let Some(else_branch) = else_branch {
+                    self.mark_escaping_exprs(ctx, else_branch);
+                }
+                let mut value = ctx.expr_source_value(then_branch);
+                if let Some(else_branch) = else_branch {
+                    value.merge(ctx.expr_source_value(else_branch));
+                }
+                ctx.set_expr_source_value(expr_id, value);
+                ctx.escaping_exprs.contains(&then_branch)
+                    || else_branch.is_some_and(|branch| ctx.escaping_exprs.contains(&branch))
+            }
+            Expr::While { condition, body } => {
+                self.mark_escaping_exprs(ctx, condition);
+                self.mark_escaping_exprs(ctx, body);
+                ctx.escaping_exprs.contains(&body)
+            }
+            Expr::For {
+                pat,
+                iterable,
+                body,
+            } => {
+                self.mark_escaping_exprs(ctx, iterable);
+                let value = ctx.expr_source_value(iterable).iterated();
+                self.bind_pattern_sources(ctx, pat, &value);
+                self.mark_escaping_exprs(ctx, body);
+                ctx.escaping_exprs.contains(&body)
+            }
+            Expr::Match { scrutinee, arms } => {
+                self.mark_escaping_exprs(ctx, scrutinee);
+                let scrutinee_value = ctx.expr_source_value(scrutinee);
+                for arm in &arms {
+                    self.bind_pattern_sources(ctx, arm.pat, &scrutinee_value);
+                    if let Some(guard) = arm.guard {
+                        self.mark_escaping_exprs(ctx, guard);
+                    }
+                    self.mark_escaping_exprs(ctx, arm.body);
+                }
+                let mut value = SourceValue::default();
+                for arm in &arms {
+                    value.merge(ctx.expr_source_value(arm.body));
+                }
+                ctx.set_expr_source_value(expr_id, value);
+                arms.iter()
+                    .any(|arm| ctx.escaping_exprs.contains(&arm.body))
+            }
+            _ => unreachable!("expected control-flow expression"),
+        }
+    }
+
+    fn mark_projection_expr(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
+        match ctx.body.exprs[expr_id].clone() {
+            Expr::FieldAccess { base, field } => {
+                self.mark_escaping_exprs(ctx, base);
+                if self.expr_may_carry_reference(ctx, expr_id) {
+                    let base_value = ctx.expr_source_value(base);
+                    let value = self
+                        .field_index(ctx, base, &field)
+                        .map_or_else(|| base_value.flattened(), |index| base_value.project(index));
+                    ctx.set_expr_source_value(expr_id, value);
+                }
+                ctx.escaping_exprs.contains(&base)
+            }
+            Expr::IndexAccess { base, index } => {
+                self.mark_escaping_exprs(ctx, base);
+                self.mark_escaping_exprs(ctx, index);
+                if self.expr_may_carry_reference(ctx, expr_id) {
+                    let base_value = ctx.expr_source_value(base);
+                    let value = match &ctx.body.exprs[index] {
+                        Expr::IntLiteral { value: index, .. } => {
+                            usize::try_from(*index).ok().map_or_else(
+                                || base_value.iterated(),
+                                |index| base_value.project(index),
+                            )
+                        }
+                        _ => base_value.iterated(),
+                    };
+                    ctx.set_expr_source_value(expr_id, value);
+                }
+                ctx.escaping_exprs.contains(&base) || ctx.escaping_exprs.contains(&index)
+            }
+            _ => unreachable!("expected projection expression"),
+        }
     }
 
     /// Handle call arguments for escape: a ref passed to a local function
@@ -767,7 +817,7 @@ impl<'a> EscapeAnalyzer<'a> {
                         .copied(),
                 ),
                 RefSource::Temporary(expr) => {
-                    pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied())
+                    pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied());
                 }
                 _ => {}
             }
@@ -936,14 +986,13 @@ impl<'a> EscapeAnalyzer<'a> {
                 if let Some(v) = value {
                     self.mark_escaping_exprs(ctx, *v);
                     if let Some(lambda) = ctx.lambda_stack.last().copied() {
-                        self.record_lambda_return_sources(ctx, lambda, *v);
+                        Self::record_lambda_return_sources(ctx, lambda, *v);
                     } else {
-                        self.mark_returning_sources(ctx, *v);
+                        Self::mark_returning_sources(ctx, *v);
                     }
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
-            Stmt::Item { .. } => {}
+            Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
         }
     }
 
@@ -954,7 +1003,7 @@ impl<'a> EscapeAnalyzer<'a> {
             .is_none_or(type_may_carry_reference)
     }
 
-    fn mark_returning_sources(&self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) {
+    fn mark_returning_sources(ctx: &mut EscapeCtx<'_>, expr_id: ExprId) {
         let value = ctx.expr_source_value(expr_id);
         ctx.returned_value.merge(value);
         let Some(sources) = ctx.expr_sources.get(&expr_id).cloned() else {
@@ -1017,7 +1066,7 @@ impl<'a> EscapeAnalyzer<'a> {
                         .copied(),
                 ),
                 RefSource::Temporary(expr) => {
-                    pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied())
+                    pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied());
                 }
                 RefSource::ParamPlace(index) | RefSource::ParamValue(index) => {
                     params.insert(index);
@@ -1038,12 +1087,7 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    fn record_lambda_return_sources(
-        &self,
-        ctx: &mut EscapeCtx<'_>,
-        lambda: ExprId,
-        expr_id: ExprId,
-    ) {
+    fn record_lambda_return_sources(ctx: &mut EscapeCtx<'_>, lambda: ExprId, expr_id: ExprId) {
         let Some(sources) = ctx.expr_sources.get(&expr_id).cloned() else {
             return;
         };
@@ -1219,7 +1263,7 @@ impl<'a> EscapeAnalyzer<'a> {
         changed
     }
 
-    fn capture_sources(&self, source: &CaptureSource, mode: CaptureMode) -> RefSources {
+    fn capture_sources(source: &CaptureSource, mode: CaptureMode) -> RefSources {
         let by_ref = matches!(mode, CaptureMode::Shared | CaptureMode::Mutable);
         match source {
             CaptureSource::Pattern(id) if by_ref => {
@@ -1460,13 +1504,13 @@ impl<'a> EscapeAnalyzer<'a> {
     }
 
     /// Propagate a flattened ref-source chain through an aggregate expression.
-    fn record_ref_chain(&self, ctx: &mut EscapeCtx<'_>, parent: ExprId, child: ExprId) {
+    fn record_ref_chain(ctx: &mut EscapeCtx<'_>, parent: ExprId, child: ExprId) {
         if let Some(sources) = ctx.expr_sources.get(&child).cloned() {
             ctx.expr_sources.entry(parent).or_default().extend(sources);
         }
     }
 
-    fn propagate_escaping_to_locals(&self, ctx: &mut EscapeCtx<'_>) {
+    fn propagate_escaping_to_locals(ctx: &mut EscapeCtx<'_>) {
         let mut changed = true;
         while changed {
             changed = false;
@@ -1493,20 +1537,23 @@ impl<'a> EscapeAnalyzer<'a> {
 
 fn type_may_carry_reference(ty: &Type) -> bool {
     match ty {
-        Type::Ref(..) | Type::Ptr { .. } => true,
-        Type::Tuple(elements) => elements.iter().any(type_may_carry_reference),
-        Type::Slice(inner) | Type::Array(inner, _) => type_may_carry_reference(inner),
-        Type::Struct(..)
+        Type::Ref(..)
+        | Type::Ptr { .. }
+        | Type::Struct(..)
         | Type::Enum(..)
         | Type::Param(..)
         | Type::InferVar(..)
         | Type::Unknown
-        | Type::Error => true,
+        | Type::Error
+        | Type::FunctionItem { .. }
+        | Type::Closure { .. }
+        | Type::OpaqueCallable { .. } => true,
+        Type::Tuple(elements) => elements.iter().any(type_may_carry_reference),
+        Type::Slice(inner) | Type::Array(inner, _) => type_may_carry_reference(inner),
         Type::CallableConstraint(signature) => {
             signature.params.iter().any(type_may_carry_reference)
                 || type_may_carry_reference(&signature.ret)
         }
-        Type::FunctionItem { .. } | Type::Closure { .. } | Type::OpaqueCallable { .. } => true,
         Type::Int(..)
         | Type::Float(..)
         | Type::InferInt

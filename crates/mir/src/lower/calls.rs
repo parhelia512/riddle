@@ -1,6 +1,10 @@
-use super::*;
+use super::{
+    Body, Builder, BuiltinOperator, Expr, ExprId, FuncRef, HirBinOp, HirTypeRef, HirUnOp, Inst,
+    InstKind, IntTy, LowerCtx, PathAnchor, ResolvedName, Type, UnOp, Value,
+    builtin_comparison_types, comparison_trait, convert_cmp_op, convert_unop,
+};
 
-impl<'a> LowerCtx<'a> {
+impl LowerCtx<'_> {
     pub(super) fn is_std_range_expr(&self, expr: ExprId) -> bool {
         self.current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, expr)))
@@ -8,7 +12,7 @@ impl<'a> LowerCtx<'a> {
                 type_checker::Type::Struct(sid, _) => Some(*sid),
                 _ => None,
             })
-            .map(|sid| {
+            .is_some_and(|sid| {
                 let s = &self.hir.item_tree.structs[sid];
                 if s.name.0 != "Range" || s.fields.len() != 2 {
                     return false;
@@ -25,7 +29,6 @@ impl<'a> LowerCtx<'a> {
                     && is_i32(&s.fields[0].ty)
                     && is_i32(&s.fields[1].ty)
             })
-            .unwrap_or(false)
     }
 
     pub(super) fn array_iter_info(&self, expr: ExprId) -> Option<(Type, usize)> {
@@ -141,7 +144,7 @@ impl<'a> LowerCtx<'a> {
     pub(super) fn lower_comparison(
         &mut self,
         builder: &mut Builder,
-        op: &HirBinOp,
+        op: HirBinOp,
         lhs: Value,
         rhs: Value,
         lhs_ty: &type_checker::Type,
@@ -202,14 +205,14 @@ impl<'a> LowerCtx<'a> {
     pub(super) fn lower_aggregate_comparison(
         &mut self,
         builder: &mut Builder,
-        op: &HirBinOp,
+        op: HirBinOp,
         elements: Vec<(Value, Value, type_checker::Type, type_checker::Type)>,
     ) -> Value {
         match op {
             HirBinOp::Eq => self.lower_aggregate_equality(builder, elements, false),
             HirBinOp::Neq => self.lower_aggregate_equality(builder, elements, true),
             HirBinOp::Lt | HirBinOp::Gt | HirBinOp::LtEq | HirBinOp::GtEq => {
-                self.lower_aggregate_ordering(builder, *op, elements)
+                self.lower_aggregate_ordering(builder, op, elements)
             }
             _ => unreachable!("aggregate comparison called with non-comparison op"),
         }
@@ -228,7 +231,7 @@ impl<'a> LowerCtx<'a> {
         let merge_block = builder.func.new_block_labeled("cmp_merge");
         let mut phi_args = Vec::with_capacity(elements.len() + 1);
         for (lhs, rhs, lhs_ty, rhs_ty) in elements {
-            let equal = self.lower_comparison(builder, &HirBinOp::Eq, lhs, rhs, &lhs_ty, &rhs_ty);
+            let equal = self.lower_comparison(builder, HirBinOp::Eq, lhs, rhs, &lhs_ty, &rhs_ty);
             let next_block = builder.func.new_block_labeled("cmp_next");
             let result_block = builder.func.new_block_labeled("cmp_result");
             builder.set_cond_branch(equal, next_block, result_block);
@@ -265,7 +268,7 @@ impl<'a> LowerCtx<'a> {
         let merge_block = builder.func.new_block_labeled("cmp_merge");
         let mut phi_args = Vec::with_capacity(elements.len() + 1);
         for (lhs, rhs, lhs_ty, rhs_ty) in elements {
-            let equal = self.lower_comparison(builder, &HirBinOp::Eq, lhs, rhs, &lhs_ty, &rhs_ty);
+            let equal = self.lower_comparison(builder, HirBinOp::Eq, lhs, rhs, &lhs_ty, &rhs_ty);
             let next_block = builder.func.new_block_labeled("cmp_next");
             let result_block = builder.func.new_block_labeled("cmp_result");
             builder.set_cond_branch(equal, next_block, result_block);
@@ -276,7 +279,7 @@ impl<'a> LowerCtx<'a> {
                 HirBinOp::Gt | HirBinOp::GtEq => HirBinOp::Gt,
                 _ => unreachable!("non-ordering op in aggregate ordering"),
             };
-            let result = self.lower_comparison(builder, &decision_op, lhs, rhs, &lhs_ty, &rhs_ty);
+            let result = self.lower_comparison(builder, decision_op, lhs, rhs, &lhs_ty, &rhs_ty);
             let result_exit = builder.current_block;
             if builder.needs_return() {
                 builder.set_branch(merge_block);
@@ -299,7 +302,7 @@ impl<'a> LowerCtx<'a> {
     pub(super) fn lower_comparison_leaf(
         &mut self,
         builder: &mut Builder,
-        op: &HirBinOp,
+        op: HirBinOp,
         lhs: Value,
         rhs: Value,
         lhs_ty: &type_checker::Type,
@@ -384,8 +387,7 @@ impl<'a> LowerCtx<'a> {
         let value_ty = self
             .current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, base)))
-            .map(|ty| self.convert_type(ty))
-            .unwrap_or(Type::Unit);
+            .map_or(Type::Unit, |ty| self.convert_type(ty));
         match op {
             BuiltinOperator::Binary(op) => {
                 let expressions = [
@@ -422,7 +424,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(super) fn actual_method_fid(
-        &mut self,
+        &self,
         callee: ExprId,
         fid: hir::item_tree::FunctionId,
         base: ExprId,
@@ -514,8 +516,7 @@ impl<'a> LowerCtx<'a> {
         let base_ty = self
             .current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, base)))
-            .map(|t| self.convert_type(t))
-            .unwrap_or(Type::Unit);
+            .map_or(Type::Unit, |t| self.convert_type(t));
 
         match expected {
             hir::item_tree::HirTypeRef::Ref(_, _) if matches!(base_ty, Type::Ref(_, _)) => {
@@ -524,7 +525,7 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Ref(_, true) => {
                 let place = self.lower_lvalue(builder, param_values, body, base);
                 builder.unop(
-                    convert_unop(&HirUnOp::MutRef),
+                    convert_unop(HirUnOp::MutRef),
                     place,
                     Type::Ref(Box::new(base_ty), true),
                 )
@@ -532,7 +533,7 @@ impl<'a> LowerCtx<'a> {
             hir::item_tree::HirTypeRef::Ref(_, mutable) => {
                 let base_val = self.lower_lvalue(builder, param_values, body, base);
                 let expected_ty = Type::Ref(Box::new(base_ty), *mutable);
-                builder.unop(convert_unop(&HirUnOp::Ref), base_val, expected_ty)
+                builder.unop(convert_unop(HirUnOp::Ref), base_val, expected_ty)
             }
             _ => self.lower_expr(builder, param_values, body, base),
         }

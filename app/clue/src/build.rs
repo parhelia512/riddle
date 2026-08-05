@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub(crate) enum BuildArtifact {
+pub enum BuildArtifact {
     Executable { path: PathBuf, target: TargetTriple },
     Library,
 }
@@ -31,16 +31,20 @@ struct CCompiler {
     target: TargetConfig,
 }
 
-pub(crate) fn run(
-    root: &Path,
-    explicit_target: Option<TargetTriple>,
-) -> anyhow::Result<BuildArtifact> {
+pub fn run(root: &Path, explicit_target: Option<TargetTriple>) -> anyhow::Result<BuildArtifact> {
     let root = if root.is_absolute() {
         root.to_path_buf()
     } else {
         env::current_dir()?.join(root)
     };
     let analysis = analyze_project(&root, &HashMap::new())?;
+    ensure_analysis_success(&analysis)?;
+    let triple = target::resolve(explicit_target, analysis.build_target.as_deref())?;
+    let target = target::load(triple, analysis.kind == ProjectKind::Binary)?;
+    build_analysis(&root, &analysis, triple, &target)
+}
+
+fn ensure_analysis_success(analysis: &crate::ProjectAnalysis) -> anyhow::Result<()> {
     let errors = riddlec::diagnostics::report_mapped(
         &analysis.result,
         &analysis.source,
@@ -49,9 +53,15 @@ pub(crate) fn run(
     if errors > 0 || !analysis.result.success() {
         bail!("build failed");
     }
-    let triple = target::resolve(explicit_target, analysis.build_target.as_deref())?;
-    let target = target::load(triple, analysis.kind == ProjectKind::Binary)?;
+    Ok(())
+}
 
+fn build_analysis(
+    root: &Path,
+    analysis: &crate::ProjectAnalysis,
+    triple: TargetTriple,
+    target: &TargetConfig,
+) -> anyhow::Result<BuildArtifact> {
     let build_dir = root.join(".clue").join("build");
     fs::create_dir_all(&build_dir)?;
     let compiler = if analysis.kind == ProjectKind::Binary {
@@ -62,9 +72,7 @@ pub(crate) fn run(
     let c_path = build_dir.join(format!("{}.c", analysis.package_name));
     let custom_runtime_path = analysis.runtime_source.as_ref().map(|path| root.join(path));
     let runtime_source = if compiler.is_some() {
-        Some(if !analysis.gc_enabled {
-            gc::NO_GC_RUNTIME_C.to_owned()
-        } else {
+        Some(if analysis.gc_enabled {
             match &custom_runtime_path {
                 Some(path) => fs::read_to_string(path).with_context(|| {
                     format!("failed to read runtime source `{}`", path.display())
@@ -76,6 +84,8 @@ pub(crate) fn run(
                     None => gc::RUNTIME_C.to_owned(),
                 },
             }
+        } else {
+            gc::NO_GC_RUNTIME_C.to_owned()
         })
     } else {
         None
@@ -91,7 +101,7 @@ pub(crate) fn run(
         &analysis.source.source,
         runtime_source.as_deref(),
         compiler.as_ref(),
-        &target,
+        target,
     );
     let source_is_fresh = c_path.is_file()
         && runtime_path.as_ref().is_none_or(|path| path.is_file())
@@ -150,7 +160,7 @@ pub(crate) fn run(
     })
 }
 
-pub(crate) fn build_proc_macro_host(
+pub fn build_proc_macro_host(
     package: &crate::project::ProcMacroPackage,
     exports: &[crate::proc_macro::HostMacroExport],
     expanded_source: &str,
@@ -261,7 +271,7 @@ fn executable_path(c_path: &Path, target: TargetTriple) -> PathBuf {
 impl CCompiler {
     fn detect(build_dir: &Path, target: TargetConfig) -> anyhow::Result<Self> {
         if let Some(program) = env::var_os("CC") {
-            let compiler = Self::new(program.clone(), target.clone()).ok_or_else(|| {
+            let compiler = Self::new(&program, target).ok_or_else(|| {
                 anyhow::anyhow!(
                     "C compiler from CC `{}` could not report its version",
                     program.to_string_lossy()
@@ -277,13 +287,12 @@ impl CCompiler {
         }
 
         if let Some(program) = &target.c_toolchain.compiler {
-            let compiler =
-                Self::new(program.as_os_str().to_owned(), target.clone()).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "configured C compiler `{}` could not report its version",
-                        program.display()
-                    )
-                })?;
+            let compiler = Self::new(program.as_os_str(), target.clone()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "configured C compiler `{}` could not report its version",
+                    program.display()
+                )
+            })?;
             if compiler.probe(build_dir) {
                 return Ok(compiler);
             }
@@ -314,7 +323,7 @@ impl CCompiler {
             .join(", ");
         programs
             .into_iter()
-            .filter_map(|program| Self::new(program, target.clone()))
+            .filter_map(|program| Self::new(&program, target.clone()))
             .find(|compiler| compiler.probe(build_dir))
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -323,8 +332,8 @@ impl CCompiler {
             })
     }
 
-    fn new(program: OsString, target: TargetConfig) -> Option<Self> {
-        let program = resolve_program(&program);
+    fn new(program: &OsStr, target: TargetConfig) -> Option<Self> {
+        let program = resolve_program(program);
         let flavor = flavor_for(&program);
         let output = Command::new(&program)
             .arg(match flavor {
@@ -552,9 +561,7 @@ fn ordinary_absolute(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        env::current_dir()
-            .map(|current| current.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
+        env::current_dir().map_or_else(|_| path.to_path_buf(), |current| current.join(path))
     }
 }
 

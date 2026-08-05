@@ -15,6 +15,7 @@ use super::{DefRef, EdgeKind, Node, NodeId, RefOrigin, ScopeGraph};
 /// - If the current scope has a matching name, it shadows outer scopes even when the remaining
 ///   path fails to resolve.
 /// - Only follow `Lex` / `Export` edges when the current scope has no matching definition.
+#[must_use]
 pub fn resolve_reference(sg: &ScopeGraph, reference: NodeId) -> Vec<DefRef> {
     if !matches!(sg.nodes[reference], Node::Reference { .. }) {
         return vec![];
@@ -23,6 +24,7 @@ pub fn resolve_reference(sg: &ScopeGraph, reference: NodeId) -> Vec<DefRef> {
 }
 
 /// Returns the definitions visible at a reference, with inner scopes shadowing outer scopes.
+#[must_use]
 pub fn visible_definitions(sg: &ScopeGraph, reference: NodeId) -> Vec<(Name, DefRef)> {
     let Node::Reference { anchor, .. } = &sg.nodes[reference] else {
         return Vec::new();
@@ -31,6 +33,7 @@ pub fn visible_definitions(sg: &ScopeGraph, reference: NodeId) -> Vec<(Name, Def
 }
 
 /// Resolves `segments` from the lexical anchor of an existing reference.
+#[must_use]
 pub fn resolve_path_at_reference(
     sg: &ScopeGraph,
     reference: NodeId,
@@ -44,12 +47,14 @@ pub fn resolve_path_at_reference(
 }
 
 /// Resolves a path from an already selected lexical anchor.
+#[must_use]
 pub fn resolve_path_from(sg: &ScopeGraph, anchor: NodeId, segments: &[Name]) -> Vec<DefRef> {
     let stack = segments.iter().rev().cloned().collect();
     resolve_from(sg, anchor, stack, &mut HashSet::new(), 64)
 }
 
 /// Returns definitions directly exported by a scope without leaking its lexical parent.
+#[must_use]
 pub fn exported_definitions(sg: &ScopeGraph, scope: NodeId) -> Vec<(Name, DefRef)> {
     collect_definitions(sg, scope, false)
 }
@@ -86,7 +91,7 @@ fn collect_definitions_from(
         return;
     };
     let mut edges = out.iter().map(|id| sg.edges[*id]).collect::<Vec<_>>();
-    edges.sort_by_key(|edge| -(edge.precedence as i32));
+    edges.sort_by_key(|edge| -i32::from(edge.precedence));
 
     for edge in &edges {
         if edge.kind != EdgeKind::Def {
@@ -118,6 +123,11 @@ fn collect_definitions_from(
 /// If resolution returns multiple candidates, the first candidate in resolver traversal order is
 /// selected. If no candidate is found, the expression is marked as unresolved and an E0050
 /// diagnostic is emitted.
+///
+/// # Panics
+///
+/// Panics if a lowered expression is missing its source-map range. Lowering records a range for
+/// every expression, so this indicates an internal compiler invariant was violated.
 pub fn resolve_hir(hir: &mut HirFile, sg: &ScopeGraph) {
     for (nid, node) in sg.nodes.iter() {
         let Node::Reference { origin, .. } = node else {
@@ -127,8 +137,7 @@ pub fn resolve_hir(hir: &mut HirFile, sg: &ScopeGraph) {
         let candidates = resolve_reference(sg, nid);
         let resolved = candidates
             .first()
-            .map(def_to_resolved_name)
-            .unwrap_or(ResolvedName::Unresolved);
+            .map_or(ResolvedName::Unresolved, def_to_resolved_name);
 
         // Only emit E0050 when genuinely unresolved (no candidates).
         // `def_to_resolved_name` may map some DefRef variants (UseAlias) to
@@ -149,7 +158,7 @@ pub fn resolve_hir(hir: &mut HirFile, sg: &ScopeGraph) {
             hir.bodies[*body].diagnostics.push(hir::body::Diagnostic {
                 code: "E0050",
                 severity: hir::body::Severity::Error,
-                message: format!("unresolved name: `{}`", path_text),
+                message: format!("unresolved name: `{path_text}`"),
                 labels: vec![hir::body::SourceLabel {
                     range,
                     message: String::new(),
@@ -178,7 +187,7 @@ fn write_resolution(hir: &mut HirFile, origin: RefOrigin, resolved_name: Resolve
     }
 }
 
-fn def_to_resolved_name(def: &DefRef) -> ResolvedName {
+const fn def_to_resolved_name(def: &DefRef) -> ResolvedName {
     match def {
         DefRef::Function(fid) => ResolvedName::Function(*fid),
         DefRef::Struct(sid) => ResolvedName::Struct(*sid),
@@ -193,8 +202,7 @@ fn def_to_resolved_name(def: &DefRef) -> ResolvedName {
             lambda: *lambda,
             index: *index,
         },
-        DefRef::ConstParam { .. } => ResolvedName::Unresolved,
-        DefRef::UseAlias { .. } => ResolvedName::Unresolved,
+        DefRef::ConstParam { .. } | DefRef::UseAlias { .. } => ResolvedName::Unresolved,
         DefRef::EnumVariant { enum_id, index } => ResolvedName::EnumVariant(*enum_id, *index),
     }
 }
@@ -214,15 +222,15 @@ fn resolve_from(
     }
 
     match &sg.nodes[node] {
-        Node::Scope(_) => resolve_scope(sg, node, stack, visited, fuel),
+        Node::Scope(_) => resolve_scope(sg, node, &stack, visited, fuel),
         Node::PopSymbol { name, define } => resolve_pop(sg, name, define, stack, visited, fuel),
         Node::JumpToScope { target } => resolve_from(sg, *target, stack, visited, fuel - 1),
         Node::PushSymbol { name } => {
             let mut next_stack = stack;
             next_stack.push(name.clone());
-            resolve_out_edges(sg, node, next_stack, visited, fuel)
+            resolve_out_edges(sg, node, &next_stack, visited, fuel)
         }
-        Node::Reference { .. } => resolve_out_edges(sg, node, stack, visited, fuel),
+        Node::Reference { .. } => resolve_out_edges(sg, node, &stack, visited, fuel),
         Node::Tombstone => vec![],
     }
 }
@@ -230,7 +238,7 @@ fn resolve_from(
 fn resolve_scope(
     sg: &ScopeGraph,
     scope: NodeId,
-    stack: Vec<Name>,
+    stack: &[Name],
     visited: &mut HashSet<(NodeId, Vec<Name>)>,
     fuel: u32,
 ) -> Vec<DefRef> {
@@ -243,7 +251,7 @@ fn resolve_scope(
     let mut results = Vec::new();
 
     let mut eids = out.clone();
-    eids.sort_by_key(|eid| -(sg.edges[*eid].precedence as i32));
+    eids.sort_by_key(|eid| -i32::from(sg.edges[*eid].precedence));
 
     for eid in &eids {
         let edge = sg.edges[*eid];
@@ -258,7 +266,13 @@ fn resolve_scope(
         }
 
         matching_def_seen = true;
-        results.extend(resolve_from(sg, edge.to, stack.clone(), visited, fuel - 1));
+        results.extend(resolve_from(
+            sg,
+            edge.to,
+            stack.to_owned(),
+            visited,
+            fuel - 1,
+        ));
     }
 
     if matching_def_seen {
@@ -269,7 +283,13 @@ fn resolve_scope(
         let edge = sg.edges[eid];
         match edge.kind {
             EdgeKind::Lex | EdgeKind::Export => {
-                results.extend(resolve_from(sg, edge.to, stack.clone(), visited, fuel - 1));
+                results.extend(resolve_from(
+                    sg,
+                    edge.to,
+                    stack.to_owned(),
+                    visited,
+                    fuel - 1,
+                ));
             }
             EdgeKind::Def => {}
         }
@@ -302,13 +322,6 @@ fn resolve_pop(
             // first and then push `[bar, foo]`; the next lookup will match `foo` first.
             remaining.extend(rewrite_to.iter().rev().cloned());
             resolve_from(sg, *anchor, remaining, visited, fuel - 1)
-        }
-        DefRef::PatternBinding { .. } => {
-            if remaining.is_empty() {
-                vec![define.clone()]
-            } else {
-                vec![]
-            }
         }
         DefRef::Module { enter, .. } => {
             if remaining.is_empty() {
@@ -349,7 +362,7 @@ fn resolve_pop(
 fn resolve_out_edges(
     sg: &ScopeGraph,
     node: NodeId,
-    stack: Vec<Name>,
+    stack: &[Name],
     visited: &mut HashSet<(NodeId, Vec<Name>)>,
     fuel: u32,
 ) -> Vec<DefRef> {
@@ -359,11 +372,17 @@ fn resolve_out_edges(
 
     let mut results = Vec::new();
     let mut eids = out.clone();
-    eids.sort_by_key(|eid| -(sg.edges[*eid].precedence as i32));
+    eids.sort_by_key(|eid| -i32::from(sg.edges[*eid].precedence));
 
     for eid in eids {
         let edge = sg.edges[eid];
-        results.extend(resolve_from(sg, edge.to, stack.clone(), visited, fuel - 1));
+        results.extend(resolve_from(
+            sg,
+            edge.to,
+            stack.to_owned(),
+            visited,
+            fuel - 1,
+        ));
     }
 
     results

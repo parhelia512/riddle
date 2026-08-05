@@ -111,9 +111,19 @@ fn position(source: &str, offset: usize) -> Position {
     let prefix = &source[..offset];
     let line_start = prefix.rfind('\n').map_or(0, |newline| newline + 1);
     Position::new(
-        prefix.bytes().filter(|byte| *byte == b'\n').count() as u32,
-        source[line_start..offset].encode_utf16().count() as u32,
+        u32::try_from(prefix.bytes().filter(|byte| *byte == b'\n').count())
+            .expect("test line should fit in u32"),
+        u32::try_from(source[line_start..offset].encode_utf16().count())
+            .expect("test column should fit in u32"),
     )
+}
+
+fn text_size(value: usize) -> rowan::TextSize {
+    rowan::TextSize::from(u32::try_from(value).expect("test offset should fit in u32"))
+}
+
+fn text_range(start: usize, end: usize) -> TextRange {
+    TextRange::new(text_size(start), text_size(end))
 }
 
 fn range(source: &str, range: TextRange) -> Range {

@@ -9,7 +9,7 @@ use crate::{
 fn incremental_impl_method_body_rebuilds_resolution() {
     let mut parser = IncrementalParser::new();
     parser.set_source(
-        r#"
+        r"
         struct S {}
 
         impl S {
@@ -17,7 +17,7 @@ fn incremental_impl_method_body_rebuilds_resolution() {
                 arg;
             }
         }
-        "#,
+        ",
     );
 
     let (_, sg) = build_incremental_graph(&parser);
@@ -42,12 +42,12 @@ fn incremental_impl_method_body_rebuilds_resolution() {
 fn incremental_multi_edit_local_shadowing_rebuilds_statement_chain() {
     let mut parser = IncrementalParser::new();
     parser.set_source(
-        r#"
+        r"
         fun f(value: int) {
             let left = value;
             left;
         }
-        "#,
+        ",
     );
 
     let (_, sg) = build_incremental_graph(&parser);
@@ -80,7 +80,7 @@ fn incremental_multi_edit_local_shadowing_rebuilds_statement_chain() {
 fn incremental_multi_edit_inline_module_definition_updates_path_resolution() {
     let mut parser = IncrementalParser::new();
     parser.set_source(
-        r#"
+        r"
         fun f() {
             mod local {
                 pub struct Hidden {}
@@ -88,7 +88,7 @@ fn incremental_multi_edit_inline_module_definition_updates_path_resolution() {
 
             local::Thing;
         }
-        "#,
+        ",
     );
 
     let (_, sg) = build_incremental_graph(&parser);
@@ -115,7 +115,7 @@ fn incremental_multi_edit_inline_module_definition_updates_path_resolution() {
 fn incremental_multi_edit_use_alias_retargets_resolution() {
     let mut parser = IncrementalParser::new();
     parser.set_source(
-        r#"
+        r"
         mod a {
             pub struct Left {}
             pub struct Right {}
@@ -126,7 +126,7 @@ fn incremental_multi_edit_use_alias_retargets_resolution() {
         fun f() {
             Pick;
         }
-        "#,
+        ",
     );
 
     let (hir, sg) = build_incremental_graph(&parser);

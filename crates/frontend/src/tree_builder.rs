@@ -13,22 +13,25 @@ pub struct Parse {
 }
 
 impl Parse {
+    #[must_use]
     pub fn syntax(&self) -> SyntaxNode {
         SyntaxNode::new_root(self.green.clone())
     }
 
+    #[must_use]
     pub fn debug_tree(&self) -> String {
         format!("{:#?}", self.syntax())
     }
 }
 
+#[must_use]
 pub fn append_parse(left: &Parse, separator: &str, right: &Parse) -> Parse {
     let index = left.green.children().count();
     let children = std::iter::once(NodeOrToken::Token(GreenToken::new(
         RiddleLang::kind_to_raw(SyntaxKind::Whitespace),
         separator,
     )))
-    .chain(right.green.children().map(|child| child.to_owned()));
+    .chain(right.green.children().map(rowan::NodeOrToken::to_owned));
     let offset = left.green.text_len() + TextSize::of(separator);
     let mut errors = left.errors.clone();
     errors.extend(right.errors.iter().cloned().map(|mut error| {
@@ -41,9 +44,10 @@ pub fn append_parse(left: &Parse, separator: &str, right: &Parse) -> Parse {
     }
 }
 
+#[must_use]
 pub fn build_tree(
-    events: Vec<Event>,
-    tokens: Vec<Token>,
+    events: &[Event],
+    tokens: &[Token],
     source: &str,
     errors: Vec<ParseError>,
 ) -> Parse {

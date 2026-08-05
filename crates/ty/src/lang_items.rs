@@ -63,6 +63,7 @@ pub enum LangItem {
 
 impl LangItem {
     /// Parses the string value of a `#[lang = "..."]` attribute.
+    #[must_use]
     pub fn from_name(s: &str) -> Option<Self> {
         Some(match s {
             "drop" => Self::Drop,
@@ -101,7 +102,8 @@ impl LangItem {
     }
 
     /// The canonical string form used in `#[lang = "..."]`.
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Drop => "drop",
             Self::Copy => "copy",
@@ -139,13 +141,10 @@ impl LangItem {
 
     /// Whether this lang item governs a composite (tuple/array structural)
     /// derivation rule. Returns `(is_binary_rhs)` for the subset that do.
-    pub(crate) fn composite_kind(self) -> Option<CompositeKind> {
+    pub(crate) const fn composite_kind(self) -> Option<CompositeKind> {
         Some(match self {
-            Self::Copy => CompositeKind::Same,
-            Self::Eq => CompositeKind::Same,
-            Self::Ord => CompositeKind::Same,
-            Self::PartialEq => CompositeKind::Binary,
-            Self::PartialOrd => CompositeKind::Binary,
+            Self::Copy | Self::Eq | Self::Ord => CompositeKind::Same,
+            Self::PartialEq | Self::PartialOrd => CompositeKind::Binary,
             _ => return None,
         })
     }
@@ -167,7 +166,7 @@ pub(crate) enum CompositeKind {
 #[derive(Debug, Clone, Default)]
 pub struct LangItemRegistry {
     items: HashMap<LangItem, TraitId>,
-    /// Reverse map: TraitId → LangItem, populated in lock-step.
+    /// Reverse map: `TraitId` → `LangItem`, populated in lock-step.
     by_trait: HashMap<TraitId, LangItem>,
 }
 
@@ -184,16 +183,19 @@ pub enum RegisterResult {
 }
 
 impl LangItemRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Looks up the `TraitId` for a lang item.
+    #[must_use]
     pub fn get(&self, item: LangItem) -> Option<TraitId> {
         self.items.get(&item).copied()
     }
 
     /// Looks up the `LangItem` for a trait id (reverse direction).
+    #[must_use]
     pub fn lang_of(&self, id: TraitId) -> Option<LangItem> {
         self.by_trait.get(&id).copied()
     }

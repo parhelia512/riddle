@@ -1,6 +1,11 @@
-use super::*;
+use super::{
+    BinOp, Body, Builder, CaptureSource, CmpOp, DropProjection, DropSlot, ExprId, HashMap, HashSet,
+    Inst, InstKind, IntTy, LiteralPattern, LowerCtx, MatchArm, MatchBindingInput, PatId, Pattern,
+    PatternBindingId, PatternBindingMode, PatternBindingValue, Type, TypePattern, UnOp, Value,
+    parse_float_suffix, parse_int_suffix,
+};
 
-impl<'a> LowerCtx<'a> {
+impl LowerCtx<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn lower_match_expr(
         &mut self,
@@ -94,12 +99,11 @@ impl<'a> LowerCtx<'a> {
         builder.switch_to_block(next_test);
         builder.set_unreachable();
         builder.switch_to_block(merge_block);
-        match phi_args.len() {
-            0 => builder.unit_const(),
-            _ => {
-                let phi = Inst::new(InstKind::Phi(phi_args), result_ty);
-                builder.func.push_inst(merge_block, phi)
-            }
+        if phi_args.is_empty() {
+            builder.unit_const()
+        } else {
+            let phi = Inst::new(InstKind::Phi(phi_args), result_ty);
+            builder.func.push_inst(merge_block, phi)
         }
     }
 
@@ -132,7 +136,7 @@ impl<'a> LowerCtx<'a> {
                 else {
                     return None;
                 };
-                Some(self.lower_variant_tag_condition(
+                Some(Self::lower_variant_tag_condition(
                     builder,
                     value,
                     enum_id,
@@ -143,106 +147,10 @@ impl<'a> LowerCtx<'a> {
             Pattern::Struct { ref fields, .. }
                 if matches!(value_ty, type_checker::Type::Struct(_, _)) =>
             {
-                let type_checker::Type::Struct(struct_id, args) = value_ty else {
-                    unreachable!();
-                };
-                let field_types = self.struct_pattern_field_types(*struct_id, args);
-                let mut condition = None;
-                for field in fields {
-                    let Some(child) = field.pat else {
-                        continue;
-                    };
-                    let Some((index, (_, child_ty))) = field_types
-                        .iter()
-                        .enumerate()
-                        .find(|(_, (name, _))| *name == field.name.0)
-                    else {
-                        continue;
-                    };
-                    let child_value =
-                        builder.extract_value(value, index, self.convert_type(child_ty));
-                    let child_condition =
-                        self.lower_pattern_condition(builder, body, child, child_value, child_ty);
-                    condition = self.and_pattern_conditions(builder, condition, child_condition);
-                }
-                condition
+                self.lower_struct_pattern_condition(builder, body, value, value_ty, fields)
             }
-            Pattern::Path { ref path }
-            | Pattern::TupleStruct { ref path, .. }
-            | Pattern::Struct { ref path, .. } => {
-                let name = path.segments.last().map(|name| name.0.as_str());
-                let TypePattern::EnumVariant {
-                    enum_id,
-                    variant_index,
-                    args,
-                } = self.classify_type_pattern(value_ty, name)
-                else {
-                    return Some(builder.bconst(false));
-                };
-                let mut condition = Some(self.lower_variant_tag_condition(
-                    builder,
-                    value,
-                    enum_id,
-                    variant_index,
-                    &args,
-                ));
-                let payloads = self.enum_variant_payload_types(enum_id, &args, variant_index);
-                let offset =
-                    self.enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
-
-                match pattern {
-                    Pattern::TupleStruct { elements, .. } => {
-                        for (index, child) in elements.into_iter().enumerate() {
-                            let Some((_, child_ty)) = payloads.get(index) else {
-                                break;
-                            };
-                            let child_value = builder.extract_value(
-                                value,
-                                1 + offset + index,
-                                self.convert_type(child_ty),
-                            );
-                            let child_condition = self.lower_pattern_condition(
-                                builder,
-                                body,
-                                child,
-                                child_value,
-                                child_ty,
-                            );
-                            condition =
-                                self.and_pattern_conditions(builder, condition, child_condition);
-                        }
-                    }
-                    Pattern::Struct { fields, .. } => {
-                        for field in fields {
-                            let Some(child) = field.pat else {
-                                continue;
-                            };
-                            let Some((index, (_, child_ty))) = payloads
-                                .iter()
-                                .enumerate()
-                                .find(|(_, (name, _))| name.as_deref() == Some(&field.name.0))
-                            else {
-                                continue;
-                            };
-                            let child_value = builder.extract_value(
-                                value,
-                                1 + offset + index,
-                                self.convert_type(child_ty),
-                            );
-                            let child_condition = self.lower_pattern_condition(
-                                builder,
-                                body,
-                                child,
-                                child_value,
-                                child_ty,
-                            );
-                            condition =
-                                self.and_pattern_conditions(builder, condition, child_condition);
-                        }
-                    }
-                    _ => {}
-                }
-                condition
+            Pattern::Path { .. } | Pattern::TupleStruct { .. } | Pattern::Struct { .. } => {
+                self.lower_enum_pattern_condition(builder, body, value, value_ty, pattern)
             }
             Pattern::Literal(literal) => {
                 let literal_value = self.lower_literal_pattern(builder, &literal, value_ty);
@@ -254,27 +162,145 @@ impl<'a> LowerCtx<'a> {
                 None
             }
             Pattern::Tuple { elements } => {
-                let type_checker::Type::Tuple(element_types) = value_ty else {
-                    return Some(builder.bconst(false));
-                };
-                let mut condition = None;
-                for (index, child) in elements.into_iter().enumerate() {
-                    let Some(child_ty) = element_types.get(index) else {
-                        break;
-                    };
-                    let child_value =
-                        builder.extract_value(value, index, self.convert_type(child_ty));
-                    let child_condition =
-                        self.lower_pattern_condition(builder, body, child, child_value, child_ty);
-                    condition = self.and_pattern_conditions(builder, condition, child_condition);
-                }
-                condition
+                self.lower_tuple_pattern_condition(builder, body, value, value_ty, elements)
             }
         }
     }
 
+    fn lower_struct_pattern_condition(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        value: Value,
+        value_ty: &type_checker::Type,
+        fields: &[hir::body::FieldPat],
+    ) -> Option<Value> {
+        let type_checker::Type::Struct(struct_id, args) = value_ty else {
+            unreachable!();
+        };
+        let field_types = self.struct_pattern_field_types(*struct_id, args);
+        let mut condition = None;
+        for field in fields {
+            let Some(child) = field.pat else {
+                continue;
+            };
+            let Some((index, (_, child_ty))) = field_types
+                .iter()
+                .enumerate()
+                .find(|(_, (name, _))| *name == field.name.0)
+            else {
+                continue;
+            };
+            let child_value = builder.extract_value(value, index, self.convert_type(child_ty));
+            let child_condition =
+                self.lower_pattern_condition(builder, body, child, child_value, child_ty);
+            condition = Self::and_pattern_conditions(builder, condition, child_condition);
+        }
+        condition
+    }
+
+    fn lower_enum_pattern_condition(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        value: Value,
+        value_ty: &type_checker::Type,
+        pattern: Pattern,
+    ) -> Option<Value> {
+        let (Pattern::Path { path }
+        | Pattern::TupleStruct { path, .. }
+        | Pattern::Struct { path, .. }) = &pattern
+        else {
+            unreachable!();
+        };
+        let name = path.segments.last().map(|name| name.0.as_str());
+        let TypePattern::EnumVariant {
+            enum_id,
+            variant_index,
+            args,
+        } = self.classify_type_pattern(value_ty, name)
+        else {
+            return Some(builder.bconst(false));
+        };
+        let mut condition = Some(Self::lower_variant_tag_condition(
+            builder,
+            value,
+            enum_id,
+            variant_index,
+            &args,
+        ));
+        let payloads = self.enum_variant_payload_types(enum_id, &args, variant_index);
+        let offset = Self::enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
+
+        match pattern {
+            Pattern::TupleStruct { elements, .. } => {
+                for (index, child) in elements.into_iter().enumerate() {
+                    let Some((_, child_ty)) = payloads.get(index) else {
+                        break;
+                    };
+                    let child_value = builder.extract_value(
+                        value,
+                        1 + offset + index,
+                        self.convert_type(child_ty),
+                    );
+                    let child_condition =
+                        self.lower_pattern_condition(builder, body, child, child_value, child_ty);
+                    condition = Self::and_pattern_conditions(builder, condition, child_condition);
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for field in fields {
+                    let Some(child) = field.pat else {
+                        continue;
+                    };
+                    let Some((index, (_, child_ty))) = payloads
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (name, _))| name.as_deref() == Some(&field.name.0))
+                    else {
+                        continue;
+                    };
+                    let child_value = builder.extract_value(
+                        value,
+                        1 + offset + index,
+                        self.convert_type(child_ty),
+                    );
+                    let child_condition =
+                        self.lower_pattern_condition(builder, body, child, child_value, child_ty);
+                    condition = Self::and_pattern_conditions(builder, condition, child_condition);
+                }
+            }
+            Pattern::Path { .. } => {}
+            _ => unreachable!(),
+        }
+        condition
+    }
+
+    fn lower_tuple_pattern_condition(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        value: Value,
+        value_ty: &type_checker::Type,
+        elements: Vec<PatId>,
+    ) -> Option<Value> {
+        let type_checker::Type::Tuple(element_types) = value_ty else {
+            return Some(builder.bconst(false));
+        };
+        let mut condition = None;
+        for (index, child) in elements.into_iter().enumerate() {
+            let Some(child_ty) = element_types.get(index) else {
+                break;
+            };
+            let child_value = builder.extract_value(value, index, self.convert_type(child_ty));
+            let child_condition =
+                self.lower_pattern_condition(builder, body, child, child_value, child_ty);
+            condition = Self::and_pattern_conditions(builder, condition, child_condition);
+        }
+        condition
+    }
+
     pub(super) fn lower_variant_tag_condition(
-        &self,
         builder: &mut Builder,
         value: Value,
         _enum_id: hir::item_tree::EnumId,
@@ -287,7 +313,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(super) fn and_pattern_conditions(
-        &self,
         builder: &mut Builder,
         lhs: Option<Value>,
         rhs: Option<Value>,
@@ -326,7 +351,6 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn push_match_pattern_bindings(
         &mut self,
         builder: &mut Builder,
@@ -340,35 +364,45 @@ impl<'a> LowerCtx<'a> {
         self.collect_match_pattern_bindings(
             builder,
             body,
-            pat,
-            value,
-            place,
-            value_ty,
-            Vec::new(),
+            MatchBindingInput {
+                pat,
+                value,
+                place,
+                value_ty,
+                projection: Vec::new(),
+            },
             &mut scope,
         );
         self.pattern_bindings.push(scope);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn collect_match_pattern_bindings(
         &mut self,
         builder: &mut Builder,
         body: &Body,
-        pat: PatId,
-        value: Value,
-        place: Option<Value>,
-        value_ty: &type_checker::Type,
-        projection: Vec<DropProjection>,
+        input: MatchBindingInput<'_>,
         scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
     ) {
+        let MatchBindingInput {
+            pat,
+            value,
+            place,
+            value_ty,
+            projection,
+        } = input;
         let (value, place, value_ty) =
             self.adjust_pattern_value(builder, pat, value, place, value_ty);
-        let value_ty = &value_ty;
+        let input = MatchBindingInput {
+            pat,
+            value,
+            place,
+            value_ty: &value_ty,
+            projection,
+        };
         match body.pats[pat].clone() {
             Pattern::Binding { name, .. } => {
                 if !matches!(
-                    self.classify_type_pattern(value_ty, Some(&name.0)),
+                    self.classify_type_pattern(input.value_ty, Some(&name.0)),
                     TypePattern::EnumVariant { .. }
                 ) {
                     self.insert_match_pattern_binding(
@@ -377,222 +411,217 @@ impl<'a> LowerCtx<'a> {
                             pattern: pat,
                             field: None,
                         },
-                        value,
-                        place,
-                        value_ty,
-                        projection,
+                        input,
                         scope,
                     );
                 }
             }
             Pattern::Reference { pattern, .. } => {
-                let type_checker::Type::Ref(inner, _) = value_ty else {
+                let type_checker::Type::Ref(inner, _) = input.value_ty else {
                     return;
                 };
-                let inner_value = builder.load(value, self.convert_type(inner));
+                let inner_value = builder.load(input.value, self.convert_type(inner));
                 self.collect_match_pattern_bindings(
                     builder,
                     body,
-                    pattern,
-                    inner_value,
-                    None,
-                    inner,
-                    projection,
+                    MatchBindingInput {
+                        pat: pattern,
+                        value: inner_value,
+                        place: None,
+                        value_ty: inner,
+                        projection: input.projection,
+                    },
                     scope,
                 );
             }
             Pattern::Tuple { elements } => {
-                let type_checker::Type::Tuple(element_types) = value_ty else {
-                    return;
-                };
-                for (index, child) in elements.into_iter().enumerate() {
-                    let Some(child_ty) = element_types.get(index) else {
-                        break;
-                    };
-                    let child_value =
-                        builder.extract_value(value, index, self.convert_type(child_ty));
-                    let child_place = place
-                        .map(|place| builder.field_ptr(place, index, self.convert_type(child_ty)));
-                    let mut child_projection = projection.clone();
-                    child_projection.push(DropProjection::Field(index));
-                    self.collect_match_pattern_bindings(
-                        builder,
-                        body,
-                        child,
-                        child_value,
-                        child_place,
-                        child_ty,
-                        child_projection,
-                        scope,
-                    );
-                }
+                self.collect_tuple_pattern_bindings(builder, body, &input, elements, scope);
             }
-            Pattern::TupleStruct { path, elements } => {
-                let name = path.segments.last().map(|name| name.0.as_str());
-                let TypePattern::EnumVariant {
-                    enum_id,
-                    variant_index,
-                    args,
-                } = self.classify_type_pattern(value_ty, name)
-                else {
-                    return;
-                };
-                let payloads = self.enum_variant_payload_types(enum_id, &args, variant_index);
-                let offset =
-                    self.enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
-                for (index, child) in elements.into_iter().enumerate() {
-                    let Some((_, child_ty)) = payloads.get(index) else {
-                        break;
-                    };
-                    let child_value = builder.extract_value(
-                        value,
-                        1 + offset + index,
-                        self.convert_type(child_ty),
-                    );
-                    let field_index = 1 + offset + index;
-                    let child_place = place.map(|place| {
-                        builder.field_ptr(place, field_index, self.convert_type(child_ty))
-                    });
-                    let mut child_projection = projection.clone();
-                    child_projection.push(DropProjection::Field(field_index));
-                    self.collect_match_pattern_bindings(
-                        builder,
-                        body,
-                        child,
-                        child_value,
-                        child_place,
-                        child_ty,
-                        child_projection,
-                        scope,
-                    );
-                }
-            }
+            Pattern::TupleStruct { path, elements } => self.collect_tuple_struct_pattern_bindings(
+                builder, body, &input, &path, elements, scope,
+            ),
             Pattern::Struct { path, fields } => {
-                if let type_checker::Type::Struct(struct_id, args) = value_ty {
-                    let field_types = self.struct_pattern_field_types(*struct_id, args);
-                    for (binding_index, field) in fields.into_iter().enumerate() {
-                        let Some((index, (_, child_ty))) = field_types
-                            .iter()
-                            .enumerate()
-                            .find(|(_, (name, _))| *name == field.name.0)
-                        else {
-                            continue;
-                        };
-                        let child_value =
-                            builder.extract_value(value, index, self.convert_type(child_ty));
-                        let child_place = place.map(|place| {
-                            builder.field_ptr(place, index, self.convert_type(child_ty))
-                        });
-                        let mut child_projection = projection.clone();
-                        child_projection.push(DropProjection::Field(index));
-                        if let Some(child) = field.pat {
-                            self.collect_match_pattern_bindings(
-                                builder,
-                                body,
-                                child,
-                                child_value,
-                                child_place,
-                                child_ty,
-                                child_projection,
-                                scope,
-                            );
-                        } else {
-                            self.insert_match_pattern_binding(
-                                builder,
-                                PatternBindingId {
-                                    pattern: pat,
-                                    field: Some(binding_index),
-                                },
-                                child_value,
-                                child_place,
-                                child_ty,
-                                child_projection,
-                                scope,
-                            );
-                        }
-                    }
-                    return;
-                }
-                let name = path.segments.last().map(|name| name.0.as_str());
-                let TypePattern::EnumVariant {
-                    enum_id,
-                    variant_index,
-                    args,
-                } = self.classify_type_pattern(value_ty, name)
-                else {
-                    return;
-                };
-                let payloads = self.enum_variant_payload_types(enum_id, &args, variant_index);
-                let offset =
-                    self.enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
-                for (binding_index, field) in fields.into_iter().enumerate() {
-                    let Some((index, (_, child_ty))) = payloads
-                        .iter()
-                        .enumerate()
-                        .find(|(_, (name, _))| name.as_deref() == Some(&field.name.0))
-                    else {
-                        continue;
-                    };
-                    let child_value = builder.extract_value(
-                        value,
-                        1 + offset + index,
-                        self.convert_type(child_ty),
-                    );
-                    let field_index = 1 + offset + index;
-                    let child_place = place.map(|place| {
-                        builder.field_ptr(place, field_index, self.convert_type(child_ty))
-                    });
-                    let mut child_projection = projection.clone();
-                    child_projection.push(DropProjection::Field(field_index));
-                    if let Some(child) = field.pat {
-                        self.collect_match_pattern_bindings(
-                            builder,
-                            body,
-                            child,
-                            child_value,
-                            child_place,
-                            child_ty,
-                            child_projection,
-                            scope,
-                        );
-                    } else {
-                        self.insert_match_pattern_binding(
-                            builder,
-                            PatternBindingId {
-                                pattern: pat,
-                                field: Some(binding_index),
-                            },
-                            child_value,
-                            child_place,
-                            child_ty,
-                            child_projection,
-                            scope,
-                        );
-                    }
-                }
+                self.collect_struct_pattern_bindings(builder, body, &input, &path, fields, scope);
             }
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn insert_match_pattern_binding(
+    fn collect_tuple_pattern_bindings(
         &mut self,
         builder: &mut Builder,
+        body: &Body,
+        input: &MatchBindingInput<'_>,
+        elements: Vec<PatId>,
+        scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
+    ) {
+        let type_checker::Type::Tuple(element_types) = input.value_ty else {
+            return;
+        };
+        for (index, child) in elements.into_iter().enumerate() {
+            let Some(child_ty) = element_types.get(index) else {
+                break;
+            };
+            let child_value =
+                builder.extract_value(input.value, index, self.convert_type(child_ty));
+            let child_place = input
+                .place
+                .map(|place| builder.field_ptr(place, index, self.convert_type(child_ty)));
+            let mut projection = input.projection.clone();
+            projection.push(DropProjection::Field(index));
+            self.collect_match_pattern_bindings(
+                builder,
+                body,
+                MatchBindingInput {
+                    pat: child,
+                    value: child_value,
+                    place: child_place,
+                    value_ty: child_ty,
+                    projection,
+                },
+                scope,
+            );
+        }
+    }
+
+    fn collect_tuple_struct_pattern_bindings(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        input: &MatchBindingInput<'_>,
+        path: &hir::item_tree::HirPath,
+        elements: Vec<PatId>,
+        scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
+    ) {
+        let name = path.segments.last().map(|name| name.0.as_str());
+        let TypePattern::EnumVariant {
+            enum_id,
+            variant_index,
+            args,
+        } = self.classify_type_pattern(input.value_ty, name)
+        else {
+            return;
+        };
+        let payloads = self.enum_variant_payload_types(enum_id, &args, variant_index);
+        let offset = Self::enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
+        for (index, child) in elements.into_iter().enumerate() {
+            let Some((_, child_ty)) = payloads.get(index) else {
+                break;
+            };
+            let field_index = 1 + offset + index;
+            let child_value =
+                builder.extract_value(input.value, field_index, self.convert_type(child_ty));
+            let child_place = input
+                .place
+                .map(|place| builder.field_ptr(place, field_index, self.convert_type(child_ty)));
+            let mut projection = input.projection.clone();
+            projection.push(DropProjection::Field(field_index));
+            self.collect_match_pattern_bindings(
+                builder,
+                body,
+                MatchBindingInput {
+                    pat: child,
+                    value: child_value,
+                    place: child_place,
+                    value_ty: child_ty,
+                    projection,
+                },
+                scope,
+            );
+        }
+    }
+
+    fn collect_struct_pattern_bindings(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        input: &MatchBindingInput<'_>,
+        path: &hir::item_tree::HirPath,
+        fields: Vec<hir::body::FieldPat>,
+        scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
+    ) {
+        let (payloads, offset) = if let type_checker::Type::Struct(struct_id, args) = input.value_ty
+        {
+            (
+                self.struct_pattern_field_types(*struct_id, args)
+                    .into_iter()
+                    .map(|(name, ty)| (Some(name), ty))
+                    .collect::<Vec<_>>(),
+                0,
+            )
+        } else {
+            let name = path.segments.last().map(|name| name.0.as_str());
+            let TypePattern::EnumVariant {
+                enum_id,
+                variant_index,
+                args,
+            } = self.classify_type_pattern(input.value_ty, name)
+            else {
+                return;
+            };
+            (
+                self.enum_variant_payload_types(enum_id, &args, variant_index),
+                1 + Self::enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index),
+            )
+        };
+        for (binding_index, field) in fields.into_iter().enumerate() {
+            let Some((index, (_, child_ty))) = payloads
+                .iter()
+                .enumerate()
+                .find(|(_, (name, _))| name.as_deref() == Some(&field.name.0))
+            else {
+                continue;
+            };
+            let field_index = offset + index;
+            let child_value =
+                builder.extract_value(input.value, field_index, self.convert_type(child_ty));
+            let child_place = input
+                .place
+                .map(|place| builder.field_ptr(place, field_index, self.convert_type(child_ty)));
+            let mut projection = input.projection.clone();
+            projection.push(DropProjection::Field(field_index));
+            let child_input = MatchBindingInput {
+                pat: field.pat.unwrap_or(input.pat),
+                value: child_value,
+                place: child_place,
+                value_ty: child_ty,
+                projection,
+            };
+            if field.pat.is_some() {
+                self.collect_match_pattern_bindings(builder, body, child_input, scope);
+            } else {
+                self.insert_match_pattern_binding(
+                    builder,
+                    PatternBindingId {
+                        pattern: input.pat,
+                        field: Some(binding_index),
+                    },
+                    child_input,
+                    scope,
+                );
+            }
+        }
+    }
+
+    fn insert_match_pattern_binding(
+        &self,
+        builder: &mut Builder,
         id: PatternBindingId,
-        value: Value,
-        place: Option<Value>,
-        value_ty: &type_checker::Type,
-        projection: Vec<DropProjection>,
+        input: MatchBindingInput<'_>,
         scope: &mut HashMap<PatternBindingId, PatternBindingValue>,
     ) {
         let mode = self.pattern_binding_mode(id);
-        let binding_ty = self.pattern_binding_type(id, value_ty);
+        let binding_ty = self.pattern_binding_type(id, input.value_ty);
         let mir_ty = self.convert_type(&binding_ty);
         let (value, place) = match mode {
-            PatternBindingMode::Move => (value, place),
+            PatternBindingMode::Move => (input.value, input.place),
             PatternBindingMode::Ref | PatternBindingMode::RefMut => {
-                let place = self.materialize_pattern_place(builder, value, place, value_ty);
+                let place = self.materialize_pattern_place(
+                    builder,
+                    input.value,
+                    input.place,
+                    input.value_ty,
+                );
                 let op = if mode == PatternBindingMode::RefMut {
                     UnOp::MutRef
                 } else {
@@ -603,12 +632,12 @@ impl<'a> LowerCtx<'a> {
         };
         scope.insert(
             id,
-            PatternBindingValue::direct(value, mir_ty, binding_ty, place, projection),
+            PatternBindingValue::direct(value, mir_ty, binding_ty, place, input.projection),
         );
     }
 
     pub(super) fn adjust_pattern_value(
-        &mut self,
+        &self,
         builder: &mut Builder,
         pat: PatId,
         mut value: Value,
@@ -751,7 +780,7 @@ impl<'a> LowerCtx<'a> {
             .collect::<Vec<_>>();
         let flags = slots
             .iter()
-            .map(|slot| self.drop_slot_flag_place(builder, slot))
+            .map(|slot| Self::drop_slot_flag_place(builder, slot))
             .collect::<HashSet<_>>();
         for flag in flags {
             let inactive = builder.bconst(false);
@@ -767,7 +796,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(super) fn create_pattern_owner_slots(
-        &mut self,
+        &self,
         builder: &mut Builder,
         body: &Body,
         pat: PatId,
@@ -798,7 +827,7 @@ impl<'a> LowerCtx<'a> {
         };
 
         let fields = self.enum_variant_payload_types(enum_id, &args, variant_index);
-        let offset = self.enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
+        let offset = Self::enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
         let mut slots = Vec::new();
         for (index, (_, field_ty)) in fields.into_iter().enumerate() {
             if !self.type_needs_drop(&field_ty, 0) {
@@ -831,12 +860,13 @@ impl<'a> LowerCtx<'a> {
             .variants
             .iter()
             .position(|variant| variant.name.0 == name)
-            .map(|variant_index| TypePattern::EnumVariant {
-                enum_id: *enum_id,
-                variant_index,
-                args: args.clone(),
+            .map_or(TypePattern::Other, |variant_index| {
+                TypePattern::EnumVariant {
+                    enum_id: *enum_id,
+                    variant_index,
+                    args: args.clone(),
+                }
             })
-            .unwrap_or(TypePattern::Other)
     }
 
     pub(super) fn enum_variant_payload_types(
@@ -905,61 +935,11 @@ impl<'a> LowerCtx<'a> {
         subst: &HashMap<String, type_checker::Type>,
     ) -> type_checker::Type {
         use hir::item_tree::{HirConstArg, HirTypeRef};
-        use type_checker::{ConstArg, FloatTy as TcFloatTy, IntTy as TcIntTy};
+        use type_checker::ConstArg;
 
         match ty {
             HirTypeRef::Never => type_checker::Type::Never,
-            HirTypeRef::Named(path) => {
-                let Some(name) = path.as_single_name().map(|name| name.0.as_str()) else {
-                    return type_checker::Type::Unknown;
-                };
-                if let Some(ty) = subst.get(name) {
-                    return ty.clone();
-                }
-                match name {
-                    "i8" => type_checker::Type::Int(TcIntTy::I8),
-                    "i16" => type_checker::Type::Int(TcIntTy::I16),
-                    "i32" => type_checker::Type::Int(TcIntTy::I32),
-                    "i64" => type_checker::Type::Int(TcIntTy::I64),
-                    "isize" => type_checker::Type::Int(TcIntTy::Isize),
-                    "u8" => type_checker::Type::Int(TcIntTy::U8),
-                    "u16" => type_checker::Type::Int(TcIntTy::U16),
-                    "u32" => type_checker::Type::Int(TcIntTy::U32),
-                    "u64" => type_checker::Type::Int(TcIntTy::U64),
-                    "usize" => type_checker::Type::Int(TcIntTy::Usize),
-                    "f32" => type_checker::Type::Float(TcFloatTy::F32),
-                    "f64" => type_checker::Type::Float(TcFloatTy::F64),
-                    "bool" => type_checker::Type::Bool,
-                    "str" => type_checker::Type::Str,
-                    "char" => type_checker::Type::Char,
-                    _ => {
-                        let args = path
-                            .type_args
-                            .iter()
-                            .map(|arg| self.lower_hir_type_for_pattern(arg, subst))
-                            .collect::<Vec<_>>();
-                        if let Some((id, _)) = self
-                            .hir
-                            .item_tree
-                            .structs
-                            .iter()
-                            .find(|(_, item)| item.name.0 == name)
-                        {
-                            type_checker::Type::Struct(id, args)
-                        } else if let Some((id, _)) = self
-                            .hir
-                            .item_tree
-                            .enums
-                            .iter()
-                            .find(|(_, item)| item.name.0 == name)
-                        {
-                            type_checker::Type::Enum(id, args)
-                        } else {
-                            type_checker::Type::Unknown
-                        }
-                    }
-                }
-            }
+            HirTypeRef::Named(path) => self.lower_named_hir_type_for_pattern(path, subst),
             HirTypeRef::Ref(inner, mutable) => type_checker::Type::Ref(
                 Box::new(self.lower_hir_type_for_pattern(inner, subst)),
                 *mutable,
@@ -996,53 +976,121 @@ impl<'a> LowerCtx<'a> {
                 HirConstArg::Unknown => ConstArg::Unknown,
                 HirConstArg::Error => ConstArg::Error,
             }),
-            HirTypeRef::ImplTrait {
-                trait_ty,
-                trait_range,
-                callable,
-                hidden,
-            } => {
-                if let Some(hidden) = hidden {
-                    return subst
-                        .get(&hidden.0)
-                        .cloned()
-                        .unwrap_or_else(|| type_checker::Type::Param(hidden.0.clone()));
-                }
-                let kind = match trait_ty.as_ref() {
-                    HirTypeRef::Named(path) => {
-                        match path.segments.last().map(|name| name.0.as_str()) {
-                            Some("Fn") => type_checker::ClosureKind::Fn,
-                            Some("FnMut") => type_checker::ClosureKind::FnMut,
-                            Some("FnOnce") => type_checker::ClosureKind::FnOnce,
-                            _ => return type_checker::Type::Unknown,
-                        }
-                    }
-                    _ => return type_checker::Type::Unknown,
-                };
-                let Some(callable) = callable else {
-                    return type_checker::Type::Unknown;
-                };
-                type_checker::Type::OpaqueCallable {
-                    id: type_checker::OpaqueCallableId(*trait_range),
-                    signature: type_checker::CallableSignature {
-                        is_unsafe: false,
-                        kind,
-                        params: callable
-                            .params
-                            .iter()
-                            .map(|param| self.lower_hir_type_for_pattern(param, subst))
-                            .collect(),
-                        ret: Box::new(self.lower_hir_type_for_pattern(&callable.ret, subst)),
-                    },
-                }
-            }
+            HirTypeRef::ImplTrait { .. } => self.lower_impl_trait_for_pattern(ty, subst),
             HirTypeRef::Unknown => type_checker::Type::Unknown,
             HirTypeRef::Error => type_checker::Type::Error,
         }
     }
 
+    fn lower_named_hir_type_for_pattern(
+        &self,
+        path: &hir::item_tree::HirPath,
+        subst: &HashMap<String, type_checker::Type>,
+    ) -> type_checker::Type {
+        use type_checker::{FloatTy as TcFloatTy, IntTy as TcIntTy};
+
+        let Some(name) = path.as_single_name().map(|name| name.0.as_str()) else {
+            return type_checker::Type::Unknown;
+        };
+        if let Some(ty) = subst.get(name) {
+            return ty.clone();
+        }
+        match name {
+            "i8" => type_checker::Type::Int(TcIntTy::I8),
+            "i16" => type_checker::Type::Int(TcIntTy::I16),
+            "i32" => type_checker::Type::Int(TcIntTy::I32),
+            "i64" => type_checker::Type::Int(TcIntTy::I64),
+            "isize" => type_checker::Type::Int(TcIntTy::Isize),
+            "u8" => type_checker::Type::Int(TcIntTy::U8),
+            "u16" => type_checker::Type::Int(TcIntTy::U16),
+            "u32" => type_checker::Type::Int(TcIntTy::U32),
+            "u64" => type_checker::Type::Int(TcIntTy::U64),
+            "usize" => type_checker::Type::Int(TcIntTy::Usize),
+            "f32" => type_checker::Type::Float(TcFloatTy::F32),
+            "f64" => type_checker::Type::Float(TcFloatTy::F64),
+            "bool" => type_checker::Type::Bool,
+            "str" => type_checker::Type::Str,
+            "char" => type_checker::Type::Char,
+            _ => {
+                let args = path
+                    .type_args
+                    .iter()
+                    .map(|arg| self.lower_hir_type_for_pattern(arg, subst))
+                    .collect::<Vec<_>>();
+                if let Some((id, _)) = self
+                    .hir
+                    .item_tree
+                    .structs
+                    .iter()
+                    .find(|(_, item)| item.name.0 == name)
+                {
+                    type_checker::Type::Struct(id, args)
+                } else if let Some((id, _)) = self
+                    .hir
+                    .item_tree
+                    .enums
+                    .iter()
+                    .find(|(_, item)| item.name.0 == name)
+                {
+                    type_checker::Type::Enum(id, args)
+                } else {
+                    type_checker::Type::Unknown
+                }
+            }
+        }
+    }
+
+    fn lower_impl_trait_for_pattern(
+        &self,
+        ty: &hir::item_tree::HirTypeRef,
+        subst: &HashMap<String, type_checker::Type>,
+    ) -> type_checker::Type {
+        use hir::item_tree::HirTypeRef;
+
+        let HirTypeRef::ImplTrait {
+            trait_ty,
+            trait_range,
+            callable,
+            hidden,
+        } = ty
+        else {
+            unreachable!();
+        };
+        if let Some(hidden) = hidden {
+            return subst
+                .get(&hidden.0)
+                .cloned()
+                .unwrap_or_else(|| type_checker::Type::Param(hidden.0.clone()));
+        }
+        let kind = match trait_ty.as_ref() {
+            HirTypeRef::Named(path) => match path.segments.last().map(|name| name.0.as_str()) {
+                Some("Fn") => type_checker::ClosureKind::Fn,
+                Some("FnMut") => type_checker::ClosureKind::FnMut,
+                Some("FnOnce") => type_checker::ClosureKind::FnOnce,
+                _ => return type_checker::Type::Unknown,
+            },
+            _ => return type_checker::Type::Unknown,
+        };
+        let Some(callable) = callable else {
+            return type_checker::Type::Unknown;
+        };
+        type_checker::Type::OpaqueCallable {
+            id: type_checker::OpaqueCallableId(*trait_range),
+            signature: type_checker::CallableSignature {
+                is_unsafe: false,
+                kind,
+                params: callable
+                    .params
+                    .iter()
+                    .map(|param| self.lower_hir_type_for_pattern(param, subst))
+                    .collect(),
+                ret: Box::new(self.lower_hir_type_for_pattern(&callable.ret, subst)),
+            },
+        }
+    }
+
     pub(super) fn lower_enum_variant_value(
-        &mut self,
+        &self,
         builder: &mut Builder,
         enum_id: hir::item_tree::EnumId,
         variant_index: usize,
@@ -1050,7 +1098,7 @@ impl<'a> LowerCtx<'a> {
         ty: Type,
     ) -> Value {
         let tag = builder.iconst(variant_index as u64, IntTy::U32);
-        let offset = self.enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
+        let offset = Self::enum_payload_offset(&self.hir.item_tree.enums[enum_id], variant_index);
         let mut fields = vec![(0, tag)];
         fields.extend(
             args.into_iter()
@@ -1061,7 +1109,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(super) fn enum_payload_offset(
-        &self,
         enum_data: &hir::item_tree::HirEnum,
         variant_index: usize,
     ) -> usize {
@@ -1080,7 +1127,7 @@ impl<'a> LowerCtx<'a> {
     /// Read a binding. `let` bindings live in `scope_map`; `match`/`for` arm
     /// bindings live in the arm-scoped `pattern_bindings` stack.
     pub(super) fn binding_value(
-        &mut self,
+        &self,
         builder: &mut Builder,
         id: PatternBindingId,
         ty: &Type,

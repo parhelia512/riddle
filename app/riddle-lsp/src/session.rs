@@ -88,7 +88,7 @@ impl AnalysisSessions {
         let session = self.projects.lock().unwrap().get(&root).cloned()?;
         let session = session
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         session
             .inputs_are_current(&overlays)
             .then(|| session.revision())
@@ -106,12 +106,11 @@ impl AnalysisSessions {
             .lock()
             .unwrap()
             .get(&root)
-            .map(|session| {
+            .map_or(0, |session| {
                 session
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .revision()
             })
-            .unwrap_or(0)
     }
 }

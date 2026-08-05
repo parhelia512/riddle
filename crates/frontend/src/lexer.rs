@@ -8,6 +8,7 @@ pub struct Token {
     pub span: std::ops::Range<usize>,
 }
 
+#[must_use]
 pub fn lex(input: &str) -> Vec<Token> {
     let mut tokens = vec![];
     let mut lexer = SyntaxKind::lexer(input);
@@ -15,10 +16,7 @@ pub fn lex(input: &str) -> Vec<Token> {
     while let Some(result) = lexer.next() {
         let kind = result.unwrap_or(SyntaxKind::ErrorNode);
         let span = lexer.span();
-        tokens.push(Token {
-            kind,
-            span: span.start..span.end,
-        });
+        tokens.push(Token { kind, span });
     }
 
     tokens
@@ -26,6 +24,7 @@ pub fn lex(input: &str) -> Vec<Token> {
 
 impl Token {
     #[inline]
+    #[must_use]
     pub fn text<'a>(&self, source: &'a str) -> &'a str {
         &source[self.span.clone()]
     }

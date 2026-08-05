@@ -29,6 +29,7 @@ use crate::{
     types::{CallableSignature, ClosureId, ClosureKind, ConstArg, FloatTy, IntTy, Type},
 };
 
+#[must_use]
 pub fn struct_field_is_visible(
     hir: &hir::HirFile,
     body_id: BodyId,
@@ -53,6 +54,7 @@ pub fn struct_field_is_visible(
     )
 }
 
+#[must_use]
 pub fn method_is_visible(
     hir: &hir::HirFile,
     body_id: BodyId,
@@ -127,15 +129,16 @@ fn struct_field_is_visible_for_owner(
     let Some(owner) = containing_module(
         &hir.item_tree,
         &hir.item_tree.top_level,
+        None,
         &|item| matches!(item, TopLevelItem::Struct(id) if id == struct_id),
-    )
-    .flatten() else {
+    ) else {
         return true;
     };
-    let Some(current) = containing_module(&hir.item_tree, &hir.item_tree.top_level, &|item| {
-        item_contains_body_owner(&hir.item_tree, item, function_id, const_id)
-    })
-    .flatten() else {
+    let Some(current) =
+        containing_module(&hir.item_tree, &hir.item_tree.top_level, None, &|item| {
+            item_contains_body_owner(&hir.item_tree, item, function_id, const_id)
+        })
+    else {
         return false;
     };
 
@@ -159,18 +162,16 @@ fn method_is_visible_for_owner(
     }
 
     let Some(defining_module) =
-        containing_module(&hir.item_tree, &hir.item_tree.top_level, &|item| {
+        containing_module(&hir.item_tree, &hir.item_tree.top_level, None, &|item| {
             item_contains_function(&hir.item_tree, item, function_id)
         })
-        .flatten()
     else {
         return true;
     };
     let Some(current_module) =
-        containing_module(&hir.item_tree, &hir.item_tree.top_level, &|item| {
+        containing_module(&hir.item_tree, &hir.item_tree.top_level, None, &|item| {
             item_contains_body_owner(&hir.item_tree, item, owner_function, owner_const)
         })
-        .flatten()
     else {
         return false;
     };
@@ -178,7 +179,7 @@ fn method_is_visible_for_owner(
     module_contains(&hir.item_tree, defining_module, current_module)
 }
 
-fn capture_mode(is_move: bool, use_kind: ValueUse) -> CaptureMode {
+const fn capture_mode(is_move: bool, use_kind: ValueUse) -> CaptureMode {
     if is_move {
         return CaptureMode::Value;
     }
@@ -201,17 +202,18 @@ mod patterns;
 fn containing_module(
     tree: &ItemTree,
     items: &[TopLevelItem],
+    owner: Option<ModuleId>,
     target: &impl Fn(TopLevelItem) -> bool,
-) -> Option<Option<ModuleId>> {
+) -> Option<ModuleId> {
     for &item in items {
         if target(item) {
-            return Some(None);
+            return owner;
         }
         if let TopLevelItem::Module(module) = item
             && let Some(children) = &tree.modules[module].items
-            && let Some(owner) = containing_module(tree, children, target)
+            && let Some(owner) = containing_module(tree, children, Some(module), target)
         {
-            return Some(Some(owner.unwrap_or(module)));
+            return Some(owner);
         }
     }
     None
@@ -256,7 +258,7 @@ struct ResolvedMethod {
     trait_id: Option<TraitId>,
 }
 
-fn callable_signature_type(signature: CallableSignature) -> Type {
+const fn callable_signature_type(signature: CallableSignature) -> Type {
     Type::CallableConstraint(signature)
 }
 
@@ -328,8 +330,10 @@ fn bound_target_param(bound: &HirGenericBound) -> Option<&str> {
 
 fn type_has_unresolved_inference(ty: &Type) -> bool {
     match ty {
-        Type::InferVar(_) | Type::Unknown | Type::Error => true,
-        Type::Const(ConstArg::Unknown | ConstArg::Error) => true,
+        Type::InferVar(_)
+        | Type::Unknown
+        | Type::Error
+        | Type::Const(ConstArg::Unknown | ConstArg::Error) => true,
         Type::Ref(inner, _) | Type::Slice(inner) | Type::Ptr { inner, .. } => {
             type_has_unresolved_inference(inner)
         }
@@ -351,7 +355,7 @@ fn type_has_unresolved_inference(ty: &Type) -> bool {
     }
 }
 
-fn generic_arg_unknown(ty: &Type) -> bool {
+const fn generic_arg_unknown(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Unknown | Type::Error | Type::Const(ConstArg::Unknown | ConstArg::Error)
@@ -370,9 +374,8 @@ fn is_supported_cast(source: &Type, target: &Type) -> bool {
         ) | (
             Type::Float(_) | Type::InferFloat,
             Type::Int(_) | Type::Float(_)
-        ) | (Type::Bool, Type::Int(_))
+        ) | (Type::Bool | Type::Char, Type::Int(_))
             | (Type::Int(IntTy::U8), Type::Char)
-            | (Type::Char, Type::Int(_))
             | (Type::Ptr { .. }, Type::Ptr { .. })
     ) || matches!(
         (source, target),
@@ -470,11 +473,12 @@ fn type_contains_unresolved_const_param(ty: &Type, params: &HashMap<String, Type
 fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
     match ty {
         HirTypeRef::Error => true,
-        HirTypeRef::Ref(inner, _) | HirTypeRef::Slice(inner) => type_ref_contains_error(inner),
+        HirTypeRef::Ref(inner, _) | HirTypeRef::Slice(inner) | HirTypeRef::Ptr { inner, .. } => {
+            type_ref_contains_error(inner)
+        }
         HirTypeRef::Array(inner, len) => {
             type_ref_contains_error(inner) || matches!(len, hir::item_tree::HirConstArg::Error)
         }
-        HirTypeRef::Ptr { inner, .. } => type_ref_contains_error(inner),
         HirTypeRef::Tuple(elements) => elements.iter().any(type_ref_contains_error),
         HirTypeRef::Named(path) => path.type_args.iter().any(type_ref_contains_error),
         HirTypeRef::Const(value) => matches!(value, hir::item_tree::HirConstArg::Error),
@@ -493,8 +497,7 @@ fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
 
 fn grows_generic_arg(ty: &Type, params: &HashMap<String, Type>) -> bool {
     match ty {
-        Type::Param(name) => !params.contains_key(name),
-        Type::Const(ConstArg::Param(name)) => !params.contains_key(name),
+        Type::Param(name) | Type::Const(ConstArg::Param(name)) => !params.contains_key(name),
         Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
             contains_current_param(inner, params)
         }
@@ -513,8 +516,7 @@ fn grows_generic_arg(ty: &Type, params: &HashMap<String, Type>) -> bool {
 
 fn contains_current_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
     match ty {
-        Type::Param(name) => params.contains_key(name),
-        Type::Const(ConstArg::Param(name)) => params.contains_key(name),
+        Type::Param(name) | Type::Const(ConstArg::Param(name)) => params.contains_key(name),
         Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
             contains_current_param(inner, params)
         }
@@ -535,7 +537,7 @@ fn const_contains_current_param(value: &ConstArg, params: &HashMap<String, Type>
     matches!(value, ConstArg::Param(name) if params.contains_key(name))
 }
 
-fn binary_operator_trait(op: BinaryOp) -> Option<(LangItem, &'static str)> {
+const fn binary_operator_trait(op: BinaryOp) -> Option<(LangItem, &'static str)> {
     Some(match op {
         BinaryOp::Add => (LangItem::Add, "add"),
         BinaryOp::Sub => (LangItem::Sub, "sub"),
@@ -557,7 +559,7 @@ fn binary_operator_trait(op: BinaryOp) -> Option<(LangItem, &'static str)> {
     })
 }
 
-fn unary_operator_trait(op: UnaryOp) -> Option<(LangItem, &'static str)> {
+const fn unary_operator_trait(op: UnaryOp) -> Option<(LangItem, &'static str)> {
     Some(match op {
         UnaryOp::Neg => (LangItem::Neg, "neg"),
         UnaryOp::Not => (LangItem::Not, "not"),
@@ -565,7 +567,7 @@ fn unary_operator_trait(op: UnaryOp) -> Option<(LangItem, &'static str)> {
     })
 }
 
-fn assign_operator_trait(op: BinaryOp) -> Option<(LangItem, &'static str)> {
+const fn assign_operator_trait(op: BinaryOp) -> Option<(LangItem, &'static str)> {
     Some(match op {
         BinaryOp::Add => (LangItem::AddAssign, "add_assign"),
         BinaryOp::Sub => (LangItem::SubAssign, "sub_assign"),

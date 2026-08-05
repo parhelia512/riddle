@@ -25,6 +25,11 @@ struct CliArgs {
     completion_delay_ms: u64,
 }
 
+/// Parses command-line options for the language server.
+///
+/// # Errors
+///
+/// Returns an error when an argument is invalid or a required value is missing.
 pub fn parse_args(args: &[String]) -> Result<Options, clap::Error> {
     let args = CliArgs::try_parse_from(args.iter().map(String::as_str))?;
     Ok(Options {

@@ -55,13 +55,14 @@ impl Marker {
 
 impl Drop for Marker {
     fn drop(&mut self) {
-        if !self.completed {
-            panic!("Marker must be either completed or abandoned");
-        }
+        assert!(
+            self.completed,
+            "Marker must be either completed or abandoned"
+        );
     }
 }
 
-/// It can be traced back using precede().
+/// It can be traced back using `precede()`.
 #[derive(Debug, Clone, Copy)]
 pub struct CompletedMarker {
     pos: usize,
@@ -79,12 +80,12 @@ impl CompletedMarker {
     ///
     /// Used for Pratt parsing: First, the value `1` is parsed. Later,
     /// it is determined that the expression actually represents `1 + 2`.
-    /// In other words, the `1` is encapsulated within a BinaryExpr object.
+    /// In other words, the `1` is encapsulated within a `BinaryExpr` object.
     pub fn precede(self, p: &mut Parser) -> Marker {
         let new_marker = p.start();
         match &mut p.events[self.pos] {
             Event::StartNode { forward_parent, .. } => {
-                *forward_parent = Some(new_marker.pos - self.pos)
+                *forward_parent = Some(new_marker.pos - self.pos);
             }
             _ => unreachable!(),
         }
@@ -147,6 +148,7 @@ pub struct Parser<'s> {
 }
 
 impl<'s> Parser<'s> {
+    #[must_use]
     pub fn new(source: &'s str, tokens: Vec<Token>) -> Self {
         let mut p = Self {
             source,
@@ -182,8 +184,7 @@ impl<'s> Parser<'s> {
     }
 
     /// Now non-trivia token.
-    #[inline(always)]
-    fn current(&self) -> SyntaxKind {
+    const fn current(&self) -> SyntaxKind {
         self.current_kind
     }
 
@@ -296,11 +297,17 @@ impl<'s> Parser<'s> {
         if self.current_non_trivia_pos < self.tokens.len() {
             let span = &self.tokens[self.current_non_trivia_pos].span;
             TextRange::new(
-                rowan::TextSize::from(span.start as u32),
-                rowan::TextSize::from(span.end as u32),
+                rowan::TextSize::from(
+                    u32::try_from(span.start).expect("token offset should fit in u32"),
+                ),
+                rowan::TextSize::from(
+                    u32::try_from(span.end).expect("token offset should fit in u32"),
+                ),
             )
         } else {
-            TextRange::empty(rowan::TextSize::from(self.source.len() as u32))
+            TextRange::empty(rowan::TextSize::from(
+                u32::try_from(self.source.len()).expect("source length should fit in u32"),
+            ))
         }
     }
 
@@ -319,6 +326,7 @@ impl<'s> Parser<'s> {
         self.errors.push(ParseError { message: msg, span });
     }
 
+    #[must_use]
     pub fn parse(mut self) -> (Vec<Event>, Vec<Token>, Vec<ParseError>, &'s str) {
         let m = self.start();
 
@@ -332,11 +340,15 @@ impl<'s> Parser<'s> {
     }
 
     #[allow(clippy::type_complexity)]
+    #[must_use]
     pub fn reparse(
         mut self,
         entry: ReparseEntry,
     ) -> Option<(Vec<Event>, Vec<Token>, Vec<ParseError>, &'s str)> {
-        use ReparseEntry::*;
+        use ReparseEntry::{
+            ArgList, Block, EnumVariant, Expression, FieldPattern, MatchArm, ParamList, Path,
+            Pattern, Statement, StructFieldList, Type, TypeList, UseTree, UseTreeList,
+        };
         match entry {
             Statement => {
                 self.statement();
@@ -419,7 +431,7 @@ impl<'s> Parser<'s> {
         )
     }
 
-    fn at_expr_start(&self) -> bool {
+    const fn at_expr_start(&self) -> bool {
         matches!(
             self.current(),
             SyntaxKind::Hash
@@ -547,7 +559,7 @@ impl<'s> Parser<'s> {
             match self.current() {
                 SyntaxKind::LParen => self.balanced_group(SyntaxKind::LParen, SyntaxKind::RParen),
                 SyntaxKind::LBracket => {
-                    self.balanced_group(SyntaxKind::LBracket, SyntaxKind::RBracket)
+                    self.balanced_group(SyntaxKind::LBracket, SyntaxKind::RBracket);
                 }
                 SyntaxKind::LBrace => self.balanced_group(SyntaxKind::LBrace, SyntaxKind::RBrace),
                 _ => self.bump(),
@@ -696,7 +708,7 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::PathSegment);
     }
 
-    fn is_path_segment_start(kind: SyntaxKind) -> bool {
+    const fn is_path_segment_start(kind: SyntaxKind) -> bool {
         matches!(
             kind,
             SyntaxKind::Ident | SyntaxKind::SelfKw | SyntaxKind::SuperKw | SyntaxKind::CrateKw
@@ -925,9 +937,8 @@ impl<'s> Parser<'s> {
                 continue;
             }
 
-            let expr = match self.statement_expression() {
-                Some(expr) => expr,
-                None => continue,
+            let Some(expr) = self.statement_expression() else {
+                continue;
             };
 
             if self.at(SyntaxKind::Semi) {
@@ -967,16 +978,13 @@ impl<'s> Parser<'s> {
     }
 
     fn expr_stmt(&mut self) {
-        let expr = match self.statement_expression() {
-            Some(expr) => expr,
-            None => {
-                if !self.at(SyntaxKind::Eof) {
-                    let m = self.start();
-                    self.bump();
-                    m.complete(self, SyntaxKind::ErrorNode);
-                }
-                return;
+        let Some(expr) = self.statement_expression() else {
+            if !self.at(SyntaxKind::Eof) {
+                let m = self.start();
+                self.bump();
+                m.complete(self, SyntaxKind::ErrorNode);
             }
+            return;
         };
 
         let m = expr.precede(self);
@@ -1188,62 +1196,15 @@ impl<'s> Parser<'s> {
                 continue;
             }
 
-            // postfix
-            // call
-            if op == SyntaxKind::LParen {
-                const CALL_BP: u8 = 15;
-                if CALL_BP < min_bp {
+            if matches!(
+                op,
+                SyntaxKind::LParen | SyntaxKind::Dot | SyntaxKind::LBracket | SyntaxKind::Question
+            ) {
+                const POSTFIX_BP: u8 = 15;
+                if POSTFIX_BP < min_bp {
                     break;
                 }
-                let m = lhs.precede(self);
-                self.arg_list();
-                lhs = m.complete(self, SyntaxKind::CallExpr);
-                bare_block = false;
-                continue;
-            }
-
-            // field access
-            if op == SyntaxKind::Dot {
-                const FIELD_BP: u8 = 15;
-                if FIELD_BP < min_bp {
-                    break;
-                }
-                let m = lhs.precede(self);
-                self.bump();
-                if self.at(SyntaxKind::Ident) || self.at(SyntaxKind::Number) {
-                    self.bump();
-                } else {
-                    self.expect(SyntaxKind::Ident);
-                }
-                lhs = m.complete(self, SyntaxKind::FieldExpr);
-                bare_block = false;
-                continue;
-            }
-
-            // index access
-            if op == SyntaxKind::LBracket {
-                const INDEX_BP: u8 = 15;
-                if INDEX_BP < min_bp {
-                    break;
-                }
-                let m = lhs.precede(self);
-                self.bump();
-                self.expression();
-                self.expect(SyntaxKind::RBracket);
-                lhs = m.complete(self, SyntaxKind::IndexExpr);
-                bare_block = false;
-                continue;
-            }
-
-            // try propagation
-            if op == SyntaxKind::Question {
-                const TRY_BP: u8 = 15;
-                if TRY_BP < min_bp {
-                    break;
-                }
-                let m = lhs.precede(self);
-                self.bump();
-                lhs = m.complete(self, SyntaxKind::TryExpr);
+                lhs = self.postfix_expr(lhs, op);
                 bare_block = false;
                 continue;
             }
@@ -1283,9 +1244,8 @@ impl<'s> Parser<'s> {
             if bare_block {
                 break;
             }
-            let (l_bp, r_bp) = match infix_binding_power(op) {
-                Some(bp) => bp,
-                None => break,
+            let Some((l_bp, r_bp)) = infix_binding_power(op) else {
+                break;
             };
 
             if l_bp < min_bp {
@@ -1299,6 +1259,36 @@ impl<'s> Parser<'s> {
         }
 
         Some(lhs)
+    }
+
+    fn postfix_expr(&mut self, lhs: CompletedMarker, op: SyntaxKind) -> CompletedMarker {
+        let m = lhs.precede(self);
+        match op {
+            SyntaxKind::LParen => {
+                self.arg_list();
+                m.complete(self, SyntaxKind::CallExpr)
+            }
+            SyntaxKind::Dot => {
+                self.bump();
+                if self.at(SyntaxKind::Ident) || self.at(SyntaxKind::Number) {
+                    self.bump();
+                } else {
+                    self.expect(SyntaxKind::Ident);
+                }
+                m.complete(self, SyntaxKind::FieldExpr)
+            }
+            SyntaxKind::LBracket => {
+                self.bump();
+                self.expression();
+                self.expect(SyntaxKind::RBracket);
+                m.complete(self, SyntaxKind::IndexExpr)
+            }
+            SyntaxKind::Question => {
+                self.bump();
+                m.complete(self, SyntaxKind::TryExpr)
+            }
+            _ => unreachable!("postfix expression called with {op:?}"),
+        }
     }
 
     fn nth_non_trivia_index(&self, n: usize) -> Option<usize> {
@@ -1492,52 +1482,56 @@ impl<'s> Parser<'s> {
                 None
             }
 
-            SyntaxKind::LBracket => {
-                let m = self.start();
-                self.bump();
+            SyntaxKind::LBracket => Some(self.array_expr()),
 
-                if !self.at(SyntaxKind::RBracket) && !self.at(SyntaxKind::Eof) {
-                    self.expression();
-                    if self.at(SyntaxKind::Semi) {
-                        self.bump();
-                        self.expression();
-                    } else {
-                        while self.at(SyntaxKind::Comma) {
-                            self.bump();
-                            if self.at(SyntaxKind::RBracket) {
-                                break;
-                            }
-                            self.expression();
-                        }
-                    }
-                }
-
-                self.expect(SyntaxKind::RBracket);
-                Some(m.complete(self, SyntaxKind::ArrayExpr))
-            }
-
-            SyntaxKind::LParen => {
-                let m = self.start();
-                self.bump();
-                if !self.at(SyntaxKind::RParen) {
-                    self.expr_bp_restricted(0, restrictions);
-                    while self.at(SyntaxKind::Comma) {
-                        self.bump();
-                        if self.at(SyntaxKind::RParen) {
-                            break;
-                        }
-                        self.expr_bp_restricted(0, restrictions);
-                    }
-                }
-                self.expect(SyntaxKind::RParen);
-                Some(m.complete(self, SyntaxKind::ParenExpr))
-            }
+            SyntaxKind::LParen => Some(self.paren_expr(restrictions)),
 
             _ => {
                 self.error_no_bump(format!("expected expression, found {:?}", self.current()));
                 None
             }
         }
+    }
+
+    fn array_expr(&mut self) -> CompletedMarker {
+        let m = self.start();
+        self.bump();
+
+        if !self.at(SyntaxKind::RBracket) && !self.at(SyntaxKind::Eof) {
+            self.expression();
+            if self.at(SyntaxKind::Semi) {
+                self.bump();
+                self.expression();
+            } else {
+                while self.at(SyntaxKind::Comma) {
+                    self.bump();
+                    if self.at(SyntaxKind::RBracket) {
+                        break;
+                    }
+                    self.expression();
+                }
+            }
+        }
+
+        self.expect(SyntaxKind::RBracket);
+        m.complete(self, SyntaxKind::ArrayExpr)
+    }
+
+    fn paren_expr(&mut self, restrictions: ExprRestrictions) -> CompletedMarker {
+        let m = self.start();
+        self.bump();
+        if !self.at(SyntaxKind::RParen) {
+            self.expr_bp_restricted(0, restrictions);
+            while self.at(SyntaxKind::Comma) {
+                self.bump();
+                if self.at(SyntaxKind::RParen) {
+                    break;
+                }
+                self.expr_bp_restricted(0, restrictions);
+            }
+        }
+        self.expect(SyntaxKind::RParen);
+        m.complete(self, SyntaxKind::ParenExpr)
     }
 
     fn struct_expr_field_list(&mut self) {
@@ -1648,31 +1642,7 @@ impl<'s> Parser<'s> {
                 m.complete(self, SyntaxKind::ConstType);
             }
             SyntaxKind::Impl => self.impl_trait_type(),
-            SyntaxKind::Fun | SyntaxKind::Unsafe => {
-                let m = self.start();
-                self.error(
-                    "function type syntax has been removed; use `impl Fn(i32) -> i32` or an explicit `F: Fn(i32) -> i32` bound".into(),
-                );
-                self.optional_unsafe();
-                self.expect(SyntaxKind::Fun);
-                self.expect(SyntaxKind::LParen);
-                if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
-                    self.ty();
-                    while self.at(SyntaxKind::Comma) {
-                        self.bump();
-                        if self.at(SyntaxKind::RParen) {
-                            break;
-                        }
-                        self.ty();
-                    }
-                }
-                self.expect(SyntaxKind::RParen);
-                if self.at(SyntaxKind::Arrow) {
-                    self.bump();
-                    self.ty();
-                }
-                m.complete(self, SyntaxKind::ErrorNode);
-            }
+            SyntaxKind::Fun | SyntaxKind::Unsafe => self.removed_function_type(),
             SyntaxKind::Ident
             | SyntaxKind::SelfKw
             | SyntaxKind::SuperKw
@@ -1691,6 +1661,32 @@ impl<'s> Parser<'s> {
             }
             _ => self.error(format!("expected type, found {:?}", self.current())),
         }
+    }
+
+    fn removed_function_type(&mut self) {
+        let m = self.start();
+        self.error(
+            "function type syntax has been removed; use `impl Fn(i32) -> i32` or an explicit `F: Fn(i32) -> i32` bound".into(),
+        );
+        self.optional_unsafe();
+        self.expect(SyntaxKind::Fun);
+        self.expect(SyntaxKind::LParen);
+        if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
+            self.ty();
+            while self.at(SyntaxKind::Comma) {
+                self.bump();
+                if self.at(SyntaxKind::RParen) {
+                    break;
+                }
+                self.ty();
+            }
+        }
+        self.expect(SyntaxKind::RParen);
+        if self.at(SyntaxKind::Arrow) {
+            self.bump();
+            self.ty();
+        }
+        m.complete(self, SyntaxKind::ErrorNode);
     }
 
     fn finish_macro_call(&mut self, marker: Marker) -> CompletedMarker {
@@ -2026,10 +2022,8 @@ impl<'s> Parser<'s> {
         if self.at(SyntaxKind::Ident) && self.nth(1) == SyntaxKind::Eq {
             self.bump();
             self.bump();
-            self.ty();
-        } else {
-            self.ty();
         }
+        self.ty();
     }
 
     fn where_clause(&mut self) {
@@ -2132,7 +2126,7 @@ impl<'s> Parser<'s> {
         }
     }
 
-    fn at_type_start(&self) -> bool {
+    const fn at_type_start(&self) -> bool {
         matches!(
             self.current(),
             SyntaxKind::Ident
@@ -2227,56 +2221,58 @@ impl<'s> Parser<'s> {
             | SyntaxKind::SelfKw
             | SyntaxKind::SuperKw
             | SyntaxKind::CrateKw
-            | SyntaxKind::ColonColon => {
-                let m = self.start();
-                self.path();
-
-                if self.at(SyntaxKind::Bang) {
-                    self.finish_macro_call(m);
-                    return;
-                }
-
-                match self.current() {
-                    SyntaxKind::LParen => {
-                        // enum tuple pattern: Variant(a, b)
-                        self.bump();
-                        if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
-                            self.pattern();
-                            while self.at(SyntaxKind::Comma) {
-                                self.bump();
-                                if self.at(SyntaxKind::RParen) {
-                                    break;
-                                }
-                                self.pattern();
-                            }
-                        }
-                        self.expect(SyntaxKind::RParen);
-                        m.complete(self, SyntaxKind::EnumPattern);
-                    }
-                    SyntaxKind::LBrace => {
-                        // enum struct pattern: Variant { a, b: c }
-                        self.bump();
-                        if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
-                            self.field_pattern();
-                            while self.at(SyntaxKind::Comma) {
-                                self.bump();
-                                if self.at(SyntaxKind::RBrace) {
-                                    break;
-                                }
-                                self.field_pattern();
-                            }
-                        }
-                        self.expect(SyntaxKind::RBrace);
-                        m.complete(self, SyntaxKind::EnumPattern);
-                    }
-                    _ => {
-                        // Plain ident binding or path pattern.
-                        m.complete(self, SyntaxKind::EnumPattern);
-                    }
-                }
-            }
+            | SyntaxKind::ColonColon => self.path_pattern(),
             _ => {
                 self.error(format!("expected pattern, found {:?}", self.current()));
+            }
+        }
+    }
+
+    fn path_pattern(&mut self) {
+        let m = self.start();
+        self.path();
+
+        if self.at(SyntaxKind::Bang) {
+            self.finish_macro_call(m);
+            return;
+        }
+
+        match self.current() {
+            SyntaxKind::LParen => {
+                // enum tuple pattern: Variant(a, b)
+                self.bump();
+                if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Eof) {
+                    self.pattern();
+                    while self.at(SyntaxKind::Comma) {
+                        self.bump();
+                        if self.at(SyntaxKind::RParen) {
+                            break;
+                        }
+                        self.pattern();
+                    }
+                }
+                self.expect(SyntaxKind::RParen);
+                m.complete(self, SyntaxKind::EnumPattern);
+            }
+            SyntaxKind::LBrace => {
+                // enum struct pattern: Variant { a, b: c }
+                self.bump();
+                if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
+                    self.field_pattern();
+                    while self.at(SyntaxKind::Comma) {
+                        self.bump();
+                        if self.at(SyntaxKind::RBrace) {
+                            break;
+                        }
+                        self.field_pattern();
+                    }
+                }
+                self.expect(SyntaxKind::RBrace);
+                m.complete(self, SyntaxKind::EnumPattern);
+            }
+            _ => {
+                // Plain ident binding or path pattern.
+                m.complete(self, SyntaxKind::EnumPattern);
             }
         }
     }
@@ -2297,7 +2293,7 @@ impl<'s> Parser<'s> {
 
 // == pratt binding power ==
 
-fn is_expr_with_block(kind: SyntaxKind) -> bool {
+const fn is_expr_with_block(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         SyntaxKind::Block
@@ -2310,7 +2306,7 @@ fn is_expr_with_block(kind: SyntaxKind) -> bool {
 }
 
 /// prefix binding power for `rhs`
-fn prefix_binding_power(op: SyntaxKind) -> u8 {
+const fn prefix_binding_power(op: SyntaxKind) -> u8 {
     match op {
         SyntaxKind::Plus
         | SyntaxKind::Minus
@@ -2327,7 +2323,7 @@ fn prefix_binding_power(op: SyntaxKind) -> u8 {
 /// left < right => left combination
 ///
 /// left > right => right combination
-fn infix_binding_power(op: SyntaxKind) -> Option<(u8, u8)> {
+const fn infix_binding_power(op: SyntaxKind) -> Option<(u8, u8)> {
     match op {
         SyntaxKind::Eq
         | SyntaxKind::PlusEq

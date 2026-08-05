@@ -41,7 +41,7 @@ fn build_hir_and_graph(source: &str) -> (HirFile, ScopeGraph) {
 fn build_hir_and_graph_from_parse(parse: &Parse) -> (HirFile, ScopeGraph) {
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
-    let hir = lower_root(root);
+    let hir = lower_root(&root);
     let (sg, diagnostics) = build_scope_graph(&hir, &syntax);
     diagnostic_support::assert_hir_diagnostics(&syntax.to_string(), &diagnostics);
     (hir, sg)
@@ -168,21 +168,21 @@ fn struct_id_in_module(hir: &HirFile, module: ModuleId, name: &str) -> StructId 
         .unwrap()
 }
 
-fn def_kind(def: &DefRef) -> DefKind {
+const fn def_kind(def: &DefRef) -> DefKind {
     match def {
         DefRef::Function(_) => DefKind::Function,
-        DefRef::Struct(_) => DefKind::Struct,
-        DefRef::Enum(_) => DefKind::Struct, // reuse for simplicity
-        DefRef::Trait(_) => DefKind::Struct,
-        DefRef::Const(_) => DefKind::Struct,
-        DefRef::TypeAlias(_) => DefKind::Struct,
+        DefRef::Struct(_)
+        | DefRef::Enum(_)
+        | DefRef::Trait(_)
+        | DefRef::Const(_)
+        | DefRef::TypeAlias(_)
+        | DefRef::EnumVariant { .. } => DefKind::Struct,
         DefRef::Module { .. } => DefKind::Module,
-        DefRef::Param { .. } => DefKind::Param,
-        DefRef::LambdaParam { .. } => DefKind::Param,
-        DefRef::ConstParam { .. } => DefKind::Param,
+        DefRef::Param { .. } | DefRef::LambdaParam { .. } | DefRef::ConstParam { .. } => {
+            DefKind::Param
+        }
         DefRef::PatternBinding { .. } => DefKind::Local,
         DefRef::UseAlias { .. } => DefKind::UseAlias,
-        DefRef::EnumVariant { .. } => DefKind::Struct,
     }
 }
 

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    hash::BuildHasher,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -41,16 +42,16 @@ use crate::{
     text::apply_content_changes,
 };
 
-pub(crate) struct Backend {
+pub struct Backend {
     client: Client,
     docs: Arc<Mutex<HashMap<lsp_types::Url, Document>>>,
     published: Arc<Mutex<HashMap<lsp_types::Url, diagnostics::PublishedDiagnostics>>>,
     publish_gate: Arc<tokio::sync::Mutex<()>>,
     diagnostic_revision: Arc<AtomicU64>,
     diagnostic_sessions: Arc<Mutex<DiagnosticSessions>>,
-    /// Sessions used for the marker-source analysis (the source with COMPLETION_MARKER
+    /// Sessions used for the marker-source analysis (the source with `COMPLETION_MARKER`
     /// inserted). Kept separate from `completion_fallback_sessions` so the two
-    /// IncrementalParsers never thrash each other's cache.
+    /// `IncrementalParsers` never thrash each other's cache.
     completion_sessions: Arc<AnalysisSessions>,
     /// Sessions used for the fallback analysis (the original, unmodified source).
     completion_fallback_sessions: Arc<AnalysisSessions>,
@@ -83,21 +84,43 @@ struct CachedSemanticTokens {
 pub struct RequestRevisions(Mutex<HashMap<lsp_types::Url, u64>>);
 
 impl RequestRevisions {
+    /// Starts a new request revision for a document.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the revision mutex is poisoned.
     pub fn begin(&self, uri: &lsp_types::Url) -> u64 {
         let mut revisions = self.0.lock().unwrap();
         let revision = revisions.entry(uri.clone()).or_default();
         *revision += 1;
-        *revision
+        let current = *revision;
+        drop(revisions);
+        current
     }
 
+    /// Returns whether a request revision is still current.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the revision mutex is poisoned.
     pub fn is_current(&self, uri: &lsp_types::Url, revision: u64) -> bool {
         self.current(uri) == revision
     }
 
+    /// Returns the current request revision for a document.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the revision mutex is poisoned.
     pub fn current(&self, uri: &lsp_types::Url) -> u64 {
         self.0.lock().unwrap().get(uri).copied().unwrap_or(0)
     }
 
+    /// Removes the request revision for a document.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the revision mutex is poisoned.
     pub fn remove(&self, uri: &lsp_types::Url) {
         self.0.lock().unwrap().remove(uri);
     }
@@ -129,7 +152,7 @@ impl LanguageServer for Backend {
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
-                    work_done_progress_options: Default::default(),
+                    work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
                 })),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
@@ -703,8 +726,9 @@ fn is_manifest(uri: &lsp_types::Url) -> bool {
         == Some("Clue.toml")
 }
 
-pub fn documents_for_uri(
-    docs: &HashMap<lsp_types::Url, Document>,
+#[must_use]
+pub fn documents_for_uri<S: BuildHasher>(
+    docs: &HashMap<lsp_types::Url, Document, S>,
     uri: &lsp_types::Url,
 ) -> HashMap<lsp_types::Url, Document> {
     let Some(root) = project_root(uri) else {
@@ -773,9 +797,13 @@ impl Backend {
         &self,
         uri: &lsp_types::Url,
     ) -> Option<(HashMap<lsp_types::Url, Document>, String, u64)> {
-        let all_docs = self.docs.lock().unwrap();
-        let text = all_docs.get(uri)?.text.clone();
-        let docs = documents_for_uri(&all_docs, uri);
+        let (docs, text) = {
+            let all_docs = self.docs.lock().unwrap();
+            let text = all_docs.get(uri)?.text.clone();
+            let docs = documents_for_uri(&all_docs, uri);
+            drop(all_docs);
+            (docs, text)
+        };
         let revision = self.analysis_revisions.current(uri);
         Some((docs, text, revision))
     }
@@ -814,7 +842,7 @@ impl Backend {
             let published = tokio::task::spawn_blocking(move || {
                 let mut sessions = diagnostic_sessions
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if analysis_revision.load(Ordering::SeqCst) != revision {
                     return Ok(None);
                 }
@@ -826,12 +854,13 @@ impl Backend {
                         || analysis_revision.load(Ordering::SeqCst) != revision,
                     )
                 }));
-                match result {
-                    Ok(published) => Ok(published),
-                    Err(_) => {
-                        *sessions = DiagnosticSessions::default();
-                        Err(())
-                    }
+                if let Ok(published) = result {
+                    drop(sessions);
+                    Ok(published)
+                } else {
+                    *sessions = DiagnosticSessions::default();
+                    drop(sessions);
+                    Err(())
                 }
             })
             .await;

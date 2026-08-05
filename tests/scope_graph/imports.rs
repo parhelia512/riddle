@@ -6,7 +6,7 @@ use crate::{
 #[test]
 fn use_alias_rewrites_to_target_path() {
     let sg = build(
-        r#"
+        r"
         mod m {
             pub struct S {}
         }
@@ -16,7 +16,7 @@ fn use_alias_rewrites_to_target_path() {
         fun f() {
             T
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "T"), vec![vec![DefKind::Struct]]);
@@ -25,7 +25,7 @@ fn use_alias_rewrites_to_target_path() {
 #[test]
 fn glob_import_resolves_modules_step_by_step() {
     let sg = build(
-        r#"
+        r"
         mod b {
             pub mod target {
                 pub struct B {}
@@ -44,7 +44,7 @@ fn glob_import_resolves_modules_step_by_step() {
             A;
             B
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "A"), vec![vec![DefKind::Struct]]);
@@ -54,7 +54,7 @@ fn glob_import_resolves_modules_step_by_step() {
 #[test]
 fn unresolved_glob_prefix_does_not_import_parent_module() {
     let sg = build(
-        r#"
+        r"
         mod a {
             struct S {}
         }
@@ -64,7 +64,7 @@ fn unresolved_glob_prefix_does_not_import_parent_module() {
         fun f() {
             S
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "S"), vec![vec![]]);
@@ -73,7 +73,7 @@ fn unresolved_glob_prefix_does_not_import_parent_module() {
 #[test]
 fn self_super_and_crate_aliases_bind_to_the_right_structs() {
     let (hir, sg) = build_hir_and_graph(
-        r#"
+        r"
         struct S {}
 
         pub mod outer {
@@ -93,16 +93,16 @@ fn self_super_and_crate_aliases_bind_to_the_right_structs() {
                 }
             }
         }
-        "#,
+        ",
     );
 
-    let top_sid = top_level_struct_id(&hir, "S");
-    let outer_mid = module_id_by_name(&hir, "outer");
-    let inner_mid = child_module_id(&hir, outer_mid, "inner");
-    let outer_sid = struct_id_in_module(&hir, outer_mid, "S");
-    let inner_sid = struct_id_in_module(&hir, inner_mid, "S");
+    let root_struct = top_level_struct_id(&hir, "S");
+    let parent_module = module_id_by_name(&hir, "outer");
+    let nested_module = child_module_id(&hir, parent_module, "inner");
+    let parent_struct = struct_id_in_module(&hir, parent_module, "S");
+    let nested_struct = struct_id_in_module(&hir, nested_module, "S");
 
-    assert_eq!(resolved_struct_id(&sg, "LocalS"), inner_sid);
-    assert_eq!(resolved_struct_id(&sg, "OuterS"), outer_sid);
-    assert_eq!(resolved_struct_id(&sg, "CrateS"), top_sid);
+    assert_eq!(resolved_struct_id(&sg, "LocalS"), nested_struct);
+    assert_eq!(resolved_struct_id(&sg, "OuterS"), parent_struct);
+    assert_eq!(resolved_struct_id(&sg, "CrateS"), root_struct);
 }

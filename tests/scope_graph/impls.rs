@@ -3,7 +3,7 @@ use crate::{DefKind, build, resolve_paths};
 #[test]
 fn impl_method_body_references_are_encoded() {
     let sg = build(
-        r#"
+        r"
         struct S {}
 
         impl S {
@@ -11,7 +11,7 @@ fn impl_method_body_references_are_encoded() {
                 arg;
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "arg"), vec![vec![DefKind::Param]]);
@@ -20,7 +20,7 @@ fn impl_method_body_references_are_encoded() {
 #[test]
 fn associated_function_path_resolves_through_impl_scope() {
     let sg = build(
-        r#"
+        r"
         struct Point {}
 
         impl Point {
@@ -32,7 +32,7 @@ fn associated_function_path_resolves_through_impl_scope() {
         fun main() {
             Point::new();
         }
-        "#,
+        ",
     );
 
     assert_eq!(
@@ -44,7 +44,7 @@ fn associated_function_path_resolves_through_impl_scope() {
 #[test]
 fn self_receiver_resolves_as_param() {
     let sg = build(
-        r#"
+        r"
         struct Point {}
 
         impl Point {
@@ -52,7 +52,7 @@ fn self_receiver_resolves_as_param() {
                 self;
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "self"), vec![vec![DefKind::Param]]);
@@ -61,7 +61,7 @@ fn self_receiver_resolves_as_param() {
 #[test]
 fn impl_const_generic_resolves_in_method_body() {
     let sg = build(
-        r#"
+        r"
         struct ArrayIter<T, const N: usize> {
             index: usize,
         }
@@ -71,7 +71,7 @@ fn impl_const_generic_resolves_in_method_body() {
                 N
             }
         }
-        "#,
+        ",
     );
 
     let resolved = resolve_paths(&sg, "N");

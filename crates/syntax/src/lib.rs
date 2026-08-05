@@ -280,8 +280,9 @@ pub enum SyntaxKind {
 }
 
 impl SyntaxKind {
-    pub fn is_trivia(self) -> bool {
-        matches!(self, SyntaxKind::Whitespace | Self::LineComment)
+    #[must_use]
+    pub const fn is_trivia(self) -> bool {
+        matches!(self, Self::Whitespace | Self::LineComment)
     }
 }
 

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    hash::BuildHasher,
     path::{Path, PathBuf},
 };
 
@@ -12,7 +13,7 @@ use riddlec::{
     pipeline::{CompileOptions, CompileResult},
     proc_macro::{ProcMacroKind, STANDARD_DERIVE_MACROS, STANDARD_FUNCTION_MACROS},
 };
-use rowan::{TextRange, TextSize};
+use rowan::TextRange;
 use scope_graph::resolve::{exported_definitions, resolve_path_at_reference, visible_definitions};
 use scope_graph::{DefRef, Node, NodeId, RefOrigin, ScopeGraph};
 use syntax::SyntaxKind;
@@ -20,7 +21,7 @@ use syntax::SyntaxKind;
 use crate::{
     server::Document,
     session::AnalysisSessions,
-    text::{is_identifier_continue, offset_for_position},
+    text::{is_identifier_continue, offset_for_position, text_range},
 };
 
 const COMPLETION_MARKER: &str = "__riddle_completion";
@@ -29,12 +30,12 @@ const COMPLETION_KEYWORDS: &[&str] = &[
     "mod", "use", "mut", "pub", "super", "crate", "enum", "trait", "impl", "match", "const",
     "type", "extern", "unsafe", "safe", "for", "in", "where", "move", "true", "false",
 ];
-pub(crate) const BUILTIN_TYPES: &[&str] = &[
+pub const BUILTIN_TYPES: &[&str] = &[
     "bool", "char", "str", "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize",
     "f32", "f64",
 ];
 
-pub(crate) fn completion_trigger_characters() -> Vec<String> {
+pub fn completion_trigger_characters() -> Vec<String> {
     vec![".".into(), ":".into()]
 }
 
@@ -54,9 +55,14 @@ struct CompletionSite {
     macro_kind: Option<ProcMacroKind>,
 }
 
-pub fn completion_items_for_document(
+/// Computes completion items for an open document.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn completion_items_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     position: lsp_types::Position,
     compile_options: CompileOptions,
     sessions: &AnalysisSessions,
@@ -73,6 +79,111 @@ pub fn completion_items_for_document(
         .ok_or_else(|| "completion position is outside the document".to_string())?;
     let mut marked = marked_completion_source(&document.text, &site);
 
+    if let Some((path, mut overlays)) = project_completion_overlays(uri, docs, &marked)
+        && let Some(root) = clue::find_project_root(&path)
+    {
+        let session = sessions.project(&root);
+        let mut session = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cancelled() {
+            return Ok(None);
+        }
+        let mut analyze = |overlays: &HashMap<PathBuf, String>| {
+            if site.context == CompletionContext::Member {
+                clue::check_project_with_session_cancellable(
+                    &root,
+                    overlays,
+                    compile_options,
+                    &mut session,
+                    &cancelled,
+                )
+            } else {
+                clue::resolve_project_with_session_cancellable(
+                    &root,
+                    overlays,
+                    compile_options,
+                    &mut session,
+                    &cancelled,
+                )
+            }
+        };
+        let Some(mut analysis) = analyze(&overlays).map_err(|error| error.to_string())? else {
+            return Ok(None);
+        };
+        if analysis.result.hir.is_none() && completion_needs_semicolon(&marked, &site) {
+            marked.insert(site.start + COMPLETION_MARKER.len(), ';');
+            overlays.insert(path.clone(), marked.clone());
+            let Some(recovered) = analyze(&overlays).map_err(|error| error.to_string())? else {
+                return Ok(None);
+            };
+            analysis = recovered;
+        }
+        if cancelled() {
+            return Ok(None);
+        }
+        // If the marker wasn't resolved as a scope-graph reference (e.g. the
+        // cursor is at the start of a fresh statement), re-analyse the original
+        // source to recover global-scope completions.  Use `fallback_sessions`
+        // so the two IncrementalParsers never thrash each other's cache.
+        let fallback_result = if matches!(
+            site.context,
+            CompletionContext::General | CompletionContext::Type
+        ) && analysis
+            .result
+            .hir
+            .as_ref()
+            .zip(analysis.result.scope_graph.as_ref())
+            .is_some_and(|(_, graph)| completion_marker_reference(graph).is_none())
+        {
+            let fb_session = fallback_sessions.project(&root);
+            let mut fb_session = fb_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Restore the original (non-marked) overlay so the fallback
+            // session sees the unmodified source.
+            let mut fb_overlays = overlays.clone();
+            fb_overlays.insert(path.clone(), document.text.clone());
+            clue::resolve_project_with_session_cancellable(
+                &root,
+                &fb_overlays,
+                compile_options,
+                &mut fb_session,
+                &cancelled,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        if cancelled() {
+            return Ok(None);
+        }
+        return Ok(Some(project_completion_items(
+            &analysis,
+            &path,
+            &site,
+            fallback_result.as_ref(),
+        )));
+    }
+
+    Ok(standalone_completion_items(
+        uri,
+        document,
+        &site,
+        compile_options,
+        sessions,
+        fallback_sessions,
+        &cancelled,
+    ))
+}
+
+fn project_completion_overlays<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    marked: &str,
+) -> Option<(PathBuf, HashMap<PathBuf, String>)> {
+    let path = uri.to_file_path().ok()?;
     let mut overlays = docs
         .iter()
         .filter_map(|(uri, document)| {
@@ -81,126 +192,61 @@ pub fn completion_items_for_document(
                 .map(|path| (path, document.text.clone()))
         })
         .collect::<HashMap<_, _>>();
-    if let Ok(path) = uri.to_file_path() {
-        overlays.insert(path.clone(), marked.clone());
-        if let Some(root) = clue::find_project_root(&path) {
-            let session = sessions.project(&root);
-            let mut session = session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if cancelled() {
-                return Ok(None);
-            }
-            let mut analyze = |overlays: &HashMap<PathBuf, String>| {
-                if site.context == CompletionContext::Member {
-                    clue::check_project_with_session_cancellable(
-                        &root,
-                        overlays,
-                        compile_options,
-                        &mut session,
-                        &cancelled,
-                    )
-                } else {
-                    clue::resolve_project_with_session_cancellable(
-                        &root,
-                        overlays,
-                        compile_options,
-                        &mut session,
-                        &cancelled,
-                    )
-                }
-            };
-            let Some(mut analysis) = analyze(&overlays).map_err(|error| error.to_string())? else {
-                return Ok(None);
-            };
-            if analysis.result.hir.is_none() && completion_needs_semicolon(&marked, &site) {
-                marked.insert(site.start + COMPLETION_MARKER.len(), ';');
-                overlays.insert(path.clone(), marked.clone());
-                let Some(recovered) = analyze(&overlays).map_err(|error| error.to_string())? else {
-                    return Ok(None);
-                };
-                analysis = recovered;
-            }
-            if cancelled() {
-                return Ok(None);
-            }
-            // If the marker wasn't resolved as a scope-graph reference (e.g. the
-            // cursor is at the start of a fresh statement), re-analyse the original
-            // source to recover global-scope completions.  Use `fallback_sessions`
-            // so the two IncrementalParsers never thrash each other's cache.
-            let fallback_result = if matches!(
-                site.context,
-                CompletionContext::General | CompletionContext::Type
-            ) && analysis
-                .result
-                .hir
-                .as_ref()
-                .zip(analysis.result.scope_graph.as_ref())
-                .is_some_and(|(_, graph)| completion_marker_reference(graph).is_none())
-            {
-                let fb_session = fallback_sessions.project(&root);
-                let mut fb_session = fb_session.lock().unwrap_or_else(|p| p.into_inner());
-                // Restore the original (non-marked) overlay so the fallback
-                // session sees the unmodified source.
-                let mut fb_overlays = overlays.clone();
-                fb_overlays.insert(path.clone(), document.text.clone());
-                clue::resolve_project_with_session_cancellable(
-                    &root,
-                    &fb_overlays,
-                    compile_options,
-                    &mut fb_session,
-                    &cancelled,
-                )
-                .ok()
-                .flatten()
-            } else {
-                None
-            };
-            if cancelled() {
-                return Ok(None);
-            }
-            let mut items = completion_items_from_result(
-                &analysis.result,
-                &site,
-                fallback_result.as_ref().and_then(|a| a.result.hir.as_ref()),
-            );
-            collect_standard_macro_completions(&site, &mut items);
-            collect_macro_completions(&analysis, &path, &site, &mut items);
-            items.sort_by(|left, right| left.label.cmp(&right.label));
-            items.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
-            return Ok(Some(items));
-        }
-    }
+    overlays.insert(path.clone(), marked.to_owned());
+    Some((path, overlays))
+}
 
+fn project_completion_items(
+    analysis: &clue::ProjectAnalysis,
+    path: &Path,
+    site: &CompletionSite,
+    fallback: Option<&clue::ProjectAnalysis>,
+) -> Vec<CompletionItem> {
+    let mut items = completion_items_from_result(
+        &analysis.result,
+        site,
+        fallback.and_then(|analysis| analysis.result.hir.as_ref()),
+    );
+    collect_standard_macro_completions(site, &mut items);
+    collect_macro_completions(analysis, path, site, &mut items);
+    sort_and_dedup_completion_items(&mut items);
+    items
+}
+
+fn standalone_completion_items(
+    uri: &lsp_types::Url,
+    document: &Document,
+    site: &CompletionSite,
+    compile_options: CompileOptions,
+    sessions: &AnalysisSessions,
+    fallback_sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Option<Vec<CompletionItem>> {
+    let mut marked = marked_completion_source(&document.text, site);
     let session = sessions.standalone(uri);
     let mut session = session
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if cancelled() {
-        return Ok(None);
+        return None;
     }
     let result = if site.context == CompletionContext::Member {
-        session.check_with_options_cancellable(&marked, compile_options, &cancelled)
+        session.check_with_options_cancellable(&marked, compile_options, cancelled)
     } else {
-        session.resolve_with_options_cancellable(&marked, compile_options, &cancelled)
+        session.resolve_with_options_cancellable(&marked, compile_options, cancelled)
     };
-    let Some(mut result) = result else {
-        return Ok(None);
-    };
-    if result.hir.is_none() && completion_needs_semicolon(&marked, &site) {
+    let mut result = result?;
+    if result.hir.is_none() && completion_needs_semicolon(&marked, site) {
         marked.insert(site.start + COMPLETION_MARKER.len(), ';');
         let recovered = if site.context == CompletionContext::Member {
-            session.check_with_options_cancellable(&marked, compile_options, &cancelled)
+            session.check_with_options_cancellable(&marked, compile_options, cancelled)
         } else {
-            session.resolve_with_options_cancellable(&marked, compile_options, &cancelled)
+            session.resolve_with_options_cancellable(&marked, compile_options, cancelled)
         };
-        let Some(recovered) = recovered else {
-            return Ok(None);
-        };
-        result = recovered;
+        result = recovered?;
     }
     if cancelled() {
-        return Ok(None);
+        return None;
     }
     // Fallback: if the marker wasn't resolved as a reference in the scope graph
     // (e.g. typing at the start of a statement), re-analyse the original source
@@ -218,26 +264,31 @@ pub fn completion_items_for_document(
         let fb_session = fallback_sessions.standalone(uri);
         let mut fb_session = fb_session
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        fb_session.resolve_with_options_cancellable(&document.text, compile_options, &cancelled)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fb_session.resolve_with_options_cancellable(&document.text, compile_options, cancelled)
     } else {
         None
     };
     if cancelled() {
-        return Ok(None);
+        return None;
     }
     let mut items = completion_items_from_result(
         &result,
-        &site,
+        site,
         fallback_result.as_ref().and_then(|r| r.hir.as_ref()),
     );
-    collect_standard_macro_completions(&site, &mut items);
-    items.sort_by(|left, right| left.label.cmp(&right.label));
-    items.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
-    Ok(Some(items))
+    collect_standard_macro_completions(site, &mut items);
+    sort_and_dedup_completion_items(&mut items);
+    Some(items)
 }
 
-#[cfg(feature = "test-support")]
+fn sort_and_dedup_completion_items(items: &mut Vec<CompletionItem>) {
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+    items.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
+}
+
+#[cfg(feature = "test")]
+#[must_use]
 pub fn completion_items_for_source(
     source: &str,
     position: lsp_types::Position,
@@ -300,17 +351,14 @@ fn macro_completion_kind(source: &str, start: usize, end: usize) -> Option<ProcM
     let tokens = frontend::lexer::lex(&marked);
     let (events, tokens, errors, parsed_source) =
         frontend::parser::Parser::new(&marked, tokens).parse();
-    let parse = frontend::tree_builder::build_tree(events, tokens, parsed_source, errors);
-    let marker_range = TextRange::new(
-        TextSize::from(start as u32),
-        TextSize::from((start + COMPLETION_MARKER.len()) as u32),
-    );
-    let marker = parse
+    let parse = frontend::tree_builder::build_tree(&events, &tokens, parsed_source, errors);
+    let target_range = text_range(start, start + COMPLETION_MARKER.len());
+    let marker_token = parse
         .syntax()
         .descendants_with_tokens()
-        .filter_map(|element| element.into_token())
-        .find(|token| token.text_range() == marker_range)?;
-    for node in marker.parent_ancestors() {
+        .filter_map(rowan::NodeOrToken::into_token)
+        .find(|token| token.text_range() == target_range)?;
+    for node in marker_token.parent_ancestors() {
         match node.kind() {
             SyntaxKind::MacroCall => return Some(ProcMacroKind::FunctionLike),
             SyntaxKind::Attribute => {
@@ -347,10 +395,7 @@ fn collect_macro_completions(
         .iter()
         .filter(|occurrence| occurrence.is_declaration && occurrence.kind == kind)
     {
-        let range = TextRange::new(
-            (occurrence.range.start as u32).into(),
-            (occurrence.range.end as u32).into(),
-        );
+        let range = text_range(occurrence.range.start, occurrence.range.end);
         let Some(mapped) = analysis.macro_source_map.map_range(range) else {
             continue;
         };
@@ -409,21 +454,18 @@ fn is_type_position(source: &str, start: usize, end: usize) -> bool {
     let tokens = frontend::lexer::lex(&marked);
     let (events, tokens, errors, parsed_source) =
         frontend::parser::Parser::new(&marked, tokens).parse();
-    let parse = frontend::tree_builder::build_tree(events, tokens, parsed_source, errors);
-    let marker_range = TextRange::new(
-        TextSize::from(start as u32),
-        TextSize::from((start + COMPLETION_MARKER.len()) as u32),
-    );
-    let Some(marker) = parse
+    let parse = frontend::tree_builder::build_tree(&events, &tokens, parsed_source, errors);
+    let target_range = text_range(start, start + COMPLETION_MARKER.len());
+    let Some(marker_token) = parse
         .syntax()
         .descendants_with_tokens()
-        .filter_map(|element| element.into_token())
-        .find(|token| token.text_range() == marker_range)
+        .filter_map(rowan::NodeOrToken::into_token)
+        .find(|token| token.text_range() == target_range)
     else {
         return false;
     };
 
-    let mut parent = marker.parent();
+    let mut parent = marker_token.parent();
     while let Some(node) = parent {
         if node.kind() == SyntaxKind::NamedType {
             return true;
@@ -1049,8 +1091,7 @@ fn function_completion_named(
     let ret = function
         .ret_type
         .as_ref()
-        .map(HirTypeRef::display)
-        .unwrap_or_else(|| "()".into());
+        .map_or_else(|| "()".into(), HirTypeRef::display);
     let mut item = completion_item(
         label,
         kind,
@@ -1119,29 +1160,25 @@ fn type_ref_matches_type(
 ) -> bool {
     match (expected, actual) {
         (HirTypeRef::Ref(expected, _), type_checker::Type::Ref(actual, _))
-        | (HirTypeRef::Ref(expected, _), type_checker::Type::Ptr { inner: actual, .. }) => {
-            type_ref_matches_type(hir, generics, expected, actual)
-        }
-        (
-            HirTypeRef::Ptr {
+        | (
+            HirTypeRef::Ref(expected, _)
+            | HirTypeRef::Ptr {
                 inner: expected, ..
             },
             type_checker::Type::Ptr { inner: actual, .. },
         ) => type_ref_matches_type(hir, generics, expected, actual),
-        (HirTypeRef::Array(expected, _), type_checker::Type::Array(actual, _)) => {
+        (HirTypeRef::Array(expected, _), type_checker::Type::Array(actual, _))
+        | (HirTypeRef::Slice(expected), type_checker::Type::Slice(actual)) => {
             type_ref_matches_type(hir, generics, expected, actual)
         }
-        (HirTypeRef::Slice(expected), type_checker::Type::Slice(actual)) => {
-            type_ref_matches_type(hir, generics, expected, actual)
-        }
-        (expected @ HirTypeRef::Slice(_), type_checker::Type::Ref(actual, _))
-        | (expected @ HirTypeRef::Slice(_), type_checker::Type::Ptr { inner: actual, .. }) => {
-            type_ref_matches_type(hir, generics, expected, actual)
-        }
-        (HirTypeRef::Named(_), type_checker::Type::Ref(actual, _))
-        | (HirTypeRef::Named(_), type_checker::Type::Ptr { inner: actual, .. }) => {
-            type_ref_matches_type(hir, generics, expected, actual)
-        }
+        (
+            expected @ HirTypeRef::Slice(_),
+            type_checker::Type::Ref(actual, _) | type_checker::Type::Ptr { inner: actual, .. },
+        ) => type_ref_matches_type(hir, generics, expected, actual),
+        (
+            HirTypeRef::Named(_),
+            type_checker::Type::Ref(actual, _) | type_checker::Type::Ptr { inner: actual, .. },
+        ) => type_ref_matches_type(hir, generics, expected, actual),
         (HirTypeRef::Named(path), _)
             if path.segments.len() == 1
                 && path.type_args.is_empty()
@@ -1170,14 +1207,12 @@ fn identifier_start(source: &str, offset: usize) -> usize {
         .char_indices()
         .rev()
         .find(|(_, ch)| !is_identifier_continue(*ch))
-        .map(|(index, ch)| index + ch.len_utf8())
-        .unwrap_or(0)
+        .map_or(0, |(index, ch)| index + ch.len_utf8())
 }
 
 fn identifier_end(source: &str, offset: usize) -> usize {
     source[offset..]
         .char_indices()
         .find(|(_, ch)| !is_identifier_continue(*ch))
-        .map(|(index, _)| offset + index)
-        .unwrap_or(source.len())
+        .map_or(source.len(), |(index, _)| offset + index)
 }

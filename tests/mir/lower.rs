@@ -3,11 +3,11 @@ use crate::{compile, lower};
 #[test]
 fn logical_operators_lower_to_short_circuit_control_flow() {
     let module = lower(
-        r#"
+        r"
         fun rhs() -> bool { true }
         fun both() -> bool { false && rhs() }
         fun either() -> bool { true || rhs() }
-        "#,
+        ",
     );
 
     for name in ["both", "either"] {
@@ -93,7 +93,7 @@ fn discarded_temporaries_drop_moved_and_remaining_fields() {
     let mut false_values = std::collections::HashSet::new();
     let moved_field_is_inactive = main.blocks.iter().any(|(_, block)| {
         block.insts.iter().enumerate().any(|(index, inst)| {
-            let value = mir::value::Value(block.start_value + index as u32);
+            let value = block.value_at(index);
             match inst.kind {
                 mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
                     false_values.insert(value);
@@ -141,7 +141,7 @@ fn drop_locals_in_reverse_declaration_order() {
     let mut drop_places = Vec::new();
     for (_, block) in main.blocks.iter() {
         for (index, inst) in block.insts.iter().enumerate() {
-            let value = mir::value::Value(block.start_value + index as u32);
+            let value = block.value_at(index);
             match &inst.kind {
                 mir::instr::InstKind::UnOp(mir::instr::UnOp::MutRef, place) => {
                     references.insert(value, *place);
@@ -293,7 +293,7 @@ fn partial_move_clears_only_the_moved_fields_drop_flag() {
     let mut false_stores = 0;
     for (_, block) in main.blocks.iter() {
         for (index, inst) in block.insts.iter().enumerate() {
-            let value = mir::value::Value(block.start_value + index as u32);
+            let value = block.value_at(index);
             match &inst.kind {
                 mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
                     false_values.insert(value);
@@ -496,7 +496,7 @@ fn moving_return_value_clears_its_drop_flag() {
         let mut cleared_flag = false;
         for (_, block) in function.blocks.iter() {
             for (index, inst) in block.insts.iter().enumerate() {
-                let value = mir::value::Value(block.start_value + index as u32);
+                let value = block.value_at(index);
                 match &inst.kind {
                     mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
                         false_values.insert(value);
@@ -544,7 +544,7 @@ fn drop_parameters_in_declaration_order() {
     let mut drop_places = Vec::new();
     for (_, block) in consume.blocks.iter() {
         for (index, inst) in block.insts.iter().enumerate() {
-            let value = mir::value::Value(block.start_value + index as u32);
+            let value = block.value_at(index);
             match &inst.kind {
                 mir::instr::InstKind::UnOp(mir::instr::UnOp::MutRef, place) => {
                     references.insert(value, *place);
@@ -600,7 +600,7 @@ fn moving_parameter_clears_its_drop_flag() {
         take.blocks.iter().any(|(_, block)| {
             let mut false_values = std::collections::HashSet::new();
             block.insts.iter().enumerate().any(|(index, inst)| {
-                let value = mir::value::Value(block.start_value + index as u32);
+                let value = block.value_at(index);
                 match &inst.kind {
                     mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(false)) => {
                         false_values.insert(value);
@@ -897,11 +897,11 @@ fn monomorphization_preserves_callers_drop_scope() {
 #[test]
 fn simple_function_no_params() {
     let module = lower(
-        r#"
+        r"
         fun main() {
             let x = 42;
         }
-        "#,
+        ",
     );
     assert_eq!(module.function_order.len(), 1);
     let func = &module.functions[module.function_order[0]];
@@ -912,11 +912,11 @@ fn simple_function_no_params() {
 #[test]
 fn function_with_params() {
     let module = lower(
-        r#"
+        r"
         fun add(a: i32, b: i32) -> i32 {
             return a + b;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     assert_eq!(func.name, "add");
@@ -928,11 +928,11 @@ fn function_with_params() {
 #[test]
 fn integer_literal() {
     let module = lower(
-        r#"
+        r"
         fun main() {
             let x = 42;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     // 入口块应当包含 const 指令
@@ -972,11 +972,11 @@ fn string_literal() {
 #[test]
 fn array_repeat_lowers_to_array_value() {
     let module = lower(
-        r#"
+        r"
         fun main() {
             let xs: [i32; 4] = [5; 4];
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -995,11 +995,11 @@ fn array_repeat_lowers_to_array_value() {
 #[test]
 fn tuple_expression_lowers_to_tuple_value() {
     let module = lower(
-        r#"
+        r"
         fun pair() -> (i32, i32) {
             (2, 3)
         }
-        "#,
+        ",
     );
     let pair = module
         .function_order
@@ -1095,7 +1095,7 @@ fn tuple_ordering_lowers_lexicographically() {
 #[test]
 fn array_for_loop_lowers_to_indexed_loop() {
     let module = lower(
-        r#"
+        r"
         fun main() {
             let mut sum = 0;
             let values = [1, 2, 3];
@@ -1103,7 +1103,7 @@ fn array_for_loop_lowers_to_indexed_loop() {
                 sum += item;
             }
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let has_loop_branch = func
@@ -1124,7 +1124,7 @@ fn array_for_loop_lowers_to_indexed_loop() {
 #[test]
 fn generic_for_loop_lowers_to_iterator_calls() {
     let module = lower(
-        r#"
+        r"
         enum Option<T> {
             Some(T),
             None,
@@ -1174,7 +1174,7 @@ fn generic_for_loop_lowers_to_iterator_calls() {
                 let next = item + 1;
             }
         }
-        "#,
+        ",
     );
     let func = module
         .function_order
@@ -1210,7 +1210,7 @@ fn generic_for_loop_lowers_to_iterator_calls() {
 #[test]
 fn generic_function_for_loop_uses_concrete_iterator_impl_and_enum_layout() {
     let module = lower(
-        r#"
+        r"
         enum Option<T> {
             Spare(bool),
             Some(T),
@@ -1250,7 +1250,7 @@ fn generic_function_for_loop_uses_concrete_iterator_impl_and_enum_layout() {
         fun main() {
             consume(Counter { current: 0 });
         }
-        "#,
+        ",
     );
     let func = module
         .function_order
@@ -1280,29 +1280,28 @@ fn generic_function_for_loop_uses_concrete_iterator_impl_and_enum_layout() {
 #[test]
 fn if_expression_creates_blocks() {
     let module = lower(
-        r#"
+        r"
         fun choose(flag: bool) -> i32 {
             if flag {
                 return 1;
             }
             return 0;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     // if 应当产生多个基本块
     let block_count = func.blocks.iter().count();
     assert!(
         block_count >= 2,
-        "expected at least 2 blocks for if, got {}",
-        block_count
+        "expected at least 2 blocks for if, got {block_count}"
     );
 }
 
 #[test]
 fn nested_if_phi_uses_actual_predecessor_blocks() {
     let module = lower(
-        r#"
+        r"
         enum Choice { First, Second, Third }
 
         fun choose(first: bool, second: bool) -> Choice {
@@ -1312,7 +1311,7 @@ fn nested_if_phi_uses_actual_predecessor_blocks() {
                 if second { Choice::Second } else { Choice::Third }
             }
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
 
@@ -1341,29 +1340,28 @@ fn nested_if_phi_uses_actual_predecessor_blocks() {
 #[test]
 fn while_loop_creates_blocks() {
     let module = lower(
-        r#"
+        r"
         fun loop_test() {
             let x = true;
             while x {
                 let x = false;
             }
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     // while 应当产生至少 3 个块 (cond, body, exit)
     let block_count = func.blocks.iter().count();
     assert!(
         block_count >= 3,
-        "expected at least 3 blocks for while, got {}",
-        block_count
+        "expected at least 3 blocks for while, got {block_count}"
     );
 }
 
 #[test]
 fn break_and_continue_lower_to_loop_targets_and_skip_dead_code() {
     let module = lower(
-        r#"
+        r"
         fun dead() {}
 
         fun main() {
@@ -1385,7 +1383,7 @@ fn break_and_continue_lower_to_loop_targets_and_skip_dead_code() {
                 break;
             }
         }
-        "#,
+        ",
     );
     let func = module
         .function_order
@@ -1475,14 +1473,14 @@ fn break_and_continue_drop_locals_before_branching() {
 #[test]
 fn arithmetic_operations() {
     let module = lower(
-        r#"
+        r"
         fun compute(a: i32, b: i32) -> i32 {
             let c = a + b;
             let d = c * 2;
             let e = d - 1;
             return e / 3;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -1493,13 +1491,13 @@ fn arithmetic_operations() {
 #[test]
 fn i32_add_lowers_to_builtin_binop() {
     let module = lower(
-        r#"
+        r"
         fun main() {
             let a: i32 = 1;
             let b: i32 = 2;
             let sum = a + b;
         }
-        "#,
+        ",
     );
     let func = module
         .function_order
@@ -1616,7 +1614,7 @@ fn primitive_lang_operator_methods_lower_without_wrapper_functions() {
 #[test]
 fn primitive_operator_trait_without_lang_marker_keeps_ordinary_method() {
     let module = lower(
-        r#"
+        r"
         trait Add {
             type Output;
             fun add(self, rhs: Self) -> Self::Output;
@@ -1631,7 +1629,7 @@ fn primitive_operator_trait_without_lang_marker_keeps_ordinary_method() {
             let value: i32 = 1;
             value.add(2)
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -2133,7 +2131,7 @@ fn overloaded_binary_unary_and_assign_lower_to_method_calls() {
 #[test]
 fn enum_variant_constructor_lowers_to_discriminant() {
     let module = lower(
-        r#"
+        r"
         enum Option<T> {
             Some(T),
             None,
@@ -2142,7 +2140,7 @@ fn enum_variant_constructor_lowers_to_discriminant() {
         fun make() -> Option<i32> {
             Option::Some(1)
         }
-        "#,
+        ",
     );
     let func = module
         .function_order
@@ -2161,12 +2159,12 @@ fn enum_variant_constructor_lowers_to_discriminant() {
 #[test]
 fn compound_assignment_lowers_to_load_binop_store() {
     let module = lower(
-        r#"
+        r"
         fun main() {
             let mut n: i32 = 1;
             n += 2;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2192,7 +2190,7 @@ fn compound_assignment_lowers_to_load_binop_store() {
 #[test]
 fn assignment_evaluates_rhs_before_lhs_place() {
     let module = lower(
-        r#"
+        r"
         fun lhs_index() -> i32 { 0 }
         fun rhs_value() -> i32 { 1 }
 
@@ -2200,7 +2198,7 @@ fn assignment_evaluates_rhs_before_lhs_place() {
             let mut values = [0];
             values[lhs_index()] = rhs_value();
         }
-        "#,
+        ",
     );
     let main = module
         .function_order
@@ -2224,7 +2222,7 @@ fn assignment_evaluates_rhs_before_lhs_place() {
 #[test]
 fn primitive_compound_assignment_evaluates_rhs_before_lhs_place() {
     let module = lower(
-        r#"
+        r"
         fun lhs_index() -> i32 { 0 }
         fun rhs_value() -> i32 { 1 }
 
@@ -2232,7 +2230,7 @@ fn primitive_compound_assignment_evaluates_rhs_before_lhs_place() {
             let mut values = [0];
             values[lhs_index()] += rhs_value();
         }
-        "#,
+        ",
     );
     let main = module
         .function_order
@@ -2302,14 +2300,14 @@ fn overloaded_compound_assignment_evaluates_lhs_before_rhs() {
 #[test]
 fn struct_literal() {
     let module = lower(
-        r#"
+        r"
         struct Point { x: i32, y: i32 }
 
         fun make() -> Point {
             let p = Point { x: 1, y: 2 };
             return p;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     assert!(!func.blocks[func.entry].insts.is_empty());
@@ -2318,13 +2316,13 @@ fn struct_literal() {
 #[test]
 fn field_access() {
     let module = lower(
-        r#"
+        r"
         struct Point { x: i32, y: i32 }
 
         fun get_x(p: &Point) -> i32 {
             return p.x;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     assert!(!func.blocks[func.entry].insts.is_empty());
@@ -2333,7 +2331,7 @@ fn field_access() {
 #[test]
 fn function_call() {
     let module = lower(
-        r#"
+        r"
         fun square(n: i32) -> i32 {
             return n * n;
         }
@@ -2341,7 +2339,7 @@ fn function_call() {
         fun main() -> i32 {
             return square(5);
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[1]];
     assert!(!func.blocks[func.entry].insts.is_empty());
@@ -2350,11 +2348,11 @@ fn function_call() {
 #[test]
 fn multiple_functions() {
     let module = lower(
-        r#"
+        r"
         fun a() {}
         fun b() {}
         fun c() {}
-        "#,
+        ",
     );
     assert_eq!(module.function_order.len(), 3);
 }
@@ -2362,9 +2360,9 @@ fn multiple_functions() {
 #[test]
 fn empty_function() {
     let module = lower(
-        r#"
+        r"
         fun nothing() {}
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2378,11 +2376,11 @@ fn empty_function() {
 #[test]
 fn comparison_operators() {
     let module = lower(
-        r#"
+        r"
         fun cmp(a: i32, b: i32) -> bool {
             return a < b;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     assert!(!func.blocks[func.entry].insts.is_empty());
@@ -2391,11 +2389,11 @@ fn comparison_operators() {
 #[test]
 fn bool_literal() {
     let module = lower(
-        r#"
+        r"
         fun truth() -> bool {
             return true;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     assert!(!func.blocks[func.entry].insts.is_empty());
@@ -2404,7 +2402,7 @@ fn bool_literal() {
 #[test]
 fn escape_analysis_affects_allocation() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun keep() {
@@ -2417,7 +2415,7 @@ fn escape_analysis_affects_allocation() {
             return &local;
             // local 逃逸，应当堆分配
         }
-        "#,
+        ",
     );
     assert_eq!(module.function_order.len(), 2);
 }
@@ -2425,11 +2423,11 @@ fn escape_analysis_affects_allocation() {
 #[test]
 fn param_used_in_return() {
     let module = lower(
-        r#"
+        r"
         fun identity(n: i32) -> i32 {
             return n;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2444,12 +2442,12 @@ fn param_used_in_return() {
 #[test]
 fn param_used_in_expression() {
     let module = lower(
-        r#"
+        r"
         fun double(n: i32) -> i32 {
             let d = n + n;
             return d;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2464,13 +2462,13 @@ fn param_used_in_expression() {
 #[test]
 fn local_var_used_as_init() {
     let module = lower(
-        r#"
+        r"
         fun f() -> i32 {
             let x = 42;
             let y = x;
             return y;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2484,13 +2482,13 @@ fn local_var_used_as_init() {
 #[test]
 fn delayed_let_allocates_storage_and_assignment_stores_value() {
     let module = lower(
-        r#"
+        r"
         fun f() -> i32 {
             let x: i32;
             x = 7;
             return x;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     assert_eq!(func.name, "f");
@@ -2513,11 +2511,11 @@ fn delayed_let_allocates_storage_and_assignment_stores_value() {
 #[test]
 fn two_params_both_used() {
     let module = lower(
-        r#"
+        r"
         fun add(a: i32, b: i32) -> i32 {
             return a + b;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     assert_eq!(func.params.len(), 2);
@@ -2535,14 +2533,14 @@ fn two_params_both_used() {
 #[test]
 fn escaping_local_produces_heap_alloc_instruction() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun escape() -> &Data {
             let local = Data { value: 1 };
             return &local;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2560,12 +2558,12 @@ fn escaping_local_produces_heap_alloc_instruction() {
 #[test]
 fn non_escaping_reference_temporary_uses_stack_storage() {
     let module = lower(
-        r#"
+        r"
         fun read() -> i32 {
             let value = 1;
             **&&value
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     assert!(
@@ -2588,7 +2586,7 @@ fn non_escaping_reference_temporary_uses_stack_storage() {
 #[test]
 fn reference_to_unit_enum_variant_materializes_storage() {
     let module = lower(
-        r#"
+        r"
         enum State { Ready }
 
         fun inspect(value: &State) {}
@@ -2596,7 +2594,7 @@ fn reference_to_unit_enum_variant_materializes_storage() {
         fun main() {
             inspect(&State::Ready);
         }
-        "#,
+        ",
     );
     let main = module
         .function_order
@@ -2616,7 +2614,7 @@ fn reference_to_unit_enum_variant_materializes_storage() {
 #[test]
 fn colliding_trait_method_symbols_are_disambiguated() {
     let module = lower(
-        r#"
+        r"
         trait First { fun fmt(&self) -> i32; }
         trait Second { fun fmt(&self) -> i32; }
 
@@ -2630,7 +2628,7 @@ fn colliding_trait_method_symbols_are_disambiguated() {
             let value = 0;
             first(&value) + second(&value)
         }
-        "#,
+        ",
     );
     let names = module
         .function_order
@@ -2645,14 +2643,14 @@ fn colliding_trait_method_symbols_are_disambiguated() {
 #[test]
 fn escaping_destructured_binding_moves_the_whole_slot_to_the_heap() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun escape() -> &Data {
             let (first, second) = (Data { value: 1 }, Data { value: 2 });
             return &first;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2670,14 +2668,14 @@ fn escaping_destructured_binding_moves_the_whole_slot_to_the_heap() {
 #[test]
 fn tuple_destructuring_only_promotes_the_escaping_reference_source() {
     let module = lower(
-        r#"
+        r"
         fun escape_second() -> &mut i32 {
             let mut first = 1;
             let mut second = 2;
             let (first_ref, second_ref) = (&mut first, &mut second);
             return second_ref;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let heap_allocs = func
@@ -2686,13 +2684,13 @@ fn tuple_destructuring_only_promotes_the_escaping_reference_source() {
         .flat_map(|block| &block.insts)
         .filter(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
         .count();
-    assert_eq!(heap_allocs, 1, "only `second` should escape: {:#?}", func);
+    assert_eq!(heap_allocs, 1, "only `second` should escape: {func:#?}");
 }
 
 #[test]
 fn returned_tuple_destructuring_only_promotes_the_escaping_reference_source() {
     let module = lower(
-        r#"
+        r"
         fun pair(first: &mut i32, second: &mut i32) -> (&mut i32, &mut i32) {
             (first, second)
         }
@@ -2703,7 +2701,7 @@ fn returned_tuple_destructuring_only_promotes_the_escaping_reference_source() {
             let (first_ref, second_ref) = pair(&mut first, &mut second);
             return second_ref;
         }
-        "#,
+        ",
     );
     let func = module
         .function_order
@@ -2717,20 +2715,20 @@ fn returned_tuple_destructuring_only_promotes_the_escaping_reference_source() {
         .flat_map(|block| &block.insts)
         .filter(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
         .count();
-    assert_eq!(heap_allocs, 1, "only `second` should escape: {:#?}", func);
+    assert_eq!(heap_allocs, 1, "only `second` should escape: {func:#?}");
 }
 
 #[test]
 fn non_escaping_destructured_bindings_stay_on_the_stack() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun keep() -> i32 {
             let (first, second) = (Data { value: 1 }, Data { value: 2 });
             first.value + second.value
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2747,14 +2745,14 @@ fn non_escaping_destructured_bindings_stay_on_the_stack() {
 #[test]
 fn non_escaping_local_no_heap_alloc() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun keep() {
             let local = Data { value: 1 };
             // local doesn't escape — must be stack allocated (no HeapAlloc)
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -2771,7 +2769,7 @@ fn non_escaping_local_no_heap_alloc() {
 #[test]
 fn returned_reference_consumed_by_caller_stays_on_stack() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun forward(value: &Data) -> &Data { value }
@@ -2780,7 +2778,7 @@ fn returned_reference_consumed_by_caller_stays_on_stack() {
             let local = Data { value: 42 };
             (*forward(&local)).value
         }
-        "#,
+        ",
     );
     let function = module
         .function_order
@@ -2803,7 +2801,7 @@ fn returned_reference_consumed_by_caller_stays_on_stack() {
 #[test]
 fn lambda_return_does_not_leak_into_outer_function_summary() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun read_in_lambda(value: &Data) -> i32 {
@@ -2815,7 +2813,7 @@ fn lambda_return_does_not_leak_into_outer_function_summary() {
             let local = Data { value: 42 };
             read_in_lambda(&local)
         }
-        "#,
+        ",
     );
 
     for name in ["read_in_lambda", "caller"] {
@@ -2840,7 +2838,7 @@ fn lambda_return_does_not_leak_into_outer_function_summary() {
 #[test]
 fn reference_returned_through_local_lambda_still_escapes() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun relay(value: &Data) -> &Data {
@@ -2852,7 +2850,7 @@ fn reference_returned_through_local_lambda_still_escapes() {
             let local = Data { value: 42 };
             relay(&local)
         }
-        "#,
+        ",
     );
     let function = module
         .function_order
@@ -2872,10 +2870,7 @@ fn reference_returned_through_local_lambda_still_escapes() {
     );
 }
 
-#[test]
-fn all_reference_forms_promote_their_source_local() {
-    let (_, type_result, _, module) = compile(
-        r#"
+const REFERENCE_PROMOTION_SOURCE: &str = r#"
         struct Data { value: i32 }
         struct Receiver { value: i32 }
         struct Other { value: i64 }
@@ -3047,22 +3042,22 @@ fn all_reference_forms_promote_their_source_local() {
                 reference = &later;
             }
         }
-        "#,
-    );
+        "#;
+
+#[test]
+fn all_reference_forms_promote_their_source_local() {
+    let (_, type_result, _, module) = compile(REFERENCE_PROMOTION_SOURCE);
     assert!(
         type_result.diagnostics.is_empty(),
         "type errors: {:?}",
         type_result.diagnostics
     );
-    let find_function = |name: &str| {
-        module
-            .function_order
-            .iter()
-            .map(|id| &module.functions[*id])
-            .find(|function| function.name == name)
-            .unwrap()
-    };
+    assert_reference_allocation_counts(&module);
+    assert_reference_places_are_heap_allocated(&module);
+    assert_reference_closure_allocations(&module);
+}
 
+fn assert_reference_allocation_counts(module: &mir::Module) {
     for (name, expected_allocations) in [
         ("direct_mut", 1),
         ("field_ref", 1),
@@ -3087,7 +3082,7 @@ fn all_reference_forms_promote_their_source_local() {
         ("loop_call_sink", 2),
         ("method_alias_ref", 1),
     ] {
-        let function = find_function(name);
+        let function = reference_function(module, name);
         let allocations = function
             .blocks
             .iter()
@@ -3100,7 +3095,7 @@ fn all_reference_forms_promote_their_source_local() {
         );
     }
 
-    let method = find_function("method_arg_ref");
+    let method = reference_function(module, "method_arg_ref");
     let allocated_structs: Vec<_> = method
         .blocks
         .iter()
@@ -3114,8 +3109,10 @@ fn all_reference_forms_promote_their_source_local() {
         })
         .collect();
     assert_eq!(allocated_structs, ["Other"]);
+}
 
-    let method_ref = find_function("method_ref");
+fn assert_reference_places_are_heap_allocated(module: &mir::Module) {
+    let method_ref = reference_function(module, "method_ref");
     let find_inst = |value: mir::Value| {
         method_ref.blocks.iter().find_map(|(_, block)| {
             let index = value.0.checked_sub(block.start_value)? as usize;
@@ -3140,7 +3137,7 @@ fn all_reference_forms_promote_their_source_local() {
         mir::instr::InstKind::HeapAlloc(_)
     ));
 
-    let index_ref = find_function("index_ref");
+    let index_ref = reference_function(module, "index_ref");
     let index_base = index_ref
         .blocks
         .iter()
@@ -3163,8 +3160,10 @@ fn all_reference_forms_promote_their_source_local() {
         index_base_inst.kind,
         mir::instr::InstKind::HeapAlloc(_)
     ));
+}
 
-    let closure = find_function("value_capture");
+fn assert_reference_closure_allocations(module: &mir::Module) {
+    let closure = reference_function(module, "value_capture");
     assert!(
         closure
             .blocks
@@ -3199,7 +3198,7 @@ fn all_reference_forms_promote_their_source_local() {
             .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
     );
 
-    let generic_caller = find_function("generic_before_param_ref");
+    let generic_caller = reference_function(module, "generic_before_param_ref");
     let borrowed = generic_caller
         .blocks
         .iter()
@@ -3218,6 +3217,15 @@ fn all_reference_forms_promote_their_source_local() {
             .and_then(|index| block.insts.get(index))
             .is_some_and(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_)))
     }));
+}
+
+fn reference_function<'a>(module: &'a mir::Module, name: &str) -> &'a mir::Function {
+    module
+        .function_order
+        .iter()
+        .map(|id| &module.functions[*id])
+        .find(|function| function.name == name)
+        .unwrap()
 }
 
 #[test]
@@ -3336,13 +3344,13 @@ fn generic_trait_operator_result_preserves_reference_escape() {
 #[test]
 fn reference_to_raw_pointer_cast_preserves_address() {
     let (_, type_result, analysis, module) = compile(
-        r#"
+        r"
         fun read_address() -> i32 {
             let x = 42;
             let pointer = &x as *const i32;
             unsafe { *pointer }
         }
-        "#,
+        ",
     );
     assert!(
         type_result.diagnostics.is_empty(),
@@ -3375,7 +3383,7 @@ fn reference_to_raw_pointer_cast_preserves_address() {
 #[test]
 fn pattern_bindings_preserve_reference_sources() {
     let (_, type_result, _, module) = compile(
-        r#"
+        r"
         struct Data { value: i32 }
         struct Holder { value: &Data }
 
@@ -3401,7 +3409,7 @@ fn pattern_bindings_preserve_reference_sources() {
                 Holder { value } => value
             }
         }
-        "#,
+        ",
     );
     assert!(
         type_result.diagnostics.is_empty(),
@@ -3436,7 +3444,7 @@ fn pattern_bindings_preserve_reference_sources() {
 #[test]
 fn ergonomic_pattern_bindings_lower_as_references() {
     let (_, type_result, analysis, module) = compile(
-        r#"
+        r"
         fun shared(value: &(i32, i32)) -> i32 {
             let (left, right) = value;
             *left + *right
@@ -3453,7 +3461,7 @@ fn ergonomic_pattern_bindings_lower_as_references() {
             let &mut copy = value;
             copy
         }
-        "#,
+        ",
     );
     assert_eq!(type_result.diagnostics, vec![]);
     assert_eq!(analysis.diagnostics, vec![]);
@@ -3478,13 +3486,13 @@ fn ergonomic_pattern_bindings_lower_as_references() {
 #[test]
 fn returned_ergonomic_pattern_reference_promotes_its_source() {
     let module = lower(
-        r#"
+        r"
         fun first() -> &i32 {
             let pair = (10, 20);
             let (first, second) = &pair;
             first
         }
-        "#,
+        ",
     );
     let function = module
         .function_order
@@ -3507,12 +3515,12 @@ fn returned_ergonomic_pattern_reference_promotes_its_source() {
 #[test]
 fn pos_unary_is_noop() {
     let module = lower(
-        r#"
+        r"
         fun f(x: i32) -> i32 {
             let y = +x;
             return y;
         }
-        "#,
+        ",
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
@@ -3532,7 +3540,7 @@ fn pos_unary_is_noop() {
 #[test]
 fn anonymous_function_lowers_to_function_pointer_call() {
     let module = lower(
-        r#"
+        r"
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 {
             f(value)
         }
@@ -3541,7 +3549,7 @@ fn anonymous_function_lowers_to_function_pointer_call() {
             let inc = fun(x) { x + 1 };
             apply(inc, 41)
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -3567,13 +3575,13 @@ fn anonymous_function_lowers_to_function_pointer_call() {
 #[test]
 fn non_escaping_closure_keeps_environment_and_capture_on_stack() {
     let module = lower(
-        r#"
+        r"
         fun main() -> i32 {
             let base = 40;
             let add = fun(value: i32) { base + value };
             add(2)
         }
-        "#,
+        ",
     );
 
     let lambda = module
@@ -3614,13 +3622,13 @@ fn non_escaping_closure_keeps_environment_and_capture_on_stack() {
 #[test]
 fn lambda_returned_from_lambda_uses_heap_environment() {
     let module = lower(
-        r#"
+        r"
         fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
             fun(first: i32) {
                 fun(second: i32) { base + first + second }
             }
         }
-        "#,
+        ",
     );
 
     assert!(

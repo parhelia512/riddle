@@ -3,11 +3,11 @@ use crate::check;
 #[test]
 fn reports_ptr_deref_outside_unsafe() {
     let result = check(
-        r#"
+        r"
         fun read(ptr: *const i32) -> i32 {
             *ptr
         }
-        "#,
+        ",
     );
     assert!(
         result.diagnostics.iter().any(|diag| diag.code == "E0046"),
@@ -19,11 +19,11 @@ fn reports_ptr_deref_outside_unsafe() {
 #[test]
 fn reports_ptr_index_outside_unsafe() {
     let result = check(
-        r#"
+        r"
         fun read(ptr: *const i32) -> i32 {
             ptr[0]
         }
-        "#,
+        ",
     );
     assert!(
         result.diagnostics.iter().any(|diag| diag.code == "E0046"),
@@ -35,11 +35,11 @@ fn reports_ptr_index_outside_unsafe() {
 #[test]
 fn reports_mut_ptr_deref_outside_unsafe() {
     let result = check(
-        r#"
+        r"
         fun write(ptr: *mut i32) {
             *ptr = 42;
         }
-        "#,
+        ",
     );
     assert!(
         result.diagnostics.iter().any(|diag| diag.code == "E0046"),
@@ -51,11 +51,11 @@ fn reports_mut_ptr_deref_outside_unsafe() {
 #[test]
 fn reports_mut_ptr_index_outside_unsafe() {
     let result = check(
-        r#"
+        r"
         fun write(ptr: *mut i32) {
             ptr[0] = 42;
         }
-        "#,
+        ",
     );
     assert!(
         result.diagnostics.iter().any(|diag| diag.code == "E0046"),
@@ -67,11 +67,11 @@ fn reports_mut_ptr_index_outside_unsafe() {
 #[test]
 fn accepts_ptr_deref_inside_unsafe() {
     let result = check(
-        r#"
+        r"
         fun read(ptr: *const i32) -> i32 {
             unsafe { *ptr }
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -79,11 +79,11 @@ fn accepts_ptr_deref_inside_unsafe() {
 #[test]
 fn accepts_ptr_index_inside_unsafe() {
     let result = check(
-        r#"
+        r"
         fun read(ptr: *const i32) -> i32 {
             unsafe { ptr[0] }
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -91,11 +91,11 @@ fn accepts_ptr_index_inside_unsafe() {
 #[test]
 fn accepts_mut_ptr_deref_inside_unsafe() {
     let result = check(
-        r#"
+        r"
         fun write(ptr: *mut i32) {
             unsafe { *ptr = 42; }
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -103,11 +103,11 @@ fn accepts_mut_ptr_deref_inside_unsafe() {
 #[test]
 fn accepts_mut_ptr_index_inside_unsafe() {
     let result = check(
-        r#"
+        r"
         fun write(ptr: *mut i32) {
             unsafe { ptr[0] = 42; }
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -115,7 +115,7 @@ fn accepts_mut_ptr_index_inside_unsafe() {
 #[test]
 fn accepts_dst_layout_casts_inside_unsafe() {
     let result = check(
-        r#"
+        r"
         unsafe fun slice_from_parts<T>(data: *const T, len: usize) -> &[T] {
             unsafe { (data, len) as &[T] }
         }
@@ -123,7 +123,7 @@ fn accepts_dst_layout_casts_inside_unsafe() {
         unsafe fun str_from_bytes(bytes: &[u8]) -> &str {
             unsafe { bytes as &str }
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -131,7 +131,7 @@ fn accepts_dst_layout_casts_inside_unsafe() {
 #[test]
 fn accepts_slice_to_raw_parts_casts_inside_unsafe() {
     let result = check(
-        r#"
+        r"
         unsafe fun parts<T>(values: &[T]) -> usize {
             match unsafe { values as (*const T, usize) } {
                 (_, len) => len,
@@ -143,7 +143,7 @@ fn accepts_slice_to_raw_parts_casts_inside_unsafe() {
                 (data, _) => data,
             }
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -151,13 +151,13 @@ fn accepts_slice_to_raw_parts_casts_inside_unsafe() {
 #[test]
 fn rejects_mutable_raw_parts_from_shared_slice() {
     let result = check(
-        r#"
+        r"
         unsafe fun mut_parts<T>(values: &[T]) -> *mut T {
             match unsafe { values as (*mut T, usize) } {
                 (data, _) => data,
             }
         }
-        "#,
+        ",
     );
     assert!(
         !result.diagnostics.is_empty(),
@@ -168,13 +168,13 @@ fn rejects_mutable_raw_parts_from_shared_slice() {
 #[test]
 fn slice_to_raw_parts_casts_require_unsafe() {
     let result = check(
-        r#"
+        r"
         fun parts<T>(values: &[T]) -> usize {
             match values as (*const T, usize) {
                 (_, len) => len,
             }
         }
-        "#,
+        ",
     );
     assert_eq!(
         result
@@ -191,11 +191,11 @@ fn slice_to_raw_parts_casts_require_unsafe() {
 #[test]
 fn str_to_byte_slice_layout_cast_is_safe() {
     let result = check(
-        r#"
+        r"
         fun as_bytes(value: &str) -> &[u8] {
             value as &[u8]
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -203,7 +203,7 @@ fn str_to_byte_slice_layout_cast_is_safe() {
 #[test]
 fn dst_layout_casts_require_unsafe() {
     let result = check(
-        r#"
+        r"
         fun slice_from_parts<T>(data: *const T, len: usize) -> &[T] {
             (data, len) as &[T]
         }
@@ -211,7 +211,7 @@ fn dst_layout_casts_require_unsafe() {
         fun str_from_bytes(bytes: &[u8]) -> &str {
             bytes as &str
         }
-        "#,
+        ",
     );
     assert_eq!(
         result
@@ -236,7 +236,7 @@ fn dst_layout_casts_require_unsafe() {
 #[test]
 fn nested_unsafe_blocks_work() {
     let result = check(
-        r#"
+        r"
         fun read(ptr: *const i32) -> i32 {
             unsafe {
                 unsafe {
@@ -244,7 +244,7 @@ fn nested_unsafe_blocks_work() {
                 }
             }
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -252,12 +252,12 @@ fn nested_unsafe_blocks_work() {
 #[test]
 fn unsafe_block_is_an_expression() {
     let result = check(
-        r#"
+        r"
         fun read(ptr: *const i32) -> i32 {
             let x = unsafe { 42 };
             x
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -265,11 +265,11 @@ fn unsafe_block_is_an_expression() {
 #[test]
 fn unsafe_block_does_not_disable_type_checking() {
     let result = check(
-        r#"
+        r"
         fun bad() -> i32 {
             unsafe { true + 1 }
         }
-        "#,
+        ",
     );
     assert!(
         result.diagnostics.iter().any(|diag| diag.code == "E0003"),
@@ -281,12 +281,12 @@ fn unsafe_block_does_not_disable_type_checking() {
 #[test]
 fn unsafe_block_does_not_disable_mutability_check() {
     let result = check(
-        r#"
+        r"
         fun bad() {
             let x = 1;
             unsafe { x = 2; }
         }
-        "#,
+        ",
     );
     assert!(
         result.diagnostics.iter().any(|diag| diag.code == "E0031"),
@@ -298,11 +298,11 @@ fn unsafe_block_does_not_disable_mutability_check() {
 #[test]
 fn safe_ref_deref_does_not_require_unsafe() {
     let result = check(
-        r#"
+        r"
         fun read(r: &i32) -> i32 {
             *r
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -310,13 +310,13 @@ fn safe_ref_deref_does_not_require_unsafe() {
 #[test]
 fn multiple_unsafe_operations_in_one_block() {
     let result = check(
-        r#"
+        r"
         fun read(a: *const i32, b: *const i32) -> i32 {
             unsafe {
                 *a + *b
             }
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -324,18 +324,18 @@ fn multiple_unsafe_operations_in_one_block() {
 #[test]
 fn unsafe_function_call_requires_unsafe_block() {
     let rejected = check(
-        r#"
+        r"
         unsafe fun dangerous(value: i32) -> i32 { value }
         fun main() -> i32 { dangerous(1) }
-        "#,
+        ",
     );
     assert!(rejected.diagnostics.iter().any(|diag| diag.code == "E0046"));
 
     let accepted = check(
-        r#"
+        r"
         unsafe fun dangerous(value: i32) -> i32 { value }
         fun main() -> i32 { unsafe { dangerous(1) } }
-        "#,
+        ",
     );
     assert_eq!(accepted.diagnostics, vec![]);
 }
@@ -343,9 +343,9 @@ fn unsafe_function_call_requires_unsafe_block() {
 #[test]
 fn unsafe_function_body_still_requires_unsafe_block() {
     let result = check(
-        r#"
+        r"
         unsafe fun read(ptr: *const i32) -> i32 { *ptr }
-        "#,
+        ",
     );
     assert!(result.diagnostics.iter().any(|diag| diag.code == "E0046"));
 }
@@ -353,11 +353,11 @@ fn unsafe_function_body_still_requires_unsafe_block() {
 #[test]
 fn safe_function_item_satisfies_callable_bound() {
     let result = check(
-        r#"
+        r"
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun normal(value: i32) -> i32 { value }
         fun main() -> i32 { apply(normal, 1) }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -365,13 +365,13 @@ fn safe_function_item_satisfies_callable_bound() {
 #[test]
 fn unsafe_method_call_requires_unsafe_block() {
     let result = check(
-        r#"
+        r"
         struct Reader {}
         impl Reader {
             unsafe fun read(&self) -> i32 { 1 }
         }
         fun main() -> i32 { Reader {}.read() }
-        "#,
+        ",
     );
     assert!(result.diagnostics.iter().any(|diag| diag.code == "E0046"));
 }
@@ -428,7 +428,7 @@ fn extern_definition_safety_follows_modifier() {
 #[test]
 fn trait_impl_method_safety_must_match() {
     let result = check(
-        r#"
+        r"
         trait RawRead {
             unsafe fun read(&self) -> i32;
         }
@@ -436,7 +436,7 @@ fn trait_impl_method_safety_must_match() {
         impl RawRead for Reader {
             fun read(&self) -> i32 { 1 }
         }
-        "#,
+        ",
     );
     assert!(
         result
@@ -449,11 +449,11 @@ fn trait_impl_method_safety_must_match() {
 #[test]
 fn unsafe_function_item_does_not_satisfy_safe_fn_bound() {
     let result = check(
-        r#"
+        r"
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         unsafe fun dangerous(value: i32) -> i32 { value }
         fun main() -> i32 { apply(dangerous, 1) }
-        "#,
+        ",
     );
     assert!(result.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "E0001"

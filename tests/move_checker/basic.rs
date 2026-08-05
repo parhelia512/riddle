@@ -16,13 +16,13 @@ trait IndexMut<Idx = usize>: Index<Idx> {
 #[test]
 fn delayed_initialization_is_allowed_before_use() {
     let result = analyze(
-        r#"
+        r"
         fun f() -> i32 {
             let value: i32;
             value = 7;
             value
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
@@ -30,7 +30,7 @@ fn delayed_initialization_is_allowed_before_use() {
 #[test]
 fn trait_index_cannot_move_non_copy_output() {
     let result = analyze(&format!(
-        r#"
+        r"
         {INDEX_TRAITS}
 
         struct Token {{ value: i32 }}
@@ -47,7 +47,7 @@ fn trait_index_cannot_move_non_copy_output() {
             let slot = Slot {{ value: Token {{ value: 1 }} }};
             consume(slot[0usize]);
         }}
-        "#
+        "
     ));
     assert!(
         result
@@ -62,7 +62,7 @@ fn trait_index_cannot_move_non_copy_output() {
 #[test]
 fn trait_index_borrow_blocks_mutable_receiver_call() {
     let result = analyze(&format!(
-        r#"
+        r"
         {INDEX_TRAITS}
 
         struct Slot {{ value: i32 }}
@@ -82,7 +82,7 @@ fn trait_index_borrow_blocks_mutable_receiver_call() {
             slot.set(2);
             *value;
         }}
-        "#
+        "
     ));
     assert!(
         result
@@ -97,14 +97,14 @@ fn trait_index_borrow_blocks_mutable_receiver_call() {
 #[test]
 fn delayed_tuple_bindings_are_initialized_independently() {
     let result = analyze(
-        r#"
+        r"
         fun f() -> i32 {
             let (first, second): (i32, i32);
             first = 1;
             second = 2;
             first + second
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
@@ -112,12 +112,12 @@ fn delayed_tuple_bindings_are_initialized_independently() {
 #[test]
 fn delayed_initialization_use_before_assignment_is_rejected() {
     let result = analyze(
-        r#"
+        r"
         fun f() -> i32 {
             let value: i32;
             value
         }
-        "#,
+        ",
     );
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
@@ -131,13 +131,13 @@ fn delayed_initialization_use_before_assignment_is_rejected() {
 #[test]
 fn delayed_initialization_requires_every_branch() {
     let complete = analyze(
-        r#"
+        r"
         fun f(flag: bool) -> i32 {
             let value: i32;
             if flag { value = 1; } else { value = 2; }
             value
         }
-        "#,
+        ",
     );
     assert!(
         complete.diagnostics.is_empty(),
@@ -146,13 +146,13 @@ fn delayed_initialization_requires_every_branch() {
     );
 
     let incomplete = analyze(
-        r#"
+        r"
         fun f(flag: bool) -> i32 {
             let value: i32;
             if flag { value = 1; }
             value
         }
-        "#,
+        ",
     );
     assert!(
         incomplete
@@ -167,13 +167,13 @@ fn delayed_initialization_requires_every_branch() {
 #[test]
 fn immutable_delayed_binding_rejects_second_assignment() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let value: i32;
             value = 1;
             value = 2;
         }
-        "#,
+        ",
     );
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
@@ -187,14 +187,14 @@ fn immutable_delayed_binding_rejects_second_assignment() {
 #[test]
 fn mutable_delayed_binding_can_be_assigned_repeatedly() {
     let result = analyze(
-        r#"
+        r"
         fun f() -> i32 {
             let mut value: i32;
             value = 1;
             value = 2;
             value
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
@@ -202,12 +202,12 @@ fn mutable_delayed_binding_can_be_assigned_repeatedly() {
 #[test]
 fn delayed_compound_assignment_requires_initialization() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let mut value: i32;
             value += 1;
         }
-        "#,
+        ",
     );
     assert_eq!(
         result
@@ -226,13 +226,13 @@ fn delayed_compound_assignment_requires_initialization() {
 #[test]
 fn ints_are_copy_no_move_errors() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let a: i32 = 1;
             let b = a;
             let c = a;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -240,13 +240,13 @@ fn ints_are_copy_no_move_errors() {
 #[test]
 fn bools_are_copy_no_move_errors() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let a: bool = true;
             let b = a;
             let c = a;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -254,13 +254,13 @@ fn bools_are_copy_no_move_errors() {
 #[test]
 fn floats_are_copy_no_move_errors() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let a: f64 = 3.14;
             let b = a;
             let c = a;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -268,14 +268,14 @@ fn floats_are_copy_no_move_errors() {
 #[test]
 fn references_are_copy() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let x: i32 = 42;
             let a: &i32 = &x;
             let b = a;
             let c = a;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -283,14 +283,14 @@ fn references_are_copy() {
 #[test]
 fn assignment_does_not_move_copy_types() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let a: i32 = 1;
             let mut b: i32 = 2;
             b = a;
             let c = a;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -300,7 +300,7 @@ fn assignment_does_not_move_copy_types() {
 #[test]
 fn struct_let_binding_moves_source() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -308,26 +308,26 @@ fn struct_let_binding_moves_source() {
             let q = p;
             let r = p;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|m| m.contains("use of moved value") && m.contains('p'))
     );
 }
 
 #[test]
 fn struct_let_binding_first_use_is_ok() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
             let a = Point{x: 1};
             let b = a;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -335,7 +335,7 @@ fn struct_let_binding_first_use_is_ok() {
 #[test]
 fn struct_move_in_function_call() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun take(p: Point) -> bool { true }
@@ -345,19 +345,19 @@ fn struct_move_in_function_call() {
             take(p);
             take(p);
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|m| m.contains("use of moved value") && m.contains('p'))
     );
 }
 
 #[test]
 fn method_call_after_move_is_error() {
     let result = analyze(
-        r#"
+        r"
         struct Box<T> { value: T }
 
         impl<T> Box<T> {
@@ -371,19 +371,19 @@ fn method_call_after_move_is_error() {
             let y = x;
             x.get();
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("x"))
+            .any(|m| m.contains("use of moved value") && m.contains('x'))
     );
 }
 
 #[test]
 fn moved_local_is_error_on_plain_use() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -391,19 +391,19 @@ fn moved_local_is_error_on_plain_use() {
             let q = p;
             let r = p;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|m| m.contains("use of moved value") && m.contains('p'))
     );
 }
 
 #[test]
 fn moved_local_is_error_on_method_receiver() {
     let result = analyze(
-        r#"
+        r"
         struct Box<T> { value: T }
 
         impl<T> Box<T> {
@@ -417,19 +417,19 @@ fn moved_local_is_error_on_method_receiver() {
             let y = x;
             x.get();
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("x"))
+            .any(|m| m.contains("use of moved value") && m.contains('x'))
     );
 }
 
 #[test]
 fn moved_field_blocks_parent_use() {
     let result = analyze(
-        r#"
+        r"
         struct Inner { value: i32 }
         struct Outer { inner: Inner, tag: i32 }
 
@@ -438,7 +438,7 @@ fn moved_field_blocks_parent_use() {
             let inner = outer.inner;
             let again = outer;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
@@ -450,7 +450,7 @@ fn moved_field_blocks_parent_use() {
 #[test]
 fn moved_array_element_blocks_array_use() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -458,25 +458,25 @@ fn moved_array_element_blocks_array_use() {
             let arr = [p];
             let again = p;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|m| m.contains("use of moved value") && m.contains('p'))
     );
 }
 
 #[test]
 fn copy_types_remain_usable_after_assignment() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let x: i32 = 1;
             let y = x;
             let z = x;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -484,26 +484,26 @@ fn copy_types_remain_usable_after_assignment() {
 #[test]
 fn moved_parameter_is_error_on_second_plain_use() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f(p: Point) {
             let q = p;
             let r = p;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|m| m.contains("use of moved value") && m.contains('p'))
     );
 }
 
 #[test]
 fn moved_parameter_is_error_on_method_receiver() {
     let result = analyze(
-        r#"
+        r"
         struct Box<T> { value: T }
 
         impl<T> Box<T> {
@@ -516,24 +516,24 @@ fn moved_parameter_is_error_on_method_receiver() {
             let y = x;
             x.get();
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("x"))
+            .any(|m| m.contains("use of moved value") && m.contains('x'))
     );
 }
 
 #[test]
 fn copy_parameter_remains_usable_after_assignment() {
     let result = analyze(
-        r#"
+        r"
         fun f(x: i32) {
             let y = x;
             let z = x;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -541,7 +541,7 @@ fn copy_parameter_remains_usable_after_assignment() {
 #[test]
 fn moved_whole_value_blocks_field_use() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -549,19 +549,19 @@ fn moved_whole_value_blocks_field_use() {
             let q = p;
             let x = p.x;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved field") && m.contains("x"))
+            .any(|m| m.contains("use of moved field") && m.contains('x'))
     );
 }
 
 #[test]
 fn moved_field_blocks_method_on_parent() {
     let result = analyze(
-        r#"
+        r"
         struct Inner { value: i32 }
         struct Outer { inner: Inner, tag: i32 }
 
@@ -576,7 +576,7 @@ fn moved_field_blocks_method_on_parent() {
             let inner = outer.inner;
             outer.tag();
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
@@ -588,7 +588,7 @@ fn moved_field_blocks_method_on_parent() {
 #[test]
 fn moving_one_field_allows_sibling_field_use() {
     let result = analyze(
-        r#"
+        r"
         struct Inner { value: i32 }
         struct Outer { inner: Inner, tag: i32 }
 
@@ -597,7 +597,7 @@ fn moving_one_field_allows_sibling_field_use() {
             let inner = outer.inner;
             let tag = outer.tag;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -605,7 +605,7 @@ fn moving_one_field_allows_sibling_field_use() {
 #[test]
 fn moved_array_blocks_index_use() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -615,7 +615,7 @@ fn moved_array_blocks_index_use() {
             let moved = arr;
             let first = arr[0];
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
@@ -627,7 +627,7 @@ fn moved_array_blocks_index_use() {
 #[test]
 fn struct_move_in_return_then_use_is_error() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun consume(p: Point) {}
@@ -637,26 +637,26 @@ fn struct_move_in_return_then_use_is_error() {
             consume(p);
             let q = p;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|m| m.contains("use of moved value") && m.contains('p'))
     );
 }
 
 #[test]
 fn struct_move_in_return_no_reuse_is_ok() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() -> Point {
             let p = Point{x: 1};
             return p;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -666,7 +666,7 @@ fn struct_move_in_return_no_reuse_is_ok() {
 #[test]
 fn assignment_moves_rhs_struct() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -675,19 +675,19 @@ fn assignment_moves_rhs_struct() {
             b = a;
             let c = a;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("a"))
+            .any(|m| m.contains("use of moved value") && m.contains('a'))
     );
 }
 
 #[test]
 fn assignment_reinitializes_binding_after_rhs_move() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun consume(value: Point) -> Point { value }
@@ -697,7 +697,7 @@ fn assignment_reinitializes_binding_after_rhs_move() {
             if flag { p = consume(p); } else { }
             let q = p;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
@@ -705,7 +705,7 @@ fn assignment_reinitializes_binding_after_rhs_move() {
 #[test]
 fn assignment_reinitializes_previously_moved_binding() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -714,7 +714,7 @@ fn assignment_reinitializes_previously_moved_binding() {
             p = Point{x: 2};
             let reused = p;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
@@ -724,7 +724,7 @@ fn assignment_reinitializes_previously_moved_binding() {
 #[test]
 fn match_copy_fields_keep_scrutinee_available() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32, y: i32 }
 
         fun f() {
@@ -734,7 +734,7 @@ fn match_copy_fields_keep_scrutinee_available() {
             }
             let q = p;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
@@ -742,7 +742,7 @@ fn match_copy_fields_keep_scrutinee_available() {
 #[test]
 fn match_move_keeps_unbound_sibling_field_available() {
     let result = analyze(
-        r#"
+        r"
         struct Token {}
         struct Pair { left: Token, right: Token }
         fun consume(value: Token) {}
@@ -754,7 +754,7 @@ fn match_move_keeps_unbound_sibling_field_available() {
             }
             consume(pair.right);
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
@@ -762,7 +762,7 @@ fn match_move_keeps_unbound_sibling_field_available() {
 #[test]
 fn match_moved_field_remains_unavailable() {
     let result = analyze(
-        r#"
+        r"
         struct Token {}
         struct Pair { left: Token, right: Token }
         fun consume(value: Token) {}
@@ -774,7 +774,7 @@ fn match_moved_field_remains_unavailable() {
             }
             consume(pair.left);
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
@@ -788,7 +788,7 @@ fn match_moved_field_remains_unavailable() {
 #[test]
 fn match_int_scrutinee_is_not_moved() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let v: i32 = 42;
             match v {
@@ -796,7 +796,7 @@ fn match_int_scrutinee_is_not_moved() {
             }
             let w = v;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -865,7 +865,7 @@ fn cannot_move_nested_field_out_of_drop_type_with_pattern() {
 #[test]
 fn cannot_move_pattern_binding_in_match_guard() {
     let result = analyze(
-        r#"
+        r"
         struct Token {}
         enum MaybeToken { Some(Token), None }
         fun consume(value: Token) -> bool { true }
@@ -877,7 +877,7 @@ fn cannot_move_pattern_binding_in_match_guard() {
                 MaybeToken::None => {},
             }
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -895,7 +895,7 @@ fn cannot_move_pattern_binding_in_match_guard() {
 #[test]
 fn struct_literal_moves_fields() {
     let result = analyze(
-        r#"
+        r"
         struct Inner { value: i32 }
         struct Outer { inner: Inner }
 
@@ -904,7 +904,7 @@ fn struct_literal_moves_fields() {
             let outer = Outer{inner};
             let x = inner;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
@@ -918,7 +918,7 @@ fn struct_literal_moves_fields() {
 #[test]
 fn array_moves_elements() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -926,18 +926,18 @@ fn array_moves_elements() {
             let arr = [p];
             let q = p;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|m| m.contains("use of moved value") && m.contains('p'))
     );
 }
 
 #[test]
 fn dynamic_array_element_move_is_tracked() {
-    let source = r#"
+    let source = r"
         struct Guard {}
         fun consume(value: Guard) {}
 
@@ -946,7 +946,7 @@ fn dynamic_array_element_move_is_tracked() {
             consume(values[index]);
             consume(values[index]);
         }
-    "#;
+    ";
     let result = analyze(source);
     assert!(
         result
@@ -961,13 +961,13 @@ fn dynamic_array_element_move_is_tracked() {
 #[test]
 fn array_repeat_copy_value_remains_usable() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let x = 1;
             let arr = [x; 3];
             let y = x;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -977,7 +977,7 @@ fn array_repeat_copy_value_remains_usable() {
 #[test]
 fn field_access_does_not_move() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32, y: i32 }
 
         fun f() {
@@ -985,7 +985,7 @@ fn field_access_does_not_move() {
             let a = p.x;
             let b = p.y;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -996,7 +996,7 @@ fn field_access_does_not_move() {
 fn taking_reference_does_not_move() {
     // &p does not move p — reading a field through the reference is fine.
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -1004,7 +1004,7 @@ fn taking_reference_does_not_move() {
             let r = &p;
             let a = p.x;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty());
 }
@@ -1012,7 +1012,7 @@ fn taking_reference_does_not_move() {
 #[test]
 fn mutable_references_move_instead_of_copying() {
     let result = analyze(
-        r#"
+        r"
         fun f() {
             let mut value: i32 = 1;
             let first: &mut i32 = &mut value;
@@ -1020,7 +1020,7 @@ fn mutable_references_move_instead_of_copying() {
             *first = 2;
             *second = 3;
         }
-        "#,
+        ",
     );
     assert!(
         result
@@ -1033,7 +1033,7 @@ fn mutable_references_move_instead_of_copying() {
 #[test]
 fn mutable_reference_arguments_are_automatically_reborrowed() {
     let result = analyze(
-        r#"
+        r"
         fun touch(value: &mut i32) {
             *value += 1;
         }
@@ -1044,7 +1044,7 @@ fn mutable_reference_arguments_are_automatically_reborrowed() {
             touch(reference);
             touch(reference);
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 }
@@ -1052,7 +1052,7 @@ fn mutable_reference_arguments_are_automatically_reborrowed() {
 #[test]
 fn shared_reborrow_freezes_the_parent_mutable_reference() {
     let result = analyze(
-        r#"
+        r"
         fun touch(value: &mut i32) {
             *value += 1;
         }
@@ -1064,7 +1064,7 @@ fn shared_reborrow_freezes_the_parent_mutable_reference() {
             touch(reference);
             *shared;
         }
-        "#,
+        ",
     );
     assert!(
         result
@@ -1077,7 +1077,7 @@ fn shared_reborrow_freezes_the_parent_mutable_reference() {
 #[test]
 fn mutable_borrow_ends_after_the_last_use() {
     let result = analyze(
-        r#"
+        r"
         struct Boxed { value: i32 }
 
         impl Boxed {
@@ -1092,7 +1092,7 @@ fn mutable_borrow_ends_after_the_last_use() {
             *reference = 2;
             boxed.set();
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 }
@@ -1100,7 +1100,7 @@ fn mutable_borrow_ends_after_the_last_use() {
 #[test]
 fn method_return_reference_keeps_receiver_borrowed() {
     let result = analyze(
-        r#"
+        r"
         struct Boxed { value: i32 }
 
         impl Boxed {
@@ -1119,7 +1119,7 @@ fn method_return_reference_keeps_receiver_borrowed() {
             boxed.set();
             *reference = 2;
         }
-        "#,
+        ",
     );
     assert!(
         result
@@ -1132,7 +1132,7 @@ fn method_return_reference_keeps_receiver_borrowed() {
 #[test]
 fn wrapped_method_return_preserves_receiver_provenance() {
     let result = analyze(
-        r#"
+        r"
         enum Maybe<T> { Some(T), None }
 
         impl<T> Maybe<T> {
@@ -1163,7 +1163,7 @@ fn wrapped_method_return_preserves_receiver_provenance() {
             boxed.set();
             *reference = 2;
         }
-        "#,
+        ",
     );
     assert!(
         result
@@ -1176,14 +1176,14 @@ fn wrapped_method_return_preserves_receiver_provenance() {
 #[test]
 fn generic_supertrait_shared_methods_do_not_move_receiver() {
     let result = analyze(
-        r#"
+        r"
         trait Named { fun name(&self) -> i32; }
         trait Tagged: Named { fun tag(&self) -> i32; }
 
         fun describe<T: Tagged>(value: T) -> i32 {
             value.name() + value.tag()
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -1192,7 +1192,7 @@ fn generic_supertrait_shared_methods_do_not_move_receiver() {
 #[test]
 fn non_generic_enum_preserves_reference_provenance() {
     let result = analyze(
-        r#"
+        r"
         enum Slot { Some(&mut i32), None }
 
         impl Slot {
@@ -1223,7 +1223,7 @@ fn non_generic_enum_preserves_reference_provenance() {
             boxed.set();
             *reference = 2;
         }
-        "#,
+        ",
     );
     assert!(
         result
@@ -1236,7 +1236,7 @@ fn non_generic_enum_preserves_reference_provenance() {
 #[test]
 fn mutable_borrows_of_disjoint_fields_can_coexist() {
     let result = analyze(
-        r#"
+        r"
         struct Pair { left: i32, right: i32 }
 
         fun f() {
@@ -1246,7 +1246,7 @@ fn mutable_borrows_of_disjoint_fields_can_coexist() {
             *left = 3;
             *right = 4;
         }
-        "#,
+        ",
     );
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 }
@@ -1255,7 +1255,7 @@ fn mutable_borrows_of_disjoint_fields_can_coexist() {
 fn move_while_borrowed_is_error() {
     // Moving p while a shared borrow exists is E0304.
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -1263,13 +1263,13 @@ fn move_while_borrowed_is_error() {
             let r = &p;
             let q = p;
         }
-        "#,
+        ",
     );
     assert!(
         result
             .diagnostics
             .iter()
-            .any(|d| d.code == "E0304" && d.message.contains("p"))
+            .any(|d| d.code == "E0304" && d.message.contains('p'))
     );
 }
 
@@ -1377,7 +1377,7 @@ fn generic_copy_impl_makes_instantiations_copyable() {
 #[test]
 fn without_copy_impl_struct_is_not_copyable() {
     let result = analyze(
-        r#"
+        r"
         trait Copy {}
 
         struct Vec2 { x: i32 }
@@ -1387,7 +1387,7 @@ fn without_copy_impl_struct_is_not_copyable() {
             let b = a;
             let c = a;
         }
-        "#,
+        ",
     );
     assert!(
         result
@@ -1400,7 +1400,7 @@ fn without_copy_impl_struct_is_not_copyable() {
 #[test]
 fn unannotated_copy_trait_does_not_enable_copy_hook() {
     let result = analyze(
-        r#"
+        r"
         trait Copy {}
 
         struct Vec2 { x: i32 }
@@ -1412,7 +1412,7 @@ fn unannotated_copy_trait_does_not_enable_copy_hook() {
             let b = a;
             let c = a;
         }
-        "#,
+        ",
     );
     assert!(
         result
@@ -1427,7 +1427,7 @@ fn unannotated_copy_trait_does_not_enable_copy_hook() {
 #[test]
 fn match_binding_whole_scrutinee_is_consumed() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun consume(p: Point) {}
@@ -1438,7 +1438,7 @@ fn match_binding_whole_scrutinee_is_consumed() {
                 val => { consume(val); consume(val); }
             }
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
@@ -1452,7 +1452,7 @@ fn match_binding_whole_scrutinee_is_consumed() {
 #[test]
 fn block_tail_moves_value() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun f() {
@@ -1460,19 +1460,19 @@ fn block_tail_moves_value() {
             let q = { p };
             let r = p;
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
             .iter()
-            .any(|m| m.contains("use of moved value") && m.contains("p"))
+            .any(|m| m.contains("use of moved value") && m.contains('p'))
     );
 }
 
 #[test]
 fn anonymous_function_parameters_follow_move_rules() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun main() {
@@ -1481,7 +1481,7 @@ fn anonymous_function_parameters_follow_move_rules() {
                 let second = value;
             };
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1494,7 +1494,7 @@ fn anonymous_function_parameters_follow_move_rules() {
 #[test]
 fn inferred_anonymous_function_parameters_follow_move_rules() {
     let result = analyze(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun main() {
@@ -1505,7 +1505,7 @@ fn inferred_anonymous_function_parameters_follow_move_rules() {
             };
             consume_twice(Point { x: 1 });
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1522,7 +1522,7 @@ fn inferred_anonymous_function_parameters_follow_move_rules() {
 #[test]
 fn value_capture_moves_non_copy_binding() {
     let result = analyze(
-        r#"
+        r"
         struct Token { value: i32 }
         fun consume(value: Token) {}
 
@@ -1531,7 +1531,7 @@ fn value_capture_moves_non_copy_binding() {
             let once = fun() { consume(token); };
             let again = token;
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1544,7 +1544,7 @@ fn value_capture_moves_non_copy_binding() {
 #[test]
 fn once_closure_cannot_be_called_twice() {
     let result = analyze(
-        r#"
+        r"
         struct Token { value: i32 }
         fun consume(value: Token) {}
 
@@ -1554,7 +1554,7 @@ fn once_closure_cannot_be_called_twice() {
             once();
             once();
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1567,7 +1567,7 @@ fn once_closure_cannot_be_called_twice() {
 #[test]
 fn closure_value_moves_when_passed_by_value() {
     let result = analyze(
-        r#"
+        r"
         fun consume(f: impl Fn(i32) -> i32) {}
 
         fun test() {
@@ -1575,7 +1575,7 @@ fn closure_value_moves_when_passed_by_value() {
             consume(add_one);
             consume(add_one);
         }
-        "#,
+        ",
     );
     assert!(
         messages(&result)
@@ -1589,7 +1589,7 @@ fn closure_value_moves_when_passed_by_value() {
 #[test]
 fn once_closure_stays_once_after_branch_join() {
     let result = analyze(
-        r#"
+        r"
         struct Token { value: i32 }
         fun consume(value: Token) {}
 
@@ -1600,7 +1600,7 @@ fn once_closure_stays_once_after_branch_join() {
             once();
             once();
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1613,12 +1613,12 @@ fn once_closure_stays_once_after_branch_join() {
 #[test]
 fn fn_once_parameter_is_consumed_by_its_first_call() {
     let result = analyze(
-        r#"
+        r"
         fun call_twice(callback: impl FnOnce() -> i32) -> i32 {
             callback();
             callback()
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
@@ -1629,7 +1629,7 @@ fn fn_once_parameter_is_consumed_by_its_first_call() {
 #[test]
 fn shared_pattern_capture_blocks_later_move() {
     let result = analyze(
-        r#"
+        r"
         struct Token { value: i32 }
         fun consume(value: Token) {}
         fun inspect(value: &Token) -> i32 { value.value }
@@ -1644,7 +1644,7 @@ fn shared_pattern_capture_blocks_later_move() {
                 }
             }
         }
-        "#,
+        ",
     );
 
     let diagnostics = messages(&result);
@@ -1661,14 +1661,14 @@ fn shared_pattern_capture_blocks_later_move() {
 #[test]
 fn shared_capture_blocks_assignment_while_closure_is_live() {
     let result = analyze(
-        r#"
+        r"
         fun main() {
             let mut base = 1;
             let read = fun() { base };
             base = 2;
             read();
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1681,7 +1681,7 @@ fn shared_capture_blocks_assignment_while_closure_is_live() {
 #[test]
 fn destructured_bindings_are_tracked_independently() {
     let result = analyze(
-        r#"
+        r"
         struct Token { value: i32 }
         fun consume(value: Token) {}
 
@@ -1691,7 +1691,7 @@ fn destructured_bindings_are_tracked_independently() {
             consume(first);
             consume(second);
         }
-        "#,
+        ",
     );
 
     assert_eq!(messages(&result), Vec::<&str>::new());
@@ -1700,7 +1700,7 @@ fn destructured_bindings_are_tracked_independently() {
 #[test]
 fn moving_a_destructured_binding_twice_is_rejected() {
     let result = analyze(
-        r#"
+        r"
         struct Token { value: i32 }
         fun consume(value: Token) {}
 
@@ -1709,7 +1709,7 @@ fn moving_a_destructured_binding_twice_is_rejected() {
             consume(first);
             consume(first);
         }
-        "#,
+        ",
     );
 
     assert!(

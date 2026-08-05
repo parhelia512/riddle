@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BodyCtx, CallableSignature, CaptureMode, CapturePlace, CaptureSource, ClosureId, ClosureKind,
+    Expr, ExprId, HirTypeRef, LabelStyle, LambdaCapture, LambdaCtx, LambdaInfo, PatId, Pattern,
+    PatternBindingId, PatternBindingMode, Projection, ResolvedName, SourceLabel, Type, TypeChecker,
+    UnaryOp, ValueUse, capture_mode, type_has_unresolved_inference,
+};
 
 impl TypeChecker<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -49,20 +54,18 @@ impl TypeChecker<'_> {
                         param
                             .ty_range
                             .or(param.name_range)
-                            .or(ctx.expr_range(expr_id)),
+                            .or_else(|| ctx.expr_range(expr_id)),
                     )
                 }
             })
             .collect::<Vec<_>>();
         let return_ty = if matches!(ret_type, HirTypeRef::Unknown) {
-            expected_fn
-                .map(|(_, ret)| ret.clone())
-                .unwrap_or_else(|| self.fresh_infer())
+            expected_fn.map_or_else(|| self.fresh_infer(), |(_, ret)| ret.clone())
         } else {
             self.lower_type_ref_with_params_at(
                 ret_type,
                 &ctx.generic_params,
-                ret_type_range.or(ctx.expr_range(expr_id)),
+                ret_type_range.or_else(|| ctx.expr_range(expr_id)),
             )
         };
 
@@ -88,6 +91,18 @@ impl TypeChecker<'_> {
         ctx.return_ty = old_return;
         ctx.loop_depth = old_loop_depth;
 
+        self.finish_lambda(ctx, expr_id, params, param_types, return_ty, lambda)
+    }
+
+    fn finish_lambda(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        params: &[hir::body::LambdaParam],
+        param_types: Vec<Type>,
+        return_ty: Type,
+        lambda: LambdaCtx,
+    ) -> Type {
         let kind = if lambda
             .captures
             .iter()
@@ -123,7 +138,7 @@ impl TypeChecker<'_> {
                         param
                             .name_range
                             .or(param.ty_range)
-                            .or(ctx.expr_range(expr_id)),
+                            .or_else(|| ctx.expr_range(expr_id)),
                         ty.clone(),
                     )
                 })
@@ -144,7 +159,6 @@ impl TypeChecker<'_> {
     }
 
     pub(super) fn capture_source(
-        &self,
         ctx: &BodyCtx<'_>,
         resolved: Option<&ResolvedName>,
     ) -> Option<CaptureSource> {
@@ -166,7 +180,6 @@ impl TypeChecker<'_> {
     }
 
     pub(super) fn record_capture(
-        &mut self,
         ctx: &mut BodyCtx<'_>,
         place: CapturePlace,
         name: String,
@@ -266,7 +279,7 @@ impl TypeChecker<'_> {
         }
     }
 
-    pub(super) fn parameter_value_use(ty: &Type) -> ValueUse {
+    pub(super) const fn parameter_value_use(ty: &Type) -> ValueUse {
         match ty {
             Type::Ref(_, false) => ValueUse::Shared,
             Type::Ref(_, true) => ValueUse::Mutable,
@@ -274,7 +287,7 @@ impl TypeChecker<'_> {
         }
     }
 
-    pub(super) fn hir_parameter_value_use(ty: &HirTypeRef) -> ValueUse {
+    pub(super) const fn hir_parameter_value_use(ty: &HirTypeRef) -> ValueUse {
         match ty {
             HirTypeRef::Ref(_, false) => ValueUse::Shared,
             HirTypeRef::Ref(_, true) => ValueUse::Mutable,
@@ -283,7 +296,7 @@ impl TypeChecker<'_> {
     }
 
     pub(super) fn record_capture_use(
-        &mut self,
+        &self,
         ctx: &mut BodyCtx<'_>,
         expr_id: ExprId,
         use_kind: ValueUse,
@@ -291,7 +304,7 @@ impl TypeChecker<'_> {
         let Some((place, name, ty)) = self.capture_place(ctx, expr_id) else {
             return;
         };
-        self.record_capture(ctx, place, name, ty, use_kind);
+        Self::record_capture(ctx, place, name, ty, use_kind);
     }
 
     pub(super) fn capture_place(
@@ -301,7 +314,7 @@ impl TypeChecker<'_> {
     ) -> Option<(CapturePlace, String, Type)> {
         match &ctx.body.exprs[expr_id] {
             Expr::Path { path, resolved } => {
-                let source = self.capture_source(ctx, resolved.as_ref())?;
+                let source = Self::capture_source(ctx, resolved.as_ref())?;
                 let ty = self
                     .result
                     .expr_types
@@ -316,8 +329,7 @@ impl TypeChecker<'_> {
                     .result
                     .expr_types
                     .get(&(ctx.body_id, *base))
-                    .map(|ty| self.resolve_type(ty))
-                    .unwrap_or(Type::Unknown);
+                    .map_or(Type::Unknown, |ty| self.resolve_type(ty));
                 let index = match base_ty {
                     Type::Struct(struct_id, _) => self.hir.item_tree.structs[struct_id]
                         .fields
@@ -356,10 +368,8 @@ impl TypeChecker<'_> {
                         .get(&(ctx.body_id, expr_id))
                         .cloned()
                         .unwrap_or(Type::Unknown);
-                    Some((place, name, ty))
-                } else {
-                    Some((place, name, ty))
                 }
+                Some((place, name, ty))
             }
             Expr::Unary {
                 operand,
@@ -397,7 +407,7 @@ impl TypeChecker<'_> {
                 }
                 CaptureMode::Value => ValueUse::Move,
             };
-            self.record_capture(
+            Self::record_capture(
                 ctx,
                 capture.place.clone(),
                 capture.name.clone(),
@@ -486,29 +496,25 @@ impl TypeChecker<'_> {
             Some(ResolvedName::Param(index)) => ctx
                 .function
                 .and_then(|function| function.params.get(*index))
-                .map(|param| {
+                .map_or((true, None), |param| {
                     (
                         !ctx.resolved_param_is_mut(&ResolvedName::Param(*index)),
                         Some(param.name_range),
                     )
-                })
-                .unwrap_or((true, None)),
+                }),
             Some(ResolvedName::LambdaParam { lambda, index }) => {
                 let Expr::Lambda { params, .. } = &ctx.body.exprs[*lambda] else {
                     return;
                 };
-                params
-                    .get(*index)
-                    .map(|param| {
-                        (
-                            !ctx.resolved_param_is_mut(&ResolvedName::LambdaParam {
-                                lambda: *lambda,
-                                index: *index,
-                            }),
-                            param.name_range,
-                        )
-                    })
-                    .unwrap_or((true, None))
+                params.get(*index).map_or((true, None), |param| {
+                    (
+                        !ctx.resolved_param_is_mut(&ResolvedName::LambdaParam {
+                            lambda: *lambda,
+                            index: *index,
+                        }),
+                        param.name_range,
+                    )
+                })
             }
             _ => (false, None),
         };

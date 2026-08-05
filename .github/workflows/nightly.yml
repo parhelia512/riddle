@@ -94,11 +94,10 @@ jobs:
             platform: windows
             cross: true
 
-          - os: windows-latest
+          - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             arch: aarch64
             platform: windows
-            cross: true
 
           # ── macOS ──────────────────────────────────────────
           - os: macos-latest
@@ -136,8 +135,7 @@ jobs:
         with:
           shared-key: nightly-${{ matrix.target }}
 
-      - name: 运行测试（仅原生目标）
-        if: matrix.cross != true
+      - name: 运行测试
         run: cargo test --workspace --target ${{ matrix.target }}
 
       - name: Release 构建

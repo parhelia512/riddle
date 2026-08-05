@@ -6,7 +6,7 @@ fn every_documented_error_code_keeps_rust_style_lsp_fields() {
     let source = "  target  ";
     let uri = lsp_types::Url::parse("file:///diagnostic-codes.rid").unwrap();
     let primary = source_label(
-        TextRange::new(0.into(), (source.len() as u32).into()),
+        text_range(0, source.len()),
         "",
         type_checker::LabelStyle::Primary,
     );
@@ -50,18 +50,12 @@ fn diagnostic_conversion_uses_primary_style_utf16_and_related_labels() {
         type_checker::Severity::Warning,
         vec![
             source_label(
-                TextRange::new(
-                    (secondary_start as u32).into(),
-                    ((secondary_start + "secondary".len()) as u32).into(),
-                ),
+                text_range(secondary_start, secondary_start + "secondary".len()),
                 "secondary label",
                 type_checker::LabelStyle::Secondary,
             ),
             source_label(
-                TextRange::new(
-                    ((primary_start - 2) as u32).into(),
-                    ((primary_start + "primary".len() + 2) as u32).into(),
-                ),
+                text_range(primary_start - 2, primary_start + "primary".len() + 2),
                 "primary label",
                 type_checker::LabelStyle::Primary,
             ),
@@ -147,8 +141,16 @@ fn parser_eof_diagnostic_stays_at_user_eof_with_std() {
 
     assert!(!diagnostics.is_empty());
     assert!(diagnostics.iter().all(|diagnostic| {
-        diagnostic.range.start == Position::new(0, source.len() as u32)
-            && diagnostic.range.end == Position::new(0, source.len() as u32)
+        diagnostic.range.start
+            == Position::new(
+                0,
+                u32::try_from(source.len()).expect("test offset should fit in u32"),
+            )
+            && diagnostic.range.end
+                == Position::new(
+                    0,
+                    u32::try_from(source.len()).expect("test offset should fit in u32"),
+                )
     }));
 }
 

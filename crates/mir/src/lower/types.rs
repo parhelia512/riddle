@@ -1,6 +1,10 @@
-use super::*;
+use super::{
+    FloatTy, FnPtrType, HashMap, IntTy, LowerCtx, ResolvedName, StructType, Type,
+    closure_value_type, is_self_associated_path, mono_name_from_parts, mono_type_name,
+    tc_const_arg_to_usize,
+};
 
-impl<'a> LowerCtx<'a> {
+impl LowerCtx<'_> {
     pub(super) fn convert_type(&self, t: &type_checker::Type) -> Type {
         use type_checker::FloatTy as TcFloat;
         use type_checker::IntTy as TcInt;
@@ -29,7 +33,11 @@ impl<'a> LowerCtx<'a> {
             TcType::Bool => Type::Bool,
             TcType::Str => Type::Str,
             TcType::Char => Type::Char,
-            TcType::Unit => Type::Unit,
+            TcType::Unit
+            | TcType::InferVar(_)
+            | TcType::Const(_)
+            | TcType::Unknown
+            | TcType::Error => Type::Unit,
             TcType::Never => Type::Never,
             TcType::Ref(inner, mutable) => Type::Ref(Box::new(self.convert_type(inner)), *mutable),
             TcType::Ptr { inner, .. } => Type::Ptr(Box::new(self.convert_type(inner))),
@@ -65,10 +73,7 @@ impl<'a> LowerCtx<'a> {
                     ret: Box::new(self.convert_type(&signature.ret)),
                 })
             }
-            TcType::InferVar(_) => Type::Unit,
             TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
-            TcType::Const(_) => Type::Unit,
-            TcType::Unknown | TcType::Error => Type::Unit,
         }
     }
 
@@ -104,13 +109,9 @@ impl<'a> LowerCtx<'a> {
                 .iter()
                 .map(|param| self.convert_type(&self.lower_hir_type_for_pattern(&param.ty, &subst)))
                 .collect(),
-            ret: Box::new(
-                function
-                    .ret_type
-                    .as_ref()
-                    .map(|ret| self.convert_type(&self.lower_hir_type_for_pattern(ret, &subst)))
-                    .unwrap_or(Type::Unit),
-            ),
+            ret: Box::new(function.ret_type.as_ref().map_or(Type::Unit, |ret| {
+                self.convert_type(&self.lower_hir_type_for_pattern(ret, &subst))
+            })),
         }
     }
 
@@ -139,7 +140,6 @@ impl<'a> LowerCtx<'a> {
                     Some("bool") => Type::Bool,
                     Some("i8") => Type::Int(IntTy::I8),
                     Some("i16") => Type::Int(IntTy::I16),
-                    Some("i32") => Type::Int(IntTy::I32),
                     Some("i64") => Type::Int(IntTy::I64),
                     Some("u8") => Type::Int(IntTy::U8),
                     Some("u16") => Type::Int(IntTy::U16),
@@ -151,6 +151,7 @@ impl<'a> LowerCtx<'a> {
                     Some("f64") => Type::Float(FloatTy::F64),
                     Some("str") => Type::Str,
                     Some("char") => Type::Char,
+                    Some("i32") | None => Type::Int(IntTy::I32),
                     Some(name) => {
                         if let Some(type_alias) = self.find_associated_type_alias(path)
                             && let Some(ty) = &self.hir.item_tree.type_aliases[type_alias].ty
@@ -171,7 +172,6 @@ impl<'a> LowerCtx<'a> {
                         }
                         Type::Int(IntTy::I32)
                     }
-                    None => Type::Int(IntTy::I32),
                 }
             }
             hir::item_tree::HirTypeRef::Ref(inner, mutable) => {
@@ -191,7 +191,9 @@ impl<'a> LowerCtx<'a> {
                 Box::new(self.convert_hir_type(inner)),
                 self.hir_const_arg_to_usize(len, &HashMap::new()),
             ),
-            hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
+            hir::item_tree::HirTypeRef::Const(_)
+            | hir::item_tree::HirTypeRef::Unknown
+            | hir::item_tree::HirTypeRef::Error => Type::Unit,
             hir::item_tree::HirTypeRef::ImplTrait {
                 callable, hidden, ..
             } => {
@@ -200,21 +202,17 @@ impl<'a> LowerCtx<'a> {
                 {
                     return ty.clone();
                 }
-                callable
-                    .as_ref()
-                    .map(|signature| {
-                        closure_value_type(FnPtrType {
-                            params: signature
-                                .params
-                                .iter()
-                                .map(|param| self.convert_hir_type(param))
-                                .collect(),
-                            ret: Box::new(self.convert_hir_type(&signature.ret)),
-                        })
+                callable.as_ref().map_or(Type::Unit, |signature| {
+                    closure_value_type(FnPtrType {
+                        params: signature
+                            .params
+                            .iter()
+                            .map(|param| self.convert_hir_type(param))
+                            .collect(),
+                        ret: Box::new(self.convert_hir_type(&signature.ret)),
                     })
-                    .unwrap_or(Type::Unit)
+                })
             }
-            hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
 
@@ -259,8 +257,7 @@ impl<'a> LowerCtx<'a> {
             self.hir.item_tree.type_aliases[*alias_id]
                 .ty
                 .as_ref()
-                .map(|ty| self.convert_hir_type(ty))
-                .unwrap_or(Type::Unit),
+                .map_or(Type::Unit, |ty| self.convert_hir_type(ty)),
         )
     }
 
@@ -336,7 +333,7 @@ impl<'a> LowerCtx<'a> {
         let name_args = type_args
             .iter()
             .map(mono_type_name)
-            .chain(const_args.iter().map(|value| value.to_string()))
+            .chain(const_args.iter().map(std::string::ToString::to_string))
             .collect::<Vec<_>>();
         Type::Struct(StructType {
             name: mono_name_from_parts(&s.name.0, &name_args),
@@ -428,7 +425,7 @@ impl<'a> LowerCtx<'a> {
         let name_args = type_args
             .iter()
             .map(mono_type_name)
-            .chain(const_args.iter().map(|value| value.to_string()))
+            .chain(const_args.iter().map(std::string::ToString::to_string))
             .collect::<Vec<_>>();
         Type::Struct(StructType {
             name: mono_name_from_parts(&e.name.0, &name_args),

@@ -95,7 +95,8 @@ pub struct Inst {
 }
 
 impl Inst {
-    pub fn new(kind: InstKind, ty: Type) -> Self {
+    #[must_use]
+    pub const fn new(kind: InstKind, ty: Type) -> Self {
         Self { kind, ty }
     }
 }
@@ -177,7 +178,7 @@ pub enum InstKind {
 // 终止指令
 
 /// Block terminator — every basic block must end with exactly one.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminator {
     /// Temporary builder state; must be replaced before code generation.
     Pending,

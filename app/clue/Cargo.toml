@@ -8,7 +8,7 @@ autotests = false
 [dependencies]
 anyhow = "1.0"
 ast = { path = "../../crates/ast" }
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "=4.5.61", features = ["derive"] }
 frontend = { path = "../../crates/frontend" }
 gc = { path = "../../crates/gc" }
 riddlec = { path = "../riddlec" }

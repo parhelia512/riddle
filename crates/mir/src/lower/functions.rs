@@ -1,6 +1,13 @@
-use super::*;
+use std::fmt::Write as _;
 
-impl<'a> LowerCtx<'a> {
+use super::{
+    Body, BodyId, Builder, CaptureAccess, CaptureMode, CapturePlace, CaptureSource, CastOp, Expr,
+    ExprId, FuncRef, Function, IntTy, LambdaCapture, LambdaExprInput, LambdaFunctionInput,
+    LambdaInfo, LowerCtx, Projection, StructType, Type, Value, closure_call_signature,
+    closure_drop_function_type, closure_env_type,
+};
+
+impl LowerCtx<'_> {
     pub(super) fn reference_storage(&self, builder: &mut Builder, ty: Type) -> Value {
         if self.gc_enabled {
             builder.heap_alloc(ty)
@@ -61,10 +68,9 @@ impl<'a> LowerCtx<'a> {
         let ret_type = func_item
             .ret_type
             .as_ref()
-            .map(|rt| self.convert_hir_type(rt))
-            .unwrap_or(Type::Unit);
+            .map_or(Type::Unit, |rt| self.convert_hir_type(rt));
 
-        let mut func = Function::new(name.clone(), ret_type);
+        let mut func = Function::new(name, ret_type);
         func.uses_c_string_abi = func_item.attrs.iter().any(|attr| attr.name.0 == "c_export");
         func.is_c_export =
             self.hir.item_tree.extern_function_ids.contains(&fid) || func.uses_c_string_abi;
@@ -134,17 +140,19 @@ impl<'a> LowerCtx<'a> {
         func
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn lower_lambda(
         &mut self,
         builder: &mut Builder,
         outer_params: &[Value],
-        body_id: BodyId,
-        expr_id: ExprId,
-        params: &[hir::body::LambdaParam],
-        lambda_body: ExprId,
-        ty: &Type,
+        input: &LambdaExprInput<'_>,
     ) -> Value {
+        let LambdaExprInput {
+            body_id,
+            expr_id,
+            params,
+            body: lambda_body,
+            ty,
+        } = *input;
         let Some(call_signature) = closure_call_signature(ty) else {
             return builder.unit_const();
         };
@@ -157,50 +165,21 @@ impl<'a> LowerCtx<'a> {
                 captures: Vec::new(),
                 kind: type_checker::ClosureKind::Fn,
             });
-        let (name, needs_lowering) = match self.lambda_functions.get(&(body_id, expr_id)) {
-            Some(name) => (name.clone(), false),
-            None => {
+        let (name, needs_lowering) =
+            if let Some(name) = self.lambda_functions.get(&(body_id, expr_id)) {
+                (name.clone(), false)
+            } else {
                 self.lambda_counter += 1;
                 let name = format!("__riddle_lambda_{}", self.lambda_counter);
                 self.lambda_functions
                     .insert((body_id, expr_id), name.clone());
                 (name, true)
-            }
-        };
-        let capture_types = info
-            .captures
-            .iter()
-            .map(|capture| self.convert_type(&capture.ty))
-            .collect::<Vec<_>>();
-        let env_struct = StructType {
-            name: format!("{}_env", name),
-            fields: info
-                .captures
-                .iter()
-                .zip(&capture_types)
-                .enumerate()
-                .map(|(index, (capture, ty))| {
-                    let field_ty = match capture.mode {
-                        CaptureMode::Shared | CaptureMode::Mutable => {
-                            Type::Ptr(Box::new(ty.clone()))
-                        }
-                        CaptureMode::Value => ty.clone(),
-                    };
-                    (
-                        format!(
-                            "capture_{}_{}",
-                            index,
-                            self.capture_environment_name(capture)
-                        ),
-                        field_ty,
-                    )
-                })
-                .collect(),
-        };
+            };
+        let (capture_types, env_struct) = self.lambda_environment_type(&name, &info);
 
         let heap_env = !info.captures.is_empty() && self.analysis.lambda_escapes(body_id, expr_id);
         let env_value = if info.captures.is_empty() {
-            self.null_env(builder)
+            Self::null_env(builder)
         } else {
             let env_ty = Type::Struct(env_struct.clone());
             let env_ptr = if heap_env {
@@ -230,19 +209,19 @@ impl<'a> LowerCtx<'a> {
         };
 
         if needs_lowering {
-            self.lower_lambda_function(
+            self.lower_lambda_function(&LambdaFunctionInput {
                 body_id,
                 expr_id,
                 params,
-                lambda_body,
-                &name,
-                &call_signature,
-                &info,
-                &capture_types,
-                &env_struct,
-            );
+                body: lambda_body,
+                name: &name,
+                call_signature: &call_signature,
+                info: &info,
+                capture_types: &capture_types,
+                env_struct: &env_struct,
+            });
             self.lower_lambda_drop_function(
-                &format!("{}_drop", name),
+                &format!("{name}_drop"),
                 &info,
                 &capture_types,
                 &env_struct,
@@ -252,10 +231,45 @@ impl<'a> LowerCtx<'a> {
 
         let call = builder.function_ref(FuncRef::Local(name.clone()), Type::FnPtr(call_signature));
         let drop = builder.function_ref(
-            FuncRef::Local(format!("{}_drop", name)),
+            FuncRef::Local(format!("{name}_drop")),
             closure_drop_function_type(),
         );
         builder.struct_value(vec![call, env_value, drop], ty.clone())
+    }
+
+    fn lambda_environment_type(&self, name: &str, info: &LambdaInfo) -> (Vec<Type>, StructType) {
+        let capture_types = info
+            .captures
+            .iter()
+            .map(|capture| self.convert_type(&capture.ty))
+            .collect::<Vec<_>>();
+        let fields = info
+            .captures
+            .iter()
+            .zip(&capture_types)
+            .enumerate()
+            .map(|(index, (capture, ty))| {
+                let field_ty = match capture.mode {
+                    CaptureMode::Shared | CaptureMode::Mutable => Type::Ptr(Box::new(ty.clone())),
+                    CaptureMode::Value => ty.clone(),
+                };
+                (
+                    format!(
+                        "capture_{}_{}",
+                        index,
+                        self.capture_environment_name(capture)
+                    ),
+                    field_ty,
+                )
+            })
+            .collect();
+        (
+            capture_types,
+            StructType {
+                name: format!("{name}_env"),
+                fields,
+            },
+        )
     }
 
     pub(super) fn capture_environment_name(&self, capture: &LambdaCapture) -> String {
@@ -279,13 +293,11 @@ impl<'a> LowerCtx<'a> {
                     };
                     name.push('_');
                     name.push_str(
-                        &field_name
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("field_{index}")),
+                        &field_name.map_or_else(|| format!("field_{index}"), str::to_owned),
                     );
                 }
                 Projection::Index(Some(index)) => {
-                    name.push_str(&format!("_{index}"));
+                    write!(name, "_{index}").expect("writing to a String cannot fail");
                 }
                 Projection::Index(None) => name.push_str("_index"),
             }
@@ -293,33 +305,21 @@ impl<'a> LowerCtx<'a> {
         name
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn lower_lambda_function(
-        &mut self,
-        body_id: BodyId,
-        expr_id: ExprId,
-        params: &[hir::body::LambdaParam],
-        lambda_body: ExprId,
-        name: &str,
-        call_signature: &FnPtrType,
-        info: &LambdaInfo,
-        capture_types: &[Type],
-        env_struct: &StructType,
-    ) {
+    pub(super) fn lower_lambda_function(&mut self, input: &LambdaFunctionInput<'_>) {
+        let LambdaFunctionInput {
+            body_id,
+            expr_id,
+            params,
+            body: lambda_body,
+            name,
+            call_signature,
+            ..
+        } = *input;
         let body = &self.hir.bodies[body_id];
-        let old_expr_cache = std::mem::take(&mut self.expr_cache);
-        let old_scope_map = std::mem::take(&mut self.scope_map);
-        let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
-        let old_drop_slots = std::mem::take(&mut self.drop_slots);
-        let old_temporary_drop_scopes = std::mem::take(&mut self.temporary_drop_scopes);
-        let old_temporary_drop_slots = std::mem::take(&mut self.temporary_drop_slots);
-        let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
-        let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
-        let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
+        let old_state = self.take_lowering_state();
         let old_loop_targets = std::mem::take(&mut self.loop_targets);
-        let old_capture_access = std::mem::take(&mut self.capture_access);
-        let old_current_lambda = self.current_lambda.replace(expr_id);
-        let old_current_body = self.current_body.replace(body_id);
+        self.current_lambda = Some(expr_id);
+        self.current_body = Some(body_id);
 
         let mut function = Function::new(name.to_string(), (*call_signature.ret).clone());
         let env_param = function.add_param("__env".into(), closure_env_type());
@@ -333,68 +333,8 @@ impl<'a> LowerCtx<'a> {
         {
             let mut lambda_builder = Builder::new(&mut function);
             self.drop_scopes.push(Vec::new());
-            for (index, value) in param_values.iter().enumerate() {
-                let ty = call_signature.params[index + 1].clone();
-                let tc_ty =
-                    self.lower_hir_type_for_pattern(&params[index].ty, &self.generic_tc_subst);
-                let needs_drop = self.type_needs_drop(&tc_ty, 0);
-                let storage = if self.analysis.lambda_param_escapes(body_id, expr_id, index) {
-                    Some(self.reference_storage(&mut lambda_builder, ty.clone()))
-                } else if params[index].is_mut
-                    || self
-                        .analysis
-                        .lambda_param_needs_address(body_id, expr_id, index)
-                    || needs_drop
-                {
-                    Some(lambda_builder.alloca(ty))
-                } else {
-                    None
-                };
-                if let Some(storage) = storage {
-                    lambda_builder.store(*value, storage);
-                    self.parameter_storage.insert(
-                        CaptureSource::LambdaParam {
-                            lambda: expr_id,
-                            index,
-                        },
-                        storage,
-                    );
-                }
-                if needs_drop {
-                    let place = storage.expect("Drop lambda parameter has storage");
-                    let source = CaptureSource::LambdaParam {
-                        lambda: expr_id,
-                        index,
-                    };
-                    let slots =
-                        self.create_drop_slots(&mut lambda_builder, place, &tc_ty, Vec::new());
-                    self.register_drop_slots(source, &slots);
-                    self.drop_scopes[0].splice(0..0, slots.into_iter().rev());
-                }
-            }
-            if !info.captures.is_empty() {
-                let env_ptr_ty = Type::Ptr(Box::new(Type::Struct(env_struct.clone())));
-                let env_ptr = lambda_builder.cast(CastOp::PtrToPtr, env_param, env_ptr_ty.clone());
-                for (index, (capture, capture_ty)) in
-                    info.captures.iter().zip(capture_types).enumerate()
-                {
-                    let field_ty = env_struct.fields[index].1.clone();
-                    let field = lambda_builder.field_ptr(env_ptr, index, field_ty.clone());
-                    let place = match capture.mode {
-                        CaptureMode::Shared | CaptureMode::Mutable => {
-                            lambda_builder.load(field, field_ty)
-                        }
-                        CaptureMode::Value => field,
-                    };
-                    self.capture_access.insert(
-                        capture.place.clone(),
-                        CaptureAccess {
-                            place,
-                            ty: capture_ty.clone(),
-                        },
-                    );
-                }
-            }
+            self.initialize_lambda_parameters(&mut lambda_builder, input, &param_values);
+            self.initialize_lambda_captures(&mut lambda_builder, input, env_param);
             let result = self.lower_expr(&mut lambda_builder, &param_values, body, lambda_body);
             if lambda_builder.needs_return() {
                 self.emit_current_drop_scope(&mut lambda_builder);
@@ -406,19 +346,91 @@ impl<'a> LowerCtx<'a> {
         }
         self.module.add_function(function);
 
-        self.expr_cache = old_expr_cache;
-        self.scope_map = old_scope_map;
-        self.drop_scopes = old_drop_scopes;
-        self.drop_slots = old_drop_slots;
-        self.temporary_drop_scopes = old_temporary_drop_scopes;
-        self.temporary_drop_slots = old_temporary_drop_slots;
-        self.storage_bindings = old_storage_bindings;
-        self.parameter_storage = old_parameter_storage;
-        self.pattern_bindings = old_pattern_bindings;
         self.loop_targets = old_loop_targets;
-        self.capture_access = old_capture_access;
-        self.current_lambda = old_current_lambda;
-        self.current_body = old_current_body;
+        self.restore_lowering_state(old_state);
+    }
+
+    fn initialize_lambda_parameters(
+        &mut self,
+        builder: &mut Builder,
+        input: &LambdaFunctionInput<'_>,
+        values: &[Value],
+    ) {
+        for (index, value) in values.iter().enumerate() {
+            let ty = input.call_signature.params[index + 1].clone();
+            let tc_ty =
+                self.lower_hir_type_for_pattern(&input.params[index].ty, &self.generic_tc_subst);
+            let needs_drop = self.type_needs_drop(&tc_ty, 0);
+            let storage = if self
+                .analysis
+                .lambda_param_escapes(input.body_id, input.expr_id, index)
+            {
+                Some(self.reference_storage(builder, ty.clone()))
+            } else if input.params[index].is_mut
+                || self
+                    .analysis
+                    .lambda_param_needs_address(input.body_id, input.expr_id, index)
+                || needs_drop
+            {
+                Some(builder.alloca(ty))
+            } else {
+                None
+            };
+            if let Some(storage) = storage {
+                builder.store(*value, storage);
+                self.parameter_storage.insert(
+                    CaptureSource::LambdaParam {
+                        lambda: input.expr_id,
+                        index,
+                    },
+                    storage,
+                );
+            }
+            if needs_drop {
+                let place = storage.expect("Drop lambda parameter has storage");
+                let source = CaptureSource::LambdaParam {
+                    lambda: input.expr_id,
+                    index,
+                };
+                let slots = self.create_drop_slots(builder, place, &tc_ty, Vec::new());
+                self.register_drop_slots(source, &slots);
+                self.drop_scopes[0].splice(0..0, slots.into_iter().rev());
+            }
+        }
+    }
+
+    fn initialize_lambda_captures(
+        &mut self,
+        builder: &mut Builder,
+        input: &LambdaFunctionInput<'_>,
+        env_param: Value,
+    ) {
+        if input.info.captures.is_empty() {
+            return;
+        }
+        let env_ptr_ty = Type::Ptr(Box::new(Type::Struct(input.env_struct.clone())));
+        let env_ptr = builder.cast(CastOp::PtrToPtr, env_param, env_ptr_ty);
+        for (index, (capture, capture_ty)) in input
+            .info
+            .captures
+            .iter()
+            .zip(input.capture_types)
+            .enumerate()
+        {
+            let field_ty = input.env_struct.fields[index].1.clone();
+            let field = builder.field_ptr(env_ptr, index, field_ty.clone());
+            let place = match capture.mode {
+                CaptureMode::Shared | CaptureMode::Mutable => builder.load(field, field_ty),
+                CaptureMode::Value => field,
+            };
+            self.capture_access.insert(
+                capture.place.clone(),
+                CaptureAccess {
+                    place,
+                    ty: capture_ty.clone(),
+                },
+            );
+        }
     }
 
     pub(super) fn lower_lambda_drop_function(
@@ -495,7 +507,7 @@ impl<'a> LowerCtx<'a> {
             builder.store(value, place);
             place
         });
-        self.project_capture_access(
+        Self::project_capture_access(
             builder,
             CaptureAccess {
                 place: root_place,
@@ -503,8 +515,7 @@ impl<'a> LowerCtx<'a> {
             },
             &capture.projections,
         )
-        .map(|access| access.place)
-        .unwrap_or(root_place)
+        .map_or(root_place, |access| access.place)
     }
 
     pub(super) fn parameter_place(
@@ -516,7 +527,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(super) fn capture_root_value(
-        &mut self,
+        &self,
         builder: &mut Builder,
         params: &[Value],
         source: &CaptureSource,
@@ -544,7 +555,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(super) fn capture_access_for_place(
-        &mut self,
+        &self,
         builder: &mut Builder,
         requested: &CapturePlace,
     ) -> Option<CaptureAccess> {
@@ -554,7 +565,7 @@ impl<'a> LowerCtx<'a> {
             .filter(|(place, _)| place.is_prefix_of(requested))
             .max_by_key(|(place, _)| place.projections.len())
             .map(|(place, access)| (place.clone(), access.clone()))?;
-        self.project_capture_access(
+        Self::project_capture_access(
             builder,
             access,
             &requested.projections[ancestor.projections.len()..],
@@ -562,7 +573,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(super) fn project_capture_access(
-        &self,
         builder: &mut Builder,
         mut access: CaptureAccess,
         projections: &[Projection],
@@ -574,7 +584,6 @@ impl<'a> LowerCtx<'a> {
                 }
                 (Projection::Field(index), Type::Tuple(elements)) => elements.get(*index)?.clone(),
                 (Projection::Index(Some(_)), Type::Array(element, _)) => *element.clone(),
-                (Projection::Index(None), _) => return None,
                 _ => return None,
             };
             access.place = match projection {
@@ -643,7 +652,7 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    pub(super) fn null_env(&self, builder: &mut Builder) -> Value {
+    pub(super) fn null_env(builder: &mut Builder) -> Value {
         let zero = builder.iconst(0, IntTy::Usize);
         builder.cast(CastOp::IntToPtr, zero, closure_env_type())
     }
@@ -669,7 +678,7 @@ impl<'a> LowerCtx<'a> {
             let target = self
                 .mono_function_name_for_args(fid, &args)
                 .unwrap_or_else(|| self.function_name(fid));
-            let name = format!("__riddle_fn_adapter_{}", target);
+            let name = format!("__riddle_fn_adapter_{target}");
             self.function_adapters.insert(key, name.clone());
 
             let mut function = Function::new(name.clone(), (*signature.ret).clone());
@@ -688,7 +697,7 @@ impl<'a> LowerCtx<'a> {
                     let param_name = parameter_names
                         .get(index)
                         .cloned()
-                        .unwrap_or_else(|| format!("p{}", index));
+                        .unwrap_or_else(|| format!("p{index}"));
                     function.add_param(param_name, param_ty.clone())
                 })
                 .collect::<Vec<_>>();
@@ -712,7 +721,7 @@ impl<'a> LowerCtx<'a> {
         };
 
         let call = builder.function_ref(FuncRef::Local(adapter), Type::FnPtr(signature));
-        let env = self.null_env(builder);
+        let env = Self::null_env(builder);
         let drop_name = self.ensure_noop_closure_drop();
         let drop = builder.function_ref(FuncRef::Local(drop_name), closure_drop_function_type());
         builder.struct_value(vec![call, env, drop], ty.clone())

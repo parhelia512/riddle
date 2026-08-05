@@ -17,8 +17,8 @@ use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
 use type_checker::{Diagnostic, TypeCheckResult, check_hir};
 
 fn check(source: &str) -> TypeCheckResult {
-    #[allow(clippy::single_range_in_vec_init)]
-    check_with_package_ranges(source, &[0..source.len()])
+    let package_range = 0..source.len();
+    check_with_package_ranges(source, std::slice::from_ref(&package_range))
 }
 
 fn check_with_package_ranges(
@@ -32,7 +32,16 @@ fn check_with_package_ranges(
     let mut hir = lower_and_resolve(parse);
     hir.package_ranges = package_ranges
         .iter()
-        .map(|range| TextRange::new((range.start as u32).into(), (range.end as u32).into()))
+        .map(|range| {
+            TextRange::new(
+                u32::try_from(range.start)
+                    .expect("test offset should fit in u32")
+                    .into(),
+                u32::try_from(range.end)
+                    .expect("test offset should fit in u32")
+                    .into(),
+            )
+        })
         .collect();
     let result = check_hir(&hir);
     diagnostic_support::assert_type_diagnostics(source, &result.diagnostics);
@@ -42,7 +51,7 @@ fn check_with_package_ranges(
 fn lower_and_resolve(parse: &Parse) -> HirFile {
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
-    let mut hir = lower_root(root);
+    let mut hir = lower_root(&root);
     let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
     diagnostic_support::assert_hir_diagnostics(

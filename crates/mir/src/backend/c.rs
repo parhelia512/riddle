@@ -4,9 +4,9 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::backend::Backend;
 use crate::func::Function;
-use crate::instr::*;
+use crate::instr::{BinOp, CastOp, CmpOp, ConstValue, Inst, InstKind, Terminator, UnOp};
 use crate::module::Module;
-use crate::types::*;
+use crate::types::{FloatTy, FnPtrType, IntTy, StructType, Type};
 use crate::value::{FuncRef, Value};
 
 #[derive(Debug, Default)]
@@ -14,7 +14,7 @@ pub struct CBackend {
     names: Vec<String>,
     counter: u64,
     ctypes: Vec<String>,
-    /// Value -> StructType mapping for field name lookup in ExtractValue.
+    /// Value -> `StructType` mapping for field name lookup in `ExtractValue`.
     struct_types: HashMap<u32, StructType>,
     /// Count of how many times each value is referenced as an operand.
     use_counts: HashMap<u32, u32>,
@@ -28,10 +28,12 @@ pub struct CBackend {
 }
 
 impl CBackend {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[must_use]
     pub fn without_gc() -> Self {
         Self {
             no_gc: true,
@@ -62,7 +64,7 @@ impl CBackend {
         }
         self.names
             .get(v.0 as usize)
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
             .filter(|s| !s.is_empty())
             .unwrap_or("0")
     }
@@ -87,8 +89,7 @@ impl CBackend {
         }
         self.ctypes
             .get(v.0 as usize)
-            .map(|ct| ct.ends_with('*'))
-            .unwrap_or(false)
+            .is_some_and(|ct| ct.ends_with('*'))
     }
 
     fn record_struct_type(&mut self, v: Value, ty: &Type) {
@@ -103,6 +104,24 @@ impl Backend for CBackend {
 
     fn compile(&mut self, module: &Module) -> Result<String, Self::Error> {
         let mut out = String::new();
+        self.emit_module_prelude(module, &mut out);
+        Self::emit_type_declarations(module, &mut out);
+        self.emit_function_declarations(module, &mut out)?;
+        for &fid in &module.function_order {
+            self.compile_function(&module.functions[fid], &mut out)?;
+            writeln!(out).unwrap();
+        }
+        self.emit_runtime_main(module, &mut out)?;
+        Ok(out)
+    }
+
+    fn name(&self) -> &'static str {
+        "c"
+    }
+}
+
+impl CBackend {
+    fn emit_module_prelude(&mut self, module: &Module, out: &mut String) {
         self.c_exports = module
             .functions
             .values()
@@ -160,7 +179,9 @@ impl Backend for CBackend {
         // ponytail: C needs an addressable unit token until generic ZST storage is supported.
         writeln!(out, "typedef unsigned char riddle_unit;").unwrap();
         writeln!(out).unwrap();
+    }
 
+    fn emit_type_declarations(module: &Module, out: &mut String) {
         let structs = collect_structs(module);
         for strukt in &structs {
             let name = c_type_name(&strukt.name);
@@ -208,7 +229,9 @@ impl Backend for CBackend {
             writeln!(out, "}};").unwrap();
             writeln!(out).unwrap();
         }
+    }
 
+    fn emit_function_declarations(&self, module: &Module, out: &mut String) -> Result<(), String> {
         // Forward declarations
         for &fid in &module.function_order {
             let func = &module.functions[fid];
@@ -276,13 +299,10 @@ impl Backend for CBackend {
             .unwrap();
         }
         writeln!(out).unwrap();
+        Ok(())
+    }
 
-        for &fid in &module.function_order {
-            let func = &module.functions[fid];
-            self.compile_function(func, &mut out)?;
-            writeln!(out).unwrap();
-        }
-
+    fn emit_runtime_main(&self, module: &Module, out: &mut String) -> Result<(), String> {
         if self.needs_runtime
             && let Some(main) = module
                 .function_order
@@ -302,16 +322,9 @@ impl Backend for CBackend {
             writeln!(out, "  return (int){user_main}();").unwrap();
             writeln!(out, "}}").unwrap();
         }
-
-        Ok(out)
+        Ok(())
     }
 
-    fn name(&self) -> &'static str {
-        "c"
-    }
-}
-
-impl CBackend {
     fn extern_name<'a>(&self, name: &'a str) -> Result<&'a str, String> {
         if !self.no_gc {
             return Ok(name);
@@ -360,7 +373,7 @@ impl CBackend {
             .collect();
 
         let sname = self.c_function_name(&func.name)?;
-        write!(out, "{} {} (", ret_ct, sname).unwrap();
+        write!(out, "{ret_ct} {sname} (").unwrap();
         if param_strs.is_empty() {
             write!(out, "void").unwrap();
         } else {
@@ -368,7 +381,7 @@ impl CBackend {
                 if i > 0 {
                     write!(out, ", ").unwrap();
                 }
-                write!(out, "{}", p).unwrap();
+                write!(out, "{p}").unwrap();
             }
         }
         writeln!(out, ") {{").unwrap();
@@ -386,60 +399,69 @@ impl CBackend {
         for (bid, block) in func.blocks.iter() {
             let bid_raw = bid.into_raw();
             if let Some(ref label) = block.label {
-                writeln!(out, "block_{}_{}:;", label, bid_raw).unwrap();
+                writeln!(out, "block_{label}_{bid_raw}:;").unwrap();
             }
 
             for (i, inst) in block.insts.iter().enumerate() {
-                let v = Value(block.start_value + i as u32);
+                let v = block.value_at(i);
                 self.emit_inst(inst, v, out)?;
             }
 
-            match &block.terminator {
-                Terminator::Pending => {
-                    return Err(format!("block {bid_raw} has no terminator"));
-                }
-                Terminator::Return(val) => {
-                    if func.name == "main" && matches!(func.ret_type, Type::Unit) {
-                        writeln!(out, "  return 0;").unwrap();
-                    } else if matches!(func.ret_type, Type::Unit | Type::Never | Type::Void) {
-                        writeln!(out, "  return;").unwrap();
-                    } else if let Some(value) = val {
-                        writeln!(out, "  return {};", self.name(*value)).unwrap();
-                    } else {
-                        writeln!(out, "  return;").unwrap();
-                    }
-                }
-                Terminator::Branch(target) => {
-                    self.emit_phi_assignments(func, *target, bid, out, "  ");
-                    let tid = target.into_raw();
-                    let label = func.blocks[*target].label.as_deref().unwrap_or("?");
-                    writeln!(out, "  goto block_{}_{};", label, tid).unwrap();
-                }
-                Terminator::CondBranch(cond, then_block, else_block) => {
-                    let tl = func.blocks[*then_block].label.as_deref().unwrap_or("?");
-                    let tid = then_block.into_raw();
-                    let el = func.blocks[*else_block].label.as_deref().unwrap_or("?");
-                    let eid = else_block.into_raw();
-                    let cond = self.name(*cond);
-                    if cond.starts_with('(') && cond.ends_with(')') {
-                        writeln!(out, "  if {} {{", cond).unwrap();
-                    } else {
-                        writeln!(out, "  if ({}) {{", cond).unwrap();
-                    }
-                    self.emit_phi_assignments(func, *then_block, bid, out, "    ");
-                    writeln!(out, "    goto block_{}_{};", tl, tid).unwrap();
-                    writeln!(out, "  }} else {{").unwrap();
-                    self.emit_phi_assignments(func, *else_block, bid, out, "    ");
-                    writeln!(out, "    goto block_{}_{};", el, eid).unwrap();
-                    writeln!(out, "  }}").unwrap();
-                }
-                Terminator::Unreachable => {
-                    writeln!(out, "  for (;;) {{}}").unwrap();
-                }
-            }
+            self.emit_terminator(func, bid, &block.terminator, out)?;
         }
 
         writeln!(out, "}}").unwrap();
+        Ok(())
+    }
+
+    fn emit_terminator(
+        &self,
+        func: &Function,
+        block: crate::value::BlockId,
+        terminator: &Terminator,
+        out: &mut String,
+    ) -> Result<(), String> {
+        match terminator {
+            Terminator::Pending => {
+                return Err(format!("block {} has no terminator", block.into_raw()));
+            }
+            Terminator::Return(value) => {
+                if func.name == "main" && matches!(func.ret_type, Type::Unit) {
+                    writeln!(out, "  return 0;").unwrap();
+                } else if matches!(func.ret_type, Type::Unit | Type::Never | Type::Void) {
+                    writeln!(out, "  return;").unwrap();
+                } else if let Some(value) = value {
+                    writeln!(out, "  return {};", self.name(*value)).unwrap();
+                } else {
+                    writeln!(out, "  return;").unwrap();
+                }
+            }
+            Terminator::Branch(target) => {
+                self.emit_phi_assignments(func, *target, block, out, "  ");
+                let id = target.into_raw();
+                let label = func.blocks[*target].label.as_deref().unwrap_or("?");
+                writeln!(out, "  goto block_{label}_{id};").unwrap();
+            }
+            Terminator::CondBranch(cond, then_block, else_block) => {
+                let then_label = func.blocks[*then_block].label.as_deref().unwrap_or("?");
+                let then_id = then_block.into_raw();
+                let else_label = func.blocks[*else_block].label.as_deref().unwrap_or("?");
+                let else_id = else_block.into_raw();
+                let cond = self.name(*cond);
+                if cond.starts_with('(') && cond.ends_with(')') {
+                    writeln!(out, "  if {cond} {{").unwrap();
+                } else {
+                    writeln!(out, "  if ({cond}) {{").unwrap();
+                }
+                self.emit_phi_assignments(func, *then_block, block, out, "    ");
+                writeln!(out, "    goto block_{then_label}_{then_id};").unwrap();
+                writeln!(out, "  }} else {{").unwrap();
+                self.emit_phi_assignments(func, *else_block, block, out, "    ");
+                writeln!(out, "    goto block_{else_label}_{else_id};").unwrap();
+                writeln!(out, "  }}").unwrap();
+            }
+            Terminator::Unreachable => writeln!(out, "  for (;;) {{}}").unwrap(),
+        }
         Ok(())
     }
 
@@ -453,11 +475,11 @@ impl CBackend {
                 if ct == "void" {
                     continue;
                 }
-                let v = Value(block.start_value + index as u32);
+                let v = block.value_at(index);
                 let name = fresh_c(&mut self.counter, "phi");
                 self.set(v, name.clone(), ct.clone());
                 self.record_struct_type(v, &inst.ty);
-                writeln!(out, "  {} {}; // phi", ct, name).unwrap();
+                writeln!(out, "  {ct} {name}; // phi").unwrap();
             }
         }
     }
@@ -466,647 +488,702 @@ impl CBackend {
         self.record_struct_type(v, &inst.ty);
         match &inst.kind {
             // ponytail: Const values always inlined — no variable emitted.
-            InstKind::Const(c) => {
-                let ct = ctype_of(&inst.ty);
-                let expr = match c {
-                    ConstValue::Int(val, _) => c_int_literal(*val, &inst.ty),
-                    ConstValue::NegativeInt(val, _) => c_negative_int_literal(*val, &inst.ty),
-                    ConstValue::Float(val, _) => format!("(({}){})", ct, val),
-                    ConstValue::Bool(val) => val.to_string(),
-                    ConstValue::String(val) => {
-                        let (inner, len) = c_string_parts(val);
-                        if is_fat_repr(&inst.ty) {
-                            format!("(riddle_str){{ \"{}\", {} }}", inner, len)
-                        } else {
-                            format!("\"{}\"", inner)
-                        }
-                    }
-                    ConstValue::Char(val) => format!("UINT32_C({})", u32::from(*val)),
-                    ConstValue::Unit => "((riddle_unit)0)".into(),
-                };
-                self.set_inline(v, expr, ct);
+            InstKind::Const(value) => self.emit_const(inst, v, value),
+            InstKind::HeapAlloc(_) => self.emit_heap_alloc(inst, v, out),
+            InstKind::HeapFree(ptr) => self.emit_heap_free(*ptr, out),
+            InstKind::Alloca(_) => self.emit_alloca(inst, v, out),
+            InstKind::Store(value, ptr) => self.emit_store(*value, *ptr, out),
+            InstKind::Load(ptr) => self.emit_load(inst, v, *ptr, out),
+            InstKind::BinOp(op, lhs, rhs) => self.emit_binop(inst, v, *op, *lhs, *rhs, out),
+            InstKind::UnOp(op, operand) => self.emit_unop(inst, v, *op, *operand, out),
+            InstKind::Cmp(op, lhs, rhs) => self.emit_cmp(v, *op, *lhs, *rhs, out),
+            InstKind::Cast(op, value, target) => {
+                self.emit_cast(v, *op, *value, target, out);
             }
+            InstKind::SizeOf(ty) => self.emit_size_of(inst, v, ty, out),
 
-            InstKind::HeapAlloc(_ty) => {
-                let ct = ctype_of(&inst.ty);
-                let inner_ct = pointee_ct(&inst.ty);
-                let name = fresh_c(&mut self.counter, "h");
-                // HeapAlloc: the C variable is a pointer — is_indirect returns true.
-                self.set(v, name.clone(), ct.clone());
-                writeln!(
-                    out,
-                    "  {} {} = ({}){}(sizeof({}));",
-                    ct,
-                    name,
-                    ct,
-                    if self.no_gc {
-                        "riddle_alloc"
-                    } else {
-                        "rgc_alloc"
-                    },
-                    inner_ct
-                )
-                .unwrap();
-            }
-
-            InstKind::HeapFree(ptr) => {
-                writeln!(
-                    out,
-                    "  {}({});",
-                    if self.no_gc {
-                        "riddle_free"
-                    } else {
-                        "rgc_free"
-                    },
-                    self.name(*ptr)
-                )
-                .unwrap();
-            }
-
-            InstKind::Alloca(_ty) => {
-                let inner = match &inst.ty {
-                    Type::Ptr(inner) | Type::Ref(inner, _) => inner.as_ref(),
-                    _ => &Type::Void,
-                };
-                let (decl_pre, decl_suf) = c_decl_parts(inner);
-                let name = fresh_c(&mut self.counter, "a");
-                let ct = format!("{}{}", decl_pre, decl_suf);
-                self.set(v, name.clone(), ct);
-                self.direct_storage.insert(v.0);
-                writeln!(out, "  {} {}{}; // stack", decl_pre, name, decl_suf).unwrap();
-            }
-
-            InstKind::Store(value, ptr) => {
-                let vn = self.value_expr(*value);
-                let pn = self.name(*ptr).to_owned();
-                let pt_ct = self
-                    .ctypes
-                    .get(ptr.0 as usize)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                let value_ct = self
-                    .ctypes
-                    .get(value.0 as usize)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if pt_ct.ends_with(']') {
-                    // Array storage — C doesn't support array assignment, use memcpy
-                    writeln!(out, "  memcpy({}, {}, sizeof({}));", pn, vn, pt_ct).unwrap();
-                } else if value_ct.ends_with(']') {
-                    let destination = if self.is_indirect(*ptr) {
-                        pn
-                    } else {
-                        format!("&{}", pn)
-                    };
-                    writeln!(
-                        out,
-                        "  memcpy({}, {}, sizeof({}));",
-                        destination, vn, value_ct
-                    )
-                    .unwrap();
-                } else if self.is_indirect(*ptr) {
-                    // ponytail: cancel *& when ptr is an inlined &-expression
-                    if let Some(inner) = strip_addr_of(&pn) {
-                        writeln!(out, "  {} = {};", inner, vn).unwrap();
-                    } else {
-                        writeln!(out, "  *{} = {};", pn, vn).unwrap();
-                    }
-                } else {
-                    writeln!(out, "  {} = {};", pn, vn).unwrap();
-                }
-            }
-
-            InstKind::Load(ptr) => {
-                let name = fresh_c(&mut self.counter, "l");
-                let ct = ctype_of(&inst.ty);
-                if ct == "void" {
-                    self.set(v, "".into(), "void".into());
-                } else if ct.ends_with(']') {
-                    // Array load — C doesn't support array assignment, use memcpy
-                    let pn = self.name(*ptr).to_owned();
-                    let (decl_pre, decl_suf) = c_decl_parts(&inst.ty);
-                    let decl_ct = format!("{}{}", decl_pre, decl_suf);
-                    self.set(v, name.clone(), decl_ct);
-                    writeln!(out, "  {} {}{};", decl_pre, name, decl_suf).unwrap();
-                    writeln!(out, "  memcpy({}, {}, sizeof({}));", name, pn, name).unwrap();
-                } else {
-                    let pn = self.name(*ptr);
-                    // ponytail: cancel *& when ptr is an inlined &-expression
-                    let rhs = if self.is_indirect(*ptr) {
-                        if let Some(inner) = strip_addr_of(pn) {
-                            inner.to_owned()
-                        } else {
-                            format!("*{}", pn)
-                        }
-                    } else {
-                        pn.to_owned()
-                    };
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(out, "  {} {} = {};", ct, name, rhs).unwrap();
-                }
-            }
-
-            InstKind::BinOp(op, lhs, rhs) => {
-                let ct = ctype_of(&inst.ty);
-                if ct == "void" {
-                    self.set(v, "".into(), "void".into());
-                } else {
-                    let lhs_name = self.name(*lhs).to_owned();
-                    let rhs_name = self.name(*rhs).to_owned();
-                    let expr = match &inst.ty {
-                        Type::Int(ty) => integer_binop_expr(*ty, *op, &lhs_name, &rhs_name),
-                        Type::Float(ty) => float_binop_expr(*ty, *op, &lhs_name, &rhs_name),
-                        _ => format!("({} {} {})", lhs_name, binop_c(*op), rhs_name),
-                    };
-                    if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
-                        self.set_inline(v, expr, ct);
-                    } else {
-                        let name = fresh_c(&mut self.counter, "b");
-                        self.set(v, name.clone(), ct.clone());
-                        writeln!(out, "  {} {} = {};", ct, name, expr).unwrap();
-                    }
-                }
-            }
-
-            InstKind::UnOp(op, operand) => {
-                let ct = ctype_of(&inst.ty);
-                let operand_name = self.name(*operand).to_owned();
-                let operand_ct = self
-                    .ctypes
-                    .get(operand.0 as usize)
-                    .cloned()
-                    .unwrap_or_default();
-                // Ref is a no-op when the operand/value is already a pointer-like thing:
-                // thin pointer: is_indirect (ctype ends with '*')
-                // fat pointer: result type is a fat Ref (unsized inner, value already ptr+len)
-                // Arrays use their first-element pointer representation in C.
-                let is_noop_ref = matches!(op, UnOp::Ref | UnOp::MutRef)
-                    && (self.is_indirect(*operand)
-                        || is_fat_repr(&inst.ty)
-                        || matches!(&inst.ty, Type::Ref(inner, _) if matches!(inner.as_ref(), Type::Array(..))));
-                let is_noop_deref =
-                    matches!(op, UnOp::Deref) && operand_ct == "riddle_str" && ct == "riddle_str";
-                let expr = if is_noop_ref || is_noop_deref {
-                    operand_name
-                } else if matches!(op, UnOp::Neg | UnOp::Not) && matches!(&inst.ty, Type::Int(_)) {
-                    let Type::Int(ty) = &inst.ty else {
-                        unreachable!()
-                    };
-                    integer_unop_expr(*ty, *op, &operand_name)
-                } else {
-                    let op_str = match op {
-                        UnOp::Neg => "-",
-                        UnOp::Not if matches!(inst.ty, Type::Int(_)) => "~",
-                        UnOp::Not => "!",
-                        UnOp::Ref => "&",
-                        UnOp::MutRef => "&",
-                        UnOp::Deref => "*",
-                    };
-                    format!("({}{})", op_str, operand_name)
-                };
-                if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1
-                    && !matches!(op, UnOp::Deref)
-                {
-                    self.set_inline(v, expr, ct);
-                } else {
-                    let name = fresh_c(&mut self.counter, "u");
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(out, "  {} {} = {};", ct, name, expr).unwrap();
-                }
-            }
-
-            InstKind::Cmp(op, lhs, rhs) => {
-                let lhs_name = self.name(*lhs).to_owned();
-                let rhs_name = self.name(*rhs).to_owned();
-                let lhs_type = self
-                    .ctypes
-                    .get(lhs.0 as usize)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                let expr = if lhs_type == "riddle_str" && matches!(op, CmpOp::Eq | CmpOp::Neq) {
-                    let equal = format!(
-                        "(({}).len == ({}).len && memcmp(({}).ptr, ({}).ptr, ({}).len) == 0)",
-                        lhs_name, rhs_name, lhs_name, rhs_name, lhs_name
-                    );
-                    if matches!(op, CmpOp::Neq) {
-                        format!("(!{})", equal)
-                    } else {
-                        equal
-                    }
-                } else {
-                    format!("({} {} {})", lhs_name, cmpop_c(*op), rhs_name)
-                };
-                if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
-                    self.set_inline(v, expr, "bool".into());
-                } else {
-                    let name = fresh_c(&mut self.counter, "cmp");
-                    self.set(v, name.clone(), "bool".into());
-                    writeln!(out, "  bool {} = {};", name, expr).unwrap();
-                }
-            }
-
-            InstKind::Cast(op, value, target_ty) => {
-                let ct = ctype_of(target_ty);
-                let src = self.value_expr(*value);
-                let expr = match (op, target_ty) {
-                    (CastOp::IntToInt, Type::Int(ty)) => integer_cast_expr(*ty, &src),
-                    (CastOp::IntToChar, Type::Char) => format!("(({}){})", ct, src),
-                    (CastOp::FloatToInt, Type::Int(ty)) => float_to_int_expr(*ty, &src),
-                    _ => format!("(({}){})", ct, src),
-                };
-                if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
-                    self.set_inline(v, expr, ct);
-                } else {
-                    let name = fresh_c(&mut self.counter, "cast");
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(out, "  {} {} = {};", ct, name, expr).unwrap();
-                }
-            }
-
-            InstKind::SizeOf(ty) => {
-                let ct = ctype_of(&inst.ty);
-                let name = fresh_c(&mut self.counter, "size");
-                self.set(v, name.clone(), ct.clone());
-                writeln!(out, "  {} {} = sizeof({});", ct, name, ctype_of(ty)).unwrap();
-            }
-
-            InstKind::StructValue(fields) => {
-                let name = fresh_c(&mut self.counter, "s");
-                let ct = ctype_of(&inst.ty);
-                self.set(v, name.clone(), ct.clone());
-
-                if is_fat_repr(&inst.ty) {
-                    let [ptr, len] = fields.as_slice() else {
-                        return Err("fat pointer requires a pointer and length".into());
-                    };
-                    let ptr_cast = if is_slice_ref(&inst.ty) {
-                        "void*"
-                    } else {
-                        "const char*"
-                    };
-                    writeln!(
-                        out,
-                        "  {} {} = {{ ({}){}, {} }};",
-                        ct,
-                        name,
-                        ptr_cast,
-                        self.name(*ptr),
-                        self.name(*len)
-                    )
-                    .unwrap();
-                } else if let Type::Struct(st) = &inst.ty {
-                    if st
-                        .fields
-                        .iter()
-                        .any(|(_, field_ty)| matches!(field_ty, Type::Array(_, _)))
-                    {
-                        writeln!(out, "  {} {} = {{0}};", ct, name).unwrap();
-                        for (index, value) in fields.iter().enumerate() {
-                            let Some((field_name, field_ty)) = st.fields.get(index) else {
-                                continue;
-                            };
-                            let field = c_source_name('m', field_name);
-                            let value_name = self.name(*value).to_owned();
-                            if matches!(field_ty, Type::Array(_, _)) {
-                                writeln!(
-                                    out,
-                                    "  memcpy({}.{}, {}, sizeof({}.{}));",
-                                    name, field, value_name, name, field
-                                )
-                                .unwrap();
-                            } else {
-                                writeln!(out, "  {}.{} = {};", name, field, value_name).unwrap();
-                            }
-                        }
-                    } else {
-                        let flds: Vec<String> =
-                            fields.iter().map(|f| self.name(*f).to_owned()).collect();
-                        if flds.is_empty() {
-                            writeln!(out, "  {} {} = {{0}};", ct, name).unwrap();
-                        } else {
-                            writeln!(out, "  {} {} = {{ {} }};", ct, name, flds.join(", "))
-                                .unwrap();
-                        }
-                    }
-                } else {
-                    let flds: Vec<String> =
-                        fields.iter().map(|f| self.name(*f).to_owned()).collect();
-                    if flds.is_empty() {
-                        writeln!(out, "  {} {} = {{0}};", ct, name).unwrap();
-                    } else {
-                        writeln!(out, "  {} {} = {{ {} }};", ct, name, flds.join(", ")).unwrap();
-                    }
-                }
-            }
-
+            InstKind::StructValue(fields) => self.emit_struct_value(inst, v, fields, out)?,
             InstKind::SparseStructValue(fields) => {
-                let name = fresh_c(&mut self.counter, "s");
-                let ct = ctype_of(&inst.ty);
-                self.set(v, name.clone(), ct.clone());
-                writeln!(out, "  {} {} = {{0}};", ct, name).unwrap();
-
-                let Type::Struct(st) = &inst.ty else {
-                    return Err("sparse aggregate initializer requires a struct type".into());
-                };
-                for (index, value) in fields {
-                    let Some((field_name, field_ty)) = st.fields.get(*index) else {
-                        return Err(format!("aggregate field index {} is out of bounds", index));
-                    };
-                    let field = c_source_name('m', field_name);
-                    let value_name = self.name(*value).to_owned();
-                    if matches!(field_ty, Type::Array(_, _)) {
-                        writeln!(
-                            out,
-                            "  memcpy({}.{}, {}, sizeof({}.{}));",
-                            name, field, value_name, name, field
-                        )
-                        .unwrap();
-                    } else {
-                        writeln!(out, "  {}.{} = {};", name, field, value_name).unwrap();
-                    }
-                }
+                self.emit_sparse_struct_value(inst, v, fields, out)?;
             }
-
-            InstKind::ArrayValue(elements) => {
-                let name = fresh_c(&mut self.counter, "arr");
-                let (decl_pre, decl_suf) = c_decl_parts(&inst.ty);
-                let ct = format!("{}{}", decl_pre, decl_suf);
-                self.set(v, name.clone(), ct.clone());
-                let nested = matches!(&inst.ty, Type::Array(inner, _) if matches!(inner.as_ref(), Type::Array(..)));
-                if nested {
-                    writeln!(out, "  {} {}{} = {{0}};", decl_pre, name, decl_suf).unwrap();
-                    for (index, element) in elements.iter().enumerate() {
-                        writeln!(
-                            out,
-                            "  memcpy({}[{}], {}, sizeof({}[{}]));",
-                            name,
-                            index,
-                            self.name(*element),
-                            name,
-                            index
-                        )
-                        .unwrap();
-                    }
-                } else {
-                    let values = elements
-                        .iter()
-                        .map(|element| self.name(*element).to_owned())
-                        .collect::<Vec<_>>();
-                    if values.is_empty() {
-                        writeln!(out, "  {} {}{} = {{0}};", decl_pre, name, decl_suf).unwrap();
-                    } else {
-                        writeln!(
-                            out,
-                            "  {} {}{} = {{ {} }};",
-                            decl_pre,
-                            name,
-                            decl_suf,
-                            values.join(", ")
-                        )
-                        .unwrap();
-                    }
-                }
-            }
-
-            InstKind::TupleValue(elements) => {
-                let name = fresh_c(&mut self.counter, "tup");
-                let ct = ctype_of(&inst.ty);
-                self.set(v, name.clone(), ct.clone());
-                let els: Vec<String> = elements.iter().map(|e| self.name(*e).to_owned()).collect();
-                writeln!(out, "  {} {} = {{ {} }};", ct, name, els.join(", ")).unwrap();
-            }
+            InstKind::ArrayValue(elements) => self.emit_array_value(inst, v, elements, out),
+            InstKind::TupleValue(elements) => self.emit_tuple_value(inst, v, elements, out),
 
             InstKind::ExtractValue(aggregate, index) => {
-                let ct = ctype_of(&inst.ty);
-                let base = self.name(*aggregate).to_owned();
-                let aggregate_ct = self
-                    .ctypes
-                    .get(aggregate.0 as usize)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                let field = if matches!(aggregate_ct, "riddle_str" | "riddle_slice") {
-                    match index {
-                        0 => "ptr".into(),
-                        1 => "len".into(),
-                        _ => {
-                            return Err(format!(
-                                "fat pointer field index {index} is out of bounds"
-                            ));
-                        }
-                    }
-                } else {
-                    self.struct_types
-                        .get(&aggregate.0)
-                        .and_then(|st| st.fields.get(*index))
-                        .map(|(fname, _)| c_source_name('m', fname))
-                        .unwrap_or_else(|| c_source_name('m', &format!("f{index}")))
-                };
-                let mut expr = field_expr(&base, &field, self.is_indirect(*aggregate));
-                if aggregate_ct == "riddle_slice" && *index == 0 {
-                    expr = format!("(({}){})", ct, expr);
-                }
-                if matches!(&inst.ty, Type::Array(..)) && self.is_indirect(*aggregate) {
-                    let name = fresh_c(&mut self.counter, "ev");
-                    let (decl_pre, decl_suf) = c_decl_parts(&inst.ty);
-                    self.set(v, name.clone(), ct);
-                    writeln!(out, "  {} {}{};", decl_pre, name, decl_suf).unwrap();
-                    writeln!(out, "  memcpy({}, {}, sizeof({}));", name, expr, name).unwrap();
-                } else if !self.is_indirect(*aggregate)
-                    && self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1
-                {
-                    self.set_inline(v, expr, ct);
-                } else {
-                    let name = fresh_c(&mut self.counter, "ev");
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(out, "  {} {} = {};", ct, name, expr).unwrap();
-                }
+                self.emit_extract_value(inst, v, *aggregate, *index, out)?;
             }
-
             InstKind::FieldPtr(base, index) => {
-                let ct = ctype_of(&inst.ty);
-                let base_name = self.name(*base).to_owned();
-                let (field, field_ty) = self
-                    .struct_types
-                    .get(&base.0)
-                    .and_then(|st| st.fields.get(*index))
-                    .map(|(fname, ty)| (c_source_name('m', fname), Some(ty)))
-                    .unwrap_or_else(|| (c_source_name('m', &format!("f{index}")), None));
-                let mut field = field_expr(&base_name, &field, self.is_indirect(*base));
-                let mut ty = field_ty;
-                while let Some(Type::Array(inner, _)) = ty {
-                    field.push_str("[0]");
-                    ty = Some(inner);
-                }
-                let expr = format!("(&{})", field);
-                if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
-                    self.set_inline(v, expr, ct);
-                } else {
-                    let name = fresh_c(&mut self.counter, "fp");
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(out, "  {} {} = {};", ct, name, expr).unwrap();
-                }
+                self.emit_field_ptr(inst, v, *base, *index, out);
+            }
+            InstKind::IndexPtr(base, index) => {
+                self.emit_index_ptr(inst, v, *base, *index, None, out);
+            }
+            InstKind::CheckedIndexPtr(base, index, len) => {
+                self.emit_index_ptr(inst, v, *base, *index, Some(*len), out);
             }
 
-            InstKind::IndexPtr(base, index) | InstKind::CheckedIndexPtr(base, index, _) => {
-                let ct = ctype_of(&inst.ty);
-                let base_name = self.name(*base).to_owned();
-                let base_ct = self
-                    .ctypes
-                    .get(base.0 as usize)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                let index_name = self.name(*index).to_owned();
-                if let InstKind::CheckedIndexPtr(_, _, len) = &inst.kind {
-                    writeln!(
-                        out,
-                        "  if ((size_t){} >= (size_t){}) {{ fputs(\"riddle: index out of bounds\\n\", stderr); abort(); }}",
-                        index_name,
-                        self.name(*len)
-                    )
-                    .unwrap();
-                }
-                let element = match &inst.ty {
-                    Type::Ptr(element) | Type::Ref(element, _) => element.as_ref(),
-                    _ => &Type::Unit,
-                };
-                let expr = if base_ct == "riddle_slice" {
-                    format!(
-                        "(&(({}*){}.ptr)[{}])",
-                        ctype_of(element),
-                        base_name,
-                        index_name
-                    )
-                } else if !self.is_indirect(*base) && matches!(element, Type::Array(..)) {
-                    format!("({}[{}])", base_name, index_name)
-                } else {
-                    let stride = array_leaf_count(element);
-                    let index = if stride == 1 {
-                        index_name
-                    } else {
-                        format!("(({}) * {})", index_name, stride)
-                    };
-                    format!("(&{}[{}])", base_name, index)
-                };
-                if self.use_counts.get(&v.0).copied().unwrap_or(0) <= 1 {
-                    self.set_inline(v, expr, ct);
-                } else {
-                    let name = fresh_c(&mut self.counter, "ip");
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(out, "  {} {} = {};", ct, name, expr).unwrap();
-                }
-            }
-
-            InstKind::Phi(pairs) => {
-                let ct = ctype_of(&inst.ty);
-                if ct == "void" {
-                    // ponytail: void phi carries no value — skip variable declaration
-                    self.set(v, "".into(), "void".into());
-                    let _ = pairs;
-                } else {
-                    let _ = pairs;
-                }
-            }
-
-            InstKind::Call(callee, args) => {
-                let ct = ctype_of(&inst.ty);
-                let callee_name = match callee {
-                    FuncRef::Local(n) => self.c_function_name(n)?,
-                    FuncRef::Intrinsic(n) => n.clone(),
-                    FuncRef::Extern(n) => self.extern_name(n)?.to_owned(),
-                };
-                // For extern calls, extract .ptr from fat pointer arguments
-                let is_extern = matches!(callee, FuncRef::Extern(_));
-                let args_str: Vec<String> = args
-                    .iter()
-                    .map(|a| {
-                        let arg_name = self.name(*a).to_owned();
-                        let arg_ct = self
-                            .ctypes
-                            .get(a.0 as usize)
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        if is_extern && arg_ct == "riddle_str" {
-                            if self.is_indirect(*a) {
-                                format!("{}->ptr", arg_name)
-                            } else {
-                                format!("{}.ptr", arg_name)
-                            }
-                        } else {
-                            arg_name
-                        }
-                    })
-                    .collect();
-                // void return — emit call as a statement, no assignment
-                if matches!(&inst.ty, Type::Unit) {
-                    writeln!(out, "  {}({});", callee_name, args_str.join(", ")).unwrap();
-                    self.set_inline(v, "((riddle_unit)0)".into(), "riddle_unit".into());
-                } else if matches!(&inst.ty, Type::Never | Type::Void) {
-                    writeln!(out, "  {}({});", callee_name, args_str.join(", ")).unwrap();
-                    self.set(v, "".into(), "void".into());
-                } else if is_extern && is_fat_repr(&inst.ty) {
-                    let ffi_name = fresh_c(&mut self.counter, "ffi_str");
-                    let name = fresh_c(&mut self.counter, "call");
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(
-                        out,
-                        "  const char* {} = {}({});",
-                        ffi_name,
-                        callee_name,
-                        args_str.join(", ")
-                    )
-                    .unwrap();
-                    writeln!(
-                        out,
-                        "  {} {} = (riddle_str){{ {}, {} ? strlen({}) : 0 }};",
-                        ct, name, ffi_name, ffi_name, ffi_name
-                    )
-                    .unwrap();
-                } else {
-                    let name = fresh_c(&mut self.counter, "call");
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(
-                        out,
-                        "  {} {} = {}({});",
-                        ct,
-                        name,
-                        callee_name,
-                        args_str.join(", ")
-                    )
-                    .unwrap();
-                }
-            }
-
-            InstKind::FunctionRef(function) => {
-                let name = match function {
-                    FuncRef::Local(name) => self.c_function_name(name)?,
-                    FuncRef::Intrinsic(name) => name.clone(),
-                    FuncRef::Extern(name) => self.extern_name(name)?.to_owned(),
-                };
-                self.set_inline(v, name, ctype_of(&inst.ty));
-            }
-
+            InstKind::Phi(_) => self.emit_phi(inst, v),
+            InstKind::Call(callee, args) => self.emit_call(inst, v, callee, args, out)?,
+            InstKind::FunctionRef(function) => self.emit_function_ref(inst, v, function)?,
             InstKind::CallIndirect(callee, args) => {
-                let ct = ctype_of(&inst.ty);
-                let callee = self.name(*callee).to_owned();
-                let args = args
-                    .iter()
-                    .map(|arg| self.name(*arg).to_owned())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if matches!(&inst.ty, Type::Unit) {
-                    writeln!(out, "  {}({});", callee, args).unwrap();
-                    self.set_inline(v, "((riddle_unit)0)".into(), "riddle_unit".into());
-                } else if matches!(&inst.ty, Type::Never | Type::Void) {
-                    writeln!(out, "  {}({});", callee, args).unwrap();
-                    self.set(v, "".into(), "void".into());
-                } else {
-                    let name = fresh_c(&mut self.counter, "call");
-                    self.set(v, name.clone(), ct.clone());
-                    writeln!(out, "  {} {} = {}({});", ct, name, callee, args).unwrap();
-                }
+                self.emit_indirect_call(inst, v, *callee, args, out);
             }
         }
         Ok(())
+    }
+
+    fn emit_const(&mut self, inst: &Inst, value: Value, constant: &ConstValue) {
+        let ct = ctype_of(&inst.ty);
+        let expr = match constant {
+            ConstValue::Int(value, _) => c_int_literal(*value, &inst.ty),
+            ConstValue::NegativeInt(value, _) => c_negative_int_literal(*value, &inst.ty),
+            ConstValue::Float(value, _) => format!("(({ct}){value})"),
+            ConstValue::Bool(value) => value.to_string(),
+            ConstValue::String(value) => {
+                let (inner, len) = c_string_parts(value);
+                if is_fat_repr(&inst.ty) {
+                    format!("(riddle_str){{ \"{inner}\", {len} }}")
+                } else {
+                    format!("\"{inner}\"")
+                }
+            }
+            ConstValue::Char(value) => format!("UINT32_C({})", u32::from(*value)),
+            ConstValue::Unit => "((riddle_unit)0)".into(),
+        };
+        self.set_inline(value, expr, ct);
+    }
+
+    fn emit_heap_alloc(&mut self, inst: &Inst, value: Value, out: &mut String) {
+        let ct = ctype_of(&inst.ty);
+        let inner_ct = pointee_ct(&inst.ty);
+        let name = fresh_c(&mut self.counter, "h");
+        self.set(value, name.clone(), ct.clone());
+        writeln!(
+            out,
+            "  {} {} = ({}){}(sizeof({}));",
+            ct,
+            name,
+            ct,
+            if self.no_gc {
+                "riddle_alloc"
+            } else {
+                "rgc_alloc"
+            },
+            inner_ct
+        )
+        .unwrap();
+    }
+
+    fn emit_heap_free(&self, ptr: Value, out: &mut String) {
+        writeln!(
+            out,
+            "  {}({});",
+            if self.no_gc {
+                "riddle_free"
+            } else {
+                "rgc_free"
+            },
+            self.name(ptr)
+        )
+        .unwrap();
+    }
+
+    fn emit_alloca(&mut self, inst: &Inst, value: Value, out: &mut String) {
+        let inner = match &inst.ty {
+            Type::Ptr(inner) | Type::Ref(inner, _) => inner.as_ref(),
+            _ => &Type::Void,
+        };
+        let (decl_pre, decl_suf) = c_decl_parts(inner);
+        let name = fresh_c(&mut self.counter, "a");
+        let ct = format!("{decl_pre}{decl_suf}");
+        self.set(value, name.clone(), ct);
+        self.direct_storage.insert(value.0);
+        writeln!(out, "  {decl_pre} {name}{decl_suf}; // stack").unwrap();
+    }
+
+    fn emit_store(&self, value: Value, ptr: Value, out: &mut String) {
+        let value_name = self.value_expr(value);
+        let ptr_name = self.name(ptr).to_owned();
+        let ptr_ct = self.ctypes.get(ptr.0 as usize).map_or("", String::as_str);
+        let value_ct = self.ctypes.get(value.0 as usize).map_or("", String::as_str);
+        if ptr_ct.ends_with(']') {
+            writeln!(out, "  memcpy({ptr_name}, {value_name}, sizeof({ptr_ct}));").unwrap();
+        } else if value_ct.ends_with(']') {
+            let destination = if self.is_indirect(ptr) {
+                ptr_name
+            } else {
+                format!("&{ptr_name}")
+            };
+            writeln!(
+                out,
+                "  memcpy({destination}, {value_name}, sizeof({value_ct}));"
+            )
+            .unwrap();
+        } else if self.is_indirect(ptr) {
+            if let Some(inner) = strip_addr_of(&ptr_name) {
+                writeln!(out, "  {inner} = {value_name};").unwrap();
+            } else {
+                writeln!(out, "  *{ptr_name} = {value_name};").unwrap();
+            }
+        } else {
+            writeln!(out, "  {ptr_name} = {value_name};").unwrap();
+        }
+    }
+
+    fn emit_load(&mut self, inst: &Inst, value: Value, ptr: Value, out: &mut String) {
+        let name = fresh_c(&mut self.counter, "l");
+        let ct = ctype_of(&inst.ty);
+        if ct == "void" {
+            self.set(value, String::new(), "void".into());
+        } else if ct.ends_with(']') {
+            let ptr_name = self.name(ptr).to_owned();
+            let (decl_pre, decl_suf) = c_decl_parts(&inst.ty);
+            let decl_ct = format!("{decl_pre}{decl_suf}");
+            self.set(value, name.clone(), decl_ct);
+            writeln!(out, "  {decl_pre} {name}{decl_suf};").unwrap();
+            writeln!(out, "  memcpy({name}, {ptr_name}, sizeof({name}));").unwrap();
+        } else {
+            let ptr_name = self.name(ptr);
+            let rhs = if self.is_indirect(ptr) {
+                strip_addr_of(ptr_name).map_or_else(|| format!("*{ptr_name}"), ToOwned::to_owned)
+            } else {
+                ptr_name.to_owned()
+            };
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {rhs};").unwrap();
+        }
+    }
+
+    fn emit_binop(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        op: BinOp,
+        lhs: Value,
+        rhs: Value,
+        out: &mut String,
+    ) {
+        let ct = ctype_of(&inst.ty);
+        if ct == "void" {
+            self.set(value, String::new(), "void".into());
+            return;
+        }
+        let lhs_name = self.name(lhs).to_owned();
+        let rhs_name = self.name(rhs).to_owned();
+        let expr = match &inst.ty {
+            Type::Int(ty) => integer_binop_expr(*ty, op, &lhs_name, &rhs_name),
+            Type::Float(ty) => float_binop_expr(*ty, op, &lhs_name, &rhs_name),
+            _ => format!("({} {} {})", lhs_name, binop_c(op), rhs_name),
+        };
+        if self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1 {
+            self.set_inline(value, expr, ct);
+        } else {
+            let name = fresh_c(&mut self.counter, "b");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {expr};").unwrap();
+        }
+    }
+
+    fn emit_unop(&mut self, inst: &Inst, value: Value, op: UnOp, operand: Value, out: &mut String) {
+        let ct = ctype_of(&inst.ty);
+        let operand_name = self.name(operand).to_owned();
+        let operand_ct = self
+            .ctypes
+            .get(operand.0 as usize)
+            .cloned()
+            .unwrap_or_default();
+        let is_noop_ref = matches!(op, UnOp::Ref | UnOp::MutRef)
+            && (self.is_indirect(operand)
+                || is_fat_repr(&inst.ty)
+                || matches!(&inst.ty, Type::Ref(inner, _) if matches!(inner.as_ref(), Type::Array(..))));
+        let is_noop_deref =
+            matches!(op, UnOp::Deref) && operand_ct == "riddle_str" && ct == "riddle_str";
+        let expr = if is_noop_ref || is_noop_deref {
+            operand_name
+        } else if matches!(op, UnOp::Neg | UnOp::Not) && matches!(&inst.ty, Type::Int(_)) {
+            let Type::Int(ty) = &inst.ty else {
+                unreachable!()
+            };
+            integer_unop_expr(*ty, op, &operand_name)
+        } else {
+            let op_str = match op {
+                UnOp::Neg => "-",
+                UnOp::Not if matches!(inst.ty, Type::Int(_)) => "~",
+                UnOp::Not => "!",
+                UnOp::Ref | UnOp::MutRef => "&",
+                UnOp::Deref => "*",
+            };
+            format!("({op_str}{operand_name})")
+        };
+        if self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1 && !matches!(op, UnOp::Deref) {
+            self.set_inline(value, expr, ct);
+        } else {
+            let name = fresh_c(&mut self.counter, "u");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {expr};").unwrap();
+        }
+    }
+
+    fn emit_cmp(&mut self, value: Value, op: CmpOp, lhs: Value, rhs: Value, out: &mut String) {
+        let lhs_name = self.name(lhs).to_owned();
+        let rhs_name = self.name(rhs).to_owned();
+        let lhs_type = self.ctypes.get(lhs.0 as usize).map_or("", String::as_str);
+        let expr = if lhs_type == "riddle_str" && matches!(op, CmpOp::Eq | CmpOp::Neq) {
+            let equal = format!(
+                "(({lhs_name}).len == ({rhs_name}).len && memcmp(({lhs_name}).ptr, ({rhs_name}).ptr, ({lhs_name}).len) == 0)"
+            );
+            if matches!(op, CmpOp::Neq) {
+                format!("(!{equal})")
+            } else {
+                equal
+            }
+        } else {
+            format!("({} {} {})", lhs_name, cmpop_c(op), rhs_name)
+        };
+        if self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1 {
+            self.set_inline(value, expr, "bool".into());
+        } else {
+            let name = fresh_c(&mut self.counter, "cmp");
+            self.set(value, name.clone(), "bool".into());
+            writeln!(out, "  bool {name} = {expr};").unwrap();
+        }
+    }
+
+    fn emit_cast(
+        &mut self,
+        value: Value,
+        op: CastOp,
+        source: Value,
+        target: &Type,
+        out: &mut String,
+    ) {
+        let ct = ctype_of(target);
+        let source = self.value_expr(source);
+        let expr = match (op, target) {
+            (CastOp::IntToInt, Type::Int(ty)) => integer_cast_expr(*ty, &source),
+            (CastOp::FloatToInt, Type::Int(ty)) => float_to_int_expr(*ty, &source),
+            _ => format!("(({ct}){source})"),
+        };
+        if self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1 {
+            self.set_inline(value, expr, ct);
+        } else {
+            let name = fresh_c(&mut self.counter, "cast");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {expr};").unwrap();
+        }
+    }
+
+    fn emit_size_of(&mut self, inst: &Inst, value: Value, ty: &Type, out: &mut String) {
+        let ct = ctype_of(&inst.ty);
+        let name = fresh_c(&mut self.counter, "size");
+        self.set(value, name.clone(), ct.clone());
+        writeln!(out, "  {} {} = sizeof({});", ct, name, ctype_of(ty)).unwrap();
+    }
+
+    fn emit_struct_value(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        fields: &[Value],
+        out: &mut String,
+    ) -> Result<(), String> {
+        let name = fresh_c(&mut self.counter, "s");
+        let ct = ctype_of(&inst.ty);
+        self.set(value, name.clone(), ct.clone());
+        if is_fat_repr(&inst.ty) {
+            let [ptr, len] = fields else {
+                return Err("fat pointer requires a pointer and length".into());
+            };
+            let ptr_cast = if is_slice_ref(&inst.ty) {
+                "void*"
+            } else {
+                "const char*"
+            };
+            writeln!(
+                out,
+                "  {} {} = {{ ({}){}, {} }};",
+                ct,
+                name,
+                ptr_cast,
+                self.name(*ptr),
+                self.name(*len)
+            )
+            .unwrap();
+        } else if let Type::Struct(strukt) = &inst.ty
+            && strukt
+                .fields
+                .iter()
+                .any(|(_, field_ty)| matches!(field_ty, Type::Array(_, _)))
+        {
+            writeln!(out, "  {ct} {name} = {{0}};").unwrap();
+            for (index, value) in fields.iter().enumerate() {
+                let Some((field_name, field_ty)) = strukt.fields.get(index) else {
+                    continue;
+                };
+                let field = c_source_name('m', field_name);
+                let value_name = self.name(*value);
+                if matches!(field_ty, Type::Array(_, _)) {
+                    writeln!(
+                        out,
+                        "  memcpy({name}.{field}, {value_name}, sizeof({name}.{field}));"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(out, "  {name}.{field} = {value_name};").unwrap();
+                }
+            }
+        } else {
+            let fields = fields
+                .iter()
+                .map(|field| self.name(*field).to_owned())
+                .collect::<Vec<_>>();
+            if fields.is_empty() {
+                writeln!(out, "  {ct} {name} = {{0}};").unwrap();
+            } else {
+                writeln!(out, "  {} {} = {{ {} }};", ct, name, fields.join(", ")).unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_sparse_struct_value(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        fields: &[(usize, Value)],
+        out: &mut String,
+    ) -> Result<(), String> {
+        let name = fresh_c(&mut self.counter, "s");
+        let ct = ctype_of(&inst.ty);
+        self.set(value, name.clone(), ct.clone());
+        writeln!(out, "  {ct} {name} = {{0}};").unwrap();
+        let Type::Struct(strukt) = &inst.ty else {
+            return Err("sparse aggregate initializer requires a struct type".into());
+        };
+        for (index, value) in fields {
+            let Some((field_name, field_ty)) = strukt.fields.get(*index) else {
+                return Err(format!("aggregate field index {index} is out of bounds"));
+            };
+            let field = c_source_name('m', field_name);
+            let value_name = self.name(*value);
+            if matches!(field_ty, Type::Array(_, _)) {
+                writeln!(
+                    out,
+                    "  memcpy({name}.{field}, {value_name}, sizeof({name}.{field}));"
+                )
+                .unwrap();
+            } else {
+                writeln!(out, "  {name}.{field} = {value_name};").unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_array_value(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        elements: &[Value],
+        out: &mut String,
+    ) {
+        let name = fresh_c(&mut self.counter, "arr");
+        let (decl_pre, decl_suf) = c_decl_parts(&inst.ty);
+        self.set(value, name.clone(), format!("{decl_pre}{decl_suf}"));
+        let nested =
+            matches!(&inst.ty, Type::Array(inner, _) if matches!(inner.as_ref(), Type::Array(..)));
+        if nested {
+            writeln!(out, "  {decl_pre} {name}{decl_suf} = {{0}};").unwrap();
+            for (index, element) in elements.iter().enumerate() {
+                writeln!(
+                    out,
+                    "  memcpy({}[{}], {}, sizeof({}[{}]));",
+                    name,
+                    index,
+                    self.name(*element),
+                    name,
+                    index
+                )
+                .unwrap();
+            }
+        } else {
+            let values = elements
+                .iter()
+                .map(|element| self.name(*element).to_owned())
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                writeln!(out, "  {decl_pre} {name}{decl_suf} = {{0}};").unwrap();
+            } else {
+                writeln!(
+                    out,
+                    "  {} {}{} = {{ {} }};",
+                    decl_pre,
+                    name,
+                    decl_suf,
+                    values.join(", ")
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn emit_tuple_value(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        elements: &[Value],
+        out: &mut String,
+    ) {
+        let name = fresh_c(&mut self.counter, "tup");
+        let ct = ctype_of(&inst.ty);
+        self.set(value, name.clone(), ct.clone());
+        let elements = elements
+            .iter()
+            .map(|element| self.name(*element).to_owned())
+            .collect::<Vec<_>>();
+        writeln!(out, "  {} {} = {{ {} }};", ct, name, elements.join(", ")).unwrap();
+    }
+
+    fn emit_extract_value(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        aggregate: Value,
+        index: usize,
+        out: &mut String,
+    ) -> Result<(), String> {
+        let ct = ctype_of(&inst.ty);
+        let base = self.name(aggregate).to_owned();
+        let aggregate_ct = self
+            .ctypes
+            .get(aggregate.0 as usize)
+            .map_or("", String::as_str);
+        let field = if matches!(aggregate_ct, "riddle_str" | "riddle_slice") {
+            match index {
+                0 => "ptr".into(),
+                1 => "len".into(),
+                _ => return Err(format!("fat pointer field index {index} is out of bounds")),
+            }
+        } else {
+            self.struct_types
+                .get(&aggregate.0)
+                .and_then(|strukt| strukt.fields.get(index))
+                .map_or_else(
+                    || c_source_name('m', &format!("f{index}")),
+                    |(name, _)| c_source_name('m', name),
+                )
+        };
+        let mut expr = field_expr(&base, &field, self.is_indirect(aggregate));
+        if aggregate_ct == "riddle_slice" && index == 0 {
+            expr = format!("(({ct}){expr})");
+        }
+        if matches!(&inst.ty, Type::Array(..)) && self.is_indirect(aggregate) {
+            let name = fresh_c(&mut self.counter, "ev");
+            let (decl_pre, decl_suf) = c_decl_parts(&inst.ty);
+            self.set(value, name.clone(), ct);
+            writeln!(out, "  {decl_pre} {name}{decl_suf};").unwrap();
+            writeln!(out, "  memcpy({name}, {expr}, sizeof({name}));").unwrap();
+        } else if !self.is_indirect(aggregate)
+            && self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1
+        {
+            self.set_inline(value, expr, ct);
+        } else {
+            let name = fresh_c(&mut self.counter, "ev");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {expr};").unwrap();
+        }
+        Ok(())
+    }
+
+    fn emit_field_ptr(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        base: Value,
+        index: usize,
+        out: &mut String,
+    ) {
+        let ct = ctype_of(&inst.ty);
+        let base_name = self.name(base).to_owned();
+        let (field, field_ty) = self
+            .struct_types
+            .get(&base.0)
+            .and_then(|strukt| strukt.fields.get(index))
+            .map_or_else(
+                || (c_source_name('m', &format!("f{index}")), None),
+                |(name, ty)| (c_source_name('m', name), Some(ty)),
+            );
+        let mut field = field_expr(&base_name, &field, self.is_indirect(base));
+        let mut ty = field_ty;
+        while let Some(Type::Array(inner, _)) = ty {
+            field.push_str("[0]");
+            ty = Some(inner);
+        }
+        let expr = format!("(&{field})");
+        if self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1 {
+            self.set_inline(value, expr, ct);
+        } else {
+            let name = fresh_c(&mut self.counter, "fp");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {expr};").unwrap();
+        }
+    }
+
+    fn emit_index_ptr(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        base: Value,
+        index: Value,
+        checked_len: Option<Value>,
+        out: &mut String,
+    ) {
+        let ct = ctype_of(&inst.ty);
+        let base_name = self.name(base).to_owned();
+        let base_ct = self.ctypes.get(base.0 as usize).map_or("", String::as_str);
+        let index_name = self.name(index).to_owned();
+        if let Some(len) = checked_len {
+            writeln!(
+                out,
+                "  if ((size_t){} >= (size_t){}) {{ fputs(\"riddle: index out of bounds\\n\", stderr); abort(); }}",
+                index_name,
+                self.name(len)
+            )
+            .unwrap();
+        }
+        let element = match &inst.ty {
+            Type::Ptr(element) | Type::Ref(element, _) => element.as_ref(),
+            _ => &Type::Unit,
+        };
+        let expr = if base_ct == "riddle_slice" {
+            format!(
+                "(&(({}*){}.ptr)[{}])",
+                ctype_of(element),
+                base_name,
+                index_name
+            )
+        } else if !self.is_indirect(base) && matches!(element, Type::Array(..)) {
+            format!("({base_name}[{index_name}])")
+        } else {
+            let stride = array_leaf_count(element);
+            let index = if stride == 1 {
+                index_name
+            } else {
+                format!("(({index_name}) * {stride})")
+            };
+            format!("(&{base_name}[{index}])")
+        };
+        if self.use_counts.get(&value.0).copied().unwrap_or(0) <= 1 {
+            self.set_inline(value, expr, ct);
+        } else {
+            let name = fresh_c(&mut self.counter, "ip");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {expr};").unwrap();
+        }
+    }
+
+    fn emit_phi(&mut self, inst: &Inst, value: Value) {
+        if ctype_of(&inst.ty) == "void" {
+            self.set(value, String::new(), "void".into());
+        }
+    }
+
+    fn emit_call(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        callee: &FuncRef,
+        args: &[Value],
+        out: &mut String,
+    ) -> Result<(), String> {
+        let ct = ctype_of(&inst.ty);
+        let callee_name = match callee {
+            FuncRef::Local(name) => self.c_function_name(name)?,
+            FuncRef::Intrinsic(name) => name.clone(),
+            FuncRef::Extern(name) => self.extern_name(name)?.to_owned(),
+        };
+        let is_extern = matches!(callee, FuncRef::Extern(_));
+        let args = args
+            .iter()
+            .map(|arg| {
+                let name = self.name(*arg).to_owned();
+                let arg_ct = self.ctypes.get(arg.0 as usize).map_or("", String::as_str);
+                if is_extern && arg_ct == "riddle_str" {
+                    if self.is_indirect(*arg) {
+                        format!("{name}->ptr")
+                    } else {
+                        format!("{name}.ptr")
+                    }
+                } else {
+                    name
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if matches!(&inst.ty, Type::Unit) {
+            writeln!(out, "  {callee_name}({args});").unwrap();
+            self.set_inline(value, "((riddle_unit)0)".into(), "riddle_unit".into());
+        } else if matches!(&inst.ty, Type::Never | Type::Void) {
+            writeln!(out, "  {callee_name}({args});").unwrap();
+            self.set(value, String::new(), "void".into());
+        } else if is_extern && is_fat_repr(&inst.ty) {
+            let ffi_name = fresh_c(&mut self.counter, "ffi_str");
+            let name = fresh_c(&mut self.counter, "call");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  const char* {ffi_name} = {callee_name}({args});").unwrap();
+            writeln!(
+                out,
+                "  {ct} {name} = (riddle_str){{ {ffi_name}, {ffi_name} ? strlen({ffi_name}) : 0 }};"
+            )
+            .unwrap();
+        } else {
+            let name = fresh_c(&mut self.counter, "call");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {callee_name}({args});").unwrap();
+        }
+        Ok(())
+    }
+
+    fn emit_function_ref(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        function: &FuncRef,
+    ) -> Result<(), String> {
+        let name = match function {
+            FuncRef::Local(name) => self.c_function_name(name)?,
+            FuncRef::Intrinsic(name) => name.clone(),
+            FuncRef::Extern(name) => self.extern_name(name)?.to_owned(),
+        };
+        self.set_inline(value, name, ctype_of(&inst.ty));
+        Ok(())
+    }
+
+    fn emit_indirect_call(
+        &mut self,
+        inst: &Inst,
+        value: Value,
+        callee: Value,
+        args: &[Value],
+        out: &mut String,
+    ) {
+        let ct = ctype_of(&inst.ty);
+        let callee = self.name(callee).to_owned();
+        let args = args
+            .iter()
+            .map(|arg| self.name(*arg).to_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if matches!(&inst.ty, Type::Unit) {
+            writeln!(out, "  {callee}({args});").unwrap();
+            self.set_inline(value, "((riddle_unit)0)".into(), "riddle_unit".into());
+        } else if matches!(&inst.ty, Type::Never | Type::Void) {
+            writeln!(out, "  {callee}({args});").unwrap();
+            self.set(value, String::new(), "void".into());
+        } else {
+            let name = fresh_c(&mut self.counter, "call");
+            self.set(value, name.clone(), ct.clone());
+            writeln!(out, "  {ct} {name} = {callee}({args});").unwrap();
+        }
     }
 
     fn emit_phi_assignments(
@@ -1128,7 +1205,7 @@ impl CBackend {
             let Some((incoming, _)) = pairs.iter().find(|(_, pred)| *pred == from) else {
                 continue;
             };
-            let phi_value = Value(block.start_value + index as u32);
+            let phi_value = block.value_at(index);
             writeln!(
                 out,
                 "{}{} = {};",
@@ -1234,7 +1311,7 @@ fn collect_fn_ptr_type(ty: &Type, seen: &mut HashSet<FnPtrType>) {
             }
         }
         Type::Ptr(inner) | Type::Ref(inner, _) | Type::Array(inner, _) | Type::Slice(inner) => {
-            collect_fn_ptr_type(inner, seen)
+            collect_fn_ptr_type(inner, seen);
         }
         Type::Tuple(elements) => {
             for element in elements {
@@ -1282,7 +1359,7 @@ fn collect_struct_type(ty: &Type, seen: &mut HashMap<String, StructType>) {
             }
         }
         Type::Ptr(inner) | Type::Ref(inner, _) | Type::Array(inner, _) | Type::Slice(inner) => {
-            collect_struct_type(inner, seen)
+            collect_struct_type(inner, seen);
         }
         Type::Tuple(elements) => {
             let tuple = tuple_struct_type(elements);
@@ -1349,18 +1426,16 @@ fn count_uses(func: &Function) -> HashMap<u32, u32> {
 fn inst_operands(inst: &Inst) -> Vec<Value> {
     match &inst.kind {
         InstKind::Store(value, ptr) => vec![*value, *ptr],
-        InstKind::Load(ptr) => vec![*ptr],
-        InstKind::BinOp(_, lhs, rhs) => vec![*lhs, *rhs],
-        InstKind::UnOp(_, operand) => vec![*operand],
-        InstKind::Cmp(_, lhs, rhs) => vec![*lhs, *rhs],
-        InstKind::Cast(_, value, _) => vec![*value],
-        InstKind::SizeOf(_) => vec![],
+        InstKind::Load(value)
+        | InstKind::UnOp(_, value)
+        | InstKind::Cast(_, value, _)
+        | InstKind::ExtractValue(value, _)
+        | InstKind::FieldPtr(value, _)
+        | InstKind::HeapFree(value) => vec![*value],
+        InstKind::BinOp(_, lhs, rhs) | InstKind::Cmp(_, lhs, rhs) => vec![*lhs, *rhs],
         InstKind::StructValue(fields) => fields.clone(),
         InstKind::SparseStructValue(fields) => fields.iter().map(|(_, value)| *value).collect(),
-        InstKind::ArrayValue(elements) => elements.clone(),
-        InstKind::TupleValue(elements) => elements.clone(),
-        InstKind::ExtractValue(aggregate, _) => vec![*aggregate],
-        InstKind::FieldPtr(base, _) => vec![*base],
+        InstKind::ArrayValue(elements) | InstKind::TupleValue(elements) => elements.clone(),
         InstKind::IndexPtr(base, index) => vec![*base, *index],
         InstKind::CheckedIndexPtr(base, index, len) => vec![*base, *index, *len],
         InstKind::Phi(pairs) => pairs.iter().map(|(v, _)| *v).collect(),
@@ -1370,14 +1445,13 @@ fn inst_operands(inst: &Inst) -> Vec<Value> {
             values.extend(args);
             values
         }
-        InstKind::HeapFree(ptr) => vec![*ptr],
-        _ => vec![], // Const, HeapAlloc, Alloca: no operands
+        _ => vec![], // Const, HeapAlloc, Alloca, SizeOf: no operands
     }
 }
 
 fn fresh_c(ctr: &mut u64, prefix: &str) -> String {
     *ctr += 1;
-    format!("{}{}", prefix, ctr)
+    format!("{prefix}{ctr}")
 }
 
 fn c_return_type(func: &Function) -> String {
@@ -1427,7 +1501,7 @@ fn ctype_of(ty: &Type) -> String {
         Type::Struct(s) => c_type_name(&s.name),
         Type::Array(..) => {
             let (prefix, suffix) = c_decl_parts(ty);
-            format!("{}{}", prefix, suffix)
+            format!("{prefix}{suffix}")
         }
         Type::Tuple(elements) => c_type_name(&tuple_name(elements)),
         Type::Enum(e) => c_type_name(&format!("enum::{}", e.name)),
@@ -1456,10 +1530,13 @@ fn c_negative_int_literal(magnitude: u64, ty: &Type) -> String {
         Type::Int(IntTy::Isize) if magnitude == 1 << (usize::BITS - 1) => Some("PTRDIFF_MIN"),
         _ => None,
     };
-    minimum.map(str::to_owned).unwrap_or_else(|| {
-        let ctype = ctype_of(ty);
-        format!("(({ctype})-INT64_C({magnitude}))")
-    })
+    minimum.map_or_else(
+        || {
+            let ctype = ctype_of(ty);
+            format!("(({ctype})-INT64_C({magnitude}))")
+        },
+        str::to_owned,
+    )
 }
 
 fn pointer_ctype(inner: &Type) -> String {
@@ -1564,9 +1641,6 @@ fn decode_string(text: &str) -> String {
             Some('r') => '\r',
             Some('t') => '\t',
             Some('0') => '\0',
-            Some('\\') => '\\',
-            Some('\'') => '\'',
-            Some('"') => '"',
             Some(ch) => ch,
             None => '\\',
         });
@@ -1624,9 +1698,9 @@ fn struct_type_for_field_base(ty: &Type) -> Option<StructType> {
 
 fn field_expr(base: &str, field: &str, indirect: bool) -> String {
     if indirect {
-        format!("{}->{}", base, field)
+        format!("{base}->{field}")
     } else {
-        format!("{}.{}", base, field)
+        format!("{base}.{field}")
     }
 }
 
@@ -1637,7 +1711,7 @@ fn pointee_ct(ty: &Type) -> String {
     }
 }
 
-/// Split a MIR type into C declaration parts: (prefix, suffix_after_var_name).
+/// Split a MIR type into C declaration parts: (prefix, `suffix_after_var_name`).
 /// e.g. Array(Array(Foo, 3), 4) → ("Foo", "[4][3]")
 fn c_decl_parts(ty: &Type) -> (String, String) {
     match ty {
@@ -1651,7 +1725,7 @@ fn c_decl_parts(ty: &Type) -> (String, String) {
 
 fn c_param_decl(ty: &Type, name: &str) -> String {
     let (pre, suf) = c_decl_parts(ty);
-    format!("{} {}{}", pre, name, suf)
+    format!("{pre} {name}{suf}")
 }
 
 fn c_function_param_decl(func: &Function, ty: &Type, name: &str) -> String {
@@ -1665,8 +1739,8 @@ fn c_function_param_decl(func: &Function, ty: &Type, name: &str) -> String {
 fn integer_binop_expr(ty: IntTy, op: BinOp, lhs: &str, rhs: &str) -> String {
     let target = ctype_of(&Type::Int(ty));
     let carrier = int_carrier_ctype(ty);
-    let lhs_bits = format!("({})({})", carrier, lhs);
-    let rhs_bits = format!("({})({})", carrier, rhs);
+    let lhs_bits = format!("({carrier})({lhs})");
+    let rhs_bits = format!("({carrier})({rhs})");
 
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
@@ -1674,11 +1748,11 @@ fn integer_binop_expr(ty: IntTy, op: BinOp, lhs: &str, rhs: &str) -> String {
             if ty.is_signed() {
                 int_from_bits_expr(ty, &raw)
             } else {
-                format!("(({}){})", target, raw)
+                format!("(({target}){raw})")
             }
         }
         BinOp::Div | BinOp::Mod => {
-            let zero_guard = format!("({} == ({})0)", rhs, target);
+            let zero_guard = format!("({rhs} == ({target})0)");
             let op_type = if ty.is_signed() {
                 target.clone()
             } else {
@@ -1697,10 +1771,8 @@ fn integer_binop_expr(ty: IntTy, op: BinOp, lhs: &str, rhs: &str) -> String {
             } else {
                 "remainder by zero"
             };
-            let zero_trap = format!(
-                "(fputs(\"riddle: {}\\n\", stderr), abort(), ({})0)",
-                message, target
-            );
+            let zero_trap =
+                format!("(fputs(\"riddle: {message}\\n\", stderr), abort(), ({target})0)");
             if ty.is_signed() {
                 let overflow_guard = format!(
                     "(({}) == {} && ({}) == ({})-1)",
@@ -1715,15 +1787,13 @@ fn integer_binop_expr(ty: IntTy, op: BinOp, lhs: &str, rhs: &str) -> String {
                     "integer remainder overflow"
                 };
                 let overflow_trap = format!(
-                    "(fputs(\"riddle: {}\\n\", stderr), abort(), ({})0)",
-                    overflow_message, target
+                    "(fputs(\"riddle: {overflow_message}\\n\", stderr), abort(), ({target})0)"
                 );
                 format!(
-                    "(({}) ? {} : (({}) ? {} : {}))",
-                    zero_guard, zero_trap, overflow_guard, overflow_trap, operation
+                    "(({zero_guard}) ? {zero_trap} : (({overflow_guard}) ? {overflow_trap} : {operation}))"
                 )
             } else {
-                format!("(({}) ? {} : {})", zero_guard, zero_trap, operation)
+                format!("(({zero_guard}) ? {zero_trap} : {operation})")
             }
         }
         BinOp::Shl | BinOp::Shr => {
@@ -1734,21 +1804,21 @@ fn integer_binop_expr(ty: IntTy, op: BinOp, lhs: &str, rhs: &str) -> String {
                 int_width_expr(ty)
             );
             let raw = match op {
-                BinOp::Shl => format!("({} << {})", lhs_bits, count),
+                BinOp::Shl => format!("({lhs_bits} << {count})"),
                 BinOp::Shr if ty.is_signed() => {
-                    let complement = format!("~({})", lhs_bits);
-                    let shifted = format!("({} >> {})", complement, count);
-                    let negative = int_from_bits_expr(ty, &format!("~{}", shifted));
-                    let positive = int_from_bits_expr(ty, &format!("({} >> {})", lhs_bits, count));
-                    return format!("(({}) >= 0 ? {} : {})", lhs, positive, negative);
+                    let complement = format!("~({lhs_bits})");
+                    let shifted = format!("({complement} >> {count})");
+                    let negative = int_from_bits_expr(ty, &format!("~{shifted}"));
+                    let positive = int_from_bits_expr(ty, &format!("({lhs_bits} >> {count})"));
+                    return format!("(({lhs}) >= 0 ? {positive} : {negative})");
                 }
-                BinOp::Shr => format!("({} >> {})", lhs_bits, count),
+                BinOp::Shr => format!("({lhs_bits} >> {count})"),
                 _ => unreachable!(),
             };
             if ty.is_signed() {
                 int_from_bits_expr(ty, &raw)
             } else {
-                format!("(({}){})", target, raw)
+                format!("(({target}){raw})")
             }
         }
     }
@@ -1760,7 +1830,7 @@ fn float_binop_expr(ty: FloatTy, op: BinOp, lhs: &str, rhs: &str) -> String {
             FloatTy::F32 => "fmodf",
             FloatTy::F64 => "fmod",
         };
-        return format!("{}({}, {})", function, lhs, rhs);
+        return format!("{function}({lhs}, {rhs})");
     }
     format!("({} {} {})", lhs, binop_c(op), rhs)
 }
@@ -1769,14 +1839,14 @@ fn integer_unop_expr(ty: IntTy, op: UnOp, operand: &str) -> String {
     let target = ctype_of(&Type::Int(ty));
     let carrier = int_carrier_ctype(ty);
     let raw = match op {
-        UnOp::Neg => format!("(({})0 - ({})({}))", carrier, carrier, operand),
-        UnOp::Not => format!("~({})({})", carrier, operand),
+        UnOp::Neg => format!("(({carrier})0 - ({carrier})({operand}))"),
+        UnOp::Not => format!("~({carrier})({operand})"),
         _ => return format!("({}{})", unop_c(op), operand),
     };
     if ty.is_signed() {
         int_from_bits_expr(ty, &raw)
     } else {
-        format!("(({}){})", target, raw)
+        format!("(({target}){raw})")
     }
 }
 
@@ -1785,13 +1855,13 @@ fn integer_cast_expr(ty: IntTy, src: &str) -> String {
     if ty.is_signed() {
         int_from_bits_expr(ty, &format!("({})({})", int_unsigned_ctype(ty), src))
     } else {
-        format!("(({}){})", target, src)
+        format!("(({target}){src})")
     }
 }
 
 fn float_to_int_expr(ty: IntTy, src: &str) -> String {
     let target = ctype_of(&Type::Int(ty));
-    let source = format!("((long double)({}))", src);
+    let source = format!("((long double)({src}))");
     let min = int_min_const(ty);
     let max = int_max_const(ty);
     format!(
@@ -1799,7 +1869,7 @@ fn float_to_int_expr(ty: IntTy, src: &str) -> String {
     )
 }
 
-fn int_carrier_ctype(ty: IntTy) -> &'static str {
+const fn int_carrier_ctype(ty: IntTy) -> &'static str {
     match ty {
         IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::U8 | IntTy::U16 | IntTy::U32 => "uint32_t",
         IntTy::I64 | IntTy::U64 => "uint64_t",
@@ -1807,7 +1877,7 @@ fn int_carrier_ctype(ty: IntTy) -> &'static str {
     }
 }
 
-fn int_unsigned_ctype(ty: IntTy) -> &'static str {
+const fn int_unsigned_ctype(ty: IntTy) -> &'static str {
     match ty {
         IntTy::I8 | IntTy::U8 => "uint8_t",
         IntTy::I16 | IntTy::U16 => "uint16_t",
@@ -1817,7 +1887,7 @@ fn int_unsigned_ctype(ty: IntTy) -> &'static str {
     }
 }
 
-fn int_width_expr(ty: IntTy) -> &'static str {
+const fn int_width_expr(ty: IntTy) -> &'static str {
     match ty {
         IntTy::I8 | IntTy::U8 => "8",
         IntTy::I16 | IntTy::U16 => "16",
@@ -1836,10 +1906,10 @@ fn int_from_bits_expr(ty: IntTy, bits: &str) -> String {
         IntTy::Isize => "RIDDLE_ISIZE_FROM_BITS",
         IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::U64 | IntTy::Usize => unreachable!(),
     };
-    format!("{}({})", name, bits)
+    format!("{name}({bits})")
 }
 
-fn int_min_const(ty: IntTy) -> &'static str {
+const fn int_min_const(ty: IntTy) -> &'static str {
     match ty {
         IntTy::I8 => "INT8_MIN",
         IntTy::I16 => "INT16_MIN",
@@ -1850,7 +1920,7 @@ fn int_min_const(ty: IntTy) -> &'static str {
     }
 }
 
-fn int_max_const(ty: IntTy) -> &'static str {
+const fn int_max_const(ty: IntTy) -> &'static str {
     match ty {
         IntTy::I8 => "INT8_MAX",
         IntTy::I16 => "INT16_MAX",
@@ -1865,7 +1935,7 @@ fn int_max_const(ty: IntTy) -> &'static str {
     }
 }
 
-fn unop_c(op: UnOp) -> &'static str {
+const fn unop_c(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
         UnOp::Not => "~",
@@ -1874,7 +1944,7 @@ fn unop_c(op: UnOp) -> &'static str {
     }
 }
 
-fn binop_c(op: BinOp) -> &'static str {
+const fn binop_c(op: BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
         BinOp::Sub => "-",
@@ -1889,7 +1959,7 @@ fn binop_c(op: BinOp) -> &'static str {
     }
 }
 
-fn cmpop_c(op: CmpOp) -> &'static str {
+const fn cmpop_c(op: CmpOp) -> &'static str {
     match op {
         CmpOp::Eq => "==",
         CmpOp::Neq => "!=",

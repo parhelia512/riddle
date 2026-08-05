@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    BinaryOp, BodyCtx, FloatTy, HashMap, HashSet, HirAssocTypeConstraint, HirGenericBound,
+    HirTypeRef, IntTy, LangItem, TraitBound, TraitId, Type, TypeChecker, bound_target_param,
+    builtin_callable_kind,
+};
 
 impl TypeChecker<'_> {
     pub(crate) fn check_type_bounds(
@@ -23,7 +27,7 @@ impl TypeChecker<'_> {
                 self.check_type_bounds_inner(ctx, inner, span);
             }
             Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
-                self.check_type_bounds_inner(ctx, inner, span)
+                self.check_type_bounds_inner(ctx, inner, span);
             }
             Type::Tuple(elements) => {
                 for element in elements {
@@ -335,7 +339,7 @@ impl TypeChecker<'_> {
                     || !bound_args
                         .iter()
                         .zip(required_args)
-                        .all(|(actual, required)| self.bound_types_match(required, actual))
+                        .all(|(actual, required)| Self::bound_types_match(required, actual))
                 {
                     return false;
                 }
@@ -344,8 +348,7 @@ impl TypeChecker<'_> {
                 let expected =
                     self.lower_type_ref_with_params_at(&required.ty, subst, Some(required.range));
                 self.bound_assoc_type(ctx, &bound, &required.name.0)
-                    .map(|actual| self.bound_types_match(&expected, &actual))
-                    .unwrap_or(false)
+                    .is_some_and(|actual| Self::bound_types_match(&expected, &actual))
             })
         })
     }
@@ -364,8 +367,7 @@ impl TypeChecker<'_> {
             self.result
                 .trait_env
                 .associated_type_with_args(actual, trait_id, trait_args, &constraint.name.0)
-                .map(|actual| self.unify_types(&expected, &actual))
-                .unwrap_or(false)
+                .is_some_and(|actual| self.unify_types(&expected, &actual))
         })
     }
 
@@ -445,15 +447,15 @@ impl TypeChecker<'_> {
             .any(|supertrait| self.supertrait_reaches(supertrait, required, visited))
     }
 
-    pub(super) fn bound_types_match(&self, expected: &Type, actual: &Type) -> bool {
+    pub(super) fn bound_types_match(expected: &Type, actual: &Type) -> bool {
         expected.is_unknown_like()
             || actual.is_unknown_like()
             || expected == actual
-            || self.numeric_assignable(expected, actual)
+            || Self::numeric_assignable(expected, actual)
     }
 
-    pub(super) fn is_builtin_equality(&self, lhs_ty: &Type, rhs_ty: &Type) -> bool {
-        self.join_numeric_types(lhs_ty, rhs_ty).is_some()
+    pub(super) fn is_builtin_equality(lhs_ty: &Type, rhs_ty: &Type) -> bool {
+        Self::join_numeric_types(lhs_ty, rhs_ty).is_some()
             || matches!(
                 (lhs_ty, rhs_ty),
                 (Type::Bool, Type::Bool)
@@ -469,25 +471,21 @@ impl TypeChecker<'_> {
             )
     }
 
-    pub(super) fn is_builtin_binary_operator(
-        &self,
-        op: BinaryOp,
-        lhs_ty: &Type,
-        rhs_ty: &Type,
-    ) -> bool {
+    pub(super) fn is_builtin_binary_operator(op: BinaryOp, lhs_ty: &Type, rhs_ty: &Type) -> bool {
         match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                self.join_numeric_types(lhs_ty, rhs_ty).is_some()
+                Self::join_numeric_types(lhs_ty, rhs_ty).is_some()
             }
-            BinaryOp::Mod => lhs_ty.is_integer() && rhs_ty.is_integer(),
+            BinaryOp::Mod | BinaryOp::Shl | BinaryOp::Shr => {
+                lhs_ty.is_integer() && rhs_ty.is_integer()
+            }
             BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
                 (lhs_ty == &Type::Bool && rhs_ty == &Type::Bool)
-                    || self.join_numeric_types(lhs_ty, rhs_ty).is_some()
+                    || Self::join_numeric_types(lhs_ty, rhs_ty).is_some()
             }
-            BinaryOp::Shl | BinaryOp::Shr => lhs_ty.is_integer() && rhs_ty.is_integer(),
-            BinaryOp::Eq | BinaryOp::Neq => self.is_builtin_equality(lhs_ty, rhs_ty),
+            BinaryOp::Eq | BinaryOp::Neq => Self::is_builtin_equality(lhs_ty, rhs_ty),
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
-                self.is_builtin_ordering(lhs_ty, rhs_ty)
+                Self::is_builtin_ordering(lhs_ty, rhs_ty)
             }
             _ => false,
         }
@@ -501,7 +499,7 @@ impl TypeChecker<'_> {
         }
     }
 
-    pub(super) fn is_builtin_ordering(&self, lhs_ty: &Type, rhs_ty: &Type) -> bool {
+    pub(super) fn is_builtin_ordering(lhs_ty: &Type, rhs_ty: &Type) -> bool {
         lhs_ty.is_ordered_scalar()
             && rhs_ty.is_ordered_scalar()
             && (*lhs_ty == Type::Char) == (*rhs_ty == Type::Char)

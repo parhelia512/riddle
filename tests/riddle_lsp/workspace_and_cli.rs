@@ -20,7 +20,7 @@ fn project_diagnostics_follow_peer_overlay_removal() {
         (
             main_uri.clone(),
             Document {
-                text: main_text.clone(),
+                text: main_text,
                 version: Some(1),
             },
         ),

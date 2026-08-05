@@ -37,7 +37,8 @@ pub enum ProcMacroTokenTree {
 }
 
 impl ProcMacroTokenTree {
-    pub fn span(&self) -> &Range<usize> {
+    #[must_use]
+    pub const fn span(&self) -> &Range<usize> {
         match self {
             Self::Group { span, .. }
             | Self::Ident { span, .. }
@@ -52,17 +53,12 @@ pub struct ProcMacroTokenStream {
     pub trees: Vec<ProcMacroTokenTree>,
 }
 
-pub(super) struct RenderedTokenStream {
-    pub(super) source: String,
-    pub(super) spans: Vec<RenderedTokenSpan>,
-}
-
-pub(super) struct RenderedTokenSpan {
-    pub(super) generated: Range<usize>,
-    pub(super) original: Range<usize>,
-}
-
 impl ProcMacroTokenStream {
+    /// Lexes a source fragment into a process-macro token stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token tree contains mismatched delimiters.
     pub fn from_source(source: &str, offset: usize) -> Result<Self, String> {
         let tokens = lexer::lex(source);
         let mut index = 0;
@@ -71,7 +67,8 @@ impl ProcMacroTokenStream {
         Ok(stream)
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.trees.is_empty()
     }
 
@@ -103,26 +100,25 @@ impl ProcMacroTokenStream {
         }
     }
 
+    #[must_use]
     pub fn to_source(&self) -> String {
-        self.render().source
-    }
-
-    pub(super) fn render(&self) -> RenderedTokenStream {
         let mut output = String::new();
-        let mut spans = Vec::new();
-        write_token_stream(self, &mut output, &mut spans);
-        RenderedTokenStream {
-            source: output,
-            spans,
-        }
+        write_token_stream(self, &mut output);
+        output
     }
 
+    #[must_use]
     pub fn encode(&self) -> String {
         let mut output = String::from(TOKEN_WIRE_HEADER);
         encode_stream(self, &mut output);
         output
     }
 
+    /// Decodes the process-macro token wire format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the encoded stream is malformed or has trailing data.
     pub fn decode(input: &str) -> Result<Self, String> {
         let mut parser = TokenWireParser::new(input);
         parser.expect_bytes(TOKEN_WIRE_HEADER.as_bytes())?;
@@ -236,7 +232,9 @@ fn parse_lexed_stream(
     }
 }
 
-pub(super) fn opening_delimiter(kind: SyntaxKind) -> Option<(ProcMacroDelimiter, SyntaxKind)> {
+pub(super) const fn opening_delimiter(
+    kind: SyntaxKind,
+) -> Option<(ProcMacroDelimiter, SyntaxKind)> {
     match kind {
         SyntaxKind::LParen => Some((ProcMacroDelimiter::Parenthesis, SyntaxKind::RParen)),
         SyntaxKind::LBrace => Some((ProcMacroDelimiter::Brace, SyntaxKind::RBrace)),
@@ -245,7 +243,7 @@ pub(super) fn opening_delimiter(kind: SyntaxKind) -> Option<(ProcMacroDelimiter,
     }
 }
 
-pub(super) fn is_closing_delimiter(kind: SyntaxKind) -> bool {
+pub(super) const fn is_closing_delimiter(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         SyntaxKind::RParen | SyntaxKind::RBrace | SyntaxKind::RBracket
@@ -274,18 +272,14 @@ fn token_is_punctuation(token: &lexer::Token, source: &str) -> bool {
         .all(|byte| byte.is_ascii_punctuation())
 }
 
-fn write_token_stream(
-    stream: &ProcMacroTokenStream,
-    output: &mut String,
-    spans: &mut Vec<RenderedTokenSpan>,
-) {
+fn write_token_stream(stream: &ProcMacroTokenStream, output: &mut String) {
     let mut first = true;
     let mut joint = false;
     for tree in &stream.trees {
         if !first && !joint {
             output.push(' ');
         }
-        write_token_tree(tree, output, spans);
+        write_token_tree(tree, output);
         joint = matches!(
             tree,
             ProcMacroTokenTree::Punct {
@@ -297,16 +291,10 @@ fn write_token_stream(
     }
 }
 
-fn write_token_tree(
-    tree: &ProcMacroTokenTree,
-    output: &mut String,
-    spans: &mut Vec<RenderedTokenSpan>,
-) {
+fn write_token_tree(tree: &ProcMacroTokenTree, output: &mut String) {
     match tree {
         ProcMacroTokenTree::Group {
-            delimiter,
-            stream,
-            span,
+            delimiter, stream, ..
         } => {
             let (opening, closing) = match delimiter {
                 ProcMacroDelimiter::Parenthesis => (Some('('), Some(')')),
@@ -315,45 +303,17 @@ fn write_token_tree(
                 ProcMacroDelimiter::None => (None, None),
             };
             if let Some(opening) = opening {
-                push_mapped_char(output, opening, span, spans);
+                output.push(opening);
             }
-            write_token_stream(stream, output, spans);
+            write_token_stream(stream, output);
             if let Some(closing) = closing {
-                push_mapped_char(output, closing, span, spans);
+                output.push(closing);
             }
         }
-        ProcMacroTokenTree::Ident { text, span } | ProcMacroTokenTree::Literal { text, span } => {
-            let start = output.len();
+        ProcMacroTokenTree::Ident { text, .. } | ProcMacroTokenTree::Literal { text, .. } => {
             output.push_str(text);
-            push_rendered_span(start..output.len(), span, spans);
         }
-        ProcMacroTokenTree::Punct { value, span, .. } => {
-            push_mapped_char(output, *value, span, spans);
-        }
-    }
-}
-
-fn push_mapped_char(
-    output: &mut String,
-    value: char,
-    span: &Range<usize>,
-    spans: &mut Vec<RenderedTokenSpan>,
-) {
-    let start = output.len();
-    output.push(value);
-    push_rendered_span(start..output.len(), span, spans);
-}
-
-fn push_rendered_span(
-    generated: Range<usize>,
-    original: &Range<usize>,
-    spans: &mut Vec<RenderedTokenSpan>,
-) {
-    if !generated.is_empty() {
-        spans.push(RenderedTokenSpan {
-            generated,
-            original: original.clone(),
-        });
+        ProcMacroTokenTree::Punct { value, .. } => output.push(*value),
     }
 }
 
@@ -401,17 +361,18 @@ fn encode_stream(stream: &ProcMacroTokenStream, output: &mut String) {
     }
 }
 
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
 fn encode_text_token(kind: char, text: &str, span: &Range<usize>, output: &mut String) {
     write!(output, "{kind}{};{};{};", span.start, span.end, text.len())
         .expect("writing to String cannot fail");
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in text.bytes() {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
+        output.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        output.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
     }
 }
 
-fn encode_delimiter(delimiter: ProcMacroDelimiter) -> u8 {
+const fn encode_delimiter(delimiter: ProcMacroDelimiter) -> u8 {
     match delimiter {
         ProcMacroDelimiter::Parenthesis => 0,
         ProcMacroDelimiter::Brace => 1,
@@ -420,7 +381,7 @@ fn encode_delimiter(delimiter: ProcMacroDelimiter) -> u8 {
     }
 }
 
-fn encode_spacing(spacing: ProcMacroSpacing) -> u8 {
+const fn encode_spacing(spacing: ProcMacroSpacing) -> u8 {
     match spacing {
         ProcMacroSpacing::Alone => 0,
         ProcMacroSpacing::Joint => 1,
@@ -433,7 +394,7 @@ struct TokenWireParser<'a> {
 }
 
 impl<'a> TokenWireParser<'a> {
-    fn new(input: &'a str) -> Self {
+    const fn new(input: &'a str) -> Self {
         Self {
             input: input.as_bytes(),
             index: 0,

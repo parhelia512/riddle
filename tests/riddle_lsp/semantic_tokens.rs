@@ -165,7 +165,7 @@ fn semantic_tokens_highlight_str_and_self_as_keywords() {
 
 #[test]
 fn semantic_tokens_distinguish_methods_structs_enums_and_traits() {
-    let source = r#"struct Point {}
+    let source = r"struct Point {}
 enum State { Ready }
 trait Draw { fun draw(&self); }
 impl Draw for Point { fun draw(&self) {} }
@@ -173,7 +173,7 @@ fun main() {
     let point = Point {};
     point.draw();
     let state = State::Ready;
-}"#;
+}";
     let tokens = semantic_token_positions(&semantic_tokens(source));
     let symbols = tokens
         .iter()
@@ -283,7 +283,8 @@ fn semantic_tokens_mark_standard_library_traits() {
         CompileOptions::default(),
         false,
     ));
-    let copy_start = source.find("Copy").unwrap() as u32;
+    let copy_start =
+        u32::try_from(source.find("Copy").unwrap()).expect("test offset should fit in u32");
 
     assert!(
         tokens.iter().any(|token| {
@@ -298,13 +299,13 @@ fn semantic_tokens_mark_standard_library_traits() {
 
 #[test]
 fn semantic_tokens_classify_primitives_type_annotations_and_free_functions() {
-    let source = r#"fun make(value: i32, size: usize, enabled: bool) -> Vector<i32> {
+    let source = r"fun make(value: i32, size: usize, enabled: bool) -> Vector<i32> {
     Vector::new()
 }
 
 fun main() {
     let s: Vector<i32> = make(1i32, 0usize, true);
-}"#;
+}";
     let tokens = semantic_token_positions(&semantic_tokens_for_source_with_options(
         source,
         CompileOptions::default(),
@@ -405,10 +406,12 @@ fn semantic_tokens_prefer_resolved_variables_over_lexical_types() {
 fn semantic_tokens_prefer_immutable_locals_over_same_named_structs() {
     let source = "struct Foo {}\nfun main() { let Foo = 1; Foo; }";
     let use_position = position(source, source.rfind("Foo;").unwrap());
+    let use_line = use_position.line;
+    let use_start = use_position.character;
     let tokens = semantic_token_positions(&semantic_tokens(source));
     let token = tokens
         .iter()
-        .find(|token| token.line == use_position.line && token.start == use_position.character)
+        .find(|token| token.line == use_line && token.start == use_start)
         .unwrap();
 
     assert_eq!(token.token_type, TOKEN_VARIABLE, "{tokens:#?}");

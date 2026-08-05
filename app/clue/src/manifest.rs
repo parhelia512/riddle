@@ -5,9 +5,9 @@ use std::io::{self, Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
-pub(crate) const CLUE_PROJECT_FILE_NAME: &str = "Clue.toml";
+pub const CLUE_PROJECT_FILE_NAME: &str = "Clue.toml";
 
-pub(crate) fn new_manifest(package_name: &str, kind: ProjectKind) -> String {
+pub fn new_manifest(package_name: &str, kind: ProjectKind) -> String {
     let mut package = Table::new();
     package.insert("name".into(), Value::String(package_name.into()));
     package.insert("version".into(), Value::String("0.1.0".into()));
@@ -62,7 +62,7 @@ pub struct Dependency {
     pub path: PathBuf,
 }
 
-pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
+pub fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
     let manifest_path = root.join(CLUE_PROJECT_FILE_NAME);
     let text = fs::read_to_string(&manifest_path)?;
     let value = text.parse::<Table>().map(Value::Table).map_err(|error| {
@@ -80,7 +80,7 @@ pub(crate) fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
     let name = string_field(package, "name", "package")?;
     validate_package_name(&name).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
     let target = target_path(root, &value, kind)?;
-    let target_kind = target.as_ref().map(|(_, kind)| *kind).unwrap_or(kind);
+    let target_kind = target.as_ref().map_or(kind, |(_, kind)| *kind);
     let (entry, kind) = match optional_string_field(package, "entry", "package")? {
         Some(path) => (root.join(path), target_kind),
         None => target.unwrap_or((entry_file(root, &name, target_kind)?, target_kind)),
@@ -144,7 +144,7 @@ fn runtime_config(
     Ok((Some(source), gc_enabled))
 }
 
-pub(crate) fn validate_package_name(name: &str) -> anyhow::Result<()> {
+pub fn validate_package_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || matches!(name, "." | "..") || name.chars().any(std::path::is_separator) {
         bail!("invalid package name `{name}`");
     }
@@ -198,10 +198,10 @@ fn dependencies(value: &Value) -> io::Result<Vec<Dependency>> {
                 .ok_or_else(|| unsupported_dependency(alias))?;
             let path = optional_string_field(config, "path", alias)?
                 .ok_or_else(|| unsupported_dependency(alias))?;
-            let package = optional_string_field(config, "package", alias)?
-                .unwrap_or_else(|| alias.to_string());
+            let package =
+                optional_string_field(config, "package", alias)?.unwrap_or_else(|| alias.clone());
             Ok(Dependency {
-                alias: alias.to_string(),
+                alias: alias.clone(),
                 package,
                 path: PathBuf::from(path),
             })

@@ -134,7 +134,7 @@ fn token_stream(source: &str) -> ProcMacroTokenStream {
 
 #[test]
 fn function_like_macros_expand_in_expression_item_type_and_pattern_positions() {
-    let source = r#"
+    let source = r"
         use macros::{answer, make_item, make_type, make_pattern};
         make_item!();
         fun main() -> i32 {
@@ -144,7 +144,7 @@ fn function_like_macros_expand_in_expression_item_type_and_pattern_positions() {
                 _ => value,
             }
         }
-    "#;
+    ";
     let mut provider = GeneralProvider::default();
     let expanded = expand_source(source, &mut provider);
 
@@ -272,22 +272,25 @@ fn standard_print_macros_reject_invalid_format_strings() {
             .contains("2 placeholder(s), but 1 argument(s)")
     );
 
-    let unsupported = expand_standard_macros(r#"fun main() { println!("{:x}", 1); }"#);
+    let open = '{';
+    let close = '}';
+    let unsupported_source = format!(r#"fun main() {{ println!("{open}:x{close}", 1); }}"#);
+    let unsupported = expand_standard_macros(&unsupported_source);
     assert_eq!(unsupported.diagnostics.len(), 1);
     assert_eq!(
         unsupported.diagnostics[0].message,
-        "only `{}` and `{:?}` format placeholders are supported"
+        format!("only `{open}{close}` and `{open}:?{close}` format placeholders are supported")
     );
 }
 
 #[test]
 fn attribute_macros_receive_arguments_and_the_annotated_item_separately() {
-    let source = r#"
+    let source = r"
         use macros::replace;
         #[replace(9)]
         fun original() -> i32 { 1 }
         fun main() -> i32 { replaced() }
-    "#;
+    ";
     let mut provider = GeneralProvider::default();
     let expanded = expand_source(source, &mut provider);
 
@@ -314,11 +317,11 @@ fn attribute_macros_receive_arguments_and_the_annotated_item_separately() {
 
 #[test]
 fn mixed_imports_preserve_ordinary_bindings() {
-    let source = r#"
+    let source = r"
         mod values { pub fun plain() -> i32 { 1 } }
         use {macros::answer, values::plain};
         fun main() -> i32 { answer!() + plain() }
-    "#;
+    ";
     let mut provider = GeneralProvider::default();
     let expanded = expand_source(source, &mut provider);
 
@@ -335,12 +338,12 @@ fn mixed_imports_preserve_ordinary_bindings() {
 
 #[test]
 fn public_macro_reexports_can_be_imported_through_modules() {
-    let source = r#"
+    let source = r"
         mod first { pub use macros::answer; }
         mod prelude { pub use crate::first::answer; }
         use prelude::answer;
         fun main() -> i32 { answer!() }
-    "#;
+    ";
     let mut provider = GeneralProvider::default();
     let expanded = expand_source(source, &mut provider);
 
@@ -464,7 +467,7 @@ fn derive_expansion_preserves_the_item_and_declared_order() {
 
 #[test]
 fn derive_helper_attributes_are_scoped_to_the_registered_derive() {
-    let source = r#"
+    let source = r"
         use macros::Helpers;
         #[answer]
         #[derive(Helpers)]
@@ -472,7 +475,7 @@ fn derive_helper_attributes_are_scoped_to_the_registered_derive() {
             #[answer(value)]
             value: i32,
         }
-    "#;
+    ";
     let mut provider = FakeProvider::default();
     let expanded = expand_source(source, &mut provider);
 
@@ -496,12 +499,12 @@ fn derive_helper_attributes_are_scoped_to_the_registered_derive() {
 
 #[test]
 fn generated_impl_reenters_the_existing_pipeline() {
-    let source = r#"
+    let source = r"
         trait Named { fun name(&self) -> i32; }
         #[derive(macros::Named)]
         struct User {}
         fun main() -> i32 { User {}.name() }
-    "#;
+    ";
     let mut provider = FakeProvider::default();
     let expanded = expand_source(source, &mut provider);
     assert!(
@@ -550,12 +553,12 @@ fn unqualified_derive_names_require_an_import() {
 
 #[test]
 fn imported_derive_names_use_a_separate_macro_namespace() {
-    let source = r#"
+    let source = r"
         use macros::{First, Second as Other};
         struct First {}
         #[derive(First, Other)]
         struct User {}
-    "#;
+    ";
     let mut provider = FakeProvider::default();
     let expanded = expand_source(source, &mut provider);
 
@@ -582,11 +585,11 @@ fn imported_derive_names_use_a_separate_macro_namespace() {
 
 #[test]
 fn expansion_indexes_macro_bindings_and_uses_before_erasing_them() {
-    let source = r#"
+    let source = r"
         use macros::{First as Inspect};
         #[derive(Inspect)]
         struct User {}
-    "#;
+    ";
     let mut provider = FakeProvider::default();
     let expanded = expand_source(source, &mut provider);
 
@@ -694,14 +697,14 @@ fn recursive_derive_expansion_has_a_depth_limit() {
 
 #[test]
 fn derive_inside_inline_module_expands_inside_that_module() {
-    let source = r#"
+    let source = r"
         mod inner {
             use macros::Nested;
             #[derive(Nested)]
             struct Value {}
         }
         fun main() -> i32 { inner::generated() }
-    "#;
+    ";
     let mut provider = FakeProvider::default();
     let expanded = expand_source(source, &mut provider);
     let result = check_with_options(&expanded.source, CompileOptions::default());

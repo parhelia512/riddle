@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    hash::BuildHasher,
     path::{Path, PathBuf},
 };
 
@@ -9,16 +10,16 @@ use rowan::TextRange;
 use crate::{
     server::Document,
     session::AnalysisSessions,
-    text::{normalized_path, range_is_in_source},
+    text::{normalized_path, range_is_in_source, text_range},
 };
 
 #[derive(Clone, Copy)]
-pub(crate) enum AnalysisDepth {
+pub enum AnalysisDepth {
     Resolve,
     Check,
 }
 
-pub(crate) struct DocumentAnalysis {
+pub struct DocumentAnalysis {
     pub(crate) result: CompileResult,
     pub(crate) source: String,
     pub(crate) source_map: Option<riddlec::pipeline::SourceMap>,
@@ -41,10 +42,7 @@ impl DocumentAnalysis {
 
     pub(crate) fn local_macro_range(&self, range: &std::ops::Range<usize>) -> Option<TextRange> {
         let source_map = self.macro_source_map.as_ref()?;
-        let mapped = source_map.map_range(TextRange::new(
-            (range.start as u32).into(),
-            (range.end as u32).into(),
-        ))?;
+        let mapped = source_map.map_range(text_range(range.start, range.end))?;
         self.path
             .as_deref()
             .is_none_or(|path| mapped.path == path)
@@ -52,7 +50,7 @@ impl DocumentAnalysis {
     }
 }
 
-pub(crate) fn analyze_standalone_source(
+pub fn analyze_standalone_source(
     source: &str,
     options: CompileOptions,
     session: &mut CheckSession,
@@ -71,32 +69,32 @@ pub(crate) fn analyze_standalone_source(
         ..
     } = riddlec::proc_macro::expand_standard_macros(source);
     loaded.apply_expansion(source, &mappings);
-    #[allow(clippy::single_range_in_vec_init)]
-    let package_ranges = [0..loaded.source.len()];
+    let package_range = 0..loaded.source.len();
+    let package_ranges = std::slice::from_ref(&package_range);
     let mut result = match (depth, parse.as_ref()) {
         (AnalysisDepth::Resolve, Some(parse)) => session
             .resolve_parsed_package_with_options_cancellable(
                 &loaded.source,
                 parse,
-                &package_ranges,
+                package_ranges,
                 options,
                 || false,
             )
             .expect("non-cancellable pipeline cannot be cancelled"),
         (AnalysisDepth::Resolve, None) => {
-            session.resolve_package_with_options(&loaded.source, &package_ranges, options)
+            session.resolve_package_with_options(&loaded.source, package_ranges, options)
         }
         (AnalysisDepth::Check, Some(parse)) => session
             .check_parsed_package_with_options_cancellable(
                 &loaded.source,
                 parse,
-                &package_ranges,
+                package_ranges,
                 options,
                 || false,
             )
             .expect("non-cancellable pipeline cannot be cancelled"),
         (AnalysisDepth::Check, None) => {
-            session.check_package_with_options(&loaded.source, &package_ranges, options)
+            session.check_package_with_options(&loaded.source, package_ranges, options)
         }
     };
     result.macro_diagnostics = diagnostics;
@@ -110,9 +108,9 @@ pub(crate) fn analyze_standalone_source(
     }
 }
 
-pub(crate) fn analyze_document(
+pub fn analyze_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     options: CompileOptions,
     sessions: &AnalysisSessions,
     depth: AnalysisDepth,
@@ -134,7 +132,7 @@ pub(crate) fn analyze_document(
         let session = sessions.project(&root);
         let mut session = session
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let analysis = match depth {
             AnalysisDepth::Resolve => {
                 clue::resolve_project_with_session(&root, &overlays, options, &mut session)
@@ -157,7 +155,7 @@ pub(crate) fn analyze_document(
     let session = sessions.standalone(uri);
     let mut session = session
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = uri.to_file_path().ok().map(normalized_path);
     Ok(analyze_standalone_source(
         &document.text,

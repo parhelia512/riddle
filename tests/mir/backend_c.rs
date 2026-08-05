@@ -1,14 +1,13 @@
 use crate::{compile, lower};
 use mir::Backend;
 use mir::backend::c::CBackend;
-use std::fs;
-use std::process::Command;
+use std::{fmt::Write as _, fs, process::Command};
 
 fn c_symbol(kind: char, name: &str) -> String {
-    let suffix = name
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut suffix = String::with_capacity(name.len() * 2);
+    for byte in name.bytes() {
+        write!(&mut suffix, "{byte:02x}").unwrap();
+    }
     format!("riddle_{kind}_{suffix}")
 }
 
@@ -31,28 +30,28 @@ fn c_variable(name: &str) -> String {
 #[test]
 fn c_simple_function() {
     let module = lower(
-        r#"
+        r"
         fun main() {
             let x = 42;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains("main"), "missing main: {}", result);
-    assert!(result.contains("return"), "missing return: {}", result);
+    assert!(result.contains("main"), "missing main: {result}");
+    assert!(result.contains("return"), "missing return: {result}");
     // ponytail: const 42 is inlined; since x is dead, no int32_t variable is emitted.
 }
 
 #[test]
 fn c_export_uses_c_string_abi_and_preserves_internal_str_layout() {
     let module = lower(
-        r#"
+        r"
         #[c_export]
         fun macro_wrapper(input: &str) {}
 
         fun ordinary(input: &str) {}
-        "#,
+        ",
     );
 
     let generated = CBackend::new().compile(&module).unwrap();
@@ -77,7 +76,7 @@ fn c_export_uses_c_string_abi_and_preserves_internal_str_layout() {
 #[test]
 fn c_slice_borrow_carries_length_and_indexes_elements() {
     let (_, type_result, analysis, module) = compile(
-        r#"
+        r"
         struct Item { value: i32 }
 
         fun second(values: &[Item]) -> i32 {
@@ -93,7 +92,7 @@ fn c_slice_borrow_carries_length_and_indexes_elements() {
             let slice: &[Item] = &values;
             second(slice)
         }
-        "#,
+        ",
     );
     assert_eq!(type_result.diagnostics, vec![]);
     assert_eq!(analysis.diagnostics, vec![]);
@@ -108,7 +107,7 @@ fn c_slice_borrow_carries_length_and_indexes_elements() {
 #[test]
 fn std_slices_support_safe_access_and_borrowed_iteration() {
     let result = riddlec::pipeline::compile(
-        r#"
+        r"
         fun sum(values: &[i32]) -> i32 {
             let mut total = 0;
             for value in values {
@@ -134,7 +133,7 @@ fn std_slices_support_safe_access_and_borrowed_iteration() {
             let after: &[i32] = &values;
             if before == 20 && length_ok && sum(after) == 63 { 0 } else { 1 }
         }
-        "#,
+        ",
     );
     assert!(result.success(), "{:#?}", result.type_result.diagnostics);
 
@@ -147,7 +146,7 @@ fn std_slices_support_safe_access_and_borrowed_iteration() {
 #[test]
 fn moving_a_mutable_reference_still_respects_live_reborrows() {
     let (_, _, analysis, _) = compile(
-        r#"
+        r"
         fun consume<T>(value: T) {}
 
         fun invalid(value: &mut i32) {
@@ -155,7 +154,7 @@ fn moving_a_mutable_reference_still_respects_live_reborrows() {
             consume(value);
             *child = 1;
         }
-        "#,
+        ",
     );
     assert!(
         analysis
@@ -228,7 +227,7 @@ fn c_backend_does_not_abort_after_never_extern() {
 #[test]
 fn c_tuple_types_are_named_and_reusable() {
     let module = lower(
-        r#"
+        r"
         enum Foo { A(i32, (i64, i32)) }
 
         fun main() {
@@ -237,7 +236,7 @@ fn c_tuple_types_are_named_and_reusable() {
             };
             let sink = value;
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -365,7 +364,7 @@ fn c_array_comparison_is_lowered_elementwise() {
 #[test]
 fn c_anonymous_function_uses_typed_function_pointer() {
     let module = lower(
-        r#"
+        r"
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 {
             f(value)
         }
@@ -374,7 +373,7 @@ fn c_anonymous_function_uses_typed_function_pointer() {
             let inc = fun(x) { x + 1 };
             apply(inc, 41)
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -396,13 +395,13 @@ fn c_anonymous_function_uses_typed_function_pointer() {
 #[test]
 fn c_non_escaping_closure_capture_uses_stack_environment() {
     let module = lower(
-        r#"
+        r"
         fun main() -> i32 {
             let base = 40;
             let add = fun(value: i32) { base + value };
             add(2)
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -424,7 +423,7 @@ fn c_non_escaping_closure_capture_uses_stack_environment() {
 #[test]
 fn c_returned_closure_keeps_parameter_alive() {
     let module = lower(
-        r#"
+        r"
         fun make_adder(base: i32) -> impl Fn(i32) -> i32 {
             fun(value: i32) { base + value }
         }
@@ -433,7 +432,7 @@ fn c_returned_closure_keeps_parameter_alive() {
             let add = make_adder(40);
             add(2)
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -488,11 +487,11 @@ fn c_gc_closure_environment_has_deterministic_drop_glue() {
 #[test]
 fn c_named_function_value_uses_empty_environment_adapter() {
     let module = lower(
-        r#"
+        r"
         fun inc(value: i32) -> i32 { value + 1 }
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun main() -> i32 { apply(inc, 41) }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -506,47 +505,45 @@ fn c_named_function_value_uses_empty_environment_adapter() {
 #[test]
 fn c_backend_unit_main_returns_zero() {
     let module = lower(
-        r#"
+        r"
         fun main() {}
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains("int main"),
-        "main should return int:\n{}",
-        result
+        "main should return int:\n{result}"
     );
     assert!(
         result.contains("return 0;"),
-        "unit main should return zero:\n{}",
-        result
+        "unit main should return zero:\n{result}"
     );
 }
 
 #[test]
 fn c_return_value() {
     let module = lower(
-        r#"
+        r"
         fun answer() -> i32 {
             return 42;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains("int32_t"), "missing int type: {}", result);
-    assert!(result.contains("return"), "missing return: {}", result);
+    assert!(result.contains("int32_t"), "missing int type: {result}");
+    assert!(result.contains("return"), "missing return: {result}");
 }
 
 #[test]
 fn c_backend_preserves_unsigned_and_pointer_sized_types() {
     let module = lower(
-        r#"
+        r"
         fun values(a: u8, b: u16, c: u32, d: u64, e: usize, f: isize) -> u64 {
             a as u64 + b as u64 + c as u64 + d + e as u64 + f as u64
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -638,74 +635,73 @@ fn c_backend_casts_u8_to_char_code_point() {
 #[test]
 fn c_arithmetic() {
     let module = lower(
-        r#"
+        r"
         fun add(a: i32, b: i32) -> i32 {
             return a + b;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains("+"), "missing +: {}", result);
+    assert!(result.contains('+'), "missing +: {result}");
 }
 
 #[test]
 fn c_compound_assignment_uses_updated_value() {
     let module = lower(
-        r#"
+        r"
         fun main() {
             let mut n: i32 = 1;
             n += 2;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains("+"), "missing compound add:\n{}", result);
+    assert!(result.contains('+'), "missing compound add:\n{result}");
     assert!(
         !result.contains("= 0;"),
-        "compound assignment should not lower to zero:\n{}",
-        result
+        "compound assignment should not lower to zero:\n{result}"
     );
 }
 
 #[test]
 fn c_basic_blocks() {
     let module = lower(
-        r#"
+        r"
         fun choose(flag: bool) -> i32 {
             if flag {
                 return 1;
             }
             return 0;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains("if"), "missing if: {}", result);
-    assert!(result.contains("goto"), "missing goto: {}", result);
+    assert!(result.contains("if"), "missing if: {result}");
+    assert!(result.contains("goto"), "missing goto: {result}");
 }
 
 #[test]
 fn c_comparison() {
     let module = lower(
-        r#"
+        r"
         fun lt(a: i32, b: i32) -> bool {
             return a < b;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains("bool"), "missing bool type: {}", result);
-    assert!(result.contains("<"), "missing <: {}", result);
+    assert!(result.contains("bool"), "missing bool type: {result}");
+    assert!(result.contains('<'), "missing <: {result}");
 }
 
 #[test]
 fn c_function_call() {
     let module = lower(
-        r#"
+        r"
         fun square(n: i32) -> i32 {
             return n * n;
         }
@@ -713,21 +709,20 @@ fn c_function_call() {
         fun main() -> i32 {
             return square(5);
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains(&c_function("square")),
-        "missing callee: {}",
-        result
+        "missing callee: {result}"
     );
 }
 
 #[test]
 fn c_static_impl_method_call_uses_mangled_name() {
     let module = lower(
-        r#"
+        r"
         struct Point {
             x: i32,
         }
@@ -742,61 +737,53 @@ fn c_static_impl_method_call_uses_mangled_name() {
             let p = Point::new(1);
             return p.x;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
 
     assert!(
         result.contains(&c_function("new__Point")),
-        "static impl method should be mangled:\n{}",
-        result
+        "static impl method should be mangled:\n{result}"
     );
     assert!(
         !result.contains(" new("),
-        "static impl method call used bare name:\n{}",
-        result
+        "static impl method call used bare name:\n{result}"
     );
 }
 
 #[test]
 fn c_heap_alloc() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun escape() -> &Data {
             let local = Data { value: 1 };
             return &local;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     // GC promotion: escaping local -> runtime allocation ABI.
-    assert!(
-        result.contains("rgc_alloc"),
-        "missing rgc_alloc: {}",
-        result
-    );
+    assert!(result.contains("rgc_alloc"), "missing rgc_alloc: {result}");
     assert!(
         result.contains("void rgc_collect(void)"),
-        "missing runtime ABI declaration: {}",
-        result
+        "missing runtime ABI declaration: {result}"
     );
     assert!(
         !result.contains("struct RgcHeader")
             && !result.contains("GC_MALLOC")
             && !result.contains("#include <gc.h>"),
-        "runtime implementation should not be emitted by the backend: {}",
-        result
+        "runtime implementation should not be emitted by the backend: {result}"
     );
 }
 
 #[test]
 fn c_backend_no_gc_uses_the_owned_allocator_without_gc_symbols() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun escape() -> &Data {
@@ -805,7 +792,7 @@ fn c_backend_no_gc_uses_the_owned_allocator_without_gc_symbols() {
         }
 
         fun main() { escape(); }
-        "#,
+        ",
     );
     let generated = CBackend::without_gc().compile(&module).unwrap();
 
@@ -852,14 +839,14 @@ fn c_backend_no_gc_rejects_collector_symbols() {
 #[test]
 fn c_backend_heap_allocates_escaping_reference_temporaries() {
     let module = lower(
-        r#"
+        r"
         fun nested() -> &&i32 {
             let value = 1;
             &&value
         }
 
         fun literal() -> &i32 { &2 }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -879,7 +866,7 @@ fn c_backend_heap_allocates_escaping_reference_temporaries() {
 #[test]
 fn c_heap_alloc_wraps_main_with_a_gc_stack_boundary() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun escape() -> &Data {
@@ -888,7 +875,7 @@ fn c_heap_alloc_wraps_main_with_a_gc_stack_boundary() {
         }
 
         fun main() { escape(); }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -908,63 +895,59 @@ fn c_heap_alloc_wraps_main_with_a_gc_stack_boundary() {
 #[test]
 fn c_multiple_functions() {
     let module = lower(
-        r#"
+        r"
         fun a() {}
         fun b() {}
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains(&format!(" {} (void)", c_function("a"))),
-        "missing a: {}",
-        result
+        "missing a: {result}"
     );
     assert!(
         result.contains(&format!(" {} (void)", c_function("b"))),
-        "missing b: {}",
-        result
+        "missing b: {result}"
     );
 }
 
 #[test]
 fn c_backend_local_var_has_init_value() {
     let module = lower(
-        r#"
+        r"
         fun main() -> i32 {
             let x = 42;
             return x;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains("42"),
-        "local should be initialized with 42, got:\n{}",
-        result
+        "local should be initialized with 42, got:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_alloca_for_non_escaping_struct() {
     let module = lower(
-        r#"
+        r"
         struct Point { x: i32, y: i32 }
 
         fun use_point() -> i32 {
             let p = Point { x: 1, y: 2 };
             return p.x;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     // Non-escaping struct should stay on the stack and not pull in the GC runtime.
     assert!(
         !result.contains("rgc_alloc"),
-        "non-escaping struct should not use rgc_alloc, got:\n{}",
-        result
+        "non-escaping struct should not use rgc_alloc, got:\n{result}"
     );
     assert!(result.contains("return"), "missing return");
 }
@@ -982,10 +965,9 @@ fn c_str_slice_return() {
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains("struct { const char* ptr; size_t len; }"),
-        "fat pointer struct not found:\n{}",
-        result
+        "fat pointer struct not found:\n{result}"
     );
-    assert!(result.contains("world"), "missing string:\n{}", result);
+    assert!(result.contains("world"), "missing string:\n{result}");
 }
 
 #[test]
@@ -1003,8 +985,7 @@ fn c_raw_string_return_escapes_content() {
 
     assert!(
         result.contains("(riddle_str){ \"say \\\"hi\\\"\\n\", 9 }"),
-        "raw string not escaped as C string:\n{}",
-        result
+        "raw string not escaped as C string:\n{result}"
     );
 }
 
@@ -1077,16 +1058,15 @@ fn c_str_slice_let() {
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains("struct { const char* ptr; size_t len; }"),
-        "fat pointer struct not found for &str local:\n{}",
-        result
+        "fat pointer struct not found for &str local:\n{result}"
     );
-    assert!(result.contains("hello"), "missing string:\n{}", result);
+    assert!(result.contains("hello"), "missing string:\n{result}");
 }
 
 #[test]
 fn c_backend_preserves_returning_branches_and_mut_locals() {
     let module = lower(
-        r#"
+        r"
         fun starts_a(ch: char) -> bool {
             if ch == 'a' { return true; }
             false
@@ -1098,52 +1078,47 @@ fn c_backend_preserves_returning_branches_and_mut_locals() {
                 go = false;
             }
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains("UINT32_C(97)"),
-        "char literal lowered wrong:\n{}",
-        result
+        "char literal lowered wrong:\n{result}"
     );
-    assert!(!result.contains("if ()"), "empty condition:\n{}", result);
+    assert!(!result.contains("if ()"), "empty condition:\n{result}");
     assert!(
         !result.contains("if (("),
-        "condition has redundant parentheses:\n{}",
-        result
+        "condition has redundant parentheses:\n{result}"
     );
     assert!(
         !result
             .lines()
             .any(|line| line.starts_with("block_") && line.ends_with(':')),
-        "block label is not followed by a C11 statement:\n{}",
-        result
+        "block label is not followed by a C11 statement:\n{result}"
     );
-    assert!(!result.contains("= ;"), "empty assignment rhs:\n{}", result);
+    assert!(!result.contains("= ;"), "empty assignment rhs:\n{result}");
     assert!(
         !result.contains("0 = false"),
-        "unit fallback used as lvalue:\n{}",
-        result
+        "unit fallback used as lvalue:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_assigns_if_phi_inputs_before_branching() {
     let module = lower(
-        r#"
+        r"
         fun choose(flag: bool) -> bool {
             if flag { true } else { false }
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
-    assert!(result.contains("phi"), "missing phi variable:\n{}", result);
+    assert!(result.contains("phi"), "missing phi variable:\n{result}");
     assert!(
         result.contains(" = true;") && result.contains(" = false;"),
-        "phi inputs should be assigned on predecessor edges:\n{}",
-        result
+        "phi inputs should be assigned on predecessor edges:\n{result}"
     );
 }
 
@@ -1248,7 +1223,7 @@ fn c_backend_compares_string_pattern_by_contents() {
 #[test]
 fn c_backend_assigns_struct_field_with_associated_type_cast() {
     let module = lower(
-        r#"
+        r"
         struct Foo {
             x: i32,
             y: i64,
@@ -1267,31 +1242,28 @@ fn c_backend_assigns_struct_field_with_associated_type_cast() {
             let r = 10 as Foo::X;
             q.x = r;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains(&format!(".{} =", c_member("x"))),
-        "field store should use .x:\n{}",
-        result
+        "field store should use .x:\n{result}"
     );
     assert!(
         !result.contains(&format!(".{}", c_member("f0"))),
-        "field name fallback leaked:\n{}",
-        result
+        "field name fallback leaked:\n{result}"
     );
     assert!(
         !result.contains("((void)"),
-        "associated type cast lowered to void:\n{}",
-        result
+        "associated type cast lowered to void:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_monomorphizes_generic_structs() {
     let module = lower(
-        r#"
+        r"
         struct Box<T> {
             value: T,
         }
@@ -1300,32 +1272,29 @@ fn c_backend_monomorphizes_generic_structs() {
             let a: Box<i32> = Box { value: 1 };
             let b: Box<bool> = Box { value: true };
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains(&format!("struct {} {{", c_type("Box_i32"))),
-        "missing i32 monomorph:\n{}",
-        result
+        "missing i32 monomorph:\n{result}"
     );
     assert!(
         result.contains(&format!("struct {} {{", c_type("Box_bool"))),
-        "missing bool monomorph:\n{}",
-        result
+        "missing bool monomorph:\n{result}"
     );
     assert!(
         result.contains(&format!("int32_t {};", c_member("value")))
             && result.contains(&format!("bool {};", c_member("value"))),
-        "field types were not substituted:\n{}",
-        result
+        "field types were not substituted:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_accepts_nested_generic_type_args_without_spaces() {
     let module = lower(
-        r#"
+        r"
         struct Box<T> {
             value: T,
         }
@@ -1340,31 +1309,28 @@ fn c_backend_accepts_nested_generic_type_args_without_spaces() {
             let b: Box<Box<i32>> = Box { value: Box { value: 1 } };
             let n = b.value.get();
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains(&c_type("Box_Box_i32")),
-        "missing nested monomorph:\n{}",
-        result
+        "missing nested monomorph:\n{result}"
     );
     assert!(
         result.contains(&c_function("get__Box_i32")),
-        "missing monomorphized generic method:\n{}",
-        result
+        "missing monomorphized generic method:\n{result}"
     );
     assert!(
         !result.contains("0.f0"),
-        "method receiver lowering lost outer function state:\n{}",
-        result
+        "method receiver lowering lost outer function state:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_monomorphizes_generic_functions() {
     let module = lower(
-        r#"
+        r"
         fun id<T>(value: T) -> T {
             value
         }
@@ -1374,31 +1340,28 @@ fn c_backend_monomorphizes_generic_functions() {
             let b = id(true);
             return a;
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains(&c_function("id__i32")),
-        "missing i32 instance:\n{}",
-        result
+        "missing i32 instance:\n{result}"
     );
     assert!(
         result.contains(&c_function("id__bool")),
-        "missing bool instance:\n{}",
-        result
+        "missing bool instance:\n{result}"
     );
     assert!(
         !result.contains(" id ("),
-        "generic template should not be emitted directly:\n{}",
-        result
+        "generic template should not be emitted directly:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_monomorphizes_explicit_generic_method_arguments() {
     let module = lower(
-        r#"
+        r"
         struct Helper {}
 
         impl Helper {
@@ -1411,22 +1374,21 @@ fn c_backend_monomorphizes_explicit_generic_method_arguments() {
             let helper = Helper {};
             helper.id::<i32>(1)
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
 
     assert!(
         result.contains(&c_function("id__Helper_i32")),
-        "missing explicit generic method instance:\n{}",
-        result
+        "missing explicit generic method instance:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_separates_shadowed_impl_and_method_generics() {
     let module = lower(
-        r#"
+        r"
         struct C<T> {
             value: T,
         }
@@ -1441,22 +1403,21 @@ fn c_backend_separates_shadowed_impl_and_method_generics() {
             let c = C { value: true };
             c.test(1)
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
 
     assert!(
         result.contains(&c_function("test__C_bool_i32")),
-        "impl and method generic arguments were conflated:\n{}",
-        result
+        "impl and method generic arguments were conflated:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_dispatches_trait_bound_method_in_generic_function() {
     let module = lower(
-        r#"
+        r"
         trait Named {
             fun name(&self) -> i32;
         }
@@ -1490,31 +1451,28 @@ fn c_backend_dispatches_trait_bound_method_in_generic_function() {
             let user = User { id: 7, tag_value: 2 };
             return read(user);
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains(&c_function("read__User")),
-        "missing generic function monomorph:\n{}",
-        result
+        "missing generic function monomorph:\n{result}"
     );
     assert!(
         result.contains(&format!("{}(", c_function("name__User"))),
-        "generic body should call concrete Named impl method:\n{}",
-        result
+        "generic body should call concrete Named impl method:\n{result}"
     );
     assert!(
         result.contains(&format!("{}(", c_function("tag__User"))),
-        "generic body should call concrete Tagged impl method:\n{}",
-        result
+        "generic body should call concrete Tagged impl method:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_dispatches_generic_raw_pointer_trait_impl() {
     let module = lower(
-        r#"
+        r"
         trait Value {
             fun value(&self) -> i32;
         }
@@ -1531,27 +1489,25 @@ fn c_backend_dispatches_generic_raw_pointer_trait_impl() {
             let pointer = 0usize as *mut i32;
             read(pointer)
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
 
     assert!(
         result.contains(&c_function("value__ptr_i32")),
-        "missing raw pointer impl monomorph:\n{}",
-        result
+        "missing raw pointer impl monomorph:\n{result}"
     );
     assert!(
         result.contains(&format!("{}(", c_function("value__ptr_i32"))),
-        "generic body should call the concrete raw pointer impl:\n{}",
-        result
+        "generic body should call the concrete raw pointer impl:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_uses_trait_default_method_unless_overridden() {
     let module = lower(
-        r#"
+        r"
         trait Value {
             fun base(&self) -> i32;
 
@@ -1583,7 +1539,7 @@ fn c_backend_uses_trait_default_method_unless_overridden() {
             let overridden = Overridden {};
             defaulted.value() + overridden.value()
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -1600,7 +1556,7 @@ fn c_backend_uses_trait_default_method_unless_overridden() {
 #[test]
 fn c_backend_lowers_non_copy_array_into_iterator() {
     let module = lower(
-        r#"
+        r"
         enum Option<T> {
             Some(T),
             None,
@@ -1657,46 +1613,40 @@ fn c_backend_lowers_non_copy_array_into_iterator() {
                 let next = item.value + 1;
             }
         }
-        "#,
+        ",
     );
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
         result.contains(&c_function("into_iter__arr2_Token")),
-        "missing array IntoIterator monomorph:\n{}",
-        result
+        "missing array IntoIterator monomorph:\n{result}"
     );
     assert!(
         result.contains(&c_function("next__ArrayIter_Token_2")),
-        "missing ArrayIter::next monomorph:\n{}",
-        result
+        "missing ArrayIter::next monomorph:\n{result}"
     );
     assert!(
         result.contains(&format!("  {} s", c_type("ArrayIter_Token_2"))),
-        "array iterator construction lost its const argument:\n{}",
-        result
+        "array iterator construction lost its const argument:\n{result}"
     );
     assert!(
         result.contains(&format!("{}((&", c_function("next__ArrayIter_Token_2"))),
-        "Iterator::next should receive the iterator slot by reference:\n{}",
-        result
+        "Iterator::next should receive the iterator slot by reference:\n{result}"
     );
     assert!(
         result.contains(&format!("{} {}[2];", c_type("Token"), c_member("values"))),
-        "array field should use C array declarator:\n{}",
-        result
+        "array field should use C array declarator:\n{result}"
     );
     assert!(
         result.contains("memcpy("),
-        "array field initialization should copy array storage:\n{}",
-        result
+        "array field initialization should copy array storage:\n{result}"
     );
 }
 
 #[test]
 fn c_backend_heap_allocates_an_escaping_array() {
     let module = lower(
-        r#"
+        r"
         struct Data { value: i32 }
 
         fun index_ref() -> &Data {
@@ -1741,7 +1691,7 @@ fn c_backend_heap_allocates_an_escaping_array() {
             };
             &grid.items[1][2]
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -1786,20 +1736,20 @@ fn c_backend_heap_allocates_an_escaping_array() {
 #[test]
 fn c_backend_inlines_checked_const_values() {
     let (_, type_result, analysis, module) = compile(
-        r#"
+        r"
         const ANSWER: i32 = 40 + 2;
 
         fun answer() -> i32 {
             ANSWER
         }
-        "#,
+        ",
     );
     assert_eq!(type_result.diagnostics, vec![]);
     assert_eq!(analysis.diagnostics, vec![]);
 
     let generated = CBackend::new().compile(&module).unwrap();
     assert!(
-        generated.contains("40") && generated.contains("2"),
+        generated.contains("40") && generated.contains('2'),
         "{generated}"
     );
     assert!(!generated.contains("return 0;"), "{generated}");
@@ -1808,7 +1758,7 @@ fn c_backend_inlines_checked_const_values() {
 #[test]
 fn c_backend_checks_safe_array_and_slice_indexes() {
     let (_, type_result, analysis, module) = compile(
-        r#"
+        r"
         fun array_get(values: [i32; 2], index: usize) -> i32 {
             values[index]
         }
@@ -1828,7 +1778,7 @@ fn c_backend_checks_safe_array_and_slice_indexes() {
         fun raw_get(values: *const i32, index: usize) -> i32 {
             unsafe { values[index] }
         }
-        "#,
+        ",
     );
     assert_eq!(type_result.diagnostics, vec![]);
     assert_eq!(analysis.diagnostics, vec![]);
@@ -1844,7 +1794,7 @@ fn c_backend_checks_safe_array_and_slice_indexes() {
 #[test]
 fn c_backend_uses_strict_c11_representations_for_zero_sized_values() {
     let (_, type_result, analysis, module) = compile(
-        r#"
+        r"
         struct Empty {}
 
         fun take_unit(value: ()) {}
@@ -1856,7 +1806,7 @@ fn c_backend_uses_strict_c11_representations_for_zero_sized_values() {
             let units = [(), ()];
             take_unit(unit);
         }
-        "#,
+        ",
     );
     assert_eq!(type_result.diagnostics, vec![]);
     assert_eq!(analysis.diagnostics, vec![]);
@@ -1884,12 +1834,12 @@ fn c_backend_uses_strict_c11_representations_for_zero_sized_values() {
 #[test]
 fn c_backend_defines_integer_and_float_cast_edge_semantics() {
     let (_, type_result, analysis, module) = compile(
-        r#"
+        r"
         fun add(left: i32, right: i32) -> i32 { left + right }
         fun divide(left: i32, right: i32) -> i32 { left / right }
         fun shift(left: i32, right: i32) -> i32 { left << right }
         fun convert(value: f64) -> i32 { value as i32 }
-        "#,
+        ",
     );
     assert_eq!(type_result.diagnostics, vec![]);
     assert_eq!(analysis.diagnostics, vec![]);
@@ -1914,7 +1864,7 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
     }
 
     let (_, type_result, analysis, module) = compile(
-        r#"
+        r"
         fun wrap(left: i32, right: i32) -> i32 { left + right }
 
         fun wrap8(left: u8, right: u8) -> u8 { left + right }
@@ -1935,7 +1885,7 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
                 1
             }
         }
-        "#,
+        ",
     );
     assert_eq!(type_result.diagnostics, vec![]);
     assert_eq!(analysis.diagnostics, vec![]);
@@ -1978,7 +1928,7 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
 #[test]
 fn c_closure_environment_stores_only_the_captured_field() {
     let module = lower(
-        r#"
+        r"
         struct First { value: i32 }
         struct Second { value: i32 }
         struct Pair { first: First, second: Second }
@@ -1991,7 +1941,7 @@ fn c_closure_environment_stores_only_the_captured_field() {
             let take_first = fun() { read(pair.first) };
             pair.second.value
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
     let member = c_member("capture_0_pair_first");
@@ -2007,7 +1957,7 @@ fn c_closure_environment_stores_only_the_captured_field() {
 #[test]
 fn c_impl_fn_supports_closures_named_functions_and_opaque_returns() {
     let module = lower(
-        r#"
+        r"
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun increment(value: i32) -> i32 { value + 1 }
         fun make(base: i32) -> impl Fn(i32) -> i32 {
@@ -2016,7 +1966,7 @@ fn c_impl_fn_supports_closures_named_functions_and_opaque_returns() {
         fun main() -> i32 {
             apply(increment, 1) + apply(make(38), 2)
         }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 
@@ -2035,11 +1985,11 @@ fn c_impl_fn_supports_closures_named_functions_and_opaque_returns() {
 #[test]
 fn c_generic_function_item_adapter_targets_one_instantiation() {
     let module = lower(
-        r#"
+        r"
         fun identity<T>(value: T) -> T { value }
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun main() -> i32 { apply(identity, 42) }
-        "#,
+        ",
     );
     let generated = CBackend::new().compile(&module).unwrap();
 

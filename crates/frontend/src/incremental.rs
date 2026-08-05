@@ -29,7 +29,7 @@ pub enum EditError {
 impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EditError::OutOfBounds {
+            Self::OutOfBounds {
                 offset,
                 delete_len,
                 source_len,
@@ -38,10 +38,10 @@ impl std::fmt::Display for EditError {
                 "edit [{offset}..{}) is outside source of length {source_len}",
                 offset.saturating_add(*delete_len)
             ),
-            EditError::NotCharBoundary { offset } => {
+            Self::NotCharBoundary { offset } => {
                 write!(f, "edit offset {offset} is not a UTF-8 character boundary")
             }
-            EditError::SourceTooLarge => write!(
+            Self::SourceTooLarge => write!(
                 f,
                 "source is too large for rowan TextSize (maximum is u32::MAX bytes)"
             ),
@@ -58,7 +58,8 @@ pub struct IncrementalParser {
 }
 
 impl IncrementalParser {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             current: None,
             source: String::new(),
@@ -69,17 +70,27 @@ impl IncrementalParser {
     /// Full Parsing (First or Backward)
     pub fn set_source(&mut self, source: &str) -> &Parse {
         self.source = source.to_string();
-        self.current = Some(parse_full(&self.source));
         self.last_reparse = ReparseMode::Full;
-        self.current.as_ref().expect("parse was just initialized")
+        self.current.insert(parse_full(&self.source))
     }
 
     /// Apply editing and redirection
+    ///
+    /// # Panics
+    ///
+    /// Panics when the edit is out of bounds, splits a UTF-8 code point, or
+    /// makes the source too large for Rowan's 32-bit text offsets.
     pub fn apply_edit(&mut self, offset: usize, delete_len: usize, insert: &str) -> &Parse {
         self.try_apply_edit(offset, delete_len, insert)
             .unwrap_or_else(|err| panic!("invalid source edit: {err}"))
     }
 
+    /// Applies an edit after validating its byte range and resulting size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditError`] when the edit is out of bounds, splits a UTF-8
+    /// code point, overflows a length calculation, or exceeds 32-bit offsets.
     pub fn try_apply_edit(
         &mut self,
         offset: usize,
@@ -122,30 +133,29 @@ impl IncrementalParser {
             )
         });
 
-        match incremental {
-            Some((parse, kind)) => {
-                self.current = Some(parse);
-                self.last_reparse = ReparseMode::Incremental(kind);
-            }
-            None => {
-                self.current = Some(parse_full(&new_source));
-                self.last_reparse = ReparseMode::Full;
-            }
-        }
+        let (parse, mode) = if let Some((parse, kind)) = incremental {
+            (parse, ReparseMode::Incremental(kind))
+        } else {
+            (parse_full(&new_source), ReparseMode::Full)
+        };
 
         self.source = new_source;
-        Ok(self.current.as_ref().expect("parse was just updated"))
+        self.last_reparse = mode;
+        Ok(self.current.insert(parse))
     }
 
-    pub fn current_parse(&self) -> Option<&Parse> {
+    #[must_use]
+    pub const fn current_parse(&self) -> Option<&Parse> {
         self.current.as_ref()
     }
 
+    #[must_use]
     pub fn source(&self) -> &str {
         &self.source
     }
 
-    pub fn last_reparse_mode(&self) -> ReparseMode {
+    #[must_use]
+    pub const fn last_reparse_mode(&self) -> ReparseMode {
         self.last_reparse
     }
 
@@ -189,9 +199,10 @@ fn parse_full(source: &str) -> Parse {
     let parser = Parser::new(source, tokens);
     let (events, tokens, mut errors, source) = parser.parse();
     lex_errors.append(&mut errors);
-    tree_builder::build_tree(events, tokens, source, lex_errors)
+    tree_builder::build_tree(&events, &tokens, source, lex_errors)
 }
 
+#[must_use]
 pub fn parse_fragment(source: &str, entry: ReparseEntry) -> Option<Parse> {
     let tokens = lexer::lex(source);
     let mut lex_errors = lexer_error_diagnostics(source, &tokens);
@@ -201,15 +212,19 @@ pub fn parse_fragment(source: &str, entry: ReparseEntry) -> Option<Parse> {
     if !lex_errors.is_empty() {
         return None;
     }
-    Some(tree_builder::build_tree(event, tokens, source, lex_errors))
+    Some(tree_builder::build_tree(
+        &event, &tokens, source, lex_errors,
+    ))
 }
 
+#[must_use]
 pub fn parse_tokens(source: &str, tokens: Vec<lexer::Token>) -> Parse {
     let parser = Parser::new(source, tokens);
     let (events, tokens, errors, source) = parser.parse();
-    tree_builder::build_tree(events, tokens, source, errors)
+    tree_builder::build_tree(&events, &tokens, source, errors)
 }
 
+#[must_use]
 pub fn parse_token_fragment(
     source: &str,
     tokens: Vec<lexer::Token>,
@@ -219,7 +234,7 @@ pub fn parse_token_fragment(
     let (events, tokens, errors, source) = parser.reparse(entry)?;
     errors
         .is_empty()
-        .then(|| tree_builder::build_tree(events, tokens, source, errors))
+        .then(|| tree_builder::build_tree(&events, &tokens, source, errors))
 }
 
 /// Emit diagnostics for tokens the lexer couldn't recognise.
@@ -233,13 +248,17 @@ fn lexer_error_diagnostics(source: &str, tokens: &[lexer::Token]) -> Vec<ParseEr
             let msg = if text.is_empty() {
                 "unrecognized token".into()
             } else {
-                format!("unrecognized character: `{}`", text)
+                format!("unrecognized character: `{text}`")
             };
             ParseError {
                 message: msg,
                 span: TextRange::new(
-                    TextSize::from(t.span.start as u32),
-                    TextSize::from(t.span.end as u32),
+                    TextSize::from(
+                        u32::try_from(t.span.start).expect("token offset should fit in u32"),
+                    ),
+                    TextSize::from(
+                        u32::try_from(t.span.end).expect("token offset should fit in u32"),
+                    ),
                 ),
             }
         })
@@ -352,7 +371,7 @@ fn reparse_candidate(
     ))
 }
 
-fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
+const fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
     match kind {
         SyntaxKind::VarDecl
         | SyntaxKind::FuncDecl
@@ -365,7 +384,9 @@ fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         | SyntaxKind::TraitDecl
         | SyntaxKind::ImplDecl
         | SyntaxKind::ConstDecl
-        | SyntaxKind::TypeAliasDecl => Some(ReparseEntry::Statement),
+        | SyntaxKind::TypeAliasDecl
+        | SyntaxKind::UseDecl
+        | SyntaxKind::ModDecl => Some(ReparseEntry::Statement),
 
         SyntaxKind::Block => Some(ReparseEntry::Block),
         SyntaxKind::ParamList => Some(ReparseEntry::ParamList),
@@ -397,8 +418,6 @@ fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         | SyntaxKind::TupleType
         | SyntaxKind::ArrayType
         | SyntaxKind::ImplTraitType => Some(ReparseEntry::Type),
-
-        SyntaxKind::UseDecl | SyntaxKind::ModDecl => Some(ReparseEntry::Statement),
 
         SyntaxKind::UseTree => Some(ReparseEntry::UseTree),
         SyntaxKind::UseTreeList => Some(ReparseEntry::UseTreeList),
@@ -481,7 +500,7 @@ fn lexical_state_may_escape(
     delete_len: usize,
     insert_len: usize,
 ) -> bool {
-    fn sensitive_byte(byte: u8) -> bool {
+    const fn sensitive_byte(byte: u8) -> bool {
         matches!(
             byte,
             b'/' | b'\n'

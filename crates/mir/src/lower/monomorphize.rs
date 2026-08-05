@@ -1,6 +1,11 @@
-use super::*;
+use super::{
+    BuiltinOperator, ExprId, HashMap, HashSet, LowerCtx, MirSubst, ResolvedName, Type,
+    builtin_operator, builtin_operator_supports, is_self_output, mono_type_name,
+    operator_params_match, primitive_scalar_name, returns_unit, tc_const_arg_to_usize,
+    trait_operator_contract, type_matches_self,
+};
 
-impl<'a> LowerCtx<'a> {
+impl LowerCtx<'_> {
     pub(super) fn mono_method_name(
         &mut self,
         fid: hir::item_tree::FunctionId,
@@ -21,79 +26,7 @@ impl<'a> LowerCtx<'a> {
     ) -> Option<String> {
         let receiver_ty = self.substitute_tc_type(receiver_ty);
         if self.default_methods.contains_key(&fid) {
-            let receiver_mir_ty = self.convert_type(&receiver_ty);
-            let trait_id = self.default_methods[&fid];
-            let trait_generics = self.hir.item_tree.traits[trait_id].generics.clone();
-            let rhs_ty = rhs_ty.map(|ty| self.substitute_tc_type(ty));
-            let trait_args = trait_generics
-                .iter()
-                .enumerate()
-                .map(|(index, _)| {
-                    if index == 0 {
-                        rhs_ty.clone().unwrap_or_else(|| receiver_ty.clone())
-                    } else {
-                        receiver_ty.clone()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let suffix = std::iter::once(mono_type_name(&receiver_mir_ty))
-                .chain(
-                    trait_args
-                        .iter()
-                        .map(|arg| mono_type_name(&self.convert_type(arg))),
-                )
-                .collect::<Vec<_>>()
-                .join("_");
-            let key = (fid, suffix.clone());
-            if let Some(name) = self.mono_methods.get(&key) {
-                return Some(name.clone());
-            }
-
-            let mono_name = format!("{}__{}", self.method_symbol_base(fid), suffix);
-            self.mono_methods.insert(key, mono_name.clone());
-            let mut tc_subst = HashMap::from([("Self".into(), receiver_ty)]);
-            tc_subst.extend(
-                trait_generics
-                    .iter()
-                    .zip(trait_args)
-                    .map(|(name, ty)| (name.0.clone(), ty)),
-            );
-            let mir_subst = tc_subst
-                .iter()
-                .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
-                .collect();
-            let old_subst = std::mem::replace(&mut self.generic_subst, mir_subst);
-            let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
-            let old_expr_cache = std::mem::take(&mut self.expr_cache);
-            let old_scope_map = std::mem::take(&mut self.scope_map);
-            let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
-            let old_drop_slots = std::mem::take(&mut self.drop_slots);
-            let old_temporary_drop_scopes = std::mem::take(&mut self.temporary_drop_scopes);
-            let old_temporary_drop_slots = std::mem::take(&mut self.temporary_drop_slots);
-            let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
-            let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
-            let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
-            let old_capture_access = std::mem::take(&mut self.capture_access);
-            let old_current_lambda = self.current_lambda;
-            let old_current_body = self.current_body;
-            let body_id = *self.hir.function_bodies.get(&fid)?;
-            let func = self.lower_function(fid, mono_name.clone(), body_id);
-            self.expr_cache = old_expr_cache;
-            self.scope_map = old_scope_map;
-            self.drop_scopes = old_drop_scopes;
-            self.drop_slots = old_drop_slots;
-            self.temporary_drop_scopes = old_temporary_drop_scopes;
-            self.temporary_drop_slots = old_temporary_drop_slots;
-            self.storage_bindings = old_storage_bindings;
-            self.parameter_storage = old_parameter_storage;
-            self.pattern_bindings = old_pattern_bindings;
-            self.capture_access = old_capture_access;
-            self.current_lambda = old_current_lambda;
-            self.current_body = old_current_body;
-            self.generic_subst = old_subst;
-            self.generic_tc_subst = old_tc_subst;
-            self.module.add_function(func);
-            return Some(mono_name);
+            return self.mono_default_method_name(fid, &receiver_ty, rhs_ty);
         }
         let imp = self.impl_for_method(fid)?.clone();
         if imp.generics.is_empty() && imp.const_generics.is_empty() {
@@ -139,40 +72,77 @@ impl<'a> LowerCtx<'a> {
             return Some(name.clone());
         }
         let original_name = self.method_symbol_base(fid);
-        let mono_name = format!("{}__{}", original_name, suffix);
+        let mono_name = format!("{original_name}__{suffix}");
         self.mono_methods.insert(key, mono_name.clone());
         let old_subst = std::mem::replace(&mut self.generic_subst, subst.types);
         let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, subst.tc_types);
         let old_const_subst = std::mem::replace(&mut self.generic_const_subst, subst.consts);
-        let old_expr_cache = std::mem::take(&mut self.expr_cache);
-        let old_scope_map = std::mem::take(&mut self.scope_map);
-        let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
-        let old_drop_slots = std::mem::take(&mut self.drop_slots);
-        let old_temporary_drop_scopes = std::mem::take(&mut self.temporary_drop_scopes);
-        let old_temporary_drop_slots = std::mem::take(&mut self.temporary_drop_slots);
-        let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
-        let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
-        let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
-        let old_capture_access = std::mem::take(&mut self.capture_access);
-        let old_current_lambda = self.current_lambda;
-        let old_current_body = self.current_body;
+        let old_state = self.take_lowering_state();
         let body_id = *self.hir.function_bodies.get(&fid)?;
         let func = self.lower_function(fid, mono_name.clone(), body_id);
-        self.expr_cache = old_expr_cache;
-        self.scope_map = old_scope_map;
-        self.drop_scopes = old_drop_scopes;
-        self.drop_slots = old_drop_slots;
-        self.temporary_drop_scopes = old_temporary_drop_scopes;
-        self.temporary_drop_slots = old_temporary_drop_slots;
-        self.storage_bindings = old_storage_bindings;
-        self.parameter_storage = old_parameter_storage;
-        self.pattern_bindings = old_pattern_bindings;
-        self.capture_access = old_capture_access;
-        self.current_lambda = old_current_lambda;
-        self.current_body = old_current_body;
+        self.restore_lowering_state(old_state);
         self.generic_subst = old_subst;
         self.generic_tc_subst = old_tc_subst;
         self.generic_const_subst = old_const_subst;
+        self.module.add_function(func);
+        Some(mono_name)
+    }
+
+    fn mono_default_method_name(
+        &mut self,
+        fid: hir::item_tree::FunctionId,
+        receiver_ty: &type_checker::Type,
+        rhs_ty: Option<&type_checker::Type>,
+    ) -> Option<String> {
+        let receiver_mir_ty = self.convert_type(receiver_ty);
+        let trait_id = self.default_methods[&fid];
+        let trait_generics = self.hir.item_tree.traits[trait_id].generics.clone();
+        let rhs_ty = rhs_ty.map(|ty| self.substitute_tc_type(ty));
+        let trait_args = trait_generics
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index == 0 {
+                    rhs_ty.clone().unwrap_or_else(|| receiver_ty.clone())
+                } else {
+                    receiver_ty.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let suffix = std::iter::once(mono_type_name(&receiver_mir_ty))
+            .chain(
+                trait_args
+                    .iter()
+                    .map(|arg| mono_type_name(&self.convert_type(arg))),
+            )
+            .collect::<Vec<_>>()
+            .join("_");
+        let key = (fid, suffix.clone());
+        if let Some(name) = self.mono_methods.get(&key) {
+            return Some(name.clone());
+        }
+
+        let mono_name = format!("{}__{}", self.method_symbol_base(fid), suffix);
+        self.mono_methods.insert(key, mono_name.clone());
+        let mut tc_subst = HashMap::from([("Self".into(), receiver_ty.clone())]);
+        tc_subst.extend(
+            trait_generics
+                .iter()
+                .zip(trait_args)
+                .map(|(name, ty)| (name.0.clone(), ty)),
+        );
+        let mir_subst = tc_subst
+            .iter()
+            .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
+            .collect();
+        let old_subst = std::mem::replace(&mut self.generic_subst, mir_subst);
+        let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
+        let old_state = self.take_lowering_state();
+        let body_id = *self.hir.function_bodies.get(&fid)?;
+        let func = self.lower_function(fid, mono_name.clone(), body_id);
+        self.restore_lowering_state(old_state);
+        self.generic_subst = old_subst;
+        self.generic_tc_subst = old_tc_subst;
         self.module.add_function(func);
         Some(mono_name)
     }
@@ -267,26 +237,14 @@ impl<'a> LowerCtx<'a> {
         if let Some(self_ty) = &self_mir_ty {
             subst.insert("Self".into(), self_ty.clone());
         }
-        let mut suffix_args = self_mir_ty
-            .as_ref()
-            .map(|ty| vec![mono_type_name(ty)])
-            .unwrap_or_default();
         let outer_const_start = type_names.len();
         let outer_const_end = outer_const_start + outer_const_generics.len();
-        for (index, arg) in tc_args.iter().enumerate() {
-            if self_mir_ty.is_some()
-                && (index < outer_generics.len()
-                    || (outer_const_start..outer_const_end).contains(&index))
-            {
-                continue;
-            }
-            suffix_args.push(
-                tc_const_arg_to_usize(arg)
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| mono_type_name(&self.convert_type(arg))),
-            );
-        }
-        let suffix = suffix_args.join("_");
+        let suffix = self.mono_function_suffix(
+            &tc_args,
+            self_mir_ty.as_ref(),
+            outer_generics.len(),
+            outer_const_start..outer_const_end,
+        );
         let key = (fid, suffix.clone());
         if let Some(name) = self.mono_functions.get(&key) {
             return Some(name.clone());
@@ -302,37 +260,38 @@ impl<'a> LowerCtx<'a> {
         let old_subst = std::mem::replace(&mut self.generic_subst, subst);
         let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
         let old_const_subst = std::mem::replace(&mut self.generic_const_subst, const_subst);
-        let old_expr_cache = std::mem::take(&mut self.expr_cache);
-        let old_scope_map = std::mem::take(&mut self.scope_map);
-        let old_drop_scopes = std::mem::take(&mut self.drop_scopes);
-        let old_drop_slots = std::mem::take(&mut self.drop_slots);
-        let old_temporary_drop_scopes = std::mem::take(&mut self.temporary_drop_scopes);
-        let old_temporary_drop_slots = std::mem::take(&mut self.temporary_drop_slots);
-        let old_storage_bindings = std::mem::take(&mut self.storage_bindings);
-        let old_parameter_storage = std::mem::take(&mut self.parameter_storage);
-        let old_pattern_bindings = std::mem::take(&mut self.pattern_bindings);
-        let old_capture_access = std::mem::take(&mut self.capture_access);
-        let old_current_lambda = self.current_lambda;
-        let old_current_body = self.current_body;
+        let old_state = self.take_lowering_state();
         let body_id = *self.hir.function_bodies.get(&fid)?;
         let func = self.lower_function(fid, mono_name.clone(), body_id);
-        self.expr_cache = old_expr_cache;
-        self.scope_map = old_scope_map;
-        self.drop_scopes = old_drop_scopes;
-        self.drop_slots = old_drop_slots;
-        self.temporary_drop_scopes = old_temporary_drop_scopes;
-        self.temporary_drop_slots = old_temporary_drop_slots;
-        self.storage_bindings = old_storage_bindings;
-        self.parameter_storage = old_parameter_storage;
-        self.pattern_bindings = old_pattern_bindings;
-        self.capture_access = old_capture_access;
-        self.current_lambda = old_current_lambda;
-        self.current_body = old_current_body;
+        self.restore_lowering_state(old_state);
         self.generic_subst = old_subst;
         self.generic_tc_subst = old_tc_subst;
         self.generic_const_subst = old_const_subst;
         self.module.add_function(func);
         Some(mono_name)
+    }
+
+    fn mono_function_suffix(
+        &self,
+        args: &[type_checker::Type],
+        self_ty: Option<&Type>,
+        outer_type_count: usize,
+        outer_const_range: std::ops::Range<usize>,
+    ) -> String {
+        let mut suffix = self_ty
+            .map(|ty| vec![mono_type_name(ty)])
+            .unwrap_or_default();
+        for (index, arg) in args.iter().enumerate() {
+            if self_ty.is_some() && (index < outer_type_count || outer_const_range.contains(&index))
+            {
+                continue;
+            }
+            suffix.push(tc_const_arg_to_usize(arg).map_or_else(
+                || mono_type_name(&self.convert_type(arg)),
+                |value| value.to_string(),
+            ));
+        }
+        suffix.join("_")
     }
 
     pub(super) fn impl_for_method(
@@ -476,22 +435,20 @@ impl<'a> LowerCtx<'a> {
         if imp.generics.is_empty() && imp.const_generics.is_empty() {
             return self.convert_hir_type(&imp.self_ty) == receiver_mir_ty;
         }
-        self.impl_mir_subst(imp, receiver_ty)
-            .map(|subst| {
-                let type_subst = subst
-                    .types
-                    .iter()
-                    .map(|(name, ty)| (name.as_str(), ty))
-                    .collect::<HashMap<_, _>>();
-                let const_subst = subst
-                    .consts
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), *value))
-                    .collect::<HashMap<_, _>>();
-                self.convert_hir_type_with_substs(&imp.self_ty, &type_subst, &const_subst)
-                    == receiver_mir_ty
-            })
-            .unwrap_or(false)
+        self.impl_mir_subst(imp, receiver_ty).is_some_and(|subst| {
+            let type_subst = subst
+                .types
+                .iter()
+                .map(|(name, ty)| (name.as_str(), ty))
+                .collect::<HashMap<_, _>>();
+            let const_subst = subst
+                .consts
+                .iter()
+                .map(|(name, value)| (name.as_str(), *value))
+                .collect::<HashMap<_, _>>();
+            self.convert_hir_type_with_substs(&imp.self_ty, &type_subst, &const_subst)
+                == receiver_mir_ty
+        })
     }
 
     pub(super) fn impl_trait_args_match(
@@ -555,146 +512,180 @@ impl<'a> LowerCtx<'a> {
         imp: &hir::item_tree::HirImpl,
         receiver_ty: &type_checker::Type,
     ) -> Option<MirSubst> {
-        let mut subst = MirSubst::default();
         match receiver_ty {
             type_checker::Type::Struct(_, args) | type_checker::Type::Enum(_, args) => {
-                for (name, ty) in imp.generics.iter().zip(args.iter()) {
-                    subst.types.insert(name.0.clone(), self.convert_type(ty));
-                    subst.tc_types.insert(name.0.clone(), ty.clone());
-                }
-                for (name, ty) in imp
-                    .const_generics
-                    .iter()
-                    .zip(args.iter().skip(imp.generics.len()))
-                {
-                    if let Some(value) = tc_const_arg_to_usize(ty) {
-                        subst.consts.insert(name.0.clone(), value);
-                        subst.tc_types.insert(name.0.clone(), ty.clone());
-                    }
-                }
-                Some(subst)
+                Some(self.nominal_impl_subst(imp, args))
             }
-            type_checker::Type::Array(inner, len) => {
-                let hir::item_tree::HirTypeRef::Array(pattern_inner, pattern_len) = &imp.self_ty
-                else {
-                    return None;
-                };
-                let generics = imp
-                    .generics
-                    .iter()
-                    .map(|name| name.0.as_str())
-                    .collect::<HashSet<_>>();
-                if !self.collect_hir_type_subst(
-                    pattern_inner,
-                    inner,
-                    &generics,
-                    &mut subst.types,
-                    &mut subst.tc_types,
-                ) {
-                    return None;
-                }
-                if let hir::item_tree::HirConstArg::Param(name) = pattern_len
-                    && let Some(value) = len.as_usize()
-                {
-                    subst.consts.insert(name.0.clone(), value);
-                    subst
-                        .tc_types
-                        .insert(name.0.clone(), type_checker::Type::Const(len.clone()));
-                }
-                Some(subst)
-            }
-            type_checker::Type::Slice(inner) => {
-                let hir::item_tree::HirTypeRef::Slice(pattern_inner) = &imp.self_ty else {
-                    return None;
-                };
-                let generics = imp
-                    .generics
-                    .iter()
-                    .map(|name| name.0.as_str())
-                    .collect::<HashSet<_>>();
-                self.collect_hir_type_subst(
-                    pattern_inner,
-                    inner,
-                    &generics,
-                    &mut subst.types,
-                    &mut subst.tc_types,
-                )
-                .then_some(subst)
-            }
-            type_checker::Type::Ref(inner, mutable) => {
-                let hir::item_tree::HirTypeRef::Ref(pattern_inner, pattern_mut) = &imp.self_ty
-                else {
-                    return None;
-                };
-                if mutable != pattern_mut {
-                    return None;
-                }
-                let generics = imp
-                    .generics
-                    .iter()
-                    .map(|name| name.0.as_str())
-                    .collect::<HashSet<_>>();
-                let (pattern_inner, pattern_len, actual_inner, actual_len) =
-                    match (pattern_inner.as_ref(), inner.as_ref()) {
-                        (
-                            hir::item_tree::HirTypeRef::Array(pattern_inner, pattern_len),
-                            type_checker::Type::Array(actual_inner, actual_len),
-                        ) => (
-                            pattern_inner.as_ref(),
-                            Some(pattern_len),
-                            actual_inner.as_ref(),
-                            Some(actual_len),
-                        ),
-                        (pattern_inner, actual_inner) => (pattern_inner, None, actual_inner, None),
-                    };
-                if !self.collect_hir_type_subst(
-                    pattern_inner,
-                    actual_inner,
-                    &generics,
-                    &mut subst.types,
-                    &mut subst.tc_types,
-                ) {
-                    return None;
-                }
-                if let (Some(pattern_len), Some(actual_len)) = (pattern_len, actual_len)
-                    && let hir::item_tree::HirConstArg::Param(name) = pattern_len
-                    && let Some(value) = actual_len.as_usize()
-                {
-                    subst.consts.insert(name.0.clone(), value);
-                    subst.tc_types.insert(
-                        name.0.clone(),
-                        type_checker::Type::Const(actual_len.clone()),
-                    );
-                }
-                Some(subst)
-            }
-            type_checker::Type::Ptr { inner, mutable } => {
-                let hir::item_tree::HirTypeRef::Ptr {
-                    inner: pattern_inner,
-                    mutable: pattern_mut,
-                } = &imp.self_ty
-                else {
-                    return None;
-                };
-                if mutable != pattern_mut {
-                    return None;
-                }
-                let generics = imp
-                    .generics
-                    .iter()
-                    .map(|name| name.0.as_str())
-                    .collect::<HashSet<_>>();
-                self.collect_hir_type_subst(
-                    pattern_inner,
-                    inner,
-                    &generics,
-                    &mut subst.types,
-                    &mut subst.tc_types,
-                )
-                .then_some(subst)
-            }
+            type_checker::Type::Array(..) => self.array_impl_subst(imp, receiver_ty),
+            type_checker::Type::Slice(..) => self.slice_impl_subst(imp, receiver_ty),
+            type_checker::Type::Ref(..) => self.reference_impl_subst(imp, receiver_ty),
+            type_checker::Type::Ptr { .. } => self.pointer_impl_subst(imp, receiver_ty),
             _ => None,
         }
+    }
+
+    fn nominal_impl_subst(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        args: &[type_checker::Type],
+    ) -> MirSubst {
+        let mut subst = MirSubst::default();
+        for (name, ty) in imp.generics.iter().zip(args) {
+            subst.types.insert(name.0.clone(), self.convert_type(ty));
+            subst.tc_types.insert(name.0.clone(), ty.clone());
+        }
+        for (name, ty) in imp
+            .const_generics
+            .iter()
+            .zip(args.iter().skip(imp.generics.len()))
+        {
+            if let Some(value) = tc_const_arg_to_usize(ty) {
+                subst.consts.insert(name.0.clone(), value);
+                subst.tc_types.insert(name.0.clone(), ty.clone());
+            }
+        }
+        subst
+    }
+
+    fn array_impl_subst(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+    ) -> Option<MirSubst> {
+        let type_checker::Type::Array(inner, len) = receiver_ty else {
+            return None;
+        };
+        let hir::item_tree::HirTypeRef::Array(pattern_inner, pattern_len) = &imp.self_ty else {
+            return None;
+        };
+        let mut subst = MirSubst::default();
+        let generics = Self::impl_generic_names(imp);
+        if !self.collect_hir_type_subst(
+            pattern_inner,
+            inner,
+            &generics,
+            &mut subst.types,
+            &mut subst.tc_types,
+        ) {
+            return None;
+        }
+        if let hir::item_tree::HirConstArg::Param(name) = pattern_len
+            && let Some(value) = len.as_usize()
+        {
+            subst.consts.insert(name.0.clone(), value);
+            subst
+                .tc_types
+                .insert(name.0.clone(), type_checker::Type::Const(len.clone()));
+        }
+        Some(subst)
+    }
+
+    fn slice_impl_subst(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+    ) -> Option<MirSubst> {
+        let type_checker::Type::Slice(inner) = receiver_ty else {
+            return None;
+        };
+        let hir::item_tree::HirTypeRef::Slice(pattern_inner) = &imp.self_ty else {
+            return None;
+        };
+        let mut subst = MirSubst::default();
+        let generics = Self::impl_generic_names(imp);
+        self.collect_hir_type_subst(
+            pattern_inner,
+            inner,
+            &generics,
+            &mut subst.types,
+            &mut subst.tc_types,
+        )
+        .then_some(subst)
+    }
+
+    fn reference_impl_subst(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+    ) -> Option<MirSubst> {
+        let type_checker::Type::Ref(inner, mutable) = receiver_ty else {
+            return None;
+        };
+        let hir::item_tree::HirTypeRef::Ref(pattern_inner, pattern_mut) = &imp.self_ty else {
+            return None;
+        };
+        if mutable != pattern_mut {
+            return None;
+        }
+        let (pattern_inner, pattern_len, actual_inner, actual_len) =
+            match (pattern_inner.as_ref(), inner.as_ref()) {
+                (
+                    hir::item_tree::HirTypeRef::Array(pattern_inner, pattern_len),
+                    type_checker::Type::Array(actual_inner, actual_len),
+                ) => (
+                    pattern_inner.as_ref(),
+                    Some(pattern_len),
+                    actual_inner.as_ref(),
+                    Some(actual_len),
+                ),
+                (pattern_inner, actual_inner) => (pattern_inner, None, actual_inner, None),
+            };
+        let mut subst = MirSubst::default();
+        let generics = Self::impl_generic_names(imp);
+        if !self.collect_hir_type_subst(
+            pattern_inner,
+            actual_inner,
+            &generics,
+            &mut subst.types,
+            &mut subst.tc_types,
+        ) {
+            return None;
+        }
+        if let (Some(pattern_len), Some(actual_len)) = (pattern_len, actual_len)
+            && let hir::item_tree::HirConstArg::Param(name) = pattern_len
+            && let Some(value) = actual_len.as_usize()
+        {
+            subst.consts.insert(name.0.clone(), value);
+            subst.tc_types.insert(
+                name.0.clone(),
+                type_checker::Type::Const(actual_len.clone()),
+            );
+        }
+        Some(subst)
+    }
+
+    fn pointer_impl_subst(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+    ) -> Option<MirSubst> {
+        let type_checker::Type::Ptr { inner, mutable } = receiver_ty else {
+            return None;
+        };
+        let hir::item_tree::HirTypeRef::Ptr {
+            inner: pattern_inner,
+            mutable: pattern_mut,
+        } = &imp.self_ty
+        else {
+            return None;
+        };
+        if mutable != pattern_mut {
+            return None;
+        }
+        let mut subst = MirSubst::default();
+        let generics = Self::impl_generic_names(imp);
+        self.collect_hir_type_subst(
+            pattern_inner,
+            inner,
+            &generics,
+            &mut subst.types,
+            &mut subst.tc_types,
+        )
+        .then_some(subst)
+    }
+
+    fn impl_generic_names(imp: &hir::item_tree::HirImpl) -> HashSet<&str> {
+        imp.generics.iter().map(|name| name.0.as_str()).collect()
     }
 
     pub(super) fn collect_hir_type_subst(
@@ -825,9 +816,10 @@ impl<'a> LowerCtx<'a> {
                 Box::new(self.convert_hir_type_with_substs(inner, subst, const_subst)),
                 self.hir_const_arg_to_usize(len, const_subst),
             ),
-            hir::item_tree::HirTypeRef::Const(_) => Type::Unit,
-            hir::item_tree::HirTypeRef::ImplTrait { .. } => Type::Unit,
-            hir::item_tree::HirTypeRef::Unknown | hir::item_tree::HirTypeRef::Error => Type::Unit,
+            hir::item_tree::HirTypeRef::Const(_)
+            | hir::item_tree::HirTypeRef::ImplTrait { .. }
+            | hir::item_tree::HirTypeRef::Unknown
+            | hir::item_tree::HirTypeRef::Error => Type::Unit,
         }
     }
 

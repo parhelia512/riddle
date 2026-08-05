@@ -9,9 +9,9 @@ use crate::{
     checker::TypeChecker,
     types::{CallableSignature, ClosureKind, ConstArg, FloatTy, IntTy, OpaqueCallableId, Type},
 };
-pub(crate) use ty::{collect_subst, substitute_type};
+pub use ty::{collect_subst, substitute_type};
 
-pub(crate) fn builtin_callable_kind(ty: &HirTypeRef) -> Option<ClosureKind> {
+pub fn builtin_callable_kind(ty: &HirTypeRef) -> Option<ClosureKind> {
     let HirTypeRef::Named(path) = ty else {
         return None;
     };
@@ -37,17 +37,13 @@ impl TypeChecker<'_> {
             );
             return Type::Error;
         }
-        let ty = alias
-            .ty
-            .as_ref()
-            .map(|ty| {
-                self.lower_type_ref_with_params_at(
-                    ty,
-                    &HashMap::new(),
-                    alias.ty_range.or(Some(alias.name_range)),
-                )
-            })
-            .unwrap_or(Type::Unknown);
+        let ty = alias.ty.as_ref().map_or(Type::Unknown, |ty| {
+            self.lower_type_ref_with_params_at(
+                ty,
+                &HashMap::new(),
+                alias.ty_range.or(Some(alias.name_range)),
+            )
+        });
         self.lowering_type_aliases.remove(&type_alias);
         ty
     }
@@ -91,10 +87,10 @@ impl TypeChecker<'_> {
                 }
                 Type::Array(
                     Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
-                    self.lower_const_arg(len, params),
+                    Self::lower_const_arg(len, params),
                 )
             }
-            HirTypeRef::Const(value) => Type::Const(self.lower_const_arg(value, params)),
+            HirTypeRef::Const(value) => Type::Const(Self::lower_const_arg(value, params)),
             HirTypeRef::ImplTrait {
                 trait_ty,
                 trait_range,
@@ -117,21 +113,20 @@ impl TypeChecker<'_> {
                     );
                     return Type::Unknown;
                 };
-                if let Some(hidden) = hidden {
-                    Type::Param(hidden.0.clone())
-                } else {
-                    Type::OpaqueCallable {
+                hidden.as_ref().map_or_else(
+                    || Type::OpaqueCallable {
                         id: OpaqueCallableId(*trait_range),
                         signature: self.lower_hir_callable_signature(callable, kind, params, span),
-                    }
-                }
+                    },
+                    |hidden| Type::Param(hidden.0.clone()),
+                )
             }
             HirTypeRef::Unknown => Type::Unknown,
             HirTypeRef::Error => Type::Error,
         }
     }
 
-    pub(crate) fn display_type_ref(&mut self, ty: &HirTypeRef) -> String {
+    pub(crate) fn display_type_ref(ty: &HirTypeRef) -> String {
         Self::type_text(ty)
     }
 
@@ -155,7 +150,7 @@ impl TypeChecker<'_> {
                     .map(Self::type_text)
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("({})", inner)
+                format!("({inner})")
             }
             HirTypeRef::Slice(elem) => format!("[{}]", Self::type_text(elem)),
             HirTypeRef::Array(elem, len) => {
@@ -214,8 +209,9 @@ impl TypeChecker<'_> {
             let ty = explicit
                 .get(index)
                 .or_else(|| tr.generic_defaults.get(index).and_then(Option::as_ref))
-                .map(|arg| self.lower_type_ref_with_params_at(arg, &subst, span))
-                .unwrap_or(Type::Unknown);
+                .map_or(Type::Unknown, |arg| {
+                    self.lower_type_ref_with_params_at(arg, &subst, span)
+                });
             subst.insert(name.0.clone(), ty);
         }
         subst
@@ -324,7 +320,7 @@ impl TypeChecker<'_> {
             .collect()
     }
 
-    fn lower_const_arg(&self, arg: &HirConstArg, params: &HashMap<String, Type>) -> ConstArg {
+    fn lower_const_arg(arg: &HirConstArg, params: &HashMap<String, Type>) -> ConstArg {
         match arg {
             HirConstArg::Value(value) => ConstArg::Value(*value),
             HirConstArg::Param(name) => match params.get(&name.0) {
@@ -516,25 +512,20 @@ impl TypeChecker<'_> {
                 continue;
             };
             let alias = self.hir.item_tree.type_aliases[*alias_id].clone();
-            return Some(
-                alias
-                    .ty
-                    .map(|ty| {
-                        self.lower_type_ref_with_params_at(
-                            &ty,
-                            &subst,
-                            alias.ty_range.or(Some(alias.name_range)),
-                        )
-                    })
-                    .unwrap_or(Type::Unknown),
-            );
+            return Some(alias.ty.map_or(Type::Unknown, |ty| {
+                self.lower_type_ref_with_params_at(
+                    &ty,
+                    &subst,
+                    alias.ty_range.or(Some(alias.name_range)),
+                )
+            }));
         }
 
         None
     }
 }
 
-pub(crate) fn generic_param_map_with_consts<'a>(
+pub fn generic_param_map_with_consts<'a>(
     type_names: impl Iterator<Item = &'a str>,
     const_names: impl Iterator<Item = &'a str>,
 ) -> HashMap<String, Type> {

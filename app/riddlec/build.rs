@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
-    env, fs, io,
+    env,
+    fmt::Write as _,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -10,8 +12,7 @@ fn main() {
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
     println!("cargo:rustc-env=GIT_HASH={hash}");
     println!("cargo:rerun-if-changed=.git/HEAD");
 
@@ -57,9 +58,11 @@ fn expand_module_file(
         if let Some((indent, visibility, name)) = external_mod(line) {
             let child = find_module_file(dir, &name)?;
             let child_source = expand_module_file(&child, stack, files)?;
-            out.push_str(&format!(
-                "{indent}{visibility}mod {name} {{\n{child_source}\n{indent}}}\n"
-            ));
+            writeln!(
+                out,
+                "{indent}{visibility}mod {name} {{\n{child_source}\n{indent}}}"
+            )
+            .expect("writing to a String should not fail");
         } else {
             out.push_str(line);
             out.push('\n');

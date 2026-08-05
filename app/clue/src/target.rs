@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Hash)]
-pub(crate) struct CToolchainConfig {
+pub struct CToolchainConfig {
     pub compiler: Option<PathBuf>,
     pub sysroot: Option<PathBuf>,
     pub windows_sdk: Option<PathBuf>,
@@ -14,7 +14,7 @@ pub(crate) struct CToolchainConfig {
 }
 
 #[derive(Debug, Clone, Hash)]
-pub(crate) struct TargetConfig {
+pub struct TargetConfig {
     pub triple: TargetTriple,
     pub runtime_source: Option<PathBuf>,
     pub c_toolchain: CToolchainConfig,
@@ -35,7 +35,7 @@ struct CToolchainFile {
     msvc: Option<PathBuf>,
 }
 
-pub(crate) fn resolve(
+pub fn resolve(
     explicit: Option<TargetTriple>,
     manifest: Option<&str>,
 ) -> anyhow::Result<TargetTriple> {
@@ -58,7 +58,7 @@ pub(crate) fn resolve(
     TargetTriple::host().map_err(anyhow::Error::msg)
 }
 
-pub(crate) fn load(triple: TargetTriple, require_component: bool) -> anyhow::Result<TargetConfig> {
+pub fn load(triple: TargetTriple, require_component: bool) -> anyhow::Result<TargetConfig> {
     let host = TargetTriple::host().map_err(anyhow::Error::msg)?;
     if triple == host {
         let c_toolchain = component_root(triple)
@@ -168,21 +168,20 @@ fn load_c_toolchain(root: &Path) -> anyhow::Result<CToolchainConfig> {
             });
         }
     };
+    let resolve_path = |path: Option<PathBuf>| {
+        path.map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        })
+    };
     Ok(CToolchainConfig {
-        compiler: resolve_path(root, file.compiler),
-        sysroot: resolve_path(root, file.sysroot),
-        windows_sdk: resolve_path(root, file.windows_sdk),
-        msvc: resolve_path(root, file.msvc),
-    })
-}
-
-fn resolve_path(root: &Path, path: Option<PathBuf>) -> Option<PathBuf> {
-    path.map(|path| {
-        if path.is_absolute() {
-            path
-        } else {
-            root.join(path)
-        }
+        compiler: resolve_path(file.compiler),
+        sysroot: resolve_path(file.sysroot),
+        windows_sdk: resolve_path(file.windows_sdk),
+        msvc: resolve_path(file.msvc),
     })
 }
 

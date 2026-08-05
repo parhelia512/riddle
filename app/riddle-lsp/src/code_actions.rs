@@ -7,7 +7,7 @@ use lsp_types::{
 const MUTABLE_CLOSURE_BINDING_MESSAGE: &str =
     "cannot call a mutable closure through an immutable binding\nimmutable closure binding";
 
-pub(crate) fn quick_fixes(
+pub fn quick_fixes(
     uri: &lsp_types::Url,
     version: Option<i32>,
     diagnostics: &[lsp_types::Diagnostic],

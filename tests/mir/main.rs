@@ -26,7 +26,7 @@ fn compile(
 
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
-    let mut hir = lower_root(root);
+    let mut hir = lower_root(&root);
 
     let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);

@@ -47,7 +47,7 @@ struct ProjectArgs {
 }
 
 impl ProjectArgs {
-    fn kind(&self) -> ProjectKind {
+    const fn kind(&self) -> ProjectKind {
         if self.lib {
             ProjectKind::Library
         } else {

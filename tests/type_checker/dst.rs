@@ -41,12 +41,12 @@ fn accepts_str_slice_return() {
 #[test]
 fn empty_array_literal_coerces_to_generic_slice() {
     let result = check(
-        r#"
+        r"
         fun empty<T>() -> &[T] {
             let value: &[T] = &[];
             value
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -101,12 +101,12 @@ fn rejects_string_literal_as_mutable_str_reference() {
 #[test]
 fn rejects_mutable_str_reference_from_shared_or_const_pointer() {
     let result = check(
-        r#"
+        r"
         fun invalid(shared: &str, pointer: *const str) {
             let from_shared: &mut str = &mut *shared;
             let from_const: &mut str = &mut *pointer;
         }
-        "#,
+        ",
     );
     assert_eq!(
         result
@@ -121,12 +121,12 @@ fn rejects_mutable_str_reference_from_shared_or_const_pointer() {
 #[test]
 fn accepts_mutable_str_reference_from_mutable_sources() {
     let result = check(
-        r#"
+        r"
         fun valid(reference: &mut str, pointer: *mut str) {
             let from_reference: &mut str = &mut *reference;
             let from_pointer: &mut str = unsafe { &mut *pointer };
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -224,14 +224,14 @@ fn string_slice_match_requires_wildcard() {
 #[test]
 fn rejects_bare_str_in_inferred_aggregate_and_generic_values() {
     let result = check(
-        r#"
+        r"
         fun take<T>(value: T) {}
 
         fun invalid(value: &str) {
             take(*value);
             [*value];
         }
-        "#,
+        ",
     );
     assert!(
         result

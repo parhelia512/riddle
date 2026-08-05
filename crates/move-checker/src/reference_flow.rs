@@ -13,27 +13,27 @@ use rowan::TextRange;
 use ty::{CapturePlace, CaptureSource, PatternBindingMode, Type, TypeCheckResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum FlowKind {
+pub enum FlowKind {
     Inherit,
     Shared,
     Mutable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SummaryOrigin {
+pub struct SummaryOrigin {
     pub(crate) param: usize,
     pub(crate) kind: FlowKind,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct FunctionSummary {
+pub struct FunctionSummary {
     pub(crate) origins: HashSet<SummaryOrigin>,
     pub(crate) opaque: bool,
-    pub(crate) fields: Vec<FunctionSummary>,
+    pub(crate) fields: Vec<Self>,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ReferenceFlow {
+pub struct ReferenceFlow {
     summaries: HashMap<FunctionId, FunctionSummary>,
 }
 
@@ -86,11 +86,10 @@ type FlowValue = FunctionSummary;
 impl FunctionSummary {
     fn from_param(param: usize) -> Self {
         Self {
-            origins: [SummaryOrigin {
+            origins: std::iter::once(SummaryOrigin {
                 param,
                 kind: FlowKind::Inherit,
-            }]
-            .into_iter()
+            })
             .collect(),
             opaque: false,
             fields: Vec::new(),
@@ -219,7 +218,7 @@ impl<'a> SummaryAnalyzer<'a> {
 
     fn analyze_expr(&mut self, expr_id: ExprId) -> FlowValue {
         let expr = &self.body.exprs[expr_id];
-        let mut value = match expr {
+        let value = match expr {
             Expr::Missing
             | Expr::IntLiteral { .. }
             | Expr::FloatLiteral { .. }
@@ -268,20 +267,7 @@ impl<'a> SummaryAnalyzer<'a> {
                 result
             }
 
-            Expr::Binary { lhs, rhs, op } => {
-                self.analyze_expr(*lhs);
-                let rhs_value = self.analyze_expr(*rhs);
-                if *op == BinaryOp::Assign
-                    && let Some((binding, direct)) = self.local_assignment(*lhs)
-                {
-                    if direct {
-                        self.locals.insert(binding, rhs_value);
-                    } else {
-                        self.locals.entry(binding).or_default().merge(rhs_value);
-                    }
-                }
-                FlowValue::default()
-            }
+            Expr::Binary { lhs, rhs, op } => self.analyze_binary(*lhs, *rhs, *op),
 
             Expr::Block { stmts, tail } => {
                 for stmt in stmts {
@@ -294,64 +280,17 @@ impl<'a> SummaryAnalyzer<'a> {
                 cond,
                 then_branch,
                 else_branch,
-            } => {
-                self.analyze_expr(*cond);
-                let entry = self.locals.clone();
+            } => self.analyze_if(*cond, *then_branch, *else_branch),
 
-                self.locals = entry.clone();
-                let then_value = self.analyze_expr(*then_branch);
-                let then_locals = self.locals.clone();
-
-                self.locals = entry.clone();
-                let else_value = else_branch
-                    .map(|branch| self.analyze_expr(branch))
-                    .unwrap_or_default();
-                let else_locals = self.locals.clone();
-
-                self.locals = merge_locals(entry, then_locals, else_locals);
-                let mut result = then_value;
-                result.merge(else_value);
-                result
-            }
-
-            Expr::While { condition, body } => {
-                self.analyze_expr(*condition);
-                let entry = self.locals.clone();
-                self.analyze_expr(*body);
-                self.locals = merge_two_locals(entry, self.locals.clone());
-                FlowValue::default()
-            }
+            Expr::While { condition, body } => self.analyze_while(*condition, *body),
 
             Expr::For {
                 pat,
                 iterable,
                 body,
-            } => {
-                let iterable_value = self.analyze_expr(*iterable).iterated();
-                let entry = self.locals.clone();
-                self.bind_pattern_sources(*pat, &iterable_value);
-                self.analyze_expr(*body);
-                self.locals = merge_two_locals(entry, self.locals.clone());
-                FlowValue::default()
-            }
+            } => self.analyze_for(*pat, *iterable, *body),
 
-            Expr::Match { scrutinee, arms } => {
-                let scrutinee_value = self.analyze_expr(*scrutinee);
-                let entry = self.locals.clone();
-                let mut result = FlowValue::default();
-                let mut merged_locals = entry.clone();
-                for arm in arms {
-                    self.locals = entry.clone();
-                    self.bind_pattern_sources(arm.pat, &scrutinee_value);
-                    if let Some(guard) = arm.guard {
-                        self.analyze_expr(guard);
-                    }
-                    result.merge(self.analyze_expr(arm.body));
-                    merged_locals = merge_two_locals(merged_locals, self.locals.clone());
-                }
-                self.locals = merged_locals;
-                result
-            }
+            Expr::Match { scrutinee, arms } => self.analyze_match(*scrutinee, arms),
 
             Expr::Call { callee, args, .. } => self.analyze_call(*callee, args, expr_id),
 
@@ -369,8 +308,7 @@ impl<'a> SummaryAnalyzer<'a> {
             Expr::FieldAccess { base, field } => {
                 let value = self.analyze_expr(*base);
                 self.field_index(*base, field)
-                    .map(|index| value.project(index))
-                    .unwrap_or_else(|| value.flattened())
+                    .map_or_else(|| value.flattened(), |index| value.project(index))
             }
 
             Expr::IndexAccess { base, index } => {
@@ -379,8 +317,7 @@ impl<'a> SummaryAnalyzer<'a> {
                 match &self.body.exprs[*index] {
                     Expr::IntLiteral { value: index, .. } => usize::try_from(*index)
                         .ok()
-                        .map(|index| value.project(index))
-                        .unwrap_or_else(|| value.iterated()),
+                        .map_or_else(|| value.iterated(), |index| value.project(index)),
                     _ => value.iterated(),
                 }
             }
@@ -390,10 +327,83 @@ impl<'a> SummaryAnalyzer<'a> {
             Expr::Try { operand } => self.analyze_expr(*operand),
         };
 
-        if !self.expr_may_carry_provenance(expr_id) {
-            value = FlowValue::default();
+        if self.expr_may_carry_provenance(expr_id) {
+            value
+        } else {
+            FlowValue::default()
         }
-        value
+    }
+
+    fn analyze_binary(&mut self, lhs: ExprId, rhs: ExprId, op: BinaryOp) -> FlowValue {
+        self.analyze_expr(lhs);
+        let rhs_value = self.analyze_expr(rhs);
+        if op == BinaryOp::Assign
+            && let Some((binding, direct)) = self.local_assignment(lhs)
+        {
+            if direct {
+                self.locals.insert(binding, rhs_value);
+            } else {
+                self.locals.entry(binding).or_default().merge(rhs_value);
+            }
+        }
+        FlowValue::default()
+    }
+
+    fn analyze_if(
+        &mut self,
+        cond: ExprId,
+        then_branch: ExprId,
+        else_branch: Option<ExprId>,
+    ) -> FlowValue {
+        self.analyze_expr(cond);
+        let entry = self.locals.clone();
+        self.locals.clone_from(&entry);
+        let then_value = self.analyze_expr(then_branch);
+        let then_locals = self.locals.clone();
+        self.locals.clone_from(&entry);
+        let else_value = else_branch
+            .map(|branch| self.analyze_expr(branch))
+            .unwrap_or_default();
+        let else_locals = self.locals.clone();
+        self.locals = merge_locals(entry, then_locals, else_locals);
+        let mut result = then_value;
+        result.merge(else_value);
+        result
+    }
+
+    fn analyze_while(&mut self, condition: ExprId, body: ExprId) -> FlowValue {
+        self.analyze_expr(condition);
+        let entry = self.locals.clone();
+        self.analyze_expr(body);
+        self.locals = merge_two_locals(entry, self.locals.clone());
+        FlowValue::default()
+    }
+
+    fn analyze_for(&mut self, pat: PatId, iterable: ExprId, body: ExprId) -> FlowValue {
+        let iterable_value = self.analyze_expr(iterable).iterated();
+        let entry = self.locals.clone();
+        self.bind_pattern_sources(pat, &iterable_value);
+        self.analyze_expr(body);
+        self.locals = merge_two_locals(entry, self.locals.clone());
+        FlowValue::default()
+    }
+
+    fn analyze_match(&mut self, scrutinee: ExprId, arms: &[hir::body::MatchArm]) -> FlowValue {
+        let scrutinee_value = self.analyze_expr(scrutinee);
+        let entry = self.locals.clone();
+        let mut result = FlowValue::default();
+        let mut merged_locals = entry.clone();
+        for arm in arms {
+            self.locals.clone_from(&entry);
+            self.bind_pattern_sources(arm.pat, &scrutinee_value);
+            if let Some(guard) = arm.guard {
+                self.analyze_expr(guard);
+            }
+            result.merge(self.analyze_expr(arm.body));
+            merged_locals = merge_two_locals(merged_locals, self.locals.clone());
+        }
+        self.locals = merged_locals;
+        result
     }
 
     fn capture_value(&self, place: &CapturePlace) -> FlowValue {
@@ -699,7 +709,7 @@ fn merge_locals(
     merge_two_locals(merge_two_locals(entry, left), right)
 }
 
-pub(crate) fn type_may_carry_reference(hir: &HirFile, ty: &Type) -> bool {
+pub fn type_may_carry_reference(hir: &HirFile, ty: &Type) -> bool {
     type_may_carry_flow(hir, ty, false)
 }
 
@@ -709,7 +719,13 @@ fn type_may_carry_provenance(hir: &HirFile, ty: &Type) -> bool {
 
 fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> bool {
     match ty {
-        Type::Ref(..) => true,
+        Type::Ref(..)
+        | Type::Closure { .. }
+        | Type::OpaqueCallable { .. }
+        | Type::Param(..)
+        | Type::InferVar(..)
+        | Type::Unknown
+        | Type::Error => true,
         Type::Ptr { .. } => through_raw_pointer,
         Type::Tuple(elements) => elements
             .iter()
@@ -727,9 +743,6 @@ fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> b
                 .any(|arg| type_may_carry_flow(hir, arg, through_raw_pointer))
                 || hir_enum_may_carry_flow(hir, *id, through_raw_pointer, &mut HashSet::new())
         }
-        Type::Param(..) | Type::InferVar(..) | Type::Unknown | Type::Error => true,
-        Type::FunctionItem { .. } => false,
-        Type::Closure { .. } | Type::OpaqueCallable { .. } => true,
         Type::CallableConstraint(signature) => {
             signature
                 .params
@@ -737,7 +750,8 @@ fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> b
                 .any(|param| type_may_carry_flow(hir, param, through_raw_pointer))
                 || type_may_carry_flow(hir, &signature.ret, through_raw_pointer)
         }
-        Type::Int(..)
+        Type::FunctionItem { .. }
+        | Type::Int(..)
         | Type::Float(..)
         | Type::InferInt
         | Type::InferFloat

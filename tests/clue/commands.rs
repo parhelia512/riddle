@@ -63,6 +63,270 @@ fn c_compiler() -> Option<OsString> {
         })
 }
 
+const GENERATED_C_GC_SOURCE: &str = r#"struct Data { value: i32 }
+struct Token { value: i32 }
+
+unsafe extern "C" {
+    safe fun rgc_collect();
+}
+
+fun escaped(value: i32) -> &Data {
+    let local = Data { value };
+    &local
+}
+
+fun take(token: Token) -> i32 { token.value }
+
+fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
+
+fun increment(value: i32) -> i32 { value + 1 }
+
+fun run_mut(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
+    f(value);
+    f(value)
+}
+
+fun make_callable(base: i32) -> impl Fn(i32) -> i32 {
+    move fun(value: i32) { base + value }
+}
+
+fun make_adder(base: i32) -> impl Fn(i32) -> i32 {
+    fun(value: i32) { base + value }
+}
+
+fun mutable_capture() -> i32 {
+    let mut total = 0;
+    let mut add = fun(value: i32) -> i32 {
+        total += value;
+        total
+    };
+    add(1);
+    add(2)
+}
+
+fun value_capture() -> i32 {
+    let token = Token { value: 7 };
+    let consume = fun() { take(token) };
+    consume()
+}
+
+fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
+    fun(first: i32) {
+        fun(second: i32) { base + first + second }
+    }
+}
+
+fun match_capture() -> i32 {
+    let read = match 42 { value => fun() { value } };
+    read()
+}
+
+fun shadowed_pattern_capture() -> i32 {
+    match 1 {
+        value => {
+            let outer = fun() { value };
+            match 2 {
+                value => {
+                    let inner = fun() { value };
+                    outer() + inner()
+                }
+            }
+        }
+    }
+}
+
+fun for_capture() -> i32 {
+    let mut total = 0;
+    for value in [1, 2, 3] {
+        let read = fun() { value };
+        total += read();
+    }
+    total
+}
+
+fun main() -> i32 {
+    let first = escaped(42);
+    rgc_collect();
+    let second = escaped(7);
+    let mut i = 0;
+    let mut while_sum = 0;
+    while i < 6 {
+        i += 1;
+        if i == 2 { continue; }
+        if i == 5 { break; }
+        while_sum += i;
+    }
+    let mut for_sum = 0;
+    for value in [1, 2, 3, 4, 5] {
+        if value == 2 { continue; }
+        if value == 5 { break; }
+        for_sum += value;
+    }
+    let add = make_adder(40);
+    let outer = nested(10);
+    let inner = outer(20);
+    let mut total = 0;
+    let add_total = fun(value: i32) { total += value; total };
+    let made = make_callable(40);
+    if (*first).value == 42 && (*second).value == 7 && while_sum == 8 && for_sum == 8
+        && add(2) == 42 && mutable_capture() == 3 && value_capture() == 7
+        && inner(12) == 42 && match_capture() == 42
+        && shadowed_pattern_capture() == 3 && for_capture() == 6
+        && apply(increment, 1) == 2 && run_mut(add_total, 2) == 4 && made(2) == 42 {
+        0
+    } else {
+        1
+    }
+}
+"#;
+
+const PROC_MACRO_DEPENDENCY_SOURCE: &str = r##"use std::io::println;
+
+#[proc_macro_derive(Answer, attributes(answer))]
+pub fun derive_answer(input: TokenStream) -> TokenStream {
+    let mut saw_struct = false;
+    let mut saw_name = false;
+    let mut saw_field = false;
+    let mut saw_colon = false;
+    let mut saw_text = false;
+    let mut saw_array = false;
+    let mut saw_number = false;
+    let mut field_token_count_ok = false;
+    for tree in &input {
+        match tree {
+            TokenTree::Ident(ident) => {
+                if ident.as_str() == "struct" {
+                    saw_struct = ident.span().end() > ident.span().start();
+                }
+                if ident.as_str() == "Marker" {
+                    saw_name = ident.span().start() > 0usize;
+                }
+            },
+            TokenTree::Group(group) => {
+                match group.delimiter() {
+                    Delimiter::Bracket => {
+                        for attribute_tree in group.stream() {
+                            match attribute_tree {
+                                TokenTree::Group(arguments) => {
+                                    for argument in arguments.stream() {
+                                        match argument {
+                                            TokenTree::Literal(literal) => {
+                                                if literal.as_str() == "r#\"token text\"#" {
+                                                    saw_text = literal.span().end() > literal.span().start();
+                                                }
+                                            },
+                                            _ => {},
+                                        }
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                    Delimiter::Brace => {
+                        field_token_count_ok = group.stream().len() == 3usize;
+                        for field_tree in group.stream() {
+                            match field_tree {
+                                TokenTree::Ident(ident) => {
+                                    if ident.as_str() == "value" {
+                                        saw_field = true;
+                                    }
+                                },
+                                TokenTree::Punct(punct) => {
+                                    if punct.as_char() == ':' {
+                                        saw_colon = match punct.spacing() {
+                                            Spacing::Alone => true,
+                                            Spacing::Joint => false,
+                                        };
+                                    }
+                                },
+                                TokenTree::Group(field_type) => {
+                                    match field_type.delimiter() {
+                                        Delimiter::Bracket => {
+                                            saw_array = true;
+                                            for type_tree in field_type.stream() {
+                                                match type_tree {
+                                                    TokenTree::Literal(literal) => {
+                                                        if literal.as_str() == "3" {
+                                                            saw_number = true;
+                                                        }
+                                                    },
+                                                    _ => {},
+                                                }
+                                            }
+                                        },
+                                        _ => {},
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            },
+            _ => {},
+        }
+    }
+    if input.len() != 5usize {
+        Diagnostic::error(Span::call_site(), "unexpected top-level token count").emit();
+        return TokenStream::new();
+    }
+    if !saw_struct || !saw_name {
+        Diagnostic::error(Span::call_site(), "missing item identifiers").emit();
+        return TokenStream::new();
+    }
+    if !saw_field || !saw_colon || !field_token_count_ok {
+        Diagnostic::error(Span::call_site(), "missing field tokens").emit();
+        return TokenStream::new();
+    }
+    if !saw_text {
+        Diagnostic::error(Span::call_site(), "missing attribute literal").emit();
+        return TokenStream::new();
+    }
+    if !saw_array || !saw_number {
+        Diagnostic::error(Span::call_site(), "missing nested type tokens").emit();
+        return TokenStream::new();
+    }
+    let message = "macro log";
+    println(&message);
+    TokenStream::from_str("fun generated_answer() -> i32 { let text = \"token text\"; 42 }")
+        .unwrap_or(TokenStream::new())
+}
+
+#[proc_macro]
+pub fun answer(input: TokenStream) -> TokenStream {
+    if input.to_string().as_str() != "1" {
+        Diagnostic::error(Span::call_site(), "function macro received the wrong input").emit();
+        return TokenStream::new();
+    }
+    let mut output = TokenStream::from_str("2").unwrap_or(TokenStream::new());
+    let shared = output.clone();
+    output.push(TokenTree::Punct(Punct::new(';', Spacing::Alone)));
+    if output.len() != 2usize || shared.len() != 1usize {
+        Diagnostic::error(Span::call_site(), "TokenStream clone is not copy-on-write").emit();
+        return TokenStream::new();
+    }
+    match TokenStream::from_str("(") {
+        Result::Ok(_) => {
+            Diagnostic::error(Span::call_site(), "invalid tokens were accepted").emit();
+            TokenStream::new()
+        },
+        Result::Err(_) => shared,
+    }
+}
+
+#[proc_macro_attribute]
+pub fun replace(args: TokenStream, item: TokenStream) -> TokenStream {
+    if args.to_string().as_str() != "8" || item.is_empty() {
+        Diagnostic::error(Span::call_site(), "attribute macro inputs were not separated").emit();
+        return TokenStream::new();
+    }
+    TokenStream::from_str("fun attribute_answer() -> i32 { 8 }")
+        .unwrap_or(TokenStream::new())
+}
+"##;
+
 #[test]
 fn init_creates_a_buildable_binary_project() {
     let root = temp_root("init-build");
@@ -219,126 +483,7 @@ fn generated_c_with_gc_and_loop_control_compiles_and_runs() {
     fs::create_dir_all(&root).unwrap();
     assert!(clue(&["new", "app"], &root).status.success());
     let project = root.join("app");
-    fs::write(
-        project.join("src/main.rid"),
-        r#"struct Data { value: i32 }
-struct Token { value: i32 }
-
-unsafe extern "C" {
-    safe fun rgc_collect();
-}
-
-fun escaped(value: i32) -> &Data {
-    let local = Data { value };
-    &local
-}
-
-fun take(token: Token) -> i32 { token.value }
-
-fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
-
-fun increment(value: i32) -> i32 { value + 1 }
-
-fun run_mut(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
-    f(value);
-    f(value)
-}
-
-fun make_callable(base: i32) -> impl Fn(i32) -> i32 {
-    move fun(value: i32) { base + value }
-}
-
-fun make_adder(base: i32) -> impl Fn(i32) -> i32 {
-    fun(value: i32) { base + value }
-}
-
-fun mutable_capture() -> i32 {
-    let mut total = 0;
-    let mut add = fun(value: i32) -> i32 {
-        total += value;
-        total
-    };
-    add(1);
-    add(2)
-}
-
-fun value_capture() -> i32 {
-    let token = Token { value: 7 };
-    let consume = fun() { take(token) };
-    consume()
-}
-
-fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
-    fun(first: i32) {
-        fun(second: i32) { base + first + second }
-    }
-}
-
-fun match_capture() -> i32 {
-    let read = match 42 { value => fun() { value } };
-    read()
-}
-
-fun shadowed_pattern_capture() -> i32 {
-    match 1 {
-        value => {
-            let outer = fun() { value };
-            match 2 {
-                value => {
-                    let inner = fun() { value };
-                    outer() + inner()
-                }
-            }
-        }
-    }
-}
-
-fun for_capture() -> i32 {
-    let mut total = 0;
-    for value in [1, 2, 3] {
-        let read = fun() { value };
-        total += read();
-    }
-    total
-}
-
-fun main() -> i32 {
-    let first = escaped(42);
-    rgc_collect();
-    let second = escaped(7);
-    let mut i = 0;
-    let mut while_sum = 0;
-    while i < 6 {
-        i += 1;
-        if i == 2 { continue; }
-        if i == 5 { break; }
-        while_sum += i;
-    }
-    let mut for_sum = 0;
-    for value in [1, 2, 3, 4, 5] {
-        if value == 2 { continue; }
-        if value == 5 { break; }
-        for_sum += value;
-    }
-    let add = make_adder(40);
-    let outer = nested(10);
-    let inner = outer(20);
-    let mut total = 0;
-    let add_total = fun(value: i32) { total += value; total };
-    let made = make_callable(40);
-    if (*first).value == 42 && (*second).value == 7 && while_sum == 8 && for_sum == 8
-        && add(2) == 42 && mutable_capture() == 3 && value_capture() == 7
-        && inner(12) == 42 && match_capture() == 42
-        && shadowed_pattern_capture() == 3 && for_capture() == 6
-        && apply(increment, 1) == 2 && run_mut(add_total, 2) == 4 && made(2) == 42 {
-        0
-    } else {
-        1
-    }
-}
-"#,
-    )
-    .unwrap();
+    fs::write(project.join("src/main.rid"), GENERATED_C_GC_SOURCE).unwrap();
     let build = clue(&["build", "app"], &root);
     assert!(
         build.status.success(),
@@ -380,7 +525,7 @@ fn custom_runtime_replaces_the_default_and_invalidates_the_build_cache() {
     let project = root.join("app");
     fs::create_dir_all(project.join("runtime")).unwrap();
     let runtime_path = project.join("runtime/custom.c");
-    let runtime = r#"#include <stddef.h>
+    let runtime = r"#include <stddef.h>
 #include <stdlib.h>
 
 static size_t custom_allocations = 0;
@@ -406,7 +551,7 @@ void rgc_free(void *pointer) { free(pointer); }
 void rgc_collect(void) {}
 
 size_t custom_allocation_count(void) { return custom_allocations; }
-"#;
+";
     fs::write(&runtime_path, runtime).unwrap();
     let manifest_path = project.join("Clue.toml");
     let manifest = fs::read_to_string(&manifest_path).unwrap();
@@ -549,7 +694,7 @@ fn no_gc_rejects_reference_escape_in_clue() {
     .unwrap();
     fs::write(
         project.join("src/main.rid"),
-        r#"struct Data { value: i32 }
+        r"struct Data { value: i32 }
 
 fun escaped() -> &Data {
     let value = Data { value: 42 };
@@ -557,7 +702,7 @@ fun escaped() -> &Data {
 }
 
 fun main() { escaped(); }
-"#,
+",
     )
     .unwrap();
 
@@ -674,7 +819,7 @@ fn generated_c_array_and_by_value_param_refs_compile_and_run() {
     let project = root.join("app");
     fs::write(
         project.join("src/main.rid"),
-        r#"
+        r"
 struct Data { value: i32 }
 
 struct Boxed { items: [Data; 2] }
@@ -747,7 +892,7 @@ fun main() -> i32 {
         1
     }
 }
-"#,
+",
     )
     .unwrap();
     let build = clue(&["build", "app"], &root);
@@ -834,7 +979,7 @@ fn standard_library_basics_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 fun main() -> i32 {
     let value: Option<i32> = Some(2);
@@ -848,7 +993,7 @@ fun main() -> i32 {
         1
     }
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1117,7 +1262,7 @@ fn tree_collections_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::collections::{TreeMap, TreeSet};
+        r"use std::collections::{TreeMap, TreeSet};
 use std::io::print;
 
 struct Payload { value: i32 }
@@ -1164,7 +1309,7 @@ fun main() -> i32 {
     }
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1190,7 +1335,7 @@ fn hash_collections_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::collections::{HashMap, HashSet};
+        r"use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::print;
 
@@ -1243,7 +1388,7 @@ fun main() -> i32 {
     }
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1269,7 +1414,7 @@ fn deterministic_drop_runs_in_native_binary() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 
@@ -1288,7 +1433,7 @@ fun main() -> i32 {
     print(&0);
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1382,7 +1527,7 @@ fn inferred_lambda_parameter_move_is_rejected_by_clue_check() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"fun main() {
+        r"fun main() {
     let consume_twice = fun(value) {
         let first = value;
         let second = value;
@@ -1392,7 +1537,7 @@ fn inferred_lambda_parameter_move_is_rejected_by_clue_check() {
     values.push(1);
     let result = consume_twice(values);
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1415,7 +1560,7 @@ fn nested_dynamic_array_move_drops_selected_element_once() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 
@@ -1435,7 +1580,7 @@ fun main() -> i32 {
     let selected = matrix[row][column];
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1448,12 +1593,10 @@ fun main() -> i32 {
     );
     let drops = output.stdout.rsplit(|byte| *byte == b'\n').next().unwrap();
     for id in b'1'..=b'4' {
-        assert_eq!(
-            drops.iter().filter(|&&byte| byte == id).count(),
-            1,
-            "each Guard must be dropped once: {:?}",
-            drops
-        );
+        let first = drops.iter().position(|&byte| byte == id);
+        let last = drops.iter().rposition(|&byte| byte == id);
+        assert!(first.is_some(), "missing Guard drop: {drops:?}");
+        assert_eq!(first, last, "each Guard must be dropped once: {drops:?}");
     }
     let _ = fs::remove_dir_all(root);
 }
@@ -1469,7 +1612,7 @@ fn match_pattern_binding_drops_at_arm_end() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 
@@ -1493,7 +1636,7 @@ fun main() -> i32 {
     print(&0);
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1519,7 +1662,7 @@ fn moved_destructured_binding_is_not_dropped_twice() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 
@@ -1537,7 +1680,7 @@ fun main() -> i32 {
     print(&0);
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1564,7 +1707,7 @@ fn closures_capture_destructured_bindings() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 fun main() -> i32 {
     let (a, b) = (10, 20);
@@ -1576,7 +1719,7 @@ fun main() -> i32 {
     print(&(sum() + c));
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1602,7 +1745,7 @@ fn destructuring_let_binds_tuple_and_struct_elements() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Point { x: i32, y: i32 }
 
@@ -1614,7 +1757,7 @@ fun main() -> i32 {
     print(&(a + b + c + x + y + total));
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1640,7 +1783,7 @@ fn reference_patterns_match_rust_binding_modes_at_runtime() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Point { x: i32, y: i32 }
 
@@ -1682,7 +1825,7 @@ fun main() -> i32 {
     print(&(copied + plain + original));
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1708,7 +1851,7 @@ fn moved_match_binding_is_not_dropped_twice() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 
@@ -1734,7 +1877,7 @@ fun main() -> i32 {
     print(&0);
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1760,7 +1903,7 @@ fn match_partial_move_drops_each_field_once() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 
@@ -1784,7 +1927,7 @@ fun main() -> i32 {
     print(&0);
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1810,7 +1953,7 @@ fn array_for_break_drops_current_and_remaining_items_once() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 
@@ -1834,7 +1977,7 @@ fun main() -> i32 {
     print(&0);
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1860,7 +2003,7 @@ fn generic_for_break_drops_item_before_iterator() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 struct Once { yielded: bool }
@@ -1907,7 +2050,7 @@ fun main() -> i32 {
     print(&0);
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1933,11 +2076,11 @@ fn unsigned_ordering_and_unicode_chars_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"fun main() -> i32 {
+        r"fun main() -> i32 {
     let high: u8 = 255u8;
     if high > 127u8 && '中' > 'a' { 0 } else { 1 }
 }
-"#,
+",
     )
     .unwrap();
 
@@ -1987,7 +2130,7 @@ fn comparison_operators_dispatch_to_trait_methods() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::cmp::Ordering;
+        r"use std::cmp::Ordering;
 
 struct Rank { value: i32 }
 
@@ -2025,7 +2168,7 @@ fun main() -> i32 {
     if low >= same { return 10; }
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -2136,7 +2279,7 @@ fn vector_indexing_compiles_and_runs() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 fun main() -> i32 {
     let mut values: Vector<i32> = Vector::new();
@@ -2158,7 +2301,7 @@ fun main() -> i32 {
     print(&values[index]);
     if values[index] == 13 { 0 } else { 3 }
 }
-"#,
+",
     )
     .unwrap();
 
@@ -2185,7 +2328,7 @@ fn associated_type_turbofish_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Marker<T> {
+        r"struct Marker<T> {
     pointer: *const T,
 }
 
@@ -2201,7 +2344,7 @@ fun main() -> i32 {
     let sizes = Marker::<i32>::sizes::<u8>();
     if values.pop().unwrap_or(0) == 41 && sizes == 5usize { 0 } else { 1 }
 }
-"#,
+",
     )
     .unwrap();
 
@@ -2269,7 +2412,7 @@ fn vector_drops_owned_elements() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
+        r"use std::io::print;
 
 struct Guard { id: i32 }
 
@@ -2307,7 +2450,7 @@ fun main() -> i32 {
     print(&0);
     0
 }
-"#,
+",
     )
     .unwrap();
 
@@ -2340,7 +2483,7 @@ fn vector_buffer_keeps_escaping_elements_alive_across_collections() {
     // invisible to the GC the nodes would be swept and the sum would corrupt.
     fs::write(
         root.join("app/src/main.rid"),
-        r#"struct Node { value: i32 }
+        r"struct Node { value: i32 }
 
 fun make(value: i32) -> &Node {
     let node = Node { value: value };
@@ -2382,7 +2525,7 @@ fun main() -> i32 {
     }
     if ok { 0 } else { 1 }
 }
-"#,
+",
     )
     .unwrap();
 
@@ -2407,7 +2550,7 @@ fn arrays_support_shared_and_mutable_borrowed_iteration() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"fun main() -> i32 {
+        r"fun main() -> i32 {
     let mut values: [i32; 3] = [1, 2, 3];
     let mut sum = 0;
     for value in &values {
@@ -2422,7 +2565,7 @@ fn arrays_support_shared_and_mutable_borrowed_iteration() {
         1
     }
 }
-"#,
+",
     )
     .unwrap();
 
@@ -2501,152 +2644,7 @@ proc-macro = true
     .unwrap();
     fs::write(
         root.join("macros/src/lib.rid"),
-        r####"use std::io::println;
-
-#[proc_macro_derive(Answer, attributes(answer))]
-pub fun derive_answer(input: TokenStream) -> TokenStream {
-    let mut saw_struct = false;
-    let mut saw_name = false;
-    let mut saw_field = false;
-    let mut saw_colon = false;
-    let mut saw_text = false;
-    let mut saw_array = false;
-    let mut saw_number = false;
-    let mut field_token_count_ok = false;
-    for tree in &input {
-        match tree {
-            TokenTree::Ident(ident) => {
-                if ident.as_str() == "struct" {
-                    saw_struct = ident.span().end() > ident.span().start();
-                }
-                if ident.as_str() == "Marker" {
-                    saw_name = ident.span().start() > 0usize;
-                }
-            },
-            TokenTree::Group(group) => {
-                match group.delimiter() {
-                    Delimiter::Bracket => {
-                        for attribute_tree in group.stream() {
-                            match attribute_tree {
-                                TokenTree::Group(arguments) => {
-                                    for argument in arguments.stream() {
-                                        match argument {
-                                            TokenTree::Literal(literal) => {
-                                                if literal.as_str() == "r#\"token text\"#" {
-                                                    saw_text = literal.span().end() > literal.span().start();
-                                                }
-                                            },
-                                            _ => {},
-                                        }
-                                    }
-                                },
-                                _ => {},
-                            }
-                        }
-                    },
-                    Delimiter::Brace => {
-                        field_token_count_ok = group.stream().len() == 3usize;
-                        for field_tree in group.stream() {
-                            match field_tree {
-                                TokenTree::Ident(ident) => {
-                                    if ident.as_str() == "value" {
-                                        saw_field = true;
-                                    }
-                                },
-                                TokenTree::Punct(punct) => {
-                                    if punct.as_char() == ':' {
-                                        saw_colon = match punct.spacing() {
-                                            Spacing::Alone => true,
-                                            Spacing::Joint => false,
-                                        };
-                                    }
-                                },
-                                TokenTree::Group(field_type) => {
-                                    match field_type.delimiter() {
-                                        Delimiter::Bracket => {
-                                            saw_array = true;
-                                            for type_tree in field_type.stream() {
-                                                match type_tree {
-                                                    TokenTree::Literal(literal) => {
-                                                        if literal.as_str() == "3" {
-                                                            saw_number = true;
-                                                        }
-                                                    },
-                                                    _ => {},
-                                                }
-                                            }
-                                        },
-                                        _ => {},
-                                    }
-                                },
-                                _ => {},
-                            }
-                        }
-                    },
-                    _ => {},
-                }
-            },
-            _ => {},
-        }
-    }
-    if input.len() != 5usize {
-        Diagnostic::error(Span::call_site(), "unexpected top-level token count").emit();
-        return TokenStream::new();
-    }
-    if !saw_struct || !saw_name {
-        Diagnostic::error(Span::call_site(), "missing item identifiers").emit();
-        return TokenStream::new();
-    }
-    if !saw_field || !saw_colon || !field_token_count_ok {
-        Diagnostic::error(Span::call_site(), "missing field tokens").emit();
-        return TokenStream::new();
-    }
-    if !saw_text {
-        Diagnostic::error(Span::call_site(), "missing attribute literal").emit();
-        return TokenStream::new();
-    }
-    if !saw_array || !saw_number {
-        Diagnostic::error(Span::call_site(), "missing nested type tokens").emit();
-        return TokenStream::new();
-    }
-    let message = "macro log";
-    println(&message);
-    TokenStream::from_str("fun generated_answer() -> i32 { let text = \"token text\"; 42 }")
-        .unwrap_or(TokenStream::new())
-}
-
-#[proc_macro]
-pub fun answer(input: TokenStream) -> TokenStream {
-    if input.to_string().as_str() != "1" {
-        Diagnostic::error(Span::call_site(), "function macro received the wrong input").emit();
-        return TokenStream::new();
-    }
-    let mut output = TokenStream::from_str("2").unwrap_or(TokenStream::new());
-    let shared = output.clone();
-    output.push(TokenTree::Punct(Punct::new(';', Spacing::Alone)));
-    if output.len() != 2usize || shared.len() != 1usize {
-        Diagnostic::error(Span::call_site(), "TokenStream clone is not copy-on-write").emit();
-        return TokenStream::new();
-    }
-    match TokenStream::from_str("(") {
-        Result::Ok(_) => {
-            Diagnostic::error(Span::call_site(), "invalid tokens were accepted").emit();
-            TokenStream::new()
-        },
-        Result::Err(_) => shared,
-    }
-}
-
-#[proc_macro_attribute]
-pub fun replace(args: TokenStream, item: TokenStream) -> TokenStream {
-    if args.to_string().as_str() != "8" || item.is_empty() {
-        Diagnostic::error(Span::call_site(), "attribute macro inputs were not separated").emit();
-        return TokenStream::new();
-    }
-    TokenStream::from_str("fun attribute_answer() -> i32 { 8 }")
-        .unwrap_or(TokenStream::new())
-}
-"####,
+        PROC_MACRO_DEPENDENCY_SOURCE,
     )
     .unwrap();
     fs::write(
@@ -2664,7 +2662,7 @@ macros = { path = "../macros" }
     .unwrap();
     fs::write(
         root.join("app/src/main.rid"),
-        r####"use macros::{Answer, answer, replace};
+        r##"use macros::{Answer, answer, replace};
 
 #[answer(r#"token text"#)]
 #[derive(Answer)]
@@ -2679,7 +2677,7 @@ fun removed() -> i32 { 0 }
 fun main() -> i32 {
     if generated_answer() + answer!(1) + attribute_answer() == 52 { 0 } else { 1 }
 }
-"####,
+"##,
     )
     .unwrap();
 
@@ -2752,11 +2750,11 @@ quote = { path = "../quote" }
     .unwrap();
     fs::write(
         root.join("macros/src/lib.rid"),
-        r#"use quote::make_answer;
+        r"use quote::make_answer;
 
 #[proc_macro]
 pub fun answer(input: TokenStream) -> TokenStream { make_answer!() }
-"#,
+",
     )
     .unwrap();
     fs::write(

@@ -18,6 +18,7 @@ use super::{DefRef, EdgeId, EdgeKind, Fragment, Node, NodeId, RefOrigin, ScopeGr
 ///
 /// The builder starts from `ItemTree::top_level` and recursively encodes modules,
 /// imports, functions, and structs. Function bodies are encoded as separate fragments.
+#[must_use]
 pub fn build_scope_graph(
     hir: &HirFile,
     root_syntax: &SyntaxNode,
@@ -41,6 +42,7 @@ pub struct ScopeGraphBuilder<'a> {
 }
 
 impl<'a> ScopeGraphBuilder<'a> {
+    #[must_use]
     pub fn new(hir: &'a HirFile, root_syntax: &SyntaxNode) -> Self {
         Self {
             sg: ScopeGraph::new(),
@@ -52,6 +54,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         }
     }
 
+    #[must_use]
     pub fn build(mut self) -> (ScopeGraph, Vec<hir::body::Diagnostic>) {
         let root_scope = self.sg.root;
 
@@ -113,158 +116,207 @@ impl<'a> ScopeGraphBuilder<'a> {
         frag_edges: &mut Vec<EdgeId>,
     ) {
         self.index_module_children(items, parent_scope);
+        for &item in items {
+            self.encode_item(item, parent_scope, frag_nodes, frag_edges);
+        }
+    }
 
-        for it in items {
-            match it {
-                TopLevelItem::Function(fid) => {
-                    self.encode_function_type_refs(*fid, parent_scope, frag_nodes, frag_edges);
-                    self.encode_function(*fid, parent_scope, frag_nodes, frag_edges);
+    fn encode_item(
+        &mut self,
+        item: TopLevelItem,
+        parent_scope: NodeId,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        match item {
+            TopLevelItem::Function(fid) => {
+                self.encode_function_type_refs(fid, parent_scope, frag_nodes, frag_edges);
+                self.encode_function(fid, parent_scope, frag_nodes, frag_edges);
+            }
+            TopLevelItem::Struct(sid) => {
+                self.encode_struct_item(sid, parent_scope, frag_nodes, frag_edges);
+            }
+            TopLevelItem::Enum(eid) => {
+                self.encode_enum_item(eid, parent_scope, frag_nodes, frag_edges);
+            }
+            TopLevelItem::Trait(tid) => {
+                self.encode_trait_item(tid, parent_scope, frag_nodes, frag_edges);
+            }
+            TopLevelItem::Const(cid) => {
+                self.encode_const_item(cid, parent_scope, frag_nodes, frag_edges);
+            }
+            TopLevelItem::TypeAlias(tid) => {
+                self.encode_type_alias_item(tid, parent_scope, frag_nodes, frag_edges);
+            }
+            TopLevelItem::Module(mid) => {
+                self.encode_module(mid, parent_scope, frag_nodes, frag_edges);
+            }
+            TopLevelItem::Use(uid) => {
+                let use_item = self.hir.item_tree.uses[uid].clone();
+                self.encode_use_tree(&use_item.tree, parent_scope, frag_nodes, frag_edges);
+            }
+            TopLevelItem::Impl(iid) => {
+                self.encode_impl(iid, parent_scope, frag_nodes, frag_edges);
+            }
+        }
+    }
+
+    fn encode_struct_item(
+        &mut self,
+        sid: StructId,
+        parent_scope: NodeId,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        let strukt = self.hir.item_tree.structs[sid].clone();
+        self.emit_bound_type_references(
+            &strukt.generic_bounds,
+            parent_scope,
+            frag_nodes,
+            frag_edges,
+        );
+        for field in &strukt.fields {
+            self.emit_type_references(&field.ty, parent_scope, frag_nodes, frag_edges);
+        }
+        self.encode_struct_impl_scope(sid, parent_scope, frag_nodes, frag_edges);
+        let name = self.hir.item_tree.structs[sid].name.clone();
+        self.emit_named_def(
+            parent_scope,
+            name,
+            DefRef::Struct(sid),
+            frag_nodes,
+            frag_edges,
+        );
+    }
+
+    fn encode_enum_item(
+        &mut self,
+        eid: EnumId,
+        parent_scope: NodeId,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        let enumeration = self.hir.item_tree.enums[eid].clone();
+        self.emit_bound_type_references(
+            &enumeration.generic_bounds,
+            parent_scope,
+            frag_nodes,
+            frag_edges,
+        );
+        for variant in &enumeration.variants {
+            match &variant.kind {
+                hir::item_tree::HirVariantKind::Unit => {}
+                hir::item_tree::HirVariantKind::Tuple(fields) => {
+                    for field in fields {
+                        self.emit_type_references(field, parent_scope, frag_nodes, frag_edges);
+                    }
                 }
-                TopLevelItem::Struct(sid) => {
-                    let strukt = self.hir.item_tree.structs[*sid].clone();
-                    self.emit_bound_type_references(
-                        &strukt.generic_bounds,
-                        parent_scope,
-                        frag_nodes,
-                        frag_edges,
-                    );
-                    for field in &strukt.fields {
+                hir::item_tree::HirVariantKind::Struct(fields) => {
+                    for field in fields {
                         self.emit_type_references(&field.ty, parent_scope, frag_nodes, frag_edges);
                     }
-                    self.encode_struct_impl_scope(*sid, parent_scope, frag_nodes, frag_edges);
-                    let name = self.hir.item_tree.structs[*sid].name.clone();
-                    self.emit_named_def(
-                        parent_scope,
-                        name,
-                        DefRef::Struct(*sid),
-                        frag_nodes,
-                        frag_edges,
-                    );
-                }
-                TopLevelItem::Enum(eid) => {
-                    let enumeration = self.hir.item_tree.enums[*eid].clone();
-                    self.emit_bound_type_references(
-                        &enumeration.generic_bounds,
-                        parent_scope,
-                        frag_nodes,
-                        frag_edges,
-                    );
-                    for variant in &enumeration.variants {
-                        match &variant.kind {
-                            hir::item_tree::HirVariantKind::Unit => {}
-                            hir::item_tree::HirVariantKind::Tuple(fields) => {
-                                for field in fields {
-                                    self.emit_type_references(
-                                        field,
-                                        parent_scope,
-                                        frag_nodes,
-                                        frag_edges,
-                                    );
-                                }
-                            }
-                            hir::item_tree::HirVariantKind::Struct(fields) => {
-                                for field in fields {
-                                    self.emit_type_references(
-                                        &field.ty,
-                                        parent_scope,
-                                        frag_nodes,
-                                        frag_edges,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    let name = self.hir.item_tree.enums[*eid].name.clone();
-                    self.emit_named_def(
-                        parent_scope,
-                        name,
-                        DefRef::Enum(*eid),
-                        frag_nodes,
-                        frag_edges,
-                    );
-                    self.encode_enum_variant_scope(*eid, parent_scope, frag_nodes, frag_edges);
-                }
-                TopLevelItem::Trait(tid) => {
-                    let tr = self.hir.item_tree.traits[*tid].clone();
-                    self.emit_bound_type_references(
-                        &tr.generic_bounds,
-                        parent_scope,
-                        frag_nodes,
-                        frag_edges,
-                    );
-                    self.emit_bound_type_references(
-                        &tr.supertraits,
-                        parent_scope,
-                        frag_nodes,
-                        frag_edges,
-                    );
-                    for default in tr.generic_defaults.iter().flatten() {
-                        self.emit_type_references(default, parent_scope, frag_nodes, frag_edges);
-                    }
-                    for method in &tr.methods {
-                        self.emit_function_signature_type_references(
-                            method,
-                            parent_scope,
-                            frag_nodes,
-                            frag_edges,
-                        );
-                    }
-                    for alias in &tr.type_aliases {
-                        if let Some(ty) = &alias.ty {
-                            self.emit_type_references(ty, parent_scope, frag_nodes, frag_edges);
-                        }
-                    }
-                    let name = self.hir.item_tree.traits[*tid].name.clone();
-                    self.emit_named_def(
-                        parent_scope,
-                        name,
-                        DefRef::Trait(*tid),
-                        frag_nodes,
-                        frag_edges,
-                    );
-                    for fid in self.hir.item_tree.traits[*tid].default_methods.clone() {
-                        self.encode_function_type_refs(fid, parent_scope, frag_nodes, frag_edges);
-                        self.encode_function_body(fid, parent_scope, frag_nodes, frag_edges);
-                    }
-                }
-                TopLevelItem::Const(cid) => {
-                    let ty = self.hir.item_tree.consts[*cid].ty.clone();
-                    self.emit_type_references(&ty, parent_scope, frag_nodes, frag_edges);
-                    let name = self.hir.item_tree.consts[*cid].name.clone();
-                    self.emit_named_def(
-                        parent_scope,
-                        name,
-                        DefRef::Const(*cid),
-                        frag_nodes,
-                        frag_edges,
-                    );
-                    self.encode_const_body(*cid, parent_scope);
-                }
-                TopLevelItem::TypeAlias(tid) => {
-                    if let Some(ty) = self.hir.item_tree.type_aliases[*tid].ty.clone() {
-                        self.emit_type_references(&ty, parent_scope, frag_nodes, frag_edges);
-                    }
-                    let name = self.hir.item_tree.type_aliases[*tid].name.clone();
-                    self.emit_named_def(
-                        parent_scope,
-                        name,
-                        DefRef::TypeAlias(*tid),
-                        frag_nodes,
-                        frag_edges,
-                    );
-                }
-                TopLevelItem::Module(mid) => {
-                    self.encode_module(*mid, parent_scope, frag_nodes, frag_edges);
-                }
-                TopLevelItem::Use(uid) => {
-                    let u = self.hir.item_tree.uses[*uid].clone();
-                    self.encode_use_tree(&u.tree, parent_scope, frag_nodes, frag_edges);
-                }
-                TopLevelItem::Impl(iid) => {
-                    self.encode_impl(*iid, parent_scope, frag_nodes, frag_edges);
                 }
             }
         }
+        let name = self.hir.item_tree.enums[eid].name.clone();
+        self.emit_named_def(
+            parent_scope,
+            name,
+            DefRef::Enum(eid),
+            frag_nodes,
+            frag_edges,
+        );
+        self.encode_enum_variant_scope(eid, parent_scope, frag_nodes, frag_edges);
+    }
+
+    fn encode_trait_item(
+        &mut self,
+        tid: hir::item_tree::TraitId,
+        parent_scope: NodeId,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        let trait_item = self.hir.item_tree.traits[tid].clone();
+        self.emit_bound_type_references(
+            &trait_item.generic_bounds,
+            parent_scope,
+            frag_nodes,
+            frag_edges,
+        );
+        self.emit_bound_type_references(
+            &trait_item.supertraits,
+            parent_scope,
+            frag_nodes,
+            frag_edges,
+        );
+        for default in trait_item.generic_defaults.iter().flatten() {
+            self.emit_type_references(default, parent_scope, frag_nodes, frag_edges);
+        }
+        for method in &trait_item.methods {
+            self.emit_function_signature_type_references(
+                method,
+                parent_scope,
+                frag_nodes,
+                frag_edges,
+            );
+        }
+        for alias in &trait_item.type_aliases {
+            if let Some(ty) = &alias.ty {
+                self.emit_type_references(ty, parent_scope, frag_nodes, frag_edges);
+            }
+        }
+        let name = trait_item.name.clone();
+        self.emit_named_def(
+            parent_scope,
+            name,
+            DefRef::Trait(tid),
+            frag_nodes,
+            frag_edges,
+        );
+        for fid in trait_item.default_methods {
+            self.encode_function_type_refs(fid, parent_scope, frag_nodes, frag_edges);
+            self.encode_function_body(fid, parent_scope, frag_nodes, frag_edges);
+        }
+    }
+
+    fn encode_const_item(
+        &mut self,
+        cid: hir::item_tree::ConstId,
+        parent_scope: NodeId,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        let ty = self.hir.item_tree.consts[cid].ty.clone();
+        self.emit_type_references(&ty, parent_scope, frag_nodes, frag_edges);
+        let name = self.hir.item_tree.consts[cid].name.clone();
+        self.emit_named_def(
+            parent_scope,
+            name,
+            DefRef::Const(cid),
+            frag_nodes,
+            frag_edges,
+        );
+        self.encode_const_body(cid, parent_scope);
+    }
+
+    fn encode_type_alias_item(
+        &mut self,
+        tid: hir::item_tree::TypeAliasId,
+        parent_scope: NodeId,
+        frag_nodes: &mut Vec<NodeId>,
+        frag_edges: &mut Vec<EdgeId>,
+    ) {
+        if let Some(ty) = self.hir.item_tree.type_aliases[tid].ty.clone() {
+            self.emit_type_references(&ty, parent_scope, frag_nodes, frag_edges);
+        }
+        let name = self.hir.item_tree.type_aliases[tid].name.clone();
+        self.emit_named_def(
+            parent_scope,
+            name,
+            DefRef::TypeAlias(tid),
+            frag_nodes,
+            frag_edges,
+        );
     }
 
     fn index_module_children(&mut self, items: &[TopLevelItem], parent_scope: NodeId) {
@@ -734,7 +786,7 @@ impl<'a> ScopeGraphBuilder<'a> {
 
                 // `rewrite_to` stores the path segments only; the anchor is stored separately.
                 let rewrite_to = tree.prefix.segments.clone();
-                let anchor = self.anchor_scope_for(&tree.prefix.anchor, current_scope);
+                let anchor = self.anchor_scope_for(tree.prefix.anchor, current_scope);
 
                 let pop = self.sg.alloc_node(Node::PopSymbol {
                     name: exposed,
@@ -799,7 +851,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         })
     }
 
-    fn anchor_scope_for(&self, anchor: &PathAnchor, current: NodeId) -> NodeId {
+    fn anchor_scope_for(&self, anchor: PathAnchor, current: NodeId) -> NodeId {
         match anchor {
             PathAnchor::Plain | PathAnchor::SelfMod => current,
             PathAnchor::Crate | PathAnchor::Absolute => self.sg.root,
@@ -808,7 +860,7 @@ impl<'a> ScopeGraphBuilder<'a> {
     }
 
     fn resolve_path_scope(&self, path: &HirPath, current_scope: NodeId) -> Option<NodeId> {
-        let mut lookup_scope = self.anchor_scope_for(&path.anchor, current_scope);
+        let mut lookup_scope = self.anchor_scope_for(path.anchor, current_scope);
         let mut result_scope = None;
         let mut first_segment = true;
 
@@ -1018,7 +1070,9 @@ impl<'a> ScopeGraphBuilder<'a> {
                 self.walk_expr_for_refs(body_id, body, *lhs, current_scope, nodes, edges);
                 self.walk_expr_for_refs(body_id, body, *rhs, current_scope, nodes, edges);
             }
-            Expr::Unary { operand, .. } => {
+            Expr::Unary { operand, .. }
+            | Expr::Try { operand }
+            | Expr::Unsafe { body: operand } => {
                 self.walk_expr_for_refs(body_id, body, *operand, current_scope, nodes, edges);
             }
             Expr::Call {
@@ -1034,34 +1088,8 @@ impl<'a> ScopeGraphBuilder<'a> {
                     self.walk_expr_for_refs(body_id, body, *a, current_scope, nodes, edges);
                 }
             }
-            Expr::Lambda {
-                params,
-                ret_type,
-                body: lambda_body,
-                ..
-            } => {
-                let lambda_scope = self.sg.alloc_node(Node::Scope(ScopeKind::FunctionScope));
-                nodes.push(lambda_scope);
-                let edge = self
-                    .sg
-                    .add_edge(lambda_scope, current_scope, EdgeKind::Lex, 0);
-                edges.push(edge);
-                for (index, param) in params.iter().enumerate() {
-                    self.emit_type_references(&param.ty, lambda_scope, nodes, edges);
-                    let pop = self.sg.alloc_node(Node::PopSymbol {
-                        name: param.name.clone(),
-                        define: DefRef::LambdaParam {
-                            body_id,
-                            lambda: eid,
-                            index,
-                        },
-                    });
-                    nodes.push(pop);
-                    let edge = self.sg.add_edge(lambda_scope, pop, EdgeKind::Def, 0);
-                    edges.push(edge);
-                }
-                self.emit_type_references(ret_type, lambda_scope, nodes, edges);
-                self.walk_expr_for_refs(body_id, body, *lambda_body, lambda_scope, nodes, edges);
+            Expr::Lambda { .. } => {
+                self.walk_lambda_for_refs(body_id, body, eid, current_scope, nodes, edges);
             }
             Expr::FieldAccess { base, .. } => {
                 self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
@@ -1071,22 +1099,8 @@ impl<'a> ScopeGraphBuilder<'a> {
                 self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
                 self.walk_expr_for_refs(body_id, body, *index, current_scope, nodes, edges);
             }
-            Expr::Block { stmts, tail } => {
-                let inner = self.sg.alloc_node(Node::Scope(ScopeKind::Block));
-                nodes.push(inner);
-                let e = self.sg.add_edge(inner, current_scope, EdgeKind::Lex, 0);
-                edges.push(e);
-
-                self.index_body_module_items(body, stmts, inner);
-
-                let mut block_current = inner;
-                for sid in stmts {
-                    block_current =
-                        self.encode_body_stmt(body_id, body, *sid, block_current, nodes, edges);
-                }
-                if let Some(t) = tail {
-                    self.walk_expr_for_refs(body_id, body, *t, block_current, nodes, edges);
-                }
+            Expr::Block { .. } => {
+                self.walk_block_for_refs(body_id, body, eid, current_scope, nodes, edges);
             }
             Expr::If {
                 cond,
@@ -1113,26 +1127,12 @@ impl<'a> ScopeGraphBuilder<'a> {
                     self.walk_pat_for_bindings(body, *pat, current_scope, nodes, edges);
                 self.walk_expr_for_refs(body_id, body, *b, body_scope, nodes, edges);
             }
-            Expr::Match { scrutinee, arms } => {
-                self.walk_expr_for_refs(body_id, body, *scrutinee, current_scope, nodes, edges);
-                for arm in arms {
-                    let arm_scope =
-                        self.walk_pat_for_bindings(body, arm.pat, current_scope, nodes, edges);
-                    if let Some(g) = arm.guard {
-                        self.walk_expr_for_refs(body_id, body, g, arm_scope, nodes, edges);
-                    }
-                    self.walk_expr_for_refs(body_id, body, arm.body, arm_scope, nodes, edges);
-                }
-            }
-            Expr::Unsafe { body: b } => {
-                self.walk_expr_for_refs(body_id, body, *b, current_scope, nodes, edges);
+            Expr::Match { .. } => {
+                self.walk_match_for_refs(body_id, body, eid, current_scope, nodes, edges);
             }
             Expr::Cast { base, target } => {
                 self.walk_expr_for_refs(body_id, body, *base, current_scope, nodes, edges);
                 self.emit_type_references(target, current_scope, nodes, edges);
-            }
-            Expr::Try { operand } => {
-                self.walk_expr_for_refs(body_id, body, *operand, current_scope, nodes, edges);
             }
             Expr::Array { elements } | Expr::Tuple { elements } => {
                 for e in elements {
@@ -1143,6 +1143,97 @@ impl<'a> ScopeGraphBuilder<'a> {
                 self.walk_expr_for_refs(body_id, body, *value, current_scope, nodes, edges);
                 self.walk_expr_for_refs(body_id, body, *len, current_scope, nodes, edges);
             }
+        }
+    }
+
+    fn walk_lambda_for_refs(
+        &mut self,
+        body_id: BodyId,
+        body: &Body,
+        eid: ExprId,
+        current_scope: NodeId,
+        nodes: &mut Vec<NodeId>,
+        edges: &mut Vec<EdgeId>,
+    ) {
+        let Expr::Lambda {
+            params,
+            ret_type,
+            body: lambda_body,
+            ..
+        } = &body.exprs[eid]
+        else {
+            unreachable!("walk_lambda_for_refs requires a lambda expression");
+        };
+        let lambda_scope = self.sg.alloc_node(Node::Scope(ScopeKind::FunctionScope));
+        nodes.push(lambda_scope);
+        let edge = self
+            .sg
+            .add_edge(lambda_scope, current_scope, EdgeKind::Lex, 0);
+        edges.push(edge);
+        for (index, param) in params.iter().enumerate() {
+            self.emit_type_references(&param.ty, lambda_scope, nodes, edges);
+            let pop = self.sg.alloc_node(Node::PopSymbol {
+                name: param.name.clone(),
+                define: DefRef::LambdaParam {
+                    body_id,
+                    lambda: eid,
+                    index,
+                },
+            });
+            nodes.push(pop);
+            let edge = self.sg.add_edge(lambda_scope, pop, EdgeKind::Def, 0);
+            edges.push(edge);
+        }
+        self.emit_type_references(ret_type, lambda_scope, nodes, edges);
+        self.walk_expr_for_refs(body_id, body, *lambda_body, lambda_scope, nodes, edges);
+    }
+
+    fn walk_block_for_refs(
+        &mut self,
+        body_id: BodyId,
+        body: &Body,
+        eid: ExprId,
+        current_scope: NodeId,
+        nodes: &mut Vec<NodeId>,
+        edges: &mut Vec<EdgeId>,
+    ) {
+        let Expr::Block { stmts, tail } = &body.exprs[eid] else {
+            unreachable!("walk_block_for_refs requires a block expression");
+        };
+        let inner = self.sg.alloc_node(Node::Scope(ScopeKind::Block));
+        nodes.push(inner);
+        let edge = self.sg.add_edge(inner, current_scope, EdgeKind::Lex, 0);
+        edges.push(edge);
+        self.index_body_module_items(body, stmts, inner);
+
+        let mut block_current = inner;
+        for sid in stmts {
+            block_current = self.encode_body_stmt(body_id, body, *sid, block_current, nodes, edges);
+        }
+        if let Some(tail) = tail {
+            self.walk_expr_for_refs(body_id, body, *tail, block_current, nodes, edges);
+        }
+    }
+
+    fn walk_match_for_refs(
+        &mut self,
+        body_id: BodyId,
+        body: &Body,
+        eid: ExprId,
+        current_scope: NodeId,
+        nodes: &mut Vec<NodeId>,
+        edges: &mut Vec<EdgeId>,
+    ) {
+        let Expr::Match { scrutinee, arms } = &body.exprs[eid] else {
+            unreachable!("walk_match_for_refs requires a match expression");
+        };
+        self.walk_expr_for_refs(body_id, body, *scrutinee, current_scope, nodes, edges);
+        for arm in arms {
+            let arm_scope = self.walk_pat_for_bindings(body, arm.pat, current_scope, nodes, edges);
+            if let Some(guard) = arm.guard {
+                self.walk_expr_for_refs(body_id, body, guard, arm_scope, nodes, edges);
+            }
+            self.walk_expr_for_refs(body_id, body, arm.body, arm_scope, nodes, edges);
         }
     }
 
@@ -1243,7 +1334,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         nodes: &mut Vec<NodeId>,
         edges: &mut Vec<EdgeId>,
     ) {
-        let anchor = self.anchor_scope_for(&path.anchor, current_scope);
+        let anchor = self.anchor_scope_for(path.anchor, current_scope);
         let r = self.sg.alloc_node(Node::Reference {
             segments: path.segments.clone(),
             anchor,
@@ -1307,7 +1398,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         scope
     }
 
-    /// Recursively emits PopSymbol defs for every binding introduced by a pattern.
+    /// Recursively emits `PopSymbol` defs for every binding introduced by a pattern.
     ///
     /// Each binding creates a new scope that shadows the previous one (same shape as `let`).
     fn emit_pat_bindings(
@@ -1345,12 +1436,7 @@ impl<'a> ScopeGraphBuilder<'a> {
                 self.emit_pat_bindings(body, *pattern, current, nodes, edges);
             }
             Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
-            Pattern::Tuple { elements } => {
-                for e in elements {
-                    self.emit_pat_bindings(body, *e, current, nodes, edges);
-                }
-            }
-            Pattern::TupleStruct { elements, .. } => {
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 for e in elements {
                     self.emit_pat_bindings(body, *e, current, nodes, edges);
                 }

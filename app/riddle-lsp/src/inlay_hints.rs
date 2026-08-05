@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::BuildHasher};
 
 use hir::body::{Expr, Stmt};
 use hir::item_tree::HirTypeRef;
@@ -12,7 +12,8 @@ use crate::{
     text::ranges_overlap,
 };
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
 pub fn inlay_hints_for_source(source: &str, range: Range) -> Vec<InlayHint> {
     let result = riddlec::pipeline::check_with_options(source, CompileOptions { use_std: false });
     inlay_hints_from_analysis(
@@ -29,9 +30,14 @@ pub fn inlay_hints_for_source(source: &str, range: Range) -> Vec<InlayHint> {
     )
 }
 
-pub fn inlay_hints_for_document(
+/// Computes inlay hints for an open document.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn inlay_hints_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     range: Range,
     options: CompileOptions,
     sessions: &AnalysisSessions,
@@ -43,7 +49,7 @@ pub fn inlay_hints_for_document(
     Ok(inlay_hints_from_analysis(&document.text, &analysis, range))
 }
 
-pub(crate) fn inlay_hints_from_analysis(
+pub fn inlay_hints_from_analysis(
     document_source: &str,
     analysis: &DocumentAnalysis,
     range: Range,

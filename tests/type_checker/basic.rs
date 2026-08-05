@@ -6,12 +6,12 @@ use type_checker::{
 #[test]
 fn accepts_basic_function_body() {
     let result = check(
-        r#"
+        r"
         fun add(left: i32, right: i32) -> i32 {
             let sum: i32 = left + right;
             sum
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -91,7 +91,7 @@ fn supports_rust_style_scalar_numeric_types() {
 #[test]
 fn accepts_compound_assignment_ops() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let mut n: i32 = 1;
             n += 2;
@@ -110,7 +110,7 @@ fn accepts_compound_assignment_ops() {
             flag |= true;
             flag ^= false;
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -119,7 +119,7 @@ fn accepts_compound_assignment_ops() {
 #[test]
 fn accepts_rust_style_array_forms() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let empty: [i32; 0] = [];
             let one: [i32; 1] = [1];
@@ -128,7 +128,7 @@ fn accepts_rust_style_array_forms() {
             let nested: [[i32; 2]; 3] = [[1, 2]; 3];
             let trailing: [i32; 2] = [1, 2,];
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -157,7 +157,7 @@ fn accepts_array_repeat_for_explicit_copy_type() {
 #[test]
 fn checks_generic_function_calls() {
     let result = check(
-        r#"
+        r"
         fun id<T>(value: T) -> T {
             value
         }
@@ -167,7 +167,7 @@ fn checks_generic_function_calls() {
             let b = id(true);
             a
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -226,11 +226,11 @@ fn generic_call_inference_keeps_nested_constructor_expected_type() {
 #[test]
 fn callable_bounds_constrain_generic_function_items() {
     let result = check(
-        r#"
+        r"
         fun identity<T>(value: T) -> T { value }
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun main() -> i32 { apply(identity, 42) }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -330,7 +330,7 @@ fn index_access_expected_type_constrains_generic_element() {
 #[test]
 fn rejects_impl_type_arguments_on_associated_function() {
     let result = check(
-        r#"
+        r"
         struct Container<T> {
             pointer: *const T,
         }
@@ -342,7 +342,7 @@ fn rejects_impl_type_arguments_on_associated_function() {
         fun main() {
             Container::take::<i32>(1);
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
@@ -356,7 +356,7 @@ fn rejects_impl_type_arguments_on_associated_function() {
 #[test]
 fn infers_generic_method_arguments() {
     let result = check(
-        r#"
+        r"
         pub struct C {}
 
         impl C {
@@ -367,7 +367,7 @@ fn infers_generic_method_arguments() {
             let c = C {};
             c.test(1);
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -412,13 +412,13 @@ fn method_generic_can_shadow_impl_generic() {
 #[test]
 fn infers_generic_function_parameter_from_anonymous_function() {
     let result = check(
-        r#"
+        r"
         fun test<T>(value: T, f: impl Fn(T) -> T) { f(value); }
 
         fun main() {
             test(1, fun(x) { x + 1 });
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -427,7 +427,7 @@ fn infers_generic_function_parameter_from_anonymous_function() {
 #[test]
 fn infers_const_generic_array_length_from_struct_field() {
     let result = check(
-        r#"
+        r"
         struct Buffer<T, const N: usize> {
             data: [T; N],
         }
@@ -436,7 +436,7 @@ fn infers_const_generic_array_length_from_struct_field() {
             let b = Buffer { data: [1, 2, 3] };
             let x = b.data[0];
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -445,7 +445,7 @@ fn infers_const_generic_array_length_from_struct_field() {
 #[test]
 fn accepts_explicit_const_generic_argument() {
     let result = check(
-        r#"
+        r"
         struct Buffer<T, const N: usize> {
             data: [T; N],
         }
@@ -453,7 +453,7 @@ fn accepts_explicit_const_generic_argument() {
         fun main() {
             let b: Buffer<i32, 3> = Buffer { data: [1, 2, 3] };
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -462,7 +462,7 @@ fn accepts_explicit_const_generic_argument() {
 #[test]
 fn infers_const_generic_array_length_for_function_call() {
     let result = check(
-        r#"
+        r"
         fun len<const N: usize>(values: [i32; N]) -> i32 {
             0
         }
@@ -470,7 +470,7 @@ fn infers_const_generic_array_length_for_function_call() {
         fun main() {
             let n = len([1, 2, 3]);
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -479,7 +479,7 @@ fn infers_const_generic_array_length_for_function_call() {
 #[test]
 fn reports_uninferred_generic_function_type_arg() {
     let result = check(
-        r#"
+        r"
         fun make<T>() -> T {
             1
         }
@@ -487,7 +487,7 @@ fn reports_uninferred_generic_function_type_arg() {
         fun main() {
             let x = make();
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -501,7 +501,7 @@ fn reports_uninferred_generic_function_type_arg() {
 #[test]
 fn reports_growing_generic_recursion() {
     let result = check(
-        r#"
+        r"
         struct Wrap<T> {
             inner: T,
         }
@@ -517,7 +517,7 @@ fn reports_growing_generic_recursion() {
         fun main() -> i32 {
             return f(0i32);
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diag| {
@@ -529,7 +529,7 @@ fn reports_growing_generic_recursion() {
 #[test]
 fn infers_and_calls_anonymous_function() {
     let result = check(
-        r#"
+        r"
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 {
             f(value)
         }
@@ -538,7 +538,7 @@ fn infers_and_calls_anonymous_function() {
             let inc = fun(x) { x + 1 };
             apply(inc, 41)
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -547,12 +547,12 @@ fn infers_and_calls_anonymous_function() {
 #[test]
 fn later_call_constrains_anonymous_parameter_type() {
     let result = check(
-        r#"
+        r"
         fun main() -> i32 {
             let identity = fun(value) { value };
             identity(42)
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -561,13 +561,13 @@ fn later_call_constrains_anonymous_parameter_type() {
 #[test]
 fn infers_shared_closure_capture() {
     let result = check(
-        r#"
+        r"
         fun main() -> i32 {
             let base = 1;
             let add = fun(x: i32) { x + base };
             add(41)
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -581,7 +581,7 @@ fn infers_shared_closure_capture() {
 #[test]
 fn captures_pattern_bindings() {
     let result = check(
-        r#"
+        r"
         fun main() -> i32 {
             match 1 {
                 base => {
@@ -590,7 +590,7 @@ fn captures_pattern_bindings() {
                 }
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -603,7 +603,7 @@ fn captures_pattern_bindings() {
 #[test]
 fn infers_mutable_closure_capture() {
     let result = check(
-        r#"
+        r"
         fun main() -> i32 {
             let mut total = 0;
             let mut add = fun(value: i32) -> i32 {
@@ -612,7 +612,7 @@ fn infers_mutable_closure_capture() {
             };
             add(1)
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -655,14 +655,14 @@ fn mutable_closure_requires_mutable_binding() {
 #[test]
 fn infers_once_closure_capture() {
     let result = check(
-        r#"
+        r"
         struct Token { value: i32 }
         fun consume(value: Token) {}
         fun main() {
             let token = Token { value: 1 };
             let once = fun() { consume(token); };
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -674,7 +674,7 @@ fn infers_once_closure_capture() {
 #[test]
 fn by_value_method_receiver_makes_once_closure() {
     let result = check(
-        r#"
+        r"
         struct Token { value: i32 }
         impl Token {
             fun consume(self) -> i32 { self.value }
@@ -683,7 +683,7 @@ fn by_value_method_receiver_makes_once_closure() {
             let token = Token { value: 1 };
             let once = fun() { token.consume() };
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -695,7 +695,7 @@ fn by_value_method_receiver_makes_once_closure() {
 #[test]
 fn once_closure_is_rejected_at_fn_boundary() {
     let result = check(
-        r#"
+        r"
         struct Token { value: i32 }
         fun consume(value: Token) {}
         fun call(callback: impl Fn() -> ()) { callback(); }
@@ -704,7 +704,7 @@ fn once_closure_is_rejected_at_fn_boundary() {
             let once = fun() { consume(token); };
             call(once);
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
@@ -717,13 +717,13 @@ fn once_closure_is_rejected_at_fn_boundary() {
 #[test]
 fn nested_closure_does_not_capture_inner_parameters_in_outer_environment() {
     let result = check(
-        r#"
+        r"
         fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
             fun(first: i32) {
                 fun(second: i32) { base + first + second }
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -747,7 +747,7 @@ fn reports_uninferred_anonymous_parameter() {
 #[test]
 fn destructuring_let_binds_every_element() {
     let result = check(
-        r#"
+        r"
         struct Point { x: i32, y: bool }
 
         fun main() {
@@ -756,7 +756,7 @@ fn destructuring_let_binds_every_element() {
             let flags: bool = b && y;
             let sum: i32 = a + x;
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -776,7 +776,7 @@ fn reference_patterns_use_rust_binding_modes() {
     );
 
     let ergonomic = check(
-        r#"
+        r"
         fun shared(value: &(i32, bool)) -> i32 {
             let (number, flag) = value;
             if *flag { *number } else { 0 }
@@ -785,7 +785,7 @@ fn reference_patterns_use_rust_binding_modes() {
             let (left, right) = value;
             *left + *right
         }
-        "#,
+        ",
     );
     assert_eq!(ergonomic.diagnostics, vec![]);
     let binding_types = ergonomic
@@ -820,7 +820,7 @@ fn reference_patterns_use_rust_binding_modes() {
 #[test]
 fn rust_2024_rejects_binding_modifiers_inside_ergonomic_patterns() {
     let result = check(
-        r#"
+        r"
         fun mutable_binding(value: &(i32,)) {
             let (mut item,) = value;
         }
@@ -830,7 +830,7 @@ fn rust_2024_rejects_binding_modifiers_inside_ergonomic_patterns() {
         fun mismatched_reference(value: &mut i32) {
             let &item = value;
         }
-        "#,
+        ",
     );
 
     let errors = result
@@ -844,7 +844,7 @@ fn rust_2024_rejects_binding_modifiers_inside_ergonomic_patterns() {
 #[test]
 fn nested_and_named_patterns_inherit_reference_binding_modes() {
     let result = check(
-        r#"
+        r"
         struct Pair { left: i32, right: i32 }
         enum Maybe { Some(i32), None }
 
@@ -866,7 +866,7 @@ fn nested_and_named_patterns_inherit_reference_binding_modes() {
                 None => 0,
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -895,12 +895,12 @@ fn nested_and_named_patterns_inherit_reference_binding_modes() {
 #[test]
 fn delayed_let_rejects_reference_destructuring() {
     let result = check(
-        r#"
+        r"
         fun delayed() {
             let (implicit,): &(i32,);
             let &(explicit,): &(i32,);
         }
-        "#,
+        ",
     );
 
     let errors = result
@@ -914,12 +914,12 @@ fn delayed_let_rejects_reference_destructuring() {
 #[test]
 fn destructuring_let_checks_element_types() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let (a, b) = (1i32, true);
             let wrong: i32 = b;
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -935,11 +935,11 @@ fn destructuring_let_checks_element_types() {
 #[test]
 fn duplicate_bindings_in_one_pattern_are_rejected() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let (value, value) = (1i32, 2i32);
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -954,13 +954,13 @@ fn duplicate_bindings_in_one_pattern_are_rejected() {
 #[test]
 fn duplicate_bindings_are_rejected_in_match_patterns() {
     let result = check(
-        r#"
+        r"
         fun main() {
             match (1i32, 2i32) {
                 (value, value) => {},
             }
         }
-        "#,
+        ",
     );
 
     let duplicates = result
@@ -974,12 +974,12 @@ fn duplicate_bindings_are_rejected_in_match_patterns() {
 #[test]
 fn mut_on_a_destructured_binding_allows_reassignment() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let (mut a, b) = (1i32, 2i32);
             a = a + b;
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -988,12 +988,12 @@ fn mut_on_a_destructured_binding_allows_reassignment() {
 #[test]
 fn immutable_destructured_binding_rejects_reassignment() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let (a, b) = (1i32, 2i32);
             a = b;
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1009,14 +1009,14 @@ fn immutable_destructured_binding_rejects_reassignment() {
 #[test]
 fn rejects_refutable_patterns_in_let_bindings() {
     let result = check(
-        r#"
+        r"
         enum Opt { None, Some(i32) }
 
         fun main() {
             let value = Opt::Some(1i32);
             let Opt::Some(inner) = value;
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1031,7 +1031,7 @@ fn rejects_refutable_patterns_in_let_bindings() {
 #[test]
 fn accepts_irrefutable_patterns_in_let_bindings() {
     let result = check(
-        r#"
+        r"
         struct Wrapper { inner: i32 }
 
         fun main() {
@@ -1039,7 +1039,7 @@ fn accepts_irrefutable_patterns_in_let_bindings() {
             let Wrapper { inner } = Wrapper { inner: a + b + c };
             let total: i32 = inner;
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1048,11 +1048,11 @@ fn accepts_irrefutable_patterns_in_let_bindings() {
 #[test]
 fn wrong_tuple_arity_in_let_reports_only_the_shape_error() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let (a, b, c) = (1i32, 2i32);
         }
-        "#,
+        ",
     );
 
     let codes = result
@@ -1066,13 +1066,13 @@ fn wrong_tuple_arity_in_let_reports_only_the_shape_error() {
 #[test]
 fn accepts_let_bindings_with_delayed_initialization() {
     let result = check(
-        r#"
+        r"
         fun main() -> i32 {
             let value: i32;
             value = 7;
             value
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![], "{:#?}", result.diagnostics);
@@ -1081,13 +1081,13 @@ fn accepts_let_bindings_with_delayed_initialization() {
 #[test]
 fn infers_delayed_binding_type_from_first_assignment() {
     let result = check(
-        r#"
+        r"
         fun main() -> i32 {
             let value;
             value = 7;
             value
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![], "{:#?}", result.diagnostics);
@@ -1105,10 +1105,10 @@ fn delayed_binding_without_a_type_constraint_is_rejected() {
 #[test]
 fn checks_const_initializer_type() {
     let result = check(
-        r#"
+        r"
         const ANSWER: i32 = true;
         fun main() {}
-        "#,
+        ",
     );
 
     assert!(
@@ -1124,10 +1124,10 @@ fn checks_const_initializer_type() {
 #[test]
 fn rejects_non_constant_initializers_and_const_cycles() {
     let impure = check(
-        r#"
+        r"
         fun make() -> i32 { 1 }
         const BAD: i32 = make();
-        "#,
+        ",
     );
     assert!(
         impure
@@ -1139,10 +1139,10 @@ fn rejects_non_constant_initializers_and_const_cycles() {
     );
 
     let cycle = check(
-        r#"
+        r"
         const FIRST: i32 = SECOND;
         const SECOND: i32 = FIRST;
-        "#,
+        ",
     );
     assert!(
         cycle.diagnostics.iter().any(|diagnostic| {
@@ -1156,7 +1156,7 @@ fn rejects_non_constant_initializers_and_const_cycles() {
 #[test]
 fn resolves_top_level_aliases_qualified_types_and_imported_types() {
     let result = check(
-        r#"
+        r"
         type Number = i32;
 
         mod model {
@@ -1169,7 +1169,7 @@ fn resolves_top_level_aliases_qualified_types_and_imported_types() {
         fun read(first: model::Point, second: model::PublicPoint, third: ImportedPoint) -> Number {
             first.value + second.value + third.value
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1178,14 +1178,14 @@ fn resolves_top_level_aliases_qualified_types_and_imported_types() {
 #[test]
 fn nested_private_types_do_not_leak_into_outer_type_scope() {
     let result = check(
-        r#"
+        r"
         mod hidden {
             struct Secret {}
             pub fun make() -> Secret { Secret {} }
         }
 
         fun expose(value: Secret) {}
-        "#,
+        ",
     );
 
     assert!(
@@ -1201,12 +1201,12 @@ fn nested_private_types_do_not_leak_into_outer_type_scope() {
 #[test]
 fn self_application_reports_an_infinite_type_without_overflowing() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let id = fun(value) { value };
             id(id);
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
@@ -1217,13 +1217,13 @@ fn self_application_reports_an_infinite_type_without_overflowing() {
 #[test]
 fn different_anonymous_function_expressions_have_different_types() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let first = fun(value: i32) { value };
             let second = fun(value: i32) { value };
             let selected = if true { first } else { second };
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
@@ -1234,7 +1234,7 @@ fn different_anonymous_function_expressions_have_different_types() {
 #[test]
 fn impl_fn_accepts_closures_and_safe_named_functions() {
     let result = check(
-        r#"
+        r"
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun increment(value: i32) -> i32 { value + 1 }
 
@@ -1242,7 +1242,7 @@ fn impl_fn_accepts_closures_and_safe_named_functions() {
             let add_two = fun(value: i32) { value + 2 };
             apply(increment, 39) + apply(add_two, 0)
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -1250,7 +1250,7 @@ fn impl_fn_accepts_closures_and_safe_named_functions() {
 #[test]
 fn callable_generic_arguments_are_fully_resolved() {
     let result = check(
-        r#"
+        r"
         fun run_mut(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
             f(value);
             f(value)
@@ -1260,7 +1260,7 @@ fn callable_generic_arguments_are_fully_resolved() {
             let add = fun(value: i32) { total += value; total };
             run_mut(add, 2)
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1282,7 +1282,7 @@ fn callable_generic_arguments_are_fully_resolved() {
 #[test]
 fn explicit_callable_bound_can_name_one_callable_type() {
     let result = check(
-        r#"
+        r"
         fun call_twice<F>(mut f: F, value: i32) -> i32
         where F: FnMut(i32) -> i32
         {
@@ -1290,7 +1290,7 @@ fn explicit_callable_bound_can_name_one_callable_type() {
             f(value)
         }
         fun main() -> i32 { call_twice(fun(value: i32) { value + 1 }, 1) }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -1298,17 +1298,17 @@ fn explicit_callable_bound_can_name_one_callable_type() {
 #[test]
 fn return_position_impl_fn_has_one_hidden_type() {
     let valid = check(
-        r#"
+        r"
         fun make(base: i32) -> impl Fn(i32) -> i32 {
             move fun(value: i32) { base + value }
         }
         fun main() -> i32 { make(40)(2) }
-        "#,
+        ",
     );
     assert_eq!(valid.diagnostics, vec![]);
 
     let invalid = check(
-        r#"
+        r"
         fun choose(flag: bool) -> impl Fn(i32) -> i32 {
             if flag {
                 fun(value: i32) { value + 1 }
@@ -1316,7 +1316,7 @@ fn return_position_impl_fn_has_one_hidden_type() {
                 fun(value: i32) { value + 2 }
             }
         }
-        "#,
+        ",
     );
     assert!(
         invalid
@@ -1329,7 +1329,7 @@ fn return_position_impl_fn_has_one_hidden_type() {
 #[test]
 fn each_impl_fn_parameter_has_an_independent_hidden_type() {
     let result = check(
-        r#"
+        r"
         fun combine(
             first: impl Fn(i32) -> i32,
             second: impl Fn(i32) -> i32,
@@ -1344,7 +1344,7 @@ fn each_impl_fn_parameter_has_an_independent_hidden_type() {
                 1,
             )
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -1352,7 +1352,7 @@ fn each_impl_fn_parameter_has_an_independent_hidden_type() {
 #[test]
 fn callable_capability_requirements_follow_the_fn_hierarchy() {
     let result = check(
-        r#"
+        r"
         struct Token { value: i32 }
         fun needs_fn(f: impl Fn() -> i32) -> i32 { f() }
         fun needs_mut(mut f: impl FnMut() -> i32) -> i32 { f() }
@@ -1376,7 +1376,7 @@ fn callable_capability_requirements_follow_the_fn_hierarchy() {
             needs_once(mutable_for_once);
             needs_once(once);
         }
-        "#,
+        ",
     );
     assert_eq!(result.diagnostics, vec![]);
 }
@@ -1384,7 +1384,7 @@ fn callable_capability_requirements_follow_the_fn_hierarchy() {
 #[test]
 fn move_capture_does_not_make_a_read_only_closure_fn_once() {
     let result = check(
-        r#"
+        r"
         struct Token { value: i32 }
         fun main() {
             let token = Token { value: 1 };
@@ -1392,7 +1392,7 @@ fn move_capture_does_not_make_a_read_only_closure_fn_once() {
             read();
             read();
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1404,9 +1404,9 @@ fn move_capture_does_not_make_a_read_only_closure_fn_once() {
 #[test]
 fn mutable_callable_parameter_requires_mut() {
     let result = check(
-        r#"
+        r"
         fun run(f: impl FnMut() -> i32) -> i32 { f() }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
@@ -1417,12 +1417,12 @@ fn mutable_callable_parameter_requires_mut() {
 #[test]
 fn ordinary_mutable_parameter_can_be_assigned() {
     let result = check(
-        r#"
+        r"
         fun increment(mut value: i32) -> i32 {
             value += 1;
             value
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1431,7 +1431,7 @@ fn ordinary_mutable_parameter_can_be_assigned() {
 #[test]
 fn wildcard_match_does_not_make_a_closure_fn_once() {
     let result = check(
-        r#"
+        r"
         struct Token { value: i32 }
         fun main() {
             let token = Token { value: 1 };
@@ -1439,7 +1439,7 @@ fn wildcard_match_does_not_make_a_closure_fn_once() {
             inspect();
             inspect();
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1452,13 +1452,13 @@ fn wildcard_match_does_not_make_a_closure_fn_once() {
 #[test]
 fn captures_only_the_referenced_struct_field() {
     let result = check(
-        r#"
+        r"
         struct Pair { left: i32, right: i32 }
         fun main() {
             let pair = Pair { left: 1, right: 2 };
             let read = fun() { pair.left };
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1472,11 +1472,11 @@ fn captures_only_the_referenced_struct_field() {
 #[test]
 fn dynamic_index_and_deref_stop_capture_projection_at_their_base() {
     let indexed = check(
-        r#"
+        r"
         fun inspect(values: [i32; 2], index: usize) {
             let read = fun() { values[index] };
         }
-        "#,
+        ",
     );
     assert_eq!(indexed.diagnostics, vec![]);
     let indexed_info = indexed.lambda_infos.values().next().unwrap();
@@ -1488,11 +1488,11 @@ fn dynamic_index_and_deref_stop_capture_projection_at_their_base() {
     assert!(values.place.projections.is_empty());
 
     let dereferenced = check(
-        r#"
+        r"
         fun inspect(value: &i32) {
             let read = fun() { *value };
         }
-        "#,
+        ",
     );
     assert_eq!(dereferenced.diagnostics, vec![]);
     let capture = &dereferenced.lambda_infos.values().next().unwrap().captures[0];

@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    BodyCtx, Expr, ExprId, FunctionId, HashMap, HashSet, HirFunction, HirTypeRef, LangItem, Name,
+    PatternBindingId, PendingGenericCall, ResolvedMethod, ResolvedName, TraitId, TraitMethodCall,
+    Type, TypeChecker, UnaryOp, ValueUse, bound_target_param, callable_signature_type,
+    collect_subst, expected_has_param, generic_param_map_with_consts, method_is_visible_for_owner,
+    record_generic_arg_spans, substitute_type, type_has_unresolved_inference,
+};
 
 impl TypeChecker<'_> {
     pub(super) fn check_method_call(
@@ -49,9 +55,10 @@ impl TypeChecker<'_> {
                     },
                     _ => None,
                 };
-                let owner = owner
-                    .map(|id| format!("struct `{}`", self.hir.item_tree.structs[id].name.0))
-                    .unwrap_or_else(|| format!("type `{}`", base_ty.display(self.hir)));
+                let owner = owner.map_or_else(
+                    || format!("type `{}`", base_ty.display(self.hir)),
+                    |id| format!("struct `{}`", self.hir.item_tree.structs[id].name.0),
+                );
                 self.diagnostic(
                     "E0054",
                     format!(
@@ -64,13 +71,31 @@ impl TypeChecker<'_> {
             }
         };
 
+        self.check_resolved_method_call(
+            ctx,
+            (callee, base, args, type_args),
+            (expected, span),
+            (base_ty, method),
+        )
+    }
+
+    fn check_resolved_method_call(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        call: (ExprId, ExprId, &[ExprId], &[HirTypeRef]),
+        expected_span: (Option<&Type>, Option<rowan::TextRange>),
+        resolved: (Type, ResolvedMethod),
+    ) -> Type {
+        let (callee, base, args, type_args) = call;
+        let (expected, span) = expected_span;
+        let (base_ty, method) = resolved;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
-
         let impl_generics = self.impl_generic_names(method.fid);
         let impl_const_generics = self.impl_const_generic_names(method.fid);
-        let method_params = generic_param_map_with_consts(
+        let mut params = method.subst.clone();
+        params.extend(generic_param_map_with_consts(
             method
                 .function
                 .generics
@@ -82,31 +107,9 @@ impl TypeChecker<'_> {
                 .const_generics
                 .iter()
                 .map(|name| name.0.as_str()),
-        );
-        let mut params = method.subst.clone();
-        params.extend(method_params);
+        ));
         let mut subst = HashMap::new();
-
-        if !type_args.is_empty() {
-            if type_args.len() != method.function.generics.len() {
-                self.diagnostic(
-                    "E0005",
-                    format!(
-                        "method `{}` expects {} type argument(s), got {}",
-                        method.function.name.0,
-                        method.function.generics.len(),
-                        type_args.len()
-                    ),
-                    span,
-                );
-            }
-            for (param_name, type_arg) in method.function.generics.iter().zip(type_args) {
-                let lowered =
-                    self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
-                subst.insert(param_name.0.clone(), lowered);
-            }
-        }
-
+        self.apply_method_type_args(ctx, &method, type_args, &mut subst, span);
         self.seed_type_inference(
             method
                 .function
@@ -116,7 +119,85 @@ impl TypeChecker<'_> {
                 .map(|name| name.0.as_str()),
             &mut subst,
         );
+        self.record_method_metadata(ctx, callee, &method, span);
+        let generic_arg_spans = self.check_method_arguments(
+            ctx,
+            (base, args),
+            &method,
+            (&base_ty, &params, &mut subst),
+            span,
+        );
+        if !impl_generics.is_empty()
+            || !impl_const_generics.is_empty()
+            || !method.function.generics.is_empty()
+            || !method.function.implicit_generics.is_empty()
+            || !method.function.const_generics.is_empty()
+        {
+            self.record_method_generic_call(
+                ctx,
+                (callee, method.fid),
+                &method,
+                (&impl_generics, &impl_const_generics),
+                (&subst, generic_arg_spans),
+                span,
+            );
+        }
+        let return_ty = method.function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            substitute_type(
+                &self.lower_type_ref_with_params_at(
+                    ty,
+                    &params,
+                    method
+                        .function
+                        .ret_type_range
+                        .or(Some(method.function.name_range)),
+                ),
+                &subst,
+            )
+        });
+        if let Some(expected) = expected {
+            let _ = self.unify_types(&return_ty, expected);
+            self.last_occurs_error = None;
+        }
+        return_ty
+    }
 
+    fn apply_method_type_args(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        method: &ResolvedMethod,
+        type_args: &[HirTypeRef],
+        subst: &mut HashMap<String, Type>,
+        span: Option<rowan::TextRange>,
+    ) {
+        if type_args.is_empty() {
+            return;
+        }
+        if type_args.len() != method.function.generics.len() {
+            self.diagnostic(
+                "E0005",
+                format!(
+                    "method `{}` expects {} type argument(s), got {}",
+                    method.function.name.0,
+                    method.function.generics.len(),
+                    type_args.len()
+                ),
+                span,
+            );
+        }
+        for (param_name, type_arg) in method.function.generics.iter().zip(type_args) {
+            let lowered = self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
+            subst.insert(param_name.0.clone(), lowered);
+        }
+    }
+
+    fn record_method_metadata(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        callee: ExprId,
+        method: &ResolvedMethod,
+        span: Option<rowan::TextRange>,
+    ) {
         if method.trait_id.is_some_and(|trait_id| {
             self.result.trait_env.lang_items.get(LangItem::Drop) == Some(trait_id)
         }) {
@@ -126,7 +207,6 @@ impl TypeChecker<'_> {
                 span,
             );
         }
-
         self.result.expr_types.insert(
             (ctx.body_id, callee),
             Type::FunctionItem {
@@ -143,7 +223,18 @@ impl TypeChecker<'_> {
                 },
             );
         }
+    }
 
+    fn check_method_arguments(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        call: (ExprId, &[ExprId]),
+        method: &ResolvedMethod,
+        types: (&Type, &HashMap<String, Type>, &mut HashMap<String, Type>),
+        span: Option<rowan::TextRange>,
+    ) -> HashMap<String, rowan::TextRange> {
+        let (base, args) = call;
+        let (base_ty, params, subst) = types;
         let receiver_count = usize::from(!method.function.params.is_empty());
         let expected_arg_count = method.function.params.len().saturating_sub(receiver_count);
         if args.len() != expected_arg_count {
@@ -158,149 +249,126 @@ impl TypeChecker<'_> {
                 span,
             );
         }
-
         if let Some(receiver) = method.function.params.first() {
             let expected = self.lower_type_ref_with_params_at(
                 &receiver.ty,
                 &method.subst,
                 Some(receiver.ty_range),
             );
-            let actual = self.receiver_argument_type(&base_ty, &expected);
-            // A `&mut self` receiver only constrains the *place* when the
-            // compiler has to auto-ref it; an already-mutable reference is
-            // reborrowed, so `target.push(..)` is fine for `target: &mut T`.
+            let actual = Self::receiver_argument_type(base_ty, &expected);
             if matches!(expected, Type::Ref(_, true)) && !matches!(base_ty, Type::Ref(_, true)) {
                 self.check_assign_mut(ctx, base, ctx.expr_range(base));
             }
             self.record_value_use(ctx, base, Self::hir_parameter_value_use(&receiver.ty));
             self.expect_assignable(&expected, &actual, "method receiver", ctx.expr_range(base));
         }
-
         let mut generic_arg_spans = HashMap::new();
         for (index, arg) in args.iter().enumerate() {
-            if let Some(param) = method.function.params.get(index + receiver_count) {
-                let pattern =
-                    self.lower_type_ref_with_params_at(&param.ty, &params, Some(param.ty_range));
-                record_generic_arg_spans(
-                    &pattern,
-                    &params,
-                    ctx.expr_range(*arg),
-                    &mut generic_arg_spans,
-                );
-                let expected = substitute_type(&pattern, &subst);
-                let callable_expected = self
-                    .callable_bound_for_function_type(&method.function, &pattern, &params)
-                    .map(callable_signature_type)
-                    .map(|ty| substitute_type(&ty, &subst));
-                let actual = match callable_expected.as_ref() {
-                    Some(expected) => self.check_expr_expected(ctx, *arg, expected),
-                    None if expected_has_param(&expected) => self.check_expr(ctx, *arg),
-                    None => self.check_expr_expected(ctx, *arg, &expected),
-                };
-                if let Some(expected) = callable_expected.as_ref() {
-                    let _ = self.unify_types(expected, &actual);
-                    self.last_occurs_error = None;
-                }
-                collect_subst(&pattern, &actual, &mut subst);
-                let expected = substitute_type(&pattern, &subst);
-                self.expect_assignable(&expected, &actual, "method argument", ctx.expr_range(*arg));
-                self.record_value_use(ctx, *arg, Self::hir_parameter_value_use(&param.ty));
-            } else {
+            let Some(param) = method.function.params.get(index + receiver_count) else {
                 self.check_expr(ctx, *arg);
                 self.record_value_use(ctx, *arg, ValueUse::Move);
+                continue;
+            };
+            let pattern =
+                self.lower_type_ref_with_params_at(&param.ty, params, Some(param.ty_range));
+            record_generic_arg_spans(
+                &pattern,
+                params,
+                ctx.expr_range(*arg),
+                &mut generic_arg_spans,
+            );
+            let expected = substitute_type(&pattern, subst);
+            let callable_expected = self
+                .callable_bound_for_function_type(&method.function, &pattern, params)
+                .map(callable_signature_type)
+                .map(|ty| substitute_type(&ty, subst));
+            let actual = match callable_expected.as_ref() {
+                Some(expected) => self.check_expr_expected(ctx, *arg, expected),
+                None if expected_has_param(&expected) => self.check_expr(ctx, *arg),
+                None => self.check_expr_expected(ctx, *arg, &expected),
+            };
+            if let Some(expected) = callable_expected.as_ref() {
+                let _ = self.unify_types(expected, &actual);
+                self.last_occurs_error = None;
             }
+            collect_subst(&pattern, &actual, subst);
+            let expected = substitute_type(&pattern, subst);
+            self.expect_assignable(&expected, &actual, "method argument", ctx.expr_range(*arg));
+            self.record_value_use(ctx, *arg, Self::hir_parameter_value_use(&param.ty));
         }
+        generic_arg_spans
+    }
 
-        if !impl_generics.is_empty()
-            || !impl_const_generics.is_empty()
-            || !method.function.generics.is_empty()
-            || !method.function.implicit_generics.is_empty()
-            || !method.function.const_generics.is_empty()
-        {
-            let inferred_names = method
+    fn record_method_generic_call(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        call: (ExprId, FunctionId),
+        method: &ResolvedMethod,
+        impl_generics: (&[String], &[String]),
+        inference: (&HashMap<String, Type>, HashMap<String, rowan::TextRange>),
+        span: Option<rowan::TextRange>,
+    ) {
+        let (callee, function_id) = call;
+        let (impl_generics, impl_const_generics) = impl_generics;
+        let (subst, generic_arg_spans) = inference;
+        let inferred_names = method
+            .function
+            .generics
+            .iter()
+            .chain(&method.function.implicit_generics)
+            .chain(&method.function.const_generics)
+            .map(|name| name.0.as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut bound_subst = method.subst.clone();
+        bound_subst.extend(subst.clone());
+        let mut generic_args = impl_generics
+            .iter()
+            .map(|name| method.subst.get(name).cloned().unwrap_or(Type::Unknown))
+            .collect::<Vec<_>>();
+        generic_args.extend(
+            method
                 .function
                 .generics
                 .iter()
-                .chain(&method.function.implicit_generics)
-                .chain(&method.function.const_generics)
-                .map(|name| name.0.as_str())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            let mut bound_subst = method.subst.clone();
-            bound_subst.extend(subst.clone());
-            let mut generic_args = impl_generics
+                .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown)),
+        );
+        generic_args.extend(
+            method
+                .function
+                .implicit_generics
                 .iter()
-                .map(String::as_str)
-                .map(|name| method.subst.get(name).cloned().unwrap_or(Type::Unknown))
-                .collect::<Vec<_>>();
-            generic_args.extend(
-                method
-                    .function
-                    .generics
-                    .iter()
-                    .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown)),
-            );
-            generic_args.extend(
-                method
-                    .function
-                    .implicit_generics
-                    .iter()
-                    .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown)),
-            );
-            generic_args.extend(
-                impl_const_generics
-                    .iter()
-                    .map(|name| method.subst.get(name).cloned().unwrap_or(Type::Unknown)),
-            );
-            generic_args.extend(
-                method
-                    .function
-                    .const_generics
-                    .iter()
-                    .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown)),
-            );
-            self.result.generic_calls.insert(
-                (ctx.body_id, callee),
-                crate::result::GenericCall { args: generic_args },
-            );
-            self.pending_generic_calls.push(PendingGenericCall {
-                body_id: ctx.body_id,
-                callee,
-                function: method.fid,
-                inferred_names,
-                subst: bound_subst,
-                generic_arg_spans,
-                callee_span: ctx.expr_range(callee),
-                span,
-                kind: "method",
-                caller: None,
-                check_sized: false,
-            });
-        }
-
-        let return_ty = method
-            .function
-            .ret_type
-            .as_ref()
-            .map(|ty| {
-                substitute_type(
-                    &self.lower_type_ref_with_params_at(
-                        ty,
-                        &params,
-                        method
-                            .function
-                            .ret_type_range
-                            .or(Some(method.function.name_range)),
-                    ),
-                    &subst,
-                )
-            })
-            .unwrap_or(Type::Unit);
-        if let Some(expected) = expected {
-            let _ = self.unify_types(&return_ty, expected);
-            self.last_occurs_error = None;
-        }
-        return_ty
+                .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown)),
+        );
+        generic_args.extend(
+            impl_const_generics
+                .iter()
+                .map(|name| method.subst.get(name).cloned().unwrap_or(Type::Unknown)),
+        );
+        generic_args.extend(
+            method
+                .function
+                .const_generics
+                .iter()
+                .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown)),
+        );
+        self.result.generic_calls.insert(
+            (ctx.body_id, callee),
+            crate::result::GenericCall { args: generic_args },
+        );
+        self.pending_generic_calls.push(PendingGenericCall {
+            body_id: ctx.body_id,
+            callee,
+            function: function_id,
+            inferred_names,
+            subst: bound_subst,
+            generic_arg_spans,
+            callee_span: ctx.expr_range(callee),
+            span,
+            kind: "method",
+            caller: None,
+            check_sized: false,
+        });
     }
 
     pub(super) fn find_method(
@@ -309,12 +377,12 @@ impl TypeChecker<'_> {
         receiver_ty: &Type,
         method_name: &Name,
     ) -> Result<Option<ResolvedMethod>, FunctionId> {
-        match self.find_inherent_method(ctx, receiver_ty, method_name)? {
-            Some(method) => Ok(Some(method)),
-            None => Ok(self
-                .find_trait_impl_method_by_name(receiver_ty, method_name)
-                .or_else(|| self.find_trait_bound_method(ctx, receiver_ty, method_name))),
+        if let Some(method) = self.find_inherent_method(ctx, receiver_ty, method_name)? {
+            return Ok(Some(method));
         }
+        Ok(self
+            .find_trait_impl_method_by_name(receiver_ty, method_name)
+            .or_else(|| self.find_trait_bound_method(ctx, receiver_ty, method_name)))
     }
 
     pub(super) fn find_inherent_method(
@@ -484,7 +552,7 @@ impl TypeChecker<'_> {
                 && let Some(trait_arg) = self.hir.item_tree.traits[trait_id].generics.first()
             {
                 let expected = subst.get(&trait_arg.0).cloned().unwrap_or(Type::Unknown);
-                if !self.bound_types_match(&expected, trait_arg_ty) {
+                if !Self::bound_types_match(&expected, trait_arg_ty) {
                     continue;
                 }
             }
@@ -498,25 +566,21 @@ impl TypeChecker<'_> {
                     &subst,
                     Some(rhs_param.ty_range),
                 );
-                let actual = self.receiver_argument_type(rhs_ty, &expected);
-                if !self.bound_types_match(&expected, &actual) {
+                let actual = Self::receiver_argument_type(rhs_ty, &expected);
+                if !Self::bound_types_match(&expected, &actual) {
                     continue;
                 }
             }
             if let Some(output_ty) = output_ty.filter(|ty| !ty.is_unknown_like()) {
                 let function = &self.hir.item_tree.functions[fid];
-                let actual = function
-                    .ret_type
-                    .as_ref()
-                    .map(|ty| {
-                        self.lower_type_ref_with_params_at(
-                            ty,
-                            &subst,
-                            function.ret_type_range.or(Some(function.name_range)),
-                        )
-                    })
-                    .unwrap_or(Type::Unit);
-                if !self.bound_types_match(output_ty, &actual) {
+                let actual = function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+                    self.lower_type_ref_with_params_at(
+                        ty,
+                        &subst,
+                        function.ret_type_range.or(Some(function.name_range)),
+                    )
+                });
+                if !Self::bound_types_match(output_ty, &actual) {
                     continue;
                 }
             }
@@ -672,7 +736,7 @@ impl TypeChecker<'_> {
         None
     }
 
-    pub(super) fn receiver_argument_type(&self, base_ty: &Type, expected: &Type) -> Type {
+    pub(super) fn receiver_argument_type(base_ty: &Type, expected: &Type) -> Type {
         match (base_ty, expected) {
             (Type::Ref(actual, true), Type::Ref(expected, false)) if actual == expected => {
                 Type::Ref(actual.clone(), false)
@@ -806,95 +870,12 @@ impl TypeChecker<'_> {
                 .trait_method_calls
                 .get(&(ctx.body_id, lhs))
                 .is_some_and(|call| call.method == "index")
+            && !self.check_mutable_index(ctx, lhs, *base, *index, span)
         {
-            let base = *base;
-            let index = *index;
-            let base_ty = self
-                .result
-                .expr_types
-                .get(&(ctx.body_id, base))
-                .cloned()
-                .unwrap_or(Type::Error);
-            let index_ty = self
-                .result
-                .expr_types
-                .get(&(ctx.body_id, index))
-                .cloned()
-                .unwrap_or(Type::Error);
-            let receiver_ty = match &base_ty {
-                Type::Ref(inner, _) => inner.as_ref(),
-                _ => &base_ty,
-            };
-            let Some(trait_id) = self.result.trait_env.lang_items.get(LangItem::IndexMut) else {
-                self.diagnostic("E0036", "missing `IndexMut` trait", span);
-                return;
-            };
-            if self
-                .check_trait_bound_index(
-                    ctx,
-                    lhs,
-                    base,
-                    index,
-                    receiver_ty,
-                    &index_ty,
-                    trait_id,
-                    "index_mut",
-                    None,
-                )
-                .is_none()
-            {
-                let Some(method) = self.find_trait_impl_method(
-                    receiver_ty,
-                    Some(&index_ty),
-                    Some(&index_ty),
-                    trait_id,
-                    "index_mut",
-                ) else {
-                    self.diagnostic(
-                        "E0036",
-                        format!(
-                            "type `{}` cannot be mutably indexed by `{}`",
-                            base_ty.display(self.hir),
-                            index_ty.display(self.hir)
-                        ),
-                        span,
-                    );
-                    return;
-                };
-                let receiver = &method.function.params[0];
-                let expected_receiver = self.lower_type_ref_with_params_at(
-                    &receiver.ty,
-                    &method.subst,
-                    Some(receiver.ty_range),
-                );
-                let actual_receiver = self.receiver_argument_type(&base_ty, &expected_receiver);
-                self.expect_assignable(
-                    &expected_receiver,
-                    &actual_receiver,
-                    "mutable index receiver",
-                    ctx.expr_range(base),
-                );
-                self.record_value_use(ctx, base, Self::hir_parameter_value_use(&receiver.ty));
-                let index_param = &method.function.params[1];
-                let expected_index = self.lower_type_ref_with_params_at(
-                    &index_param.ty,
-                    &method.subst,
-                    Some(index_param.ty_range),
-                );
-                self.expect_assignable(&expected_index, &index_ty, "index", ctx.expr_range(index));
-                self.constrain_index_type(ctx, index, &index_ty, &expected_index);
-                self.record_value_use(ctx, index, Self::hir_parameter_value_use(&index_param.ty));
-                self.result.trait_method_calls.insert(
-                    (ctx.body_id, lhs),
-                    TraitMethodCall {
-                        trait_id,
-                        method: "index_mut".into(),
-                    },
-                );
-            }
+            return;
         }
         self.record_value_use(ctx, lhs, ValueUse::Mutable);
-        if let Some((id, name)) = self.root_binding_of_expr(ctx, lhs)
+        if let Some((id, name)) = Self::root_binding_of_expr(ctx, lhs)
             && !ctx.bindings.is_mut(id)
             && !ctx.is_delayed_binding(id)
         {
@@ -915,9 +896,103 @@ impl TypeChecker<'_> {
         }
     }
 
-    /// Walk the expression to find the root local StmtId (ignoring dereferences).
+    fn check_mutable_index(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        lhs: ExprId,
+        base: ExprId,
+        index: ExprId,
+        span: Option<rowan::TextRange>,
+    ) -> bool {
+        let base_ty = self
+            .result
+            .expr_types
+            .get(&(ctx.body_id, base))
+            .cloned()
+            .unwrap_or(Type::Error);
+        let index_ty = self
+            .result
+            .expr_types
+            .get(&(ctx.body_id, index))
+            .cloned()
+            .unwrap_or(Type::Error);
+        let receiver_ty = match &base_ty {
+            Type::Ref(inner, _) => inner.as_ref(),
+            _ => &base_ty,
+        };
+        let Some(trait_id) = self.result.trait_env.lang_items.get(LangItem::IndexMut) else {
+            self.diagnostic("E0036", "missing `IndexMut` trait", span);
+            return false;
+        };
+        if self
+            .check_trait_bound_index(
+                ctx,
+                lhs,
+                base,
+                index,
+                receiver_ty,
+                &index_ty,
+                trait_id,
+                "index_mut",
+                None,
+            )
+            .is_some()
+        {
+            return true;
+        }
+        let Some(method) = self.find_trait_impl_method(
+            receiver_ty,
+            Some(&index_ty),
+            Some(&index_ty),
+            trait_id,
+            "index_mut",
+        ) else {
+            self.diagnostic(
+                "E0036",
+                format!(
+                    "type `{}` cannot be mutably indexed by `{}`",
+                    base_ty.display(self.hir),
+                    index_ty.display(self.hir)
+                ),
+                span,
+            );
+            return false;
+        };
+        let receiver = &method.function.params[0];
+        let expected_receiver = self.lower_type_ref_with_params_at(
+            &receiver.ty,
+            &method.subst,
+            Some(receiver.ty_range),
+        );
+        let actual_receiver = Self::receiver_argument_type(&base_ty, &expected_receiver);
+        self.expect_assignable(
+            &expected_receiver,
+            &actual_receiver,
+            "mutable index receiver",
+            ctx.expr_range(base),
+        );
+        self.record_value_use(ctx, base, Self::hir_parameter_value_use(&receiver.ty));
+        let index_param = &method.function.params[1];
+        let expected_index = self.lower_type_ref_with_params_at(
+            &index_param.ty,
+            &method.subst,
+            Some(index_param.ty_range),
+        );
+        self.expect_assignable(&expected_index, &index_ty, "index", ctx.expr_range(index));
+        self.constrain_index_type(ctx, index, &index_ty, &expected_index);
+        self.record_value_use(ctx, index, Self::hir_parameter_value_use(&index_param.ty));
+        self.result.trait_method_calls.insert(
+            (ctx.body_id, lhs),
+            TraitMethodCall {
+                trait_id,
+                method: "index_mut".into(),
+            },
+        );
+        true
+    }
+
+    /// Walk the expression to find the root local `PatternBindingId` (ignoring dereferences).
     pub(super) fn root_binding_of_expr(
-        &self,
         ctx: &BodyCtx<'_>,
         expr_id: ExprId,
     ) -> Option<(PatternBindingId, String)> {
@@ -931,8 +1006,9 @@ impl TypeChecker<'_> {
                     .map(|name| name.0.clone())
                     .unwrap_or_default(),
             )),
-            Expr::FieldAccess { base, .. } => self.root_binding_of_expr(ctx, *base),
-            Expr::IndexAccess { base, .. } => self.root_binding_of_expr(ctx, *base),
+            Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
+                Self::root_binding_of_expr(ctx, *base)
+            }
             _ => None,
         }
     }

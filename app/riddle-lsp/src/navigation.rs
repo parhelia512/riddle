@@ -1,8 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::BuildHasher,
+};
 
 use hir::{
     HirFile, Name,
-    body::{BodyId, Expr, Pattern, PatternBindingId, ResolvedName},
+    body::{BodyId, Expr, ExprId, Pattern, PatternBindingId, ResolvedName},
     item_tree::{
         FunctionId, HirEnum, HirEnumVariant, HirFunction, HirImpl, HirStruct, HirStructField,
         HirTypeRef, HirUseTree, HirUseTreeKind, HirVariantKind, TraitId,
@@ -32,7 +35,7 @@ use crate::{
     completion::BUILTIN_TYPES,
     server::Document,
     session::AnalysisSessions,
-    text::{LineIndex, normalized_path, offset_for_position, range_is_in_source},
+    text::{LineIndex, normalized_path, offset_for_position, range_is_in_source, text_range},
 };
 
 struct Symbol {
@@ -44,9 +47,14 @@ struct Symbol {
 
 const HOVER_DECLARATION_ITEM_LIMIT: usize = 5;
 
-pub fn hover_for_document(
+/// Computes hover information for an open document.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn hover_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     position: Position,
     options: CompileOptions,
     sessions: &AnalysisSessions,
@@ -58,9 +66,14 @@ pub fn hover_for_document(
     Ok(hover_from_analysis(document, &analysis, position))
 }
 
-pub fn definition_for_document(
+/// Finds the definition at a position in an open document.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn definition_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     position: Position,
     options: CompileOptions,
     sessions: &AnalysisSessions,
@@ -72,9 +85,14 @@ pub fn definition_for_document(
     Ok(definition_from_analysis(uri, document, &analysis, position))
 }
 
-pub fn implementation_for_document(
+/// Finds implementations at a position in an open document.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn implementation_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     position: Position,
     options: CompileOptions,
     sessions: &AnalysisSessions,
@@ -88,9 +106,14 @@ pub fn implementation_for_document(
     ))
 }
 
-pub fn references_for_document(
+/// Finds references at a position in an open document.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn references_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     position: Position,
     include_declaration: bool,
     options: CompileOptions,
@@ -109,9 +132,14 @@ pub fn references_for_document(
     ))
 }
 
-pub fn prepare_rename_for_document(
+/// Prepares a rename at a position in an open document.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn prepare_rename_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     position: Position,
     options: CompileOptions,
     sessions: &AnalysisSessions,
@@ -123,9 +151,14 @@ pub fn prepare_rename_for_document(
     Ok(prepare_rename_from_analysis(document, &analysis, position))
 }
 
-pub fn rename_for_document(
+/// Renames a symbol at a position in an open document.
+///
+/// # Errors
+///
+/// Returns an error when the new name is invalid, the document is unavailable, or analysis fails.
+pub fn rename_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     position: Position,
     new_name: &str,
     options: CompileOptions,
@@ -141,7 +174,8 @@ pub fn rename_for_document(
     ))
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
 pub fn hover_for_source(
     source: &str,
     position: Position,
@@ -155,7 +189,13 @@ pub fn hover_for_source(
     hover_from_analysis(&document, &analysis, position)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
+/// Finds a definition in standalone source.
+///
+/// # Panics
+///
+/// Panics if the fixed test document URL cannot be parsed.
 pub fn definition_for_source(
     source: &str,
     position: Position,
@@ -170,7 +210,13 @@ pub fn definition_for_source(
     definition_from_analysis(&uri, &document, &analysis, position)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
+/// Finds implementations in standalone source.
+///
+/// # Panics
+///
+/// Panics if the fixed test document URL cannot be parsed.
 pub fn implementation_for_source(
     source: &str,
     position: Position,
@@ -185,7 +231,13 @@ pub fn implementation_for_source(
     implementation_from_analysis(&uri, &document, &analysis, position)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
+/// Finds references in standalone source.
+///
+/// # Panics
+///
+/// Panics if the fixed test document URL cannot be parsed.
 pub fn references_for_source(
     source: &str,
     position: Position,
@@ -201,7 +253,8 @@ pub fn references_for_source(
     references_from_analysis(&uri, &document, &analysis, position, include_declaration)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+#[must_use]
 pub fn prepare_rename_for_source(
     source: &str,
     position: Position,
@@ -215,7 +268,16 @@ pub fn prepare_rename_for_source(
     prepare_rename_from_analysis(&document, &analysis, position)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
+/// Renames a symbol in standalone source.
+///
+/// # Errors
+///
+/// Returns an error when `new_name` is not a valid Riddle identifier.
+///
+/// # Panics
+///
+/// Panics if the fixed test document URL cannot be parsed.
 pub fn rename_for_source(
     source: &str,
     position: Position,
@@ -235,7 +297,7 @@ pub fn rename_for_source(
     ))
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(feature = "test")]
 fn standalone_analysis(source: &str, options: CompileOptions) -> DocumentAnalysis {
     DocumentAnalysis {
         result: riddlec::pipeline::check_with_options(source, options),
@@ -404,9 +466,9 @@ fn prepare_rename_from_analysis(
     })
 }
 
-fn rename_from_analysis(
+fn rename_from_analysis<S: BuildHasher>(
     uri: &lsp_types::Url,
-    docs: &HashMap<lsp_types::Url, Document>,
+    docs: &HashMap<lsp_types::Url, Document, S>,
     document: &Document,
     analysis: &DocumentAnalysis,
     position: Position,
@@ -427,7 +489,7 @@ fn rename_from_analysis(
                 .1
                 .push(TextEdit::new(location.range, new_name.into()));
         }
-        return workspace_edit(documents, docs);
+        return Some(workspace_edit(documents, docs));
     }
     let target = symbol_at(&document.text, analysis, position)?.definition?;
     renamable_target(analysis, target)?;
@@ -448,13 +510,13 @@ fn rename_from_analysis(
             .push(TextEdit::new(location.range, replacement));
     }
 
-    workspace_edit(documents, docs)
+    Some(workspace_edit(documents, docs))
 }
 
-fn workspace_edit(
+fn workspace_edit<S: BuildHasher>(
     documents: BTreeMap<String, (lsp_types::Url, Vec<TextEdit>)>,
-    docs: &HashMap<lsp_types::Url, Document>,
-) -> Option<WorkspaceEdit> {
+    docs: &HashMap<lsp_types::Url, Document, S>,
+) -> WorkspaceEdit {
     let edits = documents
         .into_values()
         .map(|(uri, mut edits)| {
@@ -475,10 +537,10 @@ fn workspace_edit(
             }
         })
         .collect();
-    Some(WorkspaceEdit {
+    WorkspaceEdit {
         document_changes: Some(DocumentChanges::Edits(edits)),
         ..WorkspaceEdit::default()
-    })
+    }
 }
 
 fn macro_at<'a>(
@@ -522,10 +584,7 @@ fn macro_definition_location(
             lsp_types::Url::from_file_path(&definition.path).ok()?,
             LineIndex::new(&definition.source).range(
                 &definition.source,
-                TextRange::new(
-                    (definition.range.start as u32).into(),
-                    (definition.range.end as u32).into(),
-                ),
+                text_range(definition.range.start, definition.range.end),
             )?,
         ));
     }
@@ -537,10 +596,7 @@ fn macro_source_location(
     range: &std::ops::Range<usize>,
 ) -> Option<Location> {
     let source_map = analysis.macro_source_map.as_ref()?;
-    let mapped = source_map.map_range(TextRange::new(
-        (range.start as u32).into(),
-        (range.end as u32).into(),
-    ))?;
+    let mapped = source_map.map_range(text_range(range.start, range.end))?;
     Some(Location::new(
         lsp_types::Url::from_file_path(mapped.path).ok()?,
         LineIndex::new(mapped.source).range(mapped.source, mapped.range)?,
@@ -560,7 +616,10 @@ fn sort_and_dedup_locations(locations: &mut Vec<Location>) {
     locations.dedup();
 }
 
-fn document_version(docs: &HashMap<lsp_types::Url, Document>, uri: &lsp_types::Url) -> Option<i32> {
+fn document_version<S: BuildHasher>(
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    uri: &lsp_types::Url,
+) -> Option<i32> {
     if let Some(document) = docs.get(uri) {
         return document.version;
     }
@@ -575,7 +634,7 @@ fn document_version(docs: &HashMap<lsp_types::Url, Document>, uri: &lsp_types::U
     })
 }
 
-pub(crate) fn validate_identifier(name: &str) -> Result<(), String> {
+pub fn validate_identifier(name: &str) -> Result<(), String> {
     let tokens = frontend::lexer::lex(name);
     if matches!(tokens.as_slice(), [token] if token.kind == SyntaxKind::Ident && token.span == (0..name.len()))
     {
@@ -586,10 +645,10 @@ pub(crate) fn validate_identifier(name: &str) -> Result<(), String> {
 }
 
 fn renamable_target(analysis: &DocumentAnalysis, target: TextRange) -> Option<()> {
-    match &analysis.source_map {
-        Some(source_map) => source_map.map_range(target).map(|_| ()),
-        None => range_is_in_source(target, analysis.source.len()).then_some(()),
-    }
+    analysis.source_map.as_ref().map_or_else(
+        || range_is_in_source(target, analysis.source.len()).then_some(()),
+        |source_map| source_map.map_range(target).map(|_| ()),
+    )
 }
 
 fn location_for_range(
@@ -716,6 +775,10 @@ fn symbol_occurrences(analysis: &DocumentAnalysis, target: TextRange) -> Vec<Sym
     collect_use_path_occurrences(hir, graph, types, source, target, &mut occurrences);
     collect_pattern_path_occurrences(hir, types, source, target, &mut occurrences);
 
+    deduplicate_symbol_occurrences(occurrences)
+}
+
+fn deduplicate_symbol_occurrences(mut occurrences: Vec<SymbolOccurrence>) -> Vec<SymbolOccurrence> {
     occurrences.sort_by_key(|occurrence| (occurrence.range.start(), occurrence.range.end()));
     let mut deduplicated: Vec<SymbolOccurrence> = Vec::with_capacity(occurrences.len());
     for occurrence in occurrences {
@@ -959,6 +1022,50 @@ fn declaration_symbol(
             }
         }
     }
+    if let Some(symbol) = nominal_declaration_symbol(hir, analysis, origin) {
+        return Some(symbol);
+    }
+    for (_, konst) in hir.item_tree.consts.iter() {
+        if analysis.local_range(konst.name_range) == Some(origin) {
+            return Some(Symbol {
+                origin,
+                detail: format!("const {}: {}", konst.name.0, konst.ty.display()),
+                definition: Some(konst.name_range),
+                implementations: Vec::new(),
+            });
+        }
+    }
+    for (_, alias) in hir.item_tree.type_aliases.iter() {
+        if analysis.local_range(alias.name_range) == Some(origin) {
+            return Some(Symbol {
+                origin,
+                detail: alias.ty.as_ref().map_or_else(
+                    || format!("type {}", alias.name.0),
+                    |ty| format!("type {} = {}", alias.name.0, ty.display()),
+                ),
+                definition: Some(alias.name_range),
+                implementations: Vec::new(),
+            });
+        }
+    }
+    for (_, module) in hir.item_tree.modules.iter() {
+        if analysis.local_range(module.name_range) == Some(origin) {
+            return Some(Symbol {
+                origin,
+                detail: format!("mod {}", module.name.0),
+                definition: Some(module.name_range),
+                implementations: Vec::new(),
+            });
+        }
+    }
+    body_declaration_symbol(hir, types, analysis, origin)
+}
+
+fn nominal_declaration_symbol(
+    hir: &HirFile,
+    analysis: &DocumentAnalysis,
+    origin: TextRange,
+) -> Option<Symbol> {
     for (_, strukt) in hir.item_tree.structs.iter() {
         if analysis.local_range(strukt.name_range) == Some(origin) {
             return Some(Symbol {
@@ -970,12 +1077,7 @@ fn declaration_symbol(
         }
         for field in &strukt.fields {
             if analysis.local_range(field.name_range) == Some(origin) {
-                return Some(Symbol {
-                    origin,
-                    detail: format!("field {}: {}", field.name.0, field.ty.display()),
-                    definition: Some(field.name_range),
-                    implementations: Vec::new(),
-                });
+                return Some(field_symbol(field, origin));
             }
         }
     }
@@ -1010,40 +1112,15 @@ fn declaration_symbol(
             }
         }
     }
-    for (_, konst) in hir.item_tree.consts.iter() {
-        if analysis.local_range(konst.name_range) == Some(origin) {
-            return Some(Symbol {
-                origin,
-                detail: format!("const {}: {}", konst.name.0, konst.ty.display()),
-                definition: Some(konst.name_range),
-                implementations: Vec::new(),
-            });
-        }
-    }
-    for (_, alias) in hir.item_tree.type_aliases.iter() {
-        if analysis.local_range(alias.name_range) == Some(origin) {
-            return Some(Symbol {
-                origin,
-                detail: alias
-                    .ty
-                    .as_ref()
-                    .map(|ty| format!("type {} = {}", alias.name.0, ty.display()))
-                    .unwrap_or_else(|| format!("type {}", alias.name.0)),
-                definition: Some(alias.name_range),
-                implementations: Vec::new(),
-            });
-        }
-    }
-    for (_, module) in hir.item_tree.modules.iter() {
-        if analysis.local_range(module.name_range) == Some(origin) {
-            return Some(Symbol {
-                origin,
-                detail: format!("mod {}", module.name.0),
-                definition: Some(module.name_range),
-                implementations: Vec::new(),
-            });
-        }
-    }
+    None
+}
+
+fn body_declaration_symbol(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    analysis: &DocumentAnalysis,
+    origin: TextRange,
+) -> Option<Symbol> {
     for (body_id, body) in hir.bodies.iter() {
         for (pat_id, pattern) in body.pats.iter() {
             let mut bindings = Vec::new();
@@ -1090,16 +1167,12 @@ fn declaration_symbol(
                     .name_range
                     .is_some_and(|range| analysis.local_range(range) == Some(origin))
                 {
-                    return Some(Symbol {
+                    return Some(parameter_symbol(
+                        &parameter.name,
+                        &parameter.ty,
                         origin,
-                        detail: format!(
-                            "parameter {}: {}",
-                            parameter.name.0,
-                            parameter.ty.display()
-                        ),
-                        definition: parameter.name_range,
-                        implementations: Vec::new(),
-                    });
+                        parameter.name_range,
+                    ));
                 }
             }
         }
@@ -1177,17 +1250,14 @@ fn declaration_symbols(hir: &HirFile, types: &TypeCheckResult, source: &str) -> 
         definition: Some(item.name_range),
         implementations: Vec::new(),
     }));
-    symbols.extend(hir.item_tree.type_aliases.iter().map(|(_, item)| {
-        Symbol {
-            origin: item.name_range,
-            detail: item
-                .ty
-                .as_ref()
-                .map(|ty| format!("type {} = {}", item.name.0, ty.display()))
-                .unwrap_or_else(|| format!("type {}", item.name.0)),
-            definition: Some(item.name_range),
-            implementations: Vec::new(),
-        }
+    symbols.extend(hir.item_tree.type_aliases.iter().map(|(_, item)| Symbol {
+        origin: item.name_range,
+        detail: item.ty.as_ref().map_or_else(
+            || format!("type {}", item.name.0),
+            |ty| format!("type {} = {}", item.name.0, ty.display()),
+        ),
+        definition: Some(item.name_range),
+        implementations: Vec::new(),
     }));
     symbols.extend(hir.item_tree.modules.iter().map(|(_, item)| Symbol {
         origin: item.name_range,
@@ -1196,6 +1266,16 @@ fn declaration_symbols(hir: &HirFile, types: &TypeCheckResult, source: &str) -> 
         implementations: Vec::new(),
     }));
 
+    collect_body_declaration_symbols(hir, types, source, &mut symbols);
+    symbols
+}
+
+fn collect_body_declaration_symbols(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+) {
     for (body_id, body) in hir.bodies.iter() {
         for (pat_id, pattern) in body.pats.iter() {
             let mut bindings = Vec::new();
@@ -1235,16 +1315,15 @@ fn declaration_symbols(hir: &HirFile, types: &TypeCheckResult, source: &str) -> 
             };
             symbols.extend(params.iter().filter_map(|parameter| {
                 let range = parameter.name_range?;
-                Some(Symbol {
-                    origin: range,
-                    detail: format!("parameter {}: {}", parameter.name.0, parameter.ty.display()),
-                    definition: Some(range),
-                    implementations: Vec::new(),
-                })
+                Some(parameter_symbol(
+                    &parameter.name,
+                    &parameter.ty,
+                    range,
+                    Some(range),
+                ))
             }));
         }
     }
-    symbols
 }
 
 fn field_symbol(field: &HirStructField, origin: TextRange) -> Symbol {
@@ -1268,8 +1347,7 @@ fn pattern_binding_symbol(
     let ty = types
         .pattern_binding_types
         .get(&(body, binding))
-        .map(|ty| ty.display(hir))
-        .unwrap_or_else(|| "_".into());
+        .map_or_else(|| "_".into(), |ty| ty.display(hir));
     Symbol {
         origin,
         detail: format!("let {}: {ty}", name.0),
@@ -1576,10 +1654,7 @@ fn field_labels_in_range<'a>(
                     .is_none_or(|next| next.kind != SyntaxKind::Colon);
                 labels.push(FieldLabel {
                     name: token.text(text).into(),
-                    range: TextRange::new(
-                        TextSize::from((start + token.span.start) as u32),
-                        TextSize::from((start + token.span.end) as u32),
-                    ),
+                    range: text_range(start + token.span.start, start + token.span.end),
                     shorthand,
                 });
                 expecting_field = false;
@@ -1598,11 +1673,11 @@ fn pattern_path_symbol(
 ) -> Option<Symbol> {
     for (body_id, body) in hir.bodies.iter() {
         for (pat_id, pattern) in body.pats.iter() {
-            let path = match pattern {
-                Pattern::Path { path }
-                | Pattern::TupleStruct { path, .. }
-                | Pattern::Struct { path, .. } => path,
-                _ => continue,
+            let (Pattern::Path { path }
+            | Pattern::TupleStruct { path, .. }
+            | Pattern::Struct { path, .. }) = pattern
+            else {
+                continue;
             };
             let ranges = path_segment_ranges(&analysis.source, path.range, &path.segments);
             let Some(index) = ranges
@@ -1672,11 +1747,11 @@ fn collect_pattern_path_occurrences(
 ) {
     for (body_id, body) in hir.bodies.iter() {
         for (pat_id, pattern) in body.pats.iter() {
-            let path = match pattern {
-                Pattern::Path { path }
-                | Pattern::TupleStruct { path, .. }
-                | Pattern::Struct { path, .. } => path,
-                _ => continue,
+            let (Pattern::Path { path }
+            | Pattern::TupleStruct { path, .. }
+            | Pattern::Struct { path, .. }) = pattern
+            else {
+                continue;
             };
             let ranges = path_segment_ranges(source, path.range, &path.segments);
             for (index, range) in ranges.into_iter().enumerate() {
@@ -1877,11 +1952,10 @@ fn symbol_for_definition(
             let item = &hir.item_tree.type_aliases[id];
             Some(Symbol {
                 origin,
-                detail: item
-                    .ty
-                    .as_ref()
-                    .map(|ty| format!("type {} = {}", item.name.0, ty.display()))
-                    .unwrap_or_else(|| format!("type {}", item.name.0)),
+                detail: item.ty.as_ref().map_or_else(
+                    || format!("type {}", item.name.0),
+                    |ty| format!("type {} = {}", item.name.0, ty.display()),
+                ),
                 definition: Some(item.name_range),
                 implementations: Vec::new(),
             })
@@ -1904,29 +1978,18 @@ fn symbol_for_definition(
         }
         DefRef::Param { fn_id, index } => {
             let parameter = &hir.item_tree.functions[fn_id].params[index];
-            Some(Symbol {
+            Some(parameter_symbol(
+                &parameter.name,
+                &parameter.ty,
                 origin,
-                detail: format!("parameter {}: {}", parameter.name.0, parameter.ty.display()),
-                definition: Some(parameter.name_range),
-                implementations: Vec::new(),
-            })
+                Some(parameter.name_range),
+            ))
         }
         DefRef::LambdaParam {
             body_id,
             lambda,
             index,
-        } => {
-            let Expr::Lambda { params, .. } = &hir.bodies[body_id].exprs[lambda] else {
-                return None;
-            };
-            let parameter = params.get(index)?;
-            Some(Symbol {
-                origin,
-                detail: format!("parameter {}: {}", parameter.name.0, parameter.ty.display()),
-                definition: parameter.name_range,
-                implementations: Vec::new(),
-            })
-        }
+        } => lambda_parameter_symbol(hir, body_id, lambda, index, origin),
         DefRef::ConstParam { name } => Some(Symbol {
             origin,
             detail: format!("const parameter {}", name.0),
@@ -1948,6 +2011,39 @@ fn symbol_for_definition(
             })
         }
         DefRef::UseAlias { .. } => None,
+    }
+}
+
+fn lambda_parameter_symbol(
+    hir: &HirFile,
+    body_id: BodyId,
+    lambda: ExprId,
+    index: usize,
+    origin: TextRange,
+) -> Option<Symbol> {
+    let Expr::Lambda { params, .. } = &hir.bodies[body_id].exprs[lambda] else {
+        return None;
+    };
+    let parameter = params.get(index)?;
+    Some(parameter_symbol(
+        &parameter.name,
+        &parameter.ty,
+        origin,
+        parameter.name_range,
+    ))
+}
+
+fn parameter_symbol(
+    name: &Name,
+    ty: &HirTypeRef,
+    origin: TextRange,
+    definition: Option<TextRange>,
+) -> Symbol {
+    Symbol {
+        origin,
+        detail: format!("parameter {}: {}", name.0, ty.display()),
+        definition,
+        implementations: Vec::new(),
     }
 }
 
@@ -2095,10 +2191,7 @@ fn path_segment_ranges(source: &str, range: TextRange, segments: &[Name]) -> Vec
         }) else {
             return Vec::new();
         };
-        ranges.push(TextRange::new(
-            TextSize::from((start + token.span.start) as u32),
-            TextSize::from((start + token.span.end) as u32),
-        ));
+        ranges.push(text_range(start + token.span.start, start + token.span.end));
         next = index + 1;
     }
     ranges
@@ -2112,12 +2205,7 @@ fn identifier_range_at(source: &str, offset: usize) -> Option<TextRange> {
                 && token.span.start <= offset
                 && offset <= token.span.end
         })
-        .map(|token| {
-            TextRange::new(
-                TextSize::from(token.span.start as u32),
-                TextSize::from(token.span.end as u32),
-            )
-        })
+        .map(|token| text_range(token.span.start, token.span.end))
 }
 
 fn identifier_named_in_range(source: &str, range: TextRange, name: &str) -> Option<TextRange> {
@@ -2127,12 +2215,7 @@ fn identifier_named_in_range(source: &str, range: TextRange, name: &str) -> Opti
     frontend::lexer::lex(text)
         .into_iter()
         .find(|token| token.kind == SyntaxKind::Ident && token.text(text) == name)
-        .map(|token| {
-            TextRange::new(
-                TextSize::from((start + token.span.start) as u32),
-                TextSize::from((start + token.span.end) as u32),
-            )
-        })
+        .map(|token| text_range(start + token.span.start, start + token.span.end))
 }
 
 fn last_identifier_named_in_range(source: &str, range: TextRange, name: &str) -> Option<TextRange> {
@@ -2143,12 +2226,7 @@ fn last_identifier_named_in_range(source: &str, range: TextRange, name: &str) ->
         .into_iter()
         .rev()
         .find(|token| token.kind == SyntaxKind::Ident && token.text(text) == name)
-        .map(|token| {
-            TextRange::new(
-                TextSize::from((start + token.span.start) as u32),
-                TextSize::from((start + token.span.end) as u32),
-            )
-        })
+        .map(|token| text_range(start + token.span.start, start + token.span.end))
 }
 
 fn last_identifier_range(source: &str, range: TextRange) -> Option<TextRange> {
@@ -2159,12 +2237,7 @@ fn last_identifier_range(source: &str, range: TextRange) -> Option<TextRange> {
         .into_iter()
         .rev()
         .find(|token| token.kind == SyntaxKind::Ident)
-        .map(|token| {
-            TextRange::new(
-                TextSize::from((start + token.span.start) as u32),
-                TextSize::from((start + token.span.end) as u32),
-            )
-        })
+        .map(|token| text_range(start + token.span.start, start + token.span.end))
 }
 
 fn receiver_struct_id(ty: &Type) -> Option<hir::item_tree::StructId> {
@@ -2214,8 +2287,7 @@ fn format_function(function: &HirFunction) -> String {
     let ret = function
         .ret_type
         .as_ref()
-        .map(HirTypeRef::display)
-        .unwrap_or_else(|| "()".into());
+        .map_or_else(|| "()".into(), HirTypeRef::display);
     format!(
         "{visibility}{safety}fun {}{generics}({params}) -> {ret}",
         function.name.0

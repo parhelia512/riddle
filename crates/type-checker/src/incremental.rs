@@ -85,6 +85,7 @@ pub fn check_hir_incremental(
 }
 
 impl IncrementalTypeChecker {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -203,145 +204,20 @@ impl IncrementalTypeChecker {
                 fid,
                 function,
                 body_id,
-                checker.impl_generic_names(fid),
-                checker.impl_const_generic_names(fid),
+                &checker.impl_generic_names(fid),
+                &checker.impl_const_generic_names(fid),
             );
-            let diagnostics = checker.result.diagnostics[diagnostic_start..].to_vec();
-            let generic_edges = checker.generic_edges[generic_edge_start..].to_vec();
-            let expr_types = checker
-                .result
-                .expr_types
-                .iter()
-                .filter_map(|((checked_body, expr), ty)| {
-                    if *checked_body == body_id {
-                        Some((*expr, ty.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let expr_coercions = checker
-                .result
-                .expr_coercions
-                .iter()
-                .filter_map(|((checked_body, expr), ty)| {
-                    if *checked_body == body_id {
-                        Some((*expr, ty.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let generic_calls = checker
-                .result
-                .generic_calls
-                .iter()
-                .filter_map(|((checked_body, expr), call)| {
-                    if *checked_body == body_id {
-                        Some((*expr, call.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let trait_method_calls = checker
-                .result
-                .trait_method_calls
-                .iter()
-                .filter_map(|((checked_body, expr), call)| {
-                    if *checked_body == body_id {
-                        Some((*expr, call.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let operator_calls = checker
-                .result
-                .operator_calls
-                .iter()
-                .filter_map(|((checked_body, expr), call)| {
-                    if *checked_body == body_id {
-                        Some((*expr, call.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let for_loops = checker
-                .result
-                .for_loops
-                .iter()
-                .filter_map(|((checked_body, expr), info)| {
-                    if *checked_body == body_id {
-                        Some((*expr, info.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let lambda_infos = checker
-                .result
-                .lambda_infos
-                .iter()
-                .filter(|((checked_body, _), _)| *checked_body == body_id)
-                .map(|((_, expr), info)| (*expr, info.clone()))
-                .collect();
-            let pattern_types = checker
-                .result
-                .pattern_types
-                .iter()
-                .filter(|((checked_body, _), _)| *checked_body == body_id)
-                .map(|((_, pattern), ty)| (*pattern, ty.clone()))
-                .collect();
-            let pattern_binding_types = checker
-                .result
-                .pattern_binding_types
-                .iter()
-                .filter(|((checked_body, _), _)| *checked_body == body_id)
-                .map(|((_, binding), ty)| (*binding, ty.clone()))
-                .collect();
-            let pattern_binding_modes = checker
-                .result
-                .pattern_binding_modes
-                .iter()
-                .filter(|((checked_body, _), _)| *checked_body == body_id)
-                .map(|((_, binding), mode)| (*binding, *mode))
-                .collect();
-            let value_uses = checker
-                .result
-                .value_uses
-                .iter()
-                .filter(|((checked_body, _), _)| *checked_body == body_id)
-                .map(|((_, expr), use_kind)| (*expr, *use_kind))
-                .collect();
-            let opaque_hidden_types = checker
-                .result
-                .opaque_hidden_types
-                .iter()
-                .filter(|(id, _)| !opaque_hidden_before.contains(id))
-                .map(|(id, ty)| (*id, ty.clone()))
-                .collect();
-            self.bodies.insert(
+            self.cache_checked_body(
+                &checker,
                 fid,
-                CachedBody {
+                body_id,
+                (
                     type_context_hash,
                     body_hash,
-                    diagnostics,
-                    expr_types,
-                    expr_coercions,
-                    generic_calls,
-                    trait_method_calls,
-                    operator_calls,
-                    for_loops,
-                    lambda_infos,
-                    pattern_types,
-                    pattern_binding_types,
-                    pattern_binding_modes,
-                    value_uses,
-                    opaque_hidden_types,
-                    generic_edges,
-                },
+                    diagnostic_start,
+                    generic_edge_start,
+                    &opaque_hidden_before,
+                ),
             );
         }
 
@@ -354,6 +230,77 @@ impl IncrementalTypeChecker {
             stats,
         }
     }
+
+    fn cache_checked_body(
+        &mut self,
+        checker: &TypeChecker<'_>,
+        fid: FunctionId,
+        body_id: BodyId,
+        metadata: (u64, u64, usize, usize, &HashSet<OpaqueCallableId>),
+    ) {
+        let (
+            type_context_hash,
+            body_hash,
+            diagnostic_start,
+            generic_edge_start,
+            opaque_hidden_before,
+        ) = metadata;
+        let diagnostics = checker.result.diagnostics[diagnostic_start..].to_vec();
+        let generic_edges = checker.generic_edges[generic_edge_start..].to_vec();
+        let expr_types = entries_for_body(&checker.result.expr_types, body_id);
+        let expr_coercions = entries_for_body(&checker.result.expr_coercions, body_id);
+        let generic_calls = entries_for_body(&checker.result.generic_calls, body_id);
+        let trait_method_calls = entries_for_body(&checker.result.trait_method_calls, body_id);
+        let operator_calls = entries_for_body(&checker.result.operator_calls, body_id);
+        let for_loops = entries_for_body(&checker.result.for_loops, body_id);
+        let lambda_infos = entries_for_body(&checker.result.lambda_infos, body_id);
+        let pattern_types = entries_for_body(&checker.result.pattern_types, body_id);
+        let pattern_binding_types =
+            entries_for_body(&checker.result.pattern_binding_types, body_id);
+        let pattern_binding_modes =
+            entries_for_body(&checker.result.pattern_binding_modes, body_id);
+        let value_uses = entries_for_body(&checker.result.value_uses, body_id);
+        let opaque_hidden_types = checker
+            .result
+            .opaque_hidden_types
+            .iter()
+            .filter(|(id, _)| !opaque_hidden_before.contains(id))
+            .map(|(id, ty)| (*id, ty.clone()))
+            .collect();
+        self.bodies.insert(
+            fid,
+            CachedBody {
+                type_context_hash,
+                body_hash,
+                diagnostics,
+                expr_types,
+                expr_coercions,
+                generic_calls,
+                trait_method_calls,
+                operator_calls,
+                for_loops,
+                lambda_infos,
+                pattern_types,
+                pattern_binding_types,
+                pattern_binding_modes,
+                value_uses,
+                opaque_hidden_types,
+                generic_edges,
+            },
+        );
+    }
+}
+
+fn entries_for_body<K, V>(entries: &HashMap<(BodyId, K), V>, body_id: BodyId) -> Vec<(K, V)>
+where
+    K: Copy,
+    V: Clone,
+{
+    entries
+        .iter()
+        .filter(|((checked_body, _), _)| *checked_body == body_id)
+        .map(|((_, key), value)| (*key, value.clone()))
+        .collect()
 }
 
 fn replay_cached_body(
@@ -453,8 +400,7 @@ fn replay_cached_body(
 fn shift_range(range: TextRange, offset: i64) -> TextRange {
     let shift = |position: TextSize| {
         let shifted = i64::from(u32::from(position)) + offset;
-        debug_assert!((0..=i64::from(u32::MAX)).contains(&shifted));
-        TextSize::from(shifted as u32)
+        TextSize::from(u32::try_from(shifted).expect("shifted text position should fit in u32"))
     };
     TextRange::new(shift(range.start()), shift(range.end()))
 }
@@ -527,10 +473,15 @@ fn text_edit(old: &str, new: &str) -> TextEdit {
 
     TextEdit {
         old_range: TextRange::new(
-            TextSize::from(prefix as u32),
-            TextSize::from((old.len() - suffix) as u32),
+            TextSize::from(u32::try_from(prefix).expect("edit offset should fit in u32")),
+            TextSize::from(
+                u32::try_from(old.len() - suffix).expect("edit offset should fit in u32"),
+            ),
         ),
-        insert_len: TextSize::from((new.len() - prefix - suffix) as u32),
+        insert_len: TextSize::from(
+            u32::try_from(new.len() - prefix - suffix)
+                .expect("inserted text length should fit in u32"),
+        ),
     }
 }
 

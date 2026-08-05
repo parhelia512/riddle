@@ -31,7 +31,7 @@ enum Constructor {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum MatrixPat {
     Wildcard,
-    Constructor(Constructor, Vec<MatrixPat>),
+    Constructor(Constructor, Vec<Self>),
     IntegerRanges {
         ty: IntTy,
         ranges: Vec<IntegerRange>,
@@ -224,8 +224,8 @@ impl TypeChecker<'_> {
                 }
                 None
             }
-            MatrixPat::Wildcard => match self.constructors(&types[0]) {
-                Some(constructors) => {
+            MatrixPat::Wildcard => {
+                if let Some(constructors) = self.constructors(&types[0]) {
                     for info in constructors {
                         let arity = info.fields.len();
                         let specialized = specialize(matrix, &info.constructor, arity);
@@ -243,8 +243,7 @@ impl TypeChecker<'_> {
                         }
                     }
                     None
-                }
-                None => {
+                } else {
                     let witness = self.useful_inner(
                         &default_matrix(matrix),
                         &vector[1..],
@@ -255,7 +254,7 @@ impl TypeChecker<'_> {
                     result.extend(witness);
                     Some(result)
                 }
-            },
+            }
         }
     }
 
@@ -276,8 +275,9 @@ impl TypeChecker<'_> {
             Pattern::Wildcard => MatrixPat::Wildcard,
             Pattern::Reference { pattern, .. } => self.lower_matrix_pattern(ctx, pattern, expected),
             Pattern::Literal(literal) => literal_constructor(literal, expected)
-                .map(|constructor| MatrixPat::Constructor(constructor, Vec::new()))
-                .unwrap_or(MatrixPat::Invalid),
+                .map_or(MatrixPat::Invalid, |constructor| {
+                    MatrixPat::Constructor(constructor, Vec::new())
+                }),
             Pattern::Binding { name, .. } => {
                 let Type::Enum(enum_id, _) = expected else {
                     return MatrixPat::Wildcard;
@@ -418,8 +418,9 @@ impl TypeChecker<'_> {
                             .iter()
                             .find(|pattern| pattern.name.0 == field.name.0)
                             .and_then(|pattern| pattern.pat)
-                            .map(|pat| self.lower_matrix_pattern(ctx, pat, &ty))
-                            .unwrap_or(MatrixPat::Wildcard)
+                            .map_or(MatrixPat::Wildcard, |pat| {
+                                self.lower_matrix_pattern(ctx, pat, &ty)
+                            })
                     })
                     .collect();
                 MatrixPat::Constructor(constructor, patterns)
@@ -454,8 +455,9 @@ impl TypeChecker<'_> {
                             .iter()
                             .find(|pattern| pattern.name.0 == field.name.0)
                             .and_then(|pattern| pattern.pat)
-                            .map(|pat| self.lower_matrix_pattern(ctx, pat, &ty))
-                            .unwrap_or(MatrixPat::Wildcard)
+                            .map_or(MatrixPat::Wildcard, |pat| {
+                                self.lower_matrix_pattern(ctx, pat, &ty)
+                            })
                     })
                     .collect();
                 MatrixPat::Constructor(constructor, patterns)
@@ -492,54 +494,7 @@ impl TypeChecker<'_> {
                     fields: Vec::new(),
                 },
             ]),
-            Type::Enum(enum_id, args) => {
-                let enum_data = self.hir.item_tree.enums[*enum_id].clone();
-                let params = enum_data
-                    .generics
-                    .iter()
-                    .chain(enum_data.const_generics.iter())
-                    .zip(args)
-                    .map(|(name, ty)| (name.0.clone(), ty.clone()))
-                    .collect::<HashMap<_, _>>();
-                Some(
-                    enum_data
-                        .variants
-                        .iter()
-                        .enumerate()
-                        .map(|(index, variant)| ConstructorInfo {
-                            constructor: Constructor::EnumVariant(*enum_id, index),
-                            fields: match &variant.kind {
-                                HirVariantKind::Unit => Vec::new(),
-                                HirVariantKind::Tuple(fields) => fields
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(field_index, field)| {
-                                        self.lower_type_ref_with_params_at(
-                                            field,
-                                            &params,
-                                            variant
-                                                .field_ranges
-                                                .get(field_index)
-                                                .copied()
-                                                .or(Some(variant.name_range)),
-                                        )
-                                    })
-                                    .collect(),
-                                HirVariantKind::Struct(fields) => fields
-                                    .iter()
-                                    .map(|field| {
-                                        self.lower_type_ref_with_params_at(
-                                            &field.ty,
-                                            &params,
-                                            Some(field.ty_range),
-                                        )
-                                    })
-                                    .collect(),
-                            },
-                        })
-                        .collect(),
-                )
-            }
+            Type::Enum(enum_id, args) => Some(self.enum_constructors(*enum_id, args)),
             Type::Tuple(fields) => Some(vec![ConstructorInfo {
                 constructor: Constructor::Tuple,
                 fields: fields.clone(),
@@ -579,6 +534,53 @@ impl TypeChecker<'_> {
             Type::Never => Some(Vec::new()),
             _ => None,
         }
+    }
+
+    fn enum_constructors(&mut self, enum_id: EnumId, args: &[Type]) -> Vec<ConstructorInfo> {
+        let enum_data = self.hir.item_tree.enums[enum_id].clone();
+        let params = enum_data
+            .generics
+            .iter()
+            .chain(enum_data.const_generics.iter())
+            .zip(args)
+            .map(|(name, ty)| (name.0.clone(), ty.clone()))
+            .collect::<HashMap<_, _>>();
+        enum_data
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(index, variant)| ConstructorInfo {
+                constructor: Constructor::EnumVariant(enum_id, index),
+                fields: match &variant.kind {
+                    HirVariantKind::Unit => Vec::new(),
+                    HirVariantKind::Tuple(fields) => fields
+                        .iter()
+                        .enumerate()
+                        .map(|(field_index, field)| {
+                            self.lower_type_ref_with_params_at(
+                                field,
+                                &params,
+                                variant
+                                    .field_ranges
+                                    .get(field_index)
+                                    .copied()
+                                    .or(Some(variant.name_range)),
+                            )
+                        })
+                        .collect(),
+                    HirVariantKind::Struct(fields) => fields
+                        .iter()
+                        .map(|field| {
+                            self.lower_type_ref_with_params_at(
+                                &field.ty,
+                                &params,
+                                Some(field.ty_range),
+                            )
+                        })
+                        .collect(),
+                },
+            })
+            .collect()
     }
 
     fn constructor_fields(&mut self, ty: &Type, constructor: &Constructor) -> Option<Vec<Type>> {
@@ -726,7 +728,7 @@ fn literal_constructor(literal: LiteralPattern, expected: &Type) -> Option<Const
     }
 }
 
-fn integer_type(ty: &Type) -> Option<IntTy> {
+const fn integer_type(ty: &Type) -> Option<IntTy> {
     match ty {
         Type::Int(ty) => Some(*ty),
         Type::InferInt => Some(IntTy::I32),
@@ -854,15 +856,16 @@ fn integer_value(ty: IntTy, ordinal: u128) -> String {
         return ordinal.to_string();
     }
     let min = -(1i128 << (bits - 1));
-    (min + ordinal as i128).to_string()
+    let ordinal = i128::try_from(ordinal).expect("integer ordinal should fit in i128");
+    (min + ordinal).to_string()
 }
 
-fn integer_max_ordinal(ty: IntTy) -> u128 {
+const fn integer_max_ordinal(ty: IntTy) -> u128 {
     let (_, bits) = integer_layout(ty);
     (1u128 << bits) - 1
 }
 
-fn integer_layout(ty: IntTy) -> (bool, u32) {
+const fn integer_layout(ty: IntTy) -> (bool, u32) {
     match ty {
         IntTy::I8 => (true, 8),
         IntTy::I16 => (true, 16),
@@ -877,7 +880,7 @@ fn integer_layout(ty: IntTy) -> (bool, u32) {
     }
 }
 
-fn type_head(ty: &Type) -> TypeHead {
+const fn type_head(ty: &Type) -> TypeHead {
     match ty {
         Type::Tuple(fields) => TypeHead::Tuple(fields.len()),
         Type::Struct(id, _) => TypeHead::Struct(*id),

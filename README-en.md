@@ -87,6 +87,29 @@ the workspace's development packages do not emit duplicate binaries:
 cargo build -p riddle --release --features install-bins --bins
 ```
 
+## Development and Verification
+
+After changing the source, validate the complete workspace with:
+
+```bash
+cargo test --workspace --all-targets
+cargo check -p riddle --features install-bins --bins
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings -D clippy::pedantic -D clippy::nursery -D clippy::cargo -A clippy::multiple_crate_versions
+```
+
+`install-bins` is only for the root distribution package. Do not add
+`--all-features` to the workspace test command: that enables root and member
+`clue`/`riddlec` binaries with identical output names. The separate
+`cargo check` above covers all three installation entry points.
+
+Clippy excludes only `multiple_crate_versions`: the current Cargo dependency
+metadata contains both `hashbrown 0.14/0.17` and `syn 2/3`. This does not
+disable any source lint, and source issues must not be bypassed with new
+`#[allow(clippy::...)]` attributes. After dependency updates, audit active
+dependencies with `cargo tree -d`, remove `-A clippy::multiple_crate_versions`,
+and rerun Clippy. Delete the exception once that command has no warnings.
+
 ## Cross-compilation
 
 `clue check`, `clue build`, and `riddlec` accept `--target <triple>`. Clue

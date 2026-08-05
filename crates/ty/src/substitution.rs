@@ -1,13 +1,20 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    hash::BuildHasher,
+};
 
 use crate::{CallableSignature, ConstArg, Type};
 
-pub fn collect_subst(expected: &Type, actual: &Type, subst: &mut HashMap<String, Type>) -> bool {
+pub fn collect_subst<S: BuildHasher>(
+    expected: &Type,
+    actual: &Type,
+    subst: &mut HashMap<String, Type, S>,
+) -> bool {
     match expected {
-        Type::Param(name) => match subst.get(name) {
-            Some(existing) => existing == actual,
-            None => {
-                subst.insert(name.clone(), actual.clone());
+        Type::Param(name) => match subst.entry(name.clone()) {
+            Entry::Occupied(entry) => entry.get() == actual,
+            Entry::Vacant(entry) => {
+                entry.insert(actual.clone());
                 true
             }
         },
@@ -32,12 +39,7 @@ pub fn collect_subst(expected: &Type, actual: &Type, subst: &mut HashMap<String,
             _ => false,
         },
         Type::Tuple(expected_elems) => match actual {
-            Type::Tuple(actual_elems) if expected_elems.len() == actual_elems.len() => {
-                expected_elems
-                    .iter()
-                    .zip(actual_elems)
-                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
-            }
+            Type::Tuple(actual_elems) => collect_args_subst(expected_elems, actual_elems, subst),
             _ => false,
         },
         Type::Slice(expected_inner) => match actual {
@@ -54,24 +56,14 @@ pub fn collect_subst(expected: &Type, actual: &Type, subst: &mut HashMap<String,
             _ => false,
         },
         Type::Struct(expected_id, expected_args) => match actual {
-            Type::Struct(actual_id, actual_args)
-                if expected_id == actual_id && expected_args.len() == actual_args.len() =>
-            {
-                expected_args
-                    .iter()
-                    .zip(actual_args)
-                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
+            Type::Struct(actual_id, actual_args) if expected_id == actual_id => {
+                collect_args_subst(expected_args, actual_args, subst)
             }
             _ => false,
         },
         Type::Enum(expected_id, expected_args) => match actual {
-            Type::Enum(actual_id, actual_args)
-                if expected_id == actual_id && expected_args.len() == actual_args.len() =>
-            {
-                expected_args
-                    .iter()
-                    .zip(actual_args)
-                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
+            Type::Enum(actual_id, actual_args) if expected_id == actual_id => {
+                collect_args_subst(expected_args, actual_args, subst)
             }
             _ => false,
         },
@@ -82,13 +74,8 @@ pub fn collect_subst(expected: &Type, actual: &Type, subst: &mut HashMap<String,
             Type::FunctionItem {
                 function: actual_function,
                 args: actual_args,
-            } if expected_function == actual_function
-                && expected_args.len() == actual_args.len() =>
-            {
-                expected_args
-                    .iter()
-                    .zip(actual_args)
-                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
+            } if expected_function == actual_function => {
+                collect_args_subst(expected_args, actual_args, subst)
             }
             _ => false,
         },
@@ -99,18 +86,7 @@ pub fn collect_subst(expected: &Type, actual: &Type, subst: &mut HashMap<String,
             Type::Closure {
                 id: actual_id,
                 signature: actual,
-            } if expected_id == actual_id
-                && expected.kind == actual.kind
-                && expected.is_unsafe == actual.is_unsafe
-                && expected.params.len() == actual.params.len() =>
-            {
-                expected
-                    .params
-                    .iter()
-                    .zip(&actual.params)
-                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
-                    && collect_subst(&expected.ret, &actual.ret, subst)
-            }
+            } if expected_id == actual_id => collect_signature_subst(expected, actual, subst),
             _ => false,
         },
         Type::OpaqueCallable {
@@ -120,50 +96,64 @@ pub fn collect_subst(expected: &Type, actual: &Type, subst: &mut HashMap<String,
             Type::OpaqueCallable {
                 id: actual_id,
                 signature: actual,
-            } if expected_id == actual_id
-                && expected.kind == actual.kind
-                && expected.is_unsafe == actual.is_unsafe
-                && expected.params.len() == actual.params.len() =>
-            {
-                expected
-                    .params
-                    .iter()
-                    .zip(&actual.params)
-                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
-                    && collect_subst(&expected.ret, &actual.ret, subst)
-            }
+            } if expected_id == actual_id => collect_signature_subst(expected, actual, subst),
             _ => false,
         },
         Type::CallableConstraint(expected) => {
-            let (actual_unsafe, actual_kind, actual_params, actual_ret) = match actual {
-                Type::CallableConstraint(signature)
-                | Type::Closure { signature, .. }
-                | Type::OpaqueCallable { signature, .. } => (
-                    signature.is_unsafe,
-                    signature.kind,
-                    signature.params.as_slice(),
-                    signature.ret.as_ref(),
-                ),
-                _ => return false,
-            };
-            (!actual_unsafe || expected.is_unsafe)
-                && expected.kind.accepts(actual_kind)
-                && expected.params.len() == actual_params.len()
-                && expected
-                    .params
-                    .iter()
-                    .zip(actual_params)
-                    .all(|(expected, actual)| collect_subst(expected, actual, subst))
-                && collect_subst(&expected.ret, actual_ret, subst)
+            collect_callable_constraint_subst(expected, actual, subst)
         }
         _ => expected.is_unknown_like() || actual.is_unknown_like() || expected == actual,
     }
 }
 
-fn collect_const_subst(
+fn collect_args_subst<S: BuildHasher>(
+    expected: &[Type],
+    actual: &[Type],
+    subst: &mut HashMap<String, Type, S>,
+) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| collect_subst(expected, actual, subst))
+}
+
+fn collect_signature_subst<S: BuildHasher>(
+    expected: &CallableSignature,
+    actual: &CallableSignature,
+    subst: &mut HashMap<String, Type, S>,
+) -> bool {
+    expected.kind == actual.kind
+        && expected.is_unsafe == actual.is_unsafe
+        && collect_args_subst(&expected.params, &actual.params, subst)
+        && collect_subst(&expected.ret, &actual.ret, subst)
+}
+
+fn collect_callable_constraint_subst<S: BuildHasher>(
+    expected: &CallableSignature,
+    actual: &Type,
+    subst: &mut HashMap<String, Type, S>,
+) -> bool {
+    let (Type::CallableConstraint(actual)
+    | Type::Closure {
+        signature: actual, ..
+    }
+    | Type::OpaqueCallable {
+        signature: actual, ..
+    }) = actual
+    else {
+        return false;
+    };
+    (!actual.is_unsafe || expected.is_unsafe)
+        && expected.kind.accepts(actual.kind)
+        && collect_args_subst(&expected.params, &actual.params, subst)
+        && collect_subst(&expected.ret, &actual.ret, subst)
+}
+
+fn collect_const_subst<S: BuildHasher>(
     expected: &ConstArg,
     actual: &ConstArg,
-    subst: &mut HashMap<String, Type>,
+    subst: &mut HashMap<String, Type, S>,
 ) -> bool {
     match expected {
         ConstArg::Param(name) => match subst.get(name) {
@@ -178,7 +168,8 @@ fn collect_const_subst(
     }
 }
 
-pub fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+#[must_use]
+pub fn substitute_type<S: BuildHasher>(ty: &Type, subst: &HashMap<String, Type, S>) -> Type {
     match ty {
         Type::Param(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Const(value) => Type::Const(substitute_const(value, subst)),
@@ -250,7 +241,10 @@ pub fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
     }
 }
 
-fn substitute_const(value: &ConstArg, subst: &HashMap<String, Type>) -> ConstArg {
+fn substitute_const<S: BuildHasher>(
+    value: &ConstArg,
+    subst: &HashMap<String, Type, S>,
+) -> ConstArg {
     match value {
         ConstArg::Param(name) => match subst.get(name) {
             Some(Type::Const(value)) => value.clone(),

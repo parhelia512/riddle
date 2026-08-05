@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    BinaryOp, BodyCtx, Expr, ExprId, HashSet, IntTy, LangItem, OperatorCall, ResolvedName, TraitId,
+    TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse, assign_operator_trait,
+    binary_operator_trait, bound_target_param, type_has_unresolved_inference, unary_operator_trait,
+};
 
 impl TypeChecker<'_> {
     #[allow(clippy::too_many_arguments)]
@@ -46,7 +50,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(receiver.ty_range),
         );
-        let actual_receiver = self.receiver_argument_type(&receiver_ty, &expected_receiver);
+        let actual_receiver = Self::receiver_argument_type(&receiver_ty, &expected_receiver);
         self.expect_assignable(
             &expected_receiver,
             &actual_receiver,
@@ -71,7 +75,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(rhs_param.ty_range),
         );
-        let actual_rhs = self.receiver_argument_type(rhs_ty, &expected_rhs);
+        let actual_rhs = Self::receiver_argument_type(rhs_ty, &expected_rhs);
         self.expect_assignable(
             &expected_rhs,
             &actual_rhs,
@@ -84,23 +88,16 @@ impl TypeChecker<'_> {
             .operator_calls
             .insert((ctx.body_id, expr_id), OperatorCall::Function(method.fid));
 
-        Some(
-            method
-                .function
-                .ret_type
-                .as_ref()
-                .map(|ty| {
-                    self.lower_type_ref_with_params_at(
-                        ty,
-                        &method.subst,
-                        method
-                            .function
-                            .ret_type_range
-                            .or(Some(method.function.name_range)),
-                    )
-                })
-                .unwrap_or(Type::Unit),
-        )
+        Some(method.function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            self.lower_type_ref_with_params_at(
+                ty,
+                &method.subst,
+                method
+                    .function
+                    .ret_type_range
+                    .or(Some(method.function.name_range)),
+            )
+        }))
     }
 
     pub(super) fn check_index_access(
@@ -119,29 +116,9 @@ impl TypeChecker<'_> {
             _ => &base_ty,
         };
 
-        if let Some(output) = match receiver_ty {
-            Type::Slice(inner) | Type::Array(inner, _) => Some(*inner.clone()),
-            Type::Ptr { inner, .. } => {
-                self.require_unsafe(ctx, "indexing a raw pointer", span);
-                Some(*inner.clone())
-            }
-            _ => None,
-        } {
-            if !index_ty.is_unknown_like() && !index_ty.is_integer() {
-                self.expect_assignable(
-                    &Type::Int(IntTy::I32),
-                    &index_ty,
-                    "index",
-                    ctx.expr_range(index),
-                );
-            }
-            self.record_value_use(ctx, index, ValueUse::Move);
-            if let Some(expected) = expected
-                && type_has_unresolved_inference(&output)
-            {
-                let _ = self.unify_types(&output, expected);
-                self.last_occurs_error = None;
-            }
+        if let Some(output) =
+            self.check_builtin_index(ctx, index, &index_ty, receiver_ty, expected, span)
+        {
             return output;
         }
 
@@ -189,7 +166,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(receiver.ty_range),
         );
-        let actual_receiver = self.receiver_argument_type(&base_ty, &expected_receiver);
+        let actual_receiver = Self::receiver_argument_type(&base_ty, &expected_receiver);
         self.expect_assignable(
             &expected_receiver,
             &actual_receiver,
@@ -234,13 +211,47 @@ impl TypeChecker<'_> {
                 _ => None,
             })
             .unwrap_or(Type::Error);
+        self.constrain_index_output(&output, expected);
+        output
+    }
+
+    fn check_builtin_index(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        index: ExprId,
+        index_ty: &Type,
+        receiver_ty: &Type,
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+    ) -> Option<Type> {
+        let output = match receiver_ty {
+            Type::Slice(inner) | Type::Array(inner, _) => *inner.clone(),
+            Type::Ptr { inner, .. } => {
+                self.require_unsafe(ctx, "indexing a raw pointer", span);
+                *inner.clone()
+            }
+            _ => return None,
+        };
+        if !index_ty.is_unknown_like() && !index_ty.is_integer() {
+            self.expect_assignable(
+                &Type::Int(IntTy::I32),
+                index_ty,
+                "index",
+                ctx.expr_range(index),
+            );
+        }
+        self.record_value_use(ctx, index, ValueUse::Move);
+        self.constrain_index_output(&output, expected);
+        Some(output)
+    }
+
+    fn constrain_index_output(&mut self, output: &Type, expected: Option<&Type>) {
         if let Some(expected) = expected
-            && type_has_unresolved_inference(&output)
+            && type_has_unresolved_inference(output)
         {
-            let _ = self.unify_types(&output, expected);
+            let _ = self.unify_types(output, expected);
             self.last_occurs_error = None;
         }
-        output
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -295,7 +306,7 @@ impl TypeChecker<'_> {
             .get(&(ctx.body_id, base))
             .cloned()
             .unwrap_or(Type::Error);
-        let actual_receiver = self.receiver_argument_type(&base_ty, &expected_receiver);
+        let actual_receiver = Self::receiver_argument_type(&base_ty, &expected_receiver);
         self.expect_assignable(
             &expected_receiver,
             &actual_receiver,
@@ -400,7 +411,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(receiver.ty_range),
         );
-        let actual_receiver = self.receiver_argument_type(operand_ty, &expected_receiver);
+        let actual_receiver = Self::receiver_argument_type(operand_ty, &expected_receiver);
         self.expect_assignable(
             &expected_receiver,
             &actual_receiver,
@@ -411,23 +422,16 @@ impl TypeChecker<'_> {
         self.result
             .operator_calls
             .insert((ctx.body_id, expr_id), OperatorCall::Function(method.fid));
-        Some(
-            method
-                .function
-                .ret_type
-                .as_ref()
-                .map(|ty| {
-                    self.lower_type_ref_with_params_at(
-                        ty,
-                        &method.subst,
-                        method
-                            .function
-                            .ret_type_range
-                            .or(Some(method.function.name_range)),
-                    )
-                })
-                .unwrap_or(Type::Unit),
-        )
+        Some(method.function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            self.lower_type_ref_with_params_at(
+                ty,
+                &method.subst,
+                method
+                    .function
+                    .ret_type_range
+                    .or(Some(method.function.name_range)),
+            )
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -475,7 +479,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(receiver.ty_range),
         );
-        let actual_receiver = self.receiver_argument_type(&receiver_ty, &expected_receiver);
+        let actual_receiver = Self::receiver_argument_type(&receiver_ty, &expected_receiver);
         self.expect_assignable(
             &expected_receiver,
             &actual_receiver,
@@ -489,7 +493,7 @@ impl TypeChecker<'_> {
             &method.subst,
             Some(rhs_param.ty_range),
         );
-        let actual_rhs = self.receiver_argument_type(rhs_ty, &expected_rhs);
+        let actual_rhs = Self::receiver_argument_type(rhs_ty, &expected_rhs);
         self.expect_assignable(
             &expected_rhs,
             &actual_rhs,
@@ -562,7 +566,7 @@ impl TypeChecker<'_> {
             let rhs_param = method.params.get(1)?;
             let expected_rhs =
                 self.lower_type_ref_with_params_at(&rhs_param.ty, &subst, Some(rhs_param.ty_range));
-            let actual_rhs = self.receiver_argument_type(rhs_ty, &expected_rhs);
+            let actual_rhs = Self::receiver_argument_type(rhs_ty, &expected_rhs);
             self.expect_assignable(
                 &expected_rhs,
                 &actual_rhs,
@@ -593,170 +597,28 @@ impl TypeChecker<'_> {
         Some(output)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn check_binary_types(
         &mut self,
-        ctx: &mut BodyCtx<'_>,
-        lhs: ExprId,
-        rhs: ExprId,
+        ctx: &BodyCtx<'_>,
+        operands: (ExprId, ExprId),
         op: BinaryOp,
-        lhs_ty: &Type,
-        rhs_ty: &Type,
+        types: (&Type, &Type),
         span: Option<rowan::TextRange>,
     ) -> Type {
         match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                self.expect_numeric(lhs_ty, "left operand", ctx.expr_range(lhs));
-                self.expect_numeric(rhs_ty, "right operand", ctx.expr_range(rhs));
-                if !lhs_ty.is_numeric() || !rhs_ty.is_numeric() {
-                    return Type::Error;
-                }
-                if lhs_ty.is_unknown_like() || rhs_ty.is_unknown_like() {
-                    Type::Unknown
-                } else if let Some(result) = self.join_numeric_types(lhs_ty, rhs_ty) {
-                    result
-                } else {
-                    self.diagnostic(
-                        "E0001",
-                        format!(
-                            "binary operands have different types: {} and {}",
-                            lhs_ty.display(self.hir),
-                            rhs_ty.display(self.hir)
-                        ),
-                        span,
-                    );
-                    Type::Error
-                }
+                self.check_arithmetic_types(ctx, operands, types, span)
             }
-            BinaryOp::Mod => {
-                if !lhs_ty.is_unknown_like()
-                    && !rhs_ty.is_unknown_like()
-                    && (!lhs_ty.is_integer() || !rhs_ty.is_integer())
-                {
-                    self.diagnostic(
-                        "E0003",
-                        format!(
-                            "remainder requires integer operands, got {} and {}",
-                            lhs_ty.display(self.hir),
-                            rhs_ty.display(self.hir)
-                        ),
-                        span,
-                    );
-                    return Type::Error;
-                }
-                self.join_numeric_types(lhs_ty, rhs_ty)
-                    .unwrap_or_else(|| lhs_ty.clone())
-            }
+            BinaryOp::Mod => self.check_remainder_types(types, span),
             BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
-                if !lhs_ty.is_unknown_like()
-                    && !rhs_ty.is_unknown_like()
-                    && (!lhs_ty.is_bitwise_scalar() || !rhs_ty.is_bitwise_scalar())
-                {
-                    self.diagnostic(
-                        "E0003",
-                        format!(
-                            "bitwise operation requires integer or bool operands, got {} and {}",
-                            lhs_ty.display(self.hir),
-                            rhs_ty.display(self.hir)
-                        ),
-                        span,
-                    );
-                    return Type::Error;
-                }
-                if lhs_ty == &Type::Bool && rhs_ty == &Type::Bool {
-                    Type::Bool
-                } else if let Some(result) = self.join_numeric_types(lhs_ty, rhs_ty) {
-                    result
-                } else {
-                    self.diagnostic(
-                        "E0001",
-                        format!(
-                            "bitwise operands have different types: {} and {}",
-                            lhs_ty.display(self.hir),
-                            rhs_ty.display(self.hir)
-                        ),
-                        span,
-                    );
-                    Type::Error
-                }
+                self.check_bitwise_types(types, span)
             }
-            BinaryOp::Shl | BinaryOp::Shr => {
-                if !lhs_ty.is_unknown_like()
-                    && !rhs_ty.is_unknown_like()
-                    && (!lhs_ty.is_integer() || !rhs_ty.is_integer())
-                {
-                    self.diagnostic(
-                        "E0003",
-                        format!(
-                            "shift operation requires integer operands, got {} and {}",
-                            lhs_ty.display(self.hir),
-                            rhs_ty.display(self.hir)
-                        ),
-                        span,
-                    );
-                    return Type::Error;
-                }
-                lhs_ty.clone()
-            }
-            BinaryOp::Eq | BinaryOp::Neq => {
-                if self.is_builtin_equality(lhs_ty, rhs_ty)
-                    && self.join_numeric_types(lhs_ty, rhs_ty).is_none()
-                {
-                    self.expect_assignable(lhs_ty, rhs_ty, "comparison", span);
-                }
-                if !self.is_builtin_equality(lhs_ty, rhs_ty)
-                    && !lhs_ty.is_unknown_like()
-                    && !rhs_ty.is_unknown_like()
-                    && !self.type_has_lang_trait_with_args(
-                        ctx,
-                        lhs_ty,
-                        std::slice::from_ref(rhs_ty),
-                        LangItem::PartialEq,
-                    )
-                {
-                    self.diagnostic(
-                        "E0036",
-                        format!(
-                            "type `{}` must implement `PartialEq` for equality comparison",
-                            lhs_ty.display(self.hir)
-                        ),
-                        span,
-                    );
-                }
-                Type::Bool
-            }
+            BinaryOp::Shl | BinaryOp::Shr => self.check_shift_types(types, span),
+            BinaryOp::Eq | BinaryOp::Neq => self.check_equality_types(ctx, types, span),
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
-                if self.is_builtin_ordering(lhs_ty, rhs_ty) {
-                    if *lhs_ty != Type::Char && self.join_numeric_types(lhs_ty, rhs_ty).is_none() {
-                        self.expect_assignable(lhs_ty, rhs_ty, "comparison", span);
-                    }
-                } else if !lhs_ty.is_unknown_like()
-                    && !rhs_ty.is_unknown_like()
-                    && !self.type_has_lang_trait_with_args(
-                        ctx,
-                        lhs_ty,
-                        std::slice::from_ref(rhs_ty),
-                        LangItem::PartialOrd,
-                    )
-                {
-                    self.diagnostic(
-                        "E0003",
-                        format!(
-                            "ordered comparison requires compatible numeric or char operands or `PartialOrd`, got {} and {}",
-                            lhs_ty.display(self.hir),
-                            rhs_ty.display(self.hir)
-                        ),
-                        span,
-                    );
-                    return Type::Error;
-                }
-                Type::Bool
+                self.check_ordering_types(ctx, types, span)
             }
-            BinaryOp::And | BinaryOp::Or => {
-                self.expect_assignable(&Type::Bool, lhs_ty, "left operand", ctx.expr_range(lhs));
-                self.expect_assignable(&Type::Bool, rhs_ty, "right operand", ctx.expr_range(rhs));
-                Type::Bool
-            }
+            BinaryOp::And | BinaryOp::Or => self.check_logical_types(ctx, operands, types),
             BinaryOp::Assign
             | BinaryOp::AddAssign
             | BinaryOp::SubAssign
@@ -769,6 +631,202 @@ impl TypeChecker<'_> {
             | BinaryOp::ShlAssign
             | BinaryOp::ShrAssign => unreachable!(),
         }
+    }
+
+    fn check_arithmetic_types(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        operands: (ExprId, ExprId),
+        types: (&Type, &Type),
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let (lhs, rhs) = operands;
+        let (lhs_ty, rhs_ty) = types;
+        self.expect_numeric(lhs_ty, "left operand", ctx.expr_range(lhs));
+        self.expect_numeric(rhs_ty, "right operand", ctx.expr_range(rhs));
+        if !lhs_ty.is_numeric() || !rhs_ty.is_numeric() {
+            return Type::Error;
+        }
+        if lhs_ty.is_unknown_like() || rhs_ty.is_unknown_like() {
+            Type::Unknown
+        } else if let Some(result) = Self::join_numeric_types(lhs_ty, rhs_ty) {
+            result
+        } else {
+            self.diagnostic(
+                "E0001",
+                format!(
+                    "binary operands have different types: {} and {}",
+                    lhs_ty.display(self.hir),
+                    rhs_ty.display(self.hir)
+                ),
+                span,
+            );
+            Type::Error
+        }
+    }
+
+    fn check_remainder_types(
+        &mut self,
+        types: (&Type, &Type),
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let (lhs_ty, rhs_ty) = types;
+        if !lhs_ty.is_unknown_like()
+            && !rhs_ty.is_unknown_like()
+            && (!lhs_ty.is_integer() || !rhs_ty.is_integer())
+        {
+            self.diagnostic(
+                "E0003",
+                format!(
+                    "remainder requires integer operands, got {} and {}",
+                    lhs_ty.display(self.hir),
+                    rhs_ty.display(self.hir)
+                ),
+                span,
+            );
+            return Type::Error;
+        }
+        Self::join_numeric_types(lhs_ty, rhs_ty).unwrap_or_else(|| lhs_ty.clone())
+    }
+
+    fn check_bitwise_types(
+        &mut self,
+        types: (&Type, &Type),
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let (lhs_ty, rhs_ty) = types;
+        if !lhs_ty.is_unknown_like()
+            && !rhs_ty.is_unknown_like()
+            && (!lhs_ty.is_bitwise_scalar() || !rhs_ty.is_bitwise_scalar())
+        {
+            self.diagnostic(
+                "E0003",
+                format!(
+                    "bitwise operation requires integer or bool operands, got {} and {}",
+                    lhs_ty.display(self.hir),
+                    rhs_ty.display(self.hir)
+                ),
+                span,
+            );
+            return Type::Error;
+        }
+        if lhs_ty == &Type::Bool && rhs_ty == &Type::Bool {
+            Type::Bool
+        } else if let Some(result) = Self::join_numeric_types(lhs_ty, rhs_ty) {
+            result
+        } else {
+            self.diagnostic(
+                "E0001",
+                format!(
+                    "bitwise operands have different types: {} and {}",
+                    lhs_ty.display(self.hir),
+                    rhs_ty.display(self.hir)
+                ),
+                span,
+            );
+            Type::Error
+        }
+    }
+
+    fn check_shift_types(&mut self, types: (&Type, &Type), span: Option<rowan::TextRange>) -> Type {
+        let (lhs_ty, rhs_ty) = types;
+        if !lhs_ty.is_unknown_like()
+            && !rhs_ty.is_unknown_like()
+            && (!lhs_ty.is_integer() || !rhs_ty.is_integer())
+        {
+            self.diagnostic(
+                "E0003",
+                format!(
+                    "shift operation requires integer operands, got {} and {}",
+                    lhs_ty.display(self.hir),
+                    rhs_ty.display(self.hir)
+                ),
+                span,
+            );
+            return Type::Error;
+        }
+        lhs_ty.clone()
+    }
+
+    fn check_equality_types(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        types: (&Type, &Type),
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let (lhs_ty, rhs_ty) = types;
+        if Self::is_builtin_equality(lhs_ty, rhs_ty)
+            && Self::join_numeric_types(lhs_ty, rhs_ty).is_none()
+        {
+            self.expect_assignable(lhs_ty, rhs_ty, "comparison", span);
+        }
+        if !Self::is_builtin_equality(lhs_ty, rhs_ty)
+            && !lhs_ty.is_unknown_like()
+            && !rhs_ty.is_unknown_like()
+            && !self.type_has_lang_trait_with_args(
+                ctx,
+                lhs_ty,
+                std::slice::from_ref(rhs_ty),
+                LangItem::PartialEq,
+            )
+        {
+            self.diagnostic(
+                "E0036",
+                format!(
+                    "type `{}` must implement `PartialEq` for equality comparison",
+                    lhs_ty.display(self.hir)
+                ),
+                span,
+            );
+        }
+        Type::Bool
+    }
+
+    fn check_ordering_types(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        types: (&Type, &Type),
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        let (lhs_ty, rhs_ty) = types;
+        if Self::is_builtin_ordering(lhs_ty, rhs_ty) {
+            if *lhs_ty != Type::Char && Self::join_numeric_types(lhs_ty, rhs_ty).is_none() {
+                self.expect_assignable(lhs_ty, rhs_ty, "comparison", span);
+            }
+        } else if !lhs_ty.is_unknown_like()
+            && !rhs_ty.is_unknown_like()
+            && !self.type_has_lang_trait_with_args(
+                ctx,
+                lhs_ty,
+                std::slice::from_ref(rhs_ty),
+                LangItem::PartialOrd,
+            )
+        {
+            self.diagnostic(
+                "E0003",
+                format!(
+                    "ordered comparison requires compatible numeric or char operands or `PartialOrd`, got {} and {}",
+                    lhs_ty.display(self.hir),
+                    rhs_ty.display(self.hir)
+                ),
+                span,
+            );
+            return Type::Error;
+        }
+        Type::Bool
+    }
+
+    fn check_logical_types(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        operands: (ExprId, ExprId),
+        types: (&Type, &Type),
+    ) -> Type {
+        let (lhs, rhs) = operands;
+        let (lhs_ty, rhs_ty) = types;
+        self.expect_assignable(&Type::Bool, lhs_ty, "left operand", ctx.expr_range(lhs));
+        self.expect_assignable(&Type::Bool, rhs_ty, "right operand", ctx.expr_range(rhs));
+        Type::Bool
     }
 
     pub(super) fn check_unary(

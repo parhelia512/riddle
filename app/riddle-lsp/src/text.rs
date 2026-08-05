@@ -1,8 +1,8 @@
 use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use std::path::PathBuf;
 
-pub(crate) fn normalized_path(path: PathBuf) -> PathBuf {
+pub fn normalized_path(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or_else(|_| {
         path.parent()
             .and_then(|parent| std::fs::canonicalize(parent).ok())
@@ -11,7 +11,7 @@ pub(crate) fn normalized_path(path: PathBuf) -> PathBuf {
     })
 }
 
-pub(crate) struct LineIndex {
+pub struct LineIndex {
     starts: Vec<usize>,
 }
 
@@ -36,7 +36,10 @@ impl LineIndex {
             .chars()
             .map(char::len_utf16)
             .sum::<usize>();
-        Some(Position::new(line as u32, character as u32))
+        Some(Position::new(
+            u32::try_from(line).ok()?,
+            u32::try_from(character).ok()?,
+        ))
     }
 
     pub(crate) fn range(&self, source: &str, range: TextRange) -> Option<Range> {
@@ -72,24 +75,24 @@ pub fn apply_content_changes(
     true
 }
 
-pub(crate) fn offset_for_position(source: &str, position: Position) -> Option<usize> {
+pub fn offset_for_position(source: &str, position: Position) -> Option<usize> {
     let mut line_start = 0;
     for _ in 0..position.line {
         line_start += source[line_start..].find('\n')? + 1;
     }
     let line_end = source[line_start..]
         .find('\n')
-        .map(|offset| line_start + offset)
-        .unwrap_or(source.len());
+        .map_or(source.len(), |offset| line_start + offset);
     let line = source[line_start..line_end]
         .strip_suffix('\r')
-        .unwrap_or(&source[line_start..line_end]);
+        .unwrap_or_else(|| &source[line_start..line_end]);
     let mut utf16_column = 0;
     for (byte, ch) in line.char_indices() {
         if utf16_column == position.character {
             return Some(line_start + byte);
         }
-        utf16_column += ch.len_utf16() as u32;
+        utf16_column +=
+            u32::try_from(ch.len_utf16()).expect("a char uses at most two UTF-16 units");
         if utf16_column > position.character {
             return None;
         }
@@ -97,14 +100,22 @@ pub(crate) fn offset_for_position(source: &str, position: Position) -> Option<us
     (utf16_column == position.character).then_some(line_start + line.len())
 }
 
-pub(crate) fn is_identifier_continue(ch: char) -> bool {
+pub fn is_identifier_continue(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
 }
 
-pub(crate) fn range_is_in_source(range: TextRange, source_len: usize) -> bool {
+pub fn range_is_in_source(range: TextRange, source_len: usize) -> bool {
     usize::from(range.end()) <= source_len
 }
 
-pub(crate) fn ranges_overlap(a: TextRange, b: TextRange) -> bool {
+pub fn ranges_overlap(a: TextRange, b: TextRange) -> bool {
     a.start() < b.end() && b.start() < a.end()
+}
+
+pub fn text_size(value: usize) -> TextSize {
+    TextSize::from(u32::try_from(value).expect("source offset should fit in u32"))
+}
+
+pub fn text_range(start: usize, end: usize) -> TextRange {
+    TextRange::new(text_size(start), text_size(end))
 }

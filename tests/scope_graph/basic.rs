@@ -5,12 +5,12 @@ use scope_graph::Node;
 #[test]
 fn resolves_param_then_local_in_statement_order() {
     let sg = build(
-        r#"
+        r"
         fun f(x: int) {
             let y = x;
             y
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "x"), vec![vec![DefKind::Param]]);
@@ -20,12 +20,12 @@ fn resolves_param_then_local_in_statement_order() {
 #[test]
 fn local_shadows_param() {
     let sg = build(
-        r#"
+        r"
         fun f(x: int) {
             let x = 1;
             x
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "x"), vec![vec![DefKind::Local]]);
@@ -34,11 +34,11 @@ fn local_shadows_param() {
 #[test]
 fn let_initializer_does_not_see_its_own_binding() {
     let sg = build(
-        r#"
+        r"
         fun f(x: int) {
             let x = x;
         }
-        "#,
+        ",
     );
 
     assert_eq!(resolve_paths(&sg, "x"), vec![vec![DefKind::Param]]);
@@ -47,14 +47,14 @@ fn let_initializer_does_not_see_its_own_binding() {
 #[test]
 fn let_bindings_are_distinct_across_statement_chain() {
     let sg = build(
-        r#"
+        r"
         fun f(a: int) {
             let x = a;
             let y = x;
             let x = y;
             x
         }
-        "#,
+        ",
     );
 
     let refs: Vec<_> = sg
@@ -100,7 +100,7 @@ fn let_bindings_are_distinct_across_statement_chain() {
 #[test]
 fn local_declared_before_nested_while_body_is_visible() {
     let sg = build(
-        r#"
+        r"
         fun f(flag: bool) {
             if flag {
                 let mut go: bool = true;
@@ -109,7 +109,7 @@ fn local_declared_before_nested_while_body_is_visible() {
                 }
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(
@@ -121,7 +121,7 @@ fn local_declared_before_nested_while_body_is_visible() {
 #[test]
 fn same_named_locals_in_sibling_blocks_do_not_cross_resolve() {
     let sg = build(
-        r#"
+        r"
         fun f(flag: bool) {
             if flag {
                 let mut go: bool = true;
@@ -131,7 +131,7 @@ fn same_named_locals_in_sibling_blocks_do_not_cross_resolve() {
                 while go { go = false; }
             }
         }
-        "#,
+        ",
     );
 
     let go_defs: Vec<_> = sg

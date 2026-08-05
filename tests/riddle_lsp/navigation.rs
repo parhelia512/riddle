@@ -32,7 +32,7 @@ fn hover_shows_resolved_function_and_local_types() {
 
 #[test]
 fn hover_shows_complete_type_declarations() {
-    let source = r#"enum Foo {
+    let source = r"enum Foo {
     A,
     B(i32),
     C((i32, &Foo)),
@@ -47,7 +47,7 @@ struct Record {
     sixth: i32,
 }
 
-type a = Foo;"#;
+type a = Foo;";
 
     for offset in [source.find("Foo {").unwrap(), source.rfind("Foo;").unwrap()] {
         let hover = hover_for_source(
@@ -232,13 +232,13 @@ fn references_respect_shadowing_declarations_and_utf16_positions() {
 
 #[test]
 fn references_and_rename_cover_fields_shorthand_and_trait_methods() {
-    let source = r#"struct Point { x: i32 }
+    let source = r"struct Point { x: i32 }
 trait Read { fun read(&self) -> i32; }
 impl Read for Point { fun read(&self) -> i32 { self.x } }
 fun run(value: Point, x: i32) -> i32 {
     let point = Point { x };
     point.x + value.read()
-}"#;
+}";
     let field_definition = source.find("x: i32").unwrap();
     let field_references = references_for_source(
         source,
@@ -434,33 +434,9 @@ fn project_rename_uses_overlays_and_versions_only_open_documents() {
             .cmp(right.text_document.uri.as_str())
     });
     assert_eq!(documents.len(), 3);
-    assert_eq!(
-        documents
-            .iter()
-            .find(|document| document.text_document.uri == main_uri)
-            .unwrap()
-            .text_document
-            .version,
-        Some(7)
-    );
-    assert_eq!(
-        documents
-            .iter()
-            .find(|document| document.text_document.uri == util_uri)
-            .unwrap()
-            .text_document
-            .version,
-        Some(9)
-    );
-    assert_eq!(
-        documents
-            .iter()
-            .find(|document| document.text_document.uri == consumer_uri)
-            .unwrap()
-            .text_document
-            .version,
-        None
-    );
+    assert_eq!(document_edit_version(&documents, &main_uri), Some(7));
+    assert_eq!(document_edit_version(&documents, &util_uri), Some(9));
+    assert_eq!(document_edit_version(&documents, &consumer_uri), None);
     assert!(documents.iter().all(|document| {
         document
             .edits
@@ -468,4 +444,14 @@ fn project_rename_uses_overlays_and_versions_only_open_documents() {
             .all(|edit| matches!(edit, lsp_types::OneOf::Left(edit) if edit.new_text == "answer"))
     }));
     let _ = fs::remove_dir_all(root);
+}
+
+fn document_edit_version(
+    documents: &[lsp_types::TextDocumentEdit],
+    uri: &lsp_types::Url,
+) -> Option<i32> {
+    documents
+        .iter()
+        .find(|document| document.text_document.uri == *uri)
+        .and_then(|document| document.text_document.version)
 }

@@ -12,7 +12,7 @@ use crate::build_hir_and_graph;
 #[test]
 fn break_and_continue_parse_and_lower() {
     let (hir, _) = build_hir_and_graph(
-        r#"
+        r"
         fun main() {
             while true {
                 continue;
@@ -23,7 +23,7 @@ fn break_and_continue_parse_and_lower() {
                 continue;
             }
         }
-        "#,
+        ",
     );
 
     let body_id = *hir.function_bodies.values().next().unwrap();
@@ -43,7 +43,7 @@ fn break_and_continue_parse_and_lower() {
 #[test]
 fn resolve_hir_updates_expr_path_resolutions() {
     let (mut hir, sg) = build_hir_and_graph(
-        r#"
+        r"
         mod m {
             pub struct S {}
         }
@@ -54,7 +54,7 @@ fn resolve_hir_updates_expr_path_resolutions() {
             let y = x;
             T
         }
-        "#,
+        ",
     );
 
     resolve_hir(&mut hir, &sg);
@@ -83,14 +83,14 @@ fn resolve_hir_updates_expr_path_resolutions() {
 #[test]
 fn lowers_move_lambda_mutable_params_and_impl_fn() {
     let (hir, _) = build_hir_and_graph(
-        r#"
+        r"
         fun apply(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
             f(value)
         }
         fun main() {
             let bump = move fun(mut value: i32) { value };
         }
-        "#,
+        ",
     );
 
     let apply = hir
@@ -118,7 +118,7 @@ fn lowers_move_lambda_mutable_params_and_impl_fn() {
 
 #[test]
 fn assignment_and_struct_literal_parse_and_lower() {
-    let source = r#"
+    let source = r"
         struct Foo {
             x: int,
             y: int,
@@ -129,7 +129,7 @@ fn assignment_and_struct_literal_parse_and_lower() {
             let x = Foo{x: 1, y: 1};
             t = x;
         }
-        "#;
+        ";
 
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
@@ -137,7 +137,7 @@ fn assignment_and_struct_literal_parse_and_lower() {
 
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
-    let mut hir = lower_root(root);
+    let mut hir = lower_root(&root);
     let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
 
@@ -164,12 +164,12 @@ fn assignment_and_struct_literal_parse_and_lower() {
 
 #[test]
 fn rust_style_array_repeat_parses_and_lowers() {
-    let source = r#"
+    let source = r"
         fun f() {
             let value = 1;
             let repeated: [i32; 3] = [value; 3];
         }
-        "#;
+        ";
 
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
@@ -177,7 +177,7 @@ fn rust_style_array_repeat_parses_and_lowers() {
 
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
-    let mut hir = lower_root(root);
+    let mut hir = lower_root(&root);
     let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
 
@@ -213,7 +213,7 @@ fn raw_string_literals_parse_and_lower() {
 
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
-    let mut hir = lower_root(root);
+    let mut hir = lower_root(&root);
     let (sg, _) = build_scope_graph(&hir, &syntax);
     resolve_hir(&mut hir, &sg);
 
@@ -231,9 +231,9 @@ fn raw_string_literals_parse_and_lower() {
     assert_eq!(
         values,
         vec![
-            r#"r"hello""#,
-            r##"r#"hello "riddle""#"##,
-            r####"r###"hello "# world"###"####
+            "r\"hello\"",
+            "r#\"hello \"riddle\"\"#",
+            "r###\"hello \"# world\"###"
         ]
     );
 }
@@ -263,9 +263,9 @@ fn raw_string_attribute_values_unquote() {
 #[test]
 fn slice_and_array_types_use_rust_style_syntax() {
     let (hir, _) = build_hir_and_graph(
-        r#"
+        r"
         fun f(xs: &[i32], ys: &[i32; 4]) {}
-        "#,
+        ",
     );
     let function = hir.item_tree.functions.iter().next().unwrap().1;
     assert!(matches!(
@@ -296,7 +296,7 @@ fn slice_and_array_types_use_rust_style_syntax() {
 
 #[test]
 fn accepts_rust_style_explicit_generic_calls_and_struct_expr() {
-    let source = r#"
+    let source = r"
         struct Wrap<T> {
             inner: T,
         }
@@ -307,7 +307,7 @@ fn accepts_rust_style_explicit_generic_calls_and_struct_expr() {
             x.convert::<T>();
             Wrap::<T> { inner: x };
         }
-        "#;
+        ";
 
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
@@ -324,10 +324,10 @@ fn accepts_rust_style_explicit_generic_calls_and_struct_expr() {
 fn rejects_legacy_explicit_generic_call_syntax() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(
-        r#"
+        r"
         fun id<T>(value: T) -> T { value }
         fun main() { id<i32>(1); }
-        "#,
+        ",
     );
 
     assert!(!parse.errors.is_empty());
@@ -372,8 +372,7 @@ fn resolves_enum_variant_in_path() {
         .collect();
     assert!(
         unresolved.is_empty(),
-        "Unexpected unresolved paths: {:?}",
-        unresolved
+        "Unexpected unresolved paths: {unresolved:?}"
     );
 }
 

@@ -86,69 +86,9 @@ fn main() {
     let mut generated_code = String::new();
 
     for file in &opts.files {
-        let mut loaded = match pipeline::load_source_file(file) {
-            Ok(loaded) => loaded,
-            Err(e) => {
-                eprintln!("riddlec: cannot read `{}`: {e}", file.display());
-                total_errors += 1;
-                continue;
-            }
-        };
-        let expansion = riddlec::proc_macro::expand_standard_macros(&loaded.source);
-        loaded.apply_expansion(expansion.source, &expansion.mappings);
-        let options = pipeline::CompileOptions {
-            use_std: opts.use_std,
-        };
-        #[allow(clippy::single_range_in_vec_init)]
-        let package_ranges = [0..loaded.source.len()];
-        let mut result = if let Some(parse) = expansion.parse.as_ref() {
-            if opts.backend.is_some() {
-                pipeline::compile_parsed_package_with_options(
-                    &loaded.source,
-                    parse,
-                    &package_ranges,
-                    options,
-                )
-            } else {
-                pipeline::check_parsed_package_with_options(
-                    &loaded.source,
-                    parse,
-                    &package_ranges,
-                    options,
-                )
-            }
-        } else if opts.backend.is_some() {
-            pipeline::compile_package_with_options(&loaded.source, &package_ranges, options)
-        } else {
-            pipeline::check_package_with_options(&loaded.source, &package_ranges, options)
-        };
-        result.macro_diagnostics = expansion.diagnostics;
-
-        if opts.verbose {
-            if opts.files.len() > 1 {
-                println!("== {} ==", file.display());
-            }
-            println!("target: {target}");
-            let source_name = file.display().to_string();
-            diagnostics::report_verbose(&result, Some(&loaded.source), &source_name);
-            println!();
-        }
-
-        let source_name = file.display().to_string();
-        total_errors += diagnostics::report_mapped(&result, &loaded, &source_name);
-
-        if result.success()
-            && let Some(ref module) = result.mir_module
-            && let Some(ref backend) = opts.backend
-        {
-            match generate(module, backend) {
-                Ok(code) => generated_code.push_str(&code),
-                Err(e) => {
-                    eprintln!("riddlec: code generation error: {:?}", e);
-                    total_errors += 1;
-                }
-            }
-        }
+        let (errors, code) = compile_file(file, &opts, target);
+        total_errors += errors;
+        generated_code.push_str(&code);
     }
 
     if !generated_code.is_empty() {
@@ -174,9 +114,75 @@ fn main() {
     }
 }
 
+fn compile_file(file: &Path, opts: &Opts, target: TargetTriple) -> (usize, String) {
+    let mut loaded = match pipeline::load_source_file(file) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("riddlec: cannot read `{}`: {error}", file.display());
+            return (1, String::new());
+        }
+    };
+    let expansion = riddlec::proc_macro::expand_standard_macros(&loaded.source);
+    loaded.apply_expansion(expansion.source, &expansion.mappings);
+    let options = pipeline::CompileOptions {
+        use_std: opts.use_std,
+    };
+    let package_range = 0..loaded.source.len();
+    let package_ranges = std::slice::from_ref(&package_range);
+    let mut result = if let Some(parse) = expansion.parse.as_ref() {
+        if opts.backend.is_some() {
+            pipeline::compile_parsed_package_with_options(
+                &loaded.source,
+                parse,
+                package_ranges,
+                options,
+            )
+        } else {
+            pipeline::check_parsed_package_with_options(
+                &loaded.source,
+                parse,
+                package_ranges,
+                options,
+            )
+        }
+    } else if opts.backend.is_some() {
+        pipeline::compile_package_with_options(&loaded.source, package_ranges, options)
+    } else {
+        pipeline::check_package_with_options(&loaded.source, package_ranges, options)
+    };
+    result.macro_diagnostics = expansion.diagnostics;
+
+    if opts.verbose {
+        if opts.files.len() > 1 {
+            println!("== {} ==", file.display());
+        }
+        println!("target: {target}");
+        let source_name = file.display().to_string();
+        diagnostics::report_verbose(&result, Some(&loaded.source), &source_name);
+        println!();
+    }
+
+    let source_name = file.display().to_string();
+    let mut errors = diagnostics::report_mapped(&result, &loaded, &source_name);
+    let mut generated = String::new();
+    if result.success()
+        && let Some(ref module) = result.mir_module
+        && let Some(backend) = opts.backend
+    {
+        match generate(module, backend) {
+            Ok(code) => generated = code,
+            Err(error) => {
+                eprintln!("riddlec: code generation error: {error:?}");
+                errors += 1;
+            }
+        }
+    }
+    (errors, generated)
+}
+
 fn generate(
     module: &mir::Module,
-    backend: &BackendKind,
+    backend: BackendKind,
 ) -> Result<String, Box<dyn std::fmt::Debug>> {
     match backend {
         BackendKind::C => {
@@ -215,12 +221,14 @@ fn write_c(c_code: &str, output: Option<&Path>, input_files: &[PathBuf]) -> usiz
             .first()
             .and_then(|f| f.file_stem())
             .filter(|stem| !stem.is_empty())
-            .map(|stem| {
-                let mut output = stem.to_os_string();
-                output.push(".c");
-                PathBuf::from(output)
-            })
-            .unwrap_or_else(|| PathBuf::from("riddle_out.c")),
+            .map_or_else(
+                || PathBuf::from("riddle_out.c"),
+                |stem| {
+                    let mut output = stem.to_os_string();
+                    output.push(".c");
+                    PathBuf::from(output)
+                },
+            ),
     };
 
     if let Err(e) = fs::write(&c_path, c_code) {

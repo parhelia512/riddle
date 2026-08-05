@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    BodyCtx, CallableSignature, ClosureKind, Expr, ExprId, GenericEdge, HashMap, HirFunction,
+    HirTypeRef, HirVariantKind, LabelStyle, PendingGenericCall, ResolvedName, SourceLabel, TraitId,
+    TraitMethodCall, Type, TypeChecker, ValueUse, bound_target_param, builtin_callable_kind,
+    callable_signature_type, collect_subst, expected_has_param, generic_param_map_with_consts,
+    grows_generic_arg, pattern_has_unresolved_param, record_generic_arg_spans, substitute_type,
+    type_has_unresolved_inference,
+};
 
 impl TypeChecker<'_> {
     pub(super) fn check_call(
@@ -57,49 +64,7 @@ impl TypeChecker<'_> {
                 .or_else(|| self.callable_bound_for_type(ctx, &resolved_callee))
         };
         if let Some(signature) = signature {
-            self.record_value_use(
-                ctx,
-                callee,
-                match signature.kind {
-                    ClosureKind::Fn => ValueUse::Shared,
-                    ClosureKind::FnMut => ValueUse::Mutable,
-                    ClosureKind::FnOnce => ValueUse::Move,
-                },
-            );
-            if signature.kind == ClosureKind::FnMut {
-                self.check_mutable_closure_binding(ctx, callee);
-            }
-            if signature.is_unsafe {
-                self.require_unsafe(ctx, "calling an unsafe function", span);
-            }
-            if args.len() != signature.params.len() {
-                self.diagnostic(
-                    "E0005",
-                    format!(
-                        "function value expects {} argument(s), got {}",
-                        signature.params.len(),
-                        args.len()
-                    ),
-                    span,
-                );
-            }
-            for (index, arg) in args.iter().enumerate() {
-                if let Some(param) = signature.params.get(index) {
-                    let actual = self.check_expr_expected(ctx, *arg, param);
-                    self.expect_assignable_with_occurs_span(
-                        param,
-                        &actual,
-                        "function argument",
-                        ctx.expr_range(*arg),
-                        span,
-                    );
-                    self.record_value_use(ctx, *arg, Self::parameter_value_use(param));
-                } else {
-                    self.check_expr(ctx, *arg);
-                    self.record_value_use(ctx, *arg, ValueUse::Move);
-                }
-            }
-            return self.resolve_type(&signature.ret);
+            return self.check_callable_value_call(ctx, callee, args, &signature, span);
         }
         let Type::FunctionItem { function: fid, .. } = callee_ty else {
             for arg in args {
@@ -115,6 +80,81 @@ impl TypeChecker<'_> {
             }
             return Type::Error;
         };
+
+        self.check_function_call(
+            ctx,
+            callee,
+            fid,
+            args,
+            (impl_type_args.as_slice(), type_args),
+            (expected, span),
+        )
+    }
+
+    fn check_callable_value_call(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        callee: ExprId,
+        args: &[ExprId],
+        signature: &CallableSignature,
+        span: Option<rowan::TextRange>,
+    ) -> Type {
+        self.record_value_use(
+            ctx,
+            callee,
+            match signature.kind {
+                ClosureKind::Fn => ValueUse::Shared,
+                ClosureKind::FnMut => ValueUse::Mutable,
+                ClosureKind::FnOnce => ValueUse::Move,
+            },
+        );
+        if signature.kind == ClosureKind::FnMut {
+            self.check_mutable_closure_binding(ctx, callee);
+        }
+        if signature.is_unsafe {
+            self.require_unsafe(ctx, "calling an unsafe function", span);
+        }
+        if args.len() != signature.params.len() {
+            self.diagnostic(
+                "E0005",
+                format!(
+                    "function value expects {} argument(s), got {}",
+                    signature.params.len(),
+                    args.len()
+                ),
+                span,
+            );
+        }
+        for (index, arg) in args.iter().enumerate() {
+            if let Some(param) = signature.params.get(index) {
+                let actual = self.check_expr_expected(ctx, *arg, param);
+                self.expect_assignable_with_occurs_span(
+                    param,
+                    &actual,
+                    "function argument",
+                    ctx.expr_range(*arg),
+                    span,
+                );
+                self.record_value_use(ctx, *arg, Self::parameter_value_use(param));
+            } else {
+                self.check_expr(ctx, *arg);
+                self.record_value_use(ctx, *arg, ValueUse::Move);
+            }
+        }
+        self.resolve_type(&signature.ret)
+    }
+
+    fn check_function_call(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        callee: ExprId,
+        fid: hir::item_tree::FunctionId,
+        args: &[ExprId],
+        type_args: (&[HirTypeRef], &[HirTypeRef]),
+        expected_span: (Option<&Type>, Option<rowan::TextRange>),
+    ) -> Type {
+        let (impl_type_args, type_args) = type_args;
+        let (expected, span) = expected_span;
 
         let function = self.hir.item_tree.functions[fid].clone();
         if function.is_unsafe {
@@ -141,46 +181,15 @@ impl TypeChecker<'_> {
         let mut subst = HashMap::new();
         let mut generic_arg_spans = HashMap::new();
 
-        if !impl_type_args.is_empty() {
-            if impl_type_args.len() != impl_generics.len() {
-                self.diagnostic(
-                    "E0005",
-                    format!(
-                        "associated function `{}` expects {} type argument(s) on its type, got {}",
-                        function.name.0,
-                        impl_generics.len(),
-                        impl_type_args.len()
-                    ),
-                    span,
-                );
-            }
-            for (param_name, type_arg) in impl_generics.iter().zip(&impl_type_args) {
-                let lowered =
-                    self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
-                subst.insert(param_name.clone(), lowered);
-            }
-        }
-
-        if !type_args.is_empty() {
-            let type_param_names: Vec<_> = function.generics.iter().map(|name| &name.0).collect();
-            if type_args.len() != type_param_names.len() {
-                self.diagnostic(
-                    "E0005",
-                    format!(
-                        "function `{}` expects {} type argument(s), got {}",
-                        function.name.0,
-                        type_param_names.len(),
-                        type_args.len()
-                    ),
-                    span,
-                );
-            }
-            for (param_name, type_arg) in type_param_names.iter().zip(type_args.iter()) {
-                let lowered =
-                    self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
-                subst.insert((*param_name).clone(), lowered);
-            }
-        }
+        self.apply_impl_type_args(
+            ctx,
+            &function,
+            &impl_generics,
+            impl_type_args,
+            &mut subst,
+            span,
+        );
+        self.apply_function_type_args(ctx, &function, type_args, &mut subst, span);
 
         self.seed_type_inference(
             impl_generics
@@ -209,45 +218,14 @@ impl TypeChecker<'_> {
             );
         }
 
-        for (index, arg) in args.iter().enumerate() {
-            if let Some(param) = function.params.get(index) {
-                let pattern =
-                    self.lower_type_ref_with_params_at(&param.ty, &params, Some(param.ty_range));
-                record_generic_arg_spans(
-                    &pattern,
-                    &params,
-                    ctx.expr_range(*arg),
-                    &mut generic_arg_spans,
-                );
-                let expected = substitute_type(&pattern, &subst);
-                let callable_expected = self
-                    .callable_bound_for_function_type(&function, &pattern, &params)
-                    .map(callable_signature_type)
-                    .map(|ty| substitute_type(&ty, &subst));
-                let actual = match callable_expected.as_ref() {
-                    Some(expected) => self.check_expr_expected(ctx, *arg, expected),
-                    None if expected_has_param(&expected) => self.check_expr(ctx, *arg),
-                    None => self.check_expr_expected(ctx, *arg, &expected),
-                };
-                if let Some(expected) = callable_expected.as_ref() {
-                    let _ = self.unify_types(expected, &actual);
-                    self.last_occurs_error = None;
-                }
-                collect_subst(&pattern, &actual, &mut subst);
-                let expected = substitute_type(&pattern, &subst);
-                self.expect_assignable_with_occurs_span(
-                    &expected,
-                    &actual,
-                    "function argument",
-                    ctx.expr_range(*arg),
-                    span,
-                );
-                self.record_value_use(ctx, *arg, Self::hir_parameter_value_use(&param.ty));
-            } else {
-                self.check_expr(ctx, *arg);
-                self.record_value_use(ctx, *arg, ValueUse::Move);
-            }
-        }
+        self.check_function_arguments(
+            ctx,
+            &function,
+            args,
+            &params,
+            (&mut subst, &mut generic_arg_spans),
+            span,
+        );
 
         if let (Some(expected), Some(return_ty)) = (expected, function.ret_type.as_ref()) {
             let return_pattern = self.lower_type_ref_with_params_at(
@@ -264,63 +242,197 @@ impl TypeChecker<'_> {
             || !function.implicit_generics.is_empty()
             || !function.const_generics.is_empty()
         {
-            let inferred_names = impl_generics
-                .iter()
-                .map(String::as_str)
-                .chain(function.generics.iter().map(|name| name.0.as_str()))
-                .chain(
-                    function
-                        .implicit_generics
-                        .iter()
-                        .map(|name| name.0.as_str()),
-                )
-                .chain(impl_const_generics.iter().map(String::as_str))
-                .chain(function.const_generics.iter().map(|name| name.0.as_str()))
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            let generic_args = inferred_names
-                .iter()
-                .map(|name| subst.get(name).cloned().unwrap_or(Type::Unknown))
-                .collect::<Vec<_>>();
-            self.result.generic_calls.insert(
-                (ctx.body_id, callee),
-                crate::result::GenericCall { args: generic_args },
-            );
-            self.pending_generic_calls.push(PendingGenericCall {
-                body_id: ctx.body_id,
-                callee,
-                function: fid,
-                inferred_names,
-                subst: subst.clone(),
-                generic_arg_spans,
-                callee_span: ctx.expr_range(callee),
+            self.record_function_generic_call(
+                ctx,
+                (callee, fid),
+                &function,
+                (&impl_generics, &impl_const_generics),
+                (&subst, generic_arg_spans),
                 span,
-                kind: "function",
-                caller: ctx.function_id,
-                check_sized: true,
-            });
+            );
         }
 
-        let output_ty = function
-            .ret_type
-            .as_ref()
-            .map(|ty| {
-                substitute_type(
-                    &self.lower_type_ref_with_params_at(
-                        ty,
-                        &params,
-                        function.ret_type_range.or(Some(function.name_range)),
-                    ),
-                    &subst,
-                )
-            })
-            .unwrap_or(Type::Unit);
-        let return_ty = output_ty;
+        let return_ty = self.function_call_return_type(&function, &params, &subst);
         if let Some(expected) = expected {
             let _ = self.unify_types(&return_ty, expected);
             self.last_occurs_error = None;
         }
         return_ty
+    }
+
+    fn function_call_return_type(
+        &mut self,
+        function: &HirFunction,
+        params: &HashMap<String, Type>,
+        subst: &HashMap<String, Type>,
+    ) -> Type {
+        function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            substitute_type(
+                &self.lower_type_ref_with_params_at(
+                    ty,
+                    params,
+                    function.ret_type_range.or(Some(function.name_range)),
+                ),
+                subst,
+            )
+        })
+    }
+
+    fn record_function_generic_call(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        call: (ExprId, hir::item_tree::FunctionId),
+        function: &HirFunction,
+        impl_generics: (&[String], &[String]),
+        inference: (&HashMap<String, Type>, HashMap<String, rowan::TextRange>),
+        span: Option<rowan::TextRange>,
+    ) {
+        let (callee, function_id) = call;
+        let (impl_generics, impl_const_generics) = impl_generics;
+        let (subst, generic_arg_spans) = inference;
+        let inferred_names = impl_generics
+            .iter()
+            .map(String::as_str)
+            .chain(function.generics.iter().map(|name| name.0.as_str()))
+            .chain(
+                function
+                    .implicit_generics
+                    .iter()
+                    .map(|name| name.0.as_str()),
+            )
+            .chain(impl_const_generics.iter().map(String::as_str))
+            .chain(function.const_generics.iter().map(|name| name.0.as_str()))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let generic_args = inferred_names
+            .iter()
+            .map(|name| subst.get(name).cloned().unwrap_or(Type::Unknown))
+            .collect::<Vec<_>>();
+        self.result.generic_calls.insert(
+            (ctx.body_id, callee),
+            crate::result::GenericCall { args: generic_args },
+        );
+        self.pending_generic_calls.push(PendingGenericCall {
+            body_id: ctx.body_id,
+            callee,
+            function: function_id,
+            inferred_names,
+            subst: subst.clone(),
+            generic_arg_spans,
+            callee_span: ctx.expr_range(callee),
+            span,
+            kind: "function",
+            caller: ctx.function_id,
+            check_sized: true,
+        });
+    }
+
+    fn apply_impl_type_args(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        function: &HirFunction,
+        impl_generics: &[String],
+        type_args: &[HirTypeRef],
+        subst: &mut HashMap<String, Type>,
+        span: Option<rowan::TextRange>,
+    ) {
+        if type_args.is_empty() {
+            return;
+        }
+        if type_args.len() != impl_generics.len() {
+            self.diagnostic(
+                "E0005",
+                format!(
+                    "associated function `{}` expects {} type argument(s) on its type, got {}",
+                    function.name.0,
+                    impl_generics.len(),
+                    type_args.len()
+                ),
+                span,
+            );
+        }
+        for (param_name, type_arg) in impl_generics.iter().zip(type_args) {
+            let lowered = self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
+            subst.insert(param_name.clone(), lowered);
+        }
+    }
+
+    fn apply_function_type_args(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        function: &HirFunction,
+        type_args: &[HirTypeRef],
+        subst: &mut HashMap<String, Type>,
+        span: Option<rowan::TextRange>,
+    ) {
+        if type_args.is_empty() {
+            return;
+        }
+        if type_args.len() != function.generics.len() {
+            self.diagnostic(
+                "E0005",
+                format!(
+                    "function `{}` expects {} type argument(s), got {}",
+                    function.name.0,
+                    function.generics.len(),
+                    type_args.len()
+                ),
+                span,
+            );
+        }
+        for (param_name, type_arg) in function.generics.iter().zip(type_args) {
+            let lowered = self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
+            subst.insert(param_name.0.clone(), lowered);
+        }
+    }
+
+    fn check_function_arguments(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        function: &HirFunction,
+        args: &[ExprId],
+        params: &HashMap<String, Type>,
+        inference: (
+            &mut HashMap<String, Type>,
+            &mut HashMap<String, rowan::TextRange>,
+        ),
+        span: Option<rowan::TextRange>,
+    ) {
+        let (subst, generic_arg_spans) = inference;
+        for (index, arg) in args.iter().enumerate() {
+            let Some(param) = function.params.get(index) else {
+                self.check_expr(ctx, *arg);
+                self.record_value_use(ctx, *arg, ValueUse::Move);
+                continue;
+            };
+            let pattern =
+                self.lower_type_ref_with_params_at(&param.ty, params, Some(param.ty_range));
+            record_generic_arg_spans(&pattern, params, ctx.expr_range(*arg), generic_arg_spans);
+            let expected = substitute_type(&pattern, subst);
+            let callable_expected = self
+                .callable_bound_for_function_type(function, &pattern, params)
+                .map(callable_signature_type)
+                .map(|ty| substitute_type(&ty, subst));
+            let actual = match callable_expected.as_ref() {
+                Some(expected) => self.check_expr_expected(ctx, *arg, expected),
+                None if expected_has_param(&expected) => self.check_expr(ctx, *arg),
+                None => self.check_expr_expected(ctx, *arg, &expected),
+            };
+            if let Some(expected) = callable_expected.as_ref() {
+                let _ = self.unify_types(expected, &actual);
+                self.last_occurs_error = None;
+            }
+            collect_subst(&pattern, &actual, subst);
+            let expected = substitute_type(&pattern, subst);
+            self.expect_assignable_with_occurs_span(
+                &expected,
+                &actual,
+                "function argument",
+                ctx.expr_range(*arg),
+                span,
+            );
+            self.record_value_use(ctx, *arg, Self::hir_parameter_value_use(&param.ty));
+        }
     }
 
     pub(super) fn check_static_trait_call(
@@ -363,22 +475,17 @@ impl TypeChecker<'_> {
             self.diagnostic("E0013", "`default` must be a static trait function", span);
             return Type::Error;
         }
-        let return_ty = method
-            .function
-            .ret_type
-            .as_ref()
-            .map(|ty| {
-                self.lower_type_ref_with_params_at(
-                    ty,
-                    &method.subst,
-                    method
-                        .function
-                        .ret_type_range
-                        .or(Some(method.function.name_range)),
-                )
-            })
-            .unwrap_or(Type::Unit);
-        if !self.bound_types_match(expected, &return_ty) {
+        let return_ty = method.function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            self.lower_type_ref_with_params_at(
+                ty,
+                &method.subst,
+                method
+                    .function
+                    .ret_type_range
+                    .or(Some(method.function.name_range)),
+            )
+        });
+        if !Self::bound_types_match(expected, &return_ty) {
             self.diagnostic(
                 "E0013",
                 format!(
@@ -490,11 +597,10 @@ impl TypeChecker<'_> {
                     "enum variant argument",
                     ctx.expr_range(*arg),
                 );
-                self.record_value_use(ctx, *arg, ValueUse::Move);
             } else {
                 self.check_expr(ctx, *arg);
-                self.record_value_use(ctx, *arg, ValueUse::Move);
             }
+            self.record_value_use(ctx, *arg, ValueUse::Move);
         }
 
         let args = enum_data
@@ -637,8 +743,7 @@ impl TypeChecker<'_> {
         let actual_boundary = self
             .callable_signature_for_type(actual)
             .or_else(|| self.callable_bound_for_type(ctx, actual))
-            .map(callable_signature_type)
-            .unwrap_or_else(|| actual.clone());
+            .map_or_else(|| actual.clone(), callable_signature_type);
         let required_boundary = callable_signature_type(required.clone());
         if self.unify_types(&required_boundary, &actual_boundary) {
             return;
@@ -810,71 +915,18 @@ impl TypeChecker<'_> {
                 subst,
             ) {
                 let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
-                let format_placeholder = match (function.name.0.as_str(), trait_name.as_str()) {
-                    ("print_debug", "Debug")
-                        if self.hir.std_loaded
-                            && self.hir.package_for_range(function.name_range).is_none() =>
-                    {
-                        Some("{:?}")
-                    }
-                    _ => None,
-                };
-                if let Some(placeholder) = format_placeholder {
-                    let type_name = actual.display(self.hir);
-                    let owner_package = self.hir.package_for_range(ctx.owner_range());
-                    let derive_target = match &actual {
-                        Type::Struct(id, _) => {
-                            let item = &self.hir.item_tree.structs[*id];
-                            Some((item.name.0.clone(), item.name_range))
-                        }
-                        Type::Enum(id, _) => {
-                            let item = &self.hir.item_tree.enums[*id];
-                            Some((item.name.0.clone(), item.name_range))
-                        }
-                        _ => None,
-                    }
-                    .filter(|(_, range)| {
-                        owner_package.is_some()
-                            && self.hir.package_for_range(*range) == owner_package
-                    });
-                    let diagnostics_before = self.result.diagnostics.len();
-                    self.diagnostic(
-                        "E0035",
-                        format!("`{type_name}` doesn't implement `{trait_name}`"),
+                let is_debug_bound = function.name.0 == "print_debug"
+                    && trait_name == "Debug"
+                    && self.hir.std_loaded
+                    && self.hir.package_for_range(function.name_range).is_none();
+                if is_debug_bound {
+                    self.report_debug_bound_failure(
+                        ctx,
+                        &actual,
+                        &trait_name,
                         bound_span,
+                        callee_span,
                     );
-                    if let Some(diagnostic) = self.result.diagnostics.get_mut(diagnostics_before) {
-                        diagnostic.labels[0].message = format!(
-                            "`{type_name}` cannot be formatted using `{placeholder}` because it doesn't implement `{trait_name}`"
-                        );
-                        if let Some(callee_span) = callee_span
-                            && Some(callee_span) != bound_span
-                        {
-                            diagnostic.labels.push(SourceLabel {
-                                range: callee_span,
-                                message: "required by this formatting parameter".into(),
-                                style: LabelStyle::Secondary,
-                            });
-                        }
-                        diagnostic.notes = vec![format!(
-                            "the trait `{trait_name}` is not implemented for `{type_name}`"
-                        )];
-                        if let Some((name, range)) = derive_target {
-                            diagnostic.labels.push(SourceLabel {
-                                range,
-                                message: format!(
-                                    "consider annotating `{name}` with `#[derive(Debug)]`"
-                                ),
-                                style: LabelStyle::Secondary,
-                            });
-                            diagnostic.help = Some(format!(
-                                "add `#[derive(Debug)]` to `{name}` or manually implement `Debug`"
-                            ));
-                        } else {
-                            diagnostic.help =
-                                Some(format!("implement `{trait_name}` for `{type_name}`"));
-                        }
-                    }
                     continue;
                 }
                 self.diagnostic(
@@ -890,6 +942,17 @@ impl TypeChecker<'_> {
             }
         }
 
+        self.check_impl_trait_callable_bounds(ctx, function, subst, generic_arg_spans, span);
+    }
+
+    fn check_impl_trait_callable_bounds(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        function: &HirFunction,
+        subst: &HashMap<String, Type>,
+        generic_arg_spans: &HashMap<String, rowan::TextRange>,
+        span: Option<rowan::TextRange>,
+    ) {
         for param in &function.params {
             let HirTypeRef::ImplTrait {
                 trait_ty,
@@ -910,6 +973,68 @@ impl TypeChecker<'_> {
                 self.lower_hir_callable_signature(callable, kind, subst, Some(*trait_range));
             let bound_span = generic_arg_spans.get(&hidden.0).copied().or(span);
             self.check_callable_requirement(ctx, actual, &required, &hidden.0, bound_span);
+        }
+    }
+
+    fn report_debug_bound_failure(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        actual: &Type,
+        trait_name: &str,
+        bound_span: Option<rowan::TextRange>,
+        callee_span: Option<rowan::TextRange>,
+    ) {
+        let placeholder = concat!("{", ":?", "}");
+        let type_name = actual.display(self.hir);
+        let owner_package = self.hir.package_for_range(ctx.owner_range());
+        let derive_target = match actual {
+            Type::Struct(id, _) => {
+                let item = &self.hir.item_tree.structs[*id];
+                Some((item.name.0.clone(), item.name_range))
+            }
+            Type::Enum(id, _) => {
+                let item = &self.hir.item_tree.enums[*id];
+                Some((item.name.0.clone(), item.name_range))
+            }
+            _ => None,
+        }
+        .filter(|(_, range)| {
+            owner_package.is_some() && self.hir.package_for_range(*range) == owner_package
+        });
+        let diagnostics_before = self.result.diagnostics.len();
+        self.diagnostic(
+            "E0035",
+            format!("`{type_name}` doesn't implement `{trait_name}`"),
+            bound_span,
+        );
+        if let Some(diagnostic) = self.result.diagnostics.get_mut(diagnostics_before) {
+            diagnostic.labels[0].message = format!(
+                "`{type_name}` cannot be formatted using `{placeholder}` because it doesn't implement `{trait_name}`"
+            );
+            if let Some(callee_span) = callee_span
+                && Some(callee_span) != bound_span
+            {
+                diagnostic.labels.push(SourceLabel {
+                    range: callee_span,
+                    message: "required by this formatting parameter".into(),
+                    style: LabelStyle::Secondary,
+                });
+            }
+            diagnostic.notes = vec![format!(
+                "the trait `{trait_name}` is not implemented for `{type_name}`"
+            )];
+            if let Some((name, range)) = derive_target {
+                diagnostic.labels.push(SourceLabel {
+                    range,
+                    message: format!("consider annotating `{name}` with `#[derive(Debug)]`"),
+                    style: LabelStyle::Secondary,
+                });
+                diagnostic.help = Some(format!(
+                    "add `#[derive(Debug)]` to `{name}` or manually implement `Debug`"
+                ));
+            } else {
+                diagnostic.help = Some(format!("implement `{trait_name}` for `{type_name}`"));
+            }
         }
     }
 }

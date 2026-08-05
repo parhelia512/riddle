@@ -127,7 +127,7 @@ fn accepts_matching_trait_impl_required_items() {
 #[test]
 fn reports_trait_impl_contract_mismatches() {
     let result = check(
-        r#"
+        r"
         trait Convert {
             fun value(input: i32) -> bool;
             type Item;
@@ -140,7 +140,7 @@ fn reports_trait_impl_contract_mismatches() {
                 1
             }
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -196,7 +196,7 @@ fn accepts_inherent_method_call_with_self_receiver() {
 #[test]
 fn mutable_self_method_requires_mutable_receiver_binding() {
     let result = check(
-        r#"
+        r"
         struct Cell {
             value: i32,
         }
@@ -211,7 +211,7 @@ fn mutable_self_method_requires_mutable_receiver_binding() {
             let cell = Cell { value: 1 };
             cell.set(42);
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diag| diag.code == "E0031"));
@@ -220,7 +220,7 @@ fn mutable_self_method_requires_mutable_receiver_binding() {
 #[test]
 fn mutable_reference_requires_mutable_binding() {
     let result = check(
-        r#"
+        r"
         struct Cell {
             value: i32,
         }
@@ -229,7 +229,7 @@ fn mutable_reference_requires_mutable_binding() {
             let cell = Cell { value: 1 };
             let ref_cell = &mut cell;
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diag| diag.code == "E0031"));
@@ -238,7 +238,7 @@ fn mutable_reference_requires_mutable_binding() {
 #[test]
 fn resolves_impl_associated_type_path() {
     let result = check(
-        r#"
+        r"
         struct Foo {}
 
         trait Bar {
@@ -252,7 +252,7 @@ fn resolves_impl_associated_type_path() {
         fun main() {
             let r = 10 as Foo::X;
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -381,7 +381,7 @@ fn binary_expected_output_selects_heterogeneous_operator_impl() {
 #[test]
 fn trait_type_arguments_respect_required_and_defaulted_parameters() {
     let result = check(
-        r#"
+        r"
         trait Required<T> {}
         trait Defaulted<T = i32> {}
         struct Item {}
@@ -389,7 +389,7 @@ fn trait_type_arguments_respect_required_and_defaulted_parameters() {
         impl Required for Item {}
         impl Required<i32, bool> for bool {}
         impl Defaulted for Item {}
-        "#,
+        ",
     );
 
     let arity_errors = result
@@ -413,7 +413,7 @@ fn trait_type_arguments_respect_required_and_defaulted_parameters() {
 #[test]
 fn supertrait_impl_requires_matching_trait_arguments() {
     let result = check(
-        r#"
+        r"
         trait Parent<Rhs = Self> {}
         trait Child<Rhs = Self>: Parent<Rhs> {}
 
@@ -423,7 +423,7 @@ fn supertrait_impl_requires_matching_trait_arguments() {
 
         impl Parent<Other> for Left {}
         impl Child<Right> for Left {}
-        "#,
+        ",
     );
 
     assert!(
@@ -439,7 +439,7 @@ fn supertrait_impl_requires_matching_trait_arguments() {
 #[test]
 fn generic_supertrait_bound_substitutes_parent_arguments() {
     let result = check(
-        r#"
+        r"
         trait Parent<X> {
             fun parent(&self, value: X) -> X;
         }
@@ -457,7 +457,7 @@ fn generic_supertrait_bound_substitutes_parent_arguments() {
         fun use_parent<T: Child<i32>>(value: T) -> i32 {
             value.parent(1)
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -598,12 +598,12 @@ fn accepts_disjoint_trait_impls() {
 #[test]
 fn accepts_disjoint_impls_with_shared_generic_relationship() {
     let result = check(
-        r#"
+        r"
         trait Marker<A> {}
 
         impl<T> Marker<T> for T {}
         impl Marker<i32> for bool {}
-        "#,
+        ",
     );
 
     assert!(
@@ -616,14 +616,14 @@ fn accepts_disjoint_impls_with_shared_generic_relationship() {
 
 #[test]
 fn enforces_orphan_rules_per_package() {
-    let foreign = r#"
+    let foreign = r"
         trait Foreign<T = i32> {}
         struct ForeignType {}
         struct ForeignBox<T> { value: T }
         #[fundamental]
         struct FundBox<T> { value: T }
-    "#;
-    let local = r#"
+    ";
+    let local = r"
         struct Local<T> { value: T }
         trait LocalTrait {}
 
@@ -635,7 +635,7 @@ fn enforces_orphan_rules_per_package() {
         impl Foreign for ForeignBox<Local<i32>> {}
         impl<T> Foreign<Local<i32>> for ForeignBox<T> {}
         impl Foreign for FundBox<Local<i32>> {}
-    "#;
+    ";
     let source = format!("{foreign}{local}");
     let result =
         check_with_package_ranges(&source, &[0..foreign.len(), foreign.len()..source.len()]);
@@ -666,7 +666,7 @@ fn enforces_orphan_rules_per_package() {
 #[test]
 fn rejects_arbitrary_composite_trait_bound() {
     let result = check(
-        r#"
+        r"
         trait Marker {}
 
         impl Marker for i32 {}
@@ -677,7 +677,7 @@ fn rejects_arbitrary_composite_trait_bound() {
             accepts_marker((1i32, 2i32));
             accepts_marker([1i32, 2i32]);
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1051,7 +1051,7 @@ fn checks_eq_marker_dependencies() {
 #[test]
 fn checks_generic_trait_bounds() {
     let result = check(
-        r#"
+        r"
         trait Marker {}
 
         struct Good {}
@@ -1069,7 +1069,7 @@ fn checks_generic_trait_bounds() {
             let ok = accept(good);
             let nope = accept(bad);
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -1083,7 +1083,7 @@ fn checks_generic_trait_bounds() {
 #[test]
 fn checks_struct_and_enum_where_clause_bounds() {
     let result = check(
-        r#"
+        r"
         trait Marker {}
 
         struct Good {}
@@ -1110,7 +1110,7 @@ fn checks_struct_and_enum_where_clause_bounds() {
             let bad_box = Box { value: Bad {} };
             let bad_slot = Slot::Some(Bad {});
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -1129,7 +1129,7 @@ fn checks_struct_and_enum_where_clause_bounds() {
 #[test]
 fn allows_trait_bound_method_call_in_generic_body() {
     let result = check(
-        r#"
+        r"
         trait Named {
             fun name(&self) -> i32;
         }
@@ -1150,7 +1150,7 @@ fn allows_trait_bound_method_call_in_generic_body() {
             let user = User { id: 1 };
             let id = read(user);
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1159,7 +1159,7 @@ fn allows_trait_bound_method_call_in_generic_body() {
 #[test]
 fn accepts_iterator_next_protocol() {
     let result = check(
-        r#"
+        r"
         enum Option<T> {
             Some(T),
             None,
@@ -1190,7 +1190,7 @@ fn accepts_iterator_next_protocol() {
             let mut counter = Counter { current: 0 };
             let value = counter.next();
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1199,7 +1199,7 @@ fn accepts_iterator_next_protocol() {
 #[test]
 fn accepts_for_loop_over_into_iterator() {
     let result = check(
-        r#"
+        r"
         enum Option<T> {
             Some(T),
             None,
@@ -1247,7 +1247,7 @@ fn accepts_for_loop_over_into_iterator() {
                 let next = item + 1;
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1256,14 +1256,14 @@ fn accepts_for_loop_over_into_iterator() {
 #[test]
 fn accepts_for_loop_over_array() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let values = [1, 2, 3];
             for item in values {
                 let next = item + 1;
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1272,7 +1272,7 @@ fn accepts_for_loop_over_array() {
 #[test]
 fn matches_const_generic_trait_impl_for_arrays() {
     let result = check(
-        r#"
+        r"
         trait Marker {}
 
         impl<T, const N: usize> Marker for [T; N] {}
@@ -1282,7 +1282,7 @@ fn matches_const_generic_trait_impl_for_arrays() {
         fun main() {
             takes_marker([1, 2, 3]);
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1291,7 +1291,7 @@ fn matches_const_generic_trait_impl_for_arrays() {
 #[test]
 fn array_into_iterator_impl_type_checks_with_const_generics() {
     let result = check(
-        r#"
+        r"
         enum Option<T> {
             Some(T),
             None,
@@ -1352,7 +1352,7 @@ fn array_into_iterator_impl_type_checks_with_const_generics() {
                 let next = item.value + 1;
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1361,7 +1361,7 @@ fn array_into_iterator_impl_type_checks_with_const_generics() {
 #[test]
 fn checks_multiple_generic_trait_bounds() {
     let result = check(
-        r#"
+        r"
         trait Named {
             fun name(&self) -> i32;
         }
@@ -1395,7 +1395,7 @@ fn checks_multiple_generic_trait_bounds() {
             let ok = read(good);
             let err = read(missing);
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -1409,7 +1409,7 @@ fn checks_multiple_generic_trait_bounds() {
 #[test]
 fn accepts_where_clause_on_function_bound() {
     let result = check(
-        r#"
+        r"
         trait Named {
             fun name(&self) -> i32;
         }
@@ -1432,7 +1432,7 @@ fn accepts_where_clause_on_function_bound() {
             let user = User { id: 1 };
             let id = read(user);
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1441,7 +1441,7 @@ fn accepts_where_clause_on_function_bound() {
 #[test]
 fn accepts_where_clause_on_impl_bound() {
     let result = check(
-        r#"
+        r"
         trait Marker {}
         trait Wrap {}
 
@@ -1460,7 +1460,7 @@ fn accepts_where_clause_on_impl_bound() {
             takes_wrap(Box { value: 1 });
             takes_wrap(Box { value: Bad {} });
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -1476,7 +1476,7 @@ fn accepts_where_clause_on_impl_bound() {
 #[test]
 fn generic_bound_proves_nested_generic_impl_bound() {
     let result = check(
-        r#"
+        r"
         trait Debug {}
 
         struct Vector<T> { value: T }
@@ -1497,7 +1497,7 @@ fn generic_bound_proves_nested_generic_impl_bound() {
             let value = Vector { value: 1 };
             forward(&value);
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1506,7 +1506,7 @@ fn generic_bound_proves_nested_generic_impl_bound() {
 #[test]
 fn rejects_impl_where_clause_that_violates_paterson_condition() {
     let result = check(
-        r#"
+        r"
         trait Foo {}
 
         struct Vec<T> { value: T }
@@ -1514,7 +1514,7 @@ fn rejects_impl_where_clause_that_violates_paterson_condition() {
         impl<T> Foo for T
         where Vec<T>: Foo
         {}
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -1528,7 +1528,7 @@ fn rejects_impl_where_clause_that_violates_paterson_condition() {
 #[test]
 fn reports_unknown_generic_trait_bound() {
     let result = check(
-        r#"
+        r"
         fun accept<T: Missing>(value: T) -> T {
             value
         }
@@ -1536,7 +1536,7 @@ fn reports_unknown_generic_trait_bound() {
         fun main() {
             let value = accept(1);
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -1551,17 +1551,17 @@ fn reports_unknown_generic_trait_bound() {
 #[should_panic(expected = "expected Greater")]
 fn rejects_bounds_outside_function_generics_for_now() {
     let _ = check(
-        r#"
+        r"
         trait Marker {}
         struct Box<T: Marker> { value: T }
-        "#,
+        ",
     );
 }
 
 #[test]
 fn accepts_for_loop_over_generic_into_iterator_bound() {
     let result = check(
-        r#"
+        r"
         enum Option<T> { Some(T), None }
 
         trait Iterator {
@@ -1597,7 +1597,7 @@ fn accepts_for_loop_over_generic_into_iterator_bound() {
         fun main() {
             consume(Counter { current: 0 });
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1606,7 +1606,7 @@ fn accepts_for_loop_over_generic_into_iterator_bound() {
 #[test]
 fn rejects_iterator_next_with_non_option_result() {
     let result = check(
-        r#"
+        r"
         enum Option<T> { Some(T), None }
 
         trait Iterator {
@@ -1639,7 +1639,7 @@ fn rejects_iterator_next_with_non_option_result() {
                 let next = value + 1;
             }
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1653,7 +1653,7 @@ fn rejects_iterator_next_with_non_option_result() {
 #[test]
 fn accepts_outer_attributes_on_common_ast_nodes() {
     let result = check(
-        r#"
+        r"
         #[item]
         struct Boxed {
             #[field]
@@ -1674,7 +1674,7 @@ fn accepts_outer_attributes_on_common_ast_nodes() {
                 #[arm] #[pat] other => other,
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1683,7 +1683,7 @@ fn accepts_outer_attributes_on_common_ast_nodes() {
 #[test]
 fn supertrait_bound_exposes_parent_methods() {
     let result = check(
-        r#"
+        r"
         trait Named {
             fun name(&self) -> i32;
         }
@@ -1709,7 +1709,7 @@ fn supertrait_bound_exposes_parent_methods() {
         fun main() {
             let value = describe(Item { value: 1 });
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1718,13 +1718,13 @@ fn supertrait_bound_exposes_parent_methods() {
 #[test]
 fn supertrait_impl_requires_parent_impl() {
     let result = check(
-        r#"
+        r"
         trait Parent {}
         trait Child: Parent {}
 
         struct Item {}
         impl Child for Item {}
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -1738,11 +1738,11 @@ fn supertrait_impl_requires_parent_impl() {
 #[test]
 fn reports_invalid_supertraits() {
     let result = check(
-        r#"
+        r"
         trait MissingParent: Unknown {}
         trait First: Second {}
         trait Second: First {}
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -1760,7 +1760,7 @@ fn reports_invalid_supertraits() {
 #[test]
 fn trait_default_method_can_call_required_method() {
     let result = check(
-        r#"
+        r"
         trait Value {
             fun base(&self) -> i32;
             fun value(&self) -> i32 {
@@ -1772,7 +1772,7 @@ fn trait_default_method_can_call_required_method() {
         impl Value for Item {
             fun base(&self) -> i32 { 6 }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -1784,38 +1784,34 @@ fn std_mode_rejects_user_defined_lang_copy_trait() {
         r#"#[lang = "copy"] trait UserCopy {}"#,
         riddlec::pipeline::CompileOptions::default(),
     );
-    let e0049: Vec<_> = result
-        .type_result
-        .diagnostics
-        .iter()
-        .filter(|d| d.code == "E0049")
-        .collect();
+    let diagnostics = &result.type_result.diagnostics;
     assert!(
-        !e0049.is_empty(),
-        "expected E0049 diagnostic, got: {:?}",
-        result.type_result.diagnostics
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0049"),
+        "expected E0049 diagnostic, got: {diagnostics:?}"
     );
     assert!(
-        e0049.iter().any(|d| d.message.contains("copy")),
-        "expected message to contain \"copy\": {:?}",
-        e0049
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0049" && diagnostic.message.contains("copy")),
+        "expected message to contain \"copy\": {diagnostics:?}"
     );
 }
 
 #[test]
 fn std_mode_rejects_user_defined_fundamental_struct() {
     let result = riddlec::pipeline::check_with_options(
-        r#"#[fundamental] struct MyBox<T> { value: T }"#,
+        r"#[fundamental] struct MyBox<T> { value: T }",
         riddlec::pipeline::CompileOptions::default(),
     );
-    let e0049: Vec<_> = result
+    let has_e0049 = result
         .type_result
         .diagnostics
         .iter()
-        .filter(|d| d.code == "E0049")
-        .collect();
+        .any(|diagnostic| diagnostic.code == "E0049");
     assert!(
-        !e0049.is_empty(),
+        has_e0049,
         "expected E0049 diagnostic, got: {:?}",
         result.type_result.diagnostics
     );
@@ -1842,8 +1838,7 @@ fn no_std_mode_reports_unknown_lang_item() {
         e0053
             .iter()
             .any(|d| d.message.contains("unknown lang item")),
-        "expected message to contain \"unknown lang item\": {:?}",
-        e0053
+        "expected message to contain \"unknown lang item\": {e0053:?}"
     );
 }
 
@@ -1907,9 +1902,9 @@ fn no_std_mode_rejects_multiple_lang_items_on_one_trait() {
 #[test]
 fn std_mode_rejects_internal_attributes_before_validating_their_shape() {
     let cases = [
-        r#"#[lang] trait UserCopy {}"#,
+        r"#[lang] trait UserCopy {}",
         r#"#[lang = "copy"] struct UserCopy {}"#,
-        r#"#[fundamental] fun user_function() {}"#,
+        r"#[fundamental] fun user_function() {}",
     ];
 
     for source in cases {
@@ -1976,10 +1971,10 @@ fn no_std_mode_rejects_lang_on_every_non_trait_target() {
 #[test]
 fn no_std_mode_rejects_fundamental_on_non_type_targets() {
     let cases = [
-        r#"#[fundamental] fun user_function() {}"#,
-        r#"#[fundamental] trait UserTrait {}"#,
-        r#"struct Item { #[fundamental] value: i32 }"#,
-        r#"#[fundamental] type Value = i32;"#,
+        r"#[fundamental] fun user_function() {}",
+        r"#[fundamental] trait UserTrait {}",
+        r"struct Item { #[fundamental] value: i32 }",
+        r"#[fundamental] type Value = i32;",
     ];
 
     for source in cases {
@@ -2044,20 +2039,20 @@ fn no_std_mode_rejects_incomplete_lang_item_signatures() {
 #[test]
 fn rejects_general_impl_trait_and_manual_callable_impls() {
     let general = check(
-        r#"
+        r"
         trait Display {}
         fun show(value: impl Display) {}
-        "#,
+        ",
     );
     assert!(general.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "E0047" && diagnostic.message.contains("only impl Fn")
     }));
 
     let manual = check(
-        r#"
+        r"
         struct Callable {}
         impl Fn for Callable {}
-        "#,
+        ",
     );
     assert!(manual.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "E0048" && diagnostic.message.contains("implemented only by functions")

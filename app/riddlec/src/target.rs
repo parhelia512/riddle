@@ -23,6 +23,7 @@ impl TargetTriple {
         Self::Aarch64AppleDarwin,
     ];
 
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::X86_64UnknownLinuxGnu => "x86_64-unknown-linux-gnu",
@@ -35,6 +36,7 @@ impl TargetTriple {
         }
     }
 
+    #[must_use]
     pub const fn operating_system(self) -> &'static str {
         match self {
             Self::X86_64UnknownLinuxGnu
@@ -47,10 +49,12 @@ impl TargetTriple {
         }
     }
 
+    #[must_use]
     pub const fn executable_suffix(self) -> &'static str {
         if self.is_windows() { ".exe" } else { "" }
     }
 
+    #[must_use]
     pub const fn msvc_architecture(self) -> &'static str {
         match self {
             Self::X86_64PcWindowsMsvc => "x64",
@@ -60,6 +64,7 @@ impl TargetTriple {
         }
     }
 
+    #[must_use]
     pub const fn is_linux(self) -> bool {
         matches!(
             self,
@@ -67,6 +72,7 @@ impl TargetTriple {
         )
     }
 
+    #[must_use]
     pub const fn is_windows(self) -> bool {
         matches!(
             self,
@@ -74,10 +80,16 @@ impl TargetTriple {
         )
     }
 
+    #[must_use]
     pub const fn is_macos(self) -> bool {
         matches!(self, Self::Aarch64AppleDarwin)
     }
 
+    /// Detects the target represented by the current compiler host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnsupportedTarget`] when the host triple is not supported.
     pub fn host() -> Result<Self, UnsupportedTarget> {
         Self::from_host(
             std::env::consts::OS,
@@ -92,13 +104,18 @@ impl TargetTriple {
         )
     }
 
+    /// Maps host platform components to a supported target triple.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnsupportedTarget`] when the combination is not supported.
     pub fn from_host(os: &str, arch: &str, environment: &str) -> Result<Self, UnsupportedTarget> {
         let triple = match (os, arch, environment) {
             ("linux", "x86_64", "gnu") => Self::X86_64UnknownLinuxGnu,
             ("linux", "aarch64", "gnu") => Self::Aarch64UnknownLinuxGnu,
-            ("linux", "x86", "gnu") | ("linux", "i686", "gnu") => Self::I686UnknownLinuxGnu,
+            ("linux", "x86" | "i686", "gnu") => Self::I686UnknownLinuxGnu,
             ("windows", "x86_64", "msvc") => Self::X86_64PcWindowsMsvc,
-            ("windows", "x86", "msvc") | ("windows", "i686", "msvc") => Self::I686PcWindowsMsvc,
+            ("windows", "x86" | "i686", "msvc") => Self::I686PcWindowsMsvc,
             ("windows", "aarch64", "msvc") => Self::Aarch64PcWindowsMsvc,
             ("macos", "aarch64", "") => Self::Aarch64AppleDarwin,
             _ => {

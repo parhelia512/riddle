@@ -170,17 +170,23 @@ fn debug_format_bound_diagnostic_points_to_user_source() {
 
     let output = run(&[&input]);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let open = '{';
+    let close = '}';
+    let debug_placeholder = format!("{open}:?{close}");
 
     assert!(!output.status.success());
     assert!(
         stderr.starts_with("error[E0035]: `Foo` doesn't implement `Debug`\n"),
         "{stderr}"
     );
-    assert!(stderr.contains("println!(\"{:?}\", value);"), "{stderr}");
     assert!(
-        stderr.contains(
-            "`Foo` cannot be formatted using `{:?}` because it doesn't implement `Debug`"
-        ),
+        stderr.contains(&format!("println!(\"{debug_placeholder}\", value);")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "`Foo` cannot be formatted using `{debug_placeholder}` because it doesn't implement `Debug`"
+        )),
         "{stderr}"
     );
     assert!(

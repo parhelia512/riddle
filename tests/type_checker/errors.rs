@@ -1,14 +1,15 @@
 use crate::{check, messages};
+use std::fmt::Write as _;
 
 #[test]
 fn rejects_out_of_range_integer_expression_literals() {
     let result = check(
-        r#"
+        r"
         fun values() {
             let too_large: u8 = 256u8;
             let too_negative: i8 = -129i8;
         }
-        "#,
+        ",
     );
 
     let messages = messages(&result);
@@ -31,14 +32,14 @@ fn rejects_out_of_range_integer_expression_literals() {
 #[test]
 fn rejects_scalar_types_without_portable_c11_representations() {
     let result = check(
-        r#"
+        r"
         fun unsupported(a: i128, b: u128, c: f16, d: f128) {
             let ai = 1i128;
             let bu = 1u128;
             let cf = 1.0f16;
             let df = 1.0f128;
         }
-        "#,
+        ",
     );
 
     let messages = messages(&result);
@@ -54,11 +55,11 @@ fn rejects_scalar_types_without_portable_c11_representations() {
 #[test]
 fn reports_let_initializer_mismatch() {
     let result = check(
-        r#"
+        r"
         fun f() {
             let x: bool = 1;
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -71,7 +72,7 @@ fn reports_let_initializer_mismatch() {
 #[test]
 fn validates_cast_source_and_target_types() {
     let accepted = check(
-        r#"
+        r"
         fun accepted(pointer: *const i32) {
             let integer = 1 as i64;
             let float = 1 as f64;
@@ -84,7 +85,7 @@ fn validates_cast_source_and_target_types() {
             let raw = 0 as *const i32;
             let mutable = pointer as *mut i32;
         }
-        "#,
+        ",
     );
     assert!(
         accepted
@@ -96,7 +97,7 @@ fn validates_cast_source_and_target_types() {
     );
 
     let rejected = check(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun rejected(point: Point) {
@@ -105,7 +106,7 @@ fn validates_cast_source_and_target_types() {
             let character = 65u32 as char;
             let aggregate = point as i32;
         }
-        "#,
+        ",
     );
     let diagnostics = rejected
         .diagnostics
@@ -123,13 +124,13 @@ fn validates_cast_source_and_target_types() {
 #[test]
 fn validates_reference_to_raw_pointer_casts() {
     let accepted = check(
-        r#"
+        r"
         fun accepted(shared: &i32, mutable: &mut i32) {
             let shared_const = shared as *const i32;
             let mutable_const = mutable as *const i32;
             let mutable_raw = mutable as *mut i32;
         }
-        "#,
+        ",
     );
     assert!(
         accepted
@@ -141,30 +142,30 @@ fn validates_reference_to_raw_pointer_casts() {
     );
 
     let rejected = check(
-        r#"
+        r"
         fun rejected(shared: &i32) {
             let mutable = shared as *mut i32;
             let wrong_pointee = shared as *const u8;
             let integer = shared as usize;
         }
-        "#,
+        ",
     );
-    let diagnostics = rejected
+    let diagnostic_count = rejected
         .diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.code == "E0012")
-        .collect::<Vec<_>>();
-    assert_eq!(diagnostics.len(), 3, "{:#?}", rejected.diagnostics);
+        .count();
+    assert_eq!(diagnostic_count, 3, "{:#?}", rejected.diagnostics);
 }
 
 #[test]
 fn reports_return_type_mismatch() {
     let result = check(
-        r#"
+        r"
         fun f() -> bool {
             return 1;
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -177,14 +178,14 @@ fn reports_return_type_mismatch() {
 #[test]
 fn reports_missing_return_path() {
     let result = check(
-        r#"
+        r"
         fun choose(flag: bool) -> i32 {
             if flag {
                 return 1;
             }
             let done = true;
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -198,7 +199,7 @@ fn reports_missing_return_path() {
 #[test]
 fn accepts_functions_when_every_path_returns() {
     let result = check(
-        r#"
+        r"
         fun choose(flag: bool) -> i32 {
             if flag {
                 return 1;
@@ -206,7 +207,7 @@ fn accepts_functions_when_every_path_returns() {
                 return 2;
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -215,7 +216,7 @@ fn accepts_functions_when_every_path_returns() {
 #[test]
 fn accepts_returning_and_value_branches_together() {
     let result = check(
-        r#"
+        r"
         fun choose(flag: bool) -> i32 {
             if flag {
                 return 1;
@@ -223,7 +224,7 @@ fn accepts_returning_and_value_branches_together() {
                 2
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -232,7 +233,7 @@ fn accepts_returning_and_value_branches_together() {
 #[test]
 fn validates_break_and_continue_loop_context() {
     let result = check(
-        r#"
+        r"
         fun valid() {
             while true {
                 if true {
@@ -251,7 +252,7 @@ fn validates_break_and_continue_loop_context() {
             break;
             continue;
         }
-        "#,
+        ",
     );
 
     let diagnostics = result
@@ -275,25 +276,25 @@ fn validates_break_and_continue_loop_context() {
 #[test]
 fn checks_boolean_match_return_paths() {
     let complete = check(
-        r#"
+        r"
         fun choose(flag: bool) -> i32 {
             match flag {
                 true => { return 1; },
                 false => { return 2; },
             }
         }
-        "#,
+        ",
     );
     assert_eq!(complete.diagnostics, vec![]);
 
     let incomplete = check(
-        r#"
+        r"
         fun choose(flag: bool) -> i32 {
             match flag {
                 true => { return 1; },
             }
         }
-        "#,
+        ",
     );
     assert!(
         incomplete
@@ -303,13 +304,13 @@ fn checks_boolean_match_return_paths() {
     );
 
     let integer = check(
-        r#"
+        r"
         fun choose(value: i32) -> i32 {
             match value {
                 1 => { return 1; },
             }
         }
-        "#,
+        ",
     );
     assert!(integer.diagnostics.iter().any(|diag| diag.code == "E0039"));
 }
@@ -317,7 +318,7 @@ fn checks_boolean_match_return_paths() {
 #[test]
 fn checks_open_scalar_match_exhaustiveness() {
     let complete = check(
-        r#"
+        r"
         fun signed(value: i32) -> i32 {
             match value {
                 0 => 0,
@@ -345,12 +346,12 @@ fn checks_open_scalar_match_exhaustiveness() {
                 _ => 1,
             }
         }
-        "#,
+        ",
     );
     assert_eq!(complete.diagnostics, vec![]);
 
     let incomplete = check(
-        r#"
+        r"
         fun signed(value: i32) -> i32 {
             match value { 0 => 0 }
         }
@@ -366,7 +367,7 @@ fn checks_open_scalar_match_exhaustiveness() {
         fun character(value: char) -> i32 {
             match value { 'a' => 0 }
         }
-        "#,
+        ",
     );
     let missing = incomplete
         .diagnostics
@@ -385,7 +386,7 @@ fn checks_open_scalar_match_exhaustiveness() {
 #[test]
 fn reports_uncovered_integer_ranges() {
     let result = check(
-        r#"
+        r"
         fun signed(value: i32) -> i32 {
             match value {
                 0 => 0,
@@ -408,7 +409,7 @@ fn reports_uncovered_integer_ranges() {
                 _ if condition => 1,
             }
         }
-        "#,
+        ",
     );
 
     let diagnostics = result
@@ -435,7 +436,7 @@ fn reports_uncovered_integer_ranges() {
 #[test]
 fn invalid_integer_patterns_do_not_cover_values() {
     let result = check(
-        r#"
+        r"
         fun wrong_suffix(value: u8) -> i32 {
             match value {
                 0i32 => 0,
@@ -448,7 +449,7 @@ fn invalid_integer_patterns_do_not_cover_values() {
                 _ => 1,
             }
         }
-        "#,
+        ",
     );
 
     let non_exhaustive = result
@@ -469,9 +470,10 @@ fn invalid_integer_patterns_do_not_cover_values() {
 
 #[test]
 fn accepts_fully_enumerated_u8_match() {
-    let arms = (0u16..=255)
-        .map(|value| format!("{value} => {value},"))
-        .collect::<String>();
+    let mut arms = String::new();
+    for value in 0u16..=255 {
+        write!(&mut arms, "{value} => {value},").unwrap();
+    }
     let result = check(&format!(
         "fun complete(value: u8) -> i32 {{ match value {{ {arms} }} }}"
     ));
@@ -482,7 +484,7 @@ fn accepts_fully_enumerated_u8_match() {
 #[test]
 fn reports_64_bit_integer_range_boundaries() {
     let result = check(
-        r#"
+        r"
         fun signed(value: i64) -> i32 {
             match value { 0 => 0 }
         }
@@ -490,7 +492,7 @@ fn reports_64_bit_integer_range_boundaries() {
         fun unsigned(value: u64) -> i32 {
             match value { 0 => 0 }
         }
-        "#,
+        ",
     );
     let diagnostics = result
         .diagnostics
@@ -511,7 +513,7 @@ fn reports_64_bit_integer_range_boundaries() {
 #[test]
 fn formats_nested_and_truncated_integer_ranges() {
     let result = check(
-        r#"
+        r"
         fun pair(value: (u8, u8)) -> i32 {
             match value {}
         }
@@ -530,7 +532,7 @@ fn formats_nested_and_truncated_integer_ranges() {
                 18 => 0,
             }
         }
-        "#,
+        ",
     );
     let diagnostics = result
         .diagnostics
@@ -555,7 +557,7 @@ fn formats_nested_and_truncated_integer_ranges() {
 #[test]
 fn rejects_uncovered_enum_payload_patterns() {
     let result = check(
-        r#"
+        r"
         enum State { Ready, Done(i32) }
 
         fun main() -> i32 {
@@ -564,7 +566,7 @@ fn rejects_uncovered_enum_payload_patterns() {
                 State::Done(1) => 2,
             }
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -580,7 +582,7 @@ fn rejects_uncovered_enum_payload_patterns() {
 #[test]
 fn checks_nested_and_product_pattern_exhaustiveness() {
     let result = check(
-        r#"
+        r"
         enum Bit { Zero, One }
         enum Value { Flag(bool), Bit(Bit), Empty }
 
@@ -604,7 +606,7 @@ fn checks_nested_and_product_pattern_exhaustiveness() {
                 (true,) => 1,
             }
         }
-        "#,
+        ",
     );
 
     let missing = result
@@ -634,7 +636,7 @@ fn checks_nested_and_product_pattern_exhaustiveness() {
 #[test]
 fn checks_struct_and_generic_payload_exhaustiveness() {
     let result = check(
-        r#"
+        r"
         struct Flags { left: bool, right: bool }
         enum Maybe<T> { Some(T), None }
 
@@ -651,7 +653,7 @@ fn checks_struct_and_generic_payload_exhaustiveness() {
                 Maybe::None => 0,
             }
         }
-        "#,
+        ",
     );
 
     let missing = result
@@ -677,14 +679,14 @@ fn checks_struct_and_generic_payload_exhaustiveness() {
 #[test]
 fn guarded_patterns_do_not_make_a_match_exhaustive() {
     let result = check(
-        r#"
+        r"
         fun choose(value: bool, condition: bool) -> i32 {
             match value {
                 true if condition => 1,
                 false => 2,
             }
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -700,7 +702,7 @@ fn guarded_patterns_do_not_make_a_match_exhaustive() {
 #[test]
 fn accepts_exhaustive_nested_patterns_as_returning() {
     let result = check(
-        r#"
+        r"
         enum State { Ready, Done(bool) }
         enum Maybe<T> { Some(T), None }
         enum Box<T> { Wrap(T) }
@@ -752,7 +754,7 @@ fn accepts_exhaustive_nested_patterns_as_returning() {
                 Box::Wrap(Box::Wrap(false)) => { return 0; },
             }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -761,7 +763,7 @@ fn accepts_exhaustive_nested_patterns_as_returning() {
 #[test]
 fn unit_uses_empty_tuple_syntax() {
     let valid = check(
-        r#"
+        r"
         fun identity(value: ()) -> () {
             value
         }
@@ -774,7 +776,7 @@ fn unit_uses_empty_tuple_syntax() {
             identity(());
             make();
         }
-        "#,
+        ",
     );
     assert_eq!(valid.diagnostics, vec![]);
 
@@ -787,7 +789,7 @@ fn unit_uses_empty_tuple_syntax() {
 #[test]
 fn ignores_uninhabited_constructor_spaces() {
     let result = check(
-        r#"
+        r"
         enum Void {}
         enum Outcome { Impossible(Void), Done }
         struct NeverFlags { impossible: Void, flag: bool }
@@ -805,7 +807,7 @@ fn ignores_uninhabited_constructor_spaces() {
         fun flags(value: NeverFlags) -> i32 {
             match value {}
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -814,7 +816,7 @@ fn ignores_uninhabited_constructor_spaces() {
 #[test]
 fn checks_array_inhabitability_for_coverage() {
     let result = check(
-        r#"
+        r"
         enum Void {}
 
         fun impossible(value: [Void; 1]) -> i32 {
@@ -824,7 +826,7 @@ fn checks_array_inhabitability_for_coverage() {
         fun empty(value: [Void; 0]) -> i32 {
             match value {}
         }
-        "#,
+        ",
     );
 
     let diagnostics = result
@@ -839,14 +841,14 @@ fn checks_array_inhabitability_for_coverage() {
 #[test]
 fn recursive_generic_constructor_space_terminates() {
     let result = check(
-        r#"
+        r"
         enum Grow<T> { Next(Grow<(T, T)>) }
         enum Loop { Again(Loop) }
 
         fun impossible(value: Grow<bool>) -> i32 {
             match value {}
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -872,7 +874,7 @@ fn recursive_generic_constructor_space_terminates() {
 #[test]
 fn invalid_patterns_do_not_contribute_to_coverage() {
     let result = check(
-        r#"
+        r"
         enum Left { Same, Tuple(bool), Named { flag: bool } }
         enum Right { Same, Tuple(bool), Named { flag: bool } }
         enum Singleton { Only }
@@ -897,7 +899,7 @@ fn invalid_patterns_do_not_contribute_to_coverage() {
                 Missing::Only => 1,
             }
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -925,7 +927,7 @@ fn invalid_patterns_do_not_contribute_to_coverage() {
 #[test]
 fn checks_function_call_arguments() {
     let result = check(
-        r#"
+        r"
         fun takes_bool(flag: bool) -> bool {
             flag
         }
@@ -934,7 +936,7 @@ fn checks_function_call_arguments() {
             takes_bool(1);
             takes_bool(true, false);
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -951,12 +953,12 @@ fn checks_function_call_arguments() {
 #[test]
 fn ordered_comparison_reports_one_error_for_bad_operand_pair() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let c = 'a';
             if c >= 1 { }
         }
-        "#,
+        ",
     );
 
     let msgs = messages(&result);
@@ -971,12 +973,12 @@ fn ordered_comparison_reports_one_error_for_bad_operand_pair() {
 #[test]
 fn accepts_char_ordered_comparison() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let c = 'a';
             if c >= '0' && c <= '9' { }
         }
-        "#,
+        ",
     );
 
     assert_eq!(result.diagnostics, vec![]);
@@ -985,12 +987,12 @@ fn accepts_char_ordered_comparison() {
 #[test]
 fn compound_assignment_requires_mutable_lhs() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let n = 1;
             n += 2;
         }
-        "#,
+        ",
     );
 
     assert!(result.diagnostics.iter().any(|diag| diag.code == "E0031"));
@@ -999,11 +1001,11 @@ fn compound_assignment_requires_mutable_lhs() {
 #[test]
 fn array_literal_length_must_match_expected_array_type() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let xs: [i32; 3] = [1, 2];
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1016,11 +1018,11 @@ fn array_literal_length_must_match_expected_array_type() {
 #[test]
 fn array_repeat_length_must_match_expected_array_type() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let xs: [i32; 2] = [1; 3];
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1033,13 +1035,13 @@ fn array_repeat_length_must_match_expected_array_type() {
 #[test]
 fn array_repeat_length_must_be_non_negative_literal() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let n = 3;
             let xs = [1; n];
             let ys = [1; -1];
         }
-        "#,
+        ",
     );
 
     assert_eq!(
@@ -1056,12 +1058,12 @@ fn array_repeat_length_must_be_non_negative_literal() {
 #[test]
 fn array_type_length_must_be_literal() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let n = 3;
             let xs: [i32; n] = [1, 2, 3];
         }
-        "#,
+        ",
     );
 
     assert!(!result.diagnostics.is_empty());
@@ -1075,7 +1077,7 @@ fn array_type_length_must_be_literal() {
 #[test]
 fn reversed_array_type_order_reports_rust_style_suggestion() {
     let result = check(
-        r#"
+        r"
         struct Foo {
             x: [3; i32]
         }
@@ -1085,7 +1087,7 @@ fn reversed_array_type_order_reports_rust_style_suggestion() {
                 x: [1, 2, 3]
             };
         }
-        "#,
+        ",
     );
 
     let diag = result
@@ -1111,12 +1113,12 @@ fn reversed_array_type_order_reports_rust_style_suggestion() {
 #[test]
 fn nested_array_type_length_must_be_literal() {
     let result = check(
-        r#"
+        r"
         fun main() {
             let n = 3;
             let xs: ([i32; n]) = ([1, 2, 3]);
         }
-        "#,
+        ",
     );
 
     assert!(!result.diagnostics.is_empty());
@@ -1129,11 +1131,11 @@ fn nested_array_type_length_must_be_literal() {
 
 #[test]
 fn unknown_type_annotation_is_reported() {
-    let source = r#"
+    let source = r"
         fun main() {
             let value: KSK;
         }
-        "#;
+        ";
     let result = check(source);
 
     let diag = result
@@ -1150,14 +1152,14 @@ fn unknown_type_annotation_is_reported() {
 #[test]
 fn array_repeat_requires_copy_value() {
     let result = check(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun main() {
             let point = Point { x: 1 };
             let points: [Point; 3] = [point; 3];
         }
-        "#,
+        ",
     );
 
     assert!(
@@ -1170,14 +1172,14 @@ fn array_repeat_requires_copy_value() {
 #[test]
 fn nested_array_repeat_requires_copy_leaf_values() {
     let result = check(
-        r#"
+        r"
         struct Point { x: i32 }
 
         fun main() {
             let point = Point { x: 1 };
             let points: [[Point; 2]; 3] = [[point; 2]; 3];
         }
-        "#,
+        ",
     );
 
     assert!(

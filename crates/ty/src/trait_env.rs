@@ -48,7 +48,7 @@ enum CompositeTraitKind {
 /// repeatedly.
 #[derive(Debug, Clone, Default)]
 pub struct TraitEnv {
-    /// TraitId → set of types that have an explicit `impl Trait for Type`.
+    /// `TraitId` → set of types that have an explicit `impl Trait for Type`.
     trait_impls: HashMap<TraitId, Vec<TraitImpl>>,
 
     /// The `Copy` trait, identified by name.  `None` when the user hasn't
@@ -66,10 +66,12 @@ pub struct TraitEnv {
 
 impl TraitEnv {
     /// Whether `ty` implements the trait identified by `trait_id`.
+    #[must_use]
     pub fn type_implements(&self, ty: &Type, trait_id: TraitId) -> bool {
         self.type_implements_inner(ty, trait_id, &[], &[], 0)
     }
 
+    #[must_use]
     pub fn type_implements_with_args(
         &self,
         ty: &Type,
@@ -79,6 +81,7 @@ impl TraitEnv {
         self.type_implements_inner(ty, trait_id, trait_args, &[], 0)
     }
 
+    #[must_use]
     pub fn type_implements_assuming(
         &self,
         ty: &Type,
@@ -88,6 +91,7 @@ impl TraitEnv {
         self.type_implements_with_args_assuming(ty, trait_id, &[], assumptions)
     }
 
+    #[must_use]
     pub fn type_implements_with_args_assuming(
         &self,
         ty: &Type,
@@ -142,16 +146,9 @@ impl TraitEnv {
         }
         if let Some(impls) = self.trait_impls.get(&trait_id)
             && impls.iter().any(|candidate| {
-                self.impl_subst(candidate, ty, trait_args)
-                    .map(|subst| {
-                        self.bounds_satisfied_inner(
-                            &candidate.bounds,
-                            &subst,
-                            assumptions,
-                            depth + 1,
-                        )
-                    })
-                    .unwrap_or(false)
+                Self::impl_subst(candidate, ty, trait_args).is_some_and(|subst| {
+                    self.bounds_satisfied_inner(&candidate.bounds, &subst, assumptions, depth + 1)
+                })
             })
         {
             return true;
@@ -160,23 +157,27 @@ impl TraitEnv {
     }
 
     /// Convenience: `type_implements(ty, copy_trait_id)`.
+    #[must_use]
     pub fn type_is_copy(&self, ty: &Type) -> bool {
-        match self.copy_trait_id {
-            Some(tid) => self.type_implements(ty, tid),
-            None => self.builtin_copy_fallback(ty),
-        }
+        self.copy_trait_id.map_or_else(
+            || Self::builtin_copy_fallback(ty),
+            |tid| self.type_implements(ty, tid),
+        )
     }
 
+    #[must_use]
     pub fn type_has_explicit_drop(&self, ty: &Type) -> bool {
         self.lang_items
             .get(LangItem::Drop)
             .is_some_and(|trait_id| self.type_implements(ty, trait_id))
     }
 
+    #[must_use]
     pub fn associated_type(&self, ty: &Type, trait_id: TraitId, name: &str) -> Option<Type> {
         self.associated_type_with_args(ty, trait_id, &[], name)
     }
 
+    #[must_use]
     pub fn associated_type_with_args(
         &self,
         ty: &Type,
@@ -185,7 +186,7 @@ impl TraitEnv {
         name: &str,
     ) -> Option<Type> {
         self.trait_impls.get(&trait_id)?.iter().find_map(|imp| {
-            let subst = self.impl_subst(imp, ty, trait_args)?;
+            let subst = Self::impl_subst(imp, ty, trait_args)?;
             self.bounds_satisfied(&imp.bounds, &subst).then_some(())?;
             imp.assoc_types
                 .get(name)
@@ -281,11 +282,11 @@ impl TraitEnv {
             return false;
         };
         match kind {
-            CompositeTraitKind::Copy | CompositeTraitKind::Eq | CompositeTraitKind::Ord => {
-                trait_args.is_empty()
-                    && self.derive_same_composite(ty, trait_id, assumptions, depth)
-            }
-            CompositeTraitKind::PartialEq(false) | CompositeTraitKind::PartialOrd(false) => {
+            CompositeTraitKind::Copy
+            | CompositeTraitKind::Eq
+            | CompositeTraitKind::Ord
+            | CompositeTraitKind::PartialEq(false)
+            | CompositeTraitKind::PartialOrd(false) => {
                 trait_args.is_empty()
                     && self.derive_same_composite(ty, trait_id, assumptions, depth)
             }
@@ -347,16 +348,15 @@ impl TraitEnv {
         }
     }
 
-    fn builtin_copy_fallback(&self, ty: &Type) -> bool {
+    fn builtin_copy_fallback(ty: &Type) -> bool {
         match ty {
-            Type::Tuple(elements) => elements.iter().all(|elem| self.builtin_copy_fallback(elem)),
-            Type::Array(inner, _) => self.builtin_copy_fallback(inner),
+            Type::Tuple(elements) => elements.iter().all(Self::builtin_copy_fallback),
+            Type::Array(inner, _) => Self::builtin_copy_fallback(inner),
             _ => ty.is_fundamentally_copy(),
         }
     }
 
     fn impl_subst(
-        &self,
         imp: &TraitImpl,
         actual: &Type,
         trait_args: &[Type],
@@ -415,10 +415,9 @@ impl TraitEnv {
                     &trait_args,
                     &constraint.name,
                 )
-                .map(|actual| {
+                .is_some_and(|actual| {
                     actual.is_unknown_like() || expected.is_unknown_like() || actual == expected
                 })
-                .unwrap_or(false)
             })
         })
     }
@@ -428,8 +427,11 @@ fn builtin_partial_eq(lhs: &Type, rhs: &Type) -> bool {
     match (lhs, rhs) {
         (Type::Int(lhs), Type::Int(rhs)) => lhs == rhs,
         (Type::Float(lhs), Type::Float(rhs)) => lhs == rhs,
-        (Type::InferInt, Type::InferInt) | (Type::InferFloat, Type::InferFloat) => true,
-        (Type::Bool, Type::Bool) | (Type::Char, Type::Char) | (Type::Unit, Type::Unit) => true,
+        (Type::InferInt, Type::InferInt)
+        | (Type::InferFloat, Type::InferFloat)
+        | (Type::Bool, Type::Bool)
+        | (Type::Char, Type::Char)
+        | (Type::Unit, Type::Unit) => true,
         (Type::Ref(lhs, false), Type::Ref(rhs, false)) => {
             matches!(lhs.as_ref(), Type::Str) && matches!(rhs.as_ref(), Type::Str)
         }
@@ -441,8 +443,9 @@ fn builtin_partial_ord(lhs: &Type, rhs: &Type) -> bool {
     match (lhs, rhs) {
         (Type::Int(lhs), Type::Int(rhs)) => lhs == rhs,
         (Type::Float(lhs), Type::Float(rhs)) => lhs == rhs,
-        (Type::InferInt, Type::InferInt) | (Type::InferFloat, Type::InferFloat) => true,
-        (Type::Char, Type::Char) => true,
+        (Type::InferInt, Type::InferInt)
+        | (Type::InferFloat, Type::InferFloat)
+        | (Type::Char, Type::Char) => true,
         _ => false,
     }
 }
@@ -455,6 +458,6 @@ fn builtin_eq(ty: &Type) -> bool {
     }
 }
 
-fn builtin_ord(ty: &Type) -> bool {
+const fn builtin_ord(ty: &Type) -> bool {
     matches!(ty, Type::Int(_) | Type::Bool | Type::Char)
 }

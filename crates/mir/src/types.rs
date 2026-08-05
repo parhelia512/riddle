@@ -12,11 +12,11 @@ pub enum Type {
     Never,
 
     // 复合类型
-    Ref(Box<Type>, bool), // (inner, mutable)
-    Ptr(Box<Type>),
-    Tuple(Vec<Type>),
-    Slice(Box<Type>),
-    Array(Box<Type>, usize),
+    Ref(Box<Self>, bool), // (inner, mutable)
+    Ptr(Box<Self>),
+    Tuple(Vec<Self>),
+    Slice(Box<Self>),
+    Array(Box<Self>, usize),
     Struct(StructType),
     Enum(EnumType),
 
@@ -42,10 +42,11 @@ pub enum IntTy {
 }
 
 impl IntTy {
-    pub fn is_signed(self) -> bool {
+    #[must_use]
+    pub const fn is_signed(self) -> bool {
         matches!(
             self,
-            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::Isize
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::Isize
         )
     }
 }
@@ -90,55 +91,57 @@ pub struct FnPtrType {
 
 impl Type {
     /// Returns true if the type fits in a machine register.
-    pub fn is_scalar(&self) -> bool {
+    #[must_use]
+    pub const fn is_scalar(&self) -> bool {
         matches!(
             self,
-            Type::Int(_)
-                | Type::Float(_)
-                | Type::Bool
-                | Type::Char
-                | Type::Ptr(_)
-                | Type::Ref(_, _)
-                | Type::FnPtr(_)
+            Self::Int(_)
+                | Self::Float(_)
+                | Self::Bool
+                | Self::Char
+                | Self::Ptr(_)
+                | Self::Ref(_, _)
+                | Self::FnPtr(_)
         )
     }
 
     /// Returns `true` if this type has a known size at compile time.
     /// Unsized types (`str` and `[T]`) can only exist behind a pointer/reference.
-    pub fn is_sized(&self) -> bool {
-        !matches!(self, Type::Str | Type::Slice(_))
+    #[must_use]
+    pub const fn is_sized(&self) -> bool {
+        !matches!(self, Self::Str | Self::Slice(_))
     }
 
     /// Rough size estimate in bytes (used for alloca sizing).
     /// Backends may override this with target-specific layouts.
+    #[must_use]
     pub fn size_bytes(&self) -> usize {
         match self {
-            Type::Int(ty) => match ty {
+            Self::Int(ty) => match ty {
                 IntTy::I8 | IntTy::U8 => 1,
                 IntTy::I16 | IntTy::U16 => 2,
                 IntTy::I32 | IntTy::U32 => 4,
                 IntTy::I64 | IntTy::U64 => 8,
                 IntTy::Isize | IntTy::Usize => std::mem::size_of::<usize>(),
             },
-            Type::Float(ty) => match ty {
+            Self::Float(ty) => match ty {
                 FloatTy::F32 => 4,
                 FloatTy::F64 => 8,
             },
-            Type::Bool => 1,
-            Type::Char => 4,
-            Type::Ref(inner, _) | Type::Ptr(inner) => {
-                if !inner.is_sized() {
-                    2 * std::mem::size_of::<usize>()
-                } else {
+            Self::Bool => 1,
+            Self::Char => 4,
+            Self::Ref(inner, _) | Self::Ptr(inner) => {
+                if inner.is_sized() {
                     std::mem::size_of::<usize>()
+                } else {
+                    2 * std::mem::size_of::<usize>()
                 }
             }
-            Type::FnPtr(_) => 2 * std::mem::size_of::<usize>(),
-            Type::Str | Type::Slice(_) => {
+            Self::FnPtr(_) => 2 * std::mem::size_of::<usize>(),
+            Self::Str | Self::Slice(_) => {
                 unreachable!("cannot compute the size of an unsized type")
             }
-            Type::Unit => 0,
-            Type::Never => 0,
+            Self::Unit | Self::Never => 0,
             _ => 8, // 聚合类型：降级为指针大小
         }
     }

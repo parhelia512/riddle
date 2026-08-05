@@ -182,6 +182,7 @@ impl Default for ScopeGraph {
 }
 
 impl ScopeGraph {
+    #[must_use]
     pub fn new() -> Self {
         let mut nodes = Arena::new();
         let root = nodes.alloc(Node::Scope(ScopeKind::Root));

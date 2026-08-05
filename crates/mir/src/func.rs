@@ -28,6 +28,7 @@ pub struct Param {
 }
 
 impl Function {
+    #[must_use]
     pub fn new(name: String, ret_type: Type) -> Self {
         let mut blocks = Arena::new();
         let entry_block = Block::new(0);
@@ -53,7 +54,7 @@ impl Function {
     }
 
     /// Reserve the next Value number.
-    pub fn alloc_value(&mut self) -> Value {
+    pub const fn alloc_value(&mut self) -> Value {
         let v = Value(self.next_value);
         self.next_value += 1;
         v

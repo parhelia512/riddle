@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fs,
+    hash::BuildHasher,
+    io,
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -15,6 +17,8 @@ use mir::{self, Module};
 use scope_graph::{builder::build_scope_graph, resolve::resolve_hir};
 use syntax::SyntaxNode;
 use type_checker::{self, IncrementalTypeChecker, TypeCheckResult, check_hir};
+
+use crate::text_range;
 
 const RAW_STD_PRELUDE: &str = include_str!(concat!(env!("OUT_DIR"), "/std.rid"));
 
@@ -73,6 +77,7 @@ pub struct MappedSource<'a> {
 }
 
 impl SourceMap {
+    #[must_use]
     pub fn map_range(&self, range: rowan::TextRange) -> Option<MappedSource<'_>> {
         let start = usize::from(range.start());
         let end = usize::from(range.end());
@@ -115,18 +120,16 @@ impl SourceMap {
         Some(MappedSource {
             path: &segment.path,
             source: &segment.source,
-            range: rowan::TextRange::new(
-                (original.start as u32).into(),
-                (original.end as u32).into(),
-            ),
+            range: text_range(original.start, original.end),
         })
     }
 
+    #[must_use]
     pub fn contains_file(&self, path: &Path) -> bool {
         self.segments.iter().any(|segment| segment.path == path)
     }
 
-    pub fn extend(&mut self, mut other: SourceMap, generated_start: usize) {
+    pub fn extend(&mut self, mut other: Self, generated_start: usize) {
         for segment in &mut other.segments {
             segment.generated.start += generated_start;
             segment.generated.end += generated_start;
@@ -159,10 +162,7 @@ impl SourceMap {
         let sources = insertions
             .iter()
             .map(|insertion| {
-                let range = rowan::TextRange::new(
-                    (insertion.call_site.start as u32).into(),
-                    (insertion.call_site.end as u32).into(),
-                );
+                let range = text_range(insertion.call_site.start, insertion.call_site.end);
                 let anchor = self.map_range(range).map(|mapped| {
                     (
                         mapped.path.to_path_buf(),
@@ -173,12 +173,9 @@ impl SourceMap {
                 let spans = insertion
                     .spans
                     .iter()
-                    .filter(|span| span.original.end <= u32::MAX as usize)
+                    .filter(|span| u32::try_from(span.original.end).is_ok())
                     .filter_map(|span| {
-                        let range = rowan::TextRange::new(
-                            (span.original.start as u32).into(),
-                            (span.original.end as u32).into(),
-                        );
+                        let range = text_range(span.original.start, span.original.end);
                         self.map_range(range).map(|mapped| {
                             (
                                 span.generated.clone(),
@@ -259,10 +256,7 @@ impl SourceMap {
     fn apply_expansion(&mut self, mappings: &[crate::proc_macro::ExpandedTokenMapping]) {
         let mut segments: Vec<SourceSegment> = Vec::new();
         for mapping in mappings {
-            let original = rowan::TextRange::new(
-                (mapping.original.start as u32).into(),
-                (mapping.original.end as u32).into(),
-            );
+            let original = text_range(mapping.original.start, mapping.original.end);
             let Some(mapped) = self.map_range(original) else {
                 continue;
             };
@@ -275,13 +269,19 @@ impl SourceMap {
                     .synthetic
                     .then_some(usize::from(mapped.range.start())..usize::from(mapped.range.end())),
             };
+            let generated_is_contiguous = segments
+                .last()
+                .is_some_and(|previous| previous.generated.end == segment.generated.start);
+            let original_is_contiguous = segments.last().is_some_and(|previous| {
+                previous.original_start + previous.generated.len() == segment.original_start
+            });
             if let Some(previous) = segments.last_mut()
                 && previous.synthetic.is_none()
                 && segment.synthetic.is_none()
                 && previous.path == segment.path
                 && previous.source == segment.source
-                && previous.generated.end == segment.generated.start
-                && previous.original_start + previous.generated.len() == segment.original_start
+                && generated_is_contiguous
+                && original_is_contiguous
             {
                 previous.generated.end = segment.generated.end;
             } else {
@@ -342,10 +342,16 @@ pub struct CheckSession {
 }
 
 impl CheckSession {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Checks a source buffer while reusing this session's incremental state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the non-cancellable pipeline unexpectedly reports cancellation.
     pub fn check_with_options(&mut self, source: &str, options: CompileOptions) -> CompileResult {
         run_standalone_pipeline_with_state_cancellable(
             source,
@@ -388,9 +394,11 @@ impl CheckSession {
             options,
             true,
             PipelineDepth::Resolve,
-            None,
-            &mut self.parser,
-            None,
+            PipelineState {
+                preparsed: None,
+                parser: &mut self.parser,
+                incremental_type_checker: None,
+            },
         )
     }
 
@@ -424,9 +432,11 @@ impl CheckSession {
             options,
             gc_enabled,
             PipelineDepth::Resolve,
-            None,
-            &mut self.parser,
-            None,
+            PipelineState {
+                preparsed: None,
+                parser: &mut self.parser,
+                incremental_type_checker: None,
+            },
             &cancelled,
         )
     }
@@ -464,13 +474,20 @@ impl CheckSession {
             options,
             gc_enabled,
             PipelineDepth::Resolve,
-            Some(parse),
-            &mut self.parser,
-            None,
+            PipelineState {
+                preparsed: Some(parse),
+                parser: &mut self.parser,
+                incremental_type_checker: None,
+            },
             &cancelled,
         )
     }
 
+    /// Resolves a source buffer while reusing this session's parser state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the non-cancellable pipeline unexpectedly reports cancellation.
     pub fn resolve_with_options(&mut self, source: &str, options: CompileOptions) -> CompileResult {
         run_standalone_pipeline_with_state_cancellable(
             source,
@@ -513,9 +530,11 @@ impl CheckSession {
             options,
             true,
             PipelineDepth::Check,
-            None,
-            &mut self.parser,
-            Some(&mut self.type_checker),
+            PipelineState {
+                preparsed: None,
+                parser: &mut self.parser,
+                incremental_type_checker: Some(&mut self.type_checker),
+            },
         )
     }
 
@@ -549,9 +568,11 @@ impl CheckSession {
             options,
             gc_enabled,
             PipelineDepth::Check,
-            None,
-            &mut self.parser,
-            Some(&mut self.type_checker),
+            PipelineState {
+                preparsed: None,
+                parser: &mut self.parser,
+                incremental_type_checker: Some(&mut self.type_checker),
+            },
             &cancelled,
         )
     }
@@ -589,9 +610,11 @@ impl CheckSession {
             options,
             gc_enabled,
             PipelineDepth::Check,
-            Some(parse),
-            &mut self.parser,
-            Some(&mut self.type_checker),
+            PipelineState {
+                preparsed: Some(parse),
+                parser: &mut self.parser,
+                incremental_type_checker: Some(&mut self.type_checker),
+            },
             &cancelled,
         )
     }
@@ -599,6 +622,7 @@ impl CheckSession {
 
 /// An adapter that lets the diagnostics printer handle diagnostics from
 /// different sources (parse errors, type errors, move errors) uniformly.
+///
 /// This is also used as the bridge type in the diagnostics printer.
 #[derive(Debug, Clone)]
 pub struct DiagnosticExt {
@@ -644,13 +668,23 @@ impl IntoDiagnosticExt for ParseError {
     }
 }
 
+/// Loads a source file and recursively expands external modules.
+///
+/// # Errors
+///
+/// Returns an I/O error when a source or module cannot be read or resolved.
 pub fn load_source_file(path: impl AsRef<Path>) -> io::Result<LoadedSource> {
     load_source_file_with_overlays(path, &HashMap::new())
 }
 
-pub fn load_source_file_with_overlays(
+/// Loads a source file, preferring the supplied in-memory overlays.
+///
+/// # Errors
+///
+/// Returns an I/O error when a source or module cannot be read or resolved.
+pub fn load_source_file_with_overlays<S: BuildHasher>(
     path: impl AsRef<Path>,
-    overlays: &HashMap<PathBuf, String>,
+    overlays: &HashMap<PathBuf, String, S>,
 ) -> io::Result<LoadedSource> {
     let mut files = Vec::new();
     let mut stack = HashSet::new();
@@ -708,13 +742,13 @@ fn expand_external_mods(
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source(source);
     if !parse.errors.is_empty() {
-        return Ok(ExpandedSource::original(path, Arc::clone(source)));
+        return Ok(ExpandedSource::original(path, source));
     }
 
     let mut mods = Vec::new();
     collect_external_mods(&parse.syntax(), module_dir, &mut mods);
     if mods.is_empty() {
-        return Ok(ExpandedSource::original(path, Arc::clone(source)));
+        return Ok(ExpandedSource::original(path, source));
     }
 
     let mut replacements = Vec::new();
@@ -767,9 +801,9 @@ struct ExpandedSource {
 }
 
 impl ExpandedSource {
-    fn original(path: &Path, source: Arc<str>) -> Self {
+    fn original(path: &Path, source: &Arc<str>) -> Self {
         let mut source_map = SourceMap::default();
-        source_map.push(0..source.len(), path, Arc::clone(&source), 0);
+        source_map.push(0..source.len(), path, Arc::clone(source), 0);
         Self {
             source: source.to_string(),
             source_map,
@@ -860,10 +894,20 @@ fn normalized_path(path: &Path) -> PathBuf {
     })
 }
 
+/// Generates C for a MIR module using the default GC runtime.
+///
+/// # Errors
+///
+/// Returns an error when the module cannot be represented by the C backend.
 pub fn generate_c(module: &Module) -> Result<String, String> {
     generate_c_with_gc(module, true)
 }
 
+/// Generates C for a MIR module with an explicit GC setting.
+///
+/// # Errors
+///
+/// Returns an error when the module cannot be represented by the C backend.
 pub fn generate_c_with_gc(module: &Module, gc_enabled: bool) -> Result<String, String> {
     let mut backend = if gc_enabled {
         CBackend::new()
@@ -874,14 +918,17 @@ pub fn generate_c_with_gc(module: &Module, gc_enabled: bool) -> Result<String, S
 }
 
 /// Run the full frontend pipeline on `source`.
+#[must_use]
 pub fn compile(source: &str) -> CompileResult {
     compile_with_options(source, CompileOptions::default())
 }
 
+#[must_use]
 pub fn compile_with_options(source: &str, options: CompileOptions) -> CompileResult {
     compile_with_options_and_gc(source, options, true)
 }
 
+#[must_use]
 pub fn compile_with_options_and_gc(
     source: &str,
     options: CompileOptions,
@@ -890,10 +937,12 @@ pub fn compile_with_options_and_gc(
     run_pipeline(source, options, gc_enabled, PipelineDepth::Build)
 }
 
+#[must_use]
 pub fn check_with_options(source: &str, options: CompileOptions) -> CompileResult {
     check_with_options_and_gc(source, options, true)
 }
 
+#[must_use]
 pub fn check_with_options_and_gc(
     source: &str,
     options: CompileOptions,
@@ -902,6 +951,7 @@ pub fn check_with_options_and_gc(
     run_pipeline(source, options, gc_enabled, PipelineDepth::Check)
 }
 
+#[must_use]
 pub fn compile_package_with_options(
     source: &str,
     package_ranges: &[Range<usize>],
@@ -910,6 +960,7 @@ pub fn compile_package_with_options(
     compile_package_with_options_and_gc(source, package_ranges, options, true)
 }
 
+#[must_use]
 pub fn compile_package_with_options_and_gc(
     source: &str,
     package_ranges: &[Range<usize>],
@@ -922,12 +973,15 @@ pub fn compile_package_with_options_and_gc(
         options,
         gc_enabled,
         PipelineDepth::Build,
-        None,
-        &mut IncrementalParser::new(),
-        None,
+        PipelineState {
+            preparsed: None,
+            parser: &mut IncrementalParser::new(),
+            incremental_type_checker: None,
+        },
     )
 }
 
+#[must_use]
 pub fn compile_parsed_package_with_options(
     source: &str,
     parse: &Parse,
@@ -937,6 +991,7 @@ pub fn compile_parsed_package_with_options(
     compile_parsed_package_with_options_and_gc(source, parse, package_ranges, options, true)
 }
 
+#[must_use]
 pub fn compile_parsed_package_with_options_and_gc(
     source: &str,
     parse: &Parse,
@@ -950,12 +1005,15 @@ pub fn compile_parsed_package_with_options_and_gc(
         options,
         gc_enabled,
         PipelineDepth::Build,
-        Some(parse),
-        &mut IncrementalParser::new(),
-        None,
+        PipelineState {
+            preparsed: Some(parse),
+            parser: &mut IncrementalParser::new(),
+            incremental_type_checker: None,
+        },
     )
 }
 
+#[must_use]
 pub fn check_package_with_options(
     source: &str,
     package_ranges: &[Range<usize>],
@@ -964,6 +1022,7 @@ pub fn check_package_with_options(
     check_package_with_options_and_gc(source, package_ranges, options, true)
 }
 
+#[must_use]
 pub fn check_package_with_options_and_gc(
     source: &str,
     package_ranges: &[Range<usize>],
@@ -976,12 +1035,15 @@ pub fn check_package_with_options_and_gc(
         options,
         gc_enabled,
         PipelineDepth::Check,
-        None,
-        &mut IncrementalParser::new(),
-        None,
+        PipelineState {
+            preparsed: None,
+            parser: &mut IncrementalParser::new(),
+            incremental_type_checker: None,
+        },
     )
 }
 
+#[must_use]
 pub fn check_parsed_package_with_options(
     source: &str,
     parse: &Parse,
@@ -991,6 +1053,7 @@ pub fn check_parsed_package_with_options(
     check_parsed_package_with_options_and_gc(source, parse, package_ranges, options, true)
 }
 
+#[must_use]
 pub fn check_parsed_package_with_options_and_gc(
     source: &str,
     parse: &Parse,
@@ -1004,12 +1067,15 @@ pub fn check_parsed_package_with_options_and_gc(
         options,
         gc_enabled,
         PipelineDepth::Check,
-        Some(parse),
-        &mut IncrementalParser::new(),
-        None,
+        PipelineState {
+            preparsed: Some(parse),
+            parser: &mut IncrementalParser::new(),
+            incremental_type_checker: None,
+        },
     )
 }
 
+#[must_use]
 pub fn resolve_with_options(source: &str, options: CompileOptions) -> CompileResult {
     run_pipeline(source, options, true, PipelineDepth::Resolve)
 }
@@ -1019,6 +1085,12 @@ enum PipelineDepth {
     Resolve,
     Check,
     Build,
+}
+
+struct PipelineState<'a> {
+    preparsed: Option<&'a Parse>,
+    parser: &'a mut IncrementalParser,
+    incremental_type_checker: Option<&'a mut IncrementalTypeChecker>,
 }
 
 fn run_pipeline(
@@ -1052,17 +1124,18 @@ fn run_standalone_pipeline_with_state_cancellable(
         return None;
     }
     let expansion = crate::proc_macro::expand_standard_macros(source);
-    #[allow(clippy::single_range_in_vec_init)]
-    let package_ranges = [0..expansion.source.len()];
+    let package_range = 0..expansion.source.len();
     let mut result = run_pipeline_with_state_cancellable(
         &expansion.source,
-        &package_ranges,
+        std::slice::from_ref(&package_range),
         options,
         gc_enabled,
         depth,
-        expansion.parse.as_ref(),
-        parser,
-        incremental_type_checker,
+        PipelineState {
+            preparsed: expansion.parse.as_ref(),
+            parser,
+            incremental_type_checker,
+        },
         cancelled,
     )?;
     result.macro_diagnostics = expansion.diagnostics;
@@ -1075,9 +1148,7 @@ fn run_pipeline_with_state(
     options: CompileOptions,
     gc_enabled: bool,
     depth: PipelineDepth,
-    preparsed: Option<&Parse>,
-    parser: &mut IncrementalParser,
-    incremental_type_checker: Option<&mut IncrementalTypeChecker>,
+    state: PipelineState<'_>,
 ) -> CompileResult {
     run_pipeline_with_state_cancellable(
         source,
@@ -1085,26 +1156,117 @@ fn run_pipeline_with_state(
         options,
         gc_enabled,
         depth,
-        preparsed,
-        parser,
-        incremental_type_checker,
+        state,
         &|| false,
     )
     .expect("non-cancellable pipeline cannot be cancelled")
 }
 
-#[allow(clippy::too_many_arguments)]
+fn convert_hir_diag(diagnostic: &hir::body::Diagnostic) -> type_checker::Diagnostic {
+    type_checker::Diagnostic {
+        code: diagnostic.code,
+        severity: match diagnostic.severity {
+            hir::body::Severity::Error => type_checker::Severity::Error,
+            hir::body::Severity::Warning => type_checker::Severity::Warning,
+            hir::body::Severity::Note => type_checker::Severity::Note,
+            hir::body::Severity::Help => type_checker::Severity::Help,
+        },
+        message: diagnostic.message.clone(),
+        labels: diagnostic
+            .labels
+            .iter()
+            .map(|label| type_checker::SourceLabel {
+                range: label.range,
+                message: label.message.clone(),
+                style: match label.style {
+                    hir::body::LabelStyle::Primary => type_checker::LabelStyle::Primary,
+                    hir::body::LabelStyle::Secondary => type_checker::LabelStyle::Secondary,
+                },
+            })
+            .collect(),
+        help: diagnostic.help.clone(),
+        notes: diagnostic.notes.clone(),
+    }
+}
+
+fn parse_errors_for_source(parse: &Parse, use_std: bool, user_source: &str) -> Vec<ParseError> {
+    let mut errors = parse.errors.clone();
+    if use_std
+        && errors
+            .iter()
+            .any(|error| usize::from(error.span.end()) > user_source.len())
+    {
+        let mut parser = IncrementalParser::new();
+        let user_errors = parser.set_source(user_source).errors.clone();
+        if !user_errors.is_empty() {
+            errors = user_errors;
+        }
+    }
+    errors
+}
+
+fn collect_hir_diagnostics(
+    hir: &hir::HirFile,
+    scope_diagnostics: &[hir::body::Diagnostic],
+) -> Vec<type_checker::Diagnostic> {
+    hir.bodies
+        .iter()
+        .flat_map(|(_, body)| body.diagnostics.iter())
+        .chain(scope_diagnostics)
+        .map(convert_hir_diag)
+        .collect()
+}
+
+fn pipeline_succeeded(
+    parse_errors: &[ParseError],
+    hir_diagnostics: &[type_checker::Diagnostic],
+    type_result: &TypeCheckResult,
+    analysis_diagnostics: &[type_checker::Diagnostic],
+) -> bool {
+    let has_error = |diagnostics: &[type_checker::Diagnostic]| {
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == type_checker::Severity::Error)
+    };
+    parse_errors.is_empty()
+        && !has_error(hir_diagnostics)
+        && !has_error(&type_result.diagnostics)
+        && !has_error(analysis_diagnostics)
+}
+
+fn resolve_result(
+    hir: hir::HirFile,
+    scope_graph: scope_graph::ScopeGraph,
+    hir_diagnostics: Vec<type_checker::Diagnostic>,
+    parse_errors: Vec<ParseError>,
+) -> CompileResult {
+    CompileResult {
+        hir: Some(hir),
+        scope_graph: Some(scope_graph),
+        type_result: TypeCheckResult::default(),
+        macro_diagnostics: Vec::new(),
+        hir_diagnostics,
+        analysis_diagnostics: Vec::new(),
+        analysis: move_checker::AnalysisResult::default(),
+        mir_module: None,
+        parse_errors,
+    }
+}
+
 fn run_pipeline_with_state_cancellable(
     source: &str,
     package_ranges: &[Range<usize>],
     options: CompileOptions,
     gc_enabled: bool,
     depth: PipelineDepth,
-    preparsed: Option<&Parse>,
-    parser: &mut IncrementalParser,
-    incremental_type_checker: Option<&mut IncrementalTypeChecker>,
+    state: PipelineState<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<CompileResult> {
+    let PipelineState {
+        preparsed,
+        parser,
+        incremental_type_checker,
+    } = state;
     if cancelled() {
         return None;
     }
@@ -1135,18 +1297,7 @@ fn run_pipeline_with_state_cancellable(
         return None;
     }
 
-    let mut parse_errors = parse.errors.clone();
-    if options.use_std
-        && parse_errors
-            .iter()
-            .any(|error| usize::from(error.span.end()) > user_source.len())
-    {
-        let mut parser = IncrementalParser::new();
-        let user_errors = parser.set_source(user_source).errors.clone();
-        if !user_errors.is_empty() {
-            parse_errors = user_errors;
-        }
-    }
+    let parse_errors = parse_errors_for_source(parse, options.use_std, user_source);
 
     if !parse_errors.is_empty() {
         return Some(parse_failure(parse_errors));
@@ -1155,13 +1306,13 @@ fn run_pipeline_with_state_cancellable(
     // 2. Lower AST → HIR
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();
-    let mut hir = lower_root(root);
+    let mut hir = lower_root(&root);
     if cancelled() {
         return None;
     }
     hir.package_ranges = package_ranges
         .iter()
-        .map(|range| rowan::TextRange::new((range.start as u32).into(), (range.end as u32).into()))
+        .map(|range| text_range(range.start, range.end))
         .collect();
     hir.std_loaded = options.use_std;
 
@@ -1172,61 +1323,18 @@ fn run_pipeline_with_state_cancellable(
         return None;
     }
 
-    /// Convert a `hir::body::Diagnostic` to a `type_checker::Diagnostic`.
-    fn convert_hir_diag(d: &hir::body::Diagnostic) -> type_checker::Diagnostic {
-        type_checker::Diagnostic {
-            code: d.code,
-            severity: match d.severity {
-                hir::body::Severity::Error => type_checker::Severity::Error,
-                hir::body::Severity::Warning => type_checker::Severity::Warning,
-                hir::body::Severity::Note => type_checker::Severity::Note,
-                hir::body::Severity::Help => type_checker::Severity::Help,
-            },
-            message: d.message.clone(),
-            labels: d
-                .labels
-                .iter()
-                .map(|l| type_checker::SourceLabel {
-                    range: l.range,
-                    message: l.message.clone(),
-                    style: match l.style {
-                        hir::body::LabelStyle::Primary => type_checker::LabelStyle::Primary,
-                        hir::body::LabelStyle::Secondary => type_checker::LabelStyle::Secondary,
-                    },
-                })
-                .collect(),
-            help: d.help.clone(),
-            notes: d.notes.clone(),
-        }
-    }
-
     // Collect HIR diagnostics (E0040 lowering + E0050 resolution + E0051/E0052 scope-graph builder)
-    let hir_diagnostics: Vec<type_checker::Diagnostic> = hir
-        .bodies
-        .iter()
-        .flat_map(|(_, body)| body.diagnostics.iter())
-        .chain(scope_diagnostics.iter())
-        .map(convert_hir_diag)
-        .collect();
+    let hir_diagnostics = collect_hir_diagnostics(&hir, &scope_diagnostics);
 
     if depth == PipelineDepth::Resolve {
-        return Some(CompileResult {
-            hir: Some(hir),
-            scope_graph: Some(sg),
-            type_result: TypeCheckResult::default(),
-            macro_diagnostics: Vec::new(),
-            hir_diagnostics,
-            analysis_diagnostics: Vec::new(),
-            analysis: move_checker::AnalysisResult::default(),
-            mir_module: None,
-            parse_errors,
-        });
+        return Some(resolve_result(hir, sg, hir_diagnostics, parse_errors));
     }
 
     // 4. Type check
-    let type_result = incremental_type_checker
-        .map(|checker| checker.check_with_syntax(&hir, &syntax).result)
-        .unwrap_or_else(|| check_hir(&hir));
+    let type_result = incremental_type_checker.map_or_else(
+        || check_hir(&hir),
+        |checker| checker.check_with_syntax(&hir, &syntax).result,
+    );
     if cancelled() {
         return None;
     }
@@ -1249,17 +1357,12 @@ fn run_pipeline_with_state_cancellable(
 
     // Only Error-severity diagnostics block compilation.
     // Notes (like E0200 heap promotion) and warnings are informational.
-    let success = parse_errors.is_empty()
-        && !hir_diagnostics
-            .iter()
-            .any(|d| d.severity == type_checker::Severity::Error)
-        && !type_result
-            .diagnostics
-            .iter()
-            .any(|d| d.severity == type_checker::Severity::Error)
-        && !analysis_diagnostics
-            .iter()
-            .any(|d| d.severity == type_checker::Severity::Error);
+    let success = pipeline_succeeded(
+        &parse_errors,
+        &hir_diagnostics,
+        &type_result,
+        &analysis_diagnostics,
+    );
 
     // 7. Lower HIR → MIR
     let mir_module = (success && depth == PipelineDepth::Build).then(|| {
@@ -1343,6 +1446,7 @@ fn parse_failure(parse_errors: Vec<ParseError>) -> CompileResult {
 }
 
 impl CompileResult {
+    #[must_use]
     pub fn success(&self) -> bool {
         self.parse_errors.is_empty()
             && !self
