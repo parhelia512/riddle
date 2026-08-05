@@ -350,6 +350,10 @@ size_t riddle_proc_diagnostic_count(void) {
     return riddle_proc_diagnostic_len;
 }
 
+const void *riddle_proc_diagnostics_value(void) {
+    return riddle_proc_diagnostics;
+}
+
 uint8_t riddle_proc_diagnostic_level(size_t index) {
     return index < riddle_proc_diagnostic_len ? riddle_proc_diagnostics[index].level : 0u;
 }

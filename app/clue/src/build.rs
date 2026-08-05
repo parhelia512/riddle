@@ -151,6 +151,7 @@ fn build_analysis(
         ],
         &executable,
         &[],
+        false,
     )?;
     fs::write(&hash_path, hash)?;
     println!("clue: built {}", executable.display());
@@ -160,7 +161,7 @@ fn build_analysis(
     })
 }
 
-pub fn build_proc_macro_host(
+pub fn build_proc_macro_library(
     package: &crate::project::ProcMacroPackage,
     exports: &[crate::proc_macro::HostMacroExport],
     expanded_source: &str,
@@ -177,10 +178,11 @@ pub fn build_proc_macro_host(
     let runtime_path = build_dir.join(format!("{}.proc-macro.runtime.c", package.name));
     let bridge_path = build_dir.join(format!("{}.proc-macro.host.c", package.name));
     let hash_path = build_dir.join(format!("{}.proc-macro.hash", package.name));
-    let executable = build_dir.join(format!(
-        "{}.proc-macro-host{}",
+    let library = build_dir.join(format!(
+        "{}{}.proc-macro{}",
+        env::consts::DLL_PREFIX,
         package.name,
-        host.executable_suffix()
+        env::consts::DLL_SUFFIX
     ));
     let hash = fingerprint(
         &format!("{}\n{bridge}", package.manifest_fingerprint),
@@ -192,10 +194,10 @@ pub fn build_proc_macro_host(
     if c_path.is_file()
         && runtime_path.is_file()
         && bridge_path.is_file()
-        && executable.is_file()
+        && library.is_file()
         && fs::read_to_string(&hash_path).unwrap_or_default() == hash
     {
-        return Ok(executable);
+        return Ok(library);
     }
 
     let analysis = pipeline::compile_with_options(&source, pipeline::CompileOptions::default());
@@ -223,19 +225,12 @@ pub fn build_proc_macro_host(
             runtime_path.as_path(),
             bridge_path.as_path(),
         ],
-        &executable,
-        proc_macro_host_defines(&compiler),
+        &library,
+        &["putchar=riddle_proc_putchar"],
+        true,
     )?;
     fs::write(hash_path, hash)?;
-    Ok(executable)
-}
-
-fn proc_macro_host_defines(compiler: &CCompiler) -> &'static [&'static str] {
-    if compiler.flavor == Flavor::Msvc {
-        &["putchar=riddle_proc_putchar"]
-    } else {
-        &[]
-    }
+    Ok(library)
 }
 
 fn fingerprint(
@@ -377,7 +372,7 @@ impl CCompiler {
             return false;
         }
         let success = self
-            .command(&[source.as_path()], &executable, &[])
+            .command(&[source.as_path()], &executable, &[], false)
             .output()
             .is_ok_and(|output| output.status.success() && executable.is_file());
         let _ = fs::remove_file(&source);
@@ -404,9 +399,10 @@ impl CCompiler {
         sources: &[&Path],
         executable: &Path,
         defines: &[&str],
+        shared_library: bool,
     ) -> anyhow::Result<()> {
         let status = self
-            .command(sources, executable, defines)
+            .command(sources, executable, defines, shared_library)
             .status()
             .with_context(|| {
                 format!(
@@ -423,16 +419,41 @@ impl CCompiler {
         Ok(())
     }
 
-    fn command(&self, sources: &[&Path], executable: &Path, defines: &[&str]) -> Command {
+    fn command(
+        &self,
+        sources: &[&Path],
+        executable: &Path,
+        defines: &[&str],
+        shared_library: bool,
+    ) -> Command {
         let mut command = Command::new(&self.program);
         let host = TargetTriple::host().ok();
         let cross = host.is_some_and(|host| host != self.target.triple);
         match self.flavor {
             Flavor::Unix => {
                 command.args(["-std=c11", "-O2"]);
-                if cross {
+                if cross && self.clang {
                     command.arg(format!("--target={}", self.target.triple));
+                } else if matches!(
+                    self.target.triple,
+                    TargetTriple::I686UnknownLinuxGnu | TargetTriple::I686PcWindowsMsvc
+                ) {
+                    command.arg("-m32");
+                } else if self.target.triple == TargetTriple::X86_64UnknownLinuxGnu {
+                    command.arg("-m64");
+                }
+                if cross {
                     command.arg("-fuse-ld=lld");
+                }
+                if shared_library {
+                    command.arg(if self.target.triple.is_macos() {
+                        "-dynamiclib"
+                    } else {
+                        "-shared"
+                    });
+                    if !self.target.triple.is_windows() {
+                        command.arg("-fPIC");
+                    }
                 }
                 self.apply_unix_target_options(&mut command);
                 for define in defines {
@@ -442,9 +463,14 @@ impl CCompiler {
             }
             Flavor::Msvc => {
                 command.args(["/nologo", "/std:c11", "/O2"]);
-                if cross && self.clang {
+                if self.clang && (cross || self.target.triple == TargetTriple::I686PcWindowsMsvc) {
                     command.arg(format!("--target={}", self.target.triple));
+                }
+                if cross && self.clang {
                     command.arg("-fuse-ld=lld");
+                }
+                if shared_library {
+                    command.arg("/LD");
                 }
                 self.apply_msvc_target_options(&mut command);
                 for define in defines {
@@ -629,4 +655,46 @@ fn program_name(program: &OsStr) -> String {
         .unwrap_or_default()
         .to_ascii_lowercase();
     name.strip_suffix(".exe").unwrap_or(&name).to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared_library_args(flavor: Flavor, triple: TargetTriple, clang: bool) -> Vec<String> {
+        CCompiler {
+            program: "cc".into(),
+            flavor,
+            version: Vec::new(),
+            clang,
+            target: TargetConfig {
+                triple,
+                runtime_source: None,
+                c_toolchain: Default::default(),
+            },
+        }
+        .command(&[Path::new("input.c")], Path::new("output"), &[], true)
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect()
+    }
+
+    #[test]
+    fn shared_library_flags_cover_supported_platforms() {
+        let linux = shared_library_args(Flavor::Unix, TargetTriple::I686UnknownLinuxGnu, false);
+        assert!(linux.iter().any(|argument| argument == "-shared"));
+        assert!(linux.iter().any(|argument| argument == "-fPIC"));
+        assert!(linux.iter().any(|argument| argument == "-m32"));
+
+        let macos = shared_library_args(Flavor::Unix, TargetTriple::Aarch64AppleDarwin, true);
+        assert!(macos.iter().any(|argument| argument == "-dynamiclib"));
+
+        let windows = shared_library_args(Flavor::Msvc, TargetTriple::I686PcWindowsMsvc, true);
+        assert!(windows.iter().any(|argument| argument == "/LD"));
+        assert!(
+            windows
+                .iter()
+                .any(|argument| argument == "--target=i686-pc-windows-msvc")
+        );
+    }
 }

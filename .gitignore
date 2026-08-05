@@ -9,8 +9,6 @@
 
 # Rust
 /target
-Cargo.lock
-!/editors/zed/Cargo.lock
 **/.clue/
 
 # C

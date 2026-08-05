@@ -2690,12 +2690,13 @@ fun main() -> i32 {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        root.join(if cfg!(windows) {
-            "macros/.clue/build/macros.proc-macro-host.exe"
-        } else {
-            "macros/.clue/build/macros.proc-macro-host"
-        })
-        .is_file()
+        root.join("macros/.clue/build")
+            .join(format!(
+                "{}macros.proc-macro{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            ))
+            .is_file()
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("macro log"));
     let _ = fs::remove_dir_all(root);

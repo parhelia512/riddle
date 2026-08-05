@@ -11,6 +11,7 @@ ast = { path = "../../crates/ast" }
 clap = { version = "=4.5.61", features = ["derive"] }
 frontend = { path = "../../crates/frontend" }
 gc = { path = "../../crates/gc" }
+libloading = "0.8"
 riddlec = { path = "../riddlec" }
 rowan = "0.16.1"
 serde = { version = "1", features = ["derive"] }
