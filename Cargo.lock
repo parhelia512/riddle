@@ -734,6 +734,7 @@ dependencies = [
 name = "riddle-lsp"
 version = "0.2.0"
 dependencies = [
+ "ast",
  "clap",
  "clue",
  "frontend",
@@ -742,6 +743,7 @@ dependencies = [
  "riddlec",
  "rowan",
  "scope-graph",
+ "serde",
  "serde_json",
  "syntax",
  "tokio",

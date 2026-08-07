@@ -1,20 +1,23 @@
 use std::{
     collections::{BTreeMap, HashMap},
     hash::BuildHasher,
+    path::Path,
 };
 
 use hir::{
     HirFile, Name,
-    body::{BodyId, Expr, ExprId, Pattern, PatternBindingId, ResolvedName},
+    body::{BodyId, Expr, ExprId, Pattern, PatternBindingId, ResolvedName, Stmt},
     item_tree::{
         FunctionId, HirEnum, HirEnumVariant, HirFunction, HirImpl, HirStruct, HirStructField,
         HirTypeRef, HirUseTree, HirUseTreeKind, HirVariantKind, TraitId,
     },
 };
 use lsp_types::{
-    DocumentChanges, GotoDefinitionResponse, Hover, HoverContents, Location, MarkupContent,
-    MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position, PrepareRenameResponse,
-    TextDocumentEdit, TextEdit, WorkspaceEdit,
+    DocumentChanges, DocumentHighlight, DocumentHighlightKind, GotoDefinitionResponse, Hover,
+    HoverContents, Location, MarkupContent, MarkupKind, OneOf,
+    OptionalVersionedTextDocumentIdentifier, ParameterInformation, ParameterLabel, Position,
+    PrepareRenameResponse, SignatureHelp, SignatureInformation, TextDocumentEdit, TextEdit,
+    WorkspaceEdit,
 };
 use riddlec::{
     pipeline::CompileOptions,
@@ -25,13 +28,15 @@ use riddlec::{
 use rowan::{TextRange, TextSize};
 use scope_graph::{
     DefRef, Node, RefOrigin, ScopeGraph,
-    resolve::{resolve_path_at_reference, resolve_path_from, visible_definitions},
+    resolve::{
+        resolve_path_at_reference, resolve_path_from, resolve_reference, visible_definitions,
+    },
 };
 use syntax::SyntaxKind;
 use type_checker::{Type, TypeCheckResult};
 
 use crate::{
-    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document},
+    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document_cancellable},
     completion::BUILTIN_TYPES,
     server::Document,
     session::AnalysisSessions,
@@ -52,6 +57,7 @@ const HOVER_DECLARATION_ITEM_LIMIT: usize = 5;
 /// # Errors
 ///
 /// Returns an error when the document is unavailable or project analysis fails.
+#[cfg(feature = "test")]
 pub fn hover_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
     docs: &HashMap<lsp_types::Url, Document, S>,
@@ -59,11 +65,92 @@ pub fn hover_for_document<S: BuildHasher>(
     options: CompileOptions,
     sessions: &AnalysisSessions,
 ) -> Result<Option<Hover>, String> {
+    hover_for_document_cancellable(uri, docs, position, options, sessions, &|| false)
+}
+
+/// Computes hover information and supports cooperative cancellation.
+///
+/// # Errors
+///
+/// Returns an error when the document is unavailable or project analysis fails.
+pub fn hover_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Hover>, String> {
     let document = docs
         .get(uri)
         .ok_or_else(|| "document is not open".to_string())?;
-    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Check,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
     Ok(hover_from_analysis(document, &analysis, position))
+}
+
+pub fn signature_help_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<SignatureHelp>, String> {
+    let document = docs
+        .get(uri)
+        .ok_or_else(|| "document is not open".to_string())?;
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Check,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(signature_help_from_analysis(
+        &document.text,
+        &analysis,
+        position,
+    ))
+}
+
+pub fn document_highlights_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Vec<DocumentHighlight>>, String> {
+    let Some(locations) = references_for_document_cancellable(
+        uri, docs, position, true, options, sessions, cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        locations
+            .into_iter()
+            .filter(|location| same_document_uri(&location.uri, uri))
+            .map(|location| DocumentHighlight {
+                range: location.range,
+                kind: Some(DocumentHighlightKind::TEXT),
+            })
+            .collect(),
+    ))
 }
 
 /// Finds the definition at a position in an open document.
@@ -71,6 +158,7 @@ pub fn hover_for_document<S: BuildHasher>(
 /// # Errors
 ///
 /// Returns an error when the document is unavailable or project analysis fails.
+#[cfg(feature = "test")]
 pub fn definition_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
     docs: &HashMap<lsp_types::Url, Document, S>,
@@ -78,29 +166,94 @@ pub fn definition_for_document<S: BuildHasher>(
     options: CompileOptions,
     sessions: &AnalysisSessions,
 ) -> Result<Option<GotoDefinitionResponse>, String> {
-    let document = docs
-        .get(uri)
-        .ok_or_else(|| "document is not open".to_string())?;
-    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
-    Ok(definition_from_analysis(uri, document, &analysis, position))
+    definition_for_document_cancellable(uri, docs, position, options, sessions, &|| false)
 }
 
-/// Finds implementations at a position in an open document.
-///
-/// # Errors
-///
-/// Returns an error when the document is unavailable or project analysis fails.
-pub fn implementation_for_document<S: BuildHasher>(
+pub fn definition_for_document_cancellable<S: BuildHasher>(
     uri: &lsp_types::Url,
     docs: &HashMap<lsp_types::Url, Document, S>,
     position: Position,
     options: CompileOptions,
     sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<GotoDefinitionResponse>, String> {
+    declaration_for_document_cancellable(uri, docs, position, options, sessions, cancelled)
+}
+
+pub fn declaration_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<Option<GotoDefinitionResponse>, String> {
     let document = docs
         .get(uri)
         .ok_or_else(|| "document is not open".to_string())?;
-    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Check,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(definition_from_analysis(uri, document, &analysis, position))
+}
+
+pub fn type_definition_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<GotoDefinitionResponse>, String> {
+    let document = docs
+        .get(uri)
+        .ok_or_else(|| "document is not open".to_string())?;
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Check,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(type_definition_from_analysis(
+        uri, document, &analysis, position,
+    ))
+}
+
+pub fn implementation_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<GotoDefinitionResponse>, String> {
+    let document = docs
+        .get(uri)
+        .ok_or_else(|| "document is not open".to_string())?;
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Check,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
     Ok(implementation_from_analysis(
         uri, document, &analysis, position,
     ))
@@ -111,6 +264,7 @@ pub fn implementation_for_document<S: BuildHasher>(
 /// # Errors
 ///
 /// Returns an error when the document is unavailable or project analysis fails.
+#[cfg(feature = "test")]
 pub fn references_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
     docs: &HashMap<lsp_types::Url, Document, S>,
@@ -119,10 +273,40 @@ pub fn references_for_document<S: BuildHasher>(
     options: CompileOptions,
     sessions: &AnalysisSessions,
 ) -> Result<Option<Vec<Location>>, String> {
+    references_for_document_cancellable(
+        uri,
+        docs,
+        position,
+        include_declaration,
+        options,
+        sessions,
+        &|| false,
+    )
+}
+
+pub fn references_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    include_declaration: bool,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Vec<Location>>, String> {
     let document = docs
         .get(uri)
         .ok_or_else(|| "document is not open".to_string())?;
-    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Check,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
     Ok(references_from_analysis(
         uri,
         document,
@@ -137,6 +321,7 @@ pub fn references_for_document<S: BuildHasher>(
 /// # Errors
 ///
 /// Returns an error when the document is unavailable or project analysis fails.
+#[cfg(feature = "test")]
 pub fn prepare_rename_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
     docs: &HashMap<lsp_types::Url, Document, S>,
@@ -144,10 +329,31 @@ pub fn prepare_rename_for_document<S: BuildHasher>(
     options: CompileOptions,
     sessions: &AnalysisSessions,
 ) -> Result<Option<PrepareRenameResponse>, String> {
+    prepare_rename_for_document_cancellable(uri, docs, position, options, sessions, &|| false)
+}
+
+pub fn prepare_rename_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<PrepareRenameResponse>, String> {
     let document = docs
         .get(uri)
         .ok_or_else(|| "document is not open".to_string())?;
-    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Check,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
     Ok(prepare_rename_from_analysis(document, &analysis, position))
 }
 
@@ -156,6 +362,7 @@ pub fn prepare_rename_for_document<S: BuildHasher>(
 /// # Errors
 ///
 /// Returns an error when the new name is invalid, the document is unavailable, or analysis fails.
+#[cfg(feature = "test")]
 pub fn rename_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
     docs: &HashMap<lsp_types::Url, Document, S>,
@@ -164,11 +371,33 @@ pub fn rename_for_document<S: BuildHasher>(
     options: CompileOptions,
     sessions: &AnalysisSessions,
 ) -> Result<Option<WorkspaceEdit>, String> {
+    rename_for_document_cancellable(uri, docs, position, new_name, options, sessions, &|| false)
+}
+
+pub fn rename_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    position: Position,
+    new_name: &str,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<WorkspaceEdit>, String> {
     validate_identifier(new_name)?;
     let document = docs
         .get(uri)
         .ok_or_else(|| "document is not open".to_string())?;
-    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Check)?;
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Check,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
     Ok(rename_from_analysis(
         uri, docs, document, &analysis, position, new_name,
     ))
@@ -208,6 +437,27 @@ pub fn definition_for_source(
     };
     let analysis = standalone_analysis(source, options);
     definition_from_analysis(&uri, &document, &analysis, position)
+}
+
+#[cfg(feature = "test")]
+#[must_use]
+/// Finds a type definition in standalone source.
+///
+/// # Panics
+///
+/// Panics if the fixed test document URL cannot be parsed.
+pub fn type_definition_for_source(
+    source: &str,
+    position: Position,
+    options: CompileOptions,
+) -> Option<GotoDefinitionResponse> {
+    let uri = lsp_types::Url::parse("file:///riddle-navigation.rid").unwrap();
+    let document = Document {
+        text: source.into(),
+        version: Some(1),
+    };
+    let analysis = standalone_analysis(source, options);
+    type_definition_from_analysis(&uri, &document, &analysis, position)
 }
 
 #[cfg(feature = "test")]
@@ -298,6 +548,32 @@ pub fn rename_for_source(
 }
 
 #[cfg(feature = "test")]
+#[must_use]
+pub fn signature_help_for_source(source: &str, position: Position) -> Option<SignatureHelp> {
+    let analysis = standalone_analysis(source, CompileOptions { use_std: false });
+    signature_help_from_analysis(source, &analysis, position)
+}
+
+#[cfg(feature = "test")]
+#[must_use]
+pub fn document_highlights_for_source(
+    source: &str,
+    position: Position,
+) -> Option<Vec<DocumentHighlight>> {
+    let locations =
+        references_for_source(source, position, true, CompileOptions { use_std: false })?;
+    Some(
+        locations
+            .into_iter()
+            .map(|location| DocumentHighlight {
+                range: location.range,
+                kind: Some(DocumentHighlightKind::TEXT),
+            })
+            .collect(),
+    )
+}
+
+#[cfg(feature = "test")]
 fn standalone_analysis(source: &str, options: CompileOptions) -> DocumentAnalysis {
     DocumentAnalysis {
         result: riddlec::pipeline::check_with_options(source, options),
@@ -306,7 +582,148 @@ fn standalone_analysis(source: &str, options: CompileOptions) -> DocumentAnalysi
         macro_occurrences: Vec::new(),
         macro_source_map: None,
         path: None,
+        project_root: None,
+        project_revision: 0,
+        files: Vec::new(),
     }
+}
+
+fn signature_help_from_analysis(
+    source: &str,
+    analysis: &DocumentAnalysis,
+    position: Position,
+) -> Option<SignatureHelp> {
+    let (callee, active_parameter) = call_context(source, position)?;
+    let callee_position = LineIndex::new(source).position(source, usize::from(callee.start()))?;
+    let symbol = symbol_at(source, analysis, callee_position)?;
+    let label = symbol.detail;
+    label.starts_with("fun ").then_some(())?;
+    let parameters = signature_parameters(&label);
+    let active_parameter =
+        active_parameter + u32::from(parameters.first().is_some_and(is_receiver_parameter));
+    let active_parameter = u32::try_from(parameters.len())
+        .ok()
+        .is_some_and(|length| active_parameter < length)
+        .then_some(active_parameter);
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation: None,
+            parameters: Some(parameters),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter,
+    })
+}
+
+pub fn call_parameter_names_at(
+    source: &str,
+    analysis: &DocumentAnalysis,
+    position: Position,
+) -> Option<Vec<String>> {
+    let symbol = symbol_at(source, analysis, position)?;
+    Some(
+        signature_parameters(&symbol.detail)
+            .into_iter()
+            .filter(|parameter| !is_receiver_parameter(parameter))
+            .filter_map(|parameter| match parameter.label {
+                ParameterLabel::Simple(label) => label
+                    .split_once(':')
+                    .map(|(name, _)| name.trim().to_string()),
+                ParameterLabel::LabelOffsets(_) => None,
+            })
+            .collect(),
+    )
+}
+
+fn call_context(source: &str, position: Position) -> Option<(TextRange, u32)> {
+    let offset = offset_for_position(source, position)?;
+    let tokens = frontend::lexer::lex(source)
+        .into_iter()
+        .filter(|token| {
+            token.kind != SyntaxKind::Whitespace && token.kind != SyntaxKind::LineComment
+        })
+        .collect::<Vec<_>>();
+    let mut opens = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.span.start >= offset {
+            break;
+        }
+        match token.kind {
+            SyntaxKind::LParen => opens.push(index),
+            SyntaxKind::RParen => {
+                opens.pop();
+            }
+            _ => {}
+        }
+    }
+    let open = *opens.last()?;
+    let callee = tokens.get(open.checked_sub(1)?)?;
+    (callee.kind == SyntaxKind::Ident).then_some(())?;
+    let mut nested = 0usize;
+    let mut active_parameter = 0u32;
+    for token in tokens.iter().skip(open + 1) {
+        if token.span.start >= offset {
+            break;
+        }
+        match token.kind {
+            SyntaxKind::LParen | SyntaxKind::LBracket | SyntaxKind::LBrace => nested += 1,
+            SyntaxKind::RParen | SyntaxKind::RBracket | SyntaxKind::RBrace => {
+                nested = nested.saturating_sub(1);
+            }
+            SyntaxKind::Comma if nested == 0 => active_parameter += 1,
+            _ => {}
+        }
+    }
+    Some((
+        text_range(callee.span.start, callee.span.end),
+        active_parameter,
+    ))
+}
+
+fn signature_parameters(label: &str) -> Vec<ParameterInformation> {
+    let Some(start) = label.find('(') else {
+        return Vec::new();
+    };
+    let mut parameters = Vec::new();
+    let content_start = start + 1;
+    let mut parameter_start = content_start;
+    let mut depth = 0usize;
+    for (offset, character) in label[content_start..].char_indices() {
+        let index = content_start + offset;
+        match character {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' if depth == 0 => {
+                push_signature_parameter(&mut parameters, &label[parameter_start..index]);
+                break;
+            }
+            ')' | ']' | '}' | '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                push_signature_parameter(&mut parameters, &label[parameter_start..index]);
+                parameter_start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parameters
+}
+
+fn push_signature_parameter(parameters: &mut Vec<ParameterInformation>, parameter: &str) {
+    let parameter = parameter.trim();
+    if !parameter.is_empty() {
+        parameters.push(ParameterInformation {
+            label: ParameterLabel::Simple(parameter.into()),
+            documentation: None,
+        });
+    }
+}
+
+fn is_receiver_parameter(parameter: &ParameterInformation) -> bool {
+    let ParameterLabel::Simple(label) = &parameter.label else {
+        return false;
+    };
+    matches!(label.trim(), "self" | "&self" | "&mut self" | "mut self")
 }
 
 fn hover_from_analysis(
@@ -366,12 +783,197 @@ fn definition_from_analysis(
     position: Position,
 ) -> Option<GotoDefinitionResponse> {
     if let Some(occurrence) = macro_at(&document.text, analysis, position) {
-        let location = macro_definition_location(analysis, occurrence)?;
+        let location = macro_definition_location(uri, analysis, occurrence)?;
         return Some(GotoDefinitionResponse::Scalar(location));
     }
     let symbol = symbol_at(&document.text, analysis, position)?;
     let location = location_for_range(uri, analysis, symbol.definition?)?;
     Some(GotoDefinitionResponse::Scalar(location))
+}
+
+fn type_definition_from_analysis(
+    uri: &lsp_types::Url,
+    document: &Document,
+    analysis: &DocumentAnalysis,
+    position: Position,
+) -> Option<GotoDefinitionResponse> {
+    let offset = offset_for_position(&document.text, position)?;
+    let origin = identifier_range_at(&document.text, offset)?;
+    let hir = analysis.result.hir.as_ref()?;
+    let definition = explicit_type_definition(hir, analysis, origin)
+        .or_else(|| declared_type_definition(hir, analysis, origin))
+        .or_else(|| {
+            inferred_type_definition(hir, &analysis.result.type_result, analysis, origin)
+        })?;
+    Some(GotoDefinitionResponse::Scalar(location_for_range(
+        uri, analysis, definition,
+    )?))
+}
+
+fn explicit_type_definition(
+    hir: &HirFile,
+    analysis: &DocumentAnalysis,
+    origin: TextRange,
+) -> Option<TextRange> {
+    let graph = analysis.result.scope_graph.as_ref()?;
+    graph
+        .nodes
+        .iter()
+        .filter_map(|(reference, node)| {
+            let Node::Reference {
+                origin: RefOrigin::Type { range },
+                ..
+            } = node
+            else {
+                return None;
+            };
+            let local = analysis.local_range(*range)?;
+            range_contains(local, origin).then_some((local.len(), reference))
+        })
+        .min_by_key(|(length, _)| *length)
+        .and_then(|(_, reference)| {
+            resolve_reference(graph, reference)
+                .into_iter()
+                .find_map(|definition| definition_name_range(hir, &definition))
+        })
+}
+
+fn declared_type_definition(
+    hir: &HirFile,
+    analysis: &DocumentAnalysis,
+    origin: TextRange,
+) -> Option<TextRange> {
+    for (_, function) in hir.item_tree.functions.iter() {
+        for parameter in &function.params {
+            if analysis
+                .local_range(parameter.name_range)
+                .is_some_and(|range| range_contains(range, origin))
+            {
+                return hir_type_definition(hir, &parameter.ty);
+            }
+        }
+    }
+    for (_, strukt) in hir.item_tree.structs.iter() {
+        for field in &strukt.fields {
+            if analysis
+                .local_range(field.name_range)
+                .is_some_and(|range| range_contains(range, origin))
+            {
+                return hir_type_definition(hir, &field.ty);
+            }
+        }
+    }
+    for (body_id, body) in hir.bodies.iter() {
+        for (_, statement) in body.stmts.iter() {
+            let Stmt::Let { pat, ty, .. } = statement else {
+                continue;
+            };
+            let Some(range) = body
+                .source_map
+                .pat_ranges
+                .get(pat)
+                .and_then(|range| analysis.local_range(*range))
+            else {
+                continue;
+            };
+            if range_contains(range, origin) {
+                return hir_type_definition(hir, ty).or_else(|| {
+                    types_for_pattern(&analysis.result.type_result, body_id, *pat)
+                        .and_then(|ty| nominal_type_definition(hir, ty))
+                });
+            }
+        }
+    }
+    None
+}
+
+fn inferred_type_definition(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    analysis: &DocumentAnalysis,
+    origin: TextRange,
+) -> Option<TextRange> {
+    let expression = types
+        .expr_types
+        .iter()
+        .filter_map(|((body, expression), ty)| {
+            let range = hir.bodies[*body].source_map.expr_ranges.get(expression)?;
+            let local = analysis.local_range(*range)?;
+            range_contains(local, origin).then_some((local.len(), ty))
+        })
+        .min_by_key(|(length, _)| *length)
+        .and_then(|(_, ty)| nominal_type_definition(hir, ty));
+    if expression.is_some() {
+        return expression;
+    }
+    types
+        .pattern_binding_types
+        .iter()
+        .find_map(|((body, binding), ty)| {
+            let range = pattern_binding_name_range(hir, *body, *binding, &analysis.source)?;
+            let local = analysis.local_range(range)?;
+            range_contains(local, origin)
+                .then(|| nominal_type_definition(hir, ty))
+                .flatten()
+        })
+}
+
+fn types_for_pattern(
+    types: &TypeCheckResult,
+    body: BodyId,
+    pattern: hir::body::PatId,
+) -> Option<&Type> {
+    types
+        .pattern_binding_types
+        .iter()
+        .find_map(|((candidate_body, binding), ty)| {
+            (*candidate_body == body && binding.pattern == pattern).then_some(ty)
+        })
+}
+
+fn nominal_type_definition(hir: &HirFile, ty: &Type) -> Option<TextRange> {
+    match ty {
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } => nominal_type_definition(hir, inner),
+        Type::Struct(id, _) => Some(hir.item_tree.structs[*id].name_range),
+        Type::Enum(id, _) => Some(hir.item_tree.enums[*id].name_range),
+        _ => None,
+    }
+}
+
+fn hir_type_definition(hir: &HirFile, ty: &HirTypeRef) -> Option<TextRange> {
+    match ty {
+        HirTypeRef::Named(path) => match hir.type_resolutions.get(&path.range) {
+            Some(ResolvedName::Struct(id)) => Some(hir.item_tree.structs[*id].name_range),
+            Some(ResolvedName::Enum(id)) => Some(hir.item_tree.enums[*id].name_range),
+            Some(ResolvedName::Trait(id)) => Some(hir.item_tree.traits[*id].name_range),
+            Some(ResolvedName::TypeAlias(id)) => Some(hir.item_tree.type_aliases[*id].name_range),
+            _ => None,
+        },
+        HirTypeRef::Ref(inner, _)
+        | HirTypeRef::Ptr { inner, .. }
+        | HirTypeRef::Slice(inner)
+        | HirTypeRef::Array(inner, _) => hir_type_definition(hir, inner),
+        HirTypeRef::ImplTrait { trait_ty, .. } => hir_type_definition(hir, trait_ty),
+        HirTypeRef::Never
+        | HirTypeRef::Tuple(_)
+        | HirTypeRef::Const(_)
+        | HirTypeRef::Unknown
+        | HirTypeRef::Error => None,
+    }
+}
+
+fn definition_name_range(hir: &HirFile, definition: &DefRef) -> Option<TextRange> {
+    match definition {
+        DefRef::Struct(id) => Some(hir.item_tree.structs[*id].name_range),
+        DefRef::Enum(id) => Some(hir.item_tree.enums[*id].name_range),
+        DefRef::Trait(id) => Some(hir.item_tree.traits[*id].name_range),
+        DefRef::TypeAlias(id) => Some(hir.item_tree.type_aliases[*id].name_range),
+        _ => None,
+    }
+}
+
+fn range_contains(range: TextRange, inner: TextRange) -> bool {
+    range.start() <= inner.start() && inner.end() <= range.end()
 }
 
 fn implementation_from_analysis(
@@ -423,7 +1025,7 @@ fn references_from_analysis(
             .iter()
             .filter(|occurrence| same_macro_binding(target, occurrence))
             .filter(|occurrence| include_declaration || !occurrence.is_declaration)
-            .filter_map(|occurrence| macro_occurrence_location(analysis, occurrence))
+            .filter_map(|occurrence| macro_occurrence_location(uri, analysis, occurrence))
             .collect::<Vec<_>>();
         sort_and_dedup_locations(&mut locations);
         return Some(locations);
@@ -482,7 +1084,7 @@ fn rename_from_analysis<S: BuildHasher>(
             .iter()
             .filter(|occurrence| same_macro_binding(target, occurrence))
         {
-            let location = macro_occurrence_location(analysis, occurrence)?;
+            let location = macro_occurrence_location(uri, analysis, occurrence)?;
             documents
                 .entry(location.uri.as_str().into())
                 .or_insert_with(|| (location.uri.clone(), Vec::new()))
@@ -569,36 +1171,39 @@ fn same_macro_binding(left: &ProcMacroOccurrence, right: &ProcMacroOccurrence) -
 }
 
 fn macro_occurrence_location(
+    current_uri: &lsp_types::Url,
     analysis: &DocumentAnalysis,
     occurrence: &ProcMacroOccurrence,
 ) -> Option<Location> {
-    macro_source_location(analysis, &occurrence.range)
+    macro_source_location(current_uri, analysis, &occurrence.range)
 }
 
 fn macro_definition_location(
+    current_uri: &lsp_types::Url,
     analysis: &DocumentAnalysis,
     occurrence: &ProcMacroOccurrence,
 ) -> Option<Location> {
     if let Some(definition) = &occurrence.definition {
         return Some(Location::new(
-            lsp_types::Url::from_file_path(&definition.path).ok()?,
+            source_uri(current_uri, &definition.path)?,
             LineIndex::new(&definition.source).range(
                 &definition.source,
                 text_range(definition.range.start, definition.range.end),
             )?,
         ));
     }
-    macro_source_location(analysis, occurrence.binding.as_ref()?)
+    macro_source_location(current_uri, analysis, occurrence.binding.as_ref()?)
 }
 
 fn macro_source_location(
+    current_uri: &lsp_types::Url,
     analysis: &DocumentAnalysis,
     range: &std::ops::Range<usize>,
 ) -> Option<Location> {
     let source_map = analysis.macro_source_map.as_ref()?;
     let mapped = source_map.map_range(text_range(range.start, range.end))?;
     Some(Location::new(
-        lsp_types::Url::from_file_path(mapped.path).ok()?,
+        source_uri(current_uri, mapped.path)?,
         LineIndex::new(mapped.source).range(mapped.source, mapped.range)?,
     ))
 }
@@ -634,6 +1239,15 @@ fn document_version<S: BuildHasher>(
     })
 }
 
+fn same_document_uri(left: &lsp_types::Url, right: &lsp_types::Url) -> bool {
+    left == right
+        || left
+            .to_file_path()
+            .ok()
+            .zip(right.to_file_path().ok())
+            .is_some_and(|(left, right)| normalized_path(left) == normalized_path(right))
+}
+
 pub fn validate_identifier(name: &str) -> Result<(), String> {
     let tokens = frontend::lexer::lex(name);
     if matches!(tokens.as_slice(), [token] if token.kind == SyntaxKind::Ident && token.span == (0..name.len()))
@@ -659,7 +1273,7 @@ fn location_for_range(
     if let Some(source_map) = &analysis.source_map {
         let mapped = source_map.map_range(range)?;
         return Some(Location::new(
-            lsp_types::Url::from_file_path(mapped.path).ok()?,
+            source_uri(current_uri, mapped.path)?,
             LineIndex::new(mapped.source).range(mapped.source, mapped.range)?,
         ));
     }
@@ -667,6 +1281,14 @@ fn location_for_range(
         current_uri.clone(),
         LineIndex::new(&analysis.source).range(&analysis.source, range)?,
     ))
+}
+
+pub fn source_uri(current_uri: &lsp_types::Url, path: &Path) -> Option<lsp_types::Url> {
+    if path.as_os_str().is_empty() {
+        Some(current_uri.clone())
+    } else {
+        lsp_types::Url::from_file_path(path).ok()
+    }
 }
 
 #[derive(Clone)]

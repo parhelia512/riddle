@@ -265,17 +265,13 @@ impl LowerCtx<'_> {
         // so match the concrete Self against all impls, like the type-checker's
         // `lower_self_associated_type` does.
         let self_ty = self.generic_subst.get("Self")?;
-        let self_tc_ty = self.substitute_tc_type(&self.lower_hir_type_for_pattern(
-            &imp.self_ty,
-            &self.generic_tc_subst,
-        ));
+        let self_tc_ty = self.substitute_tc_type(
+            &self.lower_hir_type_for_pattern(&imp.self_ty, &self.generic_tc_subst),
+        );
         self.hir.item_tree.impls.iter().find_map(|(_, candidate)| {
-            let alias_id = candidate
-                .type_aliases
-                .iter()
-                .find(|alias_id| {
-                    self.hir.item_tree.type_aliases[**alias_id].name.0 == alias_name
-                })?;
+            let alias_id = candidate.type_aliases.iter().find(|alias_id| {
+                self.hir.item_tree.type_aliases[**alias_id].name.0 == alias_name
+            })?;
             if !self.impl_type_matches(candidate, &self_tc_ty) {
                 return None;
             }

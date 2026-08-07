@@ -26,6 +26,9 @@ pub struct DocumentAnalysis {
     pub(crate) macro_occurrences: Vec<riddlec::proc_macro::ProcMacroOccurrence>,
     pub(crate) macro_source_map: Option<riddlec::pipeline::SourceMap>,
     pub(crate) path: Option<PathBuf>,
+    pub(crate) project_root: Option<PathBuf>,
+    pub(crate) project_revision: u64,
+    pub(crate) files: Vec<PathBuf>,
 }
 
 impl DocumentAnalysis {
@@ -50,6 +53,7 @@ impl DocumentAnalysis {
     }
 }
 
+#[cfg(feature = "test")]
 pub fn analyze_standalone_source(
     source: &str,
     options: CompileOptions,
@@ -57,6 +61,21 @@ pub fn analyze_standalone_source(
     depth: AnalysisDepth,
     path: Option<PathBuf>,
 ) -> DocumentAnalysis {
+    analyze_standalone_source_cancellable(source, options, session, depth, path, &|| false)
+        .expect("non-cancellable analysis cannot be cancelled")
+}
+
+pub fn analyze_standalone_source_cancellable(
+    source: &str,
+    options: CompileOptions,
+    session: &mut CheckSession,
+    depth: AnalysisDepth,
+    path: Option<PathBuf>,
+    cancelled: &impl Fn() -> bool,
+) -> Option<DocumentAnalysis> {
+    if cancelled() {
+        return None;
+    }
     let mut loaded =
         LoadedSource::single_file(path.as_deref().unwrap_or_else(|| Path::new("")), source);
     let macro_source_map = loaded.source_map.clone();
@@ -69,6 +88,9 @@ pub fn analyze_standalone_source(
         ..
     } = riddlec::proc_macro::expand_standard_macros(source);
     loaded.apply_expansion(source, &mappings);
+    if cancelled() {
+        return None;
+    }
     let package_range = 0..loaded.source.len();
     let package_ranges = std::slice::from_ref(&package_range);
     let mut result = match (depth, parse.as_ref()) {
@@ -78,46 +100,57 @@ pub fn analyze_standalone_source(
                 parse,
                 package_ranges,
                 options,
-                || false,
-            )
-            .expect("non-cancellable pipeline cannot be cancelled"),
-        (AnalysisDepth::Resolve, None) => {
-            session.resolve_package_with_options(&loaded.source, package_ranges, options)
-        }
+                cancelled,
+            )?,
+        (AnalysisDepth::Resolve, None) => session.resolve_package_with_options_cancellable(
+            &loaded.source,
+            package_ranges,
+            options,
+            cancelled,
+        )?,
         (AnalysisDepth::Check, Some(parse)) => session
             .check_parsed_package_with_options_cancellable(
                 &loaded.source,
                 parse,
                 package_ranges,
                 options,
-                || false,
-            )
-            .expect("non-cancellable pipeline cannot be cancelled"),
-        (AnalysisDepth::Check, None) => {
-            session.check_package_with_options(&loaded.source, package_ranges, options)
-        }
+                cancelled,
+            )?,
+        (AnalysisDepth::Check, None) => session.check_package_with_options_cancellable(
+            &loaded.source,
+            package_ranges,
+            options,
+            cancelled,
+        )?,
     };
     result.macro_diagnostics = diagnostics;
-    DocumentAnalysis {
+    Some(DocumentAnalysis {
         result,
         source: loaded.source,
         source_map: Some(loaded.source_map),
         macro_occurrences,
         macro_source_map: Some(macro_source_map),
         path,
-    }
+        project_root: None,
+        project_revision: 0,
+        files: Vec::new(),
+    })
 }
 
-pub fn analyze_document<S: BuildHasher>(
+pub fn analyze_document_cancellable<S: BuildHasher>(
     uri: &lsp_types::Url,
     docs: &HashMap<lsp_types::Url, Document, S>,
     options: CompileOptions,
     sessions: &AnalysisSessions,
     depth: AnalysisDepth,
-) -> std::result::Result<DocumentAnalysis, String> {
+    cancelled: &impl Fn() -> bool,
+) -> std::result::Result<Option<DocumentAnalysis>, String> {
     let document = docs
         .get(uri)
         .ok_or_else(|| "document is not open".to_string())?;
+    if cancelled() {
+        return Ok(None);
+    }
     if let Ok(path) = uri.to_file_path()
         && let Some(root) = clue::find_project_root(&path)
     {
@@ -134,22 +167,39 @@ pub fn analyze_document<S: BuildHasher>(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let analysis = match depth {
-            AnalysisDepth::Resolve => {
-                clue::resolve_project_with_session(&root, &overlays, options, &mut session)
-            }
-            AnalysisDepth::Check => {
-                clue::check_project_with_session(&root, &overlays, options, &mut session)
-            }
+            AnalysisDepth::Resolve => clue::resolve_project_with_session_cancellable(
+                &root,
+                &overlays,
+                options,
+                &mut session,
+                cancelled,
+            ),
+            AnalysisDepth::Check => clue::check_project_with_session_cancellable(
+                &root,
+                &overlays,
+                options,
+                &mut session,
+                cancelled,
+            ),
         }
         .map_err(|error| error.to_string())?;
-        return Ok(DocumentAnalysis {
+        let Some(analysis) = analysis else {
+            return Ok(None);
+        };
+        let project_revision = session.revision();
+        drop(session);
+        let files = analysis.source.files.clone();
+        return Ok(Some(DocumentAnalysis {
             result: analysis.result,
             source: analysis.source.source,
             source_map: Some(analysis.source.source_map),
             macro_occurrences: analysis.macro_occurrences,
             macro_source_map: Some(analysis.macro_source_map),
             path: Some(normalized_path(path)),
-        });
+            project_root: Some(root),
+            project_revision,
+            files,
+        }));
     }
 
     let session = sessions.standalone(uri);
@@ -157,11 +207,19 @@ pub fn analyze_document<S: BuildHasher>(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = uri.to_file_path().ok().map(normalized_path);
-    Ok(analyze_standalone_source(
+    let mut analysis = analyze_standalone_source_cancellable(
         &document.text,
         options,
         &mut session,
         depth,
         path,
-    ))
+        cancelled,
+    );
+    drop(session);
+    if let Some(analysis) = &mut analysis
+        && let Some(path) = &analysis.path
+    {
+        analysis.files.push(path.clone());
+    }
+    Ok(analysis)
 }

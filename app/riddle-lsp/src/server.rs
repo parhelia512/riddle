@@ -8,20 +8,33 @@ use std::{
     time::Duration,
 };
 
-use lsp_types::request::{GotoImplementationParams, GotoImplementationResponse};
+use lsp_types::request::{
+    GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
+    GotoImplementationResponse, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
+};
 use lsp_types::{
-    CodeActionKind, CodeActionParams, CodeActionResponse, CompletionOptions, CompletionParams,
-    CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHint, InlayHintParams, MessageType, OneOf, PositionEncodingKind, PrepareRenameResponse,
-    ReferenceParams, Registration, RenameOptions, RenameParams, SemanticTokens,
-    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensFullOptions,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, WorkspaceEdit,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    CallHierarchyServerCapability, CodeActionKind, CodeActionParams, CodeActionResponse,
+    CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
+    FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf, PositionEncodingKind,
+    PrepareRenameResponse, ReferenceParams, Registration, RenameOptions, RenameParams,
+    SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
+    SignatureHelpOptions, SignatureHelpParams, SymbolInformation, TextDocumentPositionParams,
+    TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
+    TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
+    TypeHierarchyRegistrationOptions, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams,
+    WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    WorkspaceSymbolParams,
 };
 use riddlec::pipeline::CompileOptions;
 use tower_lsp::jsonrpc::Result;
@@ -31,15 +44,31 @@ use crate::{
     code_actions::quick_fixes,
     completion::{completion_items_for_document, completion_trigger_characters},
     diagnostics::{self, DiagnosticSessions, collect_workspace_diagnostics_cancellable},
-    inlay_hints::inlay_hints_for_document,
-    navigation::{
-        definition_for_document, hover_for_document, implementation_for_document,
-        prepare_rename_for_document, references_for_document, rename_for_document,
-        validate_identifier,
+    editor_features::{
+        document_symbols_for_document_cancellable, folding_ranges, format_source,
+        workspace_symbols_for_document_cancellable,
     },
-    semantic_tokens::{semantic_token_delta, semantic_tokens_for_document, semantic_tokens_legend},
+    hierarchy::{
+        incoming_calls as hierarchy_incoming_calls, outgoing_calls as hierarchy_outgoing_calls,
+        prepare_call_hierarchy as hierarchy_prepare_call,
+        prepare_type_hierarchy as hierarchy_prepare_type, subtypes as hierarchy_subtypes,
+        supertypes as hierarchy_supertypes,
+    },
+    index::project_index_for_root_cancellable,
+    inlay_hints::inlay_hints_for_document_cancellable,
+    navigation::{
+        definition_for_document_cancellable, document_highlights_for_document_cancellable,
+        hover_for_document_cancellable, implementation_for_document_cancellable,
+        prepare_rename_for_document_cancellable, references_for_document_cancellable,
+        rename_for_document_cancellable, signature_help_for_document_cancellable,
+        type_definition_for_document_cancellable, validate_identifier,
+    },
+    semantic_tokens::{
+        semantic_token_delta, semantic_tokens_for_document_cancellable, semantic_tokens_legend,
+    },
     session::AnalysisSessions,
-    text::apply_content_changes,
+    text::{LineIndex, apply_content_changes},
+    workspace::WorkspaceState,
 };
 
 pub struct Backend {
@@ -56,11 +85,14 @@ pub struct Backend {
     /// Sessions used for the fallback analysis (the original, unmodified source).
     completion_fallback_sessions: Arc<AnalysisSessions>,
     analysis_sessions: Arc<AnalysisSessions>,
+    index_sessions: Arc<AnalysisSessions>,
     analysis_revisions: Arc<RequestRevisions>,
     completion_revisions: Arc<RequestRevisions>,
     semantic_tokens: Arc<Mutex<HashMap<lsp_types::Url, CachedSemanticTokens>>>,
     semantic_token_revision: Arc<AtomicU64>,
     supports_watched_files: AtomicBool,
+    supports_type_hierarchy: AtomicBool,
+    workspace: Arc<WorkspaceState>,
     compile_options: CompileOptions,
     completion_delay: Duration,
 }
@@ -126,6 +158,58 @@ impl RequestRevisions {
     }
 }
 
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        position_encoding: Some(PositionEncodingKind::UTF16),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::INCREMENTAL,
+        )),
+        code_action_provider: Some(true.into()),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        declaration_provider: Some(DeclarationCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+        call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+        })),
+        completion_provider: Some(CompletionOptions {
+            resolve_provider: Some(false),
+            trigger_characters: Some(completion_trigger_characters()),
+            ..CompletionOptions::default()
+        }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".into(), ",".into()]),
+            retrigger_characters: Some(vec![",".into()]),
+            ..SignatureHelpOptions::default()
+        }),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(
+            SemanticTokensOptions {
+                legend: semantic_tokens_legend(),
+                full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
+                ..SemanticTokensOptions::default()
+            },
+        )),
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
+            ..WorkspaceServerCapabilities::default()
+        }),
+        ..ServerCapabilities::default()
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -139,36 +223,40 @@ impl LanguageServer for Backend {
                 .unwrap_or(false),
             Ordering::SeqCst,
         );
+        self.supports_type_hierarchy.store(
+            params
+                .capabilities
+                .text_document
+                .as_ref()
+                .and_then(|capabilities| capabilities.type_hierarchy.as_ref())
+                .and_then(|capabilities| capabilities.dynamic_registration)
+                .unwrap_or(false),
+            Ordering::SeqCst,
+        );
+        let workspace_roots = params
+            .workspace_folders
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|folder| folder.uri.to_file_path().ok())
+            .chain(
+                params
+                    .workspace_folders
+                    .is_none()
+                    .then_some(params.root_uri.as_ref())
+                    .flatten()
+                    .and_then(|uri| uri.to_file_path().ok()),
+            );
+        if let Err(error) = self.workspace.set_roots(workspace_roots) {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("failed to discover workspace projects: {error}"),
+                )
+                .await;
+        }
         Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                position_encoding: Some(PositionEncodingKind::UTF16),
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
-                )),
-                code_action_provider: Some(true.into()),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(true)),
-                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
-                references_provider: Some(OneOf::Left(true)),
-                rename_provider: Some(OneOf::Right(RenameOptions {
-                    prepare_provider: Some(true),
-                    work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
-                })),
-                completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(false),
-                    trigger_characters: Some(completion_trigger_characters()),
-                    ..CompletionOptions::default()
-                }),
-                inlay_hint_provider: Some(OneOf::Left(true)),
-                semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(
-                    SemanticTokensOptions {
-                        legend: semantic_tokens_legend(),
-                        full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
-                        ..SemanticTokensOptions::default()
-                    },
-                )),
-                ..ServerCapabilities::default()
-            },
+            capabilities: server_capabilities(),
             server_info: Some(ServerInfo {
                 name: "riddle-lsp".into(),
                 version: Some(format!(
@@ -208,9 +296,34 @@ impl LanguageServer for Backend {
                     .await;
             }
         }
+        if self.supports_type_hierarchy.load(Ordering::SeqCst) {
+            let options = TypeHierarchyRegistrationOptions {
+                text_document_registration_options: TextDocumentRegistrationOptions {
+                    document_selector: None,
+                },
+                ..TypeHierarchyRegistrationOptions::default()
+            };
+            let registration = Registration {
+                id: "riddle-type-hierarchy".into(),
+                method: "textDocument/prepareTypeHierarchy".into(),
+                register_options: Some(
+                    serde_json::to_value(options)
+                        .expect("type hierarchy registration options must serialize"),
+                ),
+            };
+            if let Err(error) = self.client.register_capability(vec![registration]).await {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("failed to register type hierarchy: {error}"),
+                    )
+                    .await;
+            }
+        }
         self.client
             .log_message(MessageType::INFO, "riddle-lsp initialized")
             .await;
+        self.schedule_workspace_indexing();
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -228,6 +341,7 @@ impl LanguageServer for Backend {
         bump_related_revisions(&self.analysis_revisions, &docs, &uri);
         drop(docs);
         self.schedule_diagnostics();
+        self.schedule_workspace_indexing();
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -243,6 +357,7 @@ impl LanguageServer for Backend {
         bump_related_revisions(&self.analysis_revisions, &docs, &uri);
         drop(docs);
         self.schedule_diagnostics();
+        self.schedule_workspace_indexing();
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -266,6 +381,151 @@ impl LanguageServer for Backend {
         self.completion_fallback_sessions.retain_open(&open_docs);
         self.analysis_sessions.retain_open(&open_docs);
         self.schedule_diagnostics();
+        self.schedule_workspace_indexing();
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let Some(document) = self
+            .docs
+            .lock()
+            .unwrap()
+            .get(&params.text_document.uri)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let formatted = format_source(
+            &document.text,
+            params.options.tab_size,
+            params.options.insert_spaces,
+        );
+        if formatted == document.text {
+            return Ok(Some(Vec::new()));
+        }
+        let end = LineIndex::new(&document.text)
+            .position(&document.text, document.text.len())
+            .unwrap_or_default();
+        Ok(Some(vec![TextEdit::new(
+            lsp_types::Range::new(lsp_types::Position::new(0, 0), end),
+            formatted,
+        )]))
+    }
+
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        let Some(document) = self
+            .docs
+            .lock()
+            .unwrap()
+            .get(&params.text_document.uri)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(folding_ranges(&document.text)))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
+        let result = tokio::task::spawn_blocking(move || {
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            document_symbols_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                options,
+                &sessions,
+                &cancelled,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let symbols = match result {
+            Ok(Some(symbols)) => symbols,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("document symbols failed: {error}"),
+                    )
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    #[allow(deprecated)]
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let docs = self.docs.lock().unwrap().clone();
+        let uris = docs.keys().cloned().collect::<Vec<_>>();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
+        let query = params.query;
+        let result = tokio::task::spawn_blocking(move || {
+            let mut symbols = Vec::new();
+            for uri in uris {
+                let revision = revisions.current(&uri);
+                let cancelled = || !revisions.is_current(&uri, revision);
+                if let Some(found) = workspace_symbols_for_document_cancellable(
+                    &uri, &docs, &query, options, &sessions, &cancelled,
+                )? {
+                    symbols.extend(found);
+                }
+            }
+            symbols.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| left.location.uri.as_str().cmp(right.location.uri.as_str()))
+                    .then_with(|| {
+                        left.location
+                            .range
+                            .start
+                            .line
+                            .cmp(&right.location.range.start.line)
+                    })
+                    .then_with(|| {
+                        left.location
+                            .range
+                            .start
+                            .character
+                            .cmp(&right.location.range.start.character)
+                    })
+            });
+            symbols
+                .dedup_by(|left, right| left.name == right.name && left.location == right.location);
+            Ok::<_, String>(symbols)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        match result {
+            Ok(symbols) => Ok(Some(symbols)),
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("workspace symbols failed: {error}"),
+                    )
+                    .await;
+                Err(tower_lsp::jsonrpc::Error::internal_error())
+            }
+        }
     }
 
     async fn semantic_tokens_full(
@@ -294,14 +554,23 @@ impl LanguageServer for Backend {
 
         let compile_options = self.compile_options;
         let analysis_sessions = Arc::clone(&self.analysis_sessions);
+        let analysis_revisions = Arc::clone(&self.analysis_revisions);
         let analysis_uri = uri.clone();
         let analyzed = tokio::task::spawn_blocking(move || {
-            semantic_tokens_for_document(&analysis_uri, &docs, compile_options, &analysis_sessions)
+            let cancelled = || !analysis_revisions.is_current(&analysis_uri, analysis_revision);
+            semantic_tokens_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                compile_options,
+                &analysis_sessions,
+                &cancelled,
+            )
         })
         .await
         .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
         let mut tokens = match analyzed {
-            Ok(tokens) => tokens,
+            Ok(Some(tokens)) => tokens,
+            Ok(None) => return Ok(None),
             Err(error) => {
                 self.client
                     .log_message(
@@ -370,20 +639,24 @@ impl LanguageServer for Backend {
         };
         let compile_options = self.compile_options;
         let analysis_sessions = Arc::clone(&self.analysis_sessions);
+        let analysis_revisions = Arc::clone(&self.analysis_revisions);
         let analysis_uri = uri.clone();
         let analyzed = tokio::task::spawn_blocking(move || {
-            inlay_hints_for_document(
+            let cancelled = || !analysis_revisions.is_current(&analysis_uri, analysis_revision);
+            inlay_hints_for_document_cancellable(
                 &analysis_uri,
                 &docs,
                 params.range,
                 compile_options,
                 &analysis_sessions,
+                &cancelled,
             )
         })
         .await
         .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
         let hints = match analyzed {
-            Ok(hints) => hints,
+            Ok(Some(hints)) => hints,
+            Ok(None) => return Ok(None),
             Err(error) => {
                 self.client
                     .log_message(MessageType::ERROR, format!("inlay hints failed: {error}"))
@@ -462,8 +735,17 @@ impl LanguageServer for Backend {
         let analysis_uri = uri.clone();
         let options = self.compile_options;
         let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
         let result = tokio::task::spawn_blocking(move || {
-            hover_for_document(&analysis_uri, &docs, position, options, &sessions)
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            hover_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &cancelled,
+            )
         })
         .await
         .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
@@ -482,6 +764,98 @@ impl LanguageServer for Backend {
         Ok(hover)
     }
 
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
+        let result = tokio::task::spawn_blocking(move || {
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            signature_help_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &cancelled,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let help = match result {
+            Ok(help) => help,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("signature help failed: {error}"),
+                    )
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(help)
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
+        let result = tokio::task::spawn_blocking(move || {
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            document_highlights_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &cancelled,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let highlights = match result {
+            Ok(highlights) => highlights,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("document highlight failed: {error}"),
+                    )
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(highlights)
+    }
+
+    async fn goto_declaration(
+        &self,
+        params: GotoDeclarationParams,
+    ) -> Result<Option<GotoDeclarationResponse>> {
+        self.goto_definition(params).await
+    }
+
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
@@ -494,8 +868,17 @@ impl LanguageServer for Backend {
         let analysis_uri = uri.clone();
         let options = self.compile_options;
         let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
         let result = tokio::task::spawn_blocking(move || {
-            definition_for_document(&analysis_uri, &docs, position, options, &sessions)
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            definition_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &cancelled,
+            )
         })
         .await
         .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
@@ -514,6 +897,156 @@ impl LanguageServer for Backend {
         Ok(definition)
     }
 
+    async fn goto_type_definition(
+        &self,
+        params: GotoTypeDefinitionParams,
+    ) -> Result<Option<GotoTypeDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
+        let result = tokio::task::spawn_blocking(move || {
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            type_definition_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &cancelled,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let definition = match result {
+            Ok(definition) => definition,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("type definition failed: {error}"),
+                    )
+                    .await;
+                return Err(tower_lsp::jsonrpc::Error::internal_error());
+            }
+        };
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(definition)
+    }
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
+        let workspace = Arc::clone(&self.workspace);
+        let result = tokio::task::spawn_blocking(move || {
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            hierarchy_prepare_call(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &workspace,
+                &cancelled,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let items = result.map_err(|error| {
+            tower_lsp::jsonrpc::Error::invalid_params(format!(
+                "prepare call hierarchy failed: {error}"
+            ))
+        })?;
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(items)
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        hierarchy_incoming_calls(&params.item, &self.workspace)
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        hierarchy_outgoing_calls(&params.item, &self.workspace)
+    }
+
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
+        let workspace = Arc::clone(&self.workspace);
+        let result = tokio::task::spawn_blocking(move || {
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            hierarchy_prepare_type(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &workspace,
+                &cancelled,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        let items = result.map_err(|error| {
+            tower_lsp::jsonrpc::Error::invalid_params(format!(
+                "prepare type hierarchy failed: {error}"
+            ))
+        })?;
+        if !self.analysis_is_current(&uri, &text, revision) {
+            return Ok(None);
+        }
+        Ok(items)
+    }
+
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        hierarchy_supertypes(&params.item, &self.workspace)
+    }
+
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        hierarchy_subtypes(&params.item, &self.workspace)
+    }
+
     async fn goto_implementation(
         &self,
         params: GotoImplementationParams,
@@ -526,8 +1059,17 @@ impl LanguageServer for Backend {
         let analysis_uri = uri.clone();
         let options = self.compile_options;
         let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
         let result = tokio::task::spawn_blocking(move || {
-            implementation_for_document(&analysis_uri, &docs, position, options, &sessions)
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            implementation_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &cancelled,
+            )
         })
         .await
         .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
@@ -562,14 +1104,17 @@ impl LanguageServer for Backend {
         let analysis_uri = uri.clone();
         let options = self.compile_options;
         let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
         let result = tokio::task::spawn_blocking(move || {
-            references_for_document(
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            references_for_document_cancellable(
                 &analysis_uri,
                 &docs,
                 position,
                 include_declaration,
                 options,
                 &sessions,
+                &cancelled,
             )
         })
         .await
@@ -601,8 +1146,17 @@ impl LanguageServer for Backend {
         let analysis_uri = uri.clone();
         let options = self.compile_options;
         let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
         let result = tokio::task::spawn_blocking(move || {
-            prepare_rename_for_document(&analysis_uri, &docs, position, options, &sessions)
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            prepare_rename_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                position,
+                options,
+                &sessions,
+                &cancelled,
+            )
         })
         .await
         .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
@@ -637,14 +1191,17 @@ impl LanguageServer for Backend {
         let analysis_uri = uri.clone();
         let options = self.compile_options;
         let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
         let result = tokio::task::spawn_blocking(move || {
-            rename_for_document(
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            rename_for_document_cancellable(
                 &analysis_uri,
                 &docs,
                 position,
                 &new_name,
                 options,
                 &sessions,
+                &cancelled,
             )
         })
         .await
@@ -693,6 +1250,12 @@ impl LanguageServer for Backend {
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         let reset_all = params.changes.iter().any(|change| is_manifest(&change.uri));
+        let invalidated = params
+            .changes
+            .iter()
+            .filter_map(|change| change.uri.to_file_path().ok())
+            .flat_map(|path| self.workspace.invalidate_path(&path))
+            .collect::<std::collections::BTreeSet<_>>();
         {
             let docs = self.docs.lock().unwrap();
             for change in &params.changes {
@@ -704,6 +1267,15 @@ impl LanguageServer for Backend {
             self.completion_sessions.clear_projects();
             self.completion_fallback_sessions.clear_projects();
             self.analysis_sessions.clear_projects();
+            self.index_sessions.clear_projects();
+            if let Err(error) = self.workspace.set_roots(self.workspace.roots()) {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("failed to refresh workspace projects: {error}"),
+                    )
+                    .await;
+            }
         } else {
             for change in &params.changes {
                 self.diagnostic_sessions
@@ -715,8 +1287,35 @@ impl LanguageServer for Backend {
                     .invalidate_project(&change.uri);
                 self.analysis_sessions.invalidate_project(&change.uri);
             }
+            self.index_sessions.invalidate_roots(&invalidated);
         }
         self.schedule_diagnostics();
+        self.schedule_workspace_indexing();
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        self.workspace.remove_roots(
+            params
+                .event
+                .removed
+                .iter()
+                .filter_map(|folder| folder.uri.to_file_path().ok()),
+        );
+        if let Err(error) = self.workspace.add_roots(
+            params
+                .event
+                .added
+                .iter()
+                .filter_map(|folder| folder.uri.to_file_path().ok()),
+        ) {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("failed to discover workspace projects: {error}"),
+                )
+                .await;
+        }
+        self.schedule_workspace_indexing();
     }
 }
 
@@ -783,11 +1382,14 @@ impl Backend {
             completion_sessions: Arc::new(AnalysisSessions::default()),
             completion_fallback_sessions: Arc::new(AnalysisSessions::default()),
             analysis_sessions: Arc::new(AnalysisSessions::default()),
+            index_sessions: Arc::new(AnalysisSessions::default()),
             analysis_revisions: Arc::new(RequestRevisions::default()),
             completion_revisions: Arc::new(RequestRevisions::default()),
             semantic_tokens: Arc::new(Mutex::new(HashMap::new())),
             semantic_token_revision: Arc::new(AtomicU64::new(1)),
             supports_watched_files: AtomicBool::new(false),
+            supports_type_hierarchy: AtomicBool::new(false),
+            workspace: Arc::new(WorkspaceState::default()),
             compile_options,
             completion_delay,
         }
@@ -891,6 +1493,69 @@ impl Backend {
             )
             .await;
         });
+    }
+
+    fn schedule_workspace_indexing(&self) {
+        let projects = self.workspace.projects();
+        if projects.is_empty() {
+            return;
+        }
+        let overlays = Arc::new(
+            self.docs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(uri, document)| {
+                    uri.to_file_path()
+                        .ok()
+                        .map(|path| (path, document.text.clone()))
+                })
+                .collect::<HashMap<_, _>>(),
+        );
+        for project in projects {
+            let token = self.workspace.begin_rebuild(&project);
+            let workspace = Arc::clone(&self.workspace);
+            let sessions = Arc::clone(&self.index_sessions);
+            let overlays = Arc::clone(&overlays);
+            let client = self.client.clone();
+            let options = self.compile_options;
+            tokio::spawn(async move {
+                let workspace_for_build = Arc::clone(&workspace);
+                let token_for_build = token.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    project_index_for_root_cancellable(
+                        &project,
+                        overlays.as_ref(),
+                        options,
+                        sessions.as_ref(),
+                        &|| !workspace_for_build.is_current(&token_for_build),
+                    )
+                })
+                .await;
+                match result {
+                    Ok(Ok(Some(index))) => {
+                        workspace.install(token, index);
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        client
+                            .log_message(
+                                MessageType::WARNING,
+                                format!("failed to index workspace project: {error}"),
+                            )
+                            .await;
+                    }
+                    Err(error) => {
+                        client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!("workspace indexing task failed: {error}"),
+                            )
+                            .await;
+                    }
+                }
+            });
+        }
     }
 }
 

@@ -670,6 +670,7 @@ fn program_name(program: &OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::CToolchainConfig;
 
     fn shared_library_args(flavor: Flavor, triple: TargetTriple, clang: bool) -> Vec<String> {
         CCompiler {
@@ -680,7 +681,7 @@ mod tests {
             target: TargetConfig {
                 triple,
                 runtime_source: None,
-                c_toolchain: Default::default(),
+                c_toolchain: CToolchainConfig::default(),
             },
         }
         .command(&[Path::new("input.c")], Path::new("output"), &[], true, &[])

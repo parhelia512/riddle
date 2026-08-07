@@ -55,6 +55,13 @@ impl AnalysisSessions {
         self.projects.lock().unwrap().clear();
     }
 
+    pub(crate) fn invalidate_roots<'a>(&self, roots: impl IntoIterator<Item = &'a PathBuf>) {
+        let mut projects = self.projects.lock().unwrap();
+        for root in roots {
+            projects.remove(root);
+        }
+    }
+
     pub(crate) fn invalidate_project(&self, uri: &lsp_types::Url) {
         let Some(root) = uri
             .to_file_path()

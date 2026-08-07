@@ -1,5 +1,56 @@
 use super::*;
 
+fn write_workspace_project(root: &std::path::Path, name: &str) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        format!("[package]\nname = \"{name}\"\n"),
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() {}\n").unwrap();
+}
+
+#[test]
+fn workspace_discovers_nested_clue_projects_and_skips_generated_trees() {
+    let root = temp_root("workspace-discovery");
+    write_workspace_project(&root.join("app"), "app");
+    write_workspace_project(&root.join("libs/math"), "math");
+    for ignored in [".git", ".clue", "target", "node_modules", "dist"] {
+        write_workspace_project(&root.join(ignored).join("ignored"), "ignored");
+    }
+
+    let projects = discover_projects(&root).unwrap();
+
+    assert_eq!(
+        projects,
+        [
+            fs::canonicalize(root.join("app")).unwrap(),
+            fs::canonicalize(root.join("libs/math")).unwrap(),
+        ]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_roots_can_be_added_and_removed_without_dropping_overlap() {
+    let root = temp_root("workspace-roots");
+    let cleanup = root.clone();
+    let nested = root.join("nested");
+    write_workspace_project(&root.join("app"), "app");
+    write_workspace_project(&nested.join("library"), "library");
+    let workspace = WorkspaceState::default();
+
+    workspace.add_roots([root.clone(), nested.clone()]).unwrap();
+    assert_eq!(workspace.projects().len(), 2);
+
+    workspace.remove_roots([nested]);
+    assert_eq!(workspace.projects().len(), 2);
+
+    workspace.remove_roots([root]);
+    assert!(workspace.projects().is_empty());
+    let _ = fs::remove_dir_all(cleanup);
+}
+
 #[test]
 fn project_diagnostics_follow_peer_overlay_removal() {
     let root = temp_root("peer-overlay-removal");
@@ -116,6 +167,31 @@ fn workspace_analysis_can_be_cancelled_between_documents() {
 
     assert!(result.is_none());
     assert_eq!(polls.get(), 2);
+}
+
+#[test]
+fn document_analysis_can_be_cancelled_before_work_starts() {
+    let uri = lsp_types::Url::parse("untitled:cancelled.rid").unwrap();
+    let source = "fun value() -> i32 { 1 }";
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: source.into(),
+            version: Some(1),
+        },
+    )]);
+
+    let hover = hover_for_document_cancellable(
+        &uri,
+        &docs,
+        Position::new(0, 5),
+        CompileOptions { use_std: false },
+        &AnalysisSessions::default(),
+        &|| true,
+    )
+    .unwrap();
+
+    assert!(hover.is_none());
 }
 
 #[test]

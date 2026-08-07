@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::SystemTime;
 
+pub use manifest::CLUE_PROJECT_FILE_NAME;
 pub use project::{ProjectKind, init, new};
 pub use riddlec::target::TargetTriple;
 

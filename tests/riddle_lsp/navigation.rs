@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn type_definition_of_inferred_local_targets_nominal_declaration() {
+    let source = "struct Point {}\nfun main() { let value = Point {}; value; }\n";
+    let definition = type_definition_for_source(
+        source,
+        position(source, source.rfind("value").unwrap()),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(location) = definition else {
+        panic!("expected one type definition")
+    };
+
+    assert_eq!(location.range.start, Position::new(0, 7));
+}
+
+#[test]
+fn primitive_has_no_type_definition() {
+    let source = "fun main() { let value = 1; value; }\n";
+    assert!(
+        type_definition_for_source(
+            source,
+            position(source, source.rfind("value").unwrap()),
+            CompileOptions { use_std: false },
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn hover_shows_resolved_function_and_local_types() {
     let source = "fun add(value: i32) -> i32 { value } fun main() { let answer = add(1); answer; }";
     let function_hover = hover_for_source(
@@ -131,6 +160,64 @@ fn definition_and_implementation_follow_trait_dispatch() {
             position(source, impl_method + "render".len()),
         )
     );
+}
+
+#[test]
+fn navigation_preserves_non_file_document_uris() {
+    let source = "fun value() -> i32 { 1 } fun main() { value(); }";
+    let uri = lsp_types::Url::parse("untitled:riddle-navigation.rid").unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: source.into(),
+            version: Some(1),
+        },
+    )]);
+    let cursor = position(source, source.rfind("value()").unwrap() + 2);
+    let sessions = AnalysisSessions::default();
+
+    let definition = definition_for_document(
+        &uri,
+        &docs,
+        cursor,
+        CompileOptions { use_std: false },
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let GotoDefinitionResponse::Scalar(definition) = definition else {
+        panic!("expected one definition")
+    };
+    assert_eq!(definition.uri, uri);
+
+    let references = references_for_document(
+        &uri,
+        &docs,
+        cursor,
+        true,
+        CompileOptions { use_std: false },
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(references.len(), 2);
+    assert!(references.iter().all(|location| location.uri == uri));
+
+    let edit = rename_for_document(
+        &uri,
+        &docs,
+        cursor,
+        "renamed",
+        CompileOptions { use_std: false },
+        &sessions,
+    )
+    .unwrap()
+    .unwrap();
+    let Some(DocumentChanges::Edits(edits)) = edit.document_changes else {
+        panic!("expected document edits")
+    };
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].text_document.uri, uri);
 }
 
 #[test]

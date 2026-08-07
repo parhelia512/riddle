@@ -546,7 +546,7 @@ impl ProcMacroLibrary {
                 second_input.as_ptr(),
                 call_site.start,
                 call_site.end,
-                &mut result,
+                &raw mut result,
             )
         };
         if status != 0 {

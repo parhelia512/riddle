@@ -417,6 +417,108 @@ fn completion_loads_unopened_project_modules() {
 }
 
 #[test]
+fn completion_auto_imports_public_symbol_with_bare_insertion() {
+    let root = temp_root("completion-auto-import");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "mod geometry { pub struct Point {} }\nfun main() { let point: Poi }\n";
+    fs::write(&main, main_text).unwrap();
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: main_text.into(),
+            version: Some(1),
+        },
+    )]);
+
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(main_text, main_text.find("Poi }").unwrap() + 3),
+        CompileOptions { use_std: false },
+        &AnalysisSessions::default(),
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+    let point = items
+        .iter()
+        .find(|item| {
+            item.label == "Point"
+                && item
+                    .label_details
+                    .as_ref()
+                    .and_then(|details| details.description.as_deref())
+                    == Some("geometry::Point")
+        })
+        .unwrap_or_else(|| panic!("{items:#?}"));
+
+    assert_eq!(point.insert_text.as_deref(), Some("Point"));
+    assert_eq!(point.filter_text.as_deref(), Some("Point"));
+    assert_eq!(point.sort_text.as_deref(), Some("3:Point:geometry::Point"));
+    assert_eq!(
+        point.additional_text_edits.as_deref(),
+        Some(
+            &[lsp_types::TextEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                new_text: "use geometry::Point;\n".into(),
+            }][..]
+        )
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completion_keeps_same_named_auto_imports_separate_and_hides_private_items() {
+    let root = temp_root("completion-auto-import-collision");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "mod a { pub struct Point {} struct Private {} }\nmod b { pub struct Point {} }\nfun main() { let point: P }\n";
+    fs::write(&main, main_text).unwrap();
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: main_text.into(),
+            version: Some(1),
+        },
+    )]);
+
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(main_text, main_text.find("P }").unwrap() + 1),
+        CompileOptions { use_std: false },
+        &AnalysisSessions::default(),
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+    let point_paths = items
+        .iter()
+        .filter(|item| item.label == "Point")
+        .filter_map(|item| item.label_details.as_ref()?.description.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(point_paths, ["a::Point", "b::Point"]);
+    assert!(!items.iter().any(|item| item.label == "Private"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn completion_uses_unsaved_project_module_overlays() {
     let root = temp_root("project-completion-overlay");
     fs::create_dir_all(root.join("src")).unwrap();

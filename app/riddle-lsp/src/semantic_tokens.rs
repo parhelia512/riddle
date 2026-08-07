@@ -13,7 +13,7 @@ use syntax::SyntaxKind;
 #[cfg(feature = "test")]
 use crate::analysis::analyze_standalone_source;
 use crate::{
-    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document},
+    analysis::{AnalysisDepth, DocumentAnalysis, analyze_document_cancellable},
     completion::BUILTIN_TYPES,
     server::Document,
     session::AnalysisSessions,
@@ -139,21 +139,52 @@ pub fn semantic_tokens_for_source_with_options(
 /// # Errors
 ///
 /// Returns an error when the document is unavailable or project analysis fails.
+#[cfg(feature = "test")]
+/// Computes semantic tokens for an open test document.
+///
+/// # Errors
+///
+/// Returns an error when project analysis fails.
+///
+/// # Panics
+///
+/// Panics if non-cancellable test analysis is unexpectedly cancelled.
 pub fn semantic_tokens_for_document<S: BuildHasher>(
     uri: &lsp_types::Url,
     docs: &HashMap<lsp_types::Url, Document, S>,
     options: CompileOptions,
     sessions: &AnalysisSessions,
 ) -> std::result::Result<SemanticTokens, String> {
+    semantic_tokens_for_document_cancellable(uri, docs, options, sessions, &|| false)
+        .map(|tokens| tokens.expect("non-cancellable analysis cannot be cancelled"))
+}
+
+pub fn semantic_tokens_for_document_cancellable<S: BuildHasher>(
+    uri: &lsp_types::Url,
+    docs: &HashMap<lsp_types::Url, Document, S>,
+    options: CompileOptions,
+    sessions: &AnalysisSessions,
+    cancelled: &impl Fn() -> bool,
+) -> std::result::Result<Option<SemanticTokens>, String> {
     let document = docs
         .get(uri)
         .ok_or_else(|| "document is not open".to_string())?;
-    let analysis = analyze_document(uri, docs, options, sessions, AnalysisDepth::Resolve)?;
-    Ok(semantic_tokens_from_analysis(
+    let Some(analysis) = analyze_document_cancellable(
+        uri,
+        docs,
+        options,
+        sessions,
+        AnalysisDepth::Resolve,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(semantic_tokens_from_analysis(
         &document.text,
         &analysis,
         is_standard_library_uri(uri),
-    ))
+    )))
 }
 
 fn semantic_tokens_from_analysis(

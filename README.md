@@ -20,7 +20,7 @@ Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.0` 提供
 
 - `riddlec`：检查 Riddle 源码并生成 C；
 - `clue`：创建、检查、构建和运行 Riddle 项目；
-- `riddle-lsp`：为编辑器提供诊断和语义高亮。
+- `riddle-lsp`：为编辑器提供诊断、工作区索引、自动导入补全、高级导航、重命名、格式化和语义高亮。
 
 仓库中的 [`editors`](./editors) 目录为 Helix、VS Code、Zed 和 IntelliJ IDEA 2026.1+ 提供 `riddle-lsp` 适配。
 

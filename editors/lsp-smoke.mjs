@@ -13,6 +13,8 @@ const fixUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-fix.rid')).href;
 const completionUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-completion.rid')).href;
 const generalCompletionUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-general-completion.rid')).href;
 const navigationUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-navigation.rid')).href;
+const untitledUri = 'untitled:riddle-lsp-untitled.rid';
+const untitledText = 'fun target() -> i32 { 1 }\nfun main() { target(); }\n';
 const navigationText = [
   'trait Show { fun show(&self) -> i32; }',
   'struct Value {}',
@@ -26,9 +28,19 @@ const navigationText = [
   'type Alias = Foo;',
 ].join('\n');
 const projectRoot = join(smokeRoot, 'project');
-const projectMainText = 'mod util;\nfun main() { let callable = util::make; callable; }\n';
+const secondWorkspaceRoot = join(smokeRoot, 'second-workspace');
+const projectMainText = [
+  'mod util;',
+  'fun main() { util::make(); }',
+  'fun imported() { mak }',
+  'trait Base {}',
+  'trait Child: Base {}',
+  'struct Value {}',
+  'impl Base for Value {}',
+].join('\n');
 const projectUtilText = 'pub fun make() -> i32 { 1 }\n';
 mkdirSync(join(projectRoot, 'src'), { recursive: true });
+mkdirSync(secondWorkspaceRoot, { recursive: true });
 writeFileSync(
   join(projectRoot, 'Clue.toml'),
   '[package]\nname = "smoke"\n\n[dependencies]\n',
@@ -106,8 +118,15 @@ try {
     params: {
       processId: null,
       rootUri: null,
+      workspaceFolders: [
+        { uri: pathToFileURL(projectRoot).href, name: 'project' },
+        { uri: pathToFileURL(secondWorkspaceRoot).href, name: 'second-workspace' },
+      ],
       capabilities: {
-        textDocument: { completion: { completionItem: { labelDetailsSupport: true } } },
+        textDocument: {
+          completion: { completionItem: { labelDetailsSupport: true } },
+          typeHierarchy: { dynamicRegistration: true },
+        },
         workspace: { didChangeWatchedFiles: { dynamicRegistration: true } },
       },
     },
@@ -117,15 +136,25 @@ try {
   assert.equal(initialized.result.capabilities.positionEncoding, 'utf-16');
   assert.equal(initialized.result.capabilities.textDocumentSync, 2);
   assert.equal(initialized.result.capabilities.codeActionProvider, true);
+  assert.equal(initialized.result.capabilities.documentFormattingProvider, true);
+  assert.equal(initialized.result.capabilities.documentHighlightProvider, true);
+  assert.equal(initialized.result.capabilities.documentSymbolProvider, true);
+  assert.equal(initialized.result.capabilities.workspaceSymbolProvider, true);
+  assert.equal(initialized.result.capabilities.foldingRangeProvider, true);
   assert.equal(initialized.result.capabilities.hoverProvider, true);
+  assert.equal(initialized.result.capabilities.declarationProvider, true);
   assert.equal(initialized.result.capabilities.definitionProvider, true);
+  assert.equal(initialized.result.capabilities.typeDefinitionProvider, true);
   assert.equal(initialized.result.capabilities.implementationProvider, true);
+  assert.equal(initialized.result.capabilities.callHierarchyProvider, true);
   assert.equal(initialized.result.capabilities.referencesProvider, true);
   assert.equal(initialized.result.capabilities.renameProvider.prepareProvider, true);
   const triggerCharacters = initialized.result.capabilities.completionProvider.triggerCharacters;
   assert.deepEqual(triggerCharacters, ['.', ':']);
+  assert.deepEqual(initialized.result.capabilities.signatureHelpProvider.triggerCharacters, ['(', ',']);
   assert.equal(initialized.result.capabilities.inlayHintProvider, true);
   assert.equal(initialized.result.capabilities.semanticTokensProvider.full.delta, true);
+  assert.equal(initialized.result.capabilities.workspace.workspaceFolders.supported, true);
 
   send({ jsonrpc: '2.0', method: 'initialized', params: {} });
   const watcherRegistration = await read(
@@ -141,6 +170,15 @@ try {
     new Set(['**/*.rid', '**/Clue.toml']),
   );
   send({ jsonrpc: '2.0', id: watcherRegistration.id, result: null });
+  const typeHierarchyRegistration = await read(
+    (message) =>
+      message.method === 'client/registerCapability' &&
+      message.params.registrations.some(
+        (registration) => registration.method === 'textDocument/prepareTypeHierarchy',
+      ),
+    3_000,
+  );
+  send({ jsonrpc: '2.0', id: typeHierarchyRegistration.id, result: null });
   send({
     jsonrpc: '2.0',
     method: 'textDocument/didOpen',
@@ -565,6 +603,76 @@ try {
 
   send({
     jsonrpc: '2.0',
+    id: 47,
+    method: 'textDocument/completion',
+    params: {
+      textDocument: { uri: projectMainUri },
+      position: { line: 2, character: projectMainText.split('\n')[2].indexOf('mak') + 3 },
+    },
+  });
+  const autoImports = await read((message) => message.id === 47);
+  const importedMake = autoImports.result.find(
+    (item) => item.label === 'make' && item.labelDetails?.description === 'util::make',
+  );
+  assert(importedMake);
+  assert.equal(importedMake.insertText, 'make');
+  assert.equal(importedMake.additionalTextEdits[0].newText, 'use util::make;\n');
+
+  send({
+    jsonrpc: '2.0',
+    id: 48,
+    method: 'textDocument/prepareCallHierarchy',
+    params: { textDocument: { uri: projectMainUri }, position: { line: 1, character: 5 } },
+  });
+  const preparedMainCall = await read((message) => message.id === 48);
+  assert.equal(preparedMainCall.result[0].name, 'main');
+  send({
+    jsonrpc: '2.0',
+    id: 49,
+    method: 'callHierarchy/outgoingCalls',
+    params: { item: preparedMainCall.result[0] },
+  });
+  const outgoing = await read((message) => message.id === 49);
+  assert.equal(outgoing.result[0].to.name, 'make');
+
+  send({
+    jsonrpc: '2.0',
+    id: 50,
+    method: 'textDocument/prepareCallHierarchy',
+    params: { textDocument: { uri: projectUtilUri }, position: { line: 0, character: 9 } },
+  });
+  const preparedMakeCall = await read((message) => message.id === 50);
+  send({
+    jsonrpc: '2.0',
+    id: 51,
+    method: 'callHierarchy/incomingCalls',
+    params: { item: preparedMakeCall.result[0] },
+  });
+  const incoming = await read((message) => message.id === 51);
+  assert.equal(incoming.result[0].from.name, 'main');
+
+  send({
+    jsonrpc: '2.0',
+    id: 52,
+    method: 'textDocument/prepareTypeHierarchy',
+    params: { textDocument: { uri: projectMainUri }, position: { line: 3, character: 7 } },
+  });
+  const preparedBaseType = await read((message) => message.id === 52);
+  assert.equal(preparedBaseType.result[0].name, 'Base');
+  send({
+    jsonrpc: '2.0',
+    id: 53,
+    method: 'typeHierarchy/subtypes',
+    params: { item: preparedBaseType.result[0] },
+  });
+  const subtypes = await read((message) => message.id === 53);
+  assert.deepEqual(
+    subtypes.result.map((item) => item.name).sort(),
+    ['Child', 'Value'],
+  );
+
+  send({
+    jsonrpc: '2.0',
     method: 'textDocument/didOpen',
     params: {
       textDocument: {
@@ -688,6 +796,101 @@ try {
     enumHover.result.contents.value,
     '```riddle\nenum Foo {\n    A,\n    B(i32),\n    C((i32, &Foo)),\n}\n```',
   );
+
+  send({
+    jsonrpc: '2.0',
+    id: 40,
+    method: 'textDocument/signatureHelp',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 3, character: traitCallCharacter + 5 },
+    },
+  });
+  const signatureHelp = await read((message) => message.id === 40);
+  assert.match(signatureHelp.result.signatures[0].label, /fun show\(&self\) -> i32/);
+
+  send({
+    jsonrpc: '2.0',
+    id: 41,
+    method: 'textDocument/documentHighlight',
+    params: {
+      textDocument: { uri: navigationUri },
+      position: { line: 3, character: traitCallCharacter + 1 },
+    },
+  });
+  const documentHighlights = await read((message) => message.id === 41);
+  assert.equal(documentHighlights.result.length, 3);
+
+  send({
+    jsonrpc: '2.0',
+    id: 42,
+    method: 'textDocument/documentSymbol',
+    params: { textDocument: { uri: navigationUri } },
+  });
+  const documentSymbols = await read((message) => message.id === 42);
+  assert(documentSymbols.result.some((symbol) => symbol.name === 'Show'));
+  assert(documentSymbols.result.some((symbol) => symbol.name === 'Value'));
+
+  send({
+    jsonrpc: '2.0',
+    id: 43,
+    method: 'textDocument/foldingRange',
+    params: { textDocument: { uri: navigationUri } },
+  });
+  const foldingRanges = await read((message) => message.id === 43);
+  assert(foldingRanges.result.some((range) => range.startLine === 4 && range.endLine === 8));
+
+  send({
+    jsonrpc: '2.0',
+    id: 44,
+    method: 'textDocument/formatting',
+    params: {
+      textDocument: { uri: navigationUri },
+      options: { tabSize: 4, insertSpaces: true },
+    },
+  });
+  const formatting = await read((message) => message.id === 44);
+  assert.equal(formatting.result.length, 1);
+  assert.match(formatting.result[0].newText, /trait Show \{/);
+
+  send({
+    jsonrpc: '2.0',
+    id: 45,
+    method: 'workspace/symbol',
+    params: { query: 'Foo' },
+  });
+  const workspaceSymbols = await read((message) => message.id === 45);
+  assert(workspaceSymbols.result.some((symbol) => symbol.name === 'Foo'));
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: untitledUri,
+        languageId: 'riddle',
+        version: 1,
+        text: untitledText,
+      },
+    },
+  });
+  await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === untitledUri &&
+      message.params.version === 1,
+  );
+  send({
+    jsonrpc: '2.0',
+    id: 46,
+    method: 'textDocument/definition',
+    params: {
+      textDocument: { uri: untitledUri },
+      position: { line: 1, character: 14 },
+    },
+  });
+  const untitledDefinition = await read((message) => message.id === 46);
+  assert.equal(untitledDefinition.result.uri, untitledUri);
 
   send({
     jsonrpc: '2.0',
@@ -832,6 +1035,19 @@ try {
       message.params.version == null,
   );
   assert.deepEqual(navigationClosed.params.diagnostics, []);
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: untitledUri } },
+  });
+  const untitledClosed = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === untitledUri &&
+      message.params.version == null,
+  );
+  assert.deepEqual(untitledClosed.params.diagnostics, []);
 
   send({ jsonrpc: '2.0', id: 10, method: 'shutdown' });
   const shutdown = await read((message) => message.id === 10);

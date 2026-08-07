@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::BuildHasher,
     path::{Path, PathBuf},
 };
@@ -14,11 +14,14 @@ use riddlec::{
     proc_macro::{ProcMacroKind, STANDARD_DERIVE_MACROS, STANDARD_FUNCTION_MACROS},
 };
 use rowan::TextRange;
-use scope_graph::resolve::{exported_definitions, resolve_path_at_reference, visible_definitions};
+use scope_graph::resolve::{
+    exported_definitions, resolve_path_at_reference, resolve_path_from, visible_definitions,
+};
 use scope_graph::{DefRef, Node, NodeId, RefOrigin, ScopeGraph};
 use syntax::SyntaxKind;
 
 use crate::{
+    imports::import_edit,
     server::Document,
     session::AnalysisSessions,
     text::{is_identifier_continue, offset_for_position, text_range},
@@ -162,6 +165,7 @@ pub fn completion_items_for_document<S: BuildHasher>(
         return Ok(Some(project_completion_items(
             &analysis,
             &path,
+            &document.text,
             &site,
             fallback_result.as_ref(),
         )));
@@ -199,6 +203,7 @@ fn project_completion_overlays<S: BuildHasher>(
 fn project_completion_items(
     analysis: &clue::ProjectAnalysis,
     path: &Path,
+    document_source: &str,
     site: &CompletionSite,
     fallback: Option<&clue::ProjectAnalysis>,
 ) -> Vec<CompletionItem> {
@@ -209,6 +214,8 @@ fn project_completion_items(
     );
     collect_standard_macro_completions(site, &mut items);
     collect_macro_completions(analysis, path, site, &mut items);
+    rank_existing_completions(site, &mut items);
+    collect_auto_import_completions(&analysis.result, document_source, site, &mut items);
     sort_and_dedup_completion_items(&mut items);
     items
 }
@@ -283,8 +290,222 @@ fn standalone_completion_items(
 }
 
 fn sort_and_dedup_completion_items(items: &mut Vec<CompletionItem>) {
-    items.sort_by(|left, right| left.label.cmp(&right.label));
-    items.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
+    items.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| completion_description(left).cmp(completion_description(right)))
+    });
+    items.dedup_by(|left, right| {
+        left.label == right.label
+            && left.kind == right.kind
+            && completion_description(left) == completion_description(right)
+    });
+}
+
+fn completion_description(item: &CompletionItem) -> &str {
+    item.label_details
+        .as_ref()
+        .and_then(|details| details.description.as_deref())
+        .unwrap_or_default()
+}
+
+fn rank_existing_completions(site: &CompletionSite, items: &mut [CompletionItem]) {
+    let group = match site.context {
+        CompletionContext::Member | CompletionContext::Associated => 0,
+        CompletionContext::General | CompletionContext::Type => 1,
+    };
+    for item in items {
+        item.filter_text.get_or_insert_with(|| item.label.clone());
+        item.sort_text.get_or_insert_with(|| {
+            let group = if item.kind == Some(CompletionItemKind::KEYWORD) {
+                2
+            } else {
+                group
+            };
+            format!("{group}:{}", item.label)
+        });
+    }
+}
+
+#[derive(Clone)]
+struct AutoImportRoute {
+    key: (u8, u32, u32),
+    label: String,
+    path: String,
+    definition: DefRef,
+}
+
+fn collect_auto_import_completions(
+    result: &CompileResult,
+    source: &str,
+    site: &CompletionSite,
+    out: &mut Vec<CompletionItem>,
+) {
+    if !matches!(
+        site.context,
+        CompletionContext::General | CompletionContext::Type
+    ) {
+        return;
+    }
+    let Some((hir, graph)) = result.hir.as_ref().zip(result.scope_graph.as_ref()) else {
+        return;
+    };
+    let visible = out
+        .iter()
+        .map(|item| item.label.clone())
+        .collect::<HashSet<_>>();
+    let prefix = site.prefix.to_lowercase();
+
+    for route in auto_import_routes(hir, graph) {
+        if visible.contains(&route.label)
+            || !route.label.to_lowercase().starts_with(&prefix)
+            || (site.context == CompletionContext::Type && !definition_is_type(&route.definition))
+        {
+            continue;
+        }
+        let Some(edit) = import_edit(source, &route.path) else {
+            continue;
+        };
+        let mut item = Vec::with_capacity(1);
+        push_definition_completion(hir, None, &route.label, &route.definition, &mut item);
+        let Some(mut item) = item.pop() else {
+            continue;
+        };
+        let label_detail = item.label_details.take().and_then(|details| details.detail);
+        item.label_details = Some(CompletionItemLabelDetails {
+            detail: label_detail,
+            description: Some(route.path.clone()),
+        });
+        item.insert_text = Some(route.label.clone());
+        item.filter_text = Some(route.label.clone());
+        item.sort_text = Some(format!("3:{}:{}", route.label, route.path));
+        item.additional_text_edits = Some(vec![edit]);
+        out.push(item);
+    }
+}
+
+fn auto_import_routes(hir: &hir::HirFile, graph: &ScopeGraph) -> Vec<AutoImportRoute> {
+    let mut routes = Vec::new();
+    collect_import_routes(
+        hir,
+        graph,
+        graph.root,
+        &mut Vec::new(),
+        &mut HashSet::new(),
+        &mut routes,
+        64,
+    );
+    routes.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| {
+                left.path
+                    .split("::")
+                    .count()
+                    .cmp(&right.path.split("::").count())
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    routes.dedup_by(|left, right| left.key == right.key && left.label == right.label);
+    routes.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    routes
+}
+
+fn collect_import_routes(
+    hir: &hir::HirFile,
+    graph: &ScopeGraph,
+    scope: NodeId,
+    path: &mut Vec<String>,
+    active: &mut HashSet<NodeId>,
+    out: &mut Vec<AutoImportRoute>,
+    fuel: u32,
+) {
+    if fuel == 0 || !active.insert(scope) {
+        return;
+    }
+    for (name, definition) in exported_definitions(graph, scope) {
+        path.push(name.0.clone());
+        match definition {
+            DefRef::Module { enter, .. } => {
+                if let Some(key) = definition_key(hir, &definition) {
+                    out.push(AutoImportRoute {
+                        key,
+                        label: name.0,
+                        path: path.join("::"),
+                        definition: definition.clone(),
+                    });
+                }
+                collect_import_routes(hir, graph, enter, path, active, out, fuel - 1);
+            }
+            DefRef::UseAlias {
+                ref rewrite_to,
+                anchor,
+                ..
+            } => {
+                for resolved in resolve_path_from(graph, anchor, rewrite_to) {
+                    if let DefRef::Module { enter, .. } = resolved {
+                        collect_import_routes(hir, graph, enter, path, active, out, fuel - 1);
+                    } else if let Some(key) = definition_key(hir, &resolved) {
+                        out.push(AutoImportRoute {
+                            key,
+                            label: name.0.clone(),
+                            path: path.join("::"),
+                            definition: resolved,
+                        });
+                    }
+                }
+            }
+            definition => {
+                if let Some(key) = definition_key(hir, &definition) {
+                    out.push(AutoImportRoute {
+                        key,
+                        label: name.0,
+                        path: path.join("::"),
+                        definition,
+                    });
+                }
+            }
+        }
+        path.pop();
+    }
+    active.remove(&scope);
+}
+
+fn definition_key(hir: &hir::HirFile, definition: &DefRef) -> Option<(u8, u32, u32)> {
+    let (kind, range) = match definition {
+        DefRef::Function(id) => (0, hir.item_tree.functions[*id].name_range),
+        DefRef::Struct(id) => (1, hir.item_tree.structs[*id].name_range),
+        DefRef::Enum(id) => (2, hir.item_tree.enums[*id].name_range),
+        DefRef::Trait(id) => (3, hir.item_tree.traits[*id].name_range),
+        DefRef::Const(id) => (4, hir.item_tree.consts[*id].name_range),
+        DefRef::TypeAlias(id) => (5, hir.item_tree.type_aliases[*id].name_range),
+        DefRef::Module { id, .. } => (6, hir.item_tree.modules[*id].name_range),
+        DefRef::EnumVariant { enum_id, index } => {
+            (7, hir.item_tree.enums[*enum_id].variants[*index].name_range)
+        }
+        DefRef::PatternBinding { .. }
+        | DefRef::Param { .. }
+        | DefRef::LambdaParam { .. }
+        | DefRef::ConstParam { .. }
+        | DefRef::UseAlias { .. } => return None,
+    };
+    Some((kind, range.start().into(), range.end().into()))
+}
+
+const fn definition_is_type(definition: &DefRef) -> bool {
+    matches!(
+        definition,
+        DefRef::Struct(_)
+            | DefRef::Enum(_)
+            | DefRef::Trait(_)
+            | DefRef::TypeAlias(_)
+            | DefRef::Module { .. }
+    )
 }
 
 #[cfg(feature = "test")]
