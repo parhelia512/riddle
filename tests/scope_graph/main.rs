@@ -38,6 +38,15 @@ fn build_hir_and_graph(source: &str) -> (HirFile, ScopeGraph) {
     build_hir_and_graph_from_parse(parse)
 }
 
+fn build_diagnostics(source: &str) -> Vec<hir::body::Diagnostic> {
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(source);
+    let syntax = parse.syntax();
+    let root = ast::Root::cast(syntax.clone()).unwrap();
+    let hir = lower_root(&root);
+    build_scope_graph(&hir, &syntax).1
+}
+
 fn build_hir_and_graph_from_parse(parse: &Parse) -> (HirFile, ScopeGraph) {
     let syntax = parse.syntax();
     let root = ast::Root::cast(syntax.clone()).unwrap();

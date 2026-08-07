@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rowan::ast::SyntaxNodePtr;
+use rowan::{TextRange, ast::SyntaxNodePtr};
 
 use hir::{
     HirFile, Name,
@@ -68,6 +68,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         let mut frag_edges = vec![];
         let top_level = self.hir.item_tree.top_level.clone();
 
+        self.diagnose_duplicate_items(&top_level);
         self.encode_items(&top_level, root_scope, &mut frag_nodes, &mut frag_edges);
 
         // Wrap root-level graph pieces in one root fragment.
@@ -83,6 +84,77 @@ impl<'a> ScopeGraphBuilder<'a> {
         self.sg.by_ptr.insert(root_ptr, fid);
 
         (self.sg, self.diagnostics)
+    }
+
+    fn diagnose_duplicate_items(&mut self, items: &[TopLevelItem]) {
+        let mut definitions = HashMap::<String, TextRange>::new();
+        for &item in items {
+            if let Some((name, range)) = self.named_item(item) {
+                if let Some(first_range) = definitions.get(&name.0) {
+                    self.diagnostics.push(hir::body::Diagnostic {
+                        code: "E0064",
+                        severity: hir::body::Severity::Error,
+                        message: format!("the name `{}` is defined multiple times", name.0),
+                        labels: vec![
+                            hir::body::SourceLabel {
+                                range,
+                                message: "duplicate definition".into(),
+                                style: hir::body::LabelStyle::Primary,
+                            },
+                            hir::body::SourceLabel {
+                                range: *first_range,
+                                message: "first definition".into(),
+                                style: hir::body::LabelStyle::Secondary,
+                            },
+                        ],
+                        help: None,
+                        notes: Vec::new(),
+                    });
+                } else {
+                    definitions.insert(name.0, range);
+                }
+            }
+
+            if let TopLevelItem::Module(mid) = item
+                && let Some(children) = self.hir.item_tree.modules[mid].items.clone()
+            {
+                self.diagnose_duplicate_items(&children);
+            }
+        }
+    }
+
+    fn named_item(&self, item: TopLevelItem) -> Option<(Name, TextRange)> {
+        match item {
+            TopLevelItem::Function(id) => {
+                let item = &self.hir.item_tree.functions[id];
+                Some((item.name.clone(), item.name_range))
+            }
+            TopLevelItem::Struct(id) => {
+                let item = &self.hir.item_tree.structs[id];
+                Some((item.name.clone(), item.name_range))
+            }
+            TopLevelItem::Enum(id) => {
+                let item = &self.hir.item_tree.enums[id];
+                Some((item.name.clone(), item.name_range))
+            }
+            TopLevelItem::Trait(id) => {
+                let item = &self.hir.item_tree.traits[id];
+                Some((item.name.clone(), item.name_range))
+            }
+            TopLevelItem::Const(id) => {
+                let item = &self.hir.item_tree.consts[id];
+                Some((item.name.clone(), item.name_range))
+            }
+            TopLevelItem::TypeAlias(id) => {
+                let item = &self.hir.item_tree.type_aliases[id];
+                Some((item.name.clone(), item.name_range))
+            }
+            TopLevelItem::Module(id) => {
+                let item = &self.hir.item_tree.modules[id];
+                Some((item.name.clone(), item.name_range))
+            }
+            TopLevelItem::Use(_) | TopLevelItem::Impl(_) => None,
+        }
     }
 
     fn pre_alloc_module_scopes(&mut self) {

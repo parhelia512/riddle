@@ -540,6 +540,13 @@ const PRODUCER_SPAN_CASES: &[DiagnosticSpanCase] = &[
         "read()?",
     ),
     (
+        "E0064",
+        "defined multiple times",
+        "fun repeated() {} fun repeated() {}",
+        "repeated",
+        "fun repeated() {} fun repeated",
+    ),
+    (
         "E0072",
         "recursive type",
         "enum Loop { Next(Loop) }",

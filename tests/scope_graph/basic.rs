@@ -1,6 +1,73 @@
-use crate::{DefKind, build, local_binding, param_fn, resolve_paths, resolve_reference};
+use crate::{
+    DefKind, build, build_diagnostics, local_binding, param_fn, resolve_paths, resolve_reference,
+};
 
 use scope_graph::Node;
+
+#[test]
+fn duplicate_top_level_functions_report_both_definitions() {
+    let source = "fun hello() -> i32 { 0 }\nfun hello() -> i32 { 1 }\nfun main() -> i32 { 0 }\nfun main() -> i32 { 1 }\n";
+    let diagnostics = build_diagnostics(source);
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+
+    for (diagnostic, name) in diagnostics.iter().zip(["hello", "main"]) {
+        assert_eq!(diagnostic.code, "E0064");
+        assert_eq!(
+            diagnostic.message,
+            format!("the name `{name}` is defined multiple times")
+        );
+        assert_eq!(diagnostic.labels.len(), 2);
+        assert_eq!(diagnostic.labels[0].style, hir::body::LabelStyle::Primary);
+        assert_eq!(diagnostic.labels[0].message, "duplicate definition");
+        assert_eq!(
+            &source[diagnostic.labels[0].range], name,
+            "the duplicate definition should be primary"
+        );
+        assert_eq!(diagnostic.labels[1].style, hir::body::LabelStyle::Secondary);
+        assert_eq!(diagnostic.labels[1].message, "first definition");
+        assert_eq!(&source[diagnostic.labels[1].range], name);
+        assert!(diagnostic.labels[0].range.start() > diagnostic.labels[1].range.start());
+    }
+}
+
+#[test]
+fn duplicate_named_items_are_scoped_and_cross_kind() {
+    let source = r"
+        struct Shared {}
+        enum Shared { Unit }
+
+        mod nested {
+            const VALUE: i32 = 1;
+            type VALUE = i32;
+        }
+
+        mod repeated {}
+        mod repeated {}
+
+        mod left { fun same() {} }
+        mod right { fun same() {} }
+    ";
+    let diagnostics = build_diagnostics(source);
+    let names = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        names,
+        [
+            "the name `Shared` is defined multiple times",
+            "the name `VALUE` is defined multiple times",
+            "the name `repeated` is defined multiple times",
+        ],
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == "E0064")
+    );
+}
 
 #[test]
 fn resolves_param_then_local_in_statement_order() {

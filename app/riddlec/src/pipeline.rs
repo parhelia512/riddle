@@ -1323,7 +1323,7 @@ fn run_pipeline_with_state_cancellable(
         return None;
     }
 
-    // Collect HIR diagnostics (E0040 lowering + E0050 resolution + E0051/E0052 scope-graph builder)
+    // Collect HIR diagnostics (lowering, resolution, and scope-graph validation).
     let hir_diagnostics = collect_hir_diagnostics(&hir, &scope_diagnostics);
 
     if depth == PipelineDepth::Resolve {
