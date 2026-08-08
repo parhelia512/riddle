@@ -295,17 +295,32 @@ fn completion_includes_standard_print_macros() {
 }
 
 #[test]
-fn completion_includes_standard_debug_derive() {
-    let source = "#[derive(De)] struct Value {}";
+fn completion_includes_standard_derives() {
+    let source = "#[derive()] struct Value {}";
     let items = completion_items_for_source(
         source,
-        position(source, source.find("De").unwrap() + 2),
+        position(source, source.find(')').unwrap()),
         CompileOptions::default(),
     );
 
-    assert!(items.iter().any(|item| {
-        item.label == "Debug" && item.detail.as_deref() == Some("standard derive macro")
-    }));
+    for name in [
+        "Debug",
+        "Clone",
+        "Copy",
+        "Default",
+        "Hash",
+        "PartialEq",
+        "Eq",
+        "PartialOrd",
+        "Ord",
+    ] {
+        assert!(
+            items.iter().any(|item| {
+                item.label == name && item.detail.as_deref() == Some("standard derive macro")
+            }),
+            "missing {name}: {items:#?}"
+        );
+    }
 }
 
 #[test]

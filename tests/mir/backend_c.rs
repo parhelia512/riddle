@@ -74,6 +74,47 @@ fn c_export_uses_c_string_abi_and_preserves_internal_str_layout() {
 }
 
 #[test]
+fn c_extern_str_arguments_use_nul_terminated_temporary_buffers() {
+    let module = lower(
+        r#"
+        unsafe extern "C" {
+            fun inspect(value: &str) -> i32;
+        }
+
+        fun forward(value: &str) -> i32 {
+            unsafe { inspect(value) }
+        }
+        "#,
+    );
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(
+        generated.contains("static char *riddle_c_string(riddle_str value)"),
+        "{generated}"
+    );
+    assert!(generated.contains(" = riddle_c_string("), "{generated}");
+    assert!(generated.contains("inspect(ffi_c_string"), "{generated}");
+    assert!(generated.contains("free(ffi_c_string"), "{generated}");
+    assert!(!generated.contains("inspect(p0.ptr)"), "{generated}");
+}
+
+#[test]
+fn c_unused_str_extern_does_not_emit_string_bridge() {
+    let module = lower(
+        r#"
+        unsafe extern "C" {
+            fun inspect(value: &str) -> i32;
+        }
+
+        fun main() -> i32 { 0 }
+        "#,
+    );
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(!generated.contains("riddle_c_string"), "{generated}");
+}
+
+#[test]
 fn c_slice_borrow_carries_length_and_indexes_elements() {
     let (_, type_result, analysis, module) = compile(
         r"
@@ -219,7 +260,11 @@ fn c_backend_does_not_abort_after_never_extern() {
     );
     assert!(!generated.contains("riddle_panic"), "{generated}");
     assert!(!generated.contains("static void panic"), "{generated}");
-    assert!(!generated.contains("abort()"), "{generated}");
+    let main_body = generated
+        .split("int main (void) {")
+        .nth(1)
+        .expect("generated main definition");
+    assert!(!main_body.contains("abort()"), "{main_body}");
     assert!(generated.contains("for (;;) {}"), "{generated}");
     assert!(!generated.contains("return 0;"), "{generated}");
 }
@@ -1022,6 +1067,7 @@ fn c_source_names_use_prefixed_collision_free_encoding() {
         "auto".into(),
         Type::Struct(StructType {
             name: "union".into(),
+            symbol: "union".into(),
             fields: vec![("case".into(), Type::Int(IntTy::I32))],
         }),
     );

@@ -238,14 +238,11 @@ impl LowerCtx<'_> {
                     let Some((_, child_ty)) = payloads.get(index) else {
                         break;
                     };
-                    let child_value = builder.extract_value(
-                        value,
-                        1 + offset + index,
-                        self.convert_type(child_ty),
+                    condition = self.lower_guarded_enum_payload_condition(
+                        builder,
+                        body,
+                        (condition, value, 1 + offset + index, child, child_ty),
                     );
-                    let child_condition =
-                        self.lower_pattern_condition(builder, body, child, child_value, child_ty);
-                    condition = Self::and_pattern_conditions(builder, condition, child_condition);
                 }
             }
             Pattern::Struct { fields, .. } => {
@@ -260,20 +257,56 @@ impl LowerCtx<'_> {
                     else {
                         continue;
                     };
-                    let child_value = builder.extract_value(
-                        value,
-                        1 + offset + index,
-                        self.convert_type(child_ty),
+                    condition = self.lower_guarded_enum_payload_condition(
+                        builder,
+                        body,
+                        (condition, value, 1 + offset + index, child, child_ty),
                     );
-                    let child_condition =
-                        self.lower_pattern_condition(builder, body, child, child_value, child_ty);
-                    condition = Self::and_pattern_conditions(builder, condition, child_condition);
                 }
             }
             Pattern::Path { .. } => {}
             _ => unreachable!(),
         }
         condition
+    }
+
+    fn lower_guarded_enum_payload_condition(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        payload: (Option<Value>, Value, usize, PatId, &type_checker::Type),
+    ) -> Option<Value> {
+        let (condition, value, index, child, child_ty) = payload;
+        let Some(condition) = condition else {
+            let child_value = builder.extract_value(value, index, self.convert_type(child_ty));
+            return self.lower_pattern_condition(builder, body, child, child_value, child_ty);
+        };
+
+        let payload_block = builder.func.new_block_labeled("match_pattern_payload");
+        let miss_block = builder.func.new_block_labeled("match_pattern_miss");
+        let merge_block = builder.func.new_block_labeled("match_pattern_merge");
+        builder.set_cond_branch(condition, payload_block, miss_block);
+
+        builder.switch_to_block(payload_block);
+        let child_value = builder.extract_value(value, index, self.convert_type(child_ty));
+        let matched = self
+            .lower_pattern_condition(builder, body, child, child_value, child_ty)
+            .unwrap_or_else(|| builder.bconst(true));
+        let payload_exit = builder.current_block;
+        builder.set_branch(merge_block);
+
+        builder.switch_to_block(miss_block);
+        let missed = builder.bconst(false);
+        builder.set_branch(merge_block);
+
+        builder.switch_to_block(merge_block);
+        Some(builder.func.push_inst(
+            merge_block,
+            Inst::new(
+                InstKind::Phi(vec![(matched, payload_exit), (missed, miss_block)]),
+                Type::Bool,
+            ),
+        ))
     }
 
     fn lower_tuple_pattern_condition(

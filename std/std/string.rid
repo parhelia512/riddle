@@ -62,6 +62,29 @@ impl String {
         }
     }
 
+    pub fun push_char(&mut self, value: char) {
+        let code = value as u32;
+        if code <= 127u32 {
+            self.bytes.push(code as u8);
+            return;
+        }
+        if code <= 2047u32 {
+            self.bytes.push((192u32 | (code >> 6u32)) as u8);
+            self.bytes.push((128u32 | (code & 63u32)) as u8);
+            return;
+        }
+        if code <= 65535u32 {
+            self.bytes.push((224u32 | (code >> 12u32)) as u8);
+            self.bytes.push((128u32 | ((code >> 6u32) & 63u32)) as u8);
+            self.bytes.push((128u32 | (code & 63u32)) as u8);
+            return;
+        }
+        self.bytes.push((240u32 | (code >> 18u32)) as u8);
+        self.bytes.push((128u32 | ((code >> 12u32) & 63u32)) as u8);
+        self.bytes.push((128u32 | ((code >> 6u32) & 63u32)) as u8);
+        self.bytes.push((128u32 | (code & 63u32)) as u8);
+    }
+
     pub fun clear(&mut self) {
         self.bytes.clear();
     }

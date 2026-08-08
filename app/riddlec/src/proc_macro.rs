@@ -15,8 +15,18 @@ const TOKEN_WIRE_HEADER: &str = "RMT1;";
 const MAX_DERIVE_EXPANSION_DEPTH: usize = 32;
 const STANDARD_MACRO_PACKAGE: &str = "std";
 
-pub const STANDARD_FUNCTION_MACROS: [&str; 2] = ["print", "println"];
-pub const STANDARD_DERIVE_MACROS: [&str; 1] = ["Debug"];
+pub const STANDARD_FUNCTION_MACROS: [&str; 4] = ["format", "print", "println", "quote"];
+pub const STANDARD_DERIVE_MACROS: [&str; 9] = [
+    "Debug",
+    "Clone",
+    "Copy",
+    "Default",
+    "Hash",
+    "PartialEq",
+    "Eq",
+    "PartialOrd",
+    "Ord",
+];
 
 mod document;
 mod expand;

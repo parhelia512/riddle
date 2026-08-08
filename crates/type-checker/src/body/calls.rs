@@ -28,7 +28,11 @@ impl TypeChecker<'_> {
             _ => Vec::new(),
         };
         if matches!(&ctx.body.exprs[callee], Expr::FieldAccess { .. }) {
-            return self.check_method_call(ctx, callee, args, type_args, expected, span);
+            return self.check_method_call(
+                ctx,
+                (expr_id, callee, args, type_args),
+                (expected, span),
+            );
         }
 
         if let Expr::Path {
@@ -50,9 +54,19 @@ impl TypeChecker<'_> {
             path,
             resolved: Some(ResolvedName::Trait(trait_id)),
         } = &ctx.body.exprs[callee]
-            && path.segments.last().is_some_and(|name| name.0 == "default")
+            && path.segments.len() > 1
         {
-            return self.check_static_trait_call(ctx, expr_id, *trait_id, args, expected, span);
+            let method = path
+                .segments
+                .last()
+                .expect("checked path has a method")
+                .0
+                .clone();
+            return self.check_static_trait_call(
+                ctx,
+                (expr_id, callee, *trait_id, &method, args),
+                (expected, span),
+            );
         }
 
         let callee_ty = self.check_expr(ctx, callee);
@@ -438,73 +452,116 @@ impl TypeChecker<'_> {
     pub(super) fn check_static_trait_call(
         &mut self,
         ctx: &mut BodyCtx<'_>,
-        expr_id: ExprId,
-        trait_id: TraitId,
-        args: &[ExprId],
-        expected: Option<&Type>,
-        span: Option<rowan::TextRange>,
+        call: (ExprId, ExprId, TraitId, &str, &[ExprId]),
+        expected_span: (Option<&Type>, Option<rowan::TextRange>),
     ) -> Type {
-        if !args.is_empty() {
+        let (expr_id, callee, trait_id, method_name, args) = call;
+        let (expected, span) = expected_span;
+        let Some(method) = self.hir.item_tree.traits[trait_id]
+            .methods
+            .iter()
+            .find(|method| method.name.0 == method_name)
+            .cloned()
+        else {
+            self.diagnostic(
+                "E0013",
+                format!("trait has no associated function `{method_name}`"),
+                span,
+            );
+            return Type::Error;
+        };
+        if method
+            .params
+            .first()
+            .is_some_and(|param| param.name.0 == "self")
+        {
             for arg in args {
                 self.check_expr(ctx, *arg);
                 self.record_value_use(ctx, *arg, ValueUse::Move);
             }
             self.diagnostic(
+                "E0013",
+                format!("`{method_name}` requires a receiver"),
+                span,
+            );
+            return Type::Error;
+        }
+        if args.len() != method.params.len() {
+            self.diagnostic(
                 "E0005",
-                "static trait functions do not take arguments",
-                span,
-            );
-            return Type::Error;
-        }
-        let Some(expected) = expected.filter(|ty| !ty.is_unknown_like()) else {
-            return Type::Unknown;
-        };
-        let Some(method) = self.find_trait_impl_method(expected, None, None, trait_id, "default")
-        else {
-            self.diagnostic(
-                "E0013",
                 format!(
-                    "no `default` implementation for `{}`",
-                    expected.display(self.hir)
+                    "associated function `{method_name}` expects {} argument(s), got {}",
+                    method.params.len(),
+                    args.len()
                 ),
                 span,
             );
-            return Type::Error;
         };
-        if !method.function.params.is_empty() {
-            self.diagnostic("E0013", "`default` must be a static trait function", span);
-            return Type::Error;
+
+        let mut params = ctx.generic_params.clone();
+        params.insert("Self".into(), Type::Param("Self".into()));
+        for name in &self.hir.item_tree.traits[trait_id].generics {
+            params.entry(name.0.clone()).or_insert(Type::Unknown);
         }
-        let return_ty = method.function.ret_type.as_ref().map_or(Type::Unit, |ty| {
-            self.lower_type_ref_with_params_at(
-                ty,
-                &method.subst,
-                method
-                    .function
-                    .ret_type_range
-                    .or(Some(method.function.name_range)),
-            )
-        });
-        if !Self::bound_types_match(expected, &return_ty) {
-            self.diagnostic(
-                "E0013",
-                format!(
-                    "`default` returns `{}`, expected `{}`",
-                    return_ty.display(self.hir),
-                    expected.display(self.hir)
-                ),
+        for name in &method.generics {
+            params.entry(name.0.clone()).or_insert(Type::Unknown);
+        }
+
+        let mut subst = HashMap::new();
+        if let (Some(expected), Some(return_ty)) = (expected, method.ret_type.as_ref()) {
+            let pattern = self.lower_type_ref_with_params_at(
+                return_ty,
+                &params,
+                method.ret_type_range.or(Some(method.name_range)),
+            );
+            collect_subst(&pattern, expected, &mut subst);
+        }
+        let receiver = subst.get("Self").cloned().unwrap_or(Type::Unknown);
+        params.insert("Self".into(), receiver.clone());
+
+        for (index, arg) in args.iter().enumerate() {
+            let Some(param) = method.params.get(index) else {
+                self.check_expr(ctx, *arg);
+                self.record_value_use(ctx, *arg, ValueUse::Move);
+                continue;
+            };
+            let pattern =
+                self.lower_type_ref_with_params_at(&param.ty, &params, Some(param.ty_range));
+            let expected_arg = substitute_type(&pattern, &subst);
+            let actual = self.check_expr_expected(ctx, *arg, &expected_arg);
+            collect_subst(&pattern, &actual, &mut subst);
+            let expected_arg = substitute_type(&pattern, &subst);
+            self.expect_assignable_with_occurs_span(
+                &expected_arg,
+                &actual,
+                "function argument",
+                ctx.expr_range(*arg),
                 span,
             );
-            return Type::Error;
+            self.record_value_use(ctx, *arg, Self::hir_parameter_value_use(&param.ty));
         }
+
+        let receiver = subst.get("Self").cloned().unwrap_or(receiver);
+        self.result
+            .expr_types
+            .insert((ctx.body_id, callee), receiver);
         self.result.trait_method_calls.insert(
             (ctx.body_id, expr_id),
             TraitMethodCall {
                 trait_id,
-                method: "default".into(),
+                method: method_name.into(),
             },
         );
-        return_ty
+        method.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            substitute_type(
+                &self.lower_type_ref_with_params_at(
+                    ty,
+                    &params,
+                    method.ret_type_range.or(Some(method.name_range)),
+                ),
+                &subst,
+            )
+        })
     }
 
     pub(super) fn check_enum_variant_call(
@@ -915,10 +972,11 @@ impl TypeChecker<'_> {
                 subst,
             ) {
                 let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
-                let is_debug_bound = function.name.0 == "print_debug"
-                    && trait_name == "Debug"
-                    && self.hir.std_loaded
-                    && self.hir.package_for_range(function.name_range).is_none();
+                let is_debug_bound =
+                    matches!(function.name.0.as_str(), "append_debug" | "print_debug")
+                        && trait_name == "Debug"
+                        && self.hir.std_loaded
+                        && self.hir.package_for_range(function.name_range).is_none();
                 if is_debug_bound {
                     self.report_debug_bound_failure(
                         ctx,

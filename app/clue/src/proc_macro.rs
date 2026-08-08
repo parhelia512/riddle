@@ -1,28 +1,30 @@
 use anyhow::{Context, bail};
 use ast::{self, support::AstNode};
 use frontend::incremental::IncrementalParser;
-use libloading::Library;
 use riddlec::proc_macro::{
     ProcMacroDefinition, ProcMacroDiagnostic, ProcMacroExpansion, ProcMacroExport, ProcMacroKind,
     ProcMacroProvider, ProcMacroTokenStream, ProcMacroTokenTree,
 };
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, c_char};
 use std::fmt::Write as _;
-use std::mem::size_of;
-use std::path::Path;
-use std::slice;
-use std::sync::Mutex;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::project::ProcMacroPackage;
 
 const MAX_PROC_MACRO_BYTES: usize = 16 * 1024 * 1024;
-const PROC_MACRO_API: &str = include_str!("../../../std/std/proc_macro.rid");
-const PROC_MACRO_ENTRY: &[u8] = b"riddle_proc_expand\0";
-const PROC_MACRO_ENTRY_X86: &[u8] = b"_riddle_proc_expand\0";
-// ponytail: process macro runtimes have mutable globals; use per-library locks if parallel
-// expansion becomes necessary.
-static PROC_MACRO_LOCK: Mutex<()> = Mutex::new(());
+const PROC_MACRO_PROTOCOL_VERSION: u32 = 1;
+const PROC_MACRO_TIMEOUT: Duration = Duration::from_secs(10);
+const PROC_MACRO_API: &str = concat!(
+    include_str!("../../../std/std/proc_macro.rid"),
+    "\n",
+    include_str!("../../../std/std/syn.rid")
+);
+static PROC_MACRO_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct HostMacroExport {
@@ -210,6 +212,177 @@ RIDDLE_PROC_EXPORT int riddle_proc_expand(
 }
 "#;
 
+const PROC_MACRO_RUNNER_C: &str = r#"#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+#define RIDDLE_PROC_MAX 16777216u
+
+typedef struct {
+    uint8_t level;
+    size_t start;
+    size_t end;
+    const char *message;
+    size_t message_len;
+} RiddleProcDiagnostic;
+
+typedef struct {
+    const char *output;
+    size_t output_len;
+    const RiddleProcDiagnostic *diagnostics;
+    size_t diagnostic_count;
+} RiddleProcResult;
+
+typedef int (*RiddleProcExpand)(
+    const char *, const char *, const char *, size_t, size_t, RiddleProcResult *
+);
+
+static int read_exact(void *buffer, size_t len) {
+    return len == 0u || fread(buffer, 1u, len, stdin) == len;
+}
+
+static int read_u32(uint32_t *value) {
+    unsigned char bytes[4];
+    if (fread(bytes, 1u, sizeof(bytes), stdin) != sizeof(bytes)) return 0;
+    *value = (uint32_t)bytes[0]
+        | ((uint32_t)bytes[1] << 8u)
+        | ((uint32_t)bytes[2] << 16u)
+        | ((uint32_t)bytes[3] << 24u);
+    return 1;
+}
+
+static uint32_t frame_u32(const unsigned char *frame, size_t offset) {
+    return (uint32_t)frame[offset]
+        | ((uint32_t)frame[offset + 1u] << 8u)
+        | ((uint32_t)frame[offset + 2u] << 16u)
+        | ((uint32_t)frame[offset + 3u] << 24u);
+}
+
+static int write_u32(uint32_t value) {
+    unsigned char bytes[4] = {
+        (unsigned char)(value & 0xffu),
+        (unsigned char)((value >> 8u) & 0xffu),
+        (unsigned char)((value >> 16u) & 0xffu),
+        (unsigned char)((value >> 24u) & 0xffu),
+    };
+    return fwrite(bytes, 1u, sizeof(bytes), stdout) == sizeof(bytes);
+}
+
+static int write_bytes(const void *value, size_t len) {
+    return len == 0u || (value && fwrite(value, 1u, len, stdout) == len);
+}
+
+static RiddleProcExpand load_expand(const char *path) {
+#if defined(_WIN32)
+    HMODULE library = LoadLibraryA(path);
+    if (!library) return NULL;
+    RiddleProcExpand expand = (RiddleProcExpand)(void *)GetProcAddress(library, "riddle_proc_expand");
+    if (!expand) expand = (RiddleProcExpand)(void *)GetProcAddress(library, "_riddle_proc_expand");
+    return expand;
+#else
+    void *library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!library) return NULL;
+    RiddleProcExpand expand = (RiddleProcExpand)dlsym(library, "riddle_proc_expand");
+    if (!expand) expand = (RiddleProcExpand)dlsym(library, "_riddle_proc_expand");
+    return expand;
+#endif
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+#if defined(_WIN32)
+    if (_setmode(_fileno(stdin), _O_BINARY) == -1
+        || _setmode(_fileno(stdout), _O_BINARY) == -1) return 1;
+    HMODULE runtime = LoadLibraryA("ucrtbase.dll");
+    if (runtime) {
+        typedef unsigned int (__cdecl *SetAbortBehavior)(unsigned int, unsigned int);
+        SetAbortBehavior set_abort_behavior =
+            (SetAbortBehavior)(void *)GetProcAddress(runtime, "_set_abort_behavior");
+        if (set_abort_behavior) {
+            set_abort_behavior(0u, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+        }
+    }
+#endif
+    RiddleProcExpand expand = load_expand(argv[1]);
+    if (!expand) return 1;
+
+    uint32_t frame_len = 0u;
+    if (!read_u32(&frame_len) || frame_len < 24u || frame_len > RIDDLE_PROC_MAX) return 1;
+    unsigned char *frame = (unsigned char *)malloc(frame_len);
+    if (!frame || !read_exact(frame, frame_len)) { free(frame); return 1; }
+
+    uint32_t version = frame_u32(frame, 0u);
+    uint32_t name_len = frame_u32(frame, 4u);
+    uint32_t input_len = frame_u32(frame, 8u);
+    uint32_t second_len = frame_u32(frame, 12u);
+    uint32_t call_start = frame_u32(frame, 16u);
+    uint32_t call_end = frame_u32(frame, 20u);
+    if (version != 1u || call_start > call_end
+        || name_len > frame_len - 24u
+        || input_len > frame_len - 24u - name_len
+        || second_len != frame_len - 24u - name_len - input_len) {
+        free(frame);
+        return 1;
+    }
+
+    char *name = (char *)malloc((size_t)name_len + 1u);
+    char *input = (char *)malloc((size_t)input_len + 1u);
+    char *second = (char *)malloc((size_t)second_len + 1u);
+    if (!name || !input || !second) {
+        free(name); free(input); free(second); free(frame); return 1;
+    }
+    memcpy(name, frame + 24u, name_len); name[name_len] = '\0';
+    memcpy(input, frame + 24u + name_len, input_len); input[input_len] = '\0';
+    memcpy(second, frame + 24u + name_len + input_len, second_len); second[second_len] = '\0';
+    free(frame);
+
+    RiddleProcResult result = {0};
+    int status = expand(name, input, second, call_start, call_end, &result);
+    free(name); free(input); free(second);
+    if (status != 0 || result.output_len > RIDDLE_PROC_MAX - 16u
+        || (result.output_len && !result.output)
+        || result.diagnostic_count > RIDDLE_PROC_MAX / sizeof(RiddleProcDiagnostic)
+        || (result.diagnostic_count && !result.diagnostics)) return 1;
+
+    size_t response_len = 16u + result.output_len;
+    for (size_t index = 0u; index < result.diagnostic_count; ++index) {
+        const RiddleProcDiagnostic *diagnostic = &result.diagnostics[index];
+        if (diagnostic->start > diagnostic->end
+            || diagnostic->end > UINT32_MAX
+            || diagnostic->message_len > RIDDLE_PROC_MAX - response_len
+            || 16u > RIDDLE_PROC_MAX - response_len - diagnostic->message_len
+            || (diagnostic->message_len && !diagnostic->message)) return 1;
+        response_len += 16u + diagnostic->message_len;
+    }
+    if (response_len > RIDDLE_PROC_MAX || result.diagnostic_count > UINT32_MAX) return 1;
+
+    if (!write_u32((uint32_t)response_len)
+        || !write_u32(1u)
+        || !write_u32((uint32_t)result.output_len)
+        || !write_u32((uint32_t)result.diagnostic_count)
+        || !write_u32(0u)
+        || !write_bytes(result.output, result.output_len)) return 1;
+    for (size_t index = 0u; index < result.diagnostic_count; ++index) {
+        const RiddleProcDiagnostic *diagnostic = &result.diagnostics[index];
+        if (!write_u32((uint32_t)diagnostic->level)
+            || !write_u32((uint32_t)diagnostic->start)
+            || !write_u32((uint32_t)diagnostic->end)
+            || !write_u32((uint32_t)diagnostic->message_len)
+            || !write_bytes(diagnostic->message, diagnostic->message_len)) return 1;
+    }
+    return fflush(stdout) == 0 ? 0 : 1;
+}
+"#;
+
 pub fn host_runtime_c(exports: &[HostMacroExport]) -> String {
     let mut output = String::from(HOST_RUNTIME_PREAMBLE);
     append_host_declarations(&mut output, exports);
@@ -217,6 +390,10 @@ pub fn host_runtime_c(exports: &[HostMacroExport]) -> String {
     append_host_dispatch(&mut output, exports);
     output.push_str(HOST_RUNTIME_ENTRY);
     output
+}
+
+pub const fn proc_macro_runner_c() -> &'static str {
+    PROC_MACRO_RUNNER_C
 }
 
 fn append_host_declarations(output: &mut String, exports: &[HostMacroExport]) {
@@ -463,42 +640,23 @@ fn c_escape(value: &str) -> String {
     escaped
 }
 
-#[repr(C)]
-struct ProcMacroFfiDiagnostic {
-    level: u8,
-    start: usize,
-    end: usize,
-    message: *const u8,
-    message_len: usize,
-}
-
-#[repr(C)]
-struct ProcMacroFfiResult {
-    output: *const u8,
-    output_len: usize,
-    diagnostics: *const ProcMacroFfiDiagnostic,
-    diagnostic_count: usize,
-}
-
-type ProcMacroExpandFn = unsafe extern "C" fn(
-    *const c_char,
-    *const c_char,
-    *const c_char,
-    usize,
-    usize,
-    *mut ProcMacroFfiResult,
-) -> i32;
-
 pub struct ProcMacroLibrary {
-    library: Library,
+    library: PathBuf,
+    runner: PathBuf,
 }
 
 impl ProcMacroLibrary {
-    pub(crate) fn load(path: &Path) -> anyhow::Result<Self> {
-        // SAFETY: this loads a compiler-generated library whose only initializer is the C runtime.
-        let library = unsafe { Library::new(path) }
-            .with_context(|| format!("failed to load proc-macro library `{}`", path.display()))?;
-        Ok(Self { library })
+    pub(crate) fn load(library: &Path, runner: &Path) -> anyhow::Result<Self> {
+        if !library.is_file() {
+            bail!("proc-macro library `{}` does not exist", library.display());
+        }
+        if !runner.is_file() {
+            bail!("proc-macro runner `{}` does not exist", runner.display());
+        }
+        Ok(Self {
+            library: library.to_owned(),
+            runner: runner.to_owned(),
+        })
     }
 
     pub(crate) fn expand(
@@ -510,117 +668,199 @@ impl ProcMacroLibrary {
     ) -> anyhow::Result<ProcMacroExpansion> {
         let input = input.encode();
         let second_input = second_input.cloned().unwrap_or_default().encode();
-        let payload_len = macro_name
+        if macro_name.as_bytes().contains(&0)
+            || input.as_bytes().contains(&0)
+            || second_input.as_bytes().contains(&0)
+        {
+            bail!("proc-macro request contains NUL");
+        }
+        let content_len = macro_name
             .len()
             .checked_add(input.len())
             .and_then(|len| len.checked_add(second_input.len()))
             .context("proc-macro request is too large")?;
+        let payload_len = 24usize
+            .checked_add(content_len)
+            .context("proc-macro request is too large")?;
         if payload_len > MAX_PROC_MACRO_BYTES {
             bail!("proc-macro request exceeds the size limit");
         }
-        let macro_name = CString::new(macro_name).context("proc-macro name contains NUL")?;
-        let input = CString::new(input).context("proc-macro input contains NUL")?;
-        let second_input =
-            CString::new(second_input).context("second proc-macro input contains NUL")?;
-        let mut result = ProcMacroFfiResult {
-            output: std::ptr::null(),
-            output_len: 0,
-            diagnostics: std::ptr::null(),
-            diagnostic_count: 0,
-        };
-        let _guard = PROC_MACRO_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("proc-macro library lock is poisoned"))?;
-        // SAFETY: both accepted names denote the generated C entry with this exact signature.
-        let expand = unsafe {
-            self.library
-                .get::<ProcMacroExpandFn>(PROC_MACRO_ENTRY)
-                .or_else(|_| self.library.get::<ProcMacroExpandFn>(PROC_MACRO_ENTRY_X86))
-        }
-        .context("proc-macro library does not export `riddle_proc_expand`")?;
-        // SAFETY: CString pointers live through the call and result points to writable storage.
-        let status = unsafe {
-            expand(
-                macro_name.as_ptr(),
-                input.as_ptr(),
-                second_input.as_ptr(),
-                call_site.start,
-                call_site.end,
-                &raw mut result,
-            )
-        };
-        if status != 0 {
-            bail!("proc-macro library rejected the expansion request");
+        let name_len = u32::try_from(macro_name.len()).context("proc-macro name is too large")?;
+        let input_len = u32::try_from(input.len()).context("proc-macro input is too large")?;
+        let second_len =
+            u32::try_from(second_input.len()).context("second proc-macro input is too large")?;
+        let call_start = u32::try_from(call_site.start)
+            .context("proc-macro call-site start exceeds the source range")?;
+        let call_end = u32::try_from(call_site.end)
+            .context("proc-macro call-site end exceeds the source range")?;
+        if call_start > call_end {
+            bail!("invalid proc-macro call-site span");
         }
 
-        let encoded_output = copy_ffi_text(result.output, result.output_len, "output")?;
-        let output = if encoded_output.is_empty() {
-            ProcMacroTokenStream::default()
-        } else {
-            ProcMacroTokenStream::decode(&encoded_output)
-                .map_err(anyhow::Error::msg)
-                .context("invalid structured proc-macro output")?
-        };
-        if result.diagnostic_count > MAX_PROC_MACRO_BYTES / size_of::<ProcMacroFfiDiagnostic>() {
-            bail!("proc-macro library returned too many diagnostics");
+        let request_id = PROC_MACRO_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let response_path = self.runner.with_file_name(format!(
+            ".riddle-proc-response-{}-{request_id}",
+            std::process::id()
+        ));
+        let response_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&response_path)
+            .with_context(|| {
+                format!(
+                    "failed to create proc-macro response `{}`",
+                    response_path.display()
+                )
+            })?;
+        let mut request = Vec::with_capacity(payload_len + 4);
+        request.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        request.extend_from_slice(&PROC_MACRO_PROTOCOL_VERSION.to_le_bytes());
+        request.extend_from_slice(&name_len.to_le_bytes());
+        request.extend_from_slice(&input_len.to_le_bytes());
+        request.extend_from_slice(&second_len.to_le_bytes());
+        request.extend_from_slice(&call_start.to_le_bytes());
+        request.extend_from_slice(&call_end.to_le_bytes());
+        request.extend_from_slice(macro_name.as_bytes());
+        request.extend_from_slice(input.as_bytes());
+        request.extend_from_slice(second_input.as_bytes());
+        let result = self.run(macro_name, &request, response_file, &response_path);
+        let _ = fs::remove_file(response_path);
+        result
+    }
+
+    fn run(
+        &self,
+        macro_name: &str,
+        request: &[u8],
+        response_file: fs::File,
+        response_path: &Path,
+    ) -> anyhow::Result<ProcMacroExpansion> {
+        let mut child = Command::new(&self.runner)
+            .arg(&self.library)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(response_file))
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to start proc-macro runner `{}`",
+                    self.runner.display()
+                )
+            })?;
+        let mut stdin = child.stdin.take().expect("piped stdin must be available");
+        let write_result = stdin.write_all(request);
+        drop(stdin);
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("failed to send proc-macro expansion request");
         }
-        let ffi_diagnostics = if result.diagnostic_count == 0 {
-            &[][..]
-        } else {
-            if result.diagnostics.is_null() {
-                bail!("proc-macro library returned a null diagnostic array");
+
+        let deadline = Instant::now() + PROC_MACRO_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait().context("failed to wait for proc-macro")? {
+                break status;
             }
-            // SAFETY: the library owns this array until the next locked expansion call.
-            unsafe { slice::from_raw_parts(result.diagnostics, result.diagnostic_count) }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "proc-macro `{macro_name}` exceeded the {} second timeout",
+                    PROC_MACRO_TIMEOUT.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
         };
-        let mut diagnostics = Vec::with_capacity(ffi_diagnostics.len());
-        let mut result_bytes = result.output_len;
-        for diagnostic in ffi_diagnostics {
-            let start = diagnostic.start;
-            let end = diagnostic.end;
-            if start > end {
-                bail!("invalid proc-macro diagnostic span");
-            }
-            result_bytes = result_bytes
-                .checked_add(size_of::<ProcMacroFfiDiagnostic>())
-                .and_then(|size| size.checked_add(diagnostic.message_len))
-                .context("proc-macro result is too large")?;
-            if result_bytes > MAX_PROC_MACRO_BYTES {
-                bail!("proc-macro result exceeds the size limit");
-            }
-            let message = copy_ffi_text(diagnostic.message, diagnostic.message_len, "diagnostic")?;
-            diagnostics.push(ProcMacroDiagnostic {
-                severity: match diagnostic.level {
-                    1 => type_checker::Severity::Warning,
-                    2 => type_checker::Severity::Note,
-                    3 => type_checker::Severity::Help,
-                    _ => type_checker::Severity::Error,
-                },
-                message,
-                span: start..end,
-            });
+        if !status.success() {
+            bail!("proc-macro `{macro_name}` process exited with {status}");
         }
-        Ok(ProcMacroExpansion {
-            output,
-            diagnostics,
-        })
+        parse_proc_macro_response(response_path)
     }
 }
 
-fn copy_ffi_text(pointer: *const u8, len: usize, kind: &str) -> anyhow::Result<String> {
-    if len > MAX_PROC_MACRO_BYTES {
-        bail!("proc-macro {kind} exceeds the size limit");
+fn parse_proc_macro_response(path: &Path) -> anyhow::Result<ProcMacroExpansion> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((MAX_PROC_MACRO_BYTES + 5) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PROC_MACRO_BYTES + 4 {
+        bail!("proc-macro result exceeds the size limit");
     }
-    if pointer.is_null() {
-        if len == 0 {
-            return Ok(String::new());
+    let mut cursor = 0usize;
+    let frame_len = take_u32(&bytes, &mut cursor)? as usize;
+    if !(16..=MAX_PROC_MACRO_BYTES).contains(&frame_len) || frame_len + 4 != bytes.len() {
+        bail!("invalid proc-macro response frame");
+    }
+    let version = take_u32(&bytes, &mut cursor)?;
+    if version != PROC_MACRO_PROTOCOL_VERSION {
+        bail!("unsupported proc-macro response version `{version}`");
+    }
+    let output_len = take_u32(&bytes, &mut cursor)? as usize;
+    let diagnostic_count = take_u32(&bytes, &mut cursor)? as usize;
+    if take_u32(&bytes, &mut cursor)? != 0 {
+        bail!("proc-macro response has an invalid status");
+    }
+    let encoded_output = take_text(&bytes, &mut cursor, output_len, "output")?;
+    let output = if encoded_output.is_empty() {
+        ProcMacroTokenStream::default()
+    } else {
+        ProcMacroTokenStream::decode(&encoded_output)
+            .map_err(anyhow::Error::msg)
+            .context("invalid structured proc-macro output")?
+    };
+    if diagnostic_count > (bytes.len().saturating_sub(cursor)) / 16 {
+        bail!("proc-macro response has too many diagnostics");
+    }
+    let mut diagnostics = Vec::with_capacity(diagnostic_count);
+    for _ in 0..diagnostic_count {
+        let level = take_u32(&bytes, &mut cursor)?;
+        let start = take_u32(&bytes, &mut cursor)? as usize;
+        let end = take_u32(&bytes, &mut cursor)? as usize;
+        let message_len = take_u32(&bytes, &mut cursor)? as usize;
+        if start > end {
+            bail!("invalid proc-macro diagnostic span");
         }
-        bail!("proc-macro library returned a null {kind} pointer");
+        diagnostics.push(ProcMacroDiagnostic {
+            severity: match level {
+                1 => type_checker::Severity::Warning,
+                2 => type_checker::Severity::Note,
+                3 => type_checker::Severity::Help,
+                _ => type_checker::Severity::Error,
+            },
+            message: take_text(&bytes, &mut cursor, message_len, "diagnostic")?,
+            span: start..end,
+        });
     }
-    // SAFETY: callers hold PROC_MACRO_LOCK and the library keeps result buffers alive until
-    // the next expansion.
-    let bytes = unsafe { slice::from_raw_parts(pointer, len) };
-    String::from_utf8(bytes.to_vec()).with_context(|| format!("proc-macro {kind} is not UTF-8"))
+    if cursor != bytes.len() {
+        bail!("proc-macro response has trailing bytes");
+    }
+    Ok(ProcMacroExpansion {
+        output,
+        diagnostics,
+    })
+}
+
+fn take_u32(bytes: &[u8], cursor: &mut usize) -> anyhow::Result<u32> {
+    let end = cursor
+        .checked_add(4)
+        .context("proc-macro response is too large")?;
+    let value = bytes
+        .get(*cursor..end)
+        .context("truncated proc-macro response")?
+        .try_into()
+        .expect("four-byte slice");
+    *cursor = end;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn take_text(bytes: &[u8], cursor: &mut usize, len: usize, kind: &str) -> anyhow::Result<String> {
+    let end = cursor
+        .checked_add(len)
+        .context("proc-macro response is too large")?;
+    let value = bytes
+        .get(*cursor..end)
+        .with_context(|| format!("truncated proc-macro {kind}"))?;
+    *cursor = end;
+    String::from_utf8(value.to_vec()).with_context(|| format!("proc-macro {kind} is not UTF-8"))
 }
 
 pub struct ClueProcMacroProvider {
@@ -653,7 +893,7 @@ impl ClueProcMacroProvider {
                     errors.join("; ")
                 );
             }
-            let library =
+            let artifacts =
                 crate::build::build_proc_macro_library(package, &exports, &expansion.source)?;
             for export in &exports {
                 let range = rowan::TextRange::new(
@@ -694,9 +934,10 @@ impl ClueProcMacroProvider {
                     })
                     .collect(),
             );
-            provider
-                .libraries
-                .insert(package.alias.clone(), ProcMacroLibrary::load(&library)?);
+            provider.libraries.insert(
+                package.alias.clone(),
+                ProcMacroLibrary::load(&artifacts.library, &artifacts.runner)?,
+            );
         }
         Ok(provider)
     }

@@ -13,7 +13,10 @@ use super::{
         build_macro_reexports, collect_scoped_statements, diagnostic, parse_derive_invocations,
         parse_derive_paths, parse_proc_macro_use_resolved, range,
     },
-    standard::{expand_standard_derive_macro, expand_standard_print_macro},
+    standard::{
+        expand_standard_derive_macro, expand_standard_format_macro, expand_standard_print_macro,
+        expand_standard_quote_macro,
+    },
     token_stream::{ProcMacroDelimiter, ProcMacroTokenStream, ProcMacroTokenTree},
 };
 
@@ -558,7 +561,11 @@ pub(super) fn standard_macro(name: &str, kind: ProcMacroKind) -> Option<Imported
         package: STANDARD_MACRO_PACKAGE.into(),
         macro_name: name.into(),
         kind,
-        helper_attributes: Vec::new(),
+        helper_attributes: if name == "Default" {
+            vec!["default".into()]
+        } else {
+            Vec::new()
+        },
         binding: None,
         definition: None,
     })
@@ -1310,7 +1317,12 @@ fn expand_function_action(
         }
     };
     let output = if imported.package == STANDARD_MACRO_PACKAGE {
-        match expand_standard_print_macro(&imported.macro_name, &input, &call_site) {
+        let expanded = match imported.macro_name.as_str() {
+            "quote" => expand_standard_quote_macro(&input, &call_site),
+            "format" => expand_standard_format_macro(&input, &call_site),
+            _ => expand_standard_print_macro(&imported.macro_name, &input, &call_site),
+        };
+        match expanded {
             Ok(output) => output,
             Err((span, message)) => {
                 diagnostics.push(diagnostic(span, message, Severity::Error));

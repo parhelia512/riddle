@@ -173,7 +173,7 @@ fn standard_print_macros_expand_and_type_check() {
         fun main() -> i32 {
             print!();
             print!("value={} {{ok}}", 7);
-            println!(" {}", true,);
+            println!(" {:?} {}", true, 9,);
             println!();
             0
         }
@@ -189,6 +189,22 @@ fn standard_print_macros_expand_and_type_check() {
     assert!(!expanded.source.contains("print!("));
     assert!(!expanded.source.contains("println!("));
     assert!(expanded.source.contains("crate :: std :: io :: print"));
+    assert!(expanded.source.contains("crate :: std :: io :: println"));
+    assert!(
+        expanded
+            .source
+            .contains("crate :: std :: fmt :: append_display")
+    );
+    assert!(
+        expanded
+            .source
+            .contains("crate :: std :: fmt :: append_debug")
+    );
+    assert!(
+        !expanded
+            .source
+            .contains("crate :: std :: io :: print_debug")
+    );
     assert_eq!(
         expanded
             .macro_occurrences
@@ -197,6 +213,40 @@ fn standard_print_macros_expand_and_type_check() {
             .collect::<Vec<_>>(),
         ["print", "print", "println", "println"]
     );
+
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?}\n{}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        expanded.source
+    );
+}
+
+#[test]
+fn standard_format_macro_expands_to_string_and_type_checks() {
+    let source = r#"
+        fun main() -> i32 {
+            let value = String::from_str("value");
+            let message = format!("{}={} {:?} {{done}}", value, 7, true);
+            if message.as_str() == "value=7 true {done}" { 0 } else { 1 }
+        }
+    "#;
+    let expanded = expand_standard_macros(source);
+
+    assert!(
+        expanded.diagnostics.is_empty(),
+        "{:?}\n{}",
+        expanded.diagnostics,
+        expanded.source
+    );
+    assert!(!expanded.source.contains("format!("));
+    assert!(expanded.macro_occurrences.iter().any(|occurrence| {
+        occurrence.name == "format" && occurrence.kind == ProcMacroKind::FunctionLike
+    }));
 
     let result = check_with_options(source, CompileOptions { use_std: true });
     assert!(
@@ -263,6 +313,236 @@ fn standard_debug_derive_expands_and_type_checks() {
 }
 
 #[test]
+fn standard_derives_expand_and_type_check() {
+    let source = r#"
+        #[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+        struct Pair<T> {
+            left: T,
+            right: bool,
+        }
+
+        #[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+        enum Message<T> {
+            #[default]
+            Empty,
+            Tuple(T, i32),
+            Named { value: T },
+        }
+
+        fun require_eq<T: Eq>(_value: &T) {}
+
+        fun main() -> i32 {
+            let pair = Pair { left: 7, right: true };
+            let copied = pair;
+            let cloned = pair.clone();
+            let default_pair: Pair<i32> = Default::default();
+            let _pair_hash = pair.hash();
+            let _pair_ordering = pair.cmp(&copied);
+            let _pair_partial_ordering = pair.partial_cmp(&copied);
+            require_eq(&cloned);
+            if pair != copied || copied != cloned {
+                return 1;
+            }
+
+            let message = Message::Named { value: 7 };
+            let copied_message = message;
+            let cloned_message = message.clone();
+            let default_message: Message<i32> = Default::default();
+            let _message_hash = message.hash();
+            let _message_ordering = message.cmp(&copied_message);
+            let _message_partial_ordering = message.partial_cmp(&copied_message);
+            if message != copied_message || copied_message != cloned_message {
+                return 2;
+            }
+            0
+        }
+    "#;
+    let expanded = expand_standard_macros(source);
+
+    assert!(
+        expanded.diagnostics.is_empty(),
+        "{:?}\n{}",
+        expanded.diagnostics,
+        expanded.source
+    );
+    for trait_name in [
+        "Debug",
+        "Clone",
+        "Copy",
+        "Default",
+        "Hash",
+        "PartialEq",
+        "Eq",
+        "PartialOrd",
+        "Ord",
+    ] {
+        assert!(
+            expanded
+                .macro_occurrences
+                .iter()
+                .any(|occurrence| occurrence.name == trait_name),
+            "missing {trait_name} occurrence: {:#?}",
+            expanded.macro_occurrences
+        );
+    }
+
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?}\n{}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        expanded.source
+    );
+}
+
+#[test]
+fn standard_default_derive_requires_one_unit_default_variant() {
+    let missing = expand_standard_macros("#[derive(Default)] enum Missing { A, B }");
+    assert!(missing.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("requires exactly one `#[default]` variant")
+    }));
+
+    let non_unit =
+        expand_standard_macros("#[derive(Default)] enum NonUnit { #[default] Value(i32) }");
+    assert!(
+        non_unit
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("must be a unit variant"))
+    );
+
+    let multiple = expand_standard_macros(
+        "#[derive(Default)] enum Multiple { #[default] First, #[default] Second }",
+    );
+    assert!(multiple.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("requires exactly one `#[default]` variant")
+    }));
+
+    let unrelated = expand_standard_macros("#[derive(Clone)] enum Unrelated { #[default] Value }");
+    assert!(unrelated.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("cannot find attribute `default`")
+    }));
+}
+
+#[test]
+fn standard_clone_derive_supports_generic_structs() {
+    let source = r#"
+        #[derive(Clone)]
+        struct Wrapper<T> { value: T }
+
+        fun clone_wrapper<T: Clone>(value: &Wrapper<T>) -> Wrapper<T> {
+            value.clone()
+        }
+    "#;
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics
+    );
+}
+
+#[test]
+fn standard_partial_eq_derive_supports_generic_structs() {
+    let source = r#"
+        #[derive(PartialEq)]
+        struct Wrapper<T> { value: T }
+
+        fun equal_wrappers<T: PartialEq>(left: &Wrapper<T>, right: &Wrapper<T>) -> bool {
+            left.eq(right)
+        }
+    "#;
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics
+    );
+}
+
+#[test]
+fn standard_eq_derive_supports_generic_structs() {
+    let source = r#"
+        #[derive(PartialEq, Eq)]
+        struct Wrapper<T> { value: T }
+
+        fun require_eq<T: Eq>(_value: &T) {}
+
+        fun require_wrapper_eq<T: Eq>(value: &Wrapper<T>) {
+            require_eq(value);
+        }
+    "#;
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics
+    );
+}
+
+#[test]
+fn standard_clone_derive_supports_generic_enums() {
+    let source = r#"
+        #[derive(Clone)]
+        enum Maybe<T> { Some(T), None }
+
+        fun clone_maybe() -> Maybe<i32> {
+            Maybe::Some(7).clone()
+        }
+    "#;
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics
+    );
+}
+
+#[test]
+fn standard_partial_eq_derive_supports_generic_enums() {
+    let source = r#"
+        #[derive(PartialEq)]
+        enum Maybe<T> { Some(T), None }
+
+        fun equal_maybe() -> bool {
+            Maybe::Some(7) == Maybe::Some(7)
+        }
+    "#;
+    let expanded = expand_standard_macros(source);
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?}\n{}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        expanded.source
+    );
+}
+
+#[test]
 fn standard_print_macros_reject_invalid_format_strings() {
     let mismatch = expand_standard_macros(r#"fun main() { print!("{} {}", 1); }"#);
     assert_eq!(mismatch.diagnostics.len(), 1);
@@ -279,6 +559,22 @@ fn standard_print_macros_reject_invalid_format_strings() {
     assert_eq!(unsupported.diagnostics.len(), 1);
     assert_eq!(
         unsupported.diagnostics[0].message,
+        format!("only `{open}{close}` and `{open}:?{close}` format placeholders are supported")
+    );
+
+    let format_mismatch = expand_standard_macros(r#"fun main() { let _ = format!("{} {}", 1); }"#);
+    assert_eq!(format_mismatch.diagnostics.len(), 1);
+    assert!(
+        format_mismatch.diagnostics[0]
+            .message
+            .contains("2 placeholder(s), but 1 argument(s)")
+    );
+
+    let format_unsupported =
+        expand_standard_macros(r#"fun main() { let _ = format!("{:x}", 1); }"#);
+    assert_eq!(format_unsupported.diagnostics.len(), 1);
+    assert_eq!(
+        format_unsupported.diagnostics[0].message,
         format!("only `{open}{close}` and `{open}:?{close}` format placeholders are supported")
     );
 }
@@ -432,6 +728,194 @@ fn proc_macro_api_type_checks() {
     "#;
 
     let source = format!("{}\n{source}", include_str!("../../std/std/proc_macro.rid"));
+    let result = check_with_options(&source, CompileOptions::default());
+    assert!(
+        result.success(),
+        "parse={:?} hir={:?} type={:?} analysis={:?}",
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn syn_derive_input_api_type_checks() {
+    let syn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/std/syn.rid"),
+    )
+    .expect("the built-in syn module source should exist");
+    let source = r#"
+        use syn::{Data, DeriveInput, GenericParam, Parse, ToTokens, parse, parse_str};
+
+        fun inspect(input: TokenStream) -> TokenStream {
+            let parsed: DeriveInput = match parse::<DeriveInput>(input) {
+                Result::Ok(value) => value,
+                Result::Err(error) => {
+                    error.emit();
+                    return TokenStream::new();
+                },
+            };
+            let mut metadata = TokenStream::new();
+            parsed.generics.tokens.to_tokens(&mut metadata);
+            parsed.generics.where_clause.to_tokens(&mut metadata);
+            for param in parsed.generics.params.as_slice() {
+                match param {
+                    GenericParam::Type(param) => param.to_tokens(&mut metadata),
+                    GenericParam::Const(param) => param.to_tokens(&mut metadata),
+                }
+            }
+            for predicate in parsed.generics.predicates.as_slice() {
+                predicate.ty.to_tokens(&mut metadata);
+            }
+            let reparsed = parse_str::<DeriveInput>(parsed.to_token_stream().to_string().as_str());
+            match &parsed.data {
+                Data::Struct(data) => {
+                    data.fields.to_tokens(&mut metadata);
+                    for field in data.named.as_slice() {
+                        field.ty.to_tokens(&mut metadata);
+                    }
+                },
+                Data::Enum(data) => {
+                    data.variants.to_tokens(&mut metadata);
+                    for variant in data.items.as_slice() {
+                        variant.to_tokens(&mut metadata);
+                    }
+                },
+            }
+            match reparsed {
+                Result::Ok(value) => value.to_token_stream(),
+                Result::Err(error) => {
+                    error.emit();
+                    TokenStream::new()
+                },
+            }
+        }
+    "#;
+
+    let source = format!(
+        "{}\n{syn}\n{source}",
+        include_str!("../../std/std/proc_macro.rid")
+    );
+    let result = check_with_options(&source, CompileOptions::default());
+    assert!(
+        result.success(),
+        "parse={:?} hir={:?} type={:?} analysis={:?}",
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn syn_core_syntax_categories_type_check() {
+    let syn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/std/syn.rid"),
+    )
+    .expect("the built-in syn module source should exist");
+    let source = r#"
+        use syn::{Expr, File, Item, Pat, Stmt, ToTokens, Type, parse_str};
+
+        fun inspect_syntax() -> TokenStream {
+            let file = match parse_str::<File>("const ANSWER: i32 = 42;") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return TokenStream::new(); },
+            };
+            let item = match parse_str::<Item>("fun answer() -> i32 { 42 }") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return TokenStream::new(); },
+            };
+            let stmt = match parse_str::<Stmt>("let value = 42;") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return TokenStream::new(); },
+            };
+            let expr = match parse_str::<Expr>("value + 1") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return TokenStream::new(); },
+            };
+            let ty = match parse_str::<Type>("&mut [i32; 3]") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return TokenStream::new(); },
+            };
+            let const_ty = match parse_str::<Type>("3") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return TokenStream::new(); },
+            };
+            let pat = match parse_str::<Pat>("Option::Some(value)") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return TokenStream::new(); },
+            };
+
+            let mut output = TokenStream::new();
+            file.to_tokens(&mut output);
+            match &item { Item::Function(tokens) => tokens.to_tokens(&mut output), _ => {} }
+            match &stmt { Stmt::Local(tokens) => tokens.to_tokens(&mut output), _ => {} }
+            match &expr { Expr::Binary(tokens) => tokens.to_tokens(&mut output), _ => {} }
+            match &ty { Type::Reference(tokens) => tokens.to_tokens(&mut output), _ => {} }
+            match &const_ty { Type::Const(tokens) => tokens.to_tokens(&mut output), _ => {} }
+            match &pat { Pat::Enum(tokens) => tokens.to_tokens(&mut output), _ => {} }
+            output
+        }
+    "#;
+
+    let source = format!(
+        "{}\n{syn}\n{source}",
+        include_str!("../../std/std/proc_macro.rid")
+    );
+    let result = check_with_options(&source, CompileOptions::default());
+    assert!(
+        result.success(),
+        "parse={:?} hir={:?} type={:?} analysis={:?}",
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn syn_visit_and_fold_api_type_checks() {
+    let syn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/std/syn.rid"),
+    )
+    .expect("the built-in syn module source should exist");
+    let source = r#"
+        use crate::std::vector::Vector;
+        use syn::{File, Fold, Item, Visit, fold_file, parse_str, walk_item};
+
+        struct ItemVisitor { pub count: usize }
+
+        impl Visit for ItemVisitor {
+            fun visit_item(&mut self, node: &Item) {
+                self.count += 1usize;
+                walk_item(self, node);
+            }
+        }
+
+        struct IdentityFolder {}
+        impl Fold for IdentityFolder {}
+
+        fun transform() -> File {
+            let file = match parse_str::<File>("const A: i32 = 1; fun answer() -> i32 { A }") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return File { stmts: Vector::new() }; },
+            };
+            let mut visitor = ItemVisitor { count: 0usize };
+            visitor.visit_file(&file);
+            let folded = match parse_str::<File>("const A: i32 = 1; fun answer() -> i32 { A }") {
+                Result::Ok(value) => value,
+                Result::Err(error) => { error.emit(); return File { stmts: Vector::new() }; },
+            };
+            let mut folder = IdentityFolder {};
+            fold_file(&mut folder, folded)
+        }
+    "#;
+
+    let source = format!(
+        "{}\n{syn}\n{source}",
+        include_str!("../../std/std/proc_macro.rid")
+    );
     let result = check_with_options(&source, CompileOptions::default());
     assert!(
         result.success(),

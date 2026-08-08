@@ -81,21 +81,24 @@ impl SourceMap {
     pub fn map_range(&self, range: rowan::TextRange) -> Option<MappedSource<'_>> {
         let start = usize::from(range.start());
         let end = usize::from(range.end());
-        let segment = self
+        let (segment, mapped_range) = self
             .segments
             .iter()
             .filter(|segment| segment.generated.contains(&start) && end <= segment.generated.end)
             .min_by_key(|segment| segment.generated.len())
+            .map(|segment| (segment, None))
             .or_else(|| {
                 if end == start {
                     self.segments
                         .iter()
                         .find(|segment| segment.generated.end == start)
+                        .map(|segment| (segment, None))
                 } else {
                     None
                 }
             })
             .or_else(|| {
+                // A diagnostic can span copied tokens and synthetic macro output.
                 let first = self
                     .segments
                     .iter()
@@ -107,15 +110,36 @@ impl SourceMap {
                     .iter()
                     .filter(|segment| segment.generated.contains(&last_offset))
                     .min_by_key(|segment| segment.generated.len())?;
-                (first.path == last.path
-                    && first.source == last.source
-                    && first.synthetic.is_some()
-                    && first.synthetic == last.synthetic)
-                    .then_some(first)
+                if first.path != last.path || first.source != last.source {
+                    return None;
+                }
+
+                let mut segments = self.segments.iter().filter(|segment| {
+                    segment.generated.start < end && start < segment.generated.end
+                });
+                let mut original_start = usize::MAX;
+                let mut original_end = 0;
+                for segment in &mut segments {
+                    if segment.path != first.path || segment.source != first.source {
+                        return None;
+                    }
+                    let mapped = segment.synthetic.clone().unwrap_or_else(|| {
+                        let overlap_start = start.max(segment.generated.start);
+                        let overlap_end = end.min(segment.generated.end);
+                        let original_start =
+                            segment.original_start + overlap_start - segment.generated.start;
+                        original_start..original_start + overlap_end - overlap_start
+                    });
+                    original_start = original_start.min(mapped.start);
+                    original_end = original_end.max(mapped.end);
+                }
+                Some((first, Some(original_start..original_end)))
             })?;
-        let original = segment.synthetic.clone().unwrap_or_else(|| {
-            let original_start = segment.original_start + start - segment.generated.start;
-            original_start..original_start + end - start
+        let original = mapped_range.unwrap_or_else(|| {
+            segment.synthetic.clone().unwrap_or_else(|| {
+                let original_start = segment.original_start + start - segment.generated.start;
+                original_start..original_start + end - start
+            })
         });
         Some(MappedSource {
             path: &segment.path,

@@ -664,12 +664,46 @@ impl<'a> TypeChecker<'a> {
         self.record_value_use(&mut ctx, body.root_block, crate::result::ValueUse::Move);
 
         if !actual.is_never() {
-            self.expect_assignable(
-                &return_ty,
-                &actual,
-                "function return",
-                ctx.expr_range(body.root_block),
-            );
+            let diagnostic_start = self.result.diagnostics.len();
+            let tail_range = match &body.exprs[body.root_block] {
+                Expr::Block {
+                    tail: Some(tail), ..
+                } => body.source_map.expr_ranges.get(tail).copied(),
+                Expr::Block { tail: None, .. } => None,
+                _ => None,
+            };
+            let body_range = ctx.expr_range(body.root_block);
+            self.expect_assignable(&return_ty, &actual, "function return", body_range);
+            if let Some(diagnostic) = self.result.diagnostics.get_mut(diagnostic_start) {
+                let return_range = function.ret_type_range.unwrap_or(function.name_range);
+                let expected = return_ty.display(self.hir);
+                let actual = actual.display(self.hir);
+                let (primary_range, secondary_range, secondary_message) =
+                    tail_range.map_or_else(
+                        || {
+                            (
+                                return_range,
+                                function.name_range,
+                                "implicitly returns `()` as its body has no tail or `return` expression"
+                                    .into(),
+                            )
+                        },
+                        |tail_range| {
+                            (
+                                tail_range,
+                                return_range,
+                                format!("expected `{expected}` because of return type"),
+                            )
+                        },
+                    );
+                diagnostic.labels[0].range = primary_range;
+                diagnostic.labels[0].message = format!("expected `{expected}`, found `{actual}`");
+                diagnostic.labels.push(SourceLabel {
+                    range: secondary_range,
+                    message: secondary_message,
+                    style: LabelStyle::Secondary,
+                });
+            }
         }
         self.finish_inference(&ctx);
     }

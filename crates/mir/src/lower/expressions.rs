@@ -777,11 +777,9 @@ impl LowerCtx<'_> {
     ) -> Value {
         if let Some(value) = self.lower_static_trait_call(
             builder,
+            input.param_values,
             input.body,
-            input.expr_id,
-            callee,
-            args,
-            input.mir_type.clone(),
+            (input.expr_id, callee, args, input.mir_type.clone()),
         ) {
             return self.finish_expr(builder, input, value);
         }

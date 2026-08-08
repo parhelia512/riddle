@@ -113,26 +113,21 @@ impl TraitEnv {
         if depth > 64 {
             return false;
         }
-        match ty {
-            Type::InferInt => {
-                return self.type_implements_inner(
-                    &Type::Int(IntTy::I32),
-                    trait_id,
-                    trait_args,
-                    assumptions,
-                    depth,
-                );
-            }
-            Type::InferFloat => {
-                return self.type_implements_inner(
-                    &Type::Float(FloatTy::F64),
-                    trait_id,
-                    trait_args,
-                    assumptions,
-                    depth,
-                );
-            }
-            _ => {}
+        if matches!(ty, Type::InferInt | Type::InferFloat) {
+            let ty = match ty {
+                Type::InferInt => Type::Int(IntTy::I32),
+                Type::InferFloat => Type::Float(FloatTy::F64),
+                _ => unreachable!(),
+            };
+            let trait_args = trait_args
+                .iter()
+                .map(|arg| match arg {
+                    Type::InferInt => Type::Int(IntTy::I32),
+                    Type::InferFloat => Type::Float(FloatTy::F64),
+                    other => other.clone(),
+                })
+                .collect::<Vec<_>>();
+            return self.type_implements_inner(&ty, trait_id, &trait_args, assumptions, depth);
         }
         if assumptions.iter().any(|bound| {
             bound.trait_id == trait_id

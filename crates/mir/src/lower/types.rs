@@ -1,7 +1,7 @@
 use super::{
     FloatTy, FnPtrType, HashMap, IntTy, LowerCtx, ResolvedName, StructType, Type,
     closure_value_type, is_self_associated_path, mono_name_from_parts, mono_type_name,
-    tc_const_arg_to_usize,
+    mono_type_symbol, tc_const_arg_to_usize,
 };
 
 impl LowerCtx<'_> {
@@ -119,8 +119,8 @@ impl LowerCtx<'_> {
         match t {
             hir::item_tree::HirTypeRef::Never => Type::Never,
             hir::item_tree::HirTypeRef::Named(path) => {
-                if let Some(ResolvedName::TypeAlias(alias)) =
-                    self.hir.type_resolutions.get(&path.range)
+                let resolved = self.hir.type_resolutions.get(&path.range);
+                if let Some(ResolvedName::TypeAlias(alias)) = resolved
                     && let Some(ty) = &self.hir.item_tree.type_aliases[*alias].ty
                 {
                     return self.convert_hir_type(ty);
@@ -135,6 +135,15 @@ impl LowerCtx<'_> {
                     && let Some(ty) = self.generic_subst.get(name)
                 {
                     return ty.clone();
+                }
+                match resolved {
+                    Some(ResolvedName::Struct(sid)) => {
+                        return self.convert_struct_type_from_hir_args(*sid, &path.type_args);
+                    }
+                    Some(ResolvedName::Enum(eid)) => {
+                        return self.convert_enum_type_from_hir_args(*eid, &path.type_args);
+                    }
+                    _ => {}
                 }
                 match path.segments.last().map(|n| n.0.as_str()) {
                     Some("bool") => Type::Bool,
@@ -368,8 +377,16 @@ impl LowerCtx<'_> {
             .map(mono_type_name)
             .chain(const_args.iter().map(std::string::ToString::to_string))
             .collect::<Vec<_>>();
+        let name = mono_name_from_parts(&s.name.0, &name_args);
+        let symbol_args = type_args
+            .iter()
+            .map(mono_type_symbol)
+            .chain(const_args.iter().map(std::string::ToString::to_string))
+            .collect::<Vec<_>>();
+        let symbol = mono_name_from_parts(&s.name.0, &symbol_args);
         Type::Struct(StructType {
-            name: mono_name_from_parts(&s.name.0, &name_args),
+            symbol: format!("struct::{}::{symbol}", sid.into_raw().into_u32()),
+            name,
             fields,
         })
     }
@@ -460,8 +477,16 @@ impl LowerCtx<'_> {
             .map(mono_type_name)
             .chain(const_args.iter().map(std::string::ToString::to_string))
             .collect::<Vec<_>>();
+        let name = mono_name_from_parts(&e.name.0, &name_args);
+        let symbol_args = type_args
+            .iter()
+            .map(mono_type_symbol)
+            .chain(const_args.iter().map(std::string::ToString::to_string))
+            .collect::<Vec<_>>();
+        let symbol = mono_name_from_parts(&e.name.0, &symbol_args);
         Type::Struct(StructType {
-            name: mono_name_from_parts(&e.name.0, &name_args),
+            symbol: format!("enum::{}::{symbol}", eid.into_raw().into_u32()),
+            name,
             fields,
         })
     }

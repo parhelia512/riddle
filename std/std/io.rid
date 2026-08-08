@@ -8,17 +8,17 @@ fun expect_written(result: crate::std::fmt::Result) {
 }
 
 pub fun print<T: Display>(value: &T) {
-    let mut formatter = Formatter {};
+    let mut formatter = Formatter::stdout();
     expect_written(value.fmt(&mut formatter));
 }
 
 pub fun println<T: Display>(value: &T) {
-    let mut formatter = Formatter {};
+    let mut formatter = Formatter::stdout();
     expect_written(value.fmt(&mut formatter));
     expect_written(formatter.write_char('\n'));
 }
 
 pub fun print_debug<T: Debug>(value: &T) {
-    let mut formatter = Formatter {};
+    let mut formatter = Formatter::stdout();
     expect_written(write_debug(value, &mut formatter));
 }

@@ -1,7 +1,7 @@
 use super::{
-    Body, Builder, BuiltinOperator, Expr, ExprId, FuncRef, HirBinOp, HirTypeRef, HirUnOp, Inst,
-    InstKind, IntTy, LowerCtx, PathAnchor, ResolvedName, Type, UnOp, Value,
-    builtin_comparison_types, comparison_trait, convert_cmp_op, convert_unop,
+    Body, Builder, BuiltinOperator, ExprId, FuncRef, HirBinOp, HirTypeRef, HirUnOp, Inst, InstKind,
+    IntTy, LowerCtx, PathAnchor, Type, UnOp, Value, builtin_comparison_types, comparison_trait,
+    convert_cmp_op, convert_unop,
 };
 
 impl LowerCtx<'_> {
@@ -95,35 +95,34 @@ impl LowerCtx<'_> {
     pub(super) fn lower_static_trait_call(
         &mut self,
         builder: &mut Builder,
+        param_values: &[Value],
         body: &Body,
-        expr_id: ExprId,
-        callee: ExprId,
-        args: &[ExprId],
-        result_ty: Type,
+        call: (ExprId, ExprId, &[ExprId], Type),
     ) -> Option<Value> {
-        if !args.is_empty()
-            || !matches!(
-                body.exprs[callee],
-                Expr::Path {
-                    resolved: Some(ResolvedName::Trait(_)),
-                    ..
-                }
-            )
-        {
-            return None;
-        }
+        let (expr_id, callee, args, result_ty) = call;
         let body_id = self.current_body?;
         let call = self
             .type_result
             .trait_method_calls
             .get(&(body_id, expr_id))
             .cloned()?;
-        let receiver_ty = self.type_result.expr_types.get(&(body_id, expr_id))?;
+        let receiver_ty = self.type_result.expr_types.get(&(body_id, callee))?;
         let fid = self.find_trait_impl_method(call.trait_id, &call.method, receiver_ty, None)?;
         let name = self
             .mono_method_name_for_receiver(fid, receiver_ty, None)
             .unwrap_or_else(|| self.function_name(fid));
-        Some(builder.call(FuncRef::Local(name), Vec::new(), result_ty))
+        let values = if let hir::body::Expr::FieldAccess { base, .. } = &body.exprs[callee] {
+            let receiver_ty = self.hir.item_tree.functions[fid].params.first()?.ty.clone();
+            let receiver =
+                self.lower_receiver_arg(builder, param_values, body, *base, &receiver_ty);
+            let mut values =
+                self.lower_expr_sequence(builder, param_values, body, expr_id, 1, args);
+            values.insert(0, receiver);
+            values
+        } else {
+            self.lower_expr_sequence(builder, param_values, body, expr_id, 0, args)
+        };
+        Some(builder.call(FuncRef::Local(name), values, result_ty))
     }
 
     pub(super) fn lower_operator_call(

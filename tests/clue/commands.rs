@@ -1107,10 +1107,32 @@ fun main() -> i32 {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.ends_with("value=7 {ok} 1 2\n\n"), "stdout: {stdout}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn macro_diagnostics_show_original_source() {
+    let root = temp_root("macro-diagnostics");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        "fun main() -> i32 {\n    let value = format!(\"{}\", 1);\n    print!(\"{}\", value);\n}\n",
+    )
+    .unwrap();
+
+    let output = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("fun main() -> i32 {"), "{stderr}");
+    assert!(!stderr.contains("__riddle_format_"), "{stderr}");
+    assert!(stderr.contains("main.rid:1:15"), "{stderr}");
     assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .replace("\r\n", "\n")
-            .ends_with("value=7 {ok} 1 2\n\n")
+        stderr.contains("implicitly returns `()` as its body has no tail or `return` expression"),
+        "{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -1176,6 +1198,148 @@ Move(10, 20)\n\
 Paint { color: Point { x: 1, y: 2 }, visible: false }\n\
 \"line\\n\" '\\t'\n"
             )
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn standard_derives_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping standard derive runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("standard-derives");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"#[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct Point { x: i32, y: i32 }
+
+#[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct Wrapper<T> { value: T }
+
+#[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+enum Message {
+    #[default]
+    Quit,
+    Move(i32, i32),
+    Paint { color: Point, visible: bool },
+}
+
+struct Unordered {}
+
+impl PartialEq for Unordered {
+    fun eq(&self, other: &Self) -> bool { true }
+}
+
+impl PartialOrd for Unordered {
+    fun partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { None }
+}
+
+#[derive(PartialEq, PartialOrd)]
+struct ContainsUnordered { value: Unordered }
+
+fun require_eq<T: Eq>(_value: &T) {}
+
+fun main() -> i32 {
+    let point = Point { x: 3, y: 4 };
+    let copied = point;
+    let cloned = point.clone();
+    require_eq(&cloned);
+    if point != copied || copied != cloned {
+        return 1;
+    }
+    let default_point: Point = Default::default();
+    if default_point.x != 0 || default_point.y != 0 {
+        return 4;
+    }
+    if point.hash() != cloned.hash() {
+        return 5;
+    }
+    let later = Point { x: 3, y: 5 };
+    if point.hash() == later.hash() {
+        return 14;
+    }
+    if !(point < later) {
+        return 6;
+    }
+    match point.cmp(&cloned) {
+        std::cmp::Ordering::Equal => {},
+        _ => { return 7; },
+    }
+    match point.partial_cmp(&later) {
+        Some(std::cmp::Ordering::Less) => {},
+        _ => { return 8; },
+    }
+
+    let wrapped = Wrapper { value: point };
+    let copied_wrapper = wrapped;
+    let cloned_wrapper = wrapped.clone();
+    require_eq(&cloned_wrapper);
+    if copied_wrapper.value != cloned_wrapper.value {
+        return 2;
+    }
+    let default_wrapper: Wrapper<Point> = Default::default();
+    if default_wrapper.value != default_point {
+        return 9;
+    }
+    if copied_wrapper.hash() != cloned_wrapper.hash() {
+        return 10;
+    }
+    let later_wrapper = Wrapper { value: later };
+    if !(copied_wrapper < later_wrapper) {
+        return 16;
+    }
+    match copied_wrapper.cmp(&cloned_wrapper) {
+        std::cmp::Ordering::Equal => {},
+        _ => { return 17; },
+    }
+
+    let message = Message::Paint { color: point, visible: true };
+    let copied_message = message;
+    let cloned_message = message.clone();
+    if message != copied_message || copied_message != cloned_message {
+        return 3;
+    }
+    let default_message: Message = Default::default();
+    match default_message {
+        Message::Quit => {},
+        _ => { return 11; },
+    }
+    if !(default_message < Message::Move(0, 0)) {
+        return 12;
+    }
+    if !(Message::Move(0, 9) < Message::Move(1, 0)) {
+        return 18;
+    }
+    if message.hash() != cloned_message.hash() {
+        return 13;
+    }
+    let unordered_left = ContainsUnordered { value: Unordered {} };
+    let unordered_right = ContainsUnordered { value: Unordered {} };
+    match unordered_left.partial_cmp(&unordered_right) {
+        None => {},
+        _ => { return 15; },
+    }
+    println!("{:?}", cloned_message);
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .replace("\r\n", "\n")
+            .ends_with("Paint { color: Point { x: 3, y: 4 }, visible: true }\n")
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -2269,6 +2433,99 @@ fun main() -> i32 {
 }
 
 #[test]
+fn format_macro_builds_a_runtime_string() {
+    if c_compiler().is_none() {
+        eprintln!("skipping format! runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("format-string");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"
+fun main() -> i32 {
+    let value = String::from_str("value");
+    let message = format!("{}={} {:?} {{done}}", value, 7, true);
+    if message.as_str() == "value=7 true {done}" { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn dynamic_string_ffi_arguments_are_nul_terminated() {
+    if c_compiler().is_none() {
+        eprintln!("skipping dynamic String FFI test: no C compiler found");
+        return;
+    }
+    let root = temp_root("string-ffi-nul");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let project = root.join("app");
+    let runtime_path = project.join("runtime.c");
+    let mut runtime = gc::RUNTIME_C.to_owned();
+    runtime.push_str(
+        r#"
+
+int riddle_c_string_is_ready(const char *value) {
+    return value[0] == 'r'
+        && value[1] == 'e'
+        && value[2] == 'a'
+        && value[3] == 'd'
+        && value[4] == 'y'
+        && value[5] == '\0';
+}
+"#,
+    );
+    fs::write(&runtime_path, runtime).unwrap();
+    let manifest_path = project.join("Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\nsource = \"runtime.c\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/main.rid"),
+        r#"
+unsafe extern "C" {
+    safe fun riddle_c_string_is_ready(value: &str) -> bool;
+}
+
+fun main() -> i32 {
+    let mut value = String::from_str("readyx");
+    value.clear();
+    value.push_str("ready");
+    if riddle_c_string_is_ready(value.as_str()) { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn vector_indexing_compiles_and_runs() {
     if c_compiler().is_none() {
         eprintln!("skipping Vector indexing runtime test: no C compiler found");
@@ -2703,6 +2960,478 @@ fun main() -> i32 {
 }
 
 #[test]
+fn proc_macro_packages_can_use_builtin_syn() {
+    if c_compiler().is_none() {
+        eprintln!("skipping syn proc-macro test: no C compiler found");
+        return;
+    }
+    let root = temp_root("proc-macro-syn");
+    fs::create_dir_all(root.join("macros/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("macros/Clue.toml"),
+        r#"[package]
+name = "macros"
+
+[lib]
+path = "src/lib.rid"
+proc-macro = true
+
+[dependencies]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("macros/src/lib.rid"),
+        r#"use crate::std::vector::Vector;
+use syn::{Data, DeriveInput, Expr, Fields, Fold, Item, Pat, Stmt, ToTokens, Type, Visit,
+    parse, parse_str};
+
+struct SyntaxVisitor {
+    exprs: usize,
+    types: usize,
+    pats: usize,
+}
+
+impl Visit for SyntaxVisitor {
+    fun visit_expr(&mut self, node: &Expr) {
+        self.exprs += 1usize;
+        syn::walk_expr(self, node);
+    }
+
+    fun visit_type(&mut self, node: &Type) {
+        self.types += 1usize;
+        syn::walk_type(self, node);
+    }
+
+    fun visit_pat(&mut self, node: &Pat) {
+        self.pats += 1usize;
+        syn::walk_pat(self, node);
+    }
+}
+
+struct ReplaceTwo {}
+
+impl Fold for ReplaceTwo {
+    fun fold_expr(&mut self, node: Expr) -> Expr {
+        let replace = match &node {
+            Expr::Literal(tokens) => tokens.to_string().as_str() == "2",
+            _ => false,
+        };
+        if replace {
+            match parse_str::<Expr>("3") {
+                Result::Ok(value) => { return value; },
+                Result::Err(_) => {},
+            }
+        }
+        syn::fold_expr(self, node)
+    }
+}
+
+struct ReplaceI32 {}
+
+impl Fold for ReplaceI32 {
+    fun fold_type(&mut self, node: Type) -> Type {
+        let replace = match &node {
+            Type::Path(tokens) => tokens.to_string().as_str() == "i32",
+            _ => false,
+        };
+        if replace {
+            match parse_str::<Type>("i64") {
+                Result::Ok(value) => { return value; },
+                Result::Err(_) => {},
+            }
+        }
+        syn::fold_type(self, node)
+    }
+}
+
+fun parses_item(source: &str) -> bool {
+    match parse_str::<Item>(source) {
+        Result::Ok(_) => true,
+        Result::Err(_) => false,
+    }
+}
+
+fun parses_stmt(source: &str) -> bool {
+    match parse_str::<Stmt>(source) {
+        Result::Ok(_) => true,
+        Result::Err(_) => false,
+    }
+}
+
+fun parses_expr(source: &str) -> bool {
+    match parse_str::<Expr>(source) {
+        Result::Ok(_) => true,
+        Result::Err(_) => false,
+    }
+}
+
+fun parses_type(source: &str) -> bool {
+    match parse_str::<Type>(source) {
+        Result::Ok(_) => true,
+        Result::Err(_) => false,
+    }
+}
+
+fun requires_type(source: &str) -> bool {
+    match parse_str::<Type>(source) {
+        Result::Ok(_) => true,
+        Result::Err(error) => {
+            Diagnostic::error(error.span, source).emit();
+            false
+        },
+    }
+}
+
+fun parses_pat(source: &str) -> bool {
+    match parse_str::<Pat>(source) {
+        Result::Ok(_) => true,
+        Result::Err(_) => false,
+    }
+}
+
+#[proc_macro_derive(SynAnswer)]
+pub fun derive_answer(input: TokenStream) -> TokenStream {
+    let parsed = match parse::<DeriveInput>(input) {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    };
+    if parsed.ident.as_str() != "Marker" {
+        Diagnostic::error(parsed.ident.span(), "syn parsed the wrong item name").emit();
+        return TokenStream::new();
+    }
+    match &parsed.data {
+        Data::Struct(_) => {},
+        Data::Enum(_) => {
+            Diagnostic::error(parsed.ident.span(), "syn parsed a struct as an enum").emit();
+            return TokenStream::new();
+        },
+    }
+    let mut structured_tokens = TokenStream::new();
+    parsed.vis.to_tokens(&mut structured_tokens);
+    parsed.generics.to_tokens(&mut structured_tokens);
+    parsed.data.to_tokens(&mut structured_tokens);
+    let generic = match parse_str::<DeriveInput>("struct Generic<T> where T: Clone { value: T }") {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    };
+    if generic.generics.tokens.is_empty()
+        || generic.generics.where_clause.is_empty()
+        || generic.generics.params.len() != 1usize
+        || generic.generics.predicates.len() != 1usize
+    {
+        Diagnostic::error(parsed.ident.span(), "syn did not split generics and where clause").emit();
+        return TokenStream::new();
+    }
+    match &generic.data {
+        Data::Struct(data) => {
+            if data.fields.is_empty()
+                || data.named.len() != 1usize
+                || data.named.as_slice()[0usize].ident.as_str() != "value"
+            {
+                Diagnostic::error(parsed.ident.span(), "syn did not parse struct fields").emit();
+                return TokenStream::new();
+            }
+        },
+        Data::Enum(_) => {
+            Diagnostic::error(parsed.ident.span(), "syn parsed a generic struct as an enum").emit();
+            return TokenStream::new();
+        },
+    }
+    let enumeration = match parse_str::<DeriveInput>(
+        "enum Message<T> { Quit, Move(T, i32), Paint { value: T } }"
+    ) {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    };
+    let mut unit = false;
+    let mut unnamed = false;
+    let mut named = false;
+    match &enumeration.data {
+        Data::Struct(_) => {
+            Diagnostic::error(parsed.ident.span(), "syn parsed an enum as a struct").emit();
+            return TokenStream::new();
+        },
+        Data::Enum(data) => {
+            if data.items.len() != 3usize {
+                Diagnostic::error(parsed.ident.span(), "syn parsed the wrong variant count").emit();
+                return TokenStream::new();
+            }
+            for variant in data.items.as_slice() {
+                match &variant.fields {
+                    Fields::Unit => unit = true,
+                    Fields::Unnamed(fields) => unnamed = fields.len() == 2usize,
+                    Fields::Named(fields) => named = fields.len() == 1usize,
+                }
+            }
+        },
+    }
+    if !unit || !unnamed || !named {
+        Diagnostic::error(parsed.ident.span(), "syn lost an enum variant field shape").emit();
+        return TokenStream::new();
+    }
+    if !parses_item("mod nested { fun answer() -> i32 { 1 } }")
+        || !parses_item("pub unsafe fun checked<T: Clone>(value: &T) -> T where T: Clone { value }")
+        || !parses_item("use crate::std::{option::Option, result::Result};")
+        || !parses_item("trait Bound<T: Clone = i32>: Clone { type Item; fun next(&self) -> Option<Self::Item>; }")
+        || !parses_item("impl<T: Clone> Iterator for Vector<T> where T: Clone { type Item = T; fun next(&mut self) -> Option<T> { Option::None } }")
+        || !parses_item("const ANSWER: i32 = 42;")
+        || !parses_item("type Alias;")
+        || !parses_item("extern \"C\" fun wrapper(value: &i32) {}")
+        || !parses_item("unsafe extern \"C\" { fun imported(value: &i32); }")
+        || parses_item("trait Broken")
+        || parses_item("impl")
+        || parses_item("extern \"C\" {}")
+    {
+        Diagnostic::error(parsed.ident.span(), "syn rejected or accepted an invalid item shape").emit();
+        return TokenStream::new();
+    }
+    if !parses_stmt("let value;")
+        || !parses_stmt("let value: i32;")
+        || !parses_stmt("break;")
+        || !parses_stmt("continue;")
+        || !parses_stmt("return;")
+        || parses_stmt("break 1;")
+    {
+        Diagnostic::error(parsed.ident.span(), "syn statement validation is incomplete").emit();
+        return TokenStream::new();
+    }
+    if !parses_expr("if true { 1 } else { 2 }")
+        || !parses_expr("while true { break; }")
+        || !parses_expr("for item in values { item }")
+        || !parses_expr("match value { Option::Some(item) if item > 0 => item, _ => 0 }")
+        || !parses_expr("unsafe { value }")
+        || !parses_expr("fun(value: &i32) -> i32 { *value }")
+        || !parses_expr("move fun() { }")
+        || !parses_expr("make!(value)")
+        || !parses_expr("Vector::new()")
+        || !parses_expr("Vector { value: 1 }")
+        || !parses_expr("[1; 2]")
+        || !parses_expr("(value,)")
+        || parses_expr("value +")
+    {
+        Diagnostic::error(parsed.ident.span(), "syn expression validation is incomplete").emit();
+        return TokenStream::new();
+    }
+    if !requires_type("!")
+        || !requires_type("*const i32")
+        || !requires_type("*mut i32")
+        || !requires_type("(i32, bool)")
+        || !requires_type("[i32]")
+        || !requires_type("[i32; 3]")
+        || !requires_type("impl Iterator<Item = i32>")
+        || !requires_type("make_type!()")
+        || parses_type("impl")
+    {
+        Diagnostic::error(parsed.ident.span(), "syn type validation is incomplete").emit();
+        return TokenStream::new();
+    }
+    if !parses_pat("_")
+        || !parses_pat("42")
+        || !parses_pat("(first, second)")
+        || !parses_pat("Message { value: inner }")
+        || !parses_pat("Option::Some(value)")
+        || !parses_pat("mut value")
+        || !parses_pat("&mut value")
+        || !parses_pat("make_pat!()")
+        || parses_pat("&")
+    {
+        Diagnostic::error(parsed.ident.span(), "syn pattern validation is incomplete").emit();
+        return TokenStream::new();
+    }
+    match parse_str::<Expr>("value.call(1)? + 2") {
+        Result::Ok(_) => {},
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    }
+    match parse_str::<Type>("impl Fn(i32) -> i32") {
+        Result::Ok(_) => {},
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    }
+    match parse_str::<Pat>("&mut Message::Paint { value: inner }") {
+        Result::Ok(_) => {},
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    }
+    match parse_str::<Expr>("1 2") {
+        Result::Ok(_) => {
+            Diagnostic::error(parsed.ident.span(), "syn accepted an invalid expression").emit();
+            return TokenStream::new();
+        },
+        Result::Err(_) => {},
+    }
+    match parse_str::<Type>("&") {
+        Result::Ok(_) => {
+            Diagnostic::error(parsed.ident.span(), "syn accepted an invalid type").emit();
+            return TokenStream::new();
+        },
+        Result::Err(_) => {},
+    }
+    match parse_str::<Pat>("&") {
+        Result::Ok(_) => {
+            Diagnostic::error(parsed.ident.span(), "syn accepted an invalid pattern").emit();
+            return TokenStream::new();
+        },
+        Result::Err(_) => {},
+    }
+    match parse_str::<Expr>("*value") {
+        Result::Ok(_) => {},
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    }
+    match parse_str::<Item>("fun checked(value: &i32) -> i32 { *value }") {
+        Result::Ok(_) => {},
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    }
+    match parse_str::<Item>("fun broken") {
+        Result::Ok(_) => {
+            Diagnostic::error(parsed.ident.span(), "syn accepted an invalid item").emit();
+            return TokenStream::new();
+        },
+        Result::Err(_) => {},
+    }
+    let visited_expr = match parse_str::<Expr>("value.call(1)? + 2") {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    };
+    let visited_type = match parse_str::<Type>("&mut [i32; 2]") {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    };
+    let visited_pat = match parse_str::<Pat>("&mut Message::Paint { value: inner }") {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    };
+    let mut visitor = SyntaxVisitor { exprs: 0usize, types: 0usize, pats: 0usize };
+    visitor.visit_expr(&visited_expr);
+    visitor.visit_type(&visited_type);
+    visitor.visit_pat(&visited_pat);
+    if visitor.exprs < 6usize || visitor.types < 3usize || visitor.pats < 2usize {
+        Diagnostic::error(parsed.ident.span(), "syn visitor skipped nested syntax").emit();
+        return TokenStream::new();
+    }
+    let folded_expr = match parse_str::<Expr>("1 + 2") {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    };
+    let mut expr_folder = ReplaceTwo {};
+    let folded_expr = expr_folder.fold_expr(folded_expr);
+    let mut folded_expr_tokens = TokenStream::new();
+    folded_expr.to_tokens(&mut folded_expr_tokens);
+    if folded_expr_tokens.to_string().as_str() != "1 + 3" {
+        Diagnostic::error(parsed.ident.span(), "syn folder did not rewrite a nested expression").emit();
+        return TokenStream::new();
+    }
+    let folded_input = match parse_str::<DeriveInput>("struct Folded { value: Vector<i32> }") {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            error.emit();
+            return TokenStream::new();
+        },
+    };
+    let mut type_folder = ReplaceI32 {};
+    let folded_input = type_folder.fold_derive_input(folded_input);
+    if folded_input.to_token_stream().to_string().as_str()
+        != "struct Folded {value : Vector < i64 >}"
+    {
+        Diagnostic::error(parsed.ident.span(), "syn folder did not rewrite a nested field type").emit();
+        return TokenStream::new();
+    }
+    let mut names: Vector<Ident> = Vector::new();
+    names.push(Ident::new("first", parsed.ident.span()));
+    names.push(Ident::new("second", parsed.ident.span()));
+    let repeated = quote! { (#(#names),*) };
+    if repeated.to_string().as_str() != "(first , second)" {
+        Diagnostic::error(parsed.ident.span(), "quote repetition produced the wrong tokens").emit();
+        return TokenStream::new();
+    }
+    let mut values: Vector<Ident> = Vector::new();
+    values.push(Ident::new("one", parsed.ident.span()));
+    values.push(Ident::new("two", parsed.ident.span()));
+    let zipped = quote! { { #(#names: #values),* } };
+    if zipped.to_string().as_str() != "{first : one , second : two}" {
+        Diagnostic::error(parsed.ident.span(), "quote repetition did not zip variables").emit();
+        return TokenStream::new();
+    }
+    let generated = Ident::new("syn_answer", parsed.ident.span());
+    quote! { fun #generated() -> i32 { 42 } }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+macros = { path = "../macros" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"use macros::SynAnswer;
+
+#[derive(SynAnswer)]
+struct Marker { value: i32 }
+
+fun main() -> i32 {
+    if syn_answer() == 42 { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn proc_macro_packages_can_use_function_macros_from_dependencies() {
     if c_compiler().is_none() {
         eprintln!("skipping nested proc-macro test: no C compiler found");
@@ -2794,6 +3523,84 @@ macros = { path = "../macros" }
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn proc_macro_panics_are_isolated_from_clue() {
+    if c_compiler().is_none() {
+        eprintln!("skipping proc-macro isolation test: no C compiler found");
+        return;
+    }
+    let root = temp_root("proc-macro-isolation");
+    fs::create_dir_all(root.join("macros/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("macros/Clue.toml"),
+        r#"[package]
+name = "macros"
+
+[lib]
+path = "src/lib.rid"
+proc-macro = true
+
+[dependencies]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("macros/src/lib.rid"),
+        r#"#[proc_macro]
+pub fun crash(_input: TokenStream) -> TokenStream {
+    panic("macro crashed")
+}
+
+#[proc_macro]
+pub fun answer(_input: TokenStream) -> TokenStream {
+    TokenStream::from_str("42").unwrap_or(TokenStream::new())
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+macros = { path = "../macros" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        "use macros::crash;\nfun main() -> i32 { crash!() }\n",
+    )
+    .unwrap();
+
+    let crashed = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&crashed.stderr);
+    assert!(
+        !crashed.status.success(),
+        "panicking macro unexpectedly passed"
+    );
+    assert!(stderr.contains("process exited with"), "{stderr}");
+
+    fs::write(
+        root.join("app/src/main.rid"),
+        "use macros::answer;\nfun main() -> i32 { answer!() }\n",
+    )
+    .unwrap();
+    let recovered = clue(&["check", "app"], &root);
+    assert!(
+        recovered.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
     );
     let _ = fs::remove_dir_all(root);
 }

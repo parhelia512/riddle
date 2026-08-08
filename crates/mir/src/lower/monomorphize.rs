@@ -94,6 +94,10 @@ impl LowerCtx<'_> {
         receiver_ty: &type_checker::Type,
         rhs_ty: Option<&type_checker::Type>,
     ) -> Option<String> {
+        let receiver_ty = match receiver_ty {
+            type_checker::Type::Ref(inner, _) => inner.as_ref(),
+            other => other,
+        };
         let receiver_mir_ty = self.convert_type(receiver_ty);
         let trait_id = self.default_methods[&fid];
         let trait_generics = self.hir.item_tree.traits[trait_id].generics.clone();
@@ -153,12 +157,14 @@ impl LowerCtx<'_> {
         callee: ExprId,
     ) -> Option<String> {
         let body_id = self.current_body?;
-        let tc_args = self
-            .type_result
-            .generic_calls
-            .get(&(body_id, callee))?
-            .args
-            .clone();
+        let tc_args = if let Some(call) = self.type_result.generic_calls.get(&(body_id, callee)) {
+            call.args.clone()
+        } else {
+            match self.type_result.expr_types.get(&(body_id, callee))? {
+                type_checker::Type::FunctionItem { args, .. } if !args.is_empty() => args.clone(),
+                _ => return None,
+            }
+        };
         self.mono_function_name_for_args(fid, &tc_args)
     }
 

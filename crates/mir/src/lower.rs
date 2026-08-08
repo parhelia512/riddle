@@ -410,8 +410,10 @@ fn closure_value_type(signature: FnPtrType) -> Type {
         params: call_params,
         ret: signature.ret,
     });
+    let name = format!("riddle_closure_{:016x}", hasher.finish());
     Type::Struct(StructType {
-        name: format!("riddle_closure_{:016x}", hasher.finish()),
+        symbol: name.clone(),
+        name,
         fields: vec![
             ("call".into(), call),
             ("env".into(), closure_env_type()),
@@ -483,6 +485,40 @@ fn mono_type_name(ty: &Type) -> String {
         Type::Enum(e) => e.name.clone(),
         Type::FnPtr(_) => "fn".into(),
         Type::Void => "void".into(),
+    }
+}
+
+fn mono_type_symbol(ty: &Type) -> String {
+    match ty {
+        Type::Struct(st) => st.symbol.clone(),
+        Type::Enum(enumeration) => format!("enum-layout::{enumeration:?}"),
+        Type::FnPtr(signature) => format!(
+            "fn({})->{}",
+            signature
+                .params
+                .iter()
+                .map(mono_type_symbol)
+                .collect::<Vec<_>>()
+                .join(","),
+            mono_type_symbol(&signature.ret)
+        ),
+        Type::Ref(inner, mutable) => format!(
+            "ref{}<{}>",
+            if *mutable { "mut" } else { "" },
+            mono_type_symbol(inner)
+        ),
+        Type::Ptr(inner) => format!("ptr<{}>", mono_type_symbol(inner)),
+        Type::Tuple(elements) => format!(
+            "tuple<{}>",
+            elements
+                .iter()
+                .map(mono_type_symbol)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Type::Slice(inner) => format!("slice<{}>", mono_type_symbol(inner)),
+        Type::Array(inner, len) => format!("array<{len},{}>", mono_type_symbol(inner)),
+        _ => mono_type_name(ty),
     }
 }
 

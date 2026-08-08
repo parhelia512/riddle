@@ -60,6 +60,7 @@ pub enum FloatTy {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StructType {
     pub name: String,
+    pub symbol: String,
     pub fields: Vec<(String, Type)>,
 }
 

@@ -10,12 +10,11 @@ impl TypeChecker<'_> {
     pub(super) fn check_method_call(
         &mut self,
         ctx: &mut BodyCtx<'_>,
-        callee: ExprId,
-        args: &[ExprId],
-        type_args: &[HirTypeRef],
-        expected: Option<&Type>,
-        span: Option<rowan::TextRange>,
+        call: (ExprId, ExprId, &[ExprId], &[HirTypeRef]),
+        expected_span: (Option<&Type>, Option<rowan::TextRange>),
     ) -> Type {
+        let (expr_id, callee, args, type_args) = call;
+        let (expected, span) = expected_span;
         let Expr::FieldAccess { base, field } = &ctx.body.exprs[callee] else {
             unreachable!("method call callee must be a field access");
         };
@@ -73,7 +72,7 @@ impl TypeChecker<'_> {
 
         self.check_resolved_method_call(
             ctx,
-            (callee, base, args, type_args),
+            (expr_id, callee, base, args, type_args),
             (expected, span),
             (base_ty, method),
         )
@@ -82,18 +81,24 @@ impl TypeChecker<'_> {
     fn check_resolved_method_call(
         &mut self,
         ctx: &mut BodyCtx<'_>,
-        call: (ExprId, ExprId, &[ExprId], &[HirTypeRef]),
+        call: (ExprId, ExprId, ExprId, &[ExprId], &[HirTypeRef]),
         expected_span: (Option<&Type>, Option<rowan::TextRange>),
         resolved: (Type, ResolvedMethod),
     ) -> Type {
-        let (callee, base, args, type_args) = call;
+        let (expr_id, callee, base, args, type_args) = call;
         let (expected, span) = expected_span;
         let (base_ty, method) = resolved;
         if method.function.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);
         }
-        let impl_generics = self.impl_generic_names(method.fid);
-        let impl_const_generics = self.impl_const_generic_names(method.fid);
+        let (impl_generics, impl_const_generics) = if method.from_trait_bound {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                self.impl_generic_names(method.fid),
+                self.impl_const_generic_names(method.fid),
+            )
+        };
         let mut params = method.subst.clone();
         params.extend(generic_param_map_with_consts(
             method
@@ -119,7 +124,7 @@ impl TypeChecker<'_> {
                 .map(|name| name.0.as_str()),
             &mut subst,
         );
-        self.record_method_metadata(ctx, callee, &method, span);
+        self.record_method_metadata(ctx, expr_id, callee, &base_ty, &method, span);
         let generic_arg_spans = self.check_method_arguments(
             ctx,
             (base, args),
@@ -127,11 +132,12 @@ impl TypeChecker<'_> {
             (&base_ty, &params, &mut subst),
             span,
         );
-        if !impl_generics.is_empty()
-            || !impl_const_generics.is_empty()
-            || !method.function.generics.is_empty()
-            || !method.function.implicit_generics.is_empty()
-            || !method.function.const_generics.is_empty()
+        if !method.from_trait_bound
+            && (!impl_generics.is_empty()
+                || !impl_const_generics.is_empty()
+                || !method.function.generics.is_empty()
+                || !method.function.implicit_generics.is_empty()
+                || !method.function.const_generics.is_empty())
         {
             self.record_method_generic_call(
                 ctx,
@@ -194,7 +200,9 @@ impl TypeChecker<'_> {
     fn record_method_metadata(
         &mut self,
         ctx: &BodyCtx<'_>,
+        expr_id: ExprId,
         callee: ExprId,
+        base_ty: &Type,
         method: &ResolvedMethod,
         span: Option<rowan::TextRange>,
     ) {
@@ -207,21 +215,32 @@ impl TypeChecker<'_> {
                 span,
             );
         }
-        self.result.expr_types.insert(
-            (ctx.body_id, callee),
-            Type::FunctionItem {
-                function: method.fid,
-                args: Vec::new(),
-            },
-        );
-        if let Some(trait_id) = method.trait_id {
-            self.result.trait_method_calls.insert(
+        if method.from_trait_bound {
+            self.result
+                .expr_types
+                .insert((ctx.body_id, callee), base_ty.clone());
+        } else {
+            self.result.expr_types.insert(
                 (ctx.body_id, callee),
-                TraitMethodCall {
-                    trait_id,
-                    method: method.function.name.0.clone(),
+                Type::FunctionItem {
+                    function: method.fid,
+                    args: Vec::new(),
                 },
             );
+        }
+        if let Some(trait_id) = method.trait_id {
+            let call = TraitMethodCall {
+                trait_id,
+                method: method.function.name.0.clone(),
+            };
+            self.result
+                .trait_method_calls
+                .insert((ctx.body_id, callee), call.clone());
+            if method.from_trait_bound {
+                self.result
+                    .trait_method_calls
+                    .insert((ctx.body_id, expr_id), call);
+            }
         }
     }
 
@@ -380,9 +399,10 @@ impl TypeChecker<'_> {
         if let Some(method) = self.find_inherent_method(ctx, receiver_ty, method_name)? {
             return Ok(Some(method));
         }
-        Ok(self
-            .find_trait_impl_method_by_name(receiver_ty, method_name)
-            .or_else(|| self.find_trait_bound_method(ctx, receiver_ty, method_name)))
+        if let Some(method) = self.find_trait_bound_method(ctx, receiver_ty, method_name) {
+            return Ok(Some(method));
+        }
+        Ok(self.find_trait_impl_method_by_name(ctx, receiver_ty, method_name))
     }
 
     pub(super) fn find_inherent_method(
@@ -411,7 +431,8 @@ impl TypeChecker<'_> {
             let Some(mut subst) = self.impl_subst_from_self_ty(&imp, receiver_self_ty) else {
                 continue;
             };
-            if !self.impl_bounds_satisfied(&imp, &subst) {
+            let assumptions = self.current_trait_assumptions(ctx);
+            if !self.impl_bounds_satisfied(&imp, &subst, &assumptions) {
                 continue;
             }
             subst.insert("Self".into(), receiver_self_ty.clone());
@@ -434,6 +455,7 @@ impl TypeChecker<'_> {
                         function: function.clone(),
                         subst,
                         trait_id: None,
+                        from_trait_bound: false,
                     }));
                 }
             }
@@ -444,6 +466,7 @@ impl TypeChecker<'_> {
 
     pub(super) fn find_trait_impl_method_by_name(
         &mut self,
+        ctx: &BodyCtx<'_>,
         receiver_ty: &Type,
         method_name: &Name,
     ) -> Option<ResolvedMethod> {
@@ -469,7 +492,8 @@ impl TypeChecker<'_> {
             let Some(mut subst) = self.impl_subst_from_self_ty(&imp, receiver_self_ty) else {
                 continue;
             };
-            if !self.impl_bounds_satisfied(&imp, &subst) {
+            let assumptions = self.current_trait_assumptions(ctx);
+            if !self.impl_bounds_satisfied(&imp, &subst, &assumptions) {
                 continue;
             }
             subst.insert("Self".into(), receiver_self_ty.clone());
@@ -485,6 +509,7 @@ impl TypeChecker<'_> {
                 function: self.hir.item_tree.functions[fid].clone(),
                 subst,
                 trait_id: Some(trait_id),
+                from_trait_bound: false,
             });
         }
 
@@ -536,7 +561,7 @@ impl TypeChecker<'_> {
             let Some(mut subst) = self.impl_subst_from_self_ty(&imp, receiver_ty) else {
                 continue;
             };
-            if !self.impl_bounds_satisfied(&imp, &subst) {
+            if !self.impl_bounds_satisfied(&imp, &subst, &[]) {
                 continue;
             }
             let fid = imp
@@ -589,6 +614,7 @@ impl TypeChecker<'_> {
                 function: self.hir.item_tree.functions[fid].clone(),
                 subst,
                 trait_id: Some(trait_id),
+                from_trait_bound: false,
             });
         }
 
@@ -671,6 +697,7 @@ impl TypeChecker<'_> {
                 function,
                 subst,
                 trait_id: Some(method_trait_id),
+                from_trait_bound: true,
             });
         }
         None

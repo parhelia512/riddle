@@ -713,7 +713,17 @@ impl<'a> ScopeGraphBuilder<'a> {
     ) {
         let imp = &self.hir.item_tree.impls[iid];
         let associated_scope = self.impl_scope_for_self_ty(&imp.self_ty);
-        let item_scope = associated_scope.unwrap_or(parent_scope);
+        let item_scope = match associated_scope {
+            Some(scope) => scope,
+            None => {
+                let scope = self.sg.alloc_node(Node::Scope(ScopeKind::ImplScope));
+                frag_nodes.push(scope);
+                let edge = self.sg.add_edge(scope, parent_scope, EdgeKind::Lex, 0);
+                frag_edges.push(edge);
+                scope
+            }
+        };
+        let resolution_scope = associated_scope.unwrap_or(parent_scope);
         let self_ty = imp.self_ty.clone();
         let trait_ty = imp.trait_ty.clone();
         let bounds = imp.generic_bounds.clone();
@@ -725,38 +735,28 @@ impl<'a> ScopeGraphBuilder<'a> {
         self.emit_bound_type_references(&bounds, parent_scope, frag_nodes, frag_edges);
 
         for fid in imp.methods.clone() {
-            self.encode_function_type_refs(fid, item_scope, frag_nodes, frag_edges);
-            let body_parent = associated_scope.unwrap_or(parent_scope);
-            if let Some(scope) = associated_scope {
-                self.encode_function_def(fid, scope, frag_nodes, frag_edges);
-                self.encode_function_body(fid, body_parent, frag_nodes, frag_edges);
-            } else {
-                self.encode_function(fid, parent_scope, frag_nodes, frag_edges);
-            }
+            self.encode_function_type_refs(fid, resolution_scope, frag_nodes, frag_edges);
+            self.encode_function_def(fid, item_scope, frag_nodes, frag_edges);
+            self.encode_function_body(fid, resolution_scope, frag_nodes, frag_edges);
         }
 
         for cid in imp.consts.clone() {
             let ty = self.hir.item_tree.consts[cid].ty.clone();
-            self.emit_type_references(&ty, item_scope, frag_nodes, frag_edges);
+            self.emit_type_references(&ty, resolution_scope, frag_nodes, frag_edges);
             let name = self.hir.item_tree.consts[cid].name.clone();
             let pop = self.sg.alloc_node(Node::PopSymbol {
                 name,
                 define: DefRef::Const(cid),
             });
             frag_nodes.push(pop);
-            let e = self.sg.add_edge(
-                associated_scope.unwrap_or(parent_scope),
-                pop,
-                EdgeKind::Def,
-                0,
-            );
+            let e = self.sg.add_edge(item_scope, pop, EdgeKind::Def, 0);
             frag_edges.push(e);
-            self.encode_const_body(cid, item_scope);
+            self.encode_const_body(cid, resolution_scope);
         }
 
         for tid in imp.type_aliases.clone() {
             if let Some(ty) = self.hir.item_tree.type_aliases[tid].ty.clone() {
-                self.emit_type_references(&ty, item_scope, frag_nodes, frag_edges);
+                self.emit_type_references(&ty, resolution_scope, frag_nodes, frag_edges);
             }
             let name = self.hir.item_tree.type_aliases[tid].name.clone();
             let pop = self.sg.alloc_node(Node::PopSymbol {
@@ -764,12 +764,7 @@ impl<'a> ScopeGraphBuilder<'a> {
                 define: DefRef::TypeAlias(tid),
             });
             frag_nodes.push(pop);
-            let e = self.sg.add_edge(
-                associated_scope.unwrap_or(parent_scope),
-                pop,
-                EdgeKind::Def,
-                0,
-            );
+            let e = self.sg.add_edge(item_scope, pop, EdgeKind::Def, 0);
             frag_edges.push(e);
         }
     }

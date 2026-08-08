@@ -1,4 +1,5 @@
 use crate::std::result::Result::{Err, Ok};
+use crate::std::string::String;
 
 unsafe extern "C" {
     safe fun putchar(value: i32) -> i32;
@@ -8,10 +9,31 @@ pub struct Error {}
 
 pub type Result = crate::std::result::Result<(), Error>;
 
-pub struct Formatter {}
+pub struct Formatter {
+    output: *mut String,
+    writes_to_string: bool,
+}
 
 impl Formatter {
+    pub fun stdout() -> Formatter {
+        Formatter {
+            output: 0usize as *mut String,
+            writes_to_string: false,
+        }
+    }
+
+    pub fun for_string(output: &mut String) -> Formatter {
+        Formatter {
+            output: output as *mut String,
+            writes_to_string: true,
+        }
+    }
+
     pub fun write_str(&mut self, value: &str) -> Result {
+        if self.writes_to_string {
+            unsafe { (*self.output).push_str(value); }
+            return Ok(());
+        }
         for byte in value.as_bytes() {
             self.write_byte(*byte)?;
         }
@@ -19,6 +41,10 @@ impl Formatter {
     }
 
     pub fun write_char(&mut self, value: char) -> Result {
+        if self.writes_to_string {
+            unsafe { (*self.output).push_char(value); }
+            return Ok(());
+        }
         let code = value as u32;
         if code <= 127u32 {
             return self.write_byte(code as u8);
@@ -39,6 +65,10 @@ impl Formatter {
     }
 
     fun write_byte(&mut self, value: u8) -> Result {
+        if self.writes_to_string {
+            unsafe { (*self.output).push_char(value as char); }
+            return Ok(());
+        }
         if putchar(value as i32) < 0 {
             Err(Error {})
         } else {
@@ -58,6 +88,12 @@ pub trait Debug {
 impl Display for &str {
     fun fmt(&self, formatter: &mut Formatter) -> Result {
         formatter.write_str(*self)
+    }
+}
+
+impl Display for String {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -120,6 +156,16 @@ impl Debug for f64 { fun fmt(&self, formatter: &mut Formatter) -> Result { write
 
 pub fun write_debug<T: Debug>(value: &T, formatter: &mut Formatter) -> Result {
     value.fmt(formatter)
+}
+
+pub fun append_display<T: Display>(output: &mut String, value: &T) {
+    let mut formatter = Formatter::for_string(output);
+    value.fmt(&mut formatter);
+}
+
+pub fun append_debug<T: Debug>(output: &mut String, value: &T) {
+    let mut formatter = Formatter::for_string(output);
+    write_debug(value, &mut formatter);
 }
 
 fun write_debug_bool(formatter: &mut Formatter, value: bool) -> Result {

@@ -162,11 +162,16 @@ fn build_analysis(
     })
 }
 
+pub struct ProcMacroArtifacts {
+    pub library: PathBuf,
+    pub runner: PathBuf,
+}
+
 pub fn build_proc_macro_library(
     package: &crate::project::ProcMacroPackage,
     exports: &[crate::proc_macro::HostMacroExport],
     expanded_source: &str,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<ProcMacroArtifacts> {
     let host = TargetTriple::host().map_err(anyhow::Error::msg)?;
     let target = target::load(host, true)?;
     let build_dir = package.root.join(".clue").join("build");
@@ -178,6 +183,7 @@ pub fn build_proc_macro_library(
     let c_path = build_dir.join(format!("{}.proc-macro.c", package.name));
     let runtime_path = build_dir.join(format!("{}.proc-macro.runtime.c", package.name));
     let bridge_path = build_dir.join(format!("{}.proc-macro.host.c", package.name));
+    let runner_c_path = build_dir.join(format!("{}.proc-macro.runner.c", package.name));
     let hash_path = build_dir.join(format!("{}.proc-macro.hash", package.name));
     let library = build_dir.join(format!(
         "{}{}.proc-macro{}",
@@ -185,8 +191,17 @@ pub fn build_proc_macro_library(
         package.name,
         env::consts::DLL_SUFFIX
     ));
+    let runner = build_dir.join(format!(
+        "{}.proc-macro-runner{}",
+        package.name,
+        host.executable_suffix()
+    ));
+    let runner_source = crate::proc_macro::proc_macro_runner_c();
     let hash = fingerprint(
-        &format!("{}\n{bridge}", package.manifest_fingerprint),
+        &format!(
+            "{}\n{bridge}\n{runner_source}",
+            package.manifest_fingerprint
+        ),
         &source,
         Some(gc::RUNTIME_C),
         Some(&compiler),
@@ -195,10 +210,12 @@ pub fn build_proc_macro_library(
     if c_path.is_file()
         && runtime_path.is_file()
         && bridge_path.is_file()
+        && runner_c_path.is_file()
         && library.is_file()
+        && runner.is_file()
         && fs::read_to_string(&hash_path).unwrap_or_default() == hash
     {
-        return Ok(library);
+        return Ok(ProcMacroArtifacts { library, runner });
     }
 
     let analysis = pipeline::compile_with_options(&source, pipeline::CompileOptions::default());
@@ -220,6 +237,7 @@ pub fn build_proc_macro_library(
     )?;
     fs::write(&runtime_path, gc::RUNTIME_C)?;
     fs::write(&bridge_path, bridge)?;
+    fs::write(&runner_c_path, runner_source)?;
     compiler.compile(
         &[
             c_path.as_path(),
@@ -233,8 +251,10 @@ pub fn build_proc_macro_library(
         // macro expansion, bypassing the -D rename; -fno-inline stops it.
         &["-fno-inline"],
     )?;
+    let runner_args = if host.is_linux() { &["-ldl"][..] } else { &[] };
+    compiler.compile(&[runner_c_path.as_path()], &runner, &[], false, runner_args)?;
     fs::write(hash_path, hash)?;
-    Ok(library)
+    Ok(ProcMacroArtifacts { library, runner })
 }
 
 fn fingerprint(
@@ -465,8 +485,11 @@ impl CCompiler {
                 for define in defines {
                     command.arg(format!("-D{define}"));
                 }
-                command.args(extra_args);
-                command.args(sources).arg("-o").arg(executable);
+                command
+                    .args(sources)
+                    .args(extra_args)
+                    .arg("-o")
+                    .arg(executable);
             }
             Flavor::Msvc => {
                 command.args(["/nologo", "/std:c11", "/O2"]);

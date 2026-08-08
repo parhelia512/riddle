@@ -267,6 +267,7 @@ impl LowerCtx<'_> {
             capture_types,
             StructType {
                 name: format!("{name}_env"),
+                symbol: format!("{name}_env"),
                 fields,
             },
         )

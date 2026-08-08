@@ -256,6 +256,7 @@ struct ResolvedMethod {
     function: HirFunction,
     subst: HashMap<String, Type>,
     trait_id: Option<TraitId>,
+    from_trait_bound: bool,
 }
 
 const fn callable_signature_type(signature: CallableSignature) -> Type {

@@ -2157,6 +2157,53 @@ fn enum_variant_constructor_lowers_to_discriminant() {
 }
 
 #[test]
+fn nested_enum_pattern_checks_tag_before_reading_payload() {
+    let module = lower(
+        r"
+        enum TokenTree {
+            Punct(i32),
+            Ident,
+        }
+
+        enum MaybeToken {
+            Some(TokenTree),
+            None,
+        }
+
+        fun is_punct(value: MaybeToken) -> bool {
+            match value {
+                MaybeToken::Some(TokenTree::Punct(_)) => true,
+                _ => false,
+            }
+        }
+        ",
+    );
+    let function = module
+        .functions
+        .values()
+        .find(|function| function.name == "is_punct")
+        .expect("missing is_punct");
+
+    assert!(
+        !function.blocks[function.entry]
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::ExtractValue(_, 1))),
+        "enum payload was read before its tag matched: {function:#?}"
+    );
+    assert!(
+        function.blocks.iter().any(|(_, block)| {
+            block.label.as_deref() == Some("match_pattern_payload")
+                && block
+                    .insts
+                    .iter()
+                    .any(|inst| matches!(inst.kind, mir::instr::InstKind::ExtractValue(_, 1)))
+        }),
+        "missing guarded enum payload read: {function:#?}"
+    );
+}
+
+#[test]
 fn compound_assignment_lowers_to_load_binop_store() {
     let module = lower(
         r"

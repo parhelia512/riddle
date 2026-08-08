@@ -375,6 +375,7 @@ impl TypeChecker<'_> {
         &mut self,
         imp: &hir::item_tree::HirImpl,
         subst: &HashMap<String, Type>,
+        assumptions: &[TraitBound],
     ) -> bool {
         imp.generic_bounds.iter().all(|bound| {
             let actual = self.lower_type_ref_with_params_at(
@@ -392,16 +393,18 @@ impl TypeChecker<'_> {
                 subst,
                 Some(bound.trait_range),
             );
-            self.result
-                .trait_env
-                .type_implements_with_args(&actual, trait_id, &trait_args)
-                && self.assoc_constraints_match(
-                    &actual,
-                    trait_id,
-                    &trait_args,
-                    &bound.assoc_constraints,
-                    subst,
-                )
+            self.result.trait_env.type_implements_with_args_assuming(
+                &actual,
+                trait_id,
+                &trait_args,
+                assumptions,
+            ) && self.assoc_constraints_match(
+                &actual,
+                trait_id,
+                &trait_args,
+                &bound.assoc_constraints,
+                subst,
+            )
         })
     }
 
