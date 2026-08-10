@@ -113,8 +113,12 @@ fn build_analysis(
             .mir_module
             .as_ref()
             .context("successful compilation did not produce MIR")?;
-        let c_code = pipeline::generate_c_with_gc(module, analysis.gc_enabled)
-            .map_err(anyhow::Error::msg)?;
+        let c_code = pipeline::generate_c_with_gc_and_source(
+            module,
+            analysis.gc_enabled,
+            &analysis.entry.display().to_string(),
+        )
+        .map_err(anyhow::Error::msg)?;
         fs::write(&c_path, c_code)?;
         if analysis.runtime_source.is_none()
             && let (Some(path), Some(source)) = (&runtime_path, &runtime_source)
@@ -233,7 +237,8 @@ pub fn build_proc_macro_library(
         .context("successful proc-macro compilation did not produce MIR")?;
     fs::write(
         &c_path,
-        pipeline::generate_c(module).map_err(anyhow::Error::msg)?,
+        pipeline::generate_c_with_gc_and_source(module, true, &package.entry.display().to_string())
+            .map_err(anyhow::Error::msg)?,
     )?;
     fs::write(&runtime_path, gc::RUNTIME_C)?;
     fs::write(&bridge_path, bridge)?;

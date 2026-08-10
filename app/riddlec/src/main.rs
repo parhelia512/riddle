@@ -169,7 +169,7 @@ fn compile_file(file: &Path, opts: &Opts, target: TargetTriple) -> (usize, Strin
         && let Some(ref module) = result.mir_module
         && let Some(backend) = opts.backend
     {
-        match generate(module, backend) {
+        match generate(module, backend, &source_name) {
             Ok(code) => generated = code,
             Err(error) => {
                 eprintln!("riddlec: code generation error: {error:?}");
@@ -183,11 +183,11 @@ fn compile_file(file: &Path, opts: &Opts, target: TargetTriple) -> (usize, Strin
 fn generate(
     module: &mir::Module,
     backend: BackendKind,
+    source_name: &str,
 ) -> Result<String, Box<dyn std::fmt::Debug>> {
     match backend {
-        BackendKind::C => {
-            pipeline::generate_c(module).map_err(|e| Box::new(e) as Box<dyn std::fmt::Debug>)
-        }
+        BackendKind::C => pipeline::generate_c_with_gc_and_source(module, true, source_name)
+            .map_err(|e| Box::new(e) as Box<dyn std::fmt::Debug>),
     }
 }
 

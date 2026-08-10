@@ -538,7 +538,7 @@ fn standard_partial_eq_derive_supports_generic_enums() {
 }
 
 #[test]
-fn standard_print_macros_reject_invalid_format_strings() {
+fn standard_formatting_macros_reject_invalid_format_strings() {
     let mismatch = expand_standard_macros(r#"fun main() { print!("{} {}", 1); }"#);
     assert_eq!(mismatch.diagnostics.len(), 1);
     assert!(
@@ -572,6 +572,140 @@ fn standard_print_macros_reject_invalid_format_strings() {
         format_unsupported.diagnostics[0].message,
         format!("only `{open}{close}` and `{open}:?{close}` format placeholders are supported")
     );
+
+    let panic_mismatch = expand_standard_macros(r#"fun main() { panic!("{} {}", 1); }"#);
+    assert_eq!(panic_mismatch.diagnostics.len(), 1);
+    assert!(
+        panic_mismatch.diagnostics[0]
+            .message
+            .contains("2 placeholder(s), but 1 argument(s)")
+    );
+}
+
+#[test]
+fn standard_panic_macro_preserves_never_type_and_expands_default_message() {
+    let source = r#"fun value() -> i32 {
+    print!();
+    panic!("value={}", 7)
+}
+fun empty() -> i32 { panic!() }
+"#;
+    let expanded = expand_standard_macros(source);
+    assert!(
+        expanded.diagnostics.is_empty(),
+        "{:?}",
+        expanded.diagnostics
+    );
+    assert!(
+        expanded.source.contains("explicit panic"),
+        "{}",
+        expanded.source
+    );
+    let compact = expanded
+        .source
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains(",3u32,5u32)"), "{}", expanded.source);
+
+    let result = check_with_options(source, CompileOptions::default());
+    assert!(
+        result.success(),
+        "parse={:?} hir={:?} type={:?} analysis={:?}",
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn standard_panic_family_macros_expand_and_type_check() {
+    let source = r#"
+        #[derive(Debug, PartialEq)]
+        struct Pair { value: i32 }
+
+        fun terminal(kind: i32) -> i32 {
+            match kind {
+                0 => todo!(),
+                1 => unimplemented!("branch {}", kind),
+                2 => unreachable!(),
+                _ => kind,
+            }
+        }
+
+        fun main() -> i32 {
+            assert!(true);
+            assert!(1 < 2, "ordered {}", 2);
+            assert_eq!(Pair { value: 1 }, Pair { value: 1 });
+            assert_eq!(1, 1, "equal {}", 1);
+            assert_ne!(1, 2);
+            assert_ne!(1, 2, "different");
+            debug_assert!(true);
+            debug_assert_eq!(3, 3);
+            debug_assert_ne!(3, 4);
+            0
+        }
+    "#;
+    let expanded = expand_standard_macros(source);
+
+    assert!(
+        expanded.diagnostics.is_empty(),
+        "{:?}\n{}",
+        expanded.diagnostics,
+        expanded.source
+    );
+    for name in [
+        "assert!",
+        "assert_eq!",
+        "assert_ne!",
+        "debug_assert!",
+        "debug_assert_eq!",
+        "debug_assert_ne!",
+        "todo!",
+        "unimplemented!",
+        "unreachable!",
+    ] {
+        assert!(!expanded.source.contains(name), "{}", expanded.source);
+    }
+    assert!(expanded.source.contains("assertion `left == right` failed"));
+    assert!(expanded.source.contains("not yet implemented"));
+    assert!(expanded.source.contains("not implemented"));
+    assert!(expanded.source.contains("entered unreachable code"));
+
+    let result = check_with_options(source, CompileOptions::default());
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?} analysis={:?}\n{}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics,
+        expanded.source
+    );
+}
+
+#[test]
+fn standard_assert_macros_validate_required_arguments() {
+    for (source, message) in [
+        (
+            "fun main() { assert!(); }",
+            "assert! requires at least 1 argument",
+        ),
+        (
+            "fun main() { assert_eq!(1); }",
+            "assert_eq! requires at least 2 arguments",
+        ),
+        (
+            "fun main() { debug_assert_ne!(1); }",
+            "debug_assert_ne! requires at least 2 arguments",
+        ),
+    ] {
+        let expanded = expand_standard_macros(source);
+        assert_eq!(expanded.diagnostics.len(), 1, "{}", expanded.source);
+        assert_eq!(expanded.diagnostics[0].message, message);
+    }
 }
 
 #[test]

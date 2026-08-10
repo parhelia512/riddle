@@ -992,7 +992,7 @@ fn normalized_path(path: &Path) -> PathBuf {
 ///
 /// Returns an error when the module cannot be represented by the C backend.
 pub fn generate_c(module: &Module) -> Result<String, String> {
-    generate_c_with_gc(module, true)
+    generate_c_with_gc_and_source(module, true, "<unknown>")
 }
 
 /// Generates C for a MIR module with an explicit GC setting.
@@ -1001,11 +1001,20 @@ pub fn generate_c(module: &Module) -> Result<String, String> {
 ///
 /// Returns an error when the module cannot be represented by the C backend.
 pub fn generate_c_with_gc(module: &Module, gc_enabled: bool) -> Result<String, String> {
+    generate_c_with_gc_and_source(module, gc_enabled, "<unknown>")
+}
+
+pub fn generate_c_with_gc_and_source(
+    module: &Module,
+    gc_enabled: bool,
+    source_name: &str,
+) -> Result<String, String> {
     let mut backend = if gc_enabled {
         CBackend::new()
     } else {
         CBackend::without_gc()
-    };
+    }
+    .with_source_name(source_name);
     backend.compile(module)
 }
 
@@ -1475,6 +1484,7 @@ fn run_pipeline_with_state_cancellable(
     let mir_module = (success && depth == PipelineDepth::Build).then(|| {
         mir::lower_hir(
             &hir,
+            source,
             &type_result,
             &escape_result,
             &analysis.moved_exprs,

@@ -152,6 +152,9 @@ pub enum InstKind {
     /// Function call: `result = call(func, args)`
     Call(FuncRef, Vec<Value>),
 
+    /// Abort with a user-facing panic diagnostic at the source call site.
+    Panic(Value, u32, u32),
+
     /// Obtain a typed function pointer.
     FunctionRef(FuncRef),
 

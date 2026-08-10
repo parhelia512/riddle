@@ -37,6 +37,7 @@ fn compile(
 
     let mir_module = mir::lower_hir(
         &hir,
+        source,
         &type_result,
         &escape_result,
         &analysis.moved_exprs,

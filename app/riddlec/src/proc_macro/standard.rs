@@ -912,6 +912,179 @@ pub(super) fn expand_standard_format_macro(
     Ok(output)
 }
 
+pub(super) fn expand_standard_panic_macro(
+    input: &ProcMacroTokenStream,
+    call_site: &Range<usize>,
+    source: &str,
+) -> Result<ProcMacroTokenStream, (Range<usize>, String)> {
+    let call_offset = source
+        .get(call_site.clone())
+        .and_then(|text| text.find(|ch: char| !ch.is_whitespace()))
+        .map_or(call_site.start, |offset| call_site.start + offset);
+    let (line, column) = line_column(source, call_offset);
+    let source = if input.is_empty() {
+        format!("{{ crate::std::panic::panic_at(\"explicit panic\", {line}u32, {column}u32) }}")
+    } else {
+        let (root, mut source) = standard_format_string_source(input, call_site)?;
+        let _ = write!(
+            source,
+            "crate::std::panic::panic_at({root}.as_str(), {line}u32, {column}u32)"
+        );
+        format!("{{ {source} }}")
+    };
+    let mut output = ProcMacroTokenStream::from_source(&source, 0).map_err(|message| {
+        (
+            call_site.clone(),
+            format!("failed to build panic output: {message}"),
+        )
+    })?;
+    output.set_span(call_site.clone());
+    Ok(output)
+}
+
+pub(super) fn expand_standard_assert_macro(
+    name: &str,
+    input: &ProcMacroTokenStream,
+    call_site: &Range<usize>,
+) -> Result<ProcMacroTokenStream, (Range<usize>, String)> {
+    let arguments = standard_macro_arguments(name, input, call_site, 1)?;
+    let condition = arguments[0].to_source();
+    let failure = if arguments.len() == 1 {
+        let message = format!("assertion failed: {condition}");
+        format!("panic!({message:?})")
+    } else {
+        format!("panic!({})", macro_arguments_source(&arguments[1..]))
+    };
+    standard_macro_output(
+        name,
+        &format!("{{ if !({condition}) {{ {failure}; }} }}"),
+        call_site,
+    )
+}
+
+pub(super) fn expand_standard_assert_comparison_macro(
+    name: &str,
+    input: &ProcMacroTokenStream,
+    call_site: &Range<usize>,
+) -> Result<ProcMacroTokenStream, (Range<usize>, String)> {
+    let arguments = standard_macro_arguments(name, input, call_site, 2)?;
+    let operator = if name.ends_with("_ne") { "!=" } else { "==" };
+    let stem = format!("__riddle_{name}_{}_{}", call_site.start, call_site.end);
+    let left = format!("{stem}_left");
+    let right = format!("{stem}_right");
+    let failure = if arguments.len() == 2 {
+        let message =
+            format!("assertion `left {operator} right` failed\n  left: {{:?}}\n right: {{:?}}");
+        format!("panic!({message:?}, {left}, {right})")
+    } else {
+        let custom = format!("{stem}_message");
+        let message = format!(
+            "assertion `left {operator} right` failed: {{}}\n  left: {{:?}}\n right: {{:?}}"
+        );
+        format!(
+            "let {custom} = format!({}); panic!({message:?}, {custom}, {left}, {right})",
+            macro_arguments_source(&arguments[2..])
+        )
+    };
+    let source = format!(
+        "{{ let {left} = ({}); let {right} = ({}); if !({left} {operator} {right}) {{ {failure}; }} }}",
+        arguments[0].to_source(),
+        arguments[1].to_source(),
+    );
+    standard_macro_output(name, &source, call_site)
+}
+
+pub(super) fn expand_standard_panic_shorthand_macro(
+    name: &str,
+    input: &ProcMacroTokenStream,
+    call_site: &Range<usize>,
+) -> Result<ProcMacroTokenStream, (Range<usize>, String)> {
+    let message = match name {
+        "todo" => "not yet implemented",
+        "unimplemented" => "not implemented",
+        "unreachable" => "internal error: entered unreachable code",
+        _ => unreachable!("registered panic shorthand must have a message"),
+    };
+    let source = if input.is_empty() {
+        format!("panic!({message:?})")
+    } else {
+        let stem = format!(
+            "__riddle_{name}_message_{}_{}",
+            call_site.start, call_site.end
+        );
+        let format_arguments = split_macro_arguments(input)
+            .map_err(|error| (call_site.clone(), format!("{name}! {error}")))?;
+        format!(
+            "{{ let {stem} = format!({}); panic!({:?}, {stem}); }}",
+            macro_arguments_source(&format_arguments),
+            format!("{message}: {{}}"),
+        )
+    };
+    standard_macro_output(name, &source, call_site)
+}
+
+fn standard_macro_arguments(
+    name: &str,
+    input: &ProcMacroTokenStream,
+    call_site: &Range<usize>,
+    minimum: usize,
+) -> Result<Vec<ProcMacroTokenStream>, (Range<usize>, String)> {
+    let arguments = split_macro_arguments(input)
+        .map_err(|error| (call_site.clone(), format!("{name}! {error}")))?;
+    if arguments.len() < minimum {
+        let noun = if minimum == 1 {
+            "argument"
+        } else {
+            "arguments"
+        };
+        return Err((
+            call_site.clone(),
+            format!("{name}! requires at least {minimum} {noun}"),
+        ));
+    }
+    Ok(arguments)
+}
+
+fn macro_arguments_source(arguments: &[ProcMacroTokenStream]) -> String {
+    arguments
+        .iter()
+        .map(ProcMacroTokenStream::to_source)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn standard_macro_output(
+    name: &str,
+    source: &str,
+    call_site: &Range<usize>,
+) -> Result<ProcMacroTokenStream, (Range<usize>, String)> {
+    let mut output = ProcMacroTokenStream::from_source(source, 0).map_err(|message| {
+        (
+            call_site.clone(),
+            format!("failed to build {name}! output: {message}"),
+        )
+    })?;
+    output.set_span(call_site.clone());
+    Ok(output)
+}
+
+fn line_column(source: &str, offset: usize) -> (u32, u32) {
+    let mut line = 1;
+    let mut column = 1;
+    for (index, ch) in source.char_indices() {
+        if index >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
 fn standard_format_string_source(
     input: &ProcMacroTokenStream,
     call_site: &Range<usize>,

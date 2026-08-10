@@ -1,7 +1,7 @@
 use super::{
-    Body, Builder, BuiltinOperator, ExprId, FuncRef, HirBinOp, HirTypeRef, HirUnOp, Inst, InstKind,
-    IntTy, LowerCtx, PathAnchor, ResolvedName, Type, UnOp, Value, builtin_comparison_types,
-    comparison_trait, convert_cmp_op, convert_unop,
+    Body, Builder, BuiltinOperator, Expr, ExprId, FuncRef, HirBinOp, HirTypeRef, HirUnOp, Inst,
+    InstKind, IntTy, LowerCtx, PathAnchor, ResolvedName, Type, UnOp, Value,
+    builtin_comparison_types, comparison_trait, convert_cmp_op, convert_unop,
 };
 
 impl LowerCtx<'_> {
@@ -77,6 +77,28 @@ impl LowerCtx<'_> {
             .get(&(body_id, callee))
             .cloned();
         match builtin.as_str() {
+            "panic" => {
+                let message = self.lower_expr(builder, param_values, body, *args.first()?);
+                let range = body.source_map.expr_ranges.get(&callee)?;
+                let offset: usize = range.start().into();
+                // ponytail: locations use the combined source; pass file mappings into MIR when module-accurate paths are needed.
+                let (line, column) = line_column(self.source, offset);
+                Some(builder.panic(message, line, column))
+            }
+            "panic_at" => {
+                let message = self.lower_expr(builder, param_values, body, *args.first()?);
+                let Expr::IntLiteral { value: line, .. } = body.exprs[*args.get(1)?] else {
+                    return None;
+                };
+                let Expr::IntLiteral { value: column, .. } = body.exprs[*args.get(2)?] else {
+                    return None;
+                };
+                Some(builder.panic(
+                    message,
+                    u32::try_from(line).ok()?,
+                    u32::try_from(column).ok()?,
+                ))
+            }
             "size_of" => {
                 let ty = self.convert_type(generic_call.as_ref()?.args.first()?);
                 Some(builder.size_of(ty))
@@ -649,4 +671,21 @@ impl LowerCtx<'_> {
         let result = Type::Ref(Box::new(output), call.method == "index_mut");
         Some(builder.call(FuncRef::Local(name), vec![receiver, index], result))
     }
+}
+
+fn line_column(source: &str, offset: usize) -> (u32, u32) {
+    let mut line = 1;
+    let mut column = 1;
+    for (index, ch) in source.char_indices() {
+        if index >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
 }

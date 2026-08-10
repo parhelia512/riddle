@@ -26,20 +26,31 @@ pub struct CBackend {
     needs_runtime: bool,
     no_gc: bool,
     needs_c_string_bridge: bool,
+    source_name: String,
 }
 
 impl CBackend {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            source_name: "<unknown>".into(),
+            ..Self::default()
+        }
     }
 
     #[must_use]
     pub fn without_gc() -> Self {
         Self {
             no_gc: true,
+            source_name: "<unknown>".into(),
             ..Self::default()
         }
+    }
+
+    #[must_use]
+    pub fn with_source_name(mut self, source_name: impl Into<String>) -> Self {
+        self.source_name = source_name.into();
+        self
     }
 
     fn ensure(&mut self, v: Value) {
@@ -180,6 +191,24 @@ impl CBackend {
         .unwrap();
         // ponytail: C needs an addressable unit token until generic ZST storage is supported.
         writeln!(out, "typedef unsigned char riddle_unit;").unwrap();
+        if module_has_panic(module) {
+            writeln!(out).unwrap();
+            writeln!(out, "static void riddle_panic(riddle_str message, const char *file, uint32_t line, uint32_t column) {{").unwrap();
+            writeln!(
+                out,
+                "  fprintf(stderr, \"thread 'main' panicked at %s:%u:%u:\\n\", file, line, column);"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  if (message.len != 0) fwrite(message.ptr, 1, message.len, stderr);"
+            )
+            .unwrap();
+            writeln!(out, "  fputc('\\n', stderr);").unwrap();
+            writeln!(out, "  fflush(stderr);").unwrap();
+            writeln!(out, "  abort();").unwrap();
+            writeln!(out, "}}").unwrap();
+        }
         if self.needs_c_string_bridge {
             writeln!(out).unwrap();
             writeln!(out, "static char *riddle_c_string(riddle_str value) {{").unwrap();
@@ -575,6 +604,16 @@ impl CBackend {
 
             InstKind::Phi(_) => self.emit_phi(inst, v),
             InstKind::Call(callee, args) => self.emit_call(inst, v, callee, args, out)?,
+            InstKind::Panic(message, line, column) => {
+                let source_name = escape_c_string(&self.source_name);
+                writeln!(
+                    out,
+                    "  riddle_panic({}, \"{source_name}\", {line}, {column});",
+                    self.name(*message)
+                )
+                .unwrap();
+                self.set(v, String::new(), "void".into());
+            }
             InstKind::FunctionRef(function) => self.emit_function_ref(inst, v, function)?,
             InstKind::CallIndirect(callee, args) => {
                 self.emit_indirect_call(inst, v, *callee, args, out);
@@ -1528,6 +1567,7 @@ fn inst_operands(inst: &Inst) -> Vec<Value> {
         InstKind::CheckedIndexPtr(base, index, len) => vec![*base, *index, *len],
         InstKind::Phi(pairs) => pairs.iter().map(|(v, _)| *v).collect(),
         InstKind::Call(_, args) => args.clone(),
+        InstKind::Panic(message, _, _) => vec![*message],
         InstKind::CallIndirect(callee, args) => {
             let mut values = vec![*callee];
             values.extend(args);
@@ -1535,6 +1575,17 @@ fn inst_operands(inst: &Inst) -> Vec<Value> {
         }
         _ => vec![], // Const, HeapAlloc, Alloca, SizeOf: no operands
     }
+}
+
+fn module_has_panic(module: &Module) -> bool {
+    module.function_order.iter().any(|fid| {
+        module.functions[*fid].blocks.iter().any(|(_, block)| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Panic(..)))
+        })
+    })
 }
 
 fn fresh_c(ctr: &mut u64, prefix: &str) -> String {

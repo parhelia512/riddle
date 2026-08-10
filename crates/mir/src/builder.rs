@@ -169,6 +169,10 @@ impl<'f> Builder<'f> {
         self.emit(InstKind::Call(callee, args), ret_ty)
     }
 
+    pub fn panic(&mut self, message: Value, line: u32, column: u32) -> Value {
+        self.emit(InstKind::Panic(message, line, column), Type::Never)
+    }
+
     pub fn function_ref(&mut self, function: FuncRef, ty: Type) -> Value {
         self.emit(InstKind::FunctionRef(function), ty)
     }

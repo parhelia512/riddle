@@ -1692,8 +1692,8 @@ fun main() -> i32 {
     let mut calls = 0;
     false && mark(&mut calls);
     true || mark(&mut calls);
-    false && panic("and rhs must not run");
-    true || panic("or rhs must not run");
+    false && panic!("and rhs must not run");
+    true || panic!("or rhs must not run");
     make_pair(1, 2).first;
     make_pair(3, 4);
     let mut iteration = 0;
@@ -2273,7 +2273,7 @@ fn unsigned_ordering_and_unicode_chars_compile_and_run() {
 }
 
 #[test]
-fn panic_aborts_without_compiler_helper() {
+fn panic_prints_message_and_source_location_before_aborting() {
     if c_compiler().is_none() {
         eprintln!("skipping panic runtime test: no C compiler found");
         return;
@@ -2283,17 +2283,66 @@ fn panic_aborts_without_compiler_helper() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        "fun main() { panic(\"boom\"); }\n",
+        "fun main() { panic!(\"boom {}\", 7); }\n",
     )
     .unwrap();
 
     let output = clue(&["run", "app"], &root);
     assert!(!output.status.success(), "{output:#?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("thread 'main' panicked at "), "{stderr}");
+    assert!(stderr.contains("main.rid:1:14:"), "{stderr}");
+    assert!(stderr.lines().any(|line| line == "boom 7"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn standard_assert_macros_evaluate_once_and_report_failure() {
+    if c_compiler().is_none() {
+        eprintln!("skipping assert runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("assert-runtime");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    let source = root.join("app/src/main.rid");
+    fs::write(
+        &source,
+        r#"fun next(value: &mut i32) -> i32 { *value += 1; *value }
+fun main() -> i32 {
+    let mut calls = 0;
+    assert_eq!(next(&mut calls), 1);
+    assert_ne!(next(&mut calls), 1);
+    assert!(true, "unused {}", next(&mut calls));
+    if calls == 2 { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let success = clue(&["run", "app"], &root);
     assert!(
-        output.stderr.is_empty()
-            || !String::from_utf8_lossy(&output.stderr).contains("riddle_panic"),
-        "{output:#?}"
+        success.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&success.stdout),
+        String::from_utf8_lossy(&success.stderr)
     );
+
+    fs::write(
+        &source,
+        "fun main() { assert_eq!(1, 2, \"numbers differ\"); }\n",
+    )
+    .unwrap();
+    let failure = clue(&["run", "app"], &root);
+    assert!(!failure.status.success(), "{failure:#?}");
+    let stderr = String::from_utf8_lossy(&failure.stderr);
+    assert!(stderr.contains("main.rid:1:14:"), "{stderr}");
+    assert!(
+        stderr.contains("assertion `left == right` failed: numbers differ"),
+        "{stderr}"
+    );
+    assert!(stderr.lines().any(|line| line == "  left: 1"), "{stderr}");
+    assert!(stderr.lines().any(|line| line == " right: 2"), "{stderr}");
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3566,7 +3615,7 @@ proc-macro = true
         root.join("macros/src/lib.rid"),
         r#"#[proc_macro]
 pub fun crash(_input: TokenStream) -> TokenStream {
-    panic("macro crashed")
+    panic!("macro crashed")
 }
 
 #[proc_macro]

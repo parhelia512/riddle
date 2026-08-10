@@ -15,7 +15,22 @@ const TOKEN_WIRE_HEADER: &str = "RMT1;";
 const MAX_DERIVE_EXPANSION_DEPTH: usize = 32;
 const STANDARD_MACRO_PACKAGE: &str = "std";
 
-pub const STANDARD_FUNCTION_MACROS: [&str; 4] = ["format", "print", "println", "quote"];
+pub const STANDARD_FUNCTION_MACROS: [&str; 14] = [
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "format",
+    "panic",
+    "print",
+    "println",
+    "quote",
+    "todo",
+    "unimplemented",
+    "unreachable",
+];
 pub const STANDARD_DERIVE_MACROS: [&str; 9] = [
     "Debug",
     "Clone",

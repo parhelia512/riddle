@@ -38,6 +38,7 @@ enum BuiltinOperator {
 #[must_use]
 pub fn lower_hir<S: BuildHasher>(
     hir: &HirFile,
+    source: &str,
     type_result: &TypeCheckResult,
     escape_result: &EscapeResult,
     moved_exprs: &HashSet<(BodyId, ExprId), S>,
@@ -67,6 +68,7 @@ pub fn lower_hir<S: BuildHasher>(
         .collect();
     let mut ctx = LowerCtx {
         hir,
+        source,
         type_result,
         analysis: escape_result,
         moved_exprs: moved_exprs.iter().copied().collect(),
@@ -150,6 +152,7 @@ pub fn lower_hir<S: BuildHasher>(
 
 struct LowerCtx<'a> {
     hir: &'a HirFile,
+    source: &'a str,
     type_result: &'a TypeCheckResult,
     analysis: &'a EscapeResult,
     moved_exprs: HashSet<(BodyId, ExprId)>,

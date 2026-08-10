@@ -6,7 +6,8 @@ use std::{
 
 use hir::body::{BodyId, Expr, Pattern, ResolvedName, Stmt};
 use hir::item_tree::{
-    HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem, Visibility,
+    HirAttr, HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem,
+    Visibility,
 };
 use lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
 use riddlec::{
@@ -940,16 +941,67 @@ fn definition_is_available_for_completion(
 }
 
 fn definition_is_hidden(hir: &hir::HirFile, definition: &DefRef) -> bool {
-    let DefRef::Function(id) = definition else {
-        return false;
+    let (name_range, attrs) = match definition {
+        DefRef::Function(id) => {
+            let item = &hir.item_tree.functions[*id];
+            (item.name_range, item.attrs.as_slice())
+        }
+        DefRef::Struct(id) => {
+            let item = &hir.item_tree.structs[*id];
+            (item.name_range, item.attrs.as_slice())
+        }
+        DefRef::Enum(id) => {
+            let item = &hir.item_tree.enums[*id];
+            (item.name_range, item.attrs.as_slice())
+        }
+        DefRef::Trait(id) => {
+            let item = &hir.item_tree.traits[*id];
+            (item.name_range, item.attrs.as_slice())
+        }
+        DefRef::Const(id) => {
+            let item = &hir.item_tree.consts[*id];
+            (item.name_range, item.attrs.as_slice())
+        }
+        DefRef::TypeAlias(id) => {
+            let item = &hir.item_tree.type_aliases[*id];
+            (item.name_range, item.attrs.as_slice())
+        }
+        DefRef::Module { id, .. } => {
+            let item = &hir.item_tree.modules[*id];
+            (item.name_range, item.attrs.as_slice())
+        }
+        DefRef::EnumVariant { enum_id, index } => {
+            let item = &hir.item_tree.enums[*enum_id].variants[*index];
+            (item.name_range, item.attrs.as_slice())
+        }
+        _ => return false,
     };
-    let function = &hir.item_tree.functions[*id];
+
+    standard_item_is_hidden(hir, name_range, attrs)
+}
+
+fn standard_item_is_hidden(hir: &hir::HirFile, name_range: TextRange, attrs: &[HirAttr]) -> bool {
     hir.std_loaded
-        && hir.package_for_range(function.name_range).is_none()
-        && function
-            .attrs
+        && hir.package_for_range(name_range).is_none()
+        && attrs
             .iter()
             .any(|attr| attr.name.0 == "doc" && attr.value.as_deref() == Some("hidden"))
+}
+
+fn top_level_item_is_hidden(hir: &hir::HirFile, item: TopLevelItem) -> bool {
+    match item {
+        TopLevelItem::Function(id) => definition_is_hidden(hir, &DefRef::Function(id)),
+        TopLevelItem::Struct(id) => definition_is_hidden(hir, &DefRef::Struct(id)),
+        TopLevelItem::Module(id) => {
+            let item = &hir.item_tree.modules[id];
+            standard_item_is_hidden(hir, item.name_range, &item.attrs)
+        }
+        TopLevelItem::Enum(id) => definition_is_hidden(hir, &DefRef::Enum(id)),
+        TopLevelItem::Trait(id) => definition_is_hidden(hir, &DefRef::Trait(id)),
+        TopLevelItem::Const(id) => definition_is_hidden(hir, &DefRef::Const(id)),
+        TopLevelItem::TypeAlias(id) => definition_is_hidden(hir, &DefRef::TypeAlias(id)),
+        TopLevelItem::Use(_) | TopLevelItem::Impl(_) => false,
+    }
 }
 
 fn push_definition_completion(
@@ -1445,6 +1497,10 @@ fn push_top_level_item(
     allow_private_user_item: bool,
     out: &mut Vec<CompletionItem>,
 ) {
+    if top_level_item_is_hidden(hir, item) {
+        return;
+    }
+
     match item {
         TopLevelItem::Function(id) => {
             let item = &hir.item_tree.functions[id];
@@ -1453,8 +1509,7 @@ fn push_top_level_item(
                 &item.visibility,
                 item.name_range,
                 allow_private_user_item,
-            ) && !definition_is_hidden(hir, &DefRef::Function(id))
-            {
+            ) {
                 out.push(function_completion(item, CompletionItemKind::FUNCTION));
             }
         }

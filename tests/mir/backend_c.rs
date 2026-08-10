@@ -189,6 +189,25 @@ fn std_slices_support_safe_access_and_borrowed_iteration() {
 }
 
 #[test]
+fn c_backend_emits_panic_message_and_source_location() {
+    let result = riddlec::pipeline::compile("fun main() { panic!(\"boom\"); }");
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+
+    let generated = riddlec::pipeline::generate_c_with_gc_and_source(
+        result.mir_module.as_ref().unwrap(),
+        true,
+        "src/main.rid",
+    )
+    .unwrap();
+    assert!(
+        generated.contains("static void riddle_panic"),
+        "{generated}"
+    );
+    assert!(generated.contains("src/main.rid\", 1, 14"), "{generated}");
+    assert!(generated.contains("fflush(stderr);"), "{generated}");
+}
+
+#[test]
 fn moving_a_mutable_reference_still_respects_live_reborrows() {
     let (_, _, analysis, _) = compile(
         r"

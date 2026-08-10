@@ -395,7 +395,7 @@ fn completion_includes_std_prelude_imports() {
 }
 
 #[test]
-fn completion_includes_standard_print_macros() {
+fn completion_includes_standard_function_macros() {
     let source = "use std::io::print; fun main() { prin }";
     let items = completion_items_for_source(
         source,
@@ -421,6 +421,39 @@ fn completion_includes_standard_print_macros() {
         .unwrap_or_else(|| panic!("{items:#?}"));
     assert_eq!(println.insert_text.as_deref(), Some("println!"));
     assert_eq!(println.filter_text.as_deref(), Some("println"));
+
+    let panic_source = "fun main() { pan }";
+    let panic_items = completion_items_for_source(
+        panic_source,
+        position(panic_source, panic_source.find("pan").unwrap() + 3),
+        CompileOptions::default(),
+    );
+    let panic = panic_items
+        .iter()
+        .find(|item| item.label == "panic!" && item.detail.as_deref() == Some("standard macro"))
+        .unwrap_or_else(|| panic!("{panic_items:#?}"));
+    assert_eq!(panic.insert_text.as_deref(), Some("panic!"));
+    assert_eq!(panic.filter_text.as_deref(), Some("panic"));
+    assert!(
+        !panic_items.iter().any(|item| item.label == "panic"),
+        "{panic_items:#?}"
+    );
+
+    let hidden_panic = "fun main() { std::panic::pan }";
+    let panic_items = completion_items_for_source(
+        hidden_panic,
+        position(
+            hidden_panic,
+            hidden_panic.rfind("pan").unwrap() + "pan".len(),
+        ),
+        CompileOptions::default(),
+    );
+    assert!(
+        !panic_items
+            .iter()
+            .any(|item| item.label == "panic" || item.label == "panic_at"),
+        "{panic_items:#?}"
+    );
 
     let existing_bang = "fun main() { p!(); }";
     let items = completion_items_for_source(
@@ -456,6 +489,76 @@ fn completion_includes_standard_print_macros() {
         !items.iter().any(|item| item.label == "_print"),
         "{items:#?}"
     );
+
+    for (prefix, expected) in [
+        ("ass", &["assert!", "assert_eq!", "assert_ne!"][..]),
+        (
+            "debug_ass",
+            &["debug_assert!", "debug_assert_eq!", "debug_assert_ne!"][..],
+        ),
+        ("unimpl", &["unimplemented!"][..]),
+        ("unreach", &["unreachable!"][..]),
+        ("todo", &["todo!"][..]),
+    ] {
+        let source = format!("fun main() {{ {prefix} }}");
+        let items = completion_items_for_source(
+            &source,
+            position(&source, source.find(prefix).unwrap() + prefix.len()),
+            CompileOptions::default(),
+        );
+        for label in expected {
+            assert!(
+                items.iter().any(|item| item.label == *label),
+                "missing {label}: {items:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn completion_hides_standard_panic_runtime_auto_imports() {
+    let root = temp_root("completion-hidden-panic-runtime");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = root.join("src/main.rid");
+    let main_text = "fun main() { pan }\n";
+    fs::write(&main, main_text).unwrap();
+    let uri = lsp_types::Url::from_file_path(&main).unwrap();
+    let docs = HashMap::from([(
+        uri.clone(),
+        Document {
+            text: main_text.into(),
+            version: Some(1),
+        },
+    )]);
+
+    let items = completion_items_for_document(
+        &uri,
+        &docs,
+        position(main_text, main_text.find("pan }").unwrap() + 3),
+        CompileOptions::default(),
+        &AnalysisSessions::default(),
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        items
+            .iter()
+            .any(|item| item.label == "panic!" && item.detail.as_deref() == Some("standard macro")),
+        "{items:#?}"
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "panic"),
+        "{items:#?}"
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

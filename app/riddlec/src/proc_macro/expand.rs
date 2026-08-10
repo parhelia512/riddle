@@ -14,7 +14,9 @@ use super::{
         parse_derive_paths, parse_proc_macro_use_resolved, range,
     },
     standard::{
-        expand_standard_derive_macro, expand_standard_format_macro, expand_standard_print_macro,
+        expand_standard_assert_comparison_macro, expand_standard_assert_macro,
+        expand_standard_derive_macro, expand_standard_format_macro, expand_standard_panic_macro,
+        expand_standard_panic_shorthand_macro, expand_standard_print_macro,
         expand_standard_quote_macro,
     },
     token_stream::{ProcMacroDelimiter, ProcMacroTokenStream, ProcMacroTokenTree},
@@ -88,6 +90,7 @@ struct ExpansionActionContext<'a> {
     document: &'a mut TokenDocument,
     parsed: &'a ParsedDocument,
     provider: &'a mut dyn ProcMacroProvider,
+    original_source: &'a str,
     source_len: usize,
     output_depth: usize,
     diagnostics: &'a mut Vec<Diagnostic>,
@@ -147,6 +150,7 @@ pub fn expand_source(source: &str, provider: &mut dyn ProcMacroProvider) -> Expa
             document: &mut document,
             parsed: &parsed,
             provider,
+            original_source: source,
             source_len: source.len(),
             output_depth: depth + 1,
             diagnostics: &mut diagnostics,
@@ -958,6 +962,7 @@ fn expand_derive_action(
         document,
         parsed,
         provider,
+        original_source: _,
         source_len,
         output_depth,
         diagnostics,
@@ -1184,6 +1189,7 @@ fn expand_attribute_action(
         document,
         parsed,
         provider,
+        original_source: _,
         source_len,
         output_depth,
         diagnostics,
@@ -1287,6 +1293,7 @@ fn expand_function_action(
         document,
         parsed,
         provider,
+        original_source,
         source_len,
         output_depth,
         diagnostics,
@@ -1320,7 +1327,21 @@ fn expand_function_action(
         let expanded = match imported.macro_name.as_str() {
             "quote" => expand_standard_quote_macro(&input, &call_site),
             "format" => expand_standard_format_macro(&input, &call_site),
-            _ => expand_standard_print_macro(&imported.macro_name, &input, &call_site),
+            "panic" => expand_standard_panic_macro(&input, &call_site, original_source),
+            "print" | "println" => {
+                expand_standard_print_macro(&imported.macro_name, &input, &call_site)
+            }
+            "assert" | "debug_assert" => {
+                // ponytail: debug assertions stay enabled until Riddle gains build-profile cfg.
+                expand_standard_assert_macro(&imported.macro_name, &input, &call_site)
+            }
+            "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne" => {
+                expand_standard_assert_comparison_macro(&imported.macro_name, &input, &call_site)
+            }
+            "todo" | "unimplemented" | "unreachable" => {
+                expand_standard_panic_shorthand_macro(&imported.macro_name, &input, &call_site)
+            }
+            _ => unreachable!("registered standard macro must have an expander"),
         };
         match expanded {
             Ok(output) => output,

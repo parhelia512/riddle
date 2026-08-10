@@ -12,6 +12,7 @@ pub mod marker;
 pub mod mem;
 pub mod ops;
 pub mod option;
+#[doc = "hidden"]
 pub mod panic;
 pub mod parse;
 pub mod prelude;
