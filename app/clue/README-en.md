@@ -8,26 +8,55 @@ Clue manages and builds Riddle projects.
 
 ```bash
 # Initialize a directory without overwriting an existing manifest or entry file
-clue init <path> [--bin|--lib]
+clue init <path> [--bin|--lib|--workspace]
 
 # Create a project in a new directory
-clue new <path> [--bin|--lib]
+clue new <path> [--bin|--lib|--workspace]
 
 # Check the whole project without generating C
-clue check [path] [--target <triple>]
+clue check [path] [--package <name>] [--workspace] [--target <triple>]
 
 # Generate C and build .clue/build/<package>[.exe]
-clue build [path] [--target <triple>]
+clue build [path] [--package <name>] [--workspace] [--target <triple>]
 
 # Build and run a binary package
-clue run [path] [--target <triple>] [-- <args>...]
+clue run [path] [--package <name>] [--target <triple>] [-- <args>...]
 ```
 
 Binary projects are the default. Clue supports local path dependencies declared in
-`Clue.toml`; it does not resolve registry, version, or git dependencies.
+`Clue.toml`; it does not resolve registry or git dependencies.
 Diagnostics from external modules and path dependencies point to their original
 source files. The Riddle LSP uses the same project loader, includes unsaved files,
 and refreshes diagnostics for every open document after a change.
+
+## Workspaces
+
+A virtual workspace registers every child package in the root manifest:
+
+```toml
+[workspace]
+crates = ["app", "libs/math"]
+```
+
+Every registered directory has its own `Clue.toml`, and dependencies stay in the
+child package manifest:
+
+```toml
+[dependencies]
+math = { path = "../libs/math" }
+```
+
+The root manifest is not a package. `clue check` and `clue build` from the root
+process all registered packages in dependency order. From a child directory they
+process only that package by default; `--workspace` selects all packages and
+`--package <name>` selects one. Use `clue run --package <name>` when a workspace
+contains more than one runnable binary.
+
+A workspace has one root `Clue.lock`. Local packages use `path = "..."` relative
+to the workspace root, alongside their versions and local dependency names. Child
+packages do not get individual lock files. A path dependency inside the workspace
+must be registered in `workspace.crates`; external local path dependencies remain
+valid.
 
 Binary builds strictly use `CC` when set. Otherwise Clue tries `cc`, `gcc`,
 `clang`, version-suffixed GCC/Clang executables, and, on Windows, `clang-cl` and
@@ -109,5 +138,7 @@ refuse to overwrite an existing manifest or target entry file.
 - `lib.rs`: public project operations and analysis API
 - `project.rs`: project creation, templates, and dependency loading
 - `manifest.rs`: `Clue.toml` serialization and parsing
+- `workspace.rs`: workspace members, dependency graph, and selection
+- `lock.rs`: root `Clue.lock` I/O
 - `build.rs`: compilation and build cache
 - `target.rs`: target components and C-toolchain configuration

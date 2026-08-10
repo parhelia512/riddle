@@ -432,8 +432,9 @@ try {
   });
   const completions = await read((message) => message.id === 4);
   const memberCompletionMs = performance.now() - memberCompletionStarted;
+  assert.equal(completions.result.isIncomplete, true);
   assert(
-    completions.result.some(
+    completions.result.items.some(
       (item) =>
         item.label === 'is_empty' &&
         item.labelDetails.detail === '(&self)' &&
@@ -442,6 +443,38 @@ try {
         item.kind === 2,
     ),
   );
+
+  const memberDot = completionText.indexOf('c.i') + 1;
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didChange',
+    params: {
+      textDocument: { uri: completionUri, version: 2 },
+      contentChanges: [
+        {
+          range: {
+            start: { line: 0, character: memberDot },
+            end: { line: 0, character: memberDot + 1 },
+          },
+          rangeLength: 1,
+          text: '',
+        },
+      ],
+    },
+  });
+  send({
+    jsonrpc: '2.0',
+    id: 54,
+    method: 'textDocument/completion',
+    params: {
+      textDocument: { uri: completionUri },
+      position: { line: 0, character: memberDot },
+      context: { triggerKind: 3 },
+    },
+  });
+  const clearedCompletions = await read((message) => message.id === 54);
+  assert.equal(clearedCompletions.result.isIncomplete, false);
+  assert.deepEqual(clearedCompletions.result.items, []);
 
   const generalCompletionText = 'fun Foo() {} fun main() { f }';
   send({

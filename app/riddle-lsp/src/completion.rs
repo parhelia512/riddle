@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use hir::body::{BodyId, Expr, Stmt};
+use hir::body::{BodyId, Expr, Pattern, ResolvedName, Stmt};
 use hir::item_tree::{
     HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem, Visibility,
 };
@@ -16,6 +16,7 @@ use riddlec::{
 use rowan::TextRange;
 use scope_graph::resolve::{
     exported_definitions, resolve_path_at_reference, resolve_path_from, visible_definitions,
+    visible_definitions_from,
 };
 use scope_graph::{DefRef, Node, NodeId, RefOrigin, ScopeGraph};
 use syntax::SyntaxKind;
@@ -42,12 +43,26 @@ pub fn completion_trigger_characters() -> Vec<String> {
     vec![".".into(), ":".into()]
 }
 
+#[must_use]
+pub fn completion_trigger_is_active(source: &str, position: lsp_types::Position) -> bool {
+    let Some(offset) = offset_for_position(source, position) else {
+        return false;
+    };
+    let start = identifier_start(source, offset);
+    let before = &source[..start];
+    before.ends_with('.') || before.ends_with("::")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionContext {
     General,
     Type,
+    TypePath,
     Member,
     Associated,
+    Import,
+    StructField,
+    PatternField,
 }
 
 struct CompletionSite {
@@ -93,8 +108,8 @@ pub fn completion_items_for_document<S: BuildHasher>(
             return Ok(None);
         }
         let mut analyze = |overlays: &HashMap<PathBuf, String>| {
-            if site.context == CompletionContext::Member {
-                clue::check_project_with_session_cancellable(
+            if completion_needs_type_check(site.context) {
+                clue::infer_project_with_session_cancellable(
                     &root,
                     overlays,
                     compile_options,
@@ -237,16 +252,16 @@ fn standalone_completion_items(
     if cancelled() {
         return None;
     }
-    let result = if site.context == CompletionContext::Member {
-        session.check_with_options_cancellable(&marked, compile_options, cancelled)
+    let result = if completion_needs_type_check(site.context) {
+        session.infer_with_options_cancellable(&marked, compile_options, cancelled)
     } else {
         session.resolve_with_options_cancellable(&marked, compile_options, cancelled)
     };
     let mut result = result?;
     if result.hir.is_none() && completion_needs_semicolon(&marked, site) {
         marked.insert(site.start + COMPLETION_MARKER.len(), ';');
-        let recovered = if site.context == CompletionContext::Member {
-            session.check_with_options_cancellable(&marked, compile_options, cancelled)
+        let recovered = if completion_needs_type_check(site.context) {
+            session.infer_with_options_cancellable(&marked, compile_options, cancelled)
         } else {
             session.resolve_with_options_cancellable(&marked, compile_options, cancelled)
         };
@@ -311,7 +326,12 @@ fn completion_description(item: &CompletionItem) -> &str {
 
 fn rank_existing_completions(site: &CompletionSite, items: &mut [CompletionItem]) {
     let group = match site.context {
-        CompletionContext::Member | CompletionContext::Associated => 0,
+        CompletionContext::TypePath
+        | CompletionContext::Member
+        | CompletionContext::Associated
+        | CompletionContext::Import
+        | CompletionContext::StructField
+        | CompletionContext::PatternField => 0,
         CompletionContext::General | CompletionContext::Type => 1,
     };
     for item in items {
@@ -357,7 +377,8 @@ fn collect_auto_import_completions(
     let prefix = site.prefix.to_lowercase();
 
     for route in auto_import_routes(hir, graph) {
-        if visible.contains(&route.label)
+        if !definition_is_available_for_completion(hir, graph, &route.definition)
+            || visible.contains(&route.label)
             || !route.label.to_lowercase().starts_with(&prefix)
             || (site.context == CompletionContext::Type && !definition_is_type(&route.definition))
         {
@@ -519,11 +540,16 @@ pub fn completion_items_for_source(
         return Vec::new();
     };
     let mut analyzed_source = marked_completion_source(source, &site);
-    let mut resolved = riddlec::pipeline::resolve_with_options(&analyzed_source, compile_options);
+    let analyze = if completion_needs_type_check(site.context) {
+        riddlec::pipeline::check_with_options
+    } else {
+        riddlec::pipeline::resolve_with_options
+    };
+    let mut resolved = analyze(&analyzed_source, compile_options);
     let marker_end = site.start + COMPLETION_MARKER.len();
     if resolved.hir.is_none() && !analyzed_source[marker_end..].trim_start().starts_with(';') {
         analyzed_source.insert(marker_end, ';');
-        resolved = riddlec::pipeline::resolve_with_options(&analyzed_source, compile_options);
+        resolved = analyze(&analyzed_source, compile_options);
     }
     let fallback = (matches!(
         site.context,
@@ -548,14 +574,24 @@ fn completion_site(source: &str, position: lsp_types::Position) -> Option<Comple
     let start = identifier_start(source, offset);
     let end = identifier_end(source, offset);
     let before = &source[..start];
+    let syntax_context = syntax_completion_context(source, start, end);
     let context = if before.ends_with('.') {
         CompletionContext::Member
+    } else if matches!(
+        syntax_context,
+        Some(CompletionContext::StructField | CompletionContext::PatternField)
+    ) {
+        syntax_context.unwrap()
+    } else if syntax_context == Some(CompletionContext::Import) {
+        CompletionContext::Import
     } else if before.ends_with("::") {
-        CompletionContext::Associated
-    } else if is_type_position(source, start, end) {
-        CompletionContext::Type
+        if syntax_context == Some(CompletionContext::Type) {
+            CompletionContext::TypePath
+        } else {
+            CompletionContext::Associated
+        }
     } else {
-        CompletionContext::General
+        syntax_context.unwrap_or(CompletionContext::General)
     };
     Some(CompletionSite {
         start,
@@ -564,6 +600,13 @@ fn completion_site(source: &str, position: lsp_types::Position) -> Option<Comple
         context,
         macro_kind: macro_completion_kind(source, start, end),
     })
+}
+
+const fn completion_needs_type_check(context: CompletionContext) -> bool {
+    matches!(
+        context,
+        CompletionContext::Member | CompletionContext::PatternField
+    )
 }
 
 fn macro_completion_kind(source: &str, start: usize, end: usize) -> Option<ProcMacroKind> {
@@ -607,8 +650,11 @@ fn collect_macro_completions(
     site: &CompletionSite,
     items: &mut Vec<CompletionItem>,
 ) {
-    let Some(kind) = site.macro_kind else {
-        return;
+    let needs_bang = site.macro_kind.is_none();
+    let kind = match (site.macro_kind, site.context) {
+        (Some(kind), _) => kind,
+        (None, CompletionContext::General) => ProcMacroKind::FunctionLike,
+        _ => return,
     };
     let path = crate::text::normalized_path(path.to_owned());
     for occurrence in analysis
@@ -633,28 +679,32 @@ fn collect_macro_completions(
             ProcMacroKind::Attribute => "attribute proc macro",
             ProcMacroKind::FunctionLike => "function-like proc macro",
         };
-        items.push(completion_item(
-            &occurrence.name,
-            CompletionItemKind::FUNCTION,
-            Some(detail.into()),
-        ));
+        items.push(if kind == ProcMacroKind::FunctionLike {
+            function_like_macro_completion(&occurrence.name, detail, needs_bang)
+        } else {
+            completion_item(
+                &occurrence.name,
+                CompletionItemKind::FUNCTION,
+                Some(detail.into()),
+            )
+        });
     }
 }
 
 fn collect_standard_macro_completions(site: &CompletionSite, items: &mut Vec<CompletionItem>) {
-    match site.macro_kind {
-        Some(ProcMacroKind::FunctionLike) => {
+    match (site.macro_kind, site.context) {
+        (Some(ProcMacroKind::FunctionLike), _) | (None, CompletionContext::General) => {
             for name in STANDARD_FUNCTION_MACROS {
                 if name.to_lowercase().starts_with(&site.prefix.to_lowercase()) {
-                    items.push(completion_item(
+                    items.push(function_like_macro_completion(
                         name,
-                        CompletionItemKind::FUNCTION,
-                        Some("standard macro".into()),
+                        "standard macro",
+                        site.macro_kind.is_none(),
                     ));
                 }
             }
         }
-        Some(ProcMacroKind::Derive) => {
+        (Some(ProcMacroKind::Derive), _) => {
             for name in STANDARD_DERIVE_MACROS {
                 if name.to_lowercase().starts_with(&site.prefix.to_lowercase()) {
                     items.push(completion_item(
@@ -669,7 +719,19 @@ fn collect_standard_macro_completions(site: &CompletionSite, items: &mut Vec<Com
     }
 }
 
-fn is_type_position(source: &str, start: usize, end: usize) -> bool {
+fn function_like_macro_completion(name: &str, detail: &str, needs_bang: bool) -> CompletionItem {
+    let label = if needs_bang {
+        format!("{name}!")
+    } else {
+        name.into()
+    };
+    let mut item = completion_item(&label, CompletionItemKind::FUNCTION, Some(detail.into()));
+    item.filter_text = Some(name.into());
+    item.insert_text = Some(label);
+    item
+}
+
+fn syntax_completion_context(source: &str, start: usize, end: usize) -> Option<CompletionContext> {
     let mut marked = source.to_string();
     marked.replace_range(start..end, COMPLETION_MARKER);
     let tokens = frontend::lexer::lex(&marked);
@@ -677,23 +739,28 @@ fn is_type_position(source: &str, start: usize, end: usize) -> bool {
         frontend::parser::Parser::new(&marked, tokens).parse();
     let parse = frontend::tree_builder::build_tree(&events, &tokens, parsed_source, errors);
     let target_range = text_range(start, start + COMPLETION_MARKER.len());
-    let Some(marker_token) = parse
+    let marker_token = parse
         .syntax()
         .descendants_with_tokens()
         .filter_map(rowan::NodeOrToken::into_token)
-        .find(|token| token.text_range() == target_range)
-    else {
-        return false;
-    };
+        .find(|token| token.text_range() == target_range)?;
 
-    let mut parent = marker_token.parent();
-    while let Some(node) = parent {
-        if node.kind() == SyntaxKind::NamedType {
-            return true;
+    if let Some(parent) = marker_token.parent() {
+        match parent.kind() {
+            SyntaxKind::StructExprField => return Some(CompletionContext::StructField),
+            SyntaxKind::StructPattern => return Some(CompletionContext::PatternField),
+            _ => {}
         }
-        parent = node.parent();
     }
-    false
+
+    for node in marker_token.parent_ancestors() {
+        match node.kind() {
+            SyntaxKind::UseTree => return Some(CompletionContext::Import),
+            SyntaxKind::NamedType => return Some(CompletionContext::Type),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn marked_completion_source(source: &str, site: &CompletionSite) -> String {
@@ -752,6 +819,20 @@ fn completion_items_from_result(
             CompletionContext::Type => {
                 collect_type_completions(hir, scope_graph, marker, fallback_hir, &mut items);
             }
+            CompletionContext::TypePath => {
+                if let Some(marker) = marker {
+                    let mut candidates = Vec::new();
+                    collect_resolved_associated_completions(
+                        hir,
+                        scope_graph,
+                        marker.reference,
+                        marker.body,
+                        marker.segments,
+                        &mut candidates,
+                    );
+                    items.extend(candidates.into_iter().filter(type_completion_item));
+                }
+            }
             CompletionContext::Member => {
                 let checked_types;
                 let types = if resolved.type_result.expr_types.is_empty() {
@@ -773,6 +854,19 @@ fn completion_items_from_result(
                         &mut items,
                     );
                 }
+            }
+            CompletionContext::Import => {
+                collect_import_completions(hir, scope_graph, &mut items);
+            }
+            CompletionContext::StructField | CompletionContext::PatternField => {
+                let checked_types;
+                let types = if resolved.type_result.pattern_types.is_empty() {
+                    checked_types = type_checker::check_hir(hir);
+                    &checked_types
+                } else {
+                    &resolved.type_result
+                };
+                collect_struct_field_completions(hir, types, &mut items);
             }
         }
     }
@@ -823,8 +917,39 @@ fn collect_visible_completions(
     out: &mut Vec<CompletionItem>,
 ) {
     for (name, definition) in visible_definitions(scope_graph, reference) {
+        if !definition_is_available_for_completion(hir, scope_graph, &definition) {
+            continue;
+        }
         push_definition_completion(hir, body, &name.0, &definition, out);
     }
+}
+
+fn definition_is_available_for_completion(
+    hir: &hir::HirFile,
+    scope_graph: &ScopeGraph,
+    definition: &DefRef,
+) -> bool {
+    match definition {
+        DefRef::UseAlias {
+            rewrite_to, anchor, ..
+        } => resolve_path_from(scope_graph, *anchor, rewrite_to)
+            .iter()
+            .any(|resolved| !definition_is_hidden(hir, resolved)),
+        definition => !definition_is_hidden(hir, definition),
+    }
+}
+
+fn definition_is_hidden(hir: &hir::HirFile, definition: &DefRef) -> bool {
+    let DefRef::Function(id) = definition else {
+        return false;
+    };
+    let function = &hir.item_tree.functions[*id];
+    hir.std_loaded
+        && hir.package_for_range(function.name_range).is_none()
+        && function
+            .attrs
+            .iter()
+            .any(|attr| attr.name.0 == "doc" && attr.value.as_deref() == Some("hidden"))
 }
 
 fn push_definition_completion(
@@ -960,6 +1085,9 @@ fn collect_resolved_associated_completions(
             _ => Vec::new(),
         };
         for (name, associated) in definitions {
+            if !definition_is_available_for_completion(hir, scope_graph, &associated) {
+                continue;
+            }
             if let DefRef::Function(id) = &associated
                 && !function_is_visible(hir, body, *id)
             {
@@ -976,6 +1104,68 @@ fn collect_resolved_associated_completions(
             push_definition_completion(hir, body, &name.0, &associated, out);
         }
     }
+}
+
+fn collect_import_completions(
+    hir: &hir::HirFile,
+    scope_graph: &ScopeGraph,
+    out: &mut Vec<CompletionItem>,
+) {
+    let Some((anchor, segments)) = completion_import_marker(scope_graph) else {
+        return;
+    };
+    let qualifier = &segments[..segments.len() - 1];
+    let definitions = if qualifier.is_empty() {
+        visible_definitions_from(scope_graph, anchor)
+    } else {
+        resolve_path_from(scope_graph, anchor, qualifier)
+            .into_iter()
+            .flat_map(|definition| match definition {
+                DefRef::Module { enter, .. } => exported_definitions(scope_graph, enter),
+                DefRef::Enum(id) => scope_graph
+                    .variant_scopes_by_enum
+                    .get(&id)
+                    .map(|scope| exported_definitions(scope_graph, *scope))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            })
+            .collect()
+    };
+
+    for (name, definition) in definitions {
+        if name.0 == COMPLETION_MARKER
+            || !definition_is_available_for_completion(hir, scope_graph, &definition)
+            || matches!(
+                definition,
+                DefRef::PatternBinding { .. }
+                    | DefRef::Param { .. }
+                    | DefRef::LambdaParam { .. }
+                    | DefRef::ConstParam { .. }
+            )
+        {
+            continue;
+        }
+        push_definition_completion(hir, None, &name.0, &definition, out);
+    }
+}
+
+fn completion_import_marker(scope_graph: &ScopeGraph) -> Option<(NodeId, &[hir::Name])> {
+    scope_graph.nodes.iter().find_map(|(_, node)| {
+        let Node::PopSymbol {
+            name,
+            define: DefRef::UseAlias {
+                rewrite_to, anchor, ..
+            },
+        } = node
+        else {
+            return None;
+        };
+        (name.0 == COMPLETION_MARKER
+            && rewrite_to
+                .last()
+                .is_some_and(|segment| segment.0 == COMPLETION_MARKER))
+        .then_some((*anchor, rewrite_to.as_slice()))
+    })
 }
 
 fn collect_global_completions(hir: &hir::HirFile, out: &mut Vec<CompletionItem>) {
@@ -1009,19 +1199,21 @@ fn collect_type_completions(
     } else {
         collect_global_completions(fallback_hir.unwrap_or(hir), &mut candidates);
     }
-    out.extend(candidates.into_iter().filter(|item| {
-        matches!(
-            item.kind,
-            Some(
-                CompletionItemKind::STRUCT
-                    | CompletionItemKind::ENUM
-                    | CompletionItemKind::INTERFACE
-                    | CompletionItemKind::TYPE_PARAMETER
-                    | CompletionItemKind::MODULE
-                    | CompletionItemKind::REFERENCE
-            )
+    out.extend(candidates.into_iter().filter(type_completion_item));
+}
+
+fn type_completion_item(item: &CompletionItem) -> bool {
+    matches!(
+        item.kind,
+        Some(
+            CompletionItemKind::STRUCT
+                | CompletionItemKind::ENUM
+                | CompletionItemKind::INTERFACE
+                | CompletionItemKind::TYPE_PARAMETER
+                | CompletionItemKind::MODULE
+                | CompletionItemKind::REFERENCE
         )
-    }));
+    )
 }
 
 fn collect_generic_type_completions(
@@ -1158,6 +1350,95 @@ fn collect_member_completions(
     }
 }
 
+fn collect_struct_field_completions(
+    hir: &hir::HirFile,
+    types: &type_checker::TypeCheckResult,
+    out: &mut Vec<CompletionItem>,
+) {
+    for (body_id, body) in hir.bodies.iter() {
+        for (_, expr) in body.exprs.iter() {
+            let Expr::Struct {
+                fields, resolved, ..
+            } = expr
+            else {
+                continue;
+            };
+            if !fields.iter().any(|field| field.name.0 == COMPLETION_MARKER) {
+                continue;
+            }
+            let Some(definitions) = crate::navigation::fields_for_struct_expression(hir, expr)
+            else {
+                return;
+            };
+            let struct_id = match resolved {
+                Some(ResolvedName::Struct(id)) => Some(*id),
+                _ => None,
+            };
+            push_missing_field_completions(
+                hir,
+                body_id,
+                struct_id,
+                definitions,
+                fields.iter().map(|field| &field.name),
+                out,
+            );
+            return;
+        }
+
+        for (pat_id, pattern) in body.pats.iter() {
+            let Pattern::Struct { fields, path } = pattern else {
+                continue;
+            };
+            if !fields.iter().any(|field| field.name.0 == COMPLETION_MARKER) {
+                continue;
+            }
+            let Some(definitions) =
+                crate::navigation::fields_for_struct_pattern(hir, types, body_id, pat_id, path)
+            else {
+                return;
+            };
+            let struct_id = types
+                .pattern_types
+                .get(&(body_id, pat_id))
+                .and_then(receiver_struct_id);
+            push_missing_field_completions(
+                hir,
+                body_id,
+                struct_id,
+                definitions,
+                fields.iter().map(|field| &field.name),
+                out,
+            );
+            return;
+        }
+    }
+}
+
+fn push_missing_field_completions<'a>(
+    hir: &hir::HirFile,
+    body_id: BodyId,
+    struct_id: Option<StructId>,
+    definitions: &[hir::item_tree::HirStructField],
+    existing: impl Iterator<Item = &'a hir::Name>,
+    out: &mut Vec<CompletionItem>,
+) {
+    let existing = existing.collect::<HashSet<_>>();
+    for field in definitions {
+        if existing.contains(&field.name)
+            || struct_id.is_some_and(|id| {
+                !type_checker::struct_field_is_visible(hir, body_id, id, &field.visibility)
+            })
+        {
+            continue;
+        }
+        out.push(completion_item(
+            &field.name.0,
+            CompletionItemKind::FIELD,
+            Some(field.ty.display()),
+        ));
+    }
+}
+
 fn push_top_level_item(
     hir: &hir::HirFile,
     item: TopLevelItem,
@@ -1172,7 +1453,8 @@ fn push_top_level_item(
                 &item.visibility,
                 item.name_range,
                 allow_private_user_item,
-            ) {
+            ) && !definition_is_hidden(hir, &DefRef::Function(id))
+            {
                 out.push(function_completion(item, CompletionItemKind::FUNCTION));
             }
         }

@@ -124,6 +124,125 @@ fn completion_keeps_expression_candidates_after_struct_field_colons() {
 }
 
 #[test]
+fn completion_includes_missing_fields_in_literals_and_patterns() {
+    let literal = "struct Point { x: i32, y: bool }\nenum Event { Move { dx: i32, dy: i32 } }\nfun main() { let point = Point { x: 1,  }; let event = Event::Move { dx: 1, d }; }";
+    let point_items = completion_items_for_source(
+        literal,
+        position(literal, literal.find("x: 1,  }").unwrap() + "x: 1, ".len()),
+        CompileOptions { use_std: false },
+    );
+    assert!(point_items.iter().any(|item| {
+        item.label == "y" && item.kind == Some(lsp_types::CompletionItemKind::FIELD)
+    }));
+    assert!(!point_items.iter().any(|item| item.label == "x"));
+
+    let variant_items = completion_items_for_source(
+        literal,
+        position(
+            literal,
+            literal.find("dx: 1, d").unwrap() + "dx: 1, d".len(),
+        ),
+        CompileOptions { use_std: false },
+    );
+    assert!(variant_items.iter().any(|item| item.label == "dy"));
+    assert!(!variant_items.iter().any(|item| item.label == "dx"));
+
+    let pattern = "struct Point { x: i32, y: bool }\nenum Event { Move { dx: i32, dy: i32 } }\nfun inspect(point: Point, event: Event) { match point { Point { x,  } => {} } match event { Event::Move { dx, d } => {} } }";
+    let point_pattern_items = completion_items_for_source(
+        pattern,
+        position(pattern, pattern.find("x,  }").unwrap() + "x, ".len()),
+        CompileOptions { use_std: false },
+    );
+    assert!(point_pattern_items.iter().any(|item| item.label == "y"));
+    assert!(!point_pattern_items.iter().any(|item| item.label == "x"));
+
+    let variant_pattern_items = completion_items_for_source(
+        pattern,
+        position(pattern, pattern.find("dx, d").unwrap() + "dx, d".len()),
+        CompileOptions { use_std: false },
+    );
+    assert!(variant_pattern_items.iter().any(|item| item.label == "dy"));
+    assert!(!variant_pattern_items.iter().any(|item| item.label == "dx"));
+
+    let visibility = "mod model { pub struct Point { hidden: i32, pub shown: i32 } }\nfun main() { let point = model::Point {  }; }";
+    let visibility_items = completion_items_for_source(
+        visibility,
+        position(
+            visibility,
+            visibility.find("Point {  }").unwrap() + "Point { ".len(),
+        ),
+        CompileOptions { use_std: false },
+    );
+    assert!(visibility_items.iter().any(|item| item.label == "shown"));
+    assert!(!visibility_items.iter().any(|item| item.label == "hidden"));
+}
+
+#[test]
+fn completion_resolves_import_paths() {
+    let module = "mod model { pub struct Widget {} pub fun make() {} struct Hidden {} }\nuse crate::model::;";
+    let module_items = completion_items_for_source(
+        module,
+        position(module, module.find("model::;").unwrap() + "model::".len()),
+        CompileOptions { use_std: false },
+    );
+    let widget = module_items
+        .iter()
+        .find(|item| item.label == "Widget")
+        .unwrap_or_else(|| panic!("{module_items:#?}"));
+    assert_eq!(widget.kind, Some(lsp_types::CompletionItemKind::STRUCT));
+    assert!(module_items.iter().any(|item| item.label == "make"));
+    assert!(!module_items.iter().any(|item| item.label == "Hidden"));
+
+    let root = "mod model {}\nuse mo;";
+    let root_items = completion_items_for_source(
+        root,
+        position(root, root.find("mo;").unwrap() + 2),
+        CompileOptions { use_std: false },
+    );
+    assert!(root_items.iter().any(|item| item.label == "model"));
+
+    let list = "mod model { pub fun make() {} }\nuse crate::model::{ma};";
+    let list_items = completion_items_for_source(
+        list,
+        position(list, list.find("ma}").unwrap() + 2),
+        CompileOptions { use_std: false },
+    );
+    assert!(list_items.iter().any(|item| item.label == "make"));
+
+    let enumeration = "enum State { Ready, Running }\nuse crate::State::Ru;";
+    let variant_items = completion_items_for_source(
+        enumeration,
+        position(enumeration, enumeration.find("Ru;").unwrap() + 2),
+        CompileOptions { use_std: false },
+    );
+    assert!(variant_items.iter().any(|item| {
+        item.label == "Running" && item.kind == Some(lsp_types::CompletionItemKind::ENUM_MEMBER)
+    }));
+}
+
+#[test]
+fn completion_filters_qualified_type_paths() {
+    let source =
+        "mod model { pub struct Widget {} pub fun make() {} }\nfun inspect(value: model::Wid) {}";
+    let items = completion_items_for_source(
+        source,
+        position(source, source.find("Wid)").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+
+    assert!(
+        items.iter().any(|item| item.label == "Widget"),
+        "{items:#?}"
+    );
+    assert!(!items.iter().any(|item| item.label == "make"));
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.kind == Some(lsp_types::CompletionItemKind::KEYWORD))
+    );
+}
+
+#[test]
 fn completion_resolves_fields_and_instance_methods() {
     let source = "struct Point { x: i32, y: i32 }\nimpl Point { fun origin() -> Point { Point { x: 0, y: 0 } } fun magnitude(&self) -> i32 { self.x } fun offset(&self, value: i32) -> i32 { value } }\nfun main() { let point = Point { x: 1, y: 2 }; point. }";
     let items = completion_items_for_source(
@@ -277,21 +396,66 @@ fn completion_includes_std_prelude_imports() {
 
 #[test]
 fn completion_includes_standard_print_macros() {
-    let source = "fun main() { p!(); }";
+    let source = "use std::io::print; fun main() { prin }";
     let items = completion_items_for_source(
         source,
-        position(source, source.find("p!").unwrap() + 1),
+        position(source, source.rfind("prin").unwrap() + "prin".len()),
         CompileOptions::default(),
     );
 
+    let print = items
+        .iter()
+        .find(|item| item.label == "print!" && item.detail.as_deref() == Some("standard macro"))
+        .unwrap_or_else(|| panic!("{items:#?}"));
+    assert_eq!(print.insert_text.as_deref(), Some("print!"));
+    assert_eq!(print.filter_text.as_deref(), Some("print"));
+
     assert!(
-        items.iter().any(|item| {
-            item.label == "print" && item.detail.as_deref() == Some("standard macro")
-        })
+        !items.iter().any(|item| item.label == "print"),
+        "{items:#?}"
     );
-    assert!(items.iter().any(|item| {
-        item.label == "println" && item.detail.as_deref() == Some("standard macro")
-    }));
+
+    let println = items
+        .iter()
+        .find(|item| item.label == "println!" && item.detail.as_deref() == Some("standard macro"))
+        .unwrap_or_else(|| panic!("{items:#?}"));
+    assert_eq!(println.insert_text.as_deref(), Some("println!"));
+    assert_eq!(println.filter_text.as_deref(), Some("println"));
+
+    let existing_bang = "fun main() { p!(); }";
+    let items = completion_items_for_source(
+        existing_bang,
+        position(existing_bang, existing_bang.find("p!").unwrap() + 1),
+        CompileOptions::default(),
+    );
+    let print = items
+        .iter()
+        .find(|item| item.label == "print" && item.detail.as_deref() == Some("standard macro"))
+        .unwrap_or_else(|| panic!("{items:#?}"));
+    assert_eq!(print.insert_text.as_deref(), Some("print"));
+    assert_eq!(print.filter_text.as_deref(), Some("print"));
+
+    let hidden = "fun main() { std::io::_pr }";
+    let items = completion_items_for_source(
+        hidden,
+        position(hidden, hidden.rfind("_pr").unwrap() + "_pr".len()),
+        CompileOptions::default(),
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "_print"),
+        "{items:#?}"
+    );
+
+    let import = "use std::io::_pr;";
+    let items = completion_items_for_source(
+        import,
+        position(import, import.find("_pr").unwrap() + "_pr".len()),
+        CompileOptions::default(),
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "_print"),
+        "{items:#?}"
+    );
 }
 
 #[test]

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
 pub const CLUE_PROJECT_FILE_NAME: &str = "Clue.toml";
+pub const WORKSPACE_CRATES_KEY: &str = "crates";
 
 pub fn new_manifest(package_name: &str, kind: ProjectKind) -> String {
     let mut package = Table::new();
@@ -46,6 +47,7 @@ fn document(name: &str, value: Value) -> String {
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub name: String,
+    pub version: String,
     pub entry: PathBuf,
     pub kind: ProjectKind,
     pub build_target: Option<String>,
@@ -60,6 +62,39 @@ pub struct Dependency {
     pub alias: String,
     pub package: String,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceManifest {
+    pub crates: Vec<PathBuf>,
+}
+
+pub fn read_workspace(root: &Path) -> io::Result<Option<WorkspaceManifest>> {
+    let manifest_path = root.join(CLUE_PROJECT_FILE_NAME);
+    let text = fs::read_to_string(&manifest_path)?;
+    let value = text.parse::<Table>().map(Value::Table).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid `{}`: {error}", manifest_path.display()),
+        )
+    })?;
+    let Some(workspace) = table(&value, "workspace") else {
+        return Ok(None);
+    };
+    let crates = workspace_crates(workspace)?;
+    Ok(Some(WorkspaceManifest { crates }))
+}
+
+pub fn is_virtual_workspace_root(root: &Path) -> io::Result<bool> {
+    let manifest_path = root.join(CLUE_PROJECT_FILE_NAME);
+    let text = fs::read_to_string(&manifest_path)?;
+    let value = text.parse::<Table>().map(Value::Table).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid `{}`: {error}", manifest_path.display()),
+        )
+    })?;
+    Ok(table(&value, "workspace").is_some() && table(&value, "package").is_none())
 }
 
 pub fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
@@ -78,6 +113,8 @@ pub fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
         )
     })?;
     let name = string_field(package, "name", "package")?;
+    let version =
+        optional_string_field(package, "version", "package")?.unwrap_or_else(|| "0.1.0".into());
     validate_package_name(&name).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
     let target = target_path(root, &value, kind)?;
     let target_kind = target.as_ref().map_or(kind, |(_, kind)| *kind);
@@ -99,6 +136,7 @@ pub fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
 
     Ok(Manifest {
         name,
+        version,
         entry,
         kind,
         build_target,
@@ -107,6 +145,33 @@ pub fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
         fingerprint: value.to_string(),
         dependencies: dependencies(&value)?,
     })
+}
+
+fn workspace_crates(workspace: &Table) -> io::Result<Vec<PathBuf>> {
+    let Some(value) = workspace.get(WORKSPACE_CRATES_KEY) else {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("missing `workspace.{WORKSPACE_CRATES_KEY}`"),
+        ));
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("`workspace.{WORKSPACE_CRATES_KEY}` must be an array of paths"),
+        ));
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(PathBuf::from).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("`workspace.{WORKSPACE_CRATES_KEY}[{index}]` must be a string path"),
+                )
+            })
+        })
+        .collect()
 }
 
 fn runtime_config(

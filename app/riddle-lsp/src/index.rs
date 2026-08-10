@@ -472,7 +472,7 @@ pub fn project_index_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -508,7 +508,7 @@ pub fn project_index_for_root_cancellable<S: BuildHasher>(
     let mut session = session
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let analysis = clue::check_project_with_session_cancellable(
+    let analysis = clue::infer_project_with_session_cancellable(
         &root,
         overlays,
         options,
@@ -524,11 +524,11 @@ pub fn project_index_for_root_cancellable<S: BuildHasher>(
     let files = analysis.source.files.clone();
     let path = Some(normalized_path(analysis.entry.clone()));
     let document_analysis = DocumentAnalysis {
-        result: analysis.result,
-        source: analysis.source.source,
-        source_map: Some(analysis.source.source_map),
-        macro_occurrences: analysis.macro_occurrences,
-        macro_source_map: Some(analysis.macro_source_map),
+        result: std::sync::Arc::clone(&analysis.result),
+        source: analysis.source.source.clone(),
+        source_map: Some(analysis.source.source_map.clone()),
+        macro_occurrences: analysis.macro_occurrences.clone(),
+        macro_source_map: Some(analysis.macro_source_map.clone()),
         path,
         project_root: Some(root),
         project_revision,

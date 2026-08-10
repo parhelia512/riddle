@@ -4,7 +4,7 @@ use std::{
     fs,
     hash::BuildHasher,
     path::{Path, PathBuf},
-    time::SystemTime,
+    sync::Arc,
 };
 
 use lsp_types::{
@@ -19,6 +19,7 @@ use type_checker::{LabelStyle, SourceLabel};
 
 use crate::{
     server::Document,
+    session::AnalysisSessions,
     text::{LineIndex, normalized_path, text_range, text_size},
 };
 
@@ -38,9 +39,17 @@ struct ResolvedLabel {
 pub struct DiagnosticSessions {
     standalone: HashMap<Url, StandaloneDiagnosticSession>,
     projects: HashMap<PathBuf, ProjectDiagnosticSession>,
+    analysis: Arc<AnalysisSessions>,
 }
 
 impl DiagnosticSessions {
+    pub(crate) fn new(analysis: Arc<AnalysisSessions>) -> Self {
+        Self {
+            analysis,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn invalidate_project(&mut self, uri: &Url) {
         let Some(root) = uri
             .to_file_path()
@@ -67,13 +76,12 @@ struct CachedStandaloneDiagnostics {
 
 #[derive(Default)]
 struct ProjectDiagnosticSession {
-    checker: clue::ProjectSession,
     cached: Option<CachedProjectDiagnostics>,
 }
 
 struct CachedProjectDiagnostics {
     options: CompileOptions,
-    inputs: ProjectInputs,
+    revision: u64,
     files: HashSet<PathBuf>,
     diagnostics: BTreeMap<Url, Vec<Diagnostic>>,
 }
@@ -87,12 +95,6 @@ struct DocumentGroups {
     overlays: HashMap<PathBuf, String>,
     projects: BTreeMap<PathBuf, Vec<Url>>,
     standalone: Vec<Url>,
-}
-
-#[derive(PartialEq, Eq)]
-struct ProjectInputs {
-    overlays: BTreeMap<PathBuf, String>,
-    disk: BTreeMap<PathBuf, Option<(u64, Option<SystemTime>)>>,
 }
 
 #[cfg(feature = "test")]
@@ -134,6 +136,7 @@ pub fn collect_workspace_diagnostics_cancellable<S: BuildHasher>(
     let mut by_uri = BTreeMap::<Url, Vec<Diagnostic>>::new();
     let mut live_standalone = HashSet::new();
     let mut live_projects = HashSet::new();
+    let analysis_sessions = Arc::clone(&sessions.analysis);
     for uri in standalone {
         if cancelled() {
             return None;
@@ -165,6 +168,7 @@ pub fn collect_workspace_diagnostics_cancellable<S: BuildHasher>(
             &overlays,
             options,
             sessions.projects.entry(root.clone()).or_default(),
+            &analysis_sessions,
         ) {
             Ok(cached) => cached,
             Err(error) => {
@@ -310,19 +314,25 @@ fn project_diagnostics(
     overlays: &HashMap<PathBuf, String>,
     options: CompileOptions,
     session: &mut ProjectDiagnosticSession,
+    analysis_sessions: &AnalysisSessions,
 ) -> Result<ProjectDiagnostics, String> {
-    if let Some(cached) = &session.cached {
-        let inputs = project_inputs(root, overlays, &cached.files);
-        if cached.options == options && inputs == cached.inputs {
-            return Ok(ProjectDiagnostics {
-                by_uri: cached.diagnostics.clone(),
-                files: cached.files.clone(),
-            });
-        }
-    }
-
-    let analysis = clue::check_project_with_session(root, overlays, options, &mut session.checker)
+    let checker = analysis_sessions.project(root);
+    let mut checker = checker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let analysis = clue::check_project_with_session(root, overlays, options, &mut checker)
         .map_err(|error| error.to_string())?;
+    let revision = checker.revision();
+    drop(checker);
+    if let Some(cached) = &session.cached
+        && cached.options == options
+        && cached.revision == revision
+    {
+        return Ok(ProjectDiagnostics {
+            by_uri: cached.diagnostics.clone(),
+            files: cached.files.clone(),
+        });
+    }
     let files = analysis
         .source
         .files
@@ -330,10 +340,9 @@ fn project_diagnostics(
         .cloned()
         .collect::<HashSet<_>>();
     let diagnostics = collect_mapped_diagnostics(&analysis.source.source_map, &analysis.result);
-    let inputs = project_inputs(root, overlays, &files);
     session.cached = Some(CachedProjectDiagnostics {
         options,
-        inputs,
+        revision,
         files: files.clone(),
         diagnostics: diagnostics.clone(),
     });
@@ -341,38 +350,6 @@ fn project_diagnostics(
         by_uri: diagnostics,
         files,
     })
-}
-
-fn project_inputs(
-    root: &Path,
-    overlays: &HashMap<PathBuf, String>,
-    files: &HashSet<PathBuf>,
-) -> ProjectInputs {
-    let overlays = overlays
-        .iter()
-        .filter_map(|(path, source)| {
-            let path = normalized_path(path.clone());
-            files.contains(&path).then(|| (path, source.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut watched_files = files.clone();
-    watched_files.insert(normalized_path(root.join("Clue.toml")));
-    for file in files {
-        if let Some(project_root) = clue::find_project_root(file) {
-            watched_files.insert(normalized_path(project_root.join("Clue.toml")));
-        }
-    }
-    let disk = watched_files
-        .into_iter()
-        .filter(|path| !overlays.contains_key(path))
-        .map(|path| {
-            let stamp = fs::metadata(&path)
-                .ok()
-                .map(|metadata| (metadata.len(), metadata.modified().ok()));
-            (path, stamp)
-        })
-        .collect();
-    ProjectInputs { overlays, disk }
 }
 
 #[cfg(feature = "test")]

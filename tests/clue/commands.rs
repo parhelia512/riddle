@@ -63,6 +63,51 @@ fn c_compiler() -> Option<OsString> {
         })
 }
 
+fn write_workspace_fixture(root: &Path) {
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::create_dir_all(root.join("math/src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[workspace]\ncrates = [\"app\", \"math\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+math = { path = "../math" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("math/Clue.toml"),
+        r#"[package]
+name = "math"
+version = "0.1.0"
+
+[lib]
+path = "src/lib.rid"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        "fun main() -> i32 { math::value() }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("math/src/lib.rid"),
+        "pub fun value() -> i32 { 1 }\n",
+    )
+    .unwrap();
+}
+
 const GENERATED_C_GC_SOURCE: &str = r#"struct Data { value: i32 }
 struct Token { value: i32 }
 
@@ -180,9 +225,7 @@ fun main() -> i32 {
 }
 "#;
 
-const PROC_MACRO_DEPENDENCY_SOURCE: &str = r##"use std::io::println;
-
-#[proc_macro_derive(Answer, attributes(answer))]
+const PROC_MACRO_DEPENDENCY_SOURCE: &str = r##"#[proc_macro_derive(Answer, attributes(answer))]
 pub fun derive_answer(input: TokenStream) -> TokenStream {
     let mut saw_struct = false;
     let mut saw_name = false;
@@ -289,7 +332,7 @@ pub fun derive_answer(input: TokenStream) -> TokenStream {
         return TokenStream::new();
     }
     let message = "macro log";
-    println(&message);
+    println!("{}", message);
     TokenStream::from_str("fun generated_answer() -> i32 { let text = \"token text\"; 42 }")
         .unwrap_or(TokenStream::new())
 }
@@ -979,13 +1022,11 @@ fn standard_library_basics_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-fun main() -> i32 {
+        r#"fun main() -> i32 {
     let value: Option<i32> = Some(2);
     let error: Result<i32, bool> = Err(true);
-    print(&(-42));
-    print(&0);
+    print!("{}", -42);
+    print!("{}", 0);
     if value.is_some() && value.unwrap_or(0) == 2
         && error.is_err() && error.err().is_some() {
         0
@@ -993,7 +1034,7 @@ fun main() -> i32 {
         1
     }
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1020,7 +1061,6 @@ fn rust_style_display_fmt_compiles_and_runs() {
     fs::write(
         root.join("app/src/main.rid"),
         r#"use std::fmt::{Display, Formatter};
-use std::io::{print, println};
 
 struct Label {
     text: &str,
@@ -1037,9 +1077,9 @@ impl Display for Label {
 
 fun main() -> i32 {
     let label = Label { text: "value=" };
-    print(&label);
-    print(&label);
-    println(&'中');
+    print!("{}", label);
+    print!("{}", label);
+    println!("{}", '中');
     0
 }
 "#,
@@ -1426,13 +1466,12 @@ fn tree_collections_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::collections::{TreeMap, TreeSet};
-use std::io::print;
+        r#"use std::collections::{TreeMap, TreeSet};
 
 struct Payload { value: i32 }
 
 impl Drop for Payload {
-    fun drop(&mut self) { print(&self.value); }
+    fun drop(&mut self) { print!("{}", self.value); }
 }
 
 fun main() -> i32 {
@@ -1473,7 +1512,7 @@ fun main() -> i32 {
     }
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1499,15 +1538,14 @@ fn hash_collections_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::collections::{HashMap, HashSet};
+        r#"use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::io::print;
 
 struct Key { value: i32 }
 struct Payload { value: i32 }
 
 impl Drop for Payload {
-    fun drop(&mut self) { print(&self.value); }
+    fun drop(&mut self) { print!("{}", self.value); }
 }
 
 impl PartialEq for Key {
@@ -1552,7 +1590,7 @@ fun main() -> i32 {
     }
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1578,13 +1616,11 @@ fn deterministic_drop_runs_in_native_binary() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
@@ -1594,10 +1630,10 @@ fun main() -> i32 {
         let second = Guard { id: 2 };
         drop(second);
     }
-    print(&0);
+    print!("{}", 0);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1623,18 +1659,16 @@ fn short_circuit_and_temporary_drops_run_in_native_binary() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 struct Pair { first: Guard, second: Guard }
 struct Condition { value: bool, id: i32 }
 
 impl Drop for Guard {
-    fun drop(&mut self) { print(&self.id); }
+    fun drop(&mut self) { print!("{}", self.id); }
 }
 
 impl Drop for Condition {
-    fun drop(&mut self) { print(&self.id); }
+    fun drop(&mut self) { print!("{}", self.id); }
 }
 
 impl Condition {
@@ -1666,7 +1700,7 @@ fun main() -> i32 {
     while make_condition(iteration == 0, 5 + iteration).get() {
         iteration += 1;
     }
-    print(&0);
+    print!("{}", 0);
     if calls == 0 { 0 } else { 1 }
 }
 "#,
@@ -1724,13 +1758,11 @@ fn nested_dynamic_array_move_drops_selected_element_once() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
@@ -1744,7 +1776,7 @@ fun main() -> i32 {
     let selected = matrix[row][column];
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1776,9 +1808,7 @@ fn match_pattern_binding_drops_at_arm_end() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 
 enum MaybeGuard {
     Some(Guard),
@@ -1787,7 +1817,7 @@ enum MaybeGuard {
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
@@ -1797,10 +1827,10 @@ fun main() -> i32 {
         MaybeGuard::Some(guard) => {},
         MaybeGuard::None => {},
     }
-    print(&0);
+    print!("{}", 0);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1826,13 +1856,11 @@ fn moved_destructured_binding_is_not_dropped_twice() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
@@ -1841,10 +1869,10 @@ fun consume(guard: Guard) {}
 fun main() -> i32 {
     let (first, second) = (Guard { id: 1 }, Guard { id: 2 });
     consume(first);
-    print(&0);
+    print!("{}", 0);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1871,19 +1899,17 @@ fn closures_capture_destructured_bindings() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-fun main() -> i32 {
+        r#"fun main() -> i32 {
     let (a, b) = (10, 20);
     let sum = fun() -> i32 { a + b };
     let (mut c, d) = (1, 2);
     let mut bump = fun() { c = c + d; };
     bump();
     bump();
-    print(&(sum() + c));
+    print!("{}", sum() + c);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1909,19 +1935,17 @@ fn destructuring_let_binds_tuple_and_struct_elements() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Point { x: i32, y: i32 }
+        r#"struct Point { x: i32, y: i32 }
 
 fun main() -> i32 {
     let ((a, b), c) = ((1, 2), 3);
     let Point { x, y } = Point { x: 10, y: 20 };
     let (mut total, step) = (0, 100);
     total = total + step;
-    print(&(a + b + c + x + y + total));
+    print!("{}", a + b + c + x + y + total);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -1947,9 +1971,7 @@ fn reference_patterns_match_rust_binding_modes_at_runtime() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Point { x: i32, y: i32 }
+        r#"struct Point { x: i32, y: i32 }
 
 enum Maybe {
     Some(i32),
@@ -1969,27 +1991,27 @@ fun main() -> i32 {
     *right = 20;
     let &mut mut copy = left;
     copy = 99;
-    print(&(*left + *right));
+    print!("{}", *left + *right);
 
     let point = Point { x: 10, y: 20 };
     let Point { x, y } = &point;
-    print(&(*x + *y));
+    print!("{}", *x + *y);
 
     let maybe = Maybe::Some(7);
     let matched = match &maybe {
         Maybe::Some(value) => *value,
         Maybe::None => 0,
     };
-    print(&matched);
-    print(&(*escaped_first()));
+    print!("{}", matched);
+    print!("{}", *escaped_first());
 
     let mut original = 3;
     let (&mut copied, plain) = (&mut original, 4);
     original = 5;
-    print(&(copied + plain + original));
+    print!("{}", copied + plain + original);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -2015,9 +2037,7 @@ fn moved_match_binding_is_not_dropped_twice() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 
 enum MaybeGuard {
     Some(Guard),
@@ -2026,7 +2046,7 @@ enum MaybeGuard {
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
@@ -2038,10 +2058,10 @@ fun main() -> i32 {
         MaybeGuard::Some(guard) => { consume(guard); },
         MaybeGuard::None => {},
     }
-    print(&0);
+    print!("{}", 0);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -2067,15 +2087,13 @@ fn match_partial_move_drops_each_field_once() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 
 struct Pair { left: Guard, right: Guard }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
@@ -2087,11 +2105,11 @@ fun main() -> i32 {
     match pair {
         Pair { left } => {}
     }
-    print(&pair.right.id);
-    print(&0);
+    print!("{}", pair.right.id);
+    print!("{}", 0);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -2117,13 +2135,11 @@ fn array_for_break_drops_current_and_remaining_items_once() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
@@ -2138,10 +2154,10 @@ fun main() -> i32 {
             break;
         }
     }
-    print(&0);
+    print!("{}", 0);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -2167,20 +2183,18 @@ fn generic_for_break_drops_item_before_iterator() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 struct Once { yielded: bool }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
 impl Drop for Once {
     fun drop(&mut self) {
-        print(&9);
+        print!("{}", 9);
     }
 }
 
@@ -2211,10 +2225,10 @@ fun main() -> i32 {
     for guard in once {
         break;
     }
-    print(&0);
+    print!("{}", 0);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -2358,9 +2372,7 @@ fn string_and_vector_compile_and_run() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r#"use std::io::print;
-
-fun main() -> i32 {
+        r#"fun main() -> i32 {
     let mut values: Vector<i32> = Vector::new();
     let mut index = 0;
     while index < 10 {
@@ -2388,7 +2400,7 @@ fun main() -> i32 {
     let text_matches = text.len() == 11usize && text.as_str() == "hello world";
     {
         let text_view = text.as_str();
-        print(&text_view);
+        print!("{}", text_view);
     }
     text.clear();
     let text_cleared = text.is_empty() && text.as_str() == "";
@@ -2536,9 +2548,7 @@ fn vector_indexing_compiles_and_runs() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-fun main() -> i32 {
+        r#"fun main() -> i32 {
     let mut values: Vector<i32> = Vector::new();
     values.push(10);
     values.push(20);
@@ -2555,10 +2565,10 @@ fun main() -> i32 {
         let second = &mut values[index];
         *second += 1;
     }
-    print(&values[index]);
+    print!("{}", values[index]);
     if values[index] == 13 { 0 } else { 3 }
 }
-",
+"#,
     )
     .unwrap();
 
@@ -2669,13 +2679,11 @@ fn vector_drops_owned_elements() {
     assert!(clue(&["new", "app"], &root).status.success());
     fs::write(
         root.join("app/src/main.rid"),
-        r"use std::io::print;
-
-struct Guard { id: i32 }
+        r#"struct Guard { id: i32 }
 
 impl Drop for Guard {
     fun drop(&mut self) {
-        print(&self.id);
+        print!("{}", self.id);
     }
 }
 
@@ -2685,7 +2693,7 @@ fun main() -> i32 {
         values.push(Guard { id: 1 });
         values.push(Guard { id: 2 });
     }
-    print(&0);
+    print!("{}", 0);
 
     {
         let mut values: Vector<Guard> = Vector::new();
@@ -2693,7 +2701,7 @@ fun main() -> i32 {
         values.push(Guard { id: 4 });
         values.clear();
     }
-    print(&0);
+    print!("{}", 0);
 
     {
         let mut values: Vector<Guard> = Vector::new();
@@ -2704,10 +2712,10 @@ fun main() -> i32 {
             break;
         }
     }
-    print(&0);
+    print!("{}", 0);
     0
 }
-",
+"#,
     )
     .unwrap();
 
@@ -3093,6 +3101,11 @@ fun parses_pat(source: &str) -> bool {
 
 #[proc_macro_derive(SynAnswer)]
 pub fun derive_answer(input: TokenStream) -> TokenStream {
+    let item = parse::<Item>(input.clone()).unwarp();
+    match item {
+        Item::Struct(_) => {},
+        _ => {},
+    }
     let parsed = match parse::<DeriveInput>(input) {
         Result::Ok(value) => value,
         Result::Err(error) => {
@@ -3411,7 +3424,7 @@ macros = { path = "../macros" }
         r#"use macros::SynAnswer;
 
 #[derive(SynAnswer)]
-struct Marker { value: i32 }
+struct Marker {}
 
 fun main() -> i32 {
     if syn_answer() == 42 { 0 } else { 1 }
@@ -3840,6 +3853,127 @@ middle = { path = "../middle" }
         accepted.status.success(),
         "{}",
         String::from_utf8_lossy(&accepted.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_check_writes_one_root_lock_for_registered_crates() {
+    let root = temp_root("workspace-check");
+    write_workspace_fixture(&root);
+
+    let output = clue(&["check"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lock = fs::read_to_string(root.join("Clue.lock")).unwrap();
+    assert!(lock.contains("path = \"app\""), "{lock}");
+    assert!(lock.contains("path = \"math\""), "{lock}");
+    assert!(lock.contains("dependencies = [\"math\"]"), "{lock}");
+    assert!(!root.join("app/Clue.lock").exists());
+    assert!(!root.join("math/Clue.lock").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_member_check_updates_the_root_lock() {
+    let root = temp_root("workspace-member-check");
+    write_workspace_fixture(&root);
+
+    let output = clue(&["check", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("Clue.lock").is_file());
+    let output = clue(&["check", "--package", "math"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_rejects_unregistered_root_path_dependencies() {
+    let root = temp_root("workspace-unregistered-dependency");
+    write_workspace_fixture(&root);
+    fs::create_dir_all(root.join("extra/src")).unwrap();
+    fs::write(
+        root.join("extra/Clue.toml"),
+        "[package]\nname = \"extra\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("extra/src/lib.rid"),
+        "pub fun value() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+
+[[bin]]
+path = "src/main.rid"
+
+[dependencies]
+extra = { path = "../extra" }
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["check"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("not registered in workspace"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_builds_registered_crates_in_dependency_order() {
+    if c_compiler().is_none() {
+        eprintln!("skipping workspace build test: no C compiler found");
+        return;
+    }
+    let root = temp_root("workspace-build");
+    write_workspace_fixture(&root);
+
+    let output = clue(&["build"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("math/.clue/build/math.c").is_file());
+    assert!(root.join("app/.clue/build/app.c").is_file());
+    assert!(root.join("Clue.lock").is_file());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn new_workspace_creates_a_virtual_manifest() {
+    let root = temp_root("workspace-new");
+    fs::create_dir_all(&root).unwrap();
+
+    let output = clue(&["new", "workspace", "--workspace"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("workspace/Clue.toml")).unwrap(),
+        "[workspace]\ncrates = []\n"
     );
     let _ = fs::remove_dir_all(root);
 }

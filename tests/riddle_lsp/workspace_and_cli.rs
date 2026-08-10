@@ -32,6 +32,30 @@ fn workspace_discovers_nested_clue_projects_and_skips_generated_trees() {
 }
 
 #[test]
+fn workspace_manifest_limits_lsp_discovery_to_registered_crates() {
+    let root = temp_root("workspace-manifest-discovery");
+    write_workspace_project(&root.join("app"), "app");
+    write_workspace_project(&root.join("libs/math"), "math");
+    write_workspace_project(&root.join("extra"), "extra");
+    fs::write(
+        root.join("Clue.toml"),
+        "[workspace]\ncrates = [\"app\", \"libs/math\"]\n",
+    )
+    .unwrap();
+
+    let projects = discover_projects(&root).unwrap();
+
+    assert_eq!(
+        projects,
+        [
+            fs::canonicalize(root.join("app")).unwrap(),
+            fs::canonicalize(root.join("libs/math")).unwrap(),
+        ]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn workspace_roots_can_be_added_and_removed_without_dropping_overlap() {
     let root = temp_root("workspace-roots");
     let cleanup = root.clone();

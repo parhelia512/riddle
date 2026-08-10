@@ -79,7 +79,7 @@ impl LowerCtx<'_> {
                 arm.pat,
                 scrutinee_place,
                 &scrutinee_ty,
-                scrutinee_source.is_none() || matches!(scrutinee_ty, type_checker::Type::Enum(..)),
+                scrutinee_source.is_none(),
             );
             self.temporary_drop_scopes.push(Vec::new());
             let arm_value = self.lower_expr(builder, param_values, body, arm.body);

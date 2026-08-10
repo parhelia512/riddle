@@ -126,6 +126,7 @@ fun main() -> i32 { answer!() + plain() }
 
     assert_imported_macro_completion(&uri, source, options);
 
+    drop(sessions);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -261,7 +262,9 @@ fn assert_imported_macro_rename(
 }
 
 fn assert_imported_macro_completion(uri: &lsp_types::Url, source: &str, options: CompileOptions) {
-    let incomplete = source.replace("#[derive(Inspect)]", "#[derive(Ins)]");
+    let incomplete = source
+        .replace("#[derive(Inspect)]", "#[derive(Ins)]")
+        .replace("answer!()", "ans");
     let docs = HashMap::from([(
         uri.clone(),
         Document {
@@ -285,6 +288,27 @@ fn assert_imported_macro_completion(uri: &lsp_types::Url, source: &str, options:
         items.iter().any(|item| item.label == "Inspect"),
         "{items:#?}"
     );
+
+    let cursor = incomplete.find("ans +").unwrap() + "ans".len();
+    let items = completion_items_for_document(
+        uri,
+        &docs,
+        position(&incomplete, cursor),
+        options,
+        &AnalysisSessions::default(),
+        &AnalysisSessions::default(),
+        || false,
+    )
+    .unwrap()
+    .unwrap();
+    let answer = items
+        .iter()
+        .find(|item| {
+            item.label == "answer!" && item.detail.as_deref() == Some("function-like proc macro")
+        })
+        .unwrap_or_else(|| panic!("{items:#?}"));
+    assert_eq!(answer.insert_text.as_deref(), Some("answer!"));
+    assert_eq!(answer.filter_text.as_deref(), Some("answer"));
 }
 
 #[test]
@@ -307,6 +331,7 @@ path = "src/main.rid"
 struct Value { number: i32 }
 
 fun main() -> i32 {
+    print!("{}", 1);
     println!("value={:?}", Value { number: 1 });
     0
 }
@@ -377,6 +402,16 @@ fun main() -> i32 {
         panic!("expected markup hover")
     };
     assert!(contents.value.contains("standard derive macro Debug"));
+
+    let hints = inlay_hints_for_document(
+        &uri,
+        &docs,
+        Range::new(Position::new(0, 0), position(source, source.len())),
+        CompileOptions::default(),
+        &sessions,
+    )
+    .unwrap();
+    assert!(hints.is_empty(), "{hints:#?}");
     let _ = fs::remove_dir_all(root);
 }
 

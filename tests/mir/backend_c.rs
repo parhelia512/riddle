@@ -19,6 +19,10 @@ fn c_type(name: &str) -> String {
     c_symbol('t', name)
 }
 
+fn c_struct_type(id: u32, name: &str) -> String {
+    c_type(&format!("struct::{id}::{name}"))
+}
+
 fn c_member(name: &str) -> String {
     c_symbol('m', name)
 }
@@ -140,7 +144,7 @@ fn c_slice_borrow_carries_length_and_indexes_elements() {
 
     let generated = CBackend::new().compile(&module).unwrap();
     assert!(generated.contains("riddle_slice"), "{generated}");
-    assert!(generated.contains(&c_type("Item")), "{generated}");
+    assert!(generated.contains(&c_struct_type(0, "Item")), "{generated}");
     assert!(generated.contains(".ptr"), "{generated}");
     assert!(generated.contains("UINT64_C(3)"), "{generated}");
 }
@@ -1323,11 +1327,11 @@ fn c_backend_monomorphizes_generic_structs() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains(&format!("struct {} {{", c_type("Box_i32"))),
+        result.contains(&format!("struct {} {{", c_struct_type(0, "Box_i32"))),
         "missing i32 monomorph:\n{result}"
     );
     assert!(
-        result.contains(&format!("struct {} {{", c_type("Box_bool"))),
+        result.contains(&format!("struct {} {{", c_struct_type(0, "Box_bool"))),
         "missing bool monomorph:\n{result}"
     );
     assert!(
@@ -1360,7 +1364,7 @@ fn c_backend_accepts_nested_generic_type_args_without_spaces() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains(&c_type("Box_Box_i32")),
+        result.contains(&c_struct_type(0, "Box_struct::0::Box_i32")),
         "missing nested monomorph:\n{result}"
     );
     assert!(
@@ -1672,7 +1676,10 @@ fn c_backend_lowers_non_copy_array_into_iterator() {
         "missing ArrayIter::next monomorph:\n{result}"
     );
     assert!(
-        result.contains(&format!("  {} s", c_type("ArrayIter_Token_2"))),
+        result.contains(&format!(
+            "  {} s",
+            c_struct_type(0, "ArrayIter_struct::1::Token_2")
+        )),
         "array iterator construction lost its const argument:\n{result}"
     );
     assert!(
@@ -1680,7 +1687,11 @@ fn c_backend_lowers_non_copy_array_into_iterator() {
         "Iterator::next should receive the iterator slot by reference:\n{result}"
     );
     assert!(
-        result.contains(&format!("{} {}[2];", c_type("Token"), c_member("values"))),
+        result.contains(&format!(
+            "{} {}[2];",
+            c_struct_type(1, "Token"),
+            c_member("values")
+        )),
         "array field should use C array declarator:\n{result}"
     );
     assert!(
@@ -1742,13 +1753,19 @@ fn c_backend_heap_allocates_an_escaping_array() {
     let generated = CBackend::new().compile(&module).unwrap();
 
     assert!(
-        generated.contains(&format!("rgc_alloc(sizeof({}[2]))", c_type("Data"))),
+        generated.contains(&format!(
+            "rgc_alloc(sizeof({}[2]))",
+            c_struct_type(0, "Data")
+        )),
         "{generated}"
     );
     assert!(generated.contains("memcpy(h"), "{generated}");
     assert!(generated.contains("(&h"), "{generated}");
     assert!(
-        generated.contains(&format!("rgc_alloc(sizeof({}[2][3]))", c_type("Data"))),
+        generated.contains(&format!(
+            "rgc_alloc(sizeof({}[2][3]))",
+            c_struct_type(0, "Data")
+        )),
         "{generated}"
     );
     assert!(generated.contains("* 3)"), "{generated}");
@@ -1757,7 +1774,7 @@ fn c_backend_heap_allocates_an_escaping_array() {
         generated.contains(&format!(
             ", {}, sizeof({}[2]))",
             c_variable("items"),
-            c_type("Data")
+            c_struct_type(0, "Data")
         )),
         "{generated}"
     );
@@ -1996,8 +2013,14 @@ fn c_closure_environment_stores_only_the_captured_field() {
         .find(|line| line.contains(&member))
         .expect("missing projected capture field");
 
-    assert!(capture_line.contains(&c_type("First")), "{capture_line}");
-    assert!(!capture_line.contains(&c_type("Pair")), "{capture_line}");
+    assert!(
+        capture_line.contains(&c_struct_type(0, "First")),
+        "{capture_line}"
+    );
+    assert!(
+        !capture_line.contains(&c_struct_type(2, "Pair")),
+        "{capture_line}"
+    );
 }
 
 #[test]

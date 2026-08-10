@@ -6,6 +6,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +27,52 @@ fn has_c_compiler() -> bool {
                 .output()
                 .is_ok_and(|output| output.status.success())
         })
+}
+
+#[test]
+fn project_session_reuses_analysis_for_unchanged_inputs() {
+    let root = temp_root("analysis-cache");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"analysis-cache\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 1 }\n").unwrap();
+
+    let mut session = ProjectSession::default();
+    let first = resolve_project_with_session(
+        &root,
+        &HashMap::new(),
+        CompileOptions::default(),
+        &mut session,
+    )
+    .unwrap();
+    let second = resolve_project_with_session(
+        &root,
+        &HashMap::new(),
+        CompileOptions::default(),
+        &mut session,
+    )
+    .unwrap();
+
+    assert!(Arc::ptr_eq(&first.result, &second.result));
+    let checked = clue::check_project_with_session(
+        &root,
+        &HashMap::new(),
+        CompileOptions::default(),
+        &mut session,
+    )
+    .unwrap();
+    let resolved_after_check = resolve_project_with_session(
+        &root,
+        &HashMap::new(),
+        CompileOptions::default(),
+        &mut session,
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&checked.result, &resolved_after_check.result));
+    let _ = fs::remove_dir_all(root);
 }
 
 fn temp_root(name: &str) -> PathBuf {

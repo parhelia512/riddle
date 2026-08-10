@@ -972,11 +972,10 @@ impl TypeChecker<'_> {
                 subst,
             ) {
                 let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
-                let is_debug_bound =
-                    matches!(function.name.0.as_str(), "append_debug" | "print_debug")
-                        && trait_name == "Debug"
-                        && self.hir.std_loaded
-                        && self.hir.package_for_range(function.name_range).is_none();
+                let is_debug_bound = function.name.0 == "append_debug"
+                    && trait_name == "Debug"
+                    && self.hir.std_loaded
+                    && self.hir.package_for_range(function.name_range).is_none();
                 if is_debug_bound {
                     self.report_debug_bound_failure(
                         ctx,

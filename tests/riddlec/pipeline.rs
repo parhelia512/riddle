@@ -594,6 +594,27 @@ fn pipeline_stops_at_the_requested_stage() {
 }
 
 #[test]
+fn inference_stage_skips_ownership_analysis() {
+    let source = r#"
+        struct Token { value: i32 }
+        fun main() {
+            let token = Token { value: 1 };
+            let first = token;
+            let second = token;
+        }
+    "#;
+    let mut session = CheckSession::new();
+    let inferred = session
+        .infer_with_options_cancellable(source, CompileOptions { use_std: false }, || false)
+        .expect("inference should not be cancelled");
+
+    assert!(inferred.hir.is_some());
+    assert!(!inferred.type_result.expr_types.is_empty());
+    assert!(inferred.analysis_diagnostics.is_empty());
+    assert!(inferred.mir_module.is_none());
+}
+
+#[test]
 fn source_loader_uses_in_memory_overlays() {
     let root = temp_source_root("source-overlay");
     fs::create_dir_all(&root).unwrap();

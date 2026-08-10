@@ -864,7 +864,7 @@ pub(super) fn expand_standard_print_macro(
 ) -> Result<ProcMacroTokenStream, (Range<usize>, String)> {
     if input.is_empty() {
         let source = if name == "println" {
-            "{ crate::std::io::println(&\"\"); }"
+            "{ crate::std::io::_print(&\"\\n\"); }"
         } else {
             "{}"
         };
@@ -879,12 +879,10 @@ pub(super) fn expand_standard_print_macro(
     }
 
     let (root, mut source) = standard_format_string_source(input, call_site)?;
-    let function = if name == "println" {
-        "println"
-    } else {
-        "print"
-    };
-    let _ = write!(source, "crate::std::io::{function}(&{root});");
+    if name == "println" {
+        let _ = write!(source, "{root}.push_char('\\n');");
+    }
+    let _ = write!(source, "crate::std::io::_print(&{root});");
     let source = format!("{{ {source} }}");
     let mut output = ProcMacroTokenStream::from_source(&source, 0).map_err(|message| {
         (

@@ -1,7 +1,7 @@
 use super::{
     Body, Builder, BuiltinOperator, ExprId, FuncRef, HirBinOp, HirTypeRef, HirUnOp, Inst, InstKind,
-    IntTy, LowerCtx, PathAnchor, Type, UnOp, Value, builtin_comparison_types, comparison_trait,
-    convert_cmp_op, convert_unop,
+    IntTy, LowerCtx, PathAnchor, ResolvedName, Type, UnOp, Value, builtin_comparison_types,
+    comparison_trait, convert_cmp_op, convert_unop,
 };
 
 impl LowerCtx<'_> {
@@ -101,27 +101,81 @@ impl LowerCtx<'_> {
     ) -> Option<Value> {
         let (expr_id, callee, args, result_ty) = call;
         let body_id = self.current_body?;
-        let call = self
+        let trait_call = self
             .type_result
             .trait_method_calls
             .get(&(body_id, expr_id))
             .cloned()?;
-        let receiver_ty = self.type_result.expr_types.get(&(body_id, callee))?;
-        let fid = self.find_trait_impl_method(call.trait_id, &call.method, receiver_ty, None)?;
-        let name = self
-            .mono_method_name_for_receiver(fid, receiver_ty, None)
-            .unwrap_or_else(|| self.function_name(fid));
-        let values = if let hir::body::Expr::FieldAccess { base, .. } = &body.exprs[callee] {
-            let receiver_ty = self.hir.item_tree.functions[fid].params.first()?.ty.clone();
+
+        if let hir::body::Expr::FieldAccess { base, .. } = &body.exprs[callee] {
+            let receiver_ty = self
+                .type_result
+                .expr_types
+                .get(&(body_id, *base))
+                .cloned()?;
+            let rhs_ty = args
+                .first()
+                .and_then(|arg| self.type_result.expr_types.get(&(body_id, *arg)))
+                .cloned();
+            let callee_ty = self
+                .type_result
+                .expr_types
+                .get(&(body_id, callee))
+                .cloned()
+                .unwrap_or_else(|| receiver_ty.clone());
+            let candidates = [
+                (&receiver_ty, rhs_ty.as_ref()),
+                (&receiver_ty, None),
+                (&callee_ty, rhs_ty.as_ref()),
+                (&callee_ty, None),
+            ];
+            let (fid, dispatch_ty, dispatch_rhs) =
+                candidates.into_iter().find_map(|(ty, rhs)| {
+                    self.find_trait_impl_method(trait_call.trait_id, &trait_call.method, ty, rhs)
+                        .map(|fid| (fid, ty, rhs))
+                })?;
+            if let Some(op) = self.builtin_operator_for_method(fid) {
+                return Some(self.lower_builtin_operator_method_call(
+                    builder,
+                    param_values,
+                    body,
+                    expr_id,
+                    *base,
+                    args,
+                    op,
+                ));
+            }
+            let receiver_param = self.hir.item_tree.functions[fid].params.first()?.ty.clone();
             let receiver =
-                self.lower_receiver_arg(builder, param_values, body, *base, &receiver_ty);
+                self.lower_receiver_arg(builder, param_values, body, *base, &receiver_param);
             let mut values =
                 self.lower_expr_sequence(builder, param_values, body, expr_id, 1, args);
             values.insert(0, receiver);
-            values
-        } else {
-            self.lower_expr_sequence(builder, param_values, body, expr_id, 0, args)
-        };
+            let name = self
+                .mono_method_name_for_receiver(fid, dispatch_ty, dispatch_rhs)
+                .unwrap_or_else(|| self.function_name(fid));
+            return Some(builder.call(FuncRef::Local(name), values, result_ty));
+        }
+        if !matches!(
+            body.exprs[callee],
+            hir::body::Expr::Path {
+                resolved: Some(ResolvedName::Trait(_)),
+                ..
+            }
+        ) {
+            return None;
+        }
+        let receiver_ty = self.type_result.expr_types.get(&(body_id, callee))?;
+        let fid = self.find_trait_impl_method(
+            trait_call.trait_id,
+            &trait_call.method,
+            receiver_ty,
+            None,
+        )?;
+        let name = self
+            .mono_method_name_for_receiver(fid, receiver_ty, None)
+            .unwrap_or_else(|| self.function_name(fid));
+        let values = self.lower_expr_sequence(builder, param_values, body, expr_id, 0, args);
         Some(builder.call(FuncRef::Local(name), values, result_ty))
     }
 

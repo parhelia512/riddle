@@ -89,7 +89,7 @@ pub fn hover_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -114,7 +114,7 @@ pub fn signature_help_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -196,7 +196,7 @@ pub fn declaration_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -221,7 +221,7 @@ pub fn type_definition_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -248,7 +248,7 @@ pub fn implementation_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -301,7 +301,7 @@ pub fn references_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -348,7 +348,7 @@ pub fn prepare_rename_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -392,7 +392,7 @@ pub fn rename_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -575,8 +575,12 @@ pub fn document_highlights_for_source(
 
 #[cfg(feature = "test")]
 fn standalone_analysis(source: &str, options: CompileOptions) -> DocumentAnalysis {
+    let mut session = riddlec::pipeline::CheckSession::new();
+    let result = session
+        .infer_with_options_cancellable(source, options, || false)
+        .expect("inference should not be cancelled");
     DocumentAnalysis {
-        result: riddlec::pipeline::check_with_options(source, options),
+        result: std::sync::Arc::new(result),
         source: source.into(),
         source_map: None,
         macro_occurrences: Vec::new(),
@@ -2134,7 +2138,10 @@ fn push_resolved_field_labels(
     }
 }
 
-fn fields_for_struct_expression<'a>(hir: &'a HirFile, expr: &Expr) -> Option<&'a [HirStructField]> {
+pub(crate) fn fields_for_struct_expression<'a>(
+    hir: &'a HirFile,
+    expr: &Expr,
+) -> Option<&'a [HirStructField]> {
     let Expr::Struct { resolved, .. } = expr else {
         return None;
     };
@@ -2152,7 +2159,7 @@ fn fields_for_struct_expression<'a>(hir: &'a HirFile, expr: &Expr) -> Option<&'a
     }
 }
 
-fn fields_for_struct_pattern<'a>(
+pub(crate) fn fields_for_struct_pattern<'a>(
     hir: &'a HirFile,
     types: &TypeCheckResult,
     body: BodyId,

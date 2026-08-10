@@ -74,6 +74,7 @@ pub struct MappedSource<'a> {
     pub path: &'a Path,
     pub source: &'a str,
     pub range: rowan::TextRange,
+    pub synthetic: bool,
 }
 
 impl SourceMap {
@@ -81,18 +82,18 @@ impl SourceMap {
     pub fn map_range(&self, range: rowan::TextRange) -> Option<MappedSource<'_>> {
         let start = usize::from(range.start());
         let end = usize::from(range.end());
-        let (segment, mapped_range) = self
+        let (segment, mapped_range, synthetic) = self
             .segments
             .iter()
             .filter(|segment| segment.generated.contains(&start) && end <= segment.generated.end)
             .min_by_key(|segment| segment.generated.len())
-            .map(|segment| (segment, None))
+            .map(|segment| (segment, None, segment.synthetic.is_some()))
             .or_else(|| {
                 if end == start {
                     self.segments
                         .iter()
                         .find(|segment| segment.generated.end == start)
-                        .map(|segment| (segment, None))
+                        .map(|segment| (segment, None, segment.synthetic.is_some()))
                 } else {
                     None
                 }
@@ -119,10 +120,12 @@ impl SourceMap {
                 });
                 let mut original_start = usize::MAX;
                 let mut original_end = 0;
+                let mut synthetic = false;
                 for segment in &mut segments {
                     if segment.path != first.path || segment.source != first.source {
                         return None;
                     }
+                    synthetic |= segment.synthetic.is_some();
                     let mapped = segment.synthetic.clone().unwrap_or_else(|| {
                         let overlap_start = start.max(segment.generated.start);
                         let overlap_end = end.min(segment.generated.end);
@@ -133,7 +136,7 @@ impl SourceMap {
                     original_start = original_start.min(mapped.start);
                     original_end = original_end.max(mapped.end);
                 }
-                Some((first, Some(original_start..original_end)))
+                Some((first, Some(original_start..original_end), synthetic))
             })?;
         let original = mapped_range.unwrap_or_else(|| {
             segment.synthetic.clone().unwrap_or_else(|| {
@@ -145,6 +148,7 @@ impl SourceMap {
             path: &segment.path,
             source: &segment.source,
             range: text_range(original.start, original.end),
+            synthetic,
         })
     }
 
@@ -406,6 +410,23 @@ impl CheckSession {
         )
     }
 
+    pub fn infer_with_options_cancellable(
+        &mut self,
+        source: &str,
+        options: CompileOptions,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
+        run_standalone_pipeline_with_state_cancellable(
+            source,
+            options,
+            true,
+            PipelineDepth::Infer,
+            &mut self.parser,
+            Some(&mut self.type_checker),
+            &cancelled,
+        )
+    }
+
     pub fn resolve_package_with_options(
         &mut self,
         source: &str,
@@ -502,6 +523,53 @@ impl CheckSession {
                 preparsed: Some(parse),
                 parser: &mut self.parser,
                 incremental_type_checker: None,
+            },
+            &cancelled,
+        )
+    }
+
+    pub fn infer_package_with_options_and_gc_cancellable(
+        &mut self,
+        source: &str,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+        gc_enabled: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
+        run_pipeline_with_state_cancellable(
+            source,
+            package_ranges,
+            options,
+            gc_enabled,
+            PipelineDepth::Infer,
+            PipelineState {
+                preparsed: None,
+                parser: &mut self.parser,
+                incremental_type_checker: Some(&mut self.type_checker),
+            },
+            &cancelled,
+        )
+    }
+
+    pub fn infer_parsed_package_with_options_and_gc_cancellable(
+        &mut self,
+        source: &str,
+        parse: &Parse,
+        package_ranges: &[Range<usize>],
+        options: CompileOptions,
+        gc_enabled: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<CompileResult> {
+        run_pipeline_with_state_cancellable(
+            source,
+            package_ranges,
+            options,
+            gc_enabled,
+            PipelineDepth::Infer,
+            PipelineState {
+                preparsed: Some(parse),
+                parser: &mut self.parser,
+                incremental_type_checker: Some(&mut self.type_checker),
             },
             &cancelled,
         )
@@ -1107,6 +1175,7 @@ pub fn resolve_with_options(source: &str, options: CompileOptions) -> CompileRes
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PipelineDepth {
     Resolve,
+    Infer,
     Check,
     Build,
 }
@@ -1361,6 +1430,20 @@ fn run_pipeline_with_state_cancellable(
     );
     if cancelled() {
         return None;
+    }
+
+    if depth == PipelineDepth::Infer {
+        return Some(CompileResult {
+            hir: Some(hir),
+            scope_graph: Some(sg),
+            type_result,
+            macro_diagnostics: Vec::new(),
+            hir_diagnostics,
+            analysis_diagnostics: Vec::new(),
+            analysis: move_checker::AnalysisResult::default(),
+            mir_module: None,
+            parse_errors,
+        });
     }
 
     // 5. Escape analysis (determines which locals need heap allocation)

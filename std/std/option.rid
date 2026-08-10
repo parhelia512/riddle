@@ -32,6 +32,13 @@ impl<T> Option<T> {
             Option::None => fallback,
         }
     }
+
+    pub fun unwarp(self) -> T {
+        match self {
+            Option::Some(value) => value,
+            Option::None => crate::std::panic::panic("called Option::unwarp on None"),
+        }
+    }
 }
 
 impl<T: crate::std::marker::Copy> crate::std::marker::Copy for Option<T> {}

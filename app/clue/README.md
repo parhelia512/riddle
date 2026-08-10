@@ -8,22 +8,42 @@
 
 ```bash
 # 初始化目录，不覆盖已有清单或入口文件
-clue init <path> [--bin|--lib]
+clue init <path> [--bin|--lib|--workspace]
 
 # 创建新项目目录
-clue new <path> [--bin|--lib]
+clue new <path> [--bin|--lib|--workspace]
 
 # 检查整个项目，不生成 C
-clue check [path] [--target <triple>]
+clue check [path] [--package <name>] [--workspace] [--target <triple>]
 
 # 生成 C 并构建 .clue/build/<package>[.exe]
-clue build [path] [--target <triple>]
+clue build [path] [--package <name>] [--workspace] [--target <triple>]
 
 # 构建并运行二进制项目
-clue run [path] [--target <triple>] [-- <args>...]
+clue run [path] [--package <name>] [--target <triple>] [-- <args>...]
 ```
 
-二进制项目是默认类型。Clue 支持在 `Clue.toml` 中声明本地路径依赖，暂不解析 registry、版本或 git 依赖。外部模块和路径依赖的诊断会指向原始源码文件。Riddle LSP 使用相同的项目加载器，并支持未保存文件。
+二进制项目是默认类型。Clue 支持在 `Clue.toml` 中声明本地路径依赖，暂不解析 registry 或 git 依赖。外部模块和路径依赖的诊断会指向原始源码文件。Riddle LSP 使用相同的项目加载器，并支持未保存文件。
+
+## 工作区
+
+根目录可以使用虚拟工作区清单注册所有子 crate：
+
+```toml
+[workspace]
+crates = ["app", "libs/math"]
+```
+
+每个已注册目录都必须有自己的 `Clue.toml`，依赖仍在子 crate 清单中声明：
+
+```toml
+[dependencies]
+math = { path = "../libs/math" }
+```
+
+根清单只负责注册 crate，不是一个可编译包。根目录的 `clue check` 和 `clue build` 会按依赖顺序处理所有注册 crate；在子目录执行时默认只处理当前 crate，`--workspace` 强制处理整个工作区，`--package <name>` 选择单个 crate。工作区运行多个二进制时使用 `clue run --package <name>`。
+
+工作区只生成一个根目录 `Clue.lock`。其中的本地包使用 `path = "..."` 记录相对根目录的路径，并记录包版本和本地依赖；子 crate 不生成自己的锁文件。工作区内的 path 依赖也必须在 `workspace.crates` 中注册，工作区外的本地依赖可以直接使用。
 
 设置 `CC` 时 Clue 会严格使用指定的 C 编译器；否则会尝试 `cc`、`gcc`、`clang`、带版本后缀的 GCC/Clang，Windows 还会尝试 `clang-cl` 和 `cl`。候选必须能够完成 C11 编译和链接。解析后的路径和版本会参与构建指纹。库项目只保留生成的 `.clue/build/<package>.c`，不会链接可执行文件。
 
@@ -68,5 +88,7 @@ target = "aarch64-unknown-linux-gnu"
 - `lib.rs`：项目操作和分析 API；
 - `project.rs`：项目创建、模板和依赖加载；
 - `manifest.rs`：`Clue.toml` 序列化与解析；
+- `workspace.rs`：工作区成员、依赖图和选择；
+- `lock.rs`：根 `Clue.lock` 读写；
 - `build.rs`：编译和构建缓存；
 - `target.rs`：目标组件和 C 工具链配置。

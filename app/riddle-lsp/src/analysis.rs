@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     hash::BuildHasher,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use riddlec::pipeline::{CheckSession, CompileOptions, CompileResult, LoadedSource};
@@ -16,11 +17,11 @@ use crate::{
 #[derive(Clone, Copy)]
 pub enum AnalysisDepth {
     Resolve,
-    Check,
+    Infer,
 }
 
 pub struct DocumentAnalysis {
-    pub(crate) result: CompileResult,
+    pub(crate) result: Arc<CompileResult>,
     pub(crate) source: String,
     pub(crate) source_map: Option<riddlec::pipeline::SourceMap>,
     pub(crate) macro_occurrences: Vec<riddlec::proc_macro::ProcMacroOccurrence>,
@@ -40,6 +41,15 @@ impl DocumentAnalysis {
         self.path
             .as_deref()
             .is_none_or(|path| mapped.path == path)
+            .then_some(mapped.range)
+    }
+
+    pub(crate) fn local_authored_range(&self, range: TextRange) -> Option<TextRange> {
+        let Some(source_map) = &self.source_map else {
+            return range_is_in_source(range, self.source.len()).then_some(range);
+        };
+        let mapped = source_map.map_range(range)?;
+        (!mapped.synthetic && self.path.as_deref().is_none_or(|path| mapped.path == path))
             .then_some(mapped.range)
     }
 
@@ -108,24 +118,26 @@ pub fn analyze_standalone_source_cancellable(
             options,
             cancelled,
         )?,
-        (AnalysisDepth::Check, Some(parse)) => session
-            .check_parsed_package_with_options_cancellable(
+        (AnalysisDepth::Infer, Some(parse)) => session
+            .infer_parsed_package_with_options_and_gc_cancellable(
                 &loaded.source,
                 parse,
                 package_ranges,
                 options,
+                true,
                 cancelled,
             )?,
-        (AnalysisDepth::Check, None) => session.check_package_with_options_cancellable(
+        (AnalysisDepth::Infer, None) => session.infer_package_with_options_and_gc_cancellable(
             &loaded.source,
             package_ranges,
             options,
+            true,
             cancelled,
         )?,
     };
     result.macro_diagnostics = diagnostics;
     Some(DocumentAnalysis {
-        result,
+        result: Arc::new(result),
         source: loaded.source,
         source_map: Some(loaded.source_map),
         macro_occurrences,
@@ -174,7 +186,7 @@ pub fn analyze_document_cancellable<S: BuildHasher>(
                 &mut session,
                 cancelled,
             ),
-            AnalysisDepth::Check => clue::check_project_with_session_cancellable(
+            AnalysisDepth::Infer => clue::infer_project_with_session_cancellable(
                 &root,
                 &overlays,
                 options,
@@ -190,11 +202,11 @@ pub fn analyze_document_cancellable<S: BuildHasher>(
         drop(session);
         let files = analysis.source.files.clone();
         return Ok(Some(DocumentAnalysis {
-            result: analysis.result,
-            source: analysis.source.source,
-            source_map: Some(analysis.source.source_map),
-            macro_occurrences: analysis.macro_occurrences,
-            macro_source_map: Some(analysis.macro_source_map),
+            result: Arc::clone(&analysis.result),
+            source: analysis.source.source.clone(),
+            source_map: Some(analysis.source.source_map.clone()),
+            macro_occurrences: analysis.macro_occurrences.clone(),
+            macro_source_map: Some(analysis.macro_source_map.clone()),
             path: Some(normalized_path(path)),
             project_root: Some(root),
             project_revision,

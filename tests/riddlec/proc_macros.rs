@@ -188,8 +188,8 @@ fn standard_print_macros_expand_and_type_check() {
     );
     assert!(!expanded.source.contains("print!("));
     assert!(!expanded.source.contains("println!("));
-    assert!(expanded.source.contains("crate :: std :: io :: print"));
-    assert!(expanded.source.contains("crate :: std :: io :: println"));
+    assert!(expanded.source.contains("crate :: std :: io :: _print"));
+    assert!(!expanded.source.contains("crate :: std :: io :: println"));
     assert!(
         expanded
             .source
@@ -199,11 +199,6 @@ fn standard_print_macros_expand_and_type_check() {
         expanded
             .source
             .contains("crate :: std :: fmt :: append_debug")
-    );
-    assert!(
-        !expanded
-            .source
-            .contains("crate :: std :: io :: print_debug")
     );
     assert_eq!(
         expanded
@@ -294,7 +289,7 @@ fn standard_debug_derive_expands_and_type_checks() {
     assert!(
         expanded
             .source
-            .contains("crate :: std :: io :: print_debug")
+            .contains("crate :: std :: fmt :: append_debug")
     );
     assert!(expanded.macro_occurrences.iter().any(|occurrence| {
         occurrence.name == "Debug" && occurrence.kind == ProcMacroKind::Derive

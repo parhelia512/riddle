@@ -32,6 +32,12 @@ pub fn visible_definitions(sg: &ScopeGraph, reference: NodeId) -> Vec<(Name, Def
     collect_definitions(sg, *anchor, true)
 }
 
+/// Returns definitions visible from an already selected lexical scope.
+#[must_use]
+pub fn visible_definitions_from(sg: &ScopeGraph, scope: NodeId) -> Vec<(Name, DefRef)> {
+    collect_definitions(sg, scope, true)
+}
+
 /// Resolves `segments` from the lexical anchor of an existing reference.
 #[must_use]
 pub fn resolve_path_at_reference(

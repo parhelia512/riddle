@@ -135,7 +135,13 @@ pub fn load_with_overlays<S: BuildHasher>(
     root: &Path,
     overlays: &HashMap<PathBuf, String, S>,
 ) -> io::Result<LoadedPackage> {
-    load_inner(root, ProjectKind::Binary, overlays, &mut HashSet::new())
+    let mut package = load_inner(root, ProjectKind::Binary, overlays, &mut HashSet::new())?;
+    if let Some(workspace_root) = crate::workspace::find_workspace_root(root)? {
+        package.watched_files.push(workspace_root.join("Clue.lock"));
+        package.watched_files.sort();
+        package.watched_files.dedup();
+    }
+    Ok(package)
 }
 
 fn load_inner<S: BuildHasher>(

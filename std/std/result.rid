@@ -41,6 +41,13 @@ impl<T, E> Result<T, E> {
             Result::Err(error) => Option::Some(error),
         }
     }
+
+    pub fun unwarp(self) -> T {
+        match self {
+            Result::Ok(value) => value,
+            Result::Err(_) => crate::std::panic::panic("called Result::unwarp on Err"),
+        }
+    }
 }
 
 impl<T: crate::std::marker::Copy, E: crate::std::marker::Copy> crate::std::marker::Copy for Result<T, E> {}

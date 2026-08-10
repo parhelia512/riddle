@@ -197,7 +197,8 @@ fn debug_format_bound_diagnostic_points_to_user_source() {
         stderr.contains("consider annotating `Foo` with `#[derive(Debug)]`"),
         "{stderr}"
     );
-    assert!(!stderr.contains("print_debug"), "{stderr}");
+    assert!(!stderr.contains("append_debug"), "{stderr}");
+    assert!(!stderr.contains("_print"), "{stderr}");
     assert!(!stderr.contains(r"\\?\"), "{stderr}");
     let _ = fs::remove_dir_all(root);
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     hash::BuildHasher,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -16,8 +17,8 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CallHierarchyServerCapability, CodeActionKind, CodeActionParams, CodeActionResponse,
-    CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    CompletionList, CompletionOptions, CompletionParams, CompletionResponse, CompletionTriggerKind,
+    DeclarationCapability, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
     DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
@@ -42,7 +43,9 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::{
     code_actions::quick_fixes,
-    completion::{completion_items_for_document, completion_trigger_characters},
+    completion::{
+        completion_items_for_document, completion_trigger_characters, completion_trigger_is_active,
+    },
     diagnostics::{self, DiagnosticSessions, collect_workspace_diagnostics_cancellable},
     editor_features::{
         document_symbols_for_document_cancellable, folding_ranges, format_source,
@@ -78,14 +81,10 @@ pub struct Backend {
     publish_gate: Arc<tokio::sync::Mutex<()>>,
     diagnostic_revision: Arc<AtomicU64>,
     diagnostic_sessions: Arc<Mutex<DiagnosticSessions>>,
-    /// Sessions used for the marker-source analysis (the source with `COMPLETION_MARKER`
-    /// inserted). Kept separate from `completion_fallback_sessions` so the two
-    /// `IncrementalParsers` never thrash each other's cache.
+    /// Sessions used for marker-source analysis (the source with the completion marker).
     completion_sessions: Arc<AnalysisSessions>,
-    /// Sessions used for the fallback analysis (the original, unmodified source).
-    completion_fallback_sessions: Arc<AnalysisSessions>,
+    /// Shared sessions for every analysis of the original, unmodified source.
     analysis_sessions: Arc<AnalysisSessions>,
-    index_sessions: Arc<AnalysisSessions>,
     analysis_revisions: Arc<RequestRevisions>,
     completion_revisions: Arc<RequestRevisions>,
     semantic_tokens: Arc<Mutex<HashMap<lsp_types::Url, CachedSemanticTokens>>>,
@@ -97,7 +96,8 @@ pub struct Backend {
     completion_delay: Duration,
 }
 
-const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(50);
+const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(150);
+const INDEX_DEBOUNCE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
@@ -341,7 +341,7 @@ impl LanguageServer for Backend {
         bump_related_revisions(&self.analysis_revisions, &docs, &uri);
         drop(docs);
         self.schedule_diagnostics();
-        self.schedule_workspace_indexing();
+        self.schedule_document_indexing(&uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -357,7 +357,7 @@ impl LanguageServer for Backend {
         bump_related_revisions(&self.analysis_revisions, &docs, &uri);
         drop(docs);
         self.schedule_diagnostics();
-        self.schedule_workspace_indexing();
+        self.schedule_document_indexing(&uri);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -378,10 +378,9 @@ impl LanguageServer for Backend {
         self.analysis_revisions.remove(&uri);
         self.completion_revisions.remove(&uri);
         self.completion_sessions.retain_open(&open_docs);
-        self.completion_fallback_sessions.retain_open(&open_docs);
         self.analysis_sessions.retain_open(&open_docs);
         self.schedule_diagnostics();
-        self.schedule_workspace_indexing();
+        self.schedule_document_indexing(&uri);
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
@@ -674,6 +673,9 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        let retriggered = params.context.as_ref().is_some_and(|context| {
+            context.trigger_kind == CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS
+        });
         let request_revision = self.completion_revisions.begin(&uri);
         if !self.completion_delay.is_zero() {
             tokio::time::sleep(self.completion_delay).await;
@@ -684,9 +686,16 @@ impl LanguageServer for Backend {
         let Some((docs, text, analysis_revision)) = self.analysis_snapshot(&uri) else {
             return Ok(Some(CompletionResponse::Array(Vec::new())));
         };
+        let trigger_is_active = completion_trigger_is_active(&text, position);
+        if retriggered && !trigger_is_active {
+            return Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete: false,
+                items: Vec::new(),
+            })));
+        }
         let compile_options = self.compile_options;
         let analysis_sessions = Arc::clone(&self.completion_sessions);
-        let fallback_sessions = Arc::clone(&self.completion_fallback_sessions);
+        let fallback_sessions = Arc::clone(&self.analysis_sessions);
         let completion_revisions = Arc::clone(&self.completion_revisions);
         let current_analysis_revisions = Arc::clone(&self.analysis_revisions);
         let completion_uri = uri.clone();
@@ -723,7 +732,14 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        Ok(Some(CompletionResponse::Array(items)))
+        Ok(Some(if trigger_is_active && !items.is_empty() {
+            CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items,
+            })
+        } else {
+            CompletionResponse::Array(items)
+        }))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -1250,12 +1266,19 @@ impl LanguageServer for Backend {
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         let reset_all = params.changes.iter().any(|change| is_manifest(&change.uri));
-        let invalidated = params
+        let mut invalidated = params
             .changes
             .iter()
             .filter_map(|change| change.uri.to_file_path().ok())
             .flat_map(|path| self.workspace.invalidate_path(&path))
             .collect::<std::collections::BTreeSet<_>>();
+        invalidated.extend(
+            params
+                .changes
+                .iter()
+                .filter_map(|change| change.uri.to_file_path().ok())
+                .filter_map(|path| clue::find_project_root(&path)),
+        );
         {
             let docs = self.docs.lock().unwrap();
             for change in &params.changes {
@@ -1263,11 +1286,10 @@ impl LanguageServer for Backend {
             }
         }
         if reset_all {
-            *self.diagnostic_sessions.lock().unwrap() = DiagnosticSessions::default();
+            *self.diagnostic_sessions.lock().unwrap() =
+                DiagnosticSessions::new(Arc::clone(&self.analysis_sessions));
             self.completion_sessions.clear_projects();
-            self.completion_fallback_sessions.clear_projects();
             self.analysis_sessions.clear_projects();
-            self.index_sessions.clear_projects();
             if let Err(error) = self.workspace.set_roots(self.workspace.roots()) {
                 self.client
                     .log_message(
@@ -1283,14 +1305,17 @@ impl LanguageServer for Backend {
                     .unwrap()
                     .invalidate_project(&change.uri);
                 self.completion_sessions.invalidate_project(&change.uri);
-                self.completion_fallback_sessions
-                    .invalidate_project(&change.uri);
                 self.analysis_sessions.invalidate_project(&change.uri);
             }
-            self.index_sessions.invalidate_roots(&invalidated);
+            self.completion_sessions.invalidate_roots(&invalidated);
+            self.analysis_sessions.invalidate_roots(&invalidated);
         }
         self.schedule_diagnostics();
-        self.schedule_workspace_indexing();
+        if reset_all {
+            self.schedule_workspace_indexing();
+        } else {
+            self.schedule_project_indexing(invalidated.into_iter().collect());
+        }
     }
 
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
@@ -1372,17 +1397,18 @@ impl Backend {
         compile_options: CompileOptions,
         completion_delay: Duration,
     ) -> Self {
+        let analysis_sessions = Arc::new(AnalysisSessions::default());
         Self {
             client,
             docs: Arc::new(Mutex::new(HashMap::new())),
             published: Arc::new(Mutex::new(HashMap::new())),
             publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             diagnostic_revision: Arc::new(AtomicU64::new(0)),
-            diagnostic_sessions: Arc::new(Mutex::new(DiagnosticSessions::default())),
+            diagnostic_sessions: Arc::new(Mutex::new(DiagnosticSessions::new(Arc::clone(
+                &analysis_sessions,
+            )))),
             completion_sessions: Arc::new(AnalysisSessions::default()),
-            completion_fallback_sessions: Arc::new(AnalysisSessions::default()),
-            analysis_sessions: Arc::new(AnalysisSessions::default()),
-            index_sessions: Arc::new(AnalysisSessions::default()),
+            analysis_sessions,
             analysis_revisions: Arc::new(RequestRevisions::default()),
             completion_revisions: Arc::new(RequestRevisions::default()),
             semantic_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -1431,6 +1457,7 @@ impl Backend {
         let publish_gate = Arc::clone(&self.publish_gate);
         let diagnostic_revision = Arc::clone(&self.diagnostic_revision);
         let diagnostic_sessions = Arc::clone(&self.diagnostic_sessions);
+        let analysis_sessions = Arc::clone(&self.analysis_sessions);
         let compile_options = self.compile_options;
 
         tokio::spawn(async move {
@@ -1460,7 +1487,7 @@ impl Backend {
                     drop(sessions);
                     Ok(published)
                 } else {
-                    *sessions = DiagnosticSessions::default();
+                    *sessions = DiagnosticSessions::new(analysis_sessions);
                     drop(sessions);
                     Err(())
                 }
@@ -1496,7 +1523,23 @@ impl Backend {
     }
 
     fn schedule_workspace_indexing(&self) {
-        let projects = self.workspace.projects();
+        self.schedule_project_indexing(self.workspace.projects());
+    }
+
+    fn schedule_document_indexing(&self, uri: &lsp_types::Url) {
+        let Some(project) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| clue::find_project_root(&path))
+        else {
+            return;
+        };
+        self.schedule_project_indexing(vec![project]);
+    }
+
+    fn schedule_project_indexing(&self, mut projects: Vec<PathBuf>) {
+        projects.sort();
+        projects.dedup();
         if projects.is_empty() {
             return;
         }
@@ -1515,11 +1558,15 @@ impl Backend {
         for project in projects {
             let token = self.workspace.begin_rebuild(&project);
             let workspace = Arc::clone(&self.workspace);
-            let sessions = Arc::clone(&self.index_sessions);
+            let sessions = Arc::clone(&self.analysis_sessions);
             let overlays = Arc::clone(&overlays);
             let client = self.client.clone();
             let options = self.compile_options;
             tokio::spawn(async move {
+                tokio::time::sleep(INDEX_DEBOUNCE).await;
+                if !workspace.is_current(&token) {
+                    return;
+                }
                 let workspace_for_build = Arc::clone(&workspace);
                 let token_for_build = token.clone();
                 let result = tokio::task::spawn_blocking(move || {

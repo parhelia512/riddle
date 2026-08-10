@@ -17,11 +17,14 @@ use syntax::SyntaxKind;
 #[cfg(feature = "test")]
 #[must_use]
 pub fn inlay_hints_for_source(source: &str, range: Range) -> Vec<InlayHint> {
-    let result = riddlec::pipeline::check_with_options(source, CompileOptions { use_std: false });
+    let mut session = riddlec::pipeline::CheckSession::new();
+    let result = session
+        .infer_with_options_cancellable(source, CompileOptions { use_std: false }, || false)
+        .expect("inference should not be cancelled");
     inlay_hints_from_analysis(
         source,
         &DocumentAnalysis {
-            result,
+            result: std::sync::Arc::new(result),
             source: source.into(),
             source_map: None,
             macro_occurrences: Vec::new(),
@@ -77,7 +80,7 @@ pub fn inlay_hints_for_document_cancellable<S: BuildHasher>(
         docs,
         options,
         sessions,
-        AnalysisDepth::Check,
+        AnalysisDepth::Infer,
         cancelled,
     )?
     else {
@@ -170,7 +173,7 @@ fn type_hints_from_analysis(
             ) {
                 continue;
             }
-            let Some(name_range) = analysis.local_range(*name_range) else {
+            let Some(name_range) = analysis.local_authored_range(*name_range) else {
                 continue;
             };
             hints.push(InlayHint {

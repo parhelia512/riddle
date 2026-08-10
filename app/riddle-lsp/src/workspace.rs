@@ -266,6 +266,10 @@ pub fn discover_projects(root: &Path) -> io::Result<Vec<PathBuf>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
+    if clue::is_virtual_workspace_root(root) {
+        return clue::workspace_members(root)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+    }
     let mut pending = vec![root.to_path_buf()];
     let mut projects = BTreeSet::new();
     while let Some(directory) = pending.pop() {

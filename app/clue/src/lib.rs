@@ -1,25 +1,51 @@
 mod build;
+mod lock;
 mod manifest;
 mod proc_macro;
 mod project;
 mod target;
+mod workspace;
 
 use anyhow::bail;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 pub use manifest::CLUE_PROJECT_FILE_NAME;
 pub use project::{ProjectKind, init, new};
 pub use riddlec::target::TargetTriple;
+pub use workspace::Workspace;
 
+pub fn init_workspace(path: &Path) -> anyhow::Result<()> {
+    workspace::init(path)
+}
+
+pub fn new_workspace(path: &Path) -> anyhow::Result<()> {
+    workspace::new(path)
+}
+
+pub fn is_workspace_root(path: &Path) -> bool {
+    workspace::is_workspace_root(path).unwrap_or(false)
+}
+
+pub fn is_virtual_workspace_root(path: &Path) -> bool {
+    manifest::is_virtual_workspace_root(path).unwrap_or(false)
+}
+
+pub fn workspace_members(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    Ok(workspace::Workspace::load(path)?.members().to_vec())
+}
+
+#[derive(Clone)]
 pub struct ProjectAnalysis {
     pub entry: PathBuf,
     pub source: riddlec::pipeline::LoadedSource,
-    pub result: riddlec::pipeline::CompileResult,
+    pub result: Arc<riddlec::pipeline::CompileResult>,
     pub macro_occurrences: Vec<riddlec::proc_macro::ProcMacroOccurrence>,
     pub macro_source_map: riddlec::pipeline::SourceMap,
     pub kind: ProjectKind,
@@ -34,6 +60,9 @@ pub struct ProjectAnalysis {
 pub struct ProjectSession {
     checker: riddlec::pipeline::CheckSession,
     cached: Option<CachedProject>,
+    expanded: Option<CachedExpansion>,
+    analysis: Option<CachedAnalysis>,
+    proc_macros: Option<CachedProcMacroProvider>,
     revision: u64,
 }
 
@@ -41,6 +70,31 @@ struct CachedProject {
     package: project::LoadedPackage,
     overlays: BTreeMap<PathBuf, String>,
     disk: BTreeMap<PathBuf, Option<(u64, Option<SystemTime>)>>,
+}
+
+struct CachedExpansion {
+    revision: u64,
+    package: project::LoadedPackage,
+    analysis: MacroAnalysis,
+}
+
+struct CachedAnalysis {
+    revision: u64,
+    options: riddlec::pipeline::CompileOptions,
+    depth: ProjectAnalysisDepth,
+    analysis: ProjectAnalysis,
+}
+
+struct CachedProcMacroProvider {
+    fingerprint: u64,
+    provider: proc_macro::ClueProcMacroProvider,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProjectAnalysisDepth {
+    Resolve,
+    Infer,
+    Check,
 }
 
 impl ProjectSession {
@@ -68,12 +122,77 @@ impl ProjectSession {
             self.checker = riddlec::pipeline::CheckSession::default();
         }
         self.revision = self.revision.wrapping_add(1).max(1);
+        self.expanded = None;
+        self.analysis = None;
         self.cached = Some(CachedProject {
             overlays: relevant_overlays(&normalized_overlays, &package.watched_files),
             disk: file_stamps(&package.watched_files, &normalized_overlays),
             package: package.clone(),
         });
         Ok(package)
+    }
+
+    fn cached_analysis(
+        &self,
+        options: riddlec::pipeline::CompileOptions,
+        depth: ProjectAnalysisDepth,
+    ) -> Option<ProjectAnalysis> {
+        self.analysis.as_ref().and_then(|cached| {
+            (cached.revision == self.revision && cached.options == options && cached.depth >= depth)
+                .then(|| cached.analysis.clone())
+        })
+    }
+
+    fn cache_analysis(
+        &mut self,
+        options: riddlec::pipeline::CompileOptions,
+        depth: ProjectAnalysisDepth,
+        analysis: ProjectAnalysis,
+    ) {
+        self.analysis = Some(CachedAnalysis {
+            revision: self.revision,
+            options,
+            depth,
+            analysis,
+        });
+    }
+
+    fn expand(
+        &mut self,
+        mut package: project::LoadedPackage,
+    ) -> anyhow::Result<(project::LoadedPackage, MacroAnalysis)> {
+        if let Some(cached) = &self.expanded
+            && cached.revision == self.revision
+        {
+            return Ok((cached.package.clone(), cached.analysis.clone()));
+        }
+
+        let fingerprint = proc_macro_fingerprint(&package.proc_macros);
+        if self
+            .proc_macros
+            .as_ref()
+            .is_none_or(|cached| cached.fingerprint != fingerprint)
+        {
+            // Windows keeps a loaded proc-macro DLL locked until its worker exits.
+            self.proc_macros = None;
+            let provider = proc_macro::ClueProcMacroProvider::build(&package.proc_macros)?;
+            self.proc_macros = Some(CachedProcMacroProvider {
+                fingerprint,
+                provider,
+            });
+        }
+        let provider = &mut self
+            .proc_macros
+            .as_mut()
+            .expect("proc-macro provider was initialized")
+            .provider;
+        let analysis = expand_proc_macros_with_provider(&mut package, provider)?;
+        self.expanded = Some(CachedExpansion {
+            revision: self.revision,
+            package: package.clone(),
+            analysis: analysis.clone(),
+        });
+        Ok((package, analysis))
     }
 
     #[must_use]
@@ -93,6 +212,19 @@ impl ProjectSession {
                 && file_stamps(&cached.package.watched_files, &normalized_overlays) == cached.disk
         })
     }
+}
+
+fn proc_macro_fingerprint(packages: &[project::ProcMacroPackage]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for package in packages {
+        package.root.hash(&mut hasher);
+        package.alias.hash(&mut hasher);
+        package.name.hash(&mut hasher);
+        package.entry.hash(&mut hasher);
+        package.source.source.hash(&mut hasher);
+        package.manifest_fingerprint.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn normalized_overlays<S: BuildHasher>(
@@ -138,7 +270,10 @@ pub fn find_project_root(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
     start
         .ancestors()
-        .find(|path| path.join(manifest::CLUE_PROJECT_FILE_NAME).is_file())
+        .find(|path| {
+            path.join(manifest::CLUE_PROJECT_FILE_NAME).is_file()
+                && !manifest::is_virtual_workspace_root(path).unwrap_or(false)
+        })
         .map(normalized_path)
 }
 
@@ -216,53 +351,36 @@ pub fn resolve_project_with_session_cancellable<S: BuildHasher>(
     session: &mut ProjectSession,
     cancelled: impl Fn() -> bool,
 ) -> anyhow::Result<Option<ProjectAnalysis>> {
-    if cancelled() {
-        return Ok(None);
-    }
-    let mut package = session.load(path, overlays)?;
-    let macro_analysis = expand_proc_macros(&mut package)?;
-    if cancelled() {
-        return Ok(None);
-    }
-    let result = if let Some(parse) = &package.macro_parse {
-        session
-            .checker
-            .resolve_parsed_package_with_options_and_gc_cancellable(
-                &package.source.source,
-                parse,
-                &package.package_ranges,
-                options,
-                package.gc_enabled,
-                &cancelled,
-            )
-    } else {
-        session
-            .checker
-            .resolve_package_with_options_and_gc_cancellable(
-                &package.source.source,
-                &package.package_ranges,
-                options,
-                package.gc_enabled,
-                &cancelled,
-            )
-    };
-    let Some(mut result) = result else {
-        return Ok(None);
-    };
-    result.macro_diagnostics = macro_analysis.diagnostics;
-    Ok(Some(ProjectAnalysis {
-        entry: package.entry,
-        source: package.source,
-        result,
-        macro_occurrences: macro_analysis.occurrences,
-        macro_source_map: macro_analysis.source_map,
-        kind: package.kind,
-        build_target: package.build_target,
-        runtime_source: package.runtime_source,
-        gc_enabled: package.gc_enabled,
-        package_name: package.name,
-        manifest_fingerprint: package.manifest_fingerprint,
-    }))
+    analyze_project_with_session_cancellable(
+        path,
+        overlays,
+        options,
+        session,
+        ProjectAnalysisDepth::Resolve,
+        cancelled,
+    )
+}
+
+/// Infers project types using an incremental session without running ownership analysis.
+///
+/// # Errors
+///
+/// Returns an error when project loading, macro expansion, or type inference fails.
+pub fn infer_project_with_session_cancellable<S: BuildHasher>(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String, S>,
+    options: riddlec::pipeline::CompileOptions,
+    session: &mut ProjectSession,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<Option<ProjectAnalysis>> {
+    analyze_project_with_session_cancellable(
+        path,
+        overlays,
+        options,
+        session,
+        ProjectAnalysisDepth::Infer,
+        cancelled,
+    )
 }
 
 /// Checks a project using an incremental session.
@@ -292,16 +410,75 @@ pub fn check_project_with_session_cancellable<S: BuildHasher>(
     session: &mut ProjectSession,
     cancelled: impl Fn() -> bool,
 ) -> anyhow::Result<Option<ProjectAnalysis>> {
+    analyze_project_with_session_cancellable(
+        path,
+        overlays,
+        options,
+        session,
+        ProjectAnalysisDepth::Check,
+        cancelled,
+    )
+}
+
+fn analyze_project_with_session_cancellable<S: BuildHasher>(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String, S>,
+    options: riddlec::pipeline::CompileOptions,
+    session: &mut ProjectSession,
+    depth: ProjectAnalysisDepth,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<Option<ProjectAnalysis>> {
     if cancelled() {
         return Ok(None);
     }
-    let mut package = session.load(path, overlays)?;
-    let macro_analysis = expand_proc_macros(&mut package)?;
+    let package = session.load(path, overlays)?;
+    if let Some(analysis) = session.cached_analysis(options, depth) {
+        return Ok(Some(analysis));
+    }
+    let (package, macro_analysis) = session.expand(package)?;
     if cancelled() {
         return Ok(None);
     }
-    let result = if let Some(parse) = &package.macro_parse {
-        session
+    let result = match (depth, package.macro_parse.as_ref()) {
+        (ProjectAnalysisDepth::Resolve, Some(parse)) => session
+            .checker
+            .resolve_parsed_package_with_options_and_gc_cancellable(
+                &package.source.source,
+                parse,
+                &package.package_ranges,
+                options,
+                package.gc_enabled,
+                &cancelled,
+            ),
+        (ProjectAnalysisDepth::Resolve, None) => session
+            .checker
+            .resolve_package_with_options_and_gc_cancellable(
+                &package.source.source,
+                &package.package_ranges,
+                options,
+                package.gc_enabled,
+                &cancelled,
+            ),
+        (ProjectAnalysisDepth::Infer, Some(parse)) => session
+            .checker
+            .infer_parsed_package_with_options_and_gc_cancellable(
+                &package.source.source,
+                parse,
+                &package.package_ranges,
+                options,
+                package.gc_enabled,
+                &cancelled,
+            ),
+        (ProjectAnalysisDepth::Infer, None) => session
+            .checker
+            .infer_package_with_options_and_gc_cancellable(
+                &package.source.source,
+                &package.package_ranges,
+                options,
+                package.gc_enabled,
+                &cancelled,
+            ),
+        (ProjectAnalysisDepth::Check, Some(parse)) => session
             .checker
             .check_parsed_package_with_options_and_gc_cancellable(
                 &package.source.source,
@@ -310,9 +487,8 @@ pub fn check_project_with_session_cancellable<S: BuildHasher>(
                 options,
                 package.gc_enabled,
                 &cancelled,
-            )
-    } else {
-        session
+            ),
+        (ProjectAnalysisDepth::Check, None) => session
             .checker
             .check_package_with_options_and_gc_cancellable(
                 &package.source.source,
@@ -320,16 +496,16 @@ pub fn check_project_with_session_cancellable<S: BuildHasher>(
                 options,
                 package.gc_enabled,
                 &cancelled,
-            )
+            ),
     };
     let Some(mut result) = result else {
         return Ok(None);
     };
     result.macro_diagnostics = macro_analysis.diagnostics;
-    Ok(Some(ProjectAnalysis {
+    let analysis = ProjectAnalysis {
         entry: package.entry,
         source: package.source,
-        result,
+        result: Arc::new(result),
         macro_occurrences: macro_analysis.occurrences,
         macro_source_map: macro_analysis.source_map,
         kind: package.kind,
@@ -338,7 +514,9 @@ pub fn check_project_with_session_cancellable<S: BuildHasher>(
         gc_enabled: package.gc_enabled,
         package_name: package.name,
         manifest_fingerprint: package.manifest_fingerprint,
-    }))
+    };
+    session.cache_analysis(options, depth, analysis.clone());
+    Ok(Some(analysis))
 }
 
 fn analyze_project_impl<S: BuildHasher>(
@@ -381,7 +559,7 @@ fn analyze_project_impl<S: BuildHasher>(
     Ok(ProjectAnalysis {
         entry: package.entry,
         source: package.source,
-        result,
+        result: Arc::new(result),
         macro_occurrences: macro_analysis.occurrences,
         macro_source_map: macro_analysis.source_map,
         kind: package.kind,
@@ -393,6 +571,7 @@ fn analyze_project_impl<S: BuildHasher>(
     })
 }
 
+#[derive(Clone)]
 struct MacroAnalysis {
     diagnostics: Vec<type_checker::Diagnostic>,
     occurrences: Vec<riddlec::proc_macro::ProcMacroOccurrence>,
@@ -401,11 +580,18 @@ struct MacroAnalysis {
 
 fn expand_proc_macros(package: &mut project::LoadedPackage) -> anyhow::Result<MacroAnalysis> {
     let mut provider = proc_macro::ClueProcMacroProvider::build(&package.proc_macros)?;
+    expand_proc_macros_with_provider(package, &mut provider)
+}
+
+fn expand_proc_macros_with_provider(
+    package: &mut project::LoadedPackage,
+    provider: &mut proc_macro::ClueProcMacroProvider,
+) -> anyhow::Result<MacroAnalysis> {
     let source_map = package.source.source_map.clone();
     let host_exports = (package.kind == ProjectKind::ProcMacro)
         .then(|| proc_macro::discover_exports(&package.source.source))
         .transpose()?;
-    let expansion = riddlec::proc_macro::expand_source(&package.source.source, &mut provider);
+    let expansion = riddlec::proc_macro::expand_source(&package.source.source, provider);
     let riddlec::proc_macro::ExpandedSource {
         source,
         parse,
@@ -524,6 +710,38 @@ pub fn check(path: &Path) -> anyhow::Result<()> {
 ///
 /// Returns an error when loading, target resolution, or compilation fails.
 pub fn check_for_target(path: &Path, explicit_target: Option<TargetTriple>) -> anyhow::Result<()> {
+    check_for_target_with_selection(path, explicit_target, None, false)
+}
+
+pub fn check_for_target_with_selection(
+    path: &Path,
+    explicit_target: Option<TargetTriple>,
+    package: Option<&str>,
+    workspace_flag: bool,
+) -> anyhow::Result<()> {
+    if let Some((_, members)) = selected_workspace(path, package, workspace_flag)? {
+        for member in members {
+            let analysis = check_project_with_options(
+                &member,
+                &HashMap::new(),
+                riddlec::pipeline::CompileOptions::default(),
+            )?;
+            target::resolve(explicit_target, analysis.build_target.as_deref())?;
+            let errors = riddlec::diagnostics::report_mapped(
+                &analysis.result,
+                &analysis.source,
+                &analysis.entry.display().to_string(),
+            );
+            if errors > 0 || !analysis.result.success() {
+                bail!("check failed");
+            }
+            println!("clue: checked {}", member.display());
+        }
+        return Ok(());
+    }
+    if package.is_some() || workspace_flag {
+        bail!("`--package` and `--workspace` require a workspace root");
+    }
     let analysis = check_project_with_options(
         path,
         &HashMap::new(),
@@ -557,6 +775,24 @@ pub fn build(path: &Path) -> anyhow::Result<()> {
 ///
 /// Returns an error when project analysis, code generation, or linking fails.
 pub fn build_for_target(path: &Path, explicit_target: Option<TargetTriple>) -> anyhow::Result<()> {
+    build_for_target_with_selection(path, explicit_target, None, false)
+}
+
+pub fn build_for_target_with_selection(
+    path: &Path,
+    explicit_target: Option<TargetTriple>,
+    package: Option<&str>,
+    workspace_flag: bool,
+) -> anyhow::Result<()> {
+    if let Some((_, members)) = selected_workspace(path, package, workspace_flag)? {
+        for member in members {
+            build::run(&member, explicit_target)?;
+        }
+        return Ok(());
+    }
+    if package.is_some() || workspace_flag {
+        bail!("`--package` and `--workspace` require a workspace root");
+    }
     build::run(path, explicit_target).map(|_| ())
 }
 
@@ -575,6 +811,33 @@ pub fn run(path: &Path, args: &[OsString]) -> anyhow::Result<ExitStatus> {
 ///
 /// Returns an error when the package cannot be built, cannot run on the host, or cannot start.
 pub fn run_for_target(
+    path: &Path,
+    args: &[OsString],
+    explicit_target: Option<TargetTriple>,
+) -> anyhow::Result<ExitStatus> {
+    run_for_target_with_selection(path, args, explicit_target, None, false)
+}
+
+pub fn run_for_target_with_selection(
+    path: &Path,
+    args: &[OsString],
+    explicit_target: Option<TargetTriple>,
+    package: Option<&str>,
+    workspace_flag: bool,
+) -> anyhow::Result<ExitStatus> {
+    if let Some((_, members)) = selected_workspace(path, package, workspace_flag)? {
+        if members.len() != 1 {
+            bail!("workspace run requires `--package` when multiple crates are selected");
+        }
+        return run_package(&members[0], args, explicit_target);
+    }
+    if package.is_some() || workspace_flag {
+        bail!("`--package` and `--workspace` require a workspace root");
+    }
+    run_package(path, args, explicit_target)
+}
+
+fn run_package(
     path: &Path,
     args: &[OsString],
     explicit_target: Option<TargetTriple>,
@@ -598,4 +861,41 @@ pub fn run_for_target(
         .current_dir(path)
         .status()
         .map_err(|error| anyhow::anyhow!("failed to run `{}`: {error}", executable.display()))
+}
+
+fn selected_workspace(
+    path: &Path,
+    package: Option<&str>,
+    workspace_flag: bool,
+) -> anyhow::Result<Option<(Workspace, Vec<PathBuf>)>> {
+    if workspace_flag && package.is_some() {
+        bail!("`--workspace` cannot be combined with `--package`");
+    }
+    let Some(workspace) = workspace::load_for_path(path)? else {
+        return Ok(None);
+    };
+    workspace.ensure_lock()?;
+    let selected = if let Some(name) = package {
+        let package = workspace
+            .package_by_name(name)
+            .ok_or_else(|| anyhow::anyhow!("package `{name}` is not a workspace crate"))?;
+        vec![package.root.clone()]
+    } else if workspace_flag || workspace.member_for_path(path).is_none() {
+        workspace.ordered_members()
+    } else {
+        vec![
+            workspace
+                .member_for_path(path)
+                .expect("member path was checked"),
+        ]
+    };
+    if selected.is_empty() {
+        bail!("workspace has no registered crates");
+    }
+    let ordered = workspace
+        .ordered_members()
+        .into_iter()
+        .filter(|member| selected.contains(member))
+        .collect();
+    Ok(Some((workspace, ordered)))
 }
