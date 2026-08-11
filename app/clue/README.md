@@ -4,91 +4,145 @@
     <a href="README-en.md">English</a> | <a href="README.md">中文</a>
 </h3>
 
-`clue` 用于管理和构建 Riddle 项目。
+`clue` 是 Riddle 的包管理器和构建器，管理清单、依赖、目标、工作区、锁文件、缓存、打包与安装。
 
-```bash
-# 初始化目录，不覆盖已有清单或入口文件
-clue init <path> [--bin|--lib|--workspace]
+## 快速开始
 
-# 创建新项目目录
-clue new <path> [--bin|--lib|--workspace]
-
-# 检查整个项目，不生成 C
-clue check [path] [--package <name>] [--workspace] [--target <triple>]
-
-# 生成 C 并构建 .clue/build/<package>[.exe]
-clue build [path] [--package <name>] [--workspace] [--target <triple>]
-
-# 构建并运行二进制项目
-clue run [path] [--package <name>] [--target <triple>] [-- <args>...]
+```powershell
+clue new hello
+Set-Location hello
+clue check
+clue run
 ```
 
-二进制项目是默认类型。Clue 支持在 `Clue.toml` 中声明本地路径依赖，暂不解析 registry 或 git 依赖。外部模块和路径依赖的诊断会指向原始源码文件。Riddle LSP 使用相同的项目加载器，并支持未保存文件。
+常用命令：
 
-## 工作区
+```text
+clue init|new <path> [--bin|--lib|--workspace]
+clue check|build [path] [-p <package>|--workspace] [--bin <name>] [--features a,b|--all-features] [--all-targets] [--locked]
+clue run [path] [-p <package>] [--bin <name>|--example <name>] [--features a,b|--all-features] [-- <args>...]
+clue test|bench [path] [-p <package>|--workspace] [--test|--bench <name>] [--features a,b|--all-features]
+clue add <name> [--version <req>|--path <path>|--git <url>] [--dev]
+clue remove <name> [--dev]
+clue fetch|update|tree|metadata [path]
+clue tree -e features
+clue package [--list] [path]
+clue publish [--dry-run] [--registry <name>] [path]
+clue install [<package>@<version-req>] [--path <path>|--git <url>]
+clue uninstall <name>
+clue clean [path]
+```
 
-根目录可以使用虚拟工作区清单注册所有子 crate：
+所有子命令都接受 `--offline` 和 `-j/--jobs <N>`；构建类命令还支持 `--release`、`--target`、`--features` 和 `--no-default-features` 中适用的选项。以 `clue <command> --help` 查看精确参数。
+
+## 清单
+
+```toml
+[package]
+name = "demo"
+version = "0.1.0"
+license = "MIT"
+publish = ["company"]
+
+[features]
+default = ["logging"]
+logging = ["dep:log", "log/std"]
+conditional-log = ["log?/std"]
+
+[dependencies]
+math = { path = "../math", version = "^1.0" }
+json = "^1.2"
+codec = { git = "https://example.com/codec.git", tag = "v1.0.0" }
+log = { version = "^1", optional = true, default-features = false }
+
+[dev-dependencies]
+assertions = { path = "../assertions" }
+
+[lib]
+path = "src/lib.rid"
+crate-type = ["riddlelib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "demo"
+path = "src/main.rid"
+required-features = ["logging"]
+
+[[example]]
+name = "basic"
+path = "examples/basic.rid"
+```
+
+依赖支持 path、git 和 sparse registry。版本使用 semver 约束；表格式依赖还支持 `package` 重命名、`branch`/`tag`/`rev`、`registry`、`features`、`default-features` 和 `optional`。feature 条目可使用 `dep:name` 启用可选依赖、`name/feature` 转发依赖 feature，以及仅在依赖已启用时生效的 `name?/feature`。`[dev-dependencies]` 只在 test、example 和 bench 目标中加载。
+
+未显式声明时，Clue 自动发现 `src/main.rid`、`src/bin/*.rid`、`tests/*.rid`、`examples/*.rid` 和 `benches/*.rid`。多个 bin 可用 `--bin` 选择；`check` 和 `build` 默认处理所有满足 `required-features` 的 bin。`--all-features` 启用清单定义的所有 feature；`--all-targets` 还会检查或构建 test、example 和 bench 目标。
+
+## 依赖与锁文件
+
+`clue fetch` 获取依赖并生成 `Clue.lock` v3。普通 check/build/fetch 优先复用锁定的 registry 版本与 git revision；`clue update` 才重新选择满足约束的最新版本。`--locked` 要求锁文件已经存在且与清单、feature 和本地源码指纹一致，`--offline` 只使用缓存。
+
+锁文件记录包名、版本、source、依赖、启用的 feature、registry checksum、git revision 和源码指纹。registry 包下载后执行 SHA-256 校验，并使用安全路径规则解包。缓存位于 `$CLUE_HOME/registry` 和 `$CLUE_HOME/git`；默认 `CLUE_HOME` 是用户目录下的 `.clue`。
+
+`clue add` 和 `clue remove` 使用 TOML 编辑器修改清单并保留无关布局。`tree -e features` 显示锁定 feature，`metadata` 输出清单发布元数据和锁图 JSON。
+
+## 工作区与调度
+
+虚拟工作区根清单：
 
 ```toml
 [workspace]
 crates = ["app", "libs/math"]
 ```
 
-每个已注册目录都必须有自己的 `Clue.toml`，依赖仍在子 crate 清单中声明：
+工作区只维护根目录的一个 `Clue.lock`。内部 path 依赖必须注册为成员；外部 path 依赖仍可直接使用。`-p/--package` 选择成员，`--workspace` 选择全部成员。Clue 按依赖拓扑分批执行，并在同一批内按 `--jobs` 并行；构建指纹避免重复生成和编译，OS 文件锁保护并发构建与锁文件替换。
 
-```toml
-[dependencies]
-math = { path = "../libs/math" }
+## 目标与产物
+
+```powershell
+clue build
+clue build --example basic
+clue test --no-run
+clue bench
 ```
 
-根清单只负责注册 crate，不是一个可编译包。根目录的 `clue check` 和 `clue build` 会按依赖顺序处理所有注册 crate；在子目录执行时默认只处理当前 crate，`--workspace` 强制处理整个工作区，`--package <name>` 选择单个 crate。工作区运行多个二进制时使用 `clue run --package <name>`。
+宿主 debug 产物位于 `.clue/build`；release 和显式目标位于 `.clue/build/<target>/<profile>`。二进制构建生成 C 和可执行文件。库构建生成 C、目标文件、`.rmeta` 和默认 `.rlib`；`crate-type` 还可请求 `.a/.lib` 与 `.so/.dylib/.dll`。依赖库先独立编译，应用只生成自身与消费方单态化代码，再链接依赖 `.rlib`；`riddlelib` 不携带 runtime，最终二进制、`staticlib` 和 `cdylib` 才链接 runtime。
 
-工作区只生成一个根目录 `Clue.lock`。其中的本地包使用 `path = "..."` 记录相对根目录的路径，并记录包版本和本地依赖；子 crate 不生成自己的锁文件。工作区内的 path 依赖也必须在 `workspace.crates` 中注册，工作区外的本地依赖可以直接使用。
+设置 `CC` 时 Clue 严格使用该编译器；否则自动探测能够完成 C11 编译和链接的 GCC、Clang 或 MSVC 工具链。目标选择顺序是 `--target`、`RIDDLE_TARGET`、`[build].target`、宿主平台。交叉构建仍需要 ridup 目标组件和对应平台的系统工具链。
 
-设置 `CC` 时 Clue 会严格使用指定的 C 编译器；否则会尝试 `cc`、`gcc`、`clang`、带版本后缀的 GCC/Clang，Windows 还会尝试 `clang-cl` 和 `cl`。候选必须能够完成 C11 编译和链接。解析后的路径和版本会参与构建指纹。库项目只保留生成的 `.clue/build/<package>.c`，不会链接可执行文件。
+## 打包、发布与安装
 
-二进制项目默认使用 Riddle 内置 GC，也可以通过一个实现 `rgc_init`、`rgc_alloc`、`rgc_realloc`、`rgc_free` 和 `rgc_collect` 的 C 源文件替换：
+`clue package` 在 `.clue/package` 生成 `.cluepkg`，排除 `.git` 和 `.clue`；`clue package --list` 只列出将被打包的文件。`clue publish --dry-run` 会执行打包与发布权限校验但不联网；实际 `clue publish` 将归档上传到所选 registry API。`clue install --path .`、`clue install calculator@^1` 和 `clue install --git <url>` 构建二进制并安装到 `$CLUE_HOME/bin`；`clue uninstall <name>` 删除它。
 
-```toml
-[runtime]
-source = "runtime/custom_gc.c"
-```
-
-要完全移除 GC、根扫描和 `rgc_*` ABI，可以启用所有权内存模式：
+全局或项目配置分别位于 `$CLUE_HOME/config.toml` 和 `.clue/config.toml`，项目配置优先：
 
 ```toml
-[runtime]
-gc = false
-```
+[net]
+offline = false
 
-该模式使用 `riddle_alloc`、`riddle_realloc` 和 `riddle_free` 管理有所有者的堆值，并在所有者结束时确定性释放。编译器会拒绝需要让栈上值活过其作用域的引用逃逸（E0310）。`gc = false` 不能与 `source` 同时使用。
-
-运行时选择属于最终二进制包，库项目不能声明 `[runtime]`。
-
-## 目标平台
-
-目标选择优先级为 `--target`、`RIDDLE_TARGET`、`Clue.toml` 的 `[build].target`、宿主平台：
-
-```toml
 [build]
-target = "aarch64-unknown-linux-gnu"
+jobs = 4
+
+[registry]
+default = "default"
+
+[registries.default]
+index = "https://registry.example/index"
+api = "https://registry.example"
+token = "..."
 ```
 
-当前只支持 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`i686-unknown-linux-gnu`、`x86_64-pc-windows-msvc`、`i686-pc-windows-msvc`、`aarch64-pc-windows-msvc` 和 `aarch64-apple-darwin`，其他 triple 会被拒绝。
+环境变量 `CLUE_OFFLINE`、`CLUE_JOBS`、`CLUE_REGISTRY_INDEX` 和 `CLUE_REGISTRY_TOKEN` 覆盖配置。
 
-交叉构建二进制项目需要先运行 `ridup target add <triple>`。目标组件提供 Riddle runtime；C 工具链状态另行检查，Linux 需要目标 sysroot，Windows MSVC 目标需要 Windows SDK 与 MSVC 库，macOS 需要 Apple SDK。`clue run` 不会在宿主机上执行交叉产物。
+## 运行时
 
-## Rust API
-
-该 crate 公开项目创建、检查、构建和分析 API，供 LSP 等工具使用。使用 `init` 可以初始化已有目录；`new` 和 `init` 都不会覆盖已有清单或目标入口文件。
+二进制默认使用内置 GC。`[runtime].source` 可指定实现 `rgc_*` ABI 的 C 文件；`[runtime] gc = false` 启用所有权内存模式。运行时配置只属于最终二进制，库不能声明 `[runtime]`。
 
 ## 源码布局
 
-- `main.rs`：CLI 参数解析和命令分发；
-- `lib.rs`：项目操作和分析 API；
-- `project.rs`：项目创建、模板和依赖加载；
-- `manifest.rs`：`Clue.toml` 序列化与解析；
-- `workspace.rs`：工作区成员、依赖图和选择；
-- `lock.rs`：根 `Clue.lock` 读写；
-- `build.rs`：编译和构建缓存；
-- `target.rs`：目标组件和 C 工具链配置。
+- `main.rs`：CLI；
+- `lib.rs`：公共 API 与命令编排；
+- `manifest.rs` / `model.rs`：清单与领域模型；
+- `package.rs` / `lock.rs`：解析、缓存、registry、git 与锁文件；
+- `workspace.rs`：工作区依赖图和调度批次；
+- `project.rs`：源码与依赖加载；
+- `build.rs`：构建缓存、C 工具链和产物；
+- `target.rs`：目标组件配置。

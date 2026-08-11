@@ -364,8 +364,9 @@ impl LowerCtx<'_> {
     }
 
     pub(super) fn function_name(&self, fid: hir::item_tree::FunctionId) -> String {
-        self.static_method_name(fid)
-            .unwrap_or_else(|| self.hir.item_tree.functions[fid].name.0.clone())
+        self.static_method_name(fid).unwrap_or_else(|| {
+            self.qualify_symbol(fid, self.hir.item_tree.functions[fid].name.0.clone())
+        })
     }
 
     pub(super) fn method_symbol_base(&self, fid: hir::item_tree::FunctionId) -> String {
@@ -381,7 +382,7 @@ impl LowerCtx<'_> {
                         && !self.default_methods.contains_key(&other_fid)
                         && function.name.0 == name
                 });
-        if collides_with_free_function {
+        let base = if collides_with_free_function {
             format!("method::{}::{name}", fid.into_raw().into_u32())
         } else if self.impl_for_method(fid).is_some_and(|imp| {
             let trait_args: &[hir::item_tree::HirTypeRef] = match &imp.trait_ty {
@@ -403,7 +404,36 @@ impl LowerCtx<'_> {
             format!("{name}__trait{}", fid.into_raw().into_u32())
         } else {
             name
+        };
+        self.qualify_symbol(fid, base)
+    }
+
+    fn qualify_symbol(&self, fid: hir::item_tree::FunctionId, base: String) -> String {
+        let function = &self.hir.item_tree.functions[fid];
+        if self.hir.item_tree.extern_function_ids.contains(&fid)
+            || function.attrs.iter().any(|attr| attr.name.0 == "c_export")
+        {
+            return base;
         }
+        let Some(package) = self.hir.package_for_range(function.name_range) else {
+            return base;
+        };
+        if self.package_names.is_empty() {
+            return base;
+        }
+        if base == "main" && package + 1 == self.hir.package_ranges.len() {
+            return base;
+        }
+        let name = self
+            .package_names
+            .get(package)
+            .map_or_else(|| format!("package_{package}"), Clone::clone);
+        format!("package::{name}::{base}")
+    }
+
+    pub(super) fn qualify_current_symbol(&self, base: String) -> String {
+        self.current_function
+            .map_or(base.clone(), |fid| self.qualify_symbol(fid, base))
     }
 
     pub(super) fn static_method_name(&self, fid: hir::item_tree::FunctionId) -> Option<String> {

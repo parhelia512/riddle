@@ -34,7 +34,7 @@ may still change without compatibility guarantees.
 ## Tools
 
 - `riddlec`: checks Riddle source and generates C;
-- `clue`: creates, checks, builds, and runs Riddle projects;
+- `clue`: manages Riddle packages, dependencies, workspaces, build targets, and installed artifacts;
 - `riddle-lsp`: provides editor diagnostics and semantic highlighting.
 
 The [`editors`](./editors) directory contains `riddle-lsp` integrations for
@@ -50,10 +50,13 @@ clue build
 clue run
 ```
 
-`clue build` keeps `.clue/build/hello.c`. When `CC` is set, Clue uses it
-strictly; otherwise it searches for `cc`, `gcc`, `clang`, and versioned command
-names, plus `clang-cl` and `cl` on Windows. A candidate must compile and link
-C11 successfully. `clue run` performs the same build before running the program.
+`clue fetch` resolves path, git, and sparse-registry dependencies into
+`Clue.lock` v3. Normal builds reuse locked versions, while `clue update`
+re-resolves them; `--locked` and `--offline` constrain the lockfile and cache.
+`clue build` keeps `.clue/build/hello.c` and supports multiple bin, lib,
+example, test, and bench targets; see [`app/clue`](./app/clue) for the complete
+manifest and command reference. When `CC` is set, Clue uses it strictly;
+otherwise it probes a GCC, Clang, or MSVC toolchain that can compile and link C11.
 
 ## Installation
 

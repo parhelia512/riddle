@@ -19,7 +19,7 @@ Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.0` 提供
 ## 工具
 
 - `riddlec`：检查 Riddle 源码并生成 C；
-- `clue`：创建、检查、构建和运行 Riddle 项目；
+- `clue`：管理 Riddle 包、依赖、工作区、构建目标与安装产物；
 - `riddle-lsp`：为编辑器提供诊断、工作区索引、自动导入补全、高级导航、重命名、格式化和语义高亮。
 
 仓库中的 [`editors`](./editors) 目录为 Helix、VS Code、Zed 和 IntelliJ IDEA 2026.1+ 提供 `riddle-lsp` 适配。
@@ -34,7 +34,7 @@ clue build
 clue run
 ```
 
-`clue build` 会保留 `.clue/build/hello.c`。设置 `CC` 时，Clue 只会使用该编译器；否则会自动寻找系统中的 `cc`、`gcc`、`clang` 及其带版本号的命令，Windows 上还支持 `clang-cl` 和 `cl`。候选编译器必须能完成 C11 编译与链接。`clue run` 会先执行同样的构建，再运行程序。
+`clue fetch` 会解析 path、git 和 sparse registry 依赖并生成 `Clue.lock` v3；普通构建复用锁定版本，`clue update` 才重新求解，`--locked` 和 `--offline` 分别提供锁文件与缓存约束。`clue build` 会保留 `.clue/build/hello.c`，并支持多 bin、lib、example、test 和 bench 目标；完整清单与命令参见 [`app/clue`](./app/clue)。设置 `CC` 时，Clue 只会使用该编译器；否则会探测能完成 C11 编译与链接的 GCC、Clang 或 MSVC 工具链。
 
 ## 安装
 

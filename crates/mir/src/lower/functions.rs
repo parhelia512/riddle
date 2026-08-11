@@ -71,6 +71,8 @@ impl LowerCtx<'_> {
             .map_or(Type::Unit, |rt| self.convert_hir_type(rt));
 
         let mut func = Function::new(name, ret_type);
+        func.package = self.hir.package_for_range(func_item.name_range);
+        func.generic_instance = self.function_is_generic_instance(fid);
         func.uses_c_string_abi = func_item.attrs.iter().any(|attr| attr.name.0 == "c_export");
         func.is_c_export =
             self.hir.item_tree.extern_function_ids.contains(&fid) || func.uses_c_string_abi;
@@ -170,7 +172,8 @@ impl LowerCtx<'_> {
                 (name.clone(), false)
             } else {
                 self.lambda_counter += 1;
-                let name = format!("__riddle_lambda_{}", self.lambda_counter);
+                let name =
+                    self.qualify_current_symbol(format!("__riddle_lambda_{}", self.lambda_counter));
                 self.lambda_functions
                     .insert((body_id, expr_id), name.clone());
                 (name, true)
@@ -323,6 +326,7 @@ impl LowerCtx<'_> {
         self.current_body = Some(body_id);
 
         let mut function = Function::new(name.to_string(), (*call_signature.ret).clone());
+        self.inherit_function_ownership(&mut function);
         let env_param = function.add_param("__env".into(), closure_env_type());
         let param_values = params
             .iter()
@@ -443,6 +447,7 @@ impl LowerCtx<'_> {
         heap_env: bool,
     ) {
         let mut function = Function::new(name.to_string(), Type::Unit);
+        self.inherit_function_ownership(&mut function);
         let env = function.add_param("__env".into(), closure_env_type());
         function.blocks[function.entry].start_value = function.next_value;
         {
@@ -683,6 +688,7 @@ impl LowerCtx<'_> {
             self.function_adapters.insert(key, name.clone());
 
             let mut function = Function::new(name.clone(), (*signature.ret).clone());
+            self.inherit_function_ownership(&mut function);
             function.add_param("__env".into(), closure_env_type());
             let parameter_names = self.hir.item_tree.functions[fid]
                 .params
@@ -743,5 +749,26 @@ impl LowerCtx<'_> {
             self.module.add_function(function);
         }
         name
+    }
+
+    fn inherit_function_ownership(&self, function: &mut Function) {
+        let Some(fid) = self.current_function else {
+            return;
+        };
+        function.package = self
+            .hir
+            .package_for_range(self.hir.item_tree.functions[fid].name_range);
+        function.generic_instance = self.function_is_generic_instance(fid);
+    }
+
+    fn function_is_generic_instance(&self, fid: hir::item_tree::FunctionId) -> bool {
+        let function = &self.hir.item_tree.functions[fid];
+        !function.generics.is_empty()
+            || !function.implicit_generics.is_empty()
+            || !function.const_generics.is_empty()
+            || self.default_methods.contains_key(&fid)
+            || self
+                .impl_for_method(fid)
+                .is_some_and(|imp| !imp.generics.is_empty() || !imp.const_generics.is_empty())
     }
 }

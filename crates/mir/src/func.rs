@@ -9,6 +9,8 @@ use crate::value::{BlockId, Value};
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    pub package: Option<usize>,
+    pub generic_instance: bool,
     pub params: Vec<Param>,
     pub ret_type: Type,
     pub blocks: Arena<Block>,
@@ -36,6 +38,8 @@ impl Function {
 
         Self {
             name,
+            package: None,
+            generic_instance: false,
             params: Vec::new(),
             ret_type,
             blocks,

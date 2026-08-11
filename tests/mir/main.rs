@@ -42,6 +42,7 @@ fn compile(
         &escape_result,
         &analysis.moved_exprs,
         true,
+        &[],
     );
 
     (hir, type_result, analysis, mir_module)

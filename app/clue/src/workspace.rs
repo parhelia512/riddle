@@ -1,6 +1,6 @@
 use crate::ProjectKind;
-use crate::lock::{self, LockFile, LockPackage};
 use crate::manifest::{self, CLUE_PROJECT_FILE_NAME, Manifest, WorkspaceManifest};
+use crate::model::{DependencyKind, DependencySource, DependencySpec};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, Error, ErrorKind};
@@ -105,48 +105,43 @@ impl Workspace {
         ordered
     }
 
-    pub fn ensure_lock(&self) -> io::Result<()> {
-        let expected = self.lock_file()?;
-        lock::write_if_changed(&self.lock_path, &expected)
+    #[must_use]
+    pub fn ordered_batches(&self, selected: &[PathBuf]) -> Vec<Vec<PathBuf>> {
+        let selected = selected.iter().cloned().collect::<BTreeSet<_>>();
+        let mut remaining = selected.clone();
+        let mut batches = Vec::new();
+        while !remaining.is_empty() {
+            let ready = remaining
+                .iter()
+                .filter(|root| {
+                    self.dependencies.get(*root).is_none_or(|dependencies| {
+                        dependencies.iter().all(|dependency| {
+                            !selected.contains(dependency) || !remaining.contains(dependency)
+                        })
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                batches.push(remaining.into_iter().collect());
+                break;
+            }
+            for root in &ready {
+                remaining.remove(root);
+            }
+            batches.push(ready);
+        }
+        batches
     }
 
-    fn lock_file(&self) -> io::Result<LockFile> {
-        let mut package = self
-            .packages
-            .values()
-            .map(|item| {
-                let mut dependencies = self
-                    .dependencies
-                    .get(&item.root)
-                    .into_iter()
-                    .flatten()
-                    .map(|root| {
-                        self.packages
-                            .get(root)
-                            .map(|package| package.manifest.name.clone())
-                            .ok_or_else(|| {
-                                Error::new(
-                                    ErrorKind::InvalidData,
-                                    format!("missing package metadata for `{}`", root.display()),
-                                )
-                            })
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                dependencies.sort();
-                dependencies.dedup();
-                Ok(LockPackage {
-                    name: item.manifest.name.clone(),
-                    version: item.manifest.version.clone(),
-                    path: lock_path(&self.root, &item.root),
-                    dependencies,
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        package.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(LockFile {
-            version: lock::LOCK_VERSION,
-            package,
-        })
+    pub fn ensure_lock(&self) -> io::Result<()> {
+        self.ensure_lock_mode(false)
+    }
+
+    pub fn ensure_lock_mode(&self, locked: bool) -> io::Result<()> {
+        crate::package::prepare_workspace(&self.root, &self.members, locked, None)
+            .map(|_| ())
+            .map_err(io::Error::other)
     }
 }
 
@@ -367,8 +362,14 @@ impl<'a> GraphBuilder<'a> {
         let manifest = manifest::read(root, kind)?;
         let mut dependency_roots = Vec::new();
         for dependency in &manifest.dependencies {
+            if dependency.kind == DependencyKind::Development {
+                continue;
+            }
             validate_dependency_alias(&dependency.alias)?;
-            let dependency_root = canonicalize(&root.join(&dependency.path))?;
+            let DependencySource::Path(path) = &dependency.source else {
+                continue;
+            };
+            let dependency_root = canonicalize(&root.join(path))?;
             if dependency_root.starts_with(self.workspace_root)
                 && !self.members.iter().any(|member| member == &dependency_root)
             {
@@ -383,6 +384,14 @@ impl<'a> GraphBuilder<'a> {
                 ));
             }
             self.visit(&dependency_root, ProjectKind::Library)?;
+            validate_dependency_target(
+                dependency,
+                &self
+                    .packages
+                    .get(&dependency_root)
+                    .expect("visited dependency has package metadata")
+                    .manifest,
+            )?;
             dependency_roots.push(dependency_root);
         }
         self.stack.pop();
@@ -413,6 +422,30 @@ fn validate_unique_names(packages: &BTreeMap<PathBuf, WorkspacePackage>) -> io::
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_dependency_target(dependency: &DependencySpec, manifest: &Manifest) -> io::Result<()> {
+    if manifest.name != dependency.package {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "dependency `{}` expected package `{}`, found `{}`",
+                dependency.alias, dependency.package, manifest.name
+            ),
+        ));
+    }
+    if let Some(requirement) = &dependency.requirement
+        && !requirement.matches(&manifest.version)
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "dependency `{}` requires version `{requirement}`, found `{}`",
+                dependency.alias, manifest.version
+            ),
+        ));
     }
     Ok(())
 }
@@ -471,8 +504,12 @@ fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     fs::canonicalize(path)
 }
 
+#[cfg(test)]
 fn lock_path(workspace_root: &Path, package_root: &Path) -> String {
     if let Ok(path) = package_root.strip_prefix(workspace_root) {
+        if path.as_os_str().is_empty() {
+            return ".".into();
+        }
         return path.to_string_lossy().replace('\\', "/");
     }
     let workspace = workspace_root.components().collect::<Vec<_>>();

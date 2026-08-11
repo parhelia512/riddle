@@ -48,6 +48,7 @@ autotests = false
 [dependencies]
 clap = { version = "=4.5.61", features = ["derive", "string"] }
 clue = { path = "app/clue" }
+ctrlc = "3.4"
 mir = { path = "crates/mir" }
 riddlec = { path = "app/riddlec" }
 riddle-lsp = { path = "app/riddle-lsp" }

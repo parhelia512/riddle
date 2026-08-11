@@ -1,9 +1,9 @@
+use crate::model::{DependencyKind, TargetKind};
 use crate::target::{self, TargetConfig};
-use crate::{ProjectKind, TargetTriple, analyze_project};
+use crate::{ProjectKind, TargetTriple};
 use anyhow::{Context, bail};
 use riddlec::pipeline;
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -11,15 +11,50 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Clone)]
 pub enum BuildArtifact {
     Executable { path: PathBuf, target: TargetTriple },
-    Library,
+    Library { links: Vec<LibraryLink> },
+}
+
+#[derive(Clone)]
+pub struct LibraryLink {
+    pub archive: PathBuf,
+    pub object: PathBuf,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LibraryUnit {
+    root: PathBuf,
+    profile: BuildProfile,
+    triple: TargetTriple,
+    features: Vec<String>,
+    no_default_features: bool,
+}
+
+#[derive(Default)]
+struct BuildState {
+    building: HashSet<PathBuf>,
+    libraries: HashMap<LibraryUnit, BuildArtifact>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuildProfile {
+    Debug,
+    Release,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Flavor {
     Unix,
     Msvc,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OutputMode {
+    Executable,
+    SharedLibrary,
+    Object { pic: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -29,19 +64,162 @@ struct CCompiler {
     version: Vec<u8>,
     clang: bool,
     target: TargetConfig,
+    profile: BuildProfile,
 }
 
-pub fn run(root: &Path, explicit_target: Option<TargetTriple>) -> anyhow::Result<BuildArtifact> {
+pub fn run_with_options(
+    root: &Path,
+    explicit_target: Option<TargetTriple>,
+    profile: BuildProfile,
+    bin: Option<&str>,
+    features: &[String],
+    no_default_features: bool,
+) -> anyhow::Result<BuildArtifact> {
+    run_target_with_options(
+        root,
+        explicit_target,
+        profile,
+        &crate::project::LoadOptions {
+            bin: bin.map(str::to_owned),
+            features: features.to_vec(),
+            no_default_features,
+            require_bin: true,
+            ..crate::project::LoadOptions::default()
+        },
+    )
+}
+
+pub(crate) fn run_target_with_options(
+    root: &Path,
+    explicit_target: Option<TargetTriple>,
+    profile: BuildProfile,
+    load_options: &crate::project::LoadOptions,
+) -> anyhow::Result<BuildArtifact> {
+    if crate::cancellation_requested() {
+        bail!("build cancelled");
+    }
     let root = if root.is_absolute() {
         root.to_path_buf()
     } else {
         env::current_dir()?.join(root)
     };
-    let analysis = analyze_project(&root, &HashMap::new())?;
+    let analysis = crate::analyze_project_impl_with_load_options(
+        &root,
+        &std::collections::HashMap::new(),
+        riddlec::pipeline::CompileOptions::default(),
+        true,
+        load_options,
+    )?;
     ensure_analysis_success(&analysis)?;
     let triple = target::resolve(explicit_target, analysis.build_target.as_deref())?;
-    let target = target::load(triple, analysis.kind == ProjectKind::Binary)?;
-    build_analysis(&root, &analysis, triple, &target)
+    let target = target::load(triple, true)?;
+    let mut state = BuildState::default();
+    state.building.insert(root.clone());
+    let dependencies =
+        build_dependencies(&root, triple, &target, profile, load_options, &mut state)?;
+    state.building.remove(&root);
+    build_analysis(&root, &analysis, triple, &target, profile, &dependencies)
+}
+
+fn build_dependencies(
+    root: &Path,
+    triple: TargetTriple,
+    target: &TargetConfig,
+    profile: BuildProfile,
+    options: &crate::project::LoadOptions,
+    state: &mut BuildState,
+) -> anyhow::Result<Vec<BuildArtifact>> {
+    let manifest = crate::manifest::read(root, ProjectKind::Binary)?;
+    let resolution = crate::model::resolve_features(
+        &manifest.features,
+        &manifest.dependencies,
+        &options.features,
+        !options.no_default_features,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mut artifacts = Vec::new();
+    for dependency in &manifest.dependencies {
+        if dependency.kind == DependencyKind::Development && !options.include_dev {
+            continue;
+        }
+        if dependency.optional && !resolution.active.contains(&dependency.alias) {
+            continue;
+        }
+        let dependency_root = crate::package::dependency_root(root, dependency)?;
+        let dependency_manifest = crate::manifest::read(&dependency_root, ProjectKind::Library)?;
+        if dependency_manifest.kind == ProjectKind::ProcMacro
+            || dependency_manifest
+                .library
+                .is_some_and(|target| target.kind == TargetKind::ProcMacro)
+        {
+            continue;
+        }
+        let mut features = dependency.features.clone();
+        if let Some(forwarded) = resolution.dependency_features.get(&dependency.alias) {
+            features.extend(forwarded.iter().cloned());
+        }
+        features.sort();
+        features.dedup();
+        artifacts.push(build_library_dependency(
+            &dependency_root,
+            triple,
+            target,
+            profile,
+            &crate::project::LoadOptions {
+                features,
+                no_default_features: !dependency.default_features,
+                ..crate::project::LoadOptions::default()
+            },
+            state,
+        )?);
+    }
+    Ok(artifacts)
+}
+
+fn build_library_dependency(
+    root: &Path,
+    triple: TargetTriple,
+    target: &TargetConfig,
+    profile: BuildProfile,
+    options: &crate::project::LoadOptions,
+    state: &mut BuildState,
+) -> anyhow::Result<BuildArtifact> {
+    let root = fs::canonicalize(root)?;
+    let mut features = options.features.clone();
+    features.sort();
+    features.dedup();
+    let unit = LibraryUnit {
+        root: root.clone(),
+        profile,
+        triple,
+        features,
+        no_default_features: options.no_default_features,
+    };
+    if let Some(artifact) = state.libraries.get(&unit) {
+        return Ok(artifact.clone());
+    }
+    if !state.building.insert(root.clone()) {
+        bail!("cyclic package dependency involving `{}`", root.display());
+    }
+    let analysis = crate::analyze_project_impl_with_load_options(
+        &root,
+        &HashMap::new(),
+        pipeline::CompileOptions::default(),
+        true,
+        options,
+    )?;
+    ensure_analysis_success(&analysis)?;
+    if analysis.kind == ProjectKind::Binary {
+        bail!(
+            "dependency `{}` does not provide a library target",
+            root.display()
+        );
+    }
+    let dependencies = build_dependencies(&root, triple, target, profile, options, state)?;
+    let artifact = build_analysis(&root, &analysis, triple, target, profile, &dependencies)?;
+    state.building.remove(&root);
+    state.libraries.insert(unit, artifact.clone());
+    Ok(artifact)
 }
 
 fn ensure_analysis_success(analysis: &crate::ProjectAnalysis) -> anyhow::Result<()> {
@@ -61,46 +239,57 @@ fn build_analysis(
     analysis: &crate::ProjectAnalysis,
     triple: TargetTriple,
     target: &TargetConfig,
+    profile: BuildProfile,
+    dependencies: &[BuildArtifact],
 ) -> anyhow::Result<BuildArtifact> {
-    let build_dir = root.join(".clue").join("build");
+    let profile_name = match profile {
+        BuildProfile::Debug => "debug",
+        BuildProfile::Release => "release",
+    };
+    let build_dir = if profile == BuildProfile::Debug
+        && TargetTriple::host().is_ok_and(|host| host == triple)
+    {
+        root.join(".clue").join("build")
+    } else {
+        root.join(".clue")
+            .join("build")
+            .join(triple.as_str())
+            .join(profile_name)
+    };
     fs::create_dir_all(&build_dir)?;
-    let compiler = if analysis.kind == ProjectKind::Binary {
-        Some(CCompiler::detect(&build_dir, target.clone())?)
-    } else {
-        None
-    };
-    let c_path = build_dir.join(format!("{}.c", analysis.package_name));
+    let _guard = crate::lock::FileGuard::acquire(&build_dir.join(".build-lock"))?;
+    let compiler = CCompiler::detect(&build_dir, target.clone(), profile)?;
+    let target_name = analysis
+        .target_name
+        .as_deref()
+        .unwrap_or(&analysis.package_name);
+    let c_path = build_dir.join(format!("{target_name}.c"));
     let custom_runtime_path = analysis.runtime_source.as_ref().map(|path| root.join(path));
-    let runtime_source = if compiler.is_some() {
-        Some(if analysis.gc_enabled {
-            match &custom_runtime_path {
+    let runtime_source = Some(if analysis.gc_enabled {
+        match &custom_runtime_path {
+            Some(path) => fs::read_to_string(path)
+                .with_context(|| format!("failed to read runtime source `{}`", path.display()))?,
+            None => match &target.runtime_source {
                 Some(path) => fs::read_to_string(path).with_context(|| {
-                    format!("failed to read runtime source `{}`", path.display())
+                    format!("failed to read target runtime `{}`", path.display())
                 })?,
-                None => match &target.runtime_source {
-                    Some(path) => fs::read_to_string(path).with_context(|| {
-                        format!("failed to read target runtime `{}`", path.display())
-                    })?,
-                    None => gc::RUNTIME_C.to_owned(),
-                },
-            }
-        } else {
-            gc::NO_GC_RUNTIME_C.to_owned()
-        })
+                None => gc::RUNTIME_C.to_owned(),
+            },
+        }
     } else {
-        None
-    };
-    let runtime_path = compiler.as_ref().map(|_| {
+        gc::NO_GC_RUNTIME_C.to_owned()
+    });
+    let runtime_path = Some({
         custom_runtime_path
             .clone()
-            .unwrap_or_else(|| build_dir.join(format!("{}.runtime.c", analysis.package_name)))
+            .unwrap_or_else(|| build_dir.join(format!("{target_name}.runtime.c")))
     });
-    let hash_path = build_dir.join(format!("{}.hash", analysis.package_name));
+    let hash_path = build_dir.join(format!("{target_name}.hash"));
     let hash = fingerprint(
         &analysis.manifest_fingerprint,
         &analysis.source.source,
         runtime_source.as_deref(),
-        compiler.as_ref(),
+        Some(&compiler),
         target,
     );
     let source_is_fresh = c_path.is_file()
@@ -113,29 +302,54 @@ fn build_analysis(
             .mir_module
             .as_ref()
             .context("successful compilation did not produce MIR")?;
-        let c_code = pipeline::generate_c_with_gc_and_source(
+        let c_code = pipeline::generate_c_for_package_with_gc_and_source(
             module,
+            analysis.package_index,
             analysis.gc_enabled,
             &analysis.entry.display().to_string(),
         )
         .map_err(anyhow::Error::msg)?;
-        fs::write(&c_path, c_code)?;
+        atomic_write(&c_path, c_code.as_bytes())?;
         if analysis.runtime_source.is_none()
             && let (Some(path), Some(source)) = (&runtime_path, &runtime_source)
         {
-            fs::write(path, source)?;
+            atomic_write(path, source.as_bytes())?;
         }
     }
 
-    let Some(compiler) = compiler else {
-        if source_is_fresh {
-            println!("clue: fresh {}", c_path.display());
-        } else {
-            fs::write(&hash_path, hash)?;
-            println!("clue: built {}", c_path.display());
+    if analysis.kind != ProjectKind::Binary {
+        let object = build_dir.join(format!(
+            "{target_name}.{}",
+            if triple.is_windows() { "obj" } else { "o" }
+        ));
+        let archive = build_dir.join(format!("{target_name}.rlib"));
+        if source_is_fresh
+            && object.is_file()
+            && archive.is_file()
+            && library_outputs_exist(&analysis.library_types, &build_dir, target_name, triple)
+        {
+            println!("clue: fresh library `{target_name}`");
+            return Ok(BuildArtifact::Library {
+                links: library_links(&archive, &object, dependencies),
+            });
         }
-        return Ok(BuildArtifact::Library);
-    };
+        build_library_artifacts(
+            analysis,
+            &compiler,
+            runtime_path
+                .as_deref()
+                .context("library build did not select a runtime")?,
+            &build_dir,
+            target_name,
+            triple,
+            dependencies,
+        )?;
+        atomic_write(&hash_path, hash.as_bytes())?;
+        println!("clue: built library `{target_name}`");
+        return Ok(BuildArtifact::Library {
+            links: library_links(&archive, &object, dependencies),
+        });
+    }
 
     let executable = executable_path(&c_path, triple);
     if source_is_fresh && executable.is_file() {
@@ -146,24 +360,162 @@ fn build_analysis(
         });
     }
 
-    compiler.compile(
-        &[
-            c_path.as_path(),
-            runtime_path
-                .as_deref()
-                .context("binary build did not select a runtime")?,
-        ],
-        &executable,
-        &[],
-        false,
-        &[],
-    )?;
-    fs::write(&hash_path, hash)?;
+    let temp_executable = temporary_path(&executable);
+    let mut sources = vec![
+        c_path.as_path(),
+        runtime_path
+            .as_deref()
+            .context("binary build did not select a runtime")?,
+    ];
+    sources.extend(
+        dependencies
+            .iter()
+            .filter_map(|dependency| match dependency {
+                BuildArtifact::Library { links, .. } => {
+                    Some(links.iter().map(|link| link.archive.as_path()))
+                }
+                BuildArtifact::Executable { .. } => None,
+            })
+            .flatten(),
+    );
+    compiler.compile(&sources, &temp_executable, &[], false, &[])?;
+    replace_file(&temp_executable, &executable)?;
+    atomic_write(&hash_path, hash.as_bytes())?;
     println!("clue: built {}", executable.display());
     Ok(BuildArtifact::Executable {
         path: executable,
         target: triple,
     })
+}
+
+fn build_library_artifacts(
+    analysis: &crate::ProjectAnalysis,
+    compiler: &CCompiler,
+    runtime_path: &Path,
+    build_dir: &Path,
+    target_name: &str,
+    triple: TargetTriple,
+    dependencies: &[BuildArtifact],
+) -> anyhow::Result<()> {
+    let c_path = build_dir.join(format!("{target_name}.c"));
+    let object = build_dir.join(format!(
+        "{target_name}.{}",
+        if triple.is_windows() { "obj" } else { "o" }
+    ));
+    compiler.compile_object(&c_path, &object, true)?;
+    let metadata = serde_json::json!({
+        "schema": 1,
+        "name": analysis.package_name,
+        "version": analysis.package_version,
+        "target": triple.as_str(),
+        "source_hash": analysis.manifest_fingerprint,
+    });
+    atomic_write(
+        &build_dir.join(format!("{target_name}.rmeta")),
+        serde_json::to_vec_pretty(&metadata)?.as_slice(),
+    )?;
+
+    let library_types = if analysis.library_types.is_empty() {
+        vec![crate::model::LibraryType::RiddleLib]
+    } else {
+        analysis.library_types.clone()
+    };
+    compiler.archive(
+        &[object.as_path()],
+        &build_dir.join(format!("{target_name}.rlib")),
+    )?;
+    if library_types.contains(&crate::model::LibraryType::StaticLib) {
+        let runtime_object = build_dir.join(format!(
+            "{target_name}.runtime.{}",
+            if triple.is_windows() { "obj" } else { "o" }
+        ));
+        compiler.compile_object(runtime_path, &runtime_object, true)?;
+        let mut objects = vec![object.as_path(), runtime_object.as_path()];
+        objects.extend(
+            dependencies
+                .iter()
+                .filter_map(|dependency| match dependency {
+                    BuildArtifact::Library { links, .. } => {
+                        Some(links.iter().map(|link| link.object.as_path()))
+                    }
+                    BuildArtifact::Executable { .. } => None,
+                })
+                .flatten(),
+        );
+        compiler.archive(
+            &objects,
+            &build_dir.join(static_library_name(target_name, triple)),
+        )?;
+    }
+    if library_types.contains(&crate::model::LibraryType::Cdylib) {
+        let output = build_dir.join(shared_library_name(target_name, triple));
+        let temp = temporary_path(&output);
+        let mut sources = vec![c_path.as_path(), runtime_path];
+        sources.extend(
+            dependencies
+                .iter()
+                .filter_map(|dependency| match dependency {
+                    BuildArtifact::Library { links, .. } => {
+                        Some(links.iter().map(|link| link.archive.as_path()))
+                    }
+                    BuildArtifact::Executable { .. } => None,
+                })
+                .flatten(),
+        );
+        compiler.compile(&sources, &temp, &[], true, &[])?;
+        replace_file(&temp, &output)?;
+    }
+    Ok(())
+}
+
+fn library_links(
+    archive: &Path,
+    object: &Path,
+    dependencies: &[BuildArtifact],
+) -> Vec<LibraryLink> {
+    std::iter::once(LibraryLink {
+        archive: archive.to_path_buf(),
+        object: object.to_path_buf(),
+    })
+    .chain(dependencies.iter().flat_map(|dependency| match dependency {
+        BuildArtifact::Library { links, .. } => links.clone().into_iter(),
+        BuildArtifact::Executable { .. } => Vec::new().into_iter(),
+    }))
+    .collect()
+}
+
+fn library_outputs_exist(
+    library_types: &[crate::model::LibraryType],
+    build_dir: &Path,
+    target_name: &str,
+    triple: TargetTriple,
+) -> bool {
+    (!library_types.contains(&crate::model::LibraryType::StaticLib)
+        || build_dir
+            .join(static_library_name(target_name, triple))
+            .is_file())
+        && (!library_types.contains(&crate::model::LibraryType::Cdylib)
+            || build_dir
+                .join(shared_library_name(target_name, triple))
+                .is_file())
+}
+
+fn static_library_name(name: &str, target: TargetTriple) -> String {
+    if target.is_windows() {
+        format!("{name}.lib")
+    } else {
+        format!("lib{name}.a")
+    }
+}
+
+fn shared_library_name(name: &str, target: TargetTriple) -> String {
+    if target.is_windows() {
+        format!("{name}.dll")
+    } else if target.is_macos() {
+        format!("lib{name}.dylib")
+    } else {
+        format!("lib{name}.so")
+    }
 }
 
 pub struct ProcMacroArtifacts {
@@ -180,7 +532,8 @@ pub fn build_proc_macro_library(
     let target = target::load(host, true)?;
     let build_dir = package.root.join(".clue").join("build");
     fs::create_dir_all(&build_dir)?;
-    let compiler = CCompiler::detect(&build_dir, target.clone())?;
+    let _guard = crate::lock::FileGuard::acquire(&build_dir.join(".build-lock"))?;
+    let compiler = CCompiler::detect(&build_dir, target.clone(), BuildProfile::Release)?;
 
     let source = crate::proc_macro::host_source(expanded_source, exports);
     let bridge = crate::proc_macro::host_runtime_c(exports);
@@ -235,30 +588,41 @@ pub fn build_proc_macro_library(
         .mir_module
         .as_ref()
         .context("successful proc-macro compilation did not produce MIR")?;
-    fs::write(
+    atomic_write(
         &c_path,
         pipeline::generate_c_with_gc_and_source(module, true, &package.entry.display().to_string())
-            .map_err(anyhow::Error::msg)?,
+            .map_err(anyhow::Error::msg)?
+            .as_bytes(),
     )?;
-    fs::write(&runtime_path, gc::RUNTIME_C)?;
-    fs::write(&bridge_path, bridge)?;
-    fs::write(&runner_c_path, runner_source)?;
+    atomic_write(&runtime_path, gc::RUNTIME_C.as_bytes())?;
+    atomic_write(&bridge_path, bridge.as_bytes())?;
+    atomic_write(&runner_c_path, runner_source.as_bytes())?;
+    let temp_library = temporary_path(&library);
     compiler.compile(
         &[
             c_path.as_path(),
             runtime_path.as_path(),
             bridge_path.as_path(),
         ],
-        &library,
+        &temp_library,
         &["putchar=riddle_proc_putchar"],
         true,
         // ponytail: glibc folds `putchar` into `putc(c, stdout)` at -O2 after
         // macro expansion, bypassing the -D rename; -fno-inline stops it.
         &["-fno-inline"],
     )?;
+    replace_file(&temp_library, &library)?;
+    let temp_runner = temporary_path(&runner);
     let runner_args = if host.is_linux() { &["-ldl"][..] } else { &[] };
-    compiler.compile(&[runner_c_path.as_path()], &runner, &[], false, runner_args)?;
-    fs::write(hash_path, hash)?;
+    compiler.compile(
+        &[runner_c_path.as_path()],
+        &temp_runner,
+        &[],
+        false,
+        runner_args,
+    )?;
+    replace_file(&temp_runner, &runner)?;
+    atomic_write(&hash_path, hash.as_bytes())?;
     Ok(ProcMacroArtifacts { library, runner })
 }
 
@@ -292,10 +656,33 @@ fn executable_path(c_path: &Path, target: TargetTriple) -> PathBuf {
     path
 }
 
+fn temporary_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    path.with_file_name(format!(".{name}.tmp-{}", std::process::id()))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let temp = temporary_path(path);
+    fs::write(&temp, bytes)?;
+    replace_file(&temp, path)
+}
+
+fn replace_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    crate::lock::replace_file(source, destination)?;
+    Ok(())
+}
+
 impl CCompiler {
-    fn detect(build_dir: &Path, target: TargetConfig) -> anyhow::Result<Self> {
+    fn detect(
+        build_dir: &Path,
+        target: TargetConfig,
+        profile: BuildProfile,
+    ) -> anyhow::Result<Self> {
         if let Some(program) = env::var_os("CC") {
-            let compiler = Self::new(&program, target).ok_or_else(|| {
+            let compiler = Self::new(&program, target, profile).ok_or_else(|| {
                 anyhow::anyhow!(
                     "C compiler from CC `{}` could not report its version",
                     program.to_string_lossy()
@@ -311,12 +698,13 @@ impl CCompiler {
         }
 
         if let Some(program) = &target.c_toolchain.compiler {
-            let compiler = Self::new(program.as_os_str(), target.clone()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "configured C compiler `{}` could not report its version",
-                    program.display()
-                )
-            })?;
+            let compiler =
+                Self::new(program.as_os_str(), target.clone(), profile).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "configured C compiler `{}` could not report its version",
+                        program.display()
+                    )
+                })?;
             if compiler.probe(build_dir) {
                 return Ok(compiler);
             }
@@ -347,7 +735,7 @@ impl CCompiler {
             .join(", ");
         programs
             .into_iter()
-            .filter_map(|program| Self::new(&program, target.clone()))
+            .filter_map(|program| Self::new(&program, target.clone(), profile))
             .find(|compiler| compiler.probe(build_dir))
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -356,7 +744,7 @@ impl CCompiler {
             })
     }
 
-    fn new(program: &OsStr, target: TargetConfig) -> Option<Self> {
+    fn new(program: &OsStr, target: TargetConfig, profile: BuildProfile) -> Option<Self> {
         let program = resolve_program(program);
         let flavor = flavor_for(&program);
         let output = Command::new(&program)
@@ -385,6 +773,7 @@ impl CCompiler {
             version,
             clang,
             target,
+            profile,
         })
     }
 
@@ -420,6 +809,7 @@ impl CCompiler {
         self.version.hash(&mut hasher);
         self.clang.hash(&mut hasher);
         self.target.hash(&mut hasher);
+        self.profile.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -449,6 +839,41 @@ impl CCompiler {
         Ok(())
     }
 
+    fn compile_object(&self, source: &Path, object: &Path, pic: bool) -> anyhow::Result<()> {
+        let status = self
+            .command_mode(&[source], object, &[], &[], OutputMode::Object { pic })
+            .status()?;
+        if !status.success() {
+            bail!(
+                "C compiler `{}` exited with {status}",
+                self.program.to_string_lossy()
+            );
+        }
+        Ok(())
+    }
+
+    fn archive(&self, objects: &[&Path], output: &Path) -> anyhow::Result<()> {
+        let (program, args) = if self.flavor == Flavor::Msvc {
+            let program = if self.clang { "llvm-lib" } else { "lib" };
+            let mut args = vec![format!("/OUT:{}", tool_path(output))];
+            args.extend(objects.iter().map(|object| tool_path(object)));
+            (program, args)
+        } else {
+            let mut args = vec!["crs".to_owned(), tool_path(output)];
+            args.extend(objects.iter().map(|object| tool_path(object)));
+            ("ar", args)
+        };
+        let status = Command::new(program)
+            .args(&args)
+            .current_dir(output.parent().unwrap_or_else(|| Path::new(".")))
+            .status()
+            .with_context(|| format!("failed to run archive tool `{program}`"))?;
+        if !status.success() {
+            bail!("archive tool `{program}` exited with {status}");
+        }
+        Ok(())
+    }
+
     fn command(
         &self,
         sources: &[&Path],
@@ -457,12 +882,47 @@ impl CCompiler {
         shared_library: bool,
         extra_args: &[&str],
     ) -> Command {
+        self.command_mode(
+            sources,
+            executable,
+            defines,
+            extra_args,
+            if shared_library {
+                OutputMode::SharedLibrary
+            } else {
+                OutputMode::Executable
+            },
+        )
+    }
+
+    fn command_mode(
+        &self,
+        sources: &[&Path],
+        executable: &Path,
+        defines: &[&str],
+        extra_args: &[&str],
+        mode: OutputMode,
+    ) -> Command {
+        let shared_library = matches!(mode, OutputMode::SharedLibrary);
+        let compile_only = matches!(mode, OutputMode::Object { .. });
+        let pic = matches!(mode, OutputMode::Object { pic: true });
+        let source_args = sources
+            .iter()
+            .map(|source| tool_path(source))
+            .collect::<Vec<_>>();
         let mut command = Command::new(&self.program);
         let host = TargetTriple::host().ok();
         let cross = host.is_some_and(|host| host != self.target.triple);
         match self.flavor {
             Flavor::Unix => {
-                command.args(["-std=c11", "-O2"]);
+                command.args([
+                    "-std=c11",
+                    if self.profile == BuildProfile::Release {
+                        "-O2"
+                    } else {
+                        "-O0"
+                    },
+                ]);
                 if cross && self.clang {
                     command.arg(format!("--target={}", self.target.triple));
                 } else if matches!(
@@ -485,19 +945,32 @@ impl CCompiler {
                     if !self.target.triple.is_windows() {
                         command.arg("-fPIC");
                     }
+                } else if pic {
+                    command.arg("-fPIC");
+                }
+                if compile_only {
+                    command.arg("-c");
                 }
                 self.apply_unix_target_options(&mut command);
                 for define in defines {
                     command.arg(format!("-D{define}"));
                 }
                 command
-                    .args(sources)
+                    .args(&source_args)
                     .args(extra_args)
                     .arg("-o")
                     .arg(executable);
             }
             Flavor::Msvc => {
-                command.args(["/nologo", "/std:c11", "/O2"]);
+                command.args([
+                    "/nologo",
+                    "/std:c11",
+                    if self.profile == BuildProfile::Release {
+                        "/O2"
+                    } else {
+                        "/Od"
+                    },
+                ]);
                 if self.clang && (cross || self.target.triple == TargetTriple::I686PcWindowsMsvc) {
                     command.arg(format!("--target={}", self.target.triple));
                 }
@@ -507,6 +980,9 @@ impl CCompiler {
                 if shared_library {
                     command.arg("/LD");
                 }
+                if compile_only {
+                    command.arg("/c");
+                }
                 self.apply_msvc_target_options(&mut command);
                 for define in defines {
                     command.arg(format!("/D{define}"));
@@ -514,9 +990,12 @@ impl CCompiler {
                 if self.clang {
                     command.args(extra_args);
                 }
-                command
-                    .args(sources)
-                    .arg(format!("/Fe{}", executable.display()));
+                command.args(&source_args);
+                if compile_only {
+                    command.arg(format!("/Fo{}", executable.display()));
+                } else {
+                    command.arg(format!("/Fe{}", executable.display()));
+                }
             }
         }
         command.current_dir(executable.parent().unwrap_or_else(|| Path::new(".")));
@@ -584,6 +1063,15 @@ impl CCompiler {
             paths.push(version.join("um").join(arch));
         }
         paths
+    }
+}
+
+fn tool_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
     }
 }
 
@@ -711,6 +1199,7 @@ mod tests {
                 runtime_source: None,
                 c_toolchain: CToolchainConfig::default(),
             },
+            profile: BuildProfile::Release,
         }
         .command(&[Path::new("input.c")], Path::new("output"), &[], true, &[])
         .get_args()

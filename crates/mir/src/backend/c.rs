@@ -27,6 +27,7 @@ pub struct CBackend {
     no_gc: bool,
     needs_c_string_bridge: bool,
     source_name: String,
+    package: Option<usize>,
 }
 
 impl CBackend {
@@ -51,6 +52,26 @@ impl CBackend {
     pub fn with_source_name(mut self, source_name: impl Into<String>) -> Self {
         self.source_name = source_name.into();
         self
+    }
+
+    #[must_use]
+    pub const fn for_package(mut self, package: usize) -> Self {
+        self.package = Some(package);
+        self
+    }
+
+    fn should_emit(&self, function: &Function) -> bool {
+        self.package.is_none_or(|package| {
+            function.package.is_none()
+                || function.package == Some(package)
+                || function.generic_instance
+        })
+    }
+
+    fn is_static(&self, function: &Function) -> bool {
+        self.package.is_some()
+            && !function.is_c_export
+            && (function.package.is_none() || function.generic_instance)
     }
 
     fn ensure(&mut self, v: Value) {
@@ -120,7 +141,11 @@ impl Backend for CBackend {
         Self::emit_type_declarations(module, &mut out);
         self.emit_function_declarations(module, &mut out)?;
         for &fid in &module.function_order {
-            self.compile_function(&module.functions[fid], &mut out)?;
+            let function = &module.functions[fid];
+            if !self.should_emit(function) {
+                continue;
+            }
+            self.compile_function(function, &mut out)?;
             writeln!(out).unwrap();
         }
         self.emit_runtime_main(module, &mut out)?;
@@ -323,9 +348,10 @@ impl CBackend {
                 .map(|(index, p)| c_function_param_decl(func, &p.ty, &format!("p{index}")))
                 .collect();
             let sname = self.c_function_name(&func.name)?;
+            let linkage = if self.is_static(func) { "static " } else { "" };
             writeln!(
                 out,
-                "{} {}({});",
+                "{linkage}{} {}({});",
                 ret,
                 sname,
                 if params.is_empty() {
@@ -388,7 +414,7 @@ impl CBackend {
                 .function_order
                 .iter()
                 .map(|fid| &module.functions[*fid])
-                .find(|function| function.name == "main")
+                .find(|function| function.name == "main" && self.should_emit(function))
         {
             if !main.params.is_empty() {
                 return Err("runtime-backed `main` cannot take parameters".into());
@@ -453,7 +479,8 @@ impl CBackend {
             .collect();
 
         let sname = self.c_function_name(&func.name)?;
-        write!(out, "{ret_ct} {sname} (").unwrap();
+        let linkage = if self.is_static(func) { "static " } else { "" };
+        write!(out, "{linkage}{ret_ct} {sname} (").unwrap();
         if param_strs.is_empty() {
             write!(out, "void").unwrap();
         } else {

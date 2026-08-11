@@ -1,6 +1,8 @@
 mod build;
 mod lock;
 mod manifest;
+mod model;
+mod package;
 mod proc_macro;
 mod project;
 mod target;
@@ -14,12 +16,599 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
+pub use build::BuildProfile;
 pub use manifest::CLUE_PROJECT_FILE_NAME;
 pub use project::{ProjectKind, init, new};
+
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+pub fn request_cancellation() {
+    CANCELLED.store(true, Ordering::Release);
+}
+
+pub(crate) fn cancellation_requested() -> bool {
+    CANCELLED.load(Ordering::Acquire)
+}
 pub use riddlec::target::TargetTriple;
 pub use workspace::Workspace;
+
+pub struct DependencyAddOptions {
+    pub name: String,
+    pub version: Option<String>,
+    pub path: Option<PathBuf>,
+    pub git: Option<String>,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
+    pub rev: Option<String>,
+    pub registry: Option<String>,
+    pub package: Option<String>,
+    pub features: Vec<String>,
+    pub default_features: bool,
+    pub optional: bool,
+    pub dev: bool,
+}
+
+pub struct InstallOptions {
+    pub package: Option<String>,
+    pub path: Option<PathBuf>,
+    pub git: Option<String>,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
+    pub rev: Option<String>,
+    pub version: Option<String>,
+    pub registry: Option<String>,
+    pub release: bool,
+    pub offline: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TargetSelection<'a> {
+    kind: model::TargetKind,
+    name: Option<&'a str>,
+    package: Option<&'a str>,
+    workspace: bool,
+}
+
+pub fn add_dependency(root: &Path, options: &DependencyAddOptions) -> anyhow::Result<()> {
+    package::add(
+        root,
+        &package::AddOptions {
+            name: &options.name,
+            version: options.version.as_deref(),
+            path: options.path.as_deref(),
+            git: options.git.as_deref(),
+            branch: options.branch.as_deref(),
+            tag: options.tag.as_deref(),
+            rev: options.rev.as_deref(),
+            registry: options.registry.as_deref(),
+            package: options.package.as_deref(),
+            features: &options.features,
+            default_features: options.default_features,
+            optional: options.optional,
+            dev: options.dev,
+        },
+    )
+}
+
+pub fn remove_dependency(root: &Path, name: &str, dev: bool) -> anyhow::Result<()> {
+    package::remove(root, name, dev)
+}
+
+pub fn fetch_packages(
+    root: &Path,
+    locked: bool,
+    offline: bool,
+    include_dev: bool,
+    features: &[String],
+) -> anyhow::Result<()> {
+    if let Some(workspace) = workspace::load_for_path(root)? {
+        let feature_package = workspace.member_for_path(root);
+        if !features.is_empty() && feature_package.is_none() {
+            bail!("--features from a workspace root requires selecting a member path");
+        }
+        package::prepare_workspace_target(
+            &workspace.root,
+            workspace.members(),
+            locked,
+            offline.then_some(true),
+            include_dev,
+            feature_package.as_deref(),
+            features,
+        )
+        .map(|_| ())
+    } else {
+        package::prepare(root, locked, offline.then_some(true), include_dev, features).map(|_| ())
+    }
+}
+
+pub fn update_packages(root: &Path, offline: bool) -> anyhow::Result<()> {
+    if let Some(workspace) = workspace::load_for_path(root)? {
+        package::update_workspace(
+            &workspace.root,
+            workspace.members(),
+            offline.then_some(true),
+        )
+        .map(|_| ())
+    } else {
+        package::update(root, offline.then_some(true)).map(|_| ())
+    }
+}
+
+pub fn dependency_tree(root: &Path) -> anyhow::Result<String> {
+    dependency_tree_with_features(root, false)
+}
+
+pub fn dependency_tree_with_features(root: &Path, show_features: bool) -> anyhow::Result<String> {
+    fetch_packages(root, false, false, false, &[])?;
+    package::tree(root, show_features)
+}
+
+pub fn package_metadata(root: &Path) -> anyhow::Result<String> {
+    fetch_packages(root, false, false, false, &[])?;
+    package::metadata(root)
+}
+
+pub fn package_archive(root: &Path) -> anyhow::Result<PathBuf> {
+    package::archive(root)
+}
+
+pub fn package_contents(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    package::package_list(root)
+}
+
+pub fn publish_package(root: &Path, registry: Option<&str>) -> anyhow::Result<PathBuf> {
+    package::publish(root, registry, false)
+}
+
+pub fn publish_package_dry_run(root: &Path, registry: Option<&str>) -> anyhow::Result<PathBuf> {
+    package::publish(root, registry, true)
+}
+
+pub fn install_package(root: &Path, options: &InstallOptions) -> anyhow::Result<PathBuf> {
+    if usize::from(options.package.is_some())
+        + usize::from(options.path.is_some())
+        + usize::from(options.git.is_some())
+        > 1
+    {
+        bail!("choose only one package name, --path, or --git");
+    }
+    if options.git.is_none()
+        && (options.branch.is_some() || options.tag.is_some() || options.rev.is_some())
+    {
+        bail!("--branch, --tag, and --rev require --git");
+    }
+    if usize::from(options.branch.is_some())
+        + usize::from(options.tag.is_some())
+        + usize::from(options.rev.is_some())
+        > 1
+    {
+        bail!("choose only one of --branch, --tag, or --rev");
+    }
+    if options.registry.is_some() && options.package.is_none() {
+        bail!("--registry requires a package name");
+    }
+    let profile = if options.release {
+        BuildProfile::Release
+    } else {
+        BuildProfile::Debug
+    };
+    let offline = options.offline.then_some(true);
+    if let Some(path) = &options.path {
+        return package::install_path(&root.join(path), profile, offline);
+    }
+    if let Some(git) = &options.git {
+        let reference = if let Some(branch) = &options.branch {
+            model::GitReference::Branch(branch.clone())
+        } else if let Some(tag) = &options.tag {
+            model::GitReference::Tag(tag.clone())
+        } else if let Some(rev) = &options.rev {
+            model::GitReference::Rev(rev.clone())
+        } else {
+            model::GitReference::DefaultBranch
+        };
+        return package::install_git(root, git, reference, profile, offline);
+    }
+    if let Some(package) = &options.package {
+        let (package, inline_version) = package
+            .rsplit_once('@')
+            .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+            .map_or((package.as_str(), None), |(name, version)| {
+                (name, Some(version))
+            });
+        if inline_version.is_some() && options.version.is_some() {
+            bail!("specify the install version either as `name@requirement` or --version");
+        }
+        return package::install_registry(
+            root,
+            package,
+            inline_version.or(options.version.as_deref()),
+            options.registry.as_deref(),
+            profile,
+            offline,
+        );
+    }
+    package::install_path(root, profile, offline)
+}
+
+pub fn uninstall_package(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    package::uninstall(root, name)
+}
+
+pub fn clean(root: &Path) -> anyhow::Result<()> {
+    if let Some(workspace) = workspace::load_for_path(root)? {
+        for member in workspace.members() {
+            package::clean(member)?;
+        }
+        return package::clean(&workspace.root);
+    }
+    package::clean(root)
+}
+
+pub fn test_targets(
+    root: &Path,
+    selected: Option<&str>,
+    no_run: bool,
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    test_targets_with_selection(root, selected, no_run, None, false, options)
+}
+
+pub fn test_targets_with_selection(
+    root: &Path,
+    selected: Option<&str>,
+    no_run: bool,
+    package: Option<&str>,
+    workspace: bool,
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    run_selected_manifest_targets(
+        root,
+        TargetSelection {
+            kind: model::TargetKind::Test,
+            name: selected,
+            package,
+            workspace,
+        },
+        &[],
+        no_run,
+        options,
+    )
+}
+
+pub fn bench_targets(
+    root: &Path,
+    selected: Option<&str>,
+    args: &[OsString],
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    bench_targets_with_selection(root, selected, args, None, false, options)
+}
+
+pub fn bench_targets_with_selection(
+    root: &Path,
+    selected: Option<&str>,
+    args: &[OsString],
+    package: Option<&str>,
+    workspace: bool,
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    run_selected_manifest_targets(
+        root,
+        TargetSelection {
+            kind: model::TargetKind::Bench,
+            name: selected,
+            package,
+            workspace,
+        },
+        args,
+        false,
+        options,
+    )
+}
+
+pub fn run_example(
+    root: &Path,
+    selected: Option<&str>,
+    args: &[OsString],
+    options: &CommandOptions,
+) -> anyhow::Result<ExitStatus> {
+    run_example_with_selection(root, selected, args, None, options)
+}
+
+pub fn run_example_with_selection(
+    root: &Path,
+    selected: Option<&str>,
+    args: &[OsString],
+    package: Option<&str>,
+    options: &CommandOptions,
+) -> anyhow::Result<ExitStatus> {
+    let statuses = run_selected_manifest_targets_collect(
+        root,
+        TargetSelection {
+            kind: model::TargetKind::Example,
+            name: selected,
+            package,
+            workspace: false,
+        },
+        args,
+        false,
+        options,
+    )?;
+    if statuses.len() != 1 {
+        bail!("choose one example with `--example <name>`");
+    }
+    statuses
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("example was not run"))
+}
+
+pub fn build_examples(
+    root: &Path,
+    selected: Option<&str>,
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    build_examples_with_selection(root, selected, None, false, options)
+}
+
+pub fn build_examples_with_selection(
+    root: &Path,
+    selected: Option<&str>,
+    package: Option<&str>,
+    workspace: bool,
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    run_selected_manifest_targets(
+        root,
+        TargetSelection {
+            kind: model::TargetKind::Example,
+            name: selected,
+            package,
+            workspace,
+        },
+        &[],
+        true,
+        options,
+    )
+}
+
+fn run_selected_manifest_targets(
+    root: &Path,
+    selection: TargetSelection<'_>,
+    args: &[OsString],
+    no_run: bool,
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    for status in run_selected_manifest_targets_collect(root, selection, args, no_run, options)? {
+        if status.is_some_and(|status| !status.success()) {
+            bail!("{} target failed", target_kind_name(selection.kind));
+        }
+    }
+    Ok(())
+}
+
+fn run_selected_manifest_targets_collect(
+    root: &Path,
+    selection: TargetSelection<'_>,
+    args: &[OsString],
+    no_run: bool,
+    options: &CommandOptions,
+) -> anyhow::Result<Vec<Option<ExitStatus>>> {
+    let packages = selected_target_packages(root, selection.package, selection.workspace)?;
+    let mut statuses = Vec::new();
+    for package in packages {
+        let manifest = manifest::read(&package, ProjectKind::Binary)?;
+        let targets = targets_for_kind(&manifest, selection.kind)?;
+        if targets.is_empty()
+            || selection
+                .name
+                .is_some_and(|name| !targets.iter().any(|target| target.name == name))
+        {
+            continue;
+        }
+        statuses.extend(run_manifest_targets_collect(
+            &package,
+            selection.kind,
+            selection.name,
+            args,
+            no_run,
+            options,
+        )?);
+    }
+    if statuses.is_empty() {
+        bail!(
+            "{} target `{}` was not found",
+            target_kind_name(selection.kind),
+            selection.name.unwrap_or("*")
+        );
+    }
+    Ok(statuses)
+}
+
+fn run_manifest_targets_collect(
+    root: &Path,
+    kind: model::TargetKind,
+    selected: Option<&str>,
+    args: &[OsString],
+    no_run: bool,
+    options: &CommandOptions,
+) -> anyhow::Result<Vec<Option<ExitStatus>>> {
+    let features = command_features(root, options)?;
+    if let Some(workspace) = workspace::load_for_path(root)? {
+        let member = workspace.member_for_path(root);
+        package::prepare_workspace_target(
+            &workspace.root,
+            workspace.members(),
+            options.locked,
+            options.offline.then_some(true),
+            true,
+            member.as_deref(),
+            &features,
+        )?;
+    } else {
+        package::prepare(
+            root,
+            options.locked,
+            options.offline.then_some(true),
+            true,
+            &features,
+        )?;
+    }
+    let manifest = manifest::read(root, ProjectKind::Binary)?;
+    let targets = targets_for_kind(&manifest, kind)?;
+    let targets = targets
+        .iter()
+        .filter(|target| selected.is_none_or(|selected| target.name == selected))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        bail!(
+            "{} target `{}` was not found",
+            target_kind_name(kind),
+            selected.unwrap_or("*")
+        );
+    }
+    let enabled_features =
+        project::enabled_features(&manifest, &features, options.no_default_features)?;
+    let mut statuses = Vec::new();
+    for target in targets {
+        let missing = target
+            .required_features
+            .iter()
+            .filter(|feature| !enabled_features.contains(*feature))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            if selected.is_some() {
+                bail!(
+                    "target `{}` requires features: {}",
+                    target.name,
+                    missing.join(", ")
+                );
+            }
+            continue;
+        }
+        let artifact = build::run_target_with_options(
+            root,
+            None,
+            options.profile,
+            &project::LoadOptions {
+                entry: Some(target.path.clone()),
+                target_name: Some(target.name.clone()),
+                features: features.clone(),
+                no_default_features: options.no_default_features,
+                include_dev: true,
+                ..project::LoadOptions::default()
+            },
+        )?;
+        let build::BuildArtifact::Executable {
+            path,
+            target: built,
+        } = artifact
+        else {
+            bail!(
+                "{} target did not produce an executable",
+                target_kind_name(kind)
+            );
+        };
+        if no_run {
+            statuses.push(None);
+            continue;
+        }
+        if built != TargetTriple::host().map_err(anyhow::Error::msg)? {
+            bail!("cannot run target `{built}` on this host");
+        }
+        let status = Command::new(&path).args(args).current_dir(root).status()?;
+        statuses.push(Some(status));
+    }
+    Ok(statuses)
+}
+
+fn targets_for_kind(
+    manifest: &manifest::Manifest,
+    kind: model::TargetKind,
+) -> anyhow::Result<&[model::Target]> {
+    match kind {
+        model::TargetKind::Test => Ok(&manifest.tests),
+        model::TargetKind::Example => Ok(&manifest.examples),
+        model::TargetKind::Bench => Ok(&manifest.benches),
+        _ => bail!("unsupported executable target kind"),
+    }
+}
+
+fn selected_target_packages(
+    path: &Path,
+    package: Option<&str>,
+    workspace_flag: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if workspace_flag && package.is_some() {
+        bail!("`--workspace` cannot be combined with `--package`");
+    }
+    let Some(workspace) = workspace::load_for_path(path)? else {
+        if package.is_some() || workspace_flag {
+            bail!("`--package` and `--workspace` require a workspace root");
+        }
+        return Ok(vec![path.to_path_buf()]);
+    };
+    if let Some(name) = package {
+        return workspace
+            .package_by_name(name)
+            .map(|package| vec![package.root.clone()])
+            .ok_or_else(|| anyhow::anyhow!("package `{name}` is not a workspace crate"));
+    }
+    if workspace_flag || workspace.member_for_path(path).is_none() {
+        Ok(workspace.ordered_members())
+    } else {
+        Ok(vec![
+            workspace
+                .member_for_path(path)
+                .expect("member path was checked"),
+        ])
+    }
+}
+
+const fn target_kind_name(kind: model::TargetKind) -> &'static str {
+    match kind {
+        model::TargetKind::Library => "library",
+        model::TargetKind::ProcMacro => "proc-macro",
+        model::TargetKind::Binary => "binary",
+        model::TargetKind::Test => "test",
+        model::TargetKind::Example => "example",
+        model::TargetKind::Bench => "bench",
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CommandOptions {
+    pub profile: BuildProfile,
+    pub bin: Option<String>,
+    pub locked: bool,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub all_targets: bool,
+    pub no_default_features: bool,
+    pub offline: bool,
+    pub jobs: Option<usize>,
+}
+
+impl Default for CommandOptions {
+    fn default() -> Self {
+        Self {
+            profile: BuildProfile::Debug,
+            bin: None,
+            locked: false,
+            features: Vec::new(),
+            all_features: false,
+            all_targets: false,
+            no_default_features: false,
+            offline: false,
+            jobs: None,
+        }
+    }
+}
 
 pub fn init_workspace(path: &Path) -> anyhow::Result<()> {
     workspace::init(path)
@@ -53,7 +642,11 @@ pub struct ProjectAnalysis {
     runtime_source: Option<PathBuf>,
     gc_enabled: bool,
     package_name: String,
+    target_name: Option<String>,
+    package_index: usize,
     manifest_fingerprint: String,
+    package_version: semver::Version,
+    library_types: Vec<model::LibraryType>,
 }
 
 #[derive(Default)]
@@ -502,6 +1095,7 @@ fn analyze_project_with_session_cancellable<S: BuildHasher>(
         return Ok(None);
     };
     result.macro_diagnostics = macro_analysis.diagnostics;
+    let package_index = package.package_ranges.len().saturating_sub(1);
     let analysis = ProjectAnalysis {
         entry: package.entry,
         source: package.source,
@@ -513,7 +1107,11 @@ fn analyze_project_with_session_cancellable<S: BuildHasher>(
         runtime_source: package.runtime_source,
         gc_enabled: package.gc_enabled,
         package_name: package.name,
+        target_name: package.target_name,
+        package_index,
         manifest_fingerprint: package.manifest_fingerprint,
+        package_version: package.version,
+        library_types: package.library_types,
     };
     session.cache_analysis(options, depth, analysis.clone());
     Ok(Some(analysis))
@@ -525,16 +1123,35 @@ fn analyze_project_impl<S: BuildHasher>(
     options: riddlec::pipeline::CompileOptions,
     build: bool,
 ) -> anyhow::Result<ProjectAnalysis> {
-    let mut package = project::load_with_overlays(path, overlays)?;
+    analyze_project_impl_with_load_options(
+        path,
+        overlays,
+        options,
+        build,
+        &project::LoadOptions::default(),
+    )
+}
+
+fn analyze_project_impl_with_load_options<S: BuildHasher>(
+    path: &Path,
+    overlays: &HashMap<PathBuf, String, S>,
+    options: riddlec::pipeline::CompileOptions,
+    build: bool,
+    load_options: &project::LoadOptions,
+) -> anyhow::Result<ProjectAnalysis> {
+    let mut package = project::load_with_overlays_and_options(path, overlays, load_options)?;
     let macro_analysis = expand_proc_macros(&mut package)?;
     let mut result = match (&package.macro_parse, build) {
-        (Some(parse), true) => riddlec::pipeline::compile_parsed_package_with_options_and_gc(
-            &package.source.source,
-            parse,
-            &package.package_ranges,
-            options,
-            package.gc_enabled,
-        ),
+        (Some(parse), true) => {
+            riddlec::pipeline::compile_parsed_package_with_options_and_gc_and_names(
+                &package.source.source,
+                parse,
+                &package.package_ranges,
+                &package.package_names,
+                options,
+                package.gc_enabled,
+            )
+        }
         (Some(parse), false) => riddlec::pipeline::check_parsed_package_with_options_and_gc(
             &package.source.source,
             parse,
@@ -542,9 +1159,10 @@ fn analyze_project_impl<S: BuildHasher>(
             options,
             package.gc_enabled,
         ),
-        (None, true) => riddlec::pipeline::compile_package_with_options_and_gc(
+        (None, true) => riddlec::pipeline::compile_package_with_options_and_gc_and_names(
             &package.source.source,
             &package.package_ranges,
+            &package.package_names,
             options,
             package.gc_enabled,
         ),
@@ -556,6 +1174,7 @@ fn analyze_project_impl<S: BuildHasher>(
         ),
     };
     result.macro_diagnostics = macro_analysis.diagnostics;
+    let package_index = package.package_ranges.len().saturating_sub(1);
     Ok(ProjectAnalysis {
         entry: package.entry,
         source: package.source,
@@ -567,7 +1186,11 @@ fn analyze_project_impl<S: BuildHasher>(
         runtime_source: package.runtime_source,
         gc_enabled: package.gc_enabled,
         package_name: package.name,
+        target_name: package.target_name,
+        package_index,
         manifest_fingerprint: package.manifest_fingerprint,
+        package_version: package.version,
+        library_types: package.library_types,
     })
 }
 
@@ -719,44 +1342,158 @@ pub fn check_for_target_with_selection(
     package: Option<&str>,
     workspace_flag: bool,
 ) -> anyhow::Result<()> {
-    if let Some((_, members)) = selected_workspace(path, package, workspace_flag)? {
-        for member in members {
-            let analysis = check_project_with_options(
-                &member,
-                &HashMap::new(),
-                riddlec::pipeline::CompileOptions::default(),
-            )?;
-            target::resolve(explicit_target, analysis.build_target.as_deref())?;
-            let errors = riddlec::diagnostics::report_mapped(
-                &analysis.result,
-                &analysis.source,
-                &analysis.entry.display().to_string(),
-            );
-            if errors > 0 || !analysis.result.success() {
-                bail!("check failed");
-            }
-            println!("clue: checked {}", member.display());
-        }
+    check_for_target_with_options(
+        path,
+        explicit_target,
+        package,
+        workspace_flag,
+        &CommandOptions::default(),
+    )
+}
+
+pub fn check_for_target_with_options(
+    path: &Path,
+    explicit_target: Option<TargetTriple>,
+    package: Option<&str>,
+    workspace_flag: bool,
+    command_options: &CommandOptions,
+) -> anyhow::Result<()> {
+    if let Some((workspace, members)) = selected_workspace(
+        path,
+        package,
+        workspace_flag,
+        command_options,
+        command_options.bin.as_deref(),
+    )? {
+        parallel_workspace_packages(&workspace, &members, command_options.jobs, |member| {
+            check_package(member, explicit_target, command_options)
+        })?;
         return Ok(());
     }
     if package.is_some() || workspace_flag {
         bail!("`--package` and `--workspace` require a workspace root");
     }
-    let analysis = check_project_with_options(
+    let features = command_features(path, command_options)?;
+    package::prepare(
         path,
-        &HashMap::new(),
-        riddlec::pipeline::CompileOptions::default(),
+        command_options.locked,
+        command_options.offline.then_some(true),
+        false,
+        &features,
     )?;
-    target::resolve(explicit_target, analysis.build_target.as_deref())?;
-    let errors = riddlec::diagnostics::report_mapped(
-        &analysis.result,
-        &analysis.source,
-        &analysis.entry.display().to_string(),
-    );
-    if errors > 0 || !analysis.result.success() {
-        bail!("check failed");
+    check_package(path, explicit_target, command_options)
+}
+
+fn check_package(
+    path: &Path,
+    explicit_target: Option<TargetTriple>,
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    let features = command_features(path, options)?;
+    for bin in command_bins(
+        path,
+        options.bin.as_deref(),
+        &features,
+        options.no_default_features,
+    )? {
+        let analysis = analyze_project_impl_with_load_options(
+            path,
+            &HashMap::new(),
+            riddlec::pipeline::CompileOptions::default(),
+            false,
+            &project::LoadOptions {
+                bin: bin.clone(),
+                features: features.clone(),
+                no_default_features: options.no_default_features,
+                require_bin: true,
+                ..project::LoadOptions::default()
+            },
+        )?;
+        target::resolve(explicit_target, analysis.build_target.as_deref())?;
+        let errors = riddlec::diagnostics::report_mapped(
+            &analysis.result,
+            &analysis.source,
+            &analysis.entry.display().to_string(),
+        );
+        if errors > 0 || !analysis.result.success() {
+            bail!("check failed");
+        }
+        println!("clue: checked {}", analysis.entry.display());
     }
-    println!("clue: checked {}", path.display());
+    if options.all_targets {
+        for kind in [
+            model::TargetKind::Test,
+            model::TargetKind::Example,
+            model::TargetKind::Bench,
+        ] {
+            check_manifest_targets(path, kind, options, &features)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_manifest_targets(
+    root: &Path,
+    kind: model::TargetKind,
+    options: &CommandOptions,
+    features: &[String],
+) -> anyhow::Result<()> {
+    let manifest = manifest::read(root, ProjectKind::Binary)?;
+    let enabled = project::enabled_features(&manifest, features, options.no_default_features)?;
+    let targets = targets_for_kind(&manifest, kind)?;
+    for target in targets {
+        if !target
+            .required_features
+            .iter()
+            .all(|feature| enabled.contains(feature))
+        {
+            continue;
+        }
+        if let Some(workspace) = workspace::load_for_path(root)? {
+            package::prepare_workspace_target(
+                &workspace.root,
+                workspace.members(),
+                options.locked,
+                options.offline.then_some(true),
+                true,
+                workspace.member_for_path(root).as_deref(),
+                features,
+            )?;
+        } else {
+            package::prepare(
+                root,
+                options.locked,
+                options.offline.then_some(true),
+                true,
+                features,
+            )?;
+        }
+        let analysis = analyze_project_impl_with_load_options(
+            root,
+            &HashMap::new(),
+            riddlec::pipeline::CompileOptions::default(),
+            false,
+            &project::LoadOptions {
+                entry: Some(target.path.clone()),
+                target_name: Some(target.name.clone()),
+                features: features.to_vec(),
+                no_default_features: options.no_default_features,
+                include_dev: true,
+                require_bin: false,
+                ..project::LoadOptions::default()
+            },
+        )?;
+        target::resolve(None, analysis.build_target.as_deref())?;
+        let errors = riddlec::diagnostics::report_mapped(
+            &analysis.result,
+            &analysis.source,
+            &analysis.entry.display().to_string(),
+        );
+        if errors > 0 || !analysis.result.success() {
+            bail!("{} target check failed", target_kind_name(kind));
+        }
+        println!("clue: checked {} {}", target_kind_name(kind), target.name);
+    }
     Ok(())
 }
 
@@ -784,16 +1521,131 @@ pub fn build_for_target_with_selection(
     package: Option<&str>,
     workspace_flag: bool,
 ) -> anyhow::Result<()> {
-    if let Some((_, members)) = selected_workspace(path, package, workspace_flag)? {
-        for member in members {
-            build::run(&member, explicit_target)?;
-        }
+    build_for_target_with_profile(
+        path,
+        explicit_target,
+        package,
+        workspace_flag,
+        BuildProfile::Debug,
+    )
+}
+
+pub fn build_for_target_with_options(
+    path: &Path,
+    explicit_target: Option<TargetTriple>,
+    package: Option<&str>,
+    workspace_flag: bool,
+    command_options: &CommandOptions,
+) -> anyhow::Result<()> {
+    if let Some((workspace, members)) = selected_workspace(
+        path,
+        package,
+        workspace_flag,
+        command_options,
+        command_options.bin.as_deref(),
+    )? {
+        parallel_workspace_packages(&workspace, &members, command_options.jobs, |member| {
+            build_package(member, explicit_target, command_options)
+        })?;
         return Ok(());
     }
     if package.is_some() || workspace_flag {
         bail!("`--package` and `--workspace` require a workspace root");
     }
-    build::run(path, explicit_target).map(|_| ())
+    let features = command_features(path, command_options)?;
+    package::prepare(
+        path,
+        command_options.locked,
+        command_options.offline.then_some(true),
+        false,
+        &features,
+    )?;
+    build_package(path, explicit_target, command_options)
+}
+
+fn build_package(
+    path: &Path,
+    explicit_target: Option<TargetTriple>,
+    options: &CommandOptions,
+) -> anyhow::Result<()> {
+    let features = command_features(path, options)?;
+    for bin in command_bins(
+        path,
+        options.bin.as_deref(),
+        &features,
+        options.no_default_features,
+    )? {
+        build::run_with_options(
+            path,
+            explicit_target,
+            options.profile,
+            bin.as_deref(),
+            &features,
+            options.no_default_features,
+        )?;
+    }
+    if options.all_targets {
+        for kind in [
+            model::TargetKind::Test,
+            model::TargetKind::Example,
+            model::TargetKind::Bench,
+        ] {
+            run_manifest_targets_collect(path, kind, None, &[], true, options)?;
+        }
+    }
+    Ok(())
+}
+
+fn command_bins(
+    path: &Path,
+    selected: Option<&str>,
+    features: &[String],
+    no_default_features: bool,
+) -> anyhow::Result<Vec<Option<String>>> {
+    if let Some(selected) = selected {
+        return Ok(vec![Some(selected.to_owned())]);
+    }
+    let manifest = manifest::read(path, ProjectKind::Binary)?;
+    if manifest.kind == ProjectKind::Binary && !manifest.binaries.is_empty() {
+        let enabled = project::enabled_features(&manifest, features, no_default_features)?;
+        let binaries = manifest
+            .binaries
+            .iter()
+            .filter(|target| {
+                target
+                    .required_features
+                    .iter()
+                    .all(|feature| enabled.contains(feature))
+            })
+            .map(|target| Some(target.name.clone()))
+            .collect::<Vec<_>>();
+        if manifest.binaries.len() > 1 || binaries.len() != manifest.binaries.len() {
+            return Ok(binaries);
+        }
+    }
+    Ok(vec![None])
+}
+
+fn command_features(root: &Path, options: &CommandOptions) -> anyhow::Result<Vec<String>> {
+    if !options.all_features {
+        return Ok(options.features.clone());
+    }
+    let manifest = manifest::read(root, ProjectKind::Binary)?;
+    Ok(manifest.features.keys().cloned().collect())
+}
+
+pub fn build_for_target_with_profile(
+    path: &Path,
+    explicit_target: Option<TargetTriple>,
+    package: Option<&str>,
+    workspace_flag: bool,
+    profile: BuildProfile,
+) -> anyhow::Result<()> {
+    let options = CommandOptions {
+        profile,
+        ..CommandOptions::default()
+    };
+    build_for_target_with_options(path, explicit_target, package, workspace_flag, &options)
 }
 
 /// Builds and runs a package for the host target.
@@ -825,24 +1677,65 @@ pub fn run_for_target_with_selection(
     package: Option<&str>,
     workspace_flag: bool,
 ) -> anyhow::Result<ExitStatus> {
-    if let Some((_, members)) = selected_workspace(path, package, workspace_flag)? {
+    run_for_target_with_options(
+        path,
+        args,
+        explicit_target,
+        package,
+        workspace_flag,
+        &CommandOptions::default(),
+    )
+}
+
+pub fn run_for_target_with_options(
+    path: &Path,
+    args: &[OsString],
+    explicit_target: Option<TargetTriple>,
+    package: Option<&str>,
+    workspace_flag: bool,
+    command_options: &CommandOptions,
+) -> anyhow::Result<ExitStatus> {
+    if let Some((_, members)) = selected_workspace(
+        path,
+        package,
+        workspace_flag,
+        command_options,
+        command_options.bin.as_deref(),
+    )? {
         if members.len() != 1 {
             bail!("workspace run requires `--package` when multiple crates are selected");
         }
-        return run_package(&members[0], args, explicit_target);
+        return run_package(&members[0], args, explicit_target, command_options);
     }
     if package.is_some() || workspace_flag {
         bail!("`--package` and `--workspace` require a workspace root");
     }
-    run_package(path, args, explicit_target)
+    let features = command_features(path, command_options)?;
+    package::prepare(
+        path,
+        command_options.locked,
+        command_options.offline.then_some(true),
+        false,
+        &features,
+    )?;
+    run_package(path, args, explicit_target, command_options)
 }
 
 fn run_package(
     path: &Path,
     args: &[OsString],
     explicit_target: Option<TargetTriple>,
+    options: &CommandOptions,
 ) -> anyhow::Result<ExitStatus> {
-    let artifact = build::run(path, explicit_target)?;
+    let features = command_features(path, options)?;
+    let artifact = build::run_with_options(
+        path,
+        explicit_target,
+        options.profile,
+        options.bin.as_deref(),
+        &features,
+        options.no_default_features,
+    )?;
     let build::BuildArtifact::Executable {
         path: executable,
         target,
@@ -867,6 +1760,8 @@ fn selected_workspace(
     path: &Path,
     package: Option<&str>,
     workspace_flag: bool,
+    options: &CommandOptions,
+    bin: Option<&str>,
 ) -> anyhow::Result<Option<(Workspace, Vec<PathBuf>)>> {
     if workspace_flag && package.is_some() {
         bail!("`--workspace` cannot be combined with `--package`");
@@ -874,8 +1769,7 @@ fn selected_workspace(
     let Some(workspace) = workspace::load_for_path(path)? else {
         return Ok(None);
     };
-    workspace.ensure_lock()?;
-    let selected = if let Some(name) = package {
+    let mut selected = if let Some(name) = package {
         let package = workspace
             .package_by_name(name)
             .ok_or_else(|| anyhow::anyhow!("package `{name}` is not a workspace crate"))?;
@@ -889,6 +1783,23 @@ fn selected_workspace(
                 .expect("member path was checked"),
         ]
     };
+    if let Some(bin) = bin
+        && package.is_none()
+        && (workspace_flag || workspace.member_for_path(path).is_none())
+    {
+        selected.retain(|member| {
+            workspace.package(member).is_some_and(|package| {
+                package
+                    .manifest
+                    .binaries
+                    .iter()
+                    .any(|target| target.name == bin)
+            })
+        });
+        if selected.is_empty() {
+            bail!("binary target `{bin}` was not found in the selected workspace");
+        }
+    }
     if selected.is_empty() {
         bail!("workspace has no registered crates");
     }
@@ -896,6 +1807,88 @@ fn selected_workspace(
         .ordered_members()
         .into_iter()
         .filter(|member| selected.contains(member))
-        .collect();
+        .collect::<Vec<_>>();
+    let selections = ordered
+        .iter()
+        .map(|member| Ok((member.clone(), command_features(member, options)?)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    package::prepare_workspace_targets(
+        &workspace.root,
+        workspace.members(),
+        options.locked,
+        options.offline.then_some(true),
+        false,
+        &selections,
+    )?;
     Ok(Some((workspace, ordered)))
+}
+
+fn parallel_packages<F>(
+    members: &[PathBuf],
+    jobs: Option<usize>,
+    operation: F,
+) -> anyhow::Result<()>
+where
+    F: Fn(&Path) -> anyhow::Result<()> + Sync,
+{
+    if cancellation_requested() {
+        bail!("operation cancelled");
+    }
+    let jobs = jobs
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
+        .max(1)
+        .min(members.len().max(1));
+    if jobs == 1 {
+        for member in members {
+            operation(member)?;
+        }
+        return Ok(());
+    }
+    let errors = std::sync::Mutex::new(Vec::new());
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for worker in 0..jobs {
+            let errors = &errors;
+            let cancelled = &cancelled;
+            let operation = &operation;
+            scope.spawn(move || {
+                for member in members.iter().skip(worker).step_by(jobs) {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire)
+                        || cancellation_requested()
+                    {
+                        break;
+                    }
+                    if let Err(error) = operation(member) {
+                        errors.lock().expect("error mutex poisoned").push(error);
+                        cancelled.store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    if cancellation_requested() {
+        bail!("operation cancelled");
+    }
+    let mut errors = errors.into_inner().expect("error mutex poisoned");
+    errors.pop().map_or(Ok(()), Err)
+}
+
+fn parallel_workspace_packages<F>(
+    workspace: &Workspace,
+    members: &[PathBuf],
+    jobs: Option<usize>,
+    operation: F,
+) -> anyhow::Result<()>
+where
+    F: Fn(&Path) -> anyhow::Result<()> + Sync,
+{
+    let jobs = match jobs {
+        Some(jobs) => Some(jobs),
+        None => Some(package::configured_jobs(&workspace.root)?),
+    };
+    for batch in workspace.ordered_batches(members) {
+        parallel_packages(&batch, jobs, &operation)?;
+    }
+    Ok(())
 }

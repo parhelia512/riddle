@@ -1,9 +1,14 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use clue::TargetTriple;
+use sha2::{Digest, Sha256};
 
 fn temp_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -20,6 +25,27 @@ fn clue(args: &[&str], root: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clue"))
         .args(args)
         .current_dir(root)
+        .env_remove("RIDDLE_TARGET")
+        .output()
+        .unwrap()
+}
+
+fn clue_with_home(args: &[&str], root: &Path, home: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_clue"))
+        .args(args)
+        .current_dir(root)
+        .env("CLUE_HOME", home)
+        .env_remove("RIDDLE_TARGET")
+        .output()
+        .unwrap()
+}
+
+fn clue_with_registry(args: &[&str], root: &Path, home: &Path, index: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_clue"))
+        .args(args)
+        .current_dir(root)
+        .env("CLUE_HOME", home)
+        .env("CLUE_REGISTRY_INDEX", index)
         .env_remove("RIDDLE_TARGET")
         .output()
         .unwrap()
@@ -98,12 +124,12 @@ path = "src/lib.rid"
     .unwrap();
     fs::write(
         root.join("app/src/main.rid"),
-        "fun main() -> i32 { math::value() }\n",
+        "fun main() -> i32 { math::identity(math::value()) }\n",
     )
     .unwrap();
     fs::write(
         root.join("math/src/lib.rid"),
-        "pub fun value() -> i32 { 1 }\n",
+        "pub fun value() -> i32 { 0 }\npub fun identity<T>(value: T) -> T { value }\n",
     )
     .unwrap();
 }
@@ -3995,7 +4021,7 @@ fn workspace_builds_registered_crates_in_dependency_order() {
     let root = temp_root("workspace-build");
     write_workspace_fixture(&root);
 
-    let output = clue(&["build"], &root);
+    let output = clue(&["-j", "1", "build"], &root);
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -4004,7 +4030,92 @@ fn workspace_builds_registered_crates_in_dependency_order() {
     );
     assert!(root.join("math/.clue/build/math.c").is_file());
     assert!(root.join("app/.clue/build/app.c").is_file());
+    assert!(root.join("math/.clue/build/math.rlib").is_file());
+    let app_c = fs::read_to_string(root.join("app/.clue/build/app.c")).unwrap();
+    let math_c = fs::read_to_string(root.join("math/.clue/build/math.c")).unwrap();
+    let declaration = "int32_t riddle_f_7061636b6167653a3a6d6174683a3a76616c7565(void);";
+    let definition = "int32_t riddle_f_7061636b6167653a3a6d6174683a3a76616c7565 (void) {";
+    assert!(app_c.contains(declaration));
+    assert!(
+        !app_c.contains(definition),
+        "dependency was redefined in app C"
+    );
+    assert!(math_c.contains(definition), "library C should define value");
+    let run = clue(&["run", "--package", "app"], &root);
+    assert!(
+        run.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert!(root.join("Clue.lock").is_file());
+    let output = clue(&["-j", "2", "build"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn nested_library_dependencies_are_linked_transitively() {
+    if c_compiler().is_none() {
+        eprintln!("skipping nested library link test: no C compiler found");
+        return;
+    }
+    let root = temp_root("nested-library-link");
+    for package in ["app", "middle", "base"] {
+        fs::create_dir_all(root.join(package).join("src")).unwrap();
+    }
+    fs::write(
+        root.join("app/Clue.toml"),
+        "[package]\nname = \"app\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[dependencies]\nmiddle = { path = \"../middle\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        "fun main() -> i32 { middle::value() }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("middle/Clue.toml"),
+        "[package]\nname = \"middle\"\n\n[lib]\npath = \"src/lib.rid\"\n\n[dependencies]\nbase = { path = \"../base\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("middle/src/lib.rid"),
+        "pub fun value() -> i32 { base::value() }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("base/Clue.toml"),
+        "[package]\nname = \"base\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("base/src/lib.rid"),
+        "pub fun value() -> i32 { 0 }\n",
+    )
+    .unwrap();
+
+    let output = clue(&["build", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("middle/.clue/build/middle.rlib").is_file());
+    assert!(root.join("base/.clue/build/base.rlib").is_file());
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -4024,5 +4135,935 @@ fn new_workspace_creates_a_virtual_manifest() {
         fs::read_to_string(root.join("workspace/Clue.toml")).unwrap(),
         "[workspace]\ncrates = []\n"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn library_dependency_must_declare_a_library_target() {
+    let root = temp_root("library-target");
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::create_dir_all(root.join("dep/src")).unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        "[package]\nname = \"app\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+    )
+    .unwrap();
+    fs::write(root.join("app/src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(
+        root.join("dep/Clue.toml"),
+        "[package]\nname = \"dep\"\n\n[[bin]]\npath = \"src/main.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("dep/src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+
+    let output = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("must declare a `[lib]` target"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn dependency_selects_library_when_package_has_both_targets() {
+    let root = temp_root("library-and-binary");
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::create_dir_all(root.join("dep/src")).unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        "[package]\nname = \"app\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        "fun main() -> i32 { dep::value() }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("dep/Clue.toml"),
+        "[package]\nname = \"dep\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("dep/src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(
+        root.join("dep/src/lib.rid"),
+        "pub fun value() -> i32 { 0 }\n",
+    )
+    .unwrap();
+
+    let output = clue(&["check", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn local_dependency_version_must_match() {
+    let root = temp_root("dependency-version");
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::create_dir_all(root.join("dep/src")).unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        "[package]\nname = \"app\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[dependencies]\ndep = { path = \"../dep\", version = \"1.0.0\" }\n",
+    )
+    .unwrap();
+    fs::write(root.join("app/src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(
+        root.join("dep/Clue.toml"),
+        "[package]\nname = \"dep\"\nversion = \"2.0.0\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("dep/src/lib.rid"),
+        "pub fun value() -> i32 { 0 }\n",
+    )
+    .unwrap();
+
+    let output = clue(&["check", "app"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("requires version `1.0.0`"), "{stderr}");
+    assert!(!root.join("app/Clue.lock").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn multiple_binary_targets_can_be_selected() {
+    let root = temp_root("multiple-bins");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"multiple-bins\"\n\n[[bin]]\npath = \"src/one.rid\"\n\n[[bin]]\nname = \"two\"\npath = \"src/two.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/one.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(root.join("src/two.rid"), "fun main() -> i32 { 7 }\n").unwrap();
+
+    let output = clue(&["check"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for name in ["one", "two"] {
+        assert!(stdout.contains(&format!("{name}.rid")), "{stdout}");
+    }
+
+    let output = clue(&["run"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("multiple binary targets"), "{stderr}");
+
+    for name in ["one", "two"] {
+        let output = clue(&["check", "--bin", name], &root);
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = clue(&["check", "--bin", "missing"], &root);
+    assert!(!output.status.success());
+
+    if let Some(cc) = c_compiler() {
+        let output = clue_with_cc(&["build"], &root, Path::new(&cc));
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for name in ["one", "two"] {
+            assert!(root.join(".clue/build").join(format!("{name}.c")).is_file());
+        }
+        let output = clue_with_cc(&["run", "--bin", "two"], &root, Path::new(&cc));
+        assert_eq!(output.status.code(), Some(7));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn duplicate_binary_target_names_are_rejected() {
+    let root = temp_root("duplicate-bins");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"duplicate-bins\"\n\n[[bin]]\nname = \"same\"\npath = \"src/one.rid\"\n\n[[bin]]\nname = \"same\"\npath = \"src/two.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/one.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(root.join("src/two.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+
+    let output = clue(&["check", "--bin", "same"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("duplicate binary target name"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn optional_dependency_is_loaded_only_when_feature_is_enabled() {
+    let root = temp_root("optional-feature");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("missing/src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"optional-feature\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[features]\nextra = [\"dep:missing\"]\n\n[dependencies]\nmissing = { path = \"missing\", optional = true }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(
+        root.join("missing/Clue.toml"),
+        "[package]\nname = \"missing\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("missing/src/lib.rid"), "not valid riddle\n").unwrap();
+
+    let output = clue(&["check"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = clue(&["check", "--features", "extra"], &root);
+    assert!(!output.status.success());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn locked_workspace_rejects_changed_package_contents() {
+    let root = temp_root("locked-source-hash");
+    write_workspace_fixture(&root);
+
+    let output = clue(&["check"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(
+        root.join("math/src/lib.rid"),
+        "pub fun value() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    let output = clue(&["check", "--locked"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("out of date"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn locked_standalone_package_rejects_changed_contents() {
+    let root = temp_root("standalone-locked-source-hash");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"standalone\"\nversion = \"0.1.0\"\n\n[[bin]]\npath = \"src/main.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+
+    let output = clue(&["check"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lock = fs::read_to_string(root.join("Clue.lock")).unwrap();
+    assert!(lock.contains("path = \".\""), "{lock}");
+    assert!(lock.contains("source_hash"), "{lock}");
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 1 }\n").unwrap();
+    let output = clue(&["check", "--locked"], &root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("out of date"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn release_build_uses_an_isolated_profile_directory() {
+    let Some(cc) = c_compiler() else {
+        eprintln!("skipping release profile test: no C compiler found");
+        return;
+    };
+    let root = temp_root("release-profile");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"release-profile\"\n\n[[bin]]\npath = \"src/main.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+
+    let output = clue_with_cc(&["build", "--release"], &root, Path::new(&cc));
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let host = TargetTriple::host().unwrap();
+    assert!(
+        root.join(".clue/build")
+            .join(host.as_str())
+            .join("release/release-profile.c")
+            .is_file()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn package_commands_manage_manifest_and_archive() {
+    let root = temp_root("package-commands");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("dep/src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"package-commands\"\nversion = \"0.1.0\"\nlicense = \"MIT\"\npublish = [\"default\"]\n\n[[bin]]\npath = \"src/main.rid\"\n\n[features]\ndefault = []\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(
+        root.join("dep/Clue.toml"),
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("dep/src/lib.rid"),
+        "pub fun value() -> i32 { 1 }\n",
+    )
+    .unwrap();
+
+    let output = clue(&["add", "dep", "--path", "dep"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = fs::read_to_string(root.join("Clue.toml")).unwrap();
+    assert!(manifest.contains("dep = { path = \"dep\" }"), "{manifest}");
+
+    let output = clue(&["tree"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("dep 0.1.0"));
+    let output = clue(&["tree", "-e", "features"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[features: default]"));
+    let output = clue(&["metadata"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("source_hash"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"MIT\""));
+
+    let output = clue(&["package", "--list"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Clue.toml"));
+
+    let output = clue(&["package"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        root.join(".clue/package/package-commands-0.1.0.cluepkg")
+            .is_file()
+    );
+
+    let output = clue(&["publish", "--dry-run"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("publish dry run"));
+
+    let output = clue(&["remove", "dep"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fs::read_to_string(root.join("Clue.toml"))
+            .unwrap()
+            .contains("dep =")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn library_build_emits_reusable_artifacts() {
+    let Some(cc) = c_compiler() else {
+        eprintln!("skipping library artifact test: no C compiler found");
+        return;
+    };
+    let root = temp_root("library-artifacts");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"library-artifacts\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/lib.rid\"\ncrate-type = [\"riddlelib\", \"staticlib\", \"cdylib\"]\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rid"), "pub fun value() -> i32 { 1 }\n").unwrap();
+    let output = clue_with_cc(&["build"], &root, Path::new(&cc));
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let build = root.join(".clue/build");
+    assert!(build.join("library-artifacts.rmeta").is_file());
+    assert!(
+        build
+            .join(if cfg!(windows) {
+                "library-artifacts.obj"
+            } else {
+                "library-artifacts.o"
+            })
+            .is_file()
+    );
+    assert!(build.join("library-artifacts.rlib").is_file());
+    assert!(
+        build
+            .join(if cfg!(windows) {
+                "library-artifacts.lib"
+            } else {
+                "liblibrary-artifacts.a"
+            })
+            .is_file()
+    );
+    assert!(
+        build
+            .join(if cfg!(windows) {
+                "library-artifacts.dll"
+            } else if cfg!(target_os = "macos") {
+                "liblibrary-artifacts.dylib"
+            } else {
+                "liblibrary-artifacts.so"
+            })
+            .is_file()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn local_install_and_uninstall_use_clue_home_bin() {
+    let Some(_) = c_compiler() else {
+        eprintln!("skipping install test: no C compiler found");
+        return;
+    };
+    let root = temp_root("install");
+    let home = root.join("home");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"installed-tool\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    let output = clue_with_home(&["install", "--path", "."], &root, &home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let executable = home
+        .join("bin/installed-tool")
+        .with_extension(std::env::consts::EXE_EXTENSION);
+    assert!(executable.is_file());
+    let output = clue_with_home(&["uninstall", "installed-tool"], &root, &home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!executable.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn registry_install_accepts_name_at_semver_requirement() {
+    let Some(_) = c_compiler() else {
+        eprintln!("skipping registry install test: no C compiler found");
+        return;
+    };
+    let root = temp_root("registry-install");
+    let package = root.join("calculator");
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::write(
+        package.join("Clue.toml"),
+        "[package]\nname = \"calculator\"\nversion = \"1.2.0\"\n\n[[bin]]\npath = \"src/main.rid\"\n",
+    )
+    .unwrap();
+    fs::write(package.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    let output = clue(&["package"], &package);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = fs::read(package.join(".clue/package/calculator-1.2.0.cluepkg")).unwrap();
+    let checksum = format!("{:x}", Sha256::digest(&archive));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let index_url = format!("{base}/index");
+    let index = format!(
+        "{{\"name\":\"calculator\",\"vers\":\"1.2.0\",\"deps\":[],\"features\":{{}},\"cksum\":\"{checksum}\",\"yanked\":false,\"archive\":\"{base}/calculator.cluepkg\"}}\n"
+    )
+    .into_bytes();
+    let server = thread::spawn(move || {
+        let mut responses = std::collections::BTreeMap::from([
+            ("/index/ca/lc/calculator".to_owned(), index),
+            ("/calculator.cluepkg".to_owned(), archive),
+        ]);
+        while !responses.is_empty() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap();
+            let body = responses
+                .remove(path)
+                .unwrap_or_else(|| panic!("unexpected path {path}"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+
+    let home = root.join("clue-home");
+    let output = clue_with_registry(&["install", "calculator@^1"], &root, &home, &index_url);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    assert!(
+        home.join("bin/calculator")
+            .with_extension(std::env::consts::EXE_EXTENSION)
+            .is_file()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn automatic_example_test_and_bench_targets_are_buildable() {
+    let Some(cc) = c_compiler() else {
+        eprintln!("skipping automatic target test: no C compiler found");
+        return;
+    };
+    let root = temp_root("automatic-targets");
+    for directory in ["src/bin", "examples", "tests", "benches", "devdep/src"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"automatic-targets\"\nversion = \"0.1.0\"\n\n[dev-dependencies]\ndevdep = { path = \"devdep\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("devdep/Clue.toml"),
+        "[package]\nname = \"devdep\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("devdep/src/lib.rid"),
+        "pub fun value() -> i32 { 0 }\n",
+    )
+    .unwrap();
+    for (path, value) in [
+        ("src/main.rid", "fun main() -> i32 { 0 }\n"),
+        ("src/bin/tool.rid", "fun main() -> i32 { 0 }\n"),
+        ("examples/demo.rid", "fun main() -> i32 { 0 }\n"),
+        ("tests/smoke.rid", "fun main() -> i32 { devdep::value() }\n"),
+        ("benches/speed.rid", "fun main() -> i32 { 0 }\n"),
+    ] {
+        fs::write(root.join(path), value).unwrap();
+    }
+    let output = clue_with_cc(&["check"], &root, Path::new(&cc));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = clue_with_cc(&["build", "--example", "demo"], &root, Path::new(&cc));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = clue_with_cc(&["test", "--no-run"], &root, Path::new(&cc));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = clue_with_cc(&["bench"], &root, Path::new(&cc));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn git_lock_keeps_revision_until_update() {
+    let root = temp_root("git-lock");
+    let clue_home = root.join("clue-home");
+    let repo = root.join("git-dep");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(
+        repo.join("Clue.toml"),
+        "[package]\nname = \"git-dep\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(repo.join("src/lib.rid"), "pub fun value() -> i32 { 1 }\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.name=Clue",
+        "-c",
+        "user.email=clue@example.invalid",
+        "add",
+        ".",
+    ]);
+    git(&[
+        "-c",
+        "user.name=Clue",
+        "-c",
+        "user.email=clue@example.invalid",
+        "commit",
+        "-qm",
+        "one",
+    ]);
+    let revision_one = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        "fun main() -> i32 { git_dep::value() }\n",
+    )
+    .unwrap();
+    let repo_url = repo.to_string_lossy().replace('\\', "/");
+    fs::write(root.join("app/Clue.toml"), format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[dependencies]\ngit_dep = {{ package = \"git-dep\", git = \"{repo_url}\" }}\n")).unwrap();
+    let output = clue_with_home(&["check", "app"], &root, &clue_home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first_lock = fs::read_to_string(root.join("app/Clue.lock")).unwrap();
+    assert!(first_lock.contains(revision_one.trim()), "{first_lock}");
+    fs::write(repo.join("src/lib.rid"), "pub fun value() -> i32 { 2 }\n").unwrap();
+    git(&[
+        "-c",
+        "user.name=Clue",
+        "-c",
+        "user.email=clue@example.invalid",
+        "add",
+        ".",
+    ]);
+    git(&[
+        "-c",
+        "user.name=Clue",
+        "-c",
+        "user.email=clue@example.invalid",
+        "commit",
+        "-qm",
+        "two",
+    ]);
+    let output = clue_with_home(&["check", "app"], &root, &clue_home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("app/Clue.lock")).unwrap(),
+        first_lock
+    );
+    let output = clue_with_home(&["update", "app"], &root, &clue_home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(
+        fs::read_to_string(root.join("app/Clue.lock")).unwrap(),
+        first_lock
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn registry_dependency_is_verified_cached_and_available_offline() {
+    let root = temp_root("registry-cache");
+    let package = root.join("regdep");
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::write(
+        package.join("Clue.toml"),
+        "[package]\nname = \"regdep\"\nversion = \"1.2.0\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(
+        package.join("src/lib.rid"),
+        "pub fun value() -> i32 { 0 }\n",
+    )
+    .unwrap();
+    let output = clue(&["package"], &package);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = fs::read(package.join(".clue/package/regdep-1.2.0.cluepkg")).unwrap();
+    let checksum = format!("{:x}", Sha256::digest(&archive));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let index_url = format!("{base}/index");
+    let index = format!(
+        "{{\"name\":\"regdep\",\"vers\":\"1.2.0\",\"deps\":[],\"features\":{{}},\"cksum\":\"{checksum}\",\"yanked\":false,\"archive\":\"{base}/regdep.cluepkg\"}}\n"
+    )
+    .into_bytes();
+    let server = thread::spawn(move || {
+        let mut responses = std::collections::BTreeMap::from([
+            ("/index/re/gd/regdep".to_owned(), index),
+            ("/regdep.cluepkg".to_owned(), archive),
+        ]);
+        while !responses.is_empty() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap();
+            let body = responses
+                .remove(path)
+                .unwrap_or_else(|| panic!("unexpected path {path}"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[dependencies]\nregdep = \"^1\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/src/main.rid"),
+        "fun main() -> i32 { regdep::value() }\n",
+    )
+    .unwrap();
+    let home = root.join("clue-home");
+    let output = clue_with_registry(&["fetch", "app"], &root, &home, &index_url);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let lock = fs::read_to_string(root.join("app/Clue.lock")).unwrap();
+    assert!(lock.contains(&checksum), "{lock}");
+    let output = clue_with_registry(&["--offline", "check", "app"], &root, &home, &index_url);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn concurrent_builds_leave_a_complete_executable() {
+    let Some(cc) = c_compiler() else {
+        eprintln!("skipping concurrent build test: no C compiler found");
+        return;
+    };
+    let root = temp_root("concurrent-build");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"concurrent-build\"\n\n[[bin]]\npath = \"src/main.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_clue"))
+            .arg("build")
+            .current_dir(&root)
+            .env("CC", &cc)
+            .env_remove("RIDDLE_TARGET")
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn();
+    let mut second = spawn();
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+    let executable = root
+        .join(".clue/build/concurrent-build")
+        .with_extension(std::env::consts::EXE_EXTENSION);
+    assert!(Command::new(executable).status().unwrap().success());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn features_forward_to_dependencies_and_all_features_enable_optional_dependencies() {
+    let root = temp_root("forwarded-features");
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::create_dir_all(root.join("middle/src")).unwrap();
+    fs::create_dir_all(root.join("leaf/src")).unwrap();
+    fs::write(
+        root.join("app/Clue.toml"),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+
+[[bin]]
+path = "src/main.rid"
+
+[features]
+forward = ["dep:middle", "middle/use-leaf"]
+conditional = ["middle?/use-leaf"]
+
+[dependencies]
+middle = { path = "../middle", optional = true }
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("app/src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(
+        root.join("middle/Clue.toml"),
+        r#"[package]
+name = "middle"
+version = "0.1.0"
+
+[lib]
+path = "src/lib.rid"
+
+[features]
+use-leaf = ["dep:leaf"]
+
+[dependencies]
+leaf = { path = "../leaf", optional = true }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("middle/src/lib.rid"),
+        "pub fun value() -> i32 { leaf::value() }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("leaf/Clue.toml"),
+        "[package]\nname = \"leaf\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/lib.rid\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("leaf/src/lib.rid"),
+        "pub fun value() -> i32 { 1 }\n",
+    )
+    .unwrap();
+
+    for args in [
+        ["check", "app", "--features", "forward"].as_slice(),
+        ["check", "app", "--features", "middle,conditional"].as_slice(),
+        ["check", "app", "--all-features"].as_slice(),
+    ] {
+        let output = clue(args, &root);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn check_all_targets_checks_automatic_test_targets() {
+    let root = temp_root("check-all-targets");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"check-all-targets\"\nversion = \"0.1.0\"\n\n[[bin]]\npath = \"src/main.rid\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    fs::write(
+        root.join("tests/failing.rid"),
+        "fun main() -> i32 { missing }\n",
+    )
+    .unwrap();
+
+    assert!(clue(&["check"], &root).status.success());
+    let output = clue(&["check", "--all-targets"], &root);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("check failed"));
     let _ = fs::remove_dir_all(root);
 }

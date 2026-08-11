@@ -1018,6 +1018,22 @@ pub fn generate_c_with_gc_and_source(
     backend.compile(module)
 }
 
+pub fn generate_c_for_package_with_gc_and_source(
+    module: &Module,
+    package: usize,
+    gc_enabled: bool,
+    source_name: &str,
+) -> Result<String, String> {
+    let mut backend = if gc_enabled {
+        CBackend::new()
+    } else {
+        CBackend::without_gc()
+    }
+    .with_source_name(source_name)
+    .for_package(package);
+    backend.compile(module)
+}
+
 /// Run the full frontend pipeline on `source`.
 #[must_use]
 pub fn compile(source: &str) -> CompileResult {
@@ -1068,9 +1084,21 @@ pub fn compile_package_with_options_and_gc(
     options: CompileOptions,
     gc_enabled: bool,
 ) -> CompileResult {
-    run_pipeline_with_state(
+    compile_package_with_options_and_gc_and_names(source, package_ranges, &[], options, gc_enabled)
+}
+
+#[must_use]
+pub fn compile_package_with_options_and_gc_and_names(
+    source: &str,
+    package_ranges: &[Range<usize>],
+    package_names: &[String],
+    options: CompileOptions,
+    gc_enabled: bool,
+) -> CompileResult {
+    run_pipeline_with_state_and_names(
         source,
         package_ranges,
+        package_names,
         options,
         gc_enabled,
         PipelineDepth::Build,
@@ -1100,9 +1128,29 @@ pub fn compile_parsed_package_with_options_and_gc(
     options: CompileOptions,
     gc_enabled: bool,
 ) -> CompileResult {
-    run_pipeline_with_state(
+    compile_parsed_package_with_options_and_gc_and_names(
+        source,
+        parse,
+        package_ranges,
+        &[],
+        options,
+        gc_enabled,
+    )
+}
+
+#[must_use]
+pub fn compile_parsed_package_with_options_and_gc_and_names(
+    source: &str,
+    parse: &Parse,
+    package_ranges: &[Range<usize>],
+    package_names: &[String],
+    options: CompileOptions,
+    gc_enabled: bool,
+) -> CompileResult {
+    run_pipeline_with_state_and_names(
         source,
         package_ranges,
+        package_names,
         options,
         gc_enabled,
         PipelineDepth::Build,
@@ -1189,6 +1237,11 @@ enum PipelineDepth {
     Build,
 }
 
+struct PackageInputs<'a> {
+    ranges: &'a [Range<usize>],
+    names: &'a [String],
+}
+
 struct PipelineState<'a> {
     preparsed: Option<&'a Parse>,
     parser: &'a mut IncrementalParser,
@@ -1252,9 +1305,32 @@ fn run_pipeline_with_state(
     depth: PipelineDepth,
     state: PipelineState<'_>,
 ) -> CompileResult {
-    run_pipeline_with_state_cancellable(
+    run_pipeline_with_state_and_names(
         source,
         package_ranges,
+        &[],
+        options,
+        gc_enabled,
+        depth,
+        state,
+    )
+}
+
+fn run_pipeline_with_state_and_names(
+    source: &str,
+    package_ranges: &[Range<usize>],
+    package_names: &[String],
+    options: CompileOptions,
+    gc_enabled: bool,
+    depth: PipelineDepth,
+    state: PipelineState<'_>,
+) -> CompileResult {
+    run_pipeline_with_state_cancellable_and_names(
+        source,
+        PackageInputs {
+            ranges: package_ranges,
+            names: package_names,
+        },
         options,
         gc_enabled,
         depth,
@@ -1364,6 +1440,29 @@ fn run_pipeline_with_state_cancellable(
     state: PipelineState<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<CompileResult> {
+    run_pipeline_with_state_cancellable_and_names(
+        source,
+        PackageInputs {
+            ranges: package_ranges,
+            names: &[],
+        },
+        options,
+        gc_enabled,
+        depth,
+        state,
+        cancelled,
+    )
+}
+
+fn run_pipeline_with_state_cancellable_and_names(
+    source: &str,
+    package: PackageInputs<'_>,
+    options: CompileOptions,
+    gc_enabled: bool,
+    depth: PipelineDepth,
+    state: PipelineState<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<CompileResult> {
     let PipelineState {
         preparsed,
         parser,
@@ -1412,7 +1511,8 @@ fn run_pipeline_with_state_cancellable(
     if cancelled() {
         return None;
     }
-    hir.package_ranges = package_ranges
+    hir.package_ranges = package
+        .ranges
         .iter()
         .map(|range| text_range(range.start, range.end))
         .collect();
@@ -1489,6 +1589,7 @@ fn run_pipeline_with_state_cancellable(
             &escape_result,
             &analysis.moved_exprs,
             gc_enabled,
+            package.names,
         )
     });
 

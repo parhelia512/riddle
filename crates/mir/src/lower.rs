@@ -43,6 +43,7 @@ pub fn lower_hir<S: BuildHasher>(
     escape_result: &EscapeResult,
     moved_exprs: &HashSet<(BodyId, ExprId), S>,
     gc_enabled: bool,
+    package_names: &[String],
 ) -> Module {
     let method_impls = hir
         .item_tree
@@ -99,6 +100,7 @@ pub fn lower_hir<S: BuildHasher>(
         current_lambda: None,
         lambda_counter: 0,
         active_consts: HashSet::new(),
+        package_names,
     };
 
     // 遍历所有有函数体的函数
@@ -186,6 +188,7 @@ struct LowerCtx<'a> {
     current_lambda: Option<ExprId>,
     lambda_counter: u32,
     active_consts: HashSet<hir::item_tree::ConstId>,
+    package_names: &'a [String],
 }
 
 #[derive(Clone)]
