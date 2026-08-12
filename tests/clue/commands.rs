@@ -1038,6 +1038,82 @@ fn run_builds_the_binary_and_propagates_its_status() {
 }
 
 #[test]
+fn process_arguments_preserve_program_name_and_order() {
+    if c_compiler().is_none() {
+        eprintln!("skipping process argument test: no C compiler found");
+        return;
+    }
+    let root = temp_root("process-args");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"use std::collections::HashMap;
+
+fun read(value: i32) -> Result<i32, i32> { Result::Ok(value) }
+
+fun main() -> i32 {
+    let values = std::env::args();
+    if values.len() != 3usize { return 1; }
+    if values[0].is_empty() { return 2; }
+    if values[1].as_str() != "--mode" { return 3; }
+    if values[2].as_str() != "fast" { return 4; }
+
+    let mut numbers: Vector<i32> = Vector::new();
+    numbers.push(1);
+    numbers.push(2);
+    let mut sum = 0;
+    for value in &numbers { sum += *value; }
+    for value in &mut numbers { *value += 1; }
+
+    let option = Some(1)
+        .map(fun(value: i32) -> i32 { value + 1 })
+        .and_then(fun(value: i32) -> Option<i32> { Some(value) })
+        .unwrap();
+    let base: Result<i32, i32> = Result::Ok(1);
+    let result = base
+        .map(fun(value: i32) -> i32 { value + 1 })
+        .and_then(fun(value: i32) -> Result<i32, i32> { read(value) })
+        .unwrap();
+
+    let key = String::from_str("count");
+    let mut map: HashMap<String, i32> = HashMap::new();
+    map.insert(key.clone(), 7);
+    match map.get_mut(&key) {
+        Some(value) => { *value += 1; },
+        None => { return 5; },
+    }
+    let mut stored = 0;
+    for entry in &map { stored += *entry.1; }
+
+    let text = String::from_str("  --name=value  ");
+    let utf8 = [228u8, 189u8, 160u8, 229u8, 165u8, 189u8];
+    let invalid_utf8 = [255u8];
+    if sum != 3 || numbers[0] != 2 || numbers[1] != 3
+        || option != 2 || result != 2 || stored != 8 { return 6; }
+    if !text.trim().starts_with("--name") || !text.contains("value")
+        || text.find("name").unwrap() != 4usize || !text.ends_with("  ")
+        || text.slice(2usize, 8usize).unwrap() != "--name" { return 7; }
+    if String::from_utf8(&utf8).unwrap().as_str() != "你好"
+        || !String::from_utf8(&invalid_utf8).is_none() { return 8; }
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app", "--", "--mode", "fast"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn standard_library_basics_compile_and_run() {
     if c_compiler().is_none() {
         eprintln!("skipping standard library runtime test: no C compiler found");

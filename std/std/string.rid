@@ -1,4 +1,6 @@
 use crate::std::iter::{IntoIterator, Iterator};
+use crate::std::cmp::{Eq, PartialEq};
+use crate::std::hash::Hash;
 use crate::std::option::Option;
 use crate::std::vector::Vector;
 
@@ -14,6 +16,10 @@ unsafe fun char_from_u32_unchecked(value: u32) -> char {
     let values = [value];
     let slice: &[u32] = &values;
     unsafe { *(slice.as_ptr() as *const char) }
+}
+
+unsafe extern "C" {
+    safe fun riddle_str_slice_ptr(value: *const u8, start: usize) -> *const u8;
 }
 
 pub struct StrIter {
@@ -39,9 +45,45 @@ impl String {
         output
     }
 
+    // SAFETY: the caller must provide a valid UTF-8 byte sequence.
+    pub unsafe fun from_raw_bytes(pointer: *const u8, length: usize) -> String {
+        let mut output = String::new();
+        let mut index = 0usize;
+        while index < length {
+            output.bytes.push(unsafe { pointer[index] });
+            index += 1usize;
+        }
+        output
+    }
+
+    pub fun from_utf8(value: &[u8]) -> Option<String> {
+        if !is_valid_utf8(value) {
+            return Option::None;
+        }
+        let mut output = String::new();
+        for byte in value {
+            output.bytes.push(*byte);
+        }
+        Option::Some(output)
+    }
+
+    // SAFETY: pointer must reference length readable bytes.
+    pub unsafe fun from_utf8_raw(pointer: *const u8, length: usize) -> Option<String> {
+        let output = unsafe { String::from_raw_bytes(pointer, length) };
+        if is_valid_utf8(output.as_bytes()) {
+            Option::Some(output)
+        } else {
+            Option::None
+        }
+    }
+
     pub fun as_str(&self) -> &str {
         // SAFETY: String only stores bytes copied from valid string slices.
         unsafe { from_utf8_unchecked(self.bytes.as_slice()) }
+    }
+
+    pub fun as_bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
     }
 
     pub fun len(&self) -> usize {
@@ -88,6 +130,30 @@ impl String {
     pub fun clear(&mut self) {
         self.bytes.clear();
     }
+
+    pub fun contains(&self, needle: &str) -> bool {
+        self.as_str().contains(needle)
+    }
+
+    pub fun find(&self, needle: &str) -> Option<usize> {
+        self.as_str().find(needle)
+    }
+
+    pub fun starts_with(&self, prefix: &str) -> bool {
+        self.as_str().starts_with(prefix)
+    }
+
+    pub fun ends_with(&self, suffix: &str) -> bool {
+        self.as_str().ends_with(suffix)
+    }
+
+    pub fun trim(&self) -> &str {
+        self.as_str().trim()
+    }
+
+    pub fun slice(&self, start: usize, end: usize) -> Option<&str> {
+        self.as_str().slice(start, end)
+    }
 }
 
 impl str {
@@ -101,6 +167,176 @@ impl str {
 
     pub fun as_bytes(&self) -> &[u8] {
         self as &[u8]
+    }
+
+    pub fun starts_with(&self, prefix: &str) -> bool {
+        if prefix.len() > self.len() {
+            return false;
+        }
+        let mut index = 0usize;
+        while index < prefix.len() {
+            if self.as_bytes()[index] != prefix.as_bytes()[index] {
+                return false;
+            }
+            index += 1usize;
+        }
+        true
+    }
+
+    pub fun ends_with(&self, suffix: &str) -> bool {
+        if suffix.len() > self.len() {
+            return false;
+        }
+        let offset = self.len() - suffix.len();
+        let mut index = 0usize;
+        while index < suffix.len() {
+            if self.as_bytes()[offset + index] != suffix.as_bytes()[index] {
+                return false;
+            }
+            index += 1usize;
+        }
+        true
+    }
+
+    pub fun contains(&self, needle: &str) -> bool {
+        self.find(needle).is_some()
+    }
+
+    pub fun find(&self, needle: &str) -> Option<usize> {
+        if needle.is_empty() {
+            return Option::Some(0usize);
+        }
+        if needle.len() > self.len() {
+            return Option::None;
+        }
+        let last = self.len() - needle.len();
+        let mut start = 0usize;
+        while start <= last {
+            let mut index = 0usize;
+            while index < needle.len()
+                && self.as_bytes()[start + index] == needle.as_bytes()[index]
+            {
+                index += 1usize;
+            }
+            if index == needle.len() {
+                return Option::Some(start);
+            }
+            start += 1usize;
+        }
+        Option::None
+    }
+
+    pub fun slice(&self, start: usize, end: usize) -> Option<&str> {
+        if start > end || end > self.len()
+            || !is_utf8_boundary(self.as_bytes(), start)
+            || !is_utf8_boundary(self.as_bytes(), end)
+        {
+            return Option::None;
+        }
+        let pointer = unsafe { riddle_str_slice_ptr(self.as_bytes().as_ptr(), start) };
+        let bytes: &[u8] = unsafe { (pointer, end - start) as &[u8] };
+        Option::Some(unsafe { bytes as &str })
+    }
+
+    pub fun trim(&self) -> &str {
+        let bytes = self.as_bytes();
+        let mut start = 0usize;
+        let mut end = bytes.len();
+        while start < end && is_ascii_whitespace(bytes[start]) {
+            start += 1usize;
+        }
+        while end > start && is_ascii_whitespace(bytes[end - 1usize]) {
+            end -= 1usize;
+        }
+        self.slice(start, end).unwrap_or("")
+    }
+}
+
+fun is_ascii_whitespace(value: u8) -> bool {
+    value == 32u8 || value == 9u8 || value == 10u8 || value == 13u8
+}
+
+fun is_utf8_boundary(value: &[u8], index: usize) -> bool {
+    index == 0usize || index == value.len()
+        || (value[index] & 192u8) != 128u8
+}
+
+fun is_utf8_continuation(value: u8) -> bool {
+    value >= 128u8 && value <= 191u8
+}
+
+fun is_valid_utf8(value: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < value.len() {
+        let first = value[index];
+        if first <= 127u8 {
+            index += 1usize;
+        } else if first >= 194u8 && first <= 223u8 {
+            if index + 1usize >= value.len() || !is_utf8_continuation(value[index + 1usize]) {
+                return false;
+            }
+            index += 2usize;
+        } else if first >= 224u8 && first <= 239u8 {
+            if index + 2usize >= value.len() {
+                return false;
+            }
+            let second = value[index + 1usize];
+            let valid_second = if first == 224u8 {
+                second >= 160u8 && second <= 191u8
+            } else if first == 237u8 {
+                second >= 128u8 && second <= 159u8
+            } else {
+                is_utf8_continuation(second)
+            };
+            if !valid_second || !is_utf8_continuation(value[index + 2usize]) {
+                return false;
+            }
+            index += 3usize;
+        } else if first >= 240u8 && first <= 244u8 {
+            if index + 3usize >= value.len() {
+                return false;
+            }
+            let second = value[index + 1usize];
+            let valid_second = if first == 240u8 {
+                second >= 144u8 && second <= 191u8
+            } else if first == 244u8 {
+                second >= 128u8 && second <= 143u8
+            } else {
+                is_utf8_continuation(second)
+            };
+            if !valid_second || !is_utf8_continuation(value[index + 2usize])
+                || !is_utf8_continuation(value[index + 3usize]) {
+                return false;
+            }
+            index += 4usize;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+impl Clone for String {
+    fun clone(&self) -> Self {
+        String::from_str(self.as_str())
+    }
+}
+
+impl PartialEq for String {
+    fun eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for String {}
+
+impl Hash for String {
+    fun hash(&self) -> usize {
+        let mut value = 1469598103934665603usize;
+        for byte in self.as_bytes() {
+            value = (value ^ (*byte as usize)) * 1099511628211usize;
+        }
+        value
     }
 }
 

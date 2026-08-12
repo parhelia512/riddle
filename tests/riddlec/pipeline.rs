@@ -1277,6 +1277,77 @@ fn std_supports_float_remainder_and_scalar_protocols() {
 }
 
 #[test]
+fn std_p0_cli_foundations_typecheck() {
+    let result = compile(
+        r#"
+            use std::collections::HashMap;
+            use std::option::Option;
+            use std::result::Result;
+            use std::string::String;
+
+            fun read(value: i32) -> Result<i32, i32> { Result::Ok(value) }
+
+            fun chained() -> Result<i32, i32> {
+                let value = read(1)?;
+                let base: Result<i32, i32> = Result::Ok(value);
+                base
+                    .map(fun(value: i32) -> i32 { value + 1 })
+                    .and_then(fun(value: i32) -> Result<i32, i32> { Result::Ok(value) })
+            }
+
+            fun main() -> i32 {
+                let mut values: std::vector::Vector<i32> = std::vector::Vector::new();
+                values.push(1);
+                values.push(2);
+                let mut sum = 0;
+                for value in &values { sum += *value; }
+                for value in &mut values { *value += 1; }
+
+                let mapped = Option::Some(1)
+                    .map(fun(value: i32) -> i32 { value + 1 })
+                    .and_then(fun(value: i32) -> Option<i32> { Option::Some(value) })
+                    .unwrap();
+
+                let key = String::from_str("name");
+                let mut map: HashMap<String, i32> = HashMap::new();
+                map.insert(key.clone(), 7);
+                match map.get_mut(&key) {
+                    Option::Some(value) => { *value += 1; },
+                    Option::None => {},
+                }
+                let mut stored = 0;
+                for entry in &map { stored += *entry.1; }
+
+                let text = String::from_str("  --name=value  ");
+                let valid_utf8 = [228u8, 189u8, 160u8, 229u8, 165u8, 189u8];
+                let invalid_utf8 = [255u8];
+                let _args = std::env::args();
+                let result = chained().unwrap();
+                if sum == 3 && values[0] == 2 && values[1] == 3
+                    && mapped == 2 && stored == 8 && result == 2
+                    && text.trim().starts_with("--name")
+                    && text.contains("value") && text.find("name").unwrap() == 4usize
+                    && text.ends_with("  ") && text.slice(2usize, 8usize).unwrap() == "--name"
+                    && String::from_utf8(&valid_utf8).unwrap().as_str() == "你好"
+                    && String::from_utf8(&invalid_utf8).is_none() {
+                    0
+                } else {
+                    1
+                }
+            }
+            "#,
+    );
+
+    assert!(
+        result.success(),
+        "parse: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+        result.parse_errors,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
 fn std_rejects_legacy_display_write_method() {
     let result = compile(
         r"

@@ -751,6 +751,14 @@ impl LowerCtx<'_> {
                     _ => false,
                 }
             }
+            hir::item_tree::HirTypeRef::Named(path) => match actual {
+                type_checker::Type::Struct(_, args) | type_checker::Type::Enum(_, args) => {
+                    path.type_args.iter().zip(args).all(|(pattern, actual)| {
+                        self.collect_hir_type_subst(pattern, actual, generics, subst, tc_subst)
+                    })
+                }
+                _ => true,
+            },
             hir::item_tree::HirTypeRef::Ref(inner, expected_mut) => match actual {
                 type_checker::Type::Ref(actual_inner, actual_mut) => {
                     expected_mut == actual_mut

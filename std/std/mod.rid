@@ -4,6 +4,7 @@ pub mod cmp;
 pub mod collections;
 pub mod convert;
 pub mod default;
+pub mod env;
 pub mod fmt;
 pub mod hash;
 pub mod io;

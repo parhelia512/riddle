@@ -28,6 +28,27 @@ impl<T, E> Result<T, E> {
         }
     }
 
+    pub fun unwrap(self) -> T {
+        match self {
+            Result::Ok(value) => value,
+            Result::Err(_) => crate::std::panic::panic("called Result::unwrap on Err"),
+        }
+    }
+
+    pub fun map<U>(self, function: impl FnOnce(T) -> U) -> Result<U, E> {
+        match self {
+            Result::Ok(value) => Result::Ok(function(value)),
+            Result::Err(error) => Result::Err(error),
+        }
+    }
+
+    pub fun and_then<U>(self, function: impl FnOnce(T) -> Result<U, E>) -> Result<U, E> {
+        match self {
+            Result::Ok(value) => function(value),
+            Result::Err(error) => Result::Err(error),
+        }
+    }
+
     pub fun ok(self) -> Option<T> {
         match self {
             Result::Ok(value) => Option::Some(value),
@@ -43,10 +64,7 @@ impl<T, E> Result<T, E> {
     }
 
     pub fun unwarp(self) -> T {
-        match self {
-            Result::Ok(value) => value,
-            Result::Err(_) => crate::std::panic::panic("called Result::unwarp on Err"),
-        }
+        self.unwrap()
     }
 }
 

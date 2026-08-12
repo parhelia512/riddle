@@ -3,6 +3,7 @@ use crate::std::mem::size_of;
 use crate::std::option::Option;
 use crate::std::ops::{Index, IndexMut};
 use crate::std::panic::panic;
+use crate::std::slice::{SliceIter, SliceIterMut};
 
 // The buffer lives in the GC heap so stored references to escaping values are
 // traced; Drop still releases it deterministically via rgc_free.
@@ -126,6 +127,15 @@ impl<T> Vector<T> {
             unsafe { (self.data, self.len) as &[T] }
         }
     }
+
+    pub fun iter(&self) -> SliceIter<T> {
+        self.as_slice().iter()
+    }
+
+    pub fun iter_mut(&mut self) -> SliceIterMut<T> {
+        let values: &mut [T] = unsafe { (self.data, self.len) as &mut [T] };
+        values.iter_mut()
+    }
 }
 
 impl<T> Drop for Vector<T> {
@@ -170,6 +180,25 @@ impl<T> Iterator for VectorIntoIter<T> {
         } else {
             Option::None
         }
+    }
+}
+
+impl<T> IntoIterator for &Vector<T> {
+    type Item = &T;
+    type IntoIter = SliceIter<T>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<T> IntoIterator for &mut Vector<T> {
+    type Item = &mut T;
+    type IntoIter = SliceIterMut<T>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        let values: &mut [T] = unsafe { (self.data, self.len) as &mut [T] };
+        values.iter_mut()
     }
 }
 

@@ -399,13 +399,14 @@ fn is_supported_cast(source: &Type, target: &Type) -> bool {
 
 fn is_unsafe_dst_layout_cast(source: &Type, target: &Type) -> bool {
     match (source, target) {
-        (Type::Tuple(parts), Type::Ref(target, false)) => {
+        (Type::Tuple(parts), Type::Ref(target, target_mutable)) => {
             let Type::Slice(target) = target.as_ref() else {
                 return false;
             };
             matches!(
                 parts.as_slice(),
-                [Type::Ptr { inner, .. }, Type::Int(IntTy::Usize)] if inner.as_ref() == target.as_ref()
+                [Type::Ptr { inner, mutable }, Type::Int(IntTy::Usize)]
+                    if inner.as_ref() == target.as_ref() && (!*target_mutable || *mutable)
             )
         }
         // `&[T] as (*const T, usize)`: the decomposition direction. A `*mut T`

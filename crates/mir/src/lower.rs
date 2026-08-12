@@ -1013,7 +1013,7 @@ fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
 
 fn is_raw_parts_to_slice_cast(source: &Type, target: &Type) -> bool {
     match (source, target) {
-        (Type::Tuple(parts), Type::Ref(target, false)) => {
+        (Type::Tuple(parts), Type::Ref(target, _)) => {
             let Type::Slice(target) = target.as_ref() else {
                 return false;
             };

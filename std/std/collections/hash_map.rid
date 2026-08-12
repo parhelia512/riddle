@@ -29,6 +29,12 @@ pub struct HashMap<K, V> {
     values: Vector<V>,
 }
 
+pub struct HashMapIter<K, V> {
+    keys: &[K],
+    values: &[V],
+    index: usize,
+}
+
 impl<K, V> HashMap<K, V> {
     pub fun new() -> HashMap<K, V> {
         let mut buckets: Vector<HashBucket> = Vector::new();
@@ -86,6 +92,22 @@ impl<K, V> HashMap<K, V> {
         match self.find_entry(key) {
             Option::Some(entry_index) => self.values.get(entry_index),
             Option::None => Option::None,
+        }
+    }
+
+    pub fun get_mut(&mut self, key: &K) -> Option<&mut V>
+    where K: Hash + Eq {
+        match self.find_entry(key) {
+            Option::Some(entry_index) => self.values.get_mut(entry_index),
+            Option::None => Option::None,
+        }
+    }
+
+    pub fun iter(&self) -> HashMapIter<K, V> {
+        HashMapIter {
+            keys: self.keys.as_slice(),
+            values: self.values.as_slice(),
+            index: 0usize,
         }
     }
 
@@ -181,5 +203,30 @@ impl<K, V> HashMap<K, V> {
             entry_index += 1usize;
         }
         self.buckets = buckets;
+    }
+}
+
+impl<K, V> crate::std::iter::Iterator for HashMapIter<K, V> {
+    type Item = (&K, &V);
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.keys.len() {
+            return Option::None;
+        }
+        let index = self.index;
+        self.index += 1usize;
+        match (self.keys.get(index), self.values.get(index)) {
+            (Option::Some(key), Option::Some(value)) => Option::Some((key, value)),
+            _ => Option::None,
+        }
+    }
+}
+
+impl<K, V> crate::std::iter::IntoIterator for &HashMap<K, V> {
+    type Item = (&K, &V);
+    type IntoIter = HashMapIter<K, V>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
