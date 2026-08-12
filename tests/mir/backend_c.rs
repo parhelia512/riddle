@@ -961,6 +961,27 @@ fn c_heap_alloc_wraps_main_with_a_gc_stack_boundary() {
 }
 
 #[test]
+fn c_process_args_are_initialized_by_the_runtime_entry() {
+    let result = riddlec::pipeline::compile(
+        r#"
+        fun main() -> i32 {
+            std::env::args().len() as i32
+        }
+        "#,
+    );
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    let generated = riddlec::pipeline::generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+
+    assert!(
+        generated.contains("void riddle_args_init(int32_t argc, char **argv);")
+            && generated.contains("int main(int argc, char **argv) {")
+            && generated.contains("riddle_args_init((int32_t)argc, argv);")
+            && !generated.contains("static int32_t riddle_process_argc"),
+        "{generated}"
+    );
+}
+
+#[test]
 fn c_multiple_functions() {
     let module = lower(
         r"

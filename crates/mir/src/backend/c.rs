@@ -193,6 +193,9 @@ impl CBackend {
         writeln!(out, "#define RIDDLE_ISIZE_FROM_BITS(v) ((uintptr_t)(v) <= (uintptr_t)PTRDIFF_MAX ? (ptrdiff_t)(uintptr_t)(v) : (ptrdiff_t)(-1 - (ptrdiff_t)(UINTPTR_MAX - (uintptr_t)(v))))").unwrap();
         writeln!(out).unwrap();
         if self.needs_runtime {
+            if module_calls_process_args(module) {
+                writeln!(out, "void riddle_args_init(int32_t argc, char **argv);").unwrap();
+            }
             if self.no_gc {
                 writeln!(out, "void *riddle_alloc(size_t size);").unwrap();
                 writeln!(out, "void *riddle_realloc(void *ptr, size_t size);").unwrap();
@@ -437,32 +440,8 @@ impl CBackend {
             }
             let user_main = self.c_function_name("main")?;
             if module_calls_process_args(module) {
-                writeln!(out, "static int32_t riddle_process_argc;").unwrap();
-                writeln!(out, "static char **riddle_process_argv;").unwrap();
-                writeln!(
-                    out,
-                    "int32_t riddle_argc(void) {{ return riddle_process_argc; }}"
-                )
-                .unwrap();
-                writeln!(out, "void *riddle_argv_at(int32_t index) {{").unwrap();
-                writeln!(
-                    out,
-                    "  if (index < 0 || index >= riddle_process_argc) return NULL;"
-                )
-                .unwrap();
-                writeln!(out, "  return (void *)riddle_process_argv[index];").unwrap();
-                writeln!(out, "}}").unwrap();
-                writeln!(out, "size_t riddle_argv_len(int32_t index) {{").unwrap();
-                writeln!(out, "  uint8_t *value = (uint8_t *)riddle_argv_at(index);").unwrap();
-                writeln!(
-                    out,
-                    "  return value == NULL ? 0u : strlen((const char *)value);"
-                )
-                .unwrap();
-                writeln!(out, "}}").unwrap();
                 writeln!(out, "int main(int argc, char **argv) {{").unwrap();
-                writeln!(out, "  riddle_process_argc = (int32_t)argc;").unwrap();
-                writeln!(out, "  riddle_process_argv = argv;").unwrap();
+                writeln!(out, "  riddle_args_init((int32_t)argc, argv);").unwrap();
             } else {
                 writeln!(out, "int main(void) {{").unwrap();
             }

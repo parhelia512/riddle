@@ -7,6 +7,11 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use clue::TargetTriple;
 use sha2::{Digest, Sha256};
 
@@ -1053,11 +1058,33 @@ fn process_arguments_preserve_program_name_and_order() {
 fun read(value: i32) -> Result<i32, i32> { Result::Ok(value) }
 
 fun main() -> i32 {
+    let os_values = std::env::args_os();
+    if os_values.len() == 2usize {
+        let encoded = os_values[1].as_encoded_bytes();
+        if encoded.len() == 3usize && encoded[0] == 237u8
+            && encoded[1] == 160u8 && encoded[2] == 128u8 { return 0; }
+    }
+    if os_values.len() == 5usize {
+        let first = os_values[1].clone().into_string().unwrap();
+        let second = os_values[2].clone().into_string().unwrap();
+        let third = os_values[3].clone().into_string().unwrap();
+        let fourth = os_values[4].clone().into_string().unwrap();
+        if first.as_str() != "a\\\\\\b" { return 13; }
+        if second.as_str() != "de fg" { return 14; }
+        if third.as_str() != "" { return 15; }
+        if fourth.as_str() != "a\"b" { return 16; }
+        return 0;
+    }
+
     let values = std::env::args();
-    if values.len() != 3usize { return 1; }
+    if values.len() != 7usize { return 1; }
     if values[0].is_empty() { return 2; }
     if values[1].as_str() != "--mode" { return 3; }
     if values[2].as_str() != "fast" { return 4; }
+    if values[3].as_str() != "你好" { return 9; }
+    if values[4].as_str() != "space value" { return 10; }
+    if values[5].as_str() != "" { return 11; }
+    if values[6].as_str() != "a\\\"b" { return 12; }
 
     let mut numbers: Vector<i32> = Vector::new();
     numbers.push(1);
@@ -1102,7 +1129,18 @@ fun main() -> i32 {
     )
     .unwrap();
 
-    let output = clue(&["run", "app", "--", "--mode", "fast"], &root);
+    let arguments = [
+        "run",
+        "app",
+        "--",
+        "--mode",
+        "fast",
+        "你好",
+        "space value",
+        "",
+        "a\\\"b",
+    ];
+    let output = clue(&arguments, &root);
     assert!(
         output.status.success(),
         "status: {}\nstdout: {}\nstderr: {}",
@@ -1110,6 +1148,63 @@ fun main() -> i32 {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let manifest_path = root.join("app/Clue.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[runtime]\ngc = false\n"),
+    )
+    .unwrap();
+    let output = clue(&arguments, &root);
+    assert!(
+        output.status.success(),
+        "no-GC status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    #[cfg(windows)]
+    {
+        let executable = root.join("app/.clue/build/app.exe");
+        let output = Command::new(executable)
+            .arg(OsString::from_wide(&[0xd800]))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated surrogate status: {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = Command::new(root.join("app/.clue/build/app.exe"))
+            .arg(OsString::from_wide(&[0xd800]))
+            .arg("--string")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "args() accepted invalid Unicode");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("process argument is not valid Unicode"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = Command::new(root.join("app/.clue/build/app.exe"))
+            .raw_arg(r#" a\\\b d"e f"g "" a\"b"#)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "raw argument status: {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let _ = fs::remove_dir_all(root);
 }
 

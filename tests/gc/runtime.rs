@@ -1,4 +1,18 @@
-use gc::{NO_GC_RUNTIME_C, RUNTIME_C};
+use gc::{ARGS_RUNTIME_C, NO_GC_RUNTIME_C, RUNTIME_C};
+
+#[test]
+fn exports_process_argument_runtime() {
+    for symbol in [
+        "GetCommandLineW",
+        "riddle_parse_windows_args",
+        "riddle_args_init",
+        "riddle_argc",
+        "riddle_argv_at",
+        "riddle_argv_len",
+    ] {
+        assert!(ARGS_RUNTIME_C.contains(symbol), "missing {symbol}");
+    }
+}
 
 #[test]
 fn exports_runtime_api() {

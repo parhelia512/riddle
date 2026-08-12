@@ -1321,6 +1321,7 @@ fn std_p0_cli_foundations_typecheck() {
                 let text = String::from_str("  --name=value  ");
                 let valid_utf8 = [228u8, 189u8, 160u8, 229u8, 165u8, 189u8];
                 let invalid_utf8 = [255u8];
+                let _args_os = std::env::args_os();
                 let _args = std::env::args();
                 let result = chained().unwrap();
                 if sum == 3 && values[0] == 2 && values[1] == 3

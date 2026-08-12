@@ -284,6 +284,7 @@ fn build_analysis(
             .clone()
             .unwrap_or_else(|| build_dir.join(format!("{target_name}.runtime.c")))
     });
+    let args_runtime_path = build_dir.join(format!("{target_name}.args.c"));
     let hash_path = build_dir.join(format!("{target_name}.hash"));
     let hash = fingerprint(
         &analysis.manifest_fingerprint,
@@ -293,6 +294,7 @@ fn build_analysis(
         target,
     );
     let source_is_fresh = c_path.is_file()
+        && args_runtime_path.is_file()
         && runtime_path.as_ref().is_none_or(|path| path.is_file())
         && fs::read_to_string(&hash_path).unwrap_or_default() == hash;
 
@@ -315,6 +317,7 @@ fn build_analysis(
         {
             atomic_write(path, source.as_bytes())?;
         }
+        atomic_write(&args_runtime_path, gc::ARGS_RUNTIME_C.as_bytes())?;
     }
 
     if analysis.kind != ProjectKind::Binary {
@@ -336,9 +339,12 @@ fn build_analysis(
         build_library_artifacts(
             analysis,
             &compiler,
-            runtime_path
-                .as_deref()
-                .context("library build did not select a runtime")?,
+            (
+                runtime_path
+                    .as_deref()
+                    .context("library build did not select a runtime")?,
+                &args_runtime_path,
+            ),
             &build_dir,
             target_name,
             triple,
@@ -366,6 +372,7 @@ fn build_analysis(
         runtime_path
             .as_deref()
             .context("binary build did not select a runtime")?,
+        args_runtime_path.as_path(),
     ];
     sources.extend(
         dependencies
@@ -391,12 +398,13 @@ fn build_analysis(
 fn build_library_artifacts(
     analysis: &crate::ProjectAnalysis,
     compiler: &CCompiler,
-    runtime_path: &Path,
+    runtime_paths: (&Path, &Path),
     build_dir: &Path,
     target_name: &str,
     triple: TargetTriple,
     dependencies: &[BuildArtifact],
 ) -> anyhow::Result<()> {
+    let (runtime_path, args_runtime_path) = runtime_paths;
     let c_path = build_dir.join(format!("{target_name}.c"));
     let object = build_dir.join(format!(
         "{target_name}.{}",
@@ -429,8 +437,17 @@ fn build_library_artifacts(
             "{target_name}.runtime.{}",
             if triple.is_windows() { "obj" } else { "o" }
         ));
+        let args_runtime_object = build_dir.join(format!(
+            "{target_name}.args.{}",
+            if triple.is_windows() { "obj" } else { "o" }
+        ));
         compiler.compile_object(runtime_path, &runtime_object, true)?;
-        let mut objects = vec![object.as_path(), runtime_object.as_path()];
+        compiler.compile_object(args_runtime_path, &args_runtime_object, true)?;
+        let mut objects = vec![
+            object.as_path(),
+            runtime_object.as_path(),
+            args_runtime_object.as_path(),
+        ];
         objects.extend(
             dependencies
                 .iter()
@@ -450,7 +467,7 @@ fn build_library_artifacts(
     if library_types.contains(&crate::model::LibraryType::Cdylib) {
         let output = build_dir.join(shared_library_name(target_name, triple));
         let temp = temporary_path(&output);
-        let mut sources = vec![c_path.as_path(), runtime_path];
+        let mut sources = vec![c_path.as_path(), runtime_path, args_runtime_path];
         sources.extend(
             dependencies
                 .iter()
@@ -539,6 +556,7 @@ pub fn build_proc_macro_library(
     let bridge = crate::proc_macro::host_runtime_c(exports);
     let c_path = build_dir.join(format!("{}.proc-macro.c", package.name));
     let runtime_path = build_dir.join(format!("{}.proc-macro.runtime.c", package.name));
+    let args_runtime_path = build_dir.join(format!("{}.proc-macro.args.c", package.name));
     let bridge_path = build_dir.join(format!("{}.proc-macro.host.c", package.name));
     let runner_c_path = build_dir.join(format!("{}.proc-macro.runner.c", package.name));
     let hash_path = build_dir.join(format!("{}.proc-macro.hash", package.name));
@@ -566,6 +584,7 @@ pub fn build_proc_macro_library(
     );
     if c_path.is_file()
         && runtime_path.is_file()
+        && args_runtime_path.is_file()
         && bridge_path.is_file()
         && runner_c_path.is_file()
         && library.is_file()
@@ -595,6 +614,7 @@ pub fn build_proc_macro_library(
             .as_bytes(),
     )?;
     atomic_write(&runtime_path, gc::RUNTIME_C.as_bytes())?;
+    atomic_write(&args_runtime_path, gc::ARGS_RUNTIME_C.as_bytes())?;
     atomic_write(&bridge_path, bridge.as_bytes())?;
     atomic_write(&runner_c_path, runner_source.as_bytes())?;
     let temp_library = temporary_path(&library);
@@ -602,6 +622,7 @@ pub fn build_proc_macro_library(
         &[
             c_path.as_path(),
             runtime_path.as_path(),
+            args_runtime_path.as_path(),
             bridge_path.as_path(),
         ],
         &temp_library,
@@ -637,6 +658,7 @@ fn fingerprint(
     manifest.hash(&mut hasher);
     source.hash(&mut hasher);
     runtime.hash(&mut hasher);
+    gc::ARGS_RUNTIME_C.hash(&mut hasher);
     "c11".hash(&mut hasher);
     riddlec::GIT_HASH.hash(&mut hasher);
     target.hash(&mut hasher);
