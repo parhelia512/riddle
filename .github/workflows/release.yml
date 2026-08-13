@@ -114,8 +114,11 @@ jobs:
       - name: 安装交叉编译依赖（Linux i686）
         if: matrix.target == 'i686-unknown-linux-gnu'
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y gcc-multilib
+          sudo apt-get install -y gcc-multilib libssl-dev:i386
+          echo "PKG_CONFIG_ALLOW_CROSS_i686_unknown_linux_gnu=1" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_LIBDIR_i686_unknown_linux_gnu=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
 
       - name: 缓存 Cargo
         uses: Swatinem/rust-cache@v2

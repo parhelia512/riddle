@@ -607,14 +607,26 @@ pub fn build_proc_macro_library(
         .mir_module
         .as_ref()
         .context("successful proc-macro compilation did not produce MIR")?;
+    let generated =
+        pipeline::generate_c_with_gc_and_source(module, true, &package.entry.display().to_string())
+            .map_err(anyhow::Error::msg)?;
     atomic_write(
         &c_path,
-        pipeline::generate_c_with_gc_and_source(module, true, &package.entry.display().to_string())
-            .map_err(anyhow::Error::msg)?
-            .as_bytes(),
+        format!(
+            "void riddle_proc_abort(void);\n{}",
+            generated.replace("abort()", "riddle_proc_abort()")
+        )
+        .as_bytes(),
     )?;
     atomic_write(&runtime_path, gc::RUNTIME_C.as_bytes())?;
-    atomic_write(&args_runtime_path, gc::ARGS_RUNTIME_C.as_bytes())?;
+    atomic_write(
+        &args_runtime_path,
+        format!(
+            "void riddle_proc_abort(void);\n{}",
+            gc::ARGS_RUNTIME_C.replace("abort()", "riddle_proc_abort()")
+        )
+        .as_bytes(),
+    )?;
     atomic_write(&bridge_path, bridge.as_bytes())?;
     atomic_write(&runner_c_path, runner_source.as_bytes())?;
     let temp_library = temporary_path(&library);

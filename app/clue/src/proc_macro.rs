@@ -123,6 +123,7 @@ pub fn host_suffix(exports: &[HostMacroExport]) -> String {
 const HOST_RUNTIME_PREAMBLE: &str = r#"#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(_WIN32)
@@ -148,6 +149,11 @@ const void *riddle_proc_diagnostics_value(void);
 int riddle_proc_putchar(int value) {
     unsigned char byte = (unsigned char)value;
     return fwrite(&byte, 1u, 1u, stderr) == 1u ? (int)byte : EOF;
+}
+
+void riddle_proc_abort(void) {
+    fflush(stderr);
+    exit(EXIT_FAILURE);
 }
 
 typedef struct {
@@ -1149,6 +1155,7 @@ mod tests {
         let runtime = host_runtime_c(&[]);
         assert!(runtime.contains("RIDDLE_PROC_EXPORT int riddle_proc_expand("));
         assert!(runtime.contains("rgc_init(&stack_anchor)"));
+        assert!(runtime.contains("void riddle_proc_abort(void)"));
         assert!(!runtime.contains("_setmode"));
         assert!(!runtime.contains("fread"));
         assert!(!runtime.contains("riddle_proc_run"));
