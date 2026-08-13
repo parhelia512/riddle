@@ -19,11 +19,19 @@
 typedef struct RgcHeader RgcHeader;
 typedef struct RgcMarkStack RgcMarkStack;
 
+#if defined(_MSC_VER) && defined(_M_IX86)
+/* MSVC's C11 mode omits max_align_t on x86, where double provides the
+ * fundamental 8-byte alignment guaranteed by malloc. */
+typedef double RgcMaxAlign;
+#else
+typedef max_align_t RgcMaxAlign;
+#endif
+
 struct RgcHeader {
     RgcHeader *next;
     size_t size;
     unsigned char marked;
-    max_align_t _align;
+    RgcMaxAlign _align;
 };
 
 struct RgcMarkStack {

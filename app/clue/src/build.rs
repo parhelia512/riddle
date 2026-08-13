@@ -999,6 +999,7 @@ impl CCompiler {
                 command.args([
                     "/nologo",
                     "/std:c11",
+                    "/utf-8",
                     if self.profile == BuildProfile::Release {
                         "/O2"
                     } else {
@@ -1253,6 +1254,7 @@ mod tests {
 
         let windows = shared_library_args(Flavor::Msvc, TargetTriple::I686PcWindowsMsvc, true);
         assert!(windows.iter().any(|argument| argument == "/LD"));
+        assert!(windows.iter().any(|argument| argument == "/utf-8"));
         assert!(
             windows
                 .iter()
