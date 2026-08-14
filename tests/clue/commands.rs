@@ -4438,8 +4438,8 @@ fn multiple_binary_targets_can_be_selected() {
     let output = clue(&["check", "--bin", "missing"], &root);
     assert!(!output.status.success());
 
-    if let Some(cc) = c_compiler() {
-        let output = clue_with_cc(&["build"], &root, Path::new(&cc));
+    if c_compiler().is_some() {
+        let output = clue(&["build"], &root);
         assert!(
             output.status.success(),
             "stdout: {}\nstderr: {}",
@@ -4449,7 +4449,7 @@ fn multiple_binary_targets_can_be_selected() {
         for name in ["one", "two"] {
             assert!(root.join(".clue/build").join(format!("{name}.c")).is_file());
         }
-        let output = clue_with_cc(&["run", "--bin", "two"], &root, Path::new(&cc));
+        let output = clue(&["run", "--bin", "two"], &root);
         assert_eq!(output.status.code(), Some(7));
     }
     let _ = fs::remove_dir_all(root);
@@ -4557,7 +4557,7 @@ fn locked_standalone_package_rejects_changed_contents() {
 
 #[test]
 fn release_build_uses_an_isolated_profile_directory() {
-    let Some(cc) = c_compiler() else {
+    let Some(_) = c_compiler() else {
         eprintln!("skipping release profile test: no C compiler found");
         return;
     };
@@ -4570,7 +4570,7 @@ fn release_build_uses_an_isolated_profile_directory() {
     .unwrap();
     fs::write(root.join("src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
 
-    let output = clue_with_cc(&["build", "--release"], &root, Path::new(&cc));
+    let output = clue(&["build", "--release"], &root);
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -4684,7 +4684,7 @@ fn package_commands_manage_manifest_and_archive() {
 
 #[test]
 fn library_build_emits_reusable_artifacts() {
-    let Some(cc) = c_compiler() else {
+    let Some(_) = c_compiler() else {
         eprintln!("skipping library artifact test: no C compiler found");
         return;
     };
@@ -4696,7 +4696,7 @@ fn library_build_emits_reusable_artifacts() {
     )
     .unwrap();
     fs::write(root.join("src/lib.rid"), "pub fun value() -> i32 { 1 }\n").unwrap();
-    let output = clue_with_cc(&["build"], &root, Path::new(&cc));
+    let output = clue(&["build"], &root);
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -4851,7 +4851,7 @@ fn registry_install_accepts_name_at_semver_requirement() {
 
 #[test]
 fn automatic_example_test_and_bench_targets_are_buildable() {
-    let Some(cc) = c_compiler() else {
+    let Some(_) = c_compiler() else {
         eprintln!("skipping automatic target test: no C compiler found");
         return;
     };
@@ -4883,25 +4883,25 @@ fn automatic_example_test_and_bench_targets_are_buildable() {
     ] {
         fs::write(root.join(path), value).unwrap();
     }
-    let output = clue_with_cc(&["check"], &root, Path::new(&cc));
+    let output = clue(&["check"], &root);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let output = clue_with_cc(&["build", "--example", "demo"], &root, Path::new(&cc));
+    let output = clue(&["build", "--example", "demo"], &root);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let output = clue_with_cc(&["test", "--no-run"], &root, Path::new(&cc));
+    let output = clue(&["test", "--no-run"], &root);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let output = clue_with_cc(&["bench"], &root, Path::new(&cc));
+    let output = clue(&["bench"], &root);
     assert!(
         output.status.success(),
         "{}",
@@ -5109,7 +5109,7 @@ fn registry_dependency_is_verified_cached_and_available_offline() {
 
 #[test]
 fn concurrent_builds_leave_a_complete_executable() {
-    let Some(cc) = c_compiler() else {
+    let Some(_) = c_compiler() else {
         eprintln!("skipping concurrent build test: no C compiler found");
         return;
     };
@@ -5126,7 +5126,6 @@ fn concurrent_builds_leave_a_complete_executable() {
         Command::new(env!("CARGO_BIN_EXE_clue"))
             .arg("build")
             .current_dir(&root)
-            .env("CC", &cc)
             .env_remove("RIDDLE_TARGET")
             .spawn()
             .unwrap()

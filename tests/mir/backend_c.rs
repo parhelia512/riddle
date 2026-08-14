@@ -1,7 +1,7 @@
 use crate::{compile, lower};
 use mir::Backend;
 use mir::backend::c::CBackend;
-use std::{fmt::Write as _, fs, process::Command};
+use std::{fmt::Write as _, fs, path::Path, process::Command};
 
 fn c_symbol(kind: char, name: &str) -> String {
     let mut suffix = String::with_capacity(name.len() * 2);
@@ -1957,8 +1957,15 @@ fn c_backend_defines_integer_and_float_cast_edge_semantics() {
 #[test]
 fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
     let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let compiler_name = Path::new(&compiler)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let is_clang_cl = compiler_name == "clang-cl" || compiler_name.starts_with("clang-cl-");
+    let is_msvc = compiler_name == "cl" || is_clang_cl;
     if !Command::new(&compiler)
-        .arg("--version")
+        .arg(if is_msvc { "/?" } else { "--version" })
         .output()
         .is_ok_and(|output| output.status.success())
     {
@@ -1974,6 +1981,8 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
 
         fun shift(value: i32, count: i32) -> i32 { value >> count }
 
+        fun divide_float(left: f64, right: f64) -> f64 { left / right }
+
         fun cast(value: f64) -> i32 { value as i32 }
 
         fun main() -> i32 {
@@ -1981,7 +1990,7 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
             let wrapped = wrap(2147483647i32, 1i32);
             let wrapped8 = wrap8(255u8, 1u8);
             let shifted = shift(-4i32, 1i32);
-            let nan = cast(zero / zero);
+            let nan = cast(divide_float(zero, zero));
             if wrapped == -2147483648i32 && wrapped8 == 0u8 && shifted == -2i32 && nan == 0 {
                 0
             } else {
@@ -2007,16 +2016,27 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
     let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
     fs::write(&source, generated).unwrap();
 
-    let compile_output = Command::new(&compiler)
-        .args(["-std=c11", "-pedantic-errors", "-Wall", "-Werror"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&executable)
-        .output()
-        .unwrap();
+    let mut command = Command::new(&compiler);
+    if is_msvc {
+        command.args(["/std:c11", "/W4", "/WX"]);
+        if is_clang_cl && cfg!(all(windows, target_arch = "x86")) {
+            command.arg("--target=i686-pc-windows-msvc");
+        }
+        command
+            .arg(&source)
+            .arg(format!("/Fe{}", executable.display()));
+    } else {
+        command
+            .args(["-std=c11", "-pedantic-errors", "-Wall", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable);
+    }
+    let compile_output = command.output().unwrap();
     assert!(
         compile_output.status.success(),
-        "C11 compile failed:\n{}",
+        "C11 compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile_output.stdout),
         String::from_utf8_lossy(&compile_output.stderr)
     );
     let run = Command::new(&executable).output().unwrap();
