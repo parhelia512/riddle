@@ -22,7 +22,7 @@ jobs:
           submodules: true
 
       - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
 
@@ -101,7 +101,7 @@ jobs:
           submodules: true
 
       - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
 

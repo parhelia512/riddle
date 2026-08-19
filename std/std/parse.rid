@@ -14,18 +14,28 @@ pub fun parse_i32(value: &str) -> Option<i32> {
             return Option::None;
         }
     }
-    let mut output = 0i32;
+    let limit = if negative { 2147483648u32 } else { 2147483647u32 };
+    let mut output = 0u32;
     while index < bytes.len() {
         let byte = bytes[index];
         if byte < 48u8 || byte > 57u8 {
             return Option::None;
         }
-        output = output * 10i32 + (byte - 48u8) as i32;
+        let digit = (byte - 48u8) as u32;
+        if output > limit / 10u32
+            || (output == limit / 10u32 && digit > limit % 10u32) {
+            return Option::None;
+        }
+        output = output * 10u32 + digit;
         index += 1usize;
     }
     if negative {
-        Option::Some(-output)
+        if output == 2147483648u32 {
+            Option::Some(-2147483647i32 - 1i32)
+        } else {
+            Option::Some(-(output as i32))
+        }
     } else {
-        Option::Some(output)
+        Option::Some(output as i32)
     }
 }

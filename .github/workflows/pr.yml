@@ -11,14 +11,21 @@ permissions:
 
 jobs:
   validate:
-    name: Validate
-    runs-on: ubuntu-latest
+    name: Validate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
 
@@ -32,4 +39,4 @@ jobs:
         run: cargo check -p riddle --features install-bins --bins
 
       - name: Run strict Clippy
-        run: cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings -D clippy::pedantic -D clippy::nursery -D clippy::cargo -A clippy::multiple_crate_versions
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings

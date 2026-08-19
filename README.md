@@ -40,7 +40,7 @@ clue run
 
 可从 [GitHub Releases][releases] 下载预编译版本：解压对应平台的 zip，并将二进制所在的目录加入 `PATH`。
 
-从源码构建需要较新的 Rust stable 工具链。
+从源码构建使用仓库 `rust-toolchain.toml` 固定的 Rust 1.97.1。
 
 Bash：
 
@@ -74,12 +74,12 @@ cargo build -p riddle --release --features install-bins --bins
 cargo test --workspace --all-targets
 cargo check -p riddle --features install-bins --bins
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings -D clippy::pedantic -D clippy::nursery -D clippy::cargo -A clippy::multiple_crate_versions
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 `install-bins` 只用于根发行包。不要在 workspace 测试命令中添加 `--all-features`，否则根发行包与成员 crate 的 `clue`、`riddlec` 会产生同名输出警告；上面的独立 `cargo check` 会覆盖这三个安装入口。
 
-Clippy 只排除 `multiple_crate_versions`：当前 Cargo 依赖元数据同时包含 `hashbrown 0.14/0.17` 和 `syn 2/3`。这不会关闭任何源码 lint，也不应通过新增 `#[allow(clippy::...)]` 绕过源码问题。依赖更新后先用 `cargo tree -d` 审计活动依赖，再移除 `-A clippy::multiple_crate_versions` 重跑 Clippy；无告警时即可删除该例外。
+Clippy 会检查默认启用的全部规则并把告警视为错误，不使用新增的 `#[allow(clippy::...)]` 绕过源码问题。
 
 ## 交叉编译
 

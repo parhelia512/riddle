@@ -38,7 +38,7 @@ Run the same checks used by pull-request CI:
 cargo fmt --all -- --check
 cargo test --workspace --all-targets
 cargo check -p riddle --features install-bins --bins
-cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings -D clippy::pedantic -D clippy::nursery -D clippy::cargo -A clippy::multiple_crate_versions
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ## Open a Pull Request

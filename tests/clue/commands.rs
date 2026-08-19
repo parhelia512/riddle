@@ -1247,6 +1247,49 @@ fn standard_library_basics_compile_and_run() {
 }
 
 #[test]
+fn parse_i32_accepts_bounds_and_rejects_overflow() {
+    if c_compiler().is_none() {
+        eprintln!("skipping parse_i32 runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("parse-i32");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"use std::parse::parse_i32;
+
+fun main() -> i32 {
+    let min = -2147483647i32 - 1i32;
+    if parse_i32("0").unwrap_or(1) == 0
+        && parse_i32("2147483647").unwrap_or(0) == 2147483647i32
+        && parse_i32("-2147483648").unwrap_or(0) == min
+        && parse_i32("2147483648").is_none()
+        && parse_i32("-2147483649").is_none()
+        && parse_i32("").is_none()
+        && parse_i32("-").is_none()
+        && parse_i32("12x").is_none() {
+        0
+    } else {
+        1
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_style_display_fmt_compiles_and_runs() {
     if c_compiler().is_none() {
         eprintln!("skipping Display::fmt runtime test: no C compiler found");

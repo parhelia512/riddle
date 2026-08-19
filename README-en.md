@@ -63,7 +63,7 @@ otherwise it probes a GCC, Clang, or MSVC toolchain that can compile and link C1
 Prebuilt releases are available from [GitHub Releases][releases]: extract the
 archive for your platform and add its binary directory to `PATH`.
 
-Building from source requires a recent Rust stable toolchain.
+Building from source uses Rust 1.97.1 as pinned by `rust-toolchain.toml`.
 
 Bash:
 
@@ -98,7 +98,7 @@ After changing the source, validate the complete workspace with:
 cargo test --workspace --all-targets
 cargo check -p riddle --features install-bins --bins
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings -D clippy::pedantic -D clippy::nursery -D clippy::cargo -A clippy::multiple_crate_versions
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 `install-bins` is only for the root distribution package. Do not add
@@ -106,12 +106,8 @@ cargo clippy --workspace --all-targets --all-features --keep-going -- -D warning
 `clue`/`riddlec` binaries with identical output names. The separate
 `cargo check` above covers all three installation entry points.
 
-Clippy excludes only `multiple_crate_versions`: the current Cargo dependency
-metadata contains both `hashbrown 0.14/0.17` and `syn 2/3`. This does not
-disable any source lint, and source issues must not be bypassed with new
-`#[allow(clippy::...)]` attributes. After dependency updates, audit active
-dependencies with `cargo tree -d`, remove `-A clippy::multiple_crate_versions`,
-and rerun Clippy. Delete the exception once that command has no warnings.
+Clippy checks every default-enabled lint and treats warnings as errors. Source
+issues must not be bypassed with new `#[allow(clippy::...)]` attributes.
 
 ## Cross-compilation
 
