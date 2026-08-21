@@ -3766,3 +3766,744 @@ fn closure_field_capture_clears_only_that_fields_drop_slot() {
             }))
     );
 }
+
+#[test]
+fn loop_with_break_value_uses_slot_and_branches_to_exit() {
+    let module = lower(
+        r"
+        fun f() -> i32 {
+            let mut n = 0;
+            let r = loop {
+                n += 1;
+                if n > 3 {
+                    break n;
+                }
+            };
+            r
+        }
+        ",
+    );
+    let func = module
+        .functions
+        .values()
+        .find(|function| function.name == "f")
+        .expect("missing f");
+    let block_id = |label: &str| {
+        func.blocks
+            .iter()
+            .find_map(|(id, block)| (block.label.as_deref() == Some(label)).then_some(id))
+            .unwrap_or_else(|| panic!("missing block {label}: {func:#?}"))
+    };
+    let body = block_id("loop_body");
+    let exit = block_id("loop_exit");
+
+    let breaking = func
+        .blocks
+        .iter()
+        .map(|(_, block)| block)
+        .find(|block| {
+            matches!(block.terminator, mir::instr::Terminator::Branch(target) if target == exit)
+        })
+        .expect("missing break block");
+    let slot = breaking
+        .insts
+        .iter()
+        .find_map(|inst| match inst.kind {
+            mir::instr::InstKind::Store(_, ptr) => Some(ptr),
+            _ => None,
+        })
+        .expect("break must store its value before branching to loop_exit");
+    assert!(
+        func.blocks[exit]
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::Load(ptr) if ptr == slot)),
+        "loop_exit must load the value staged by break: {func:#?}"
+    );
+    // 循环体尾部必须跳回 loop_body，否则循环会意外落空
+    let falls_back = func.blocks.iter().any(|(_, block)| {
+        matches!(block.terminator, mir::instr::Terminator::Branch(target) if target == body)
+    });
+    assert!(
+        falls_back,
+        "loop body must branch back to itself: {func:#?}"
+    );
+}
+
+#[test]
+fn nested_loop_break_only_exits_inner_loop() {
+    let module = lower(
+        r"
+        fun f() -> i32 {
+            let mut n = 0;
+            let r = loop {
+                n += 1;
+                let inner = loop {
+                    break n > 3;
+                };
+                if inner {
+                    break n;
+                }
+            };
+            r
+        }
+        ",
+    );
+    let func = module
+        .functions
+        .values()
+        .find(|function| function.name == "f")
+        .expect("missing f");
+
+    let exits: Vec<_> = func
+        .blocks
+        .iter()
+        .filter(|(_, block)| block.label.as_deref() == Some("loop_exit"))
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(exits.len(), 2, "expected two loop exits: {func:#?}");
+
+    let reaches = |start, want: &dyn Fn(&mir::block::Block) -> bool| {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let block = &func.blocks[id];
+            if want(block) {
+                return true;
+            }
+            match block.terminator {
+                mir::instr::Terminator::Branch(target) => stack.push(target),
+                mir::instr::Terminator::CondBranch(_, then, otherwise) => {
+                    stack.push(then);
+                    stack.push(otherwise);
+                }
+                _ => {}
+            }
+        }
+        false
+    };
+    let is_loop_body = |block: &mir::block::Block| block.label.as_deref() == Some("loop_body");
+
+    // 内层 break 出口加载 bool；外层出口加载 i32。
+    let (inner_exit, outer_exit) = exits.iter().partition::<Vec<_>, _>(|id| {
+        func.blocks[**id].insts.iter().any(|inst| {
+            matches!(inst.kind, mir::instr::InstKind::Load(_)) && inst.ty == mir::types::Type::Bool
+        })
+    });
+    let (inner_exit, outer_exit) = (
+        *inner_exit.first().expect("missing inner loop exit"),
+        *outer_exit.first().expect("missing outer loop exit"),
+    );
+
+    assert!(
+        reaches(inner_exit, &is_loop_body),
+        "inner break must fall back into the outer loop body: {func:#?}"
+    );
+    assert!(
+        !reaches(outer_exit, &is_loop_body),
+        "outer break must leave both loops: {func:#?}"
+    );
+}
+
+#[test]
+fn loop_break_value_stores_before_dropping_locals() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard {}
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun f() -> i32 {
+            let r = loop {
+                let guard = Guard {};
+                break 42;
+            };
+            r
+        }
+        "#,
+    );
+    let func = module
+        .functions
+        .values()
+        .find(|function| function.name == "f")
+        .expect("missing f");
+    let exit = func
+        .blocks
+        .iter()
+        .find_map(|(id, block)| (block.label.as_deref() == Some("loop_exit")).then_some(id))
+        .expect("missing loop_exit");
+    let slot = func.blocks[exit]
+        .insts
+        .iter()
+        .find_map(|inst| match inst.kind {
+            mir::instr::InstKind::Load(ptr) => Some(ptr),
+            _ => None,
+        })
+        .expect("loop_exit must load the break value");
+
+    let reaches = |start, want: &dyn Fn(&mir::block::Block) -> bool| {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let block = &func.blocks[id];
+            if want(block) {
+                return true;
+            }
+            match block.terminator {
+                mir::instr::Terminator::Branch(target) => stack.push(target),
+                mir::instr::Terminator::CondBranch(_, then, otherwise) => {
+                    stack.push(then);
+                    stack.push(otherwise);
+                }
+                _ => {}
+            }
+        }
+        false
+    };
+    let is_drop_block = |block: &mir::block::Block| {
+        block.insts.iter().any(|inst| {
+            matches!(
+                &inst.kind,
+                mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
+                    if name.contains("drop")
+            )
+        })
+    };
+
+    // drop 发射会拆分块，因此沿控制流断言顺序：写入 break 槽的块必须先于 drop 块执行
+    let store_block =
+        func.blocks
+            .iter()
+            .map(|(id, _)| id)
+            .find(|id| {
+                func.blocks[*id].insts.iter().any(
+                    |inst| matches!(inst.kind, mir::instr::InstKind::Store(_, ptr) if ptr == slot),
+                )
+            })
+            .expect("break must store its value");
+    assert!(
+        reaches(store_block, &is_drop_block),
+        "break value must be stored before locals are dropped: {func:#?}"
+    );
+    let drop_block = func
+        .blocks
+        .iter()
+        .map(|(id, _)| id)
+        .find(|id| is_drop_block(&func.blocks[*id]))
+        .expect("break must drop loop locals");
+    assert!(
+        reaches(drop_block, &|block| block.label.as_deref()
+            == Some("loop_exit")),
+        "break path must reach loop_exit after dropping locals: {func:#?}"
+    );
+}
+
+#[test]
+fn if_let_desugars_to_a_match_with_a_wildcard_else_arm() {
+    let (hir, types, _, _) = compile(
+        r"
+        enum Option { Some(i32), None }
+
+        fun main() -> i32 {
+            let opt = Option::Some(1);
+            if let Option::Some(x) = opt { x } else { 0 }
+        }
+        ",
+    );
+    assert!(types.diagnostics.is_empty(), "{:#?}", types.diagnostics);
+
+    let desugared = hir.bodies.iter().any(|(_, body)| {
+        body.exprs.iter().any(|(_, expr)| {
+            matches!(expr, hir::body::Expr::Match { arms, .. }
+                if arms.len() == 2
+                    && arms.iter().all(|arm| arm.guard.is_none())
+                    && matches!(body.pats[arms[1].pat], hir::body::Pattern::Wildcard))
+        })
+    });
+    assert!(desugared, "if-let should desugar to a two-arm match");
+}
+
+#[test]
+fn while_let_desugars_to_a_loop_whose_body_matches_the_scrutinee() {
+    let (hir, types, _, _) = compile(
+        r"
+        enum Option { Some(i32), None }
+
+        fun next(state: i32) -> Option {
+            if state > 0 { Option::Some(state - 1) } else { Option::None }
+        }
+
+        fun main() -> i32 {
+            let mut state = 3;
+            let mut total = 0;
+            while let Option::Some(v) = next(state) {
+                total += v;
+                state = v;
+            }
+            total
+        }
+        ",
+    );
+    assert!(types.diagnostics.is_empty(), "{:#?}", types.diagnostics);
+
+    let desugared = hir.bodies.iter().any(|(_, body)| {
+        body.exprs.iter().any(|(_, expr)| {
+            let hir::body::Expr::Loop { body: loop_body } = expr else {
+                return false;
+            };
+            let hir::body::Expr::Block {
+                tail: Some(tail), ..
+            } = &body.exprs[*loop_body]
+            else {
+                return false;
+            };
+            let hir::body::Expr::Match { arms, .. } = &body.exprs[*tail] else {
+                return false;
+            };
+            let [matched, missed] = arms.as_slice() else {
+                return false;
+            };
+            !matches!(body.pats[matched.pat], hir::body::Pattern::Wildcard)
+                && matches!(body.pats[missed.pat], hir::body::Pattern::Wildcard)
+                && matches!(
+                    &body.exprs[missed.body],
+                    hir::body::Expr::Block { stmts, tail: None }
+                        if stmts.iter().any(|stmt| matches!(
+                            body.stmts[*stmt],
+                            hir::body::Stmt::Break { value: None }
+                        ))
+                )
+        })
+    });
+    assert!(
+        desugared,
+        "while-let should desugar to a loop whose body matches, breaking on the wildcard arm"
+    );
+}
+
+#[test]
+fn while_let_lowers_to_a_back_edge_and_a_pattern_branch() {
+    let module = lower(
+        r"
+        enum Option { Some(i32), None }
+
+        fun next(state: i32) -> Option {
+            if state > 0 { Option::Some(state - 1) } else { Option::None }
+        }
+
+        fun main() -> i32 {
+            let mut state = 3;
+            let mut total = 0;
+            while let Option::Some(v) = next(state) {
+                total += v;
+                state = v;
+            }
+            total
+        }
+        ",
+    );
+
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let has_back_edge = main.blocks.iter().any(|(id, block)| {
+        matches!(block.terminator, mir::instr::Terminator::Branch(target) if target <= id)
+    });
+    assert!(has_back_edge, "while-let should loop: {main:#?}");
+    assert!(
+        main.blocks
+            .iter()
+            .any(|(_, block)| matches!(block.terminator, mir::instr::Terminator::CondBranch(..))),
+        "while-let should branch on the pattern test: {main:#?}"
+    );
+}
+
+#[test]
+fn for_loop_tuple_pattern_binds_elements_over_arrays() {
+    let module = lower(
+        r"
+        fun main() {
+            let mut sum = 0;
+            let pairs = [(1, 2), (3, 4)];
+            for (a, b) in pairs {
+                sum += a + b;
+            }
+        }
+        ",
+    );
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let extracts = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| block.insts.iter())
+        .filter(|inst| matches!(inst.kind, mir::instr::InstKind::ExtractValue(..)))
+        .count();
+    assert!(
+        extracts >= 2,
+        "both tuple elements should be extracted into bindings: {main:#?}"
+    );
+    assert!(
+        main.blocks
+            .iter()
+            .any(|(_, block)| matches!(block.terminator, mir::instr::Terminator::CondBranch(..))),
+        "{main:#?}"
+    );
+}
+
+#[test]
+fn for_loop_tuple_pattern_binds_elements_over_iterators() {
+    let module = lower(
+        r"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct Counter {
+            current: i32,
+        }
+
+        impl Iterator for Counter {
+            type Item = (i32, i32);
+
+            fun next(&mut self) -> Option<Self::Item> {
+                if self.current < 3 {
+                    let value = self.current;
+                    self.current += 1;
+                    Option::Some((value, value))
+                } else {
+                    Option::None
+                }
+            }
+        }
+
+        impl IntoIterator for Counter {
+            type Item = (i32, i32);
+            type IntoIter = Counter;
+
+            fun into_iter(self) -> Self::IntoIter {
+                self
+            }
+        }
+
+        fun main() {
+            let mut sum = 0;
+            let counter = Counter { current: 0 };
+            for (a, b) in counter {
+                sum += a + b;
+            }
+        }
+        ",
+    );
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let extracts = main
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| block.insts.iter())
+        .filter(|inst| matches!(inst.kind, mir::instr::InstKind::ExtractValue(..)))
+        .count();
+    assert!(
+        extracts >= 2,
+        "both tuple elements should be extracted into bindings: {main:#?}"
+    );
+}
+
+#[test]
+fn for_loop_over_range_shaped_struct_still_binds_the_pattern() {
+    // Without an `IntoIterator` trait in scope the range fast path lowers the
+    // loop directly from the struct; the header binding must survive.
+    let module = lower(
+        r"
+        struct Range { start: i32, end: i32 }
+
+        fun main() {
+            let mut sum = 0;
+            let range = Range { start: 0, end: 3 };
+            for i in range {
+                sum += i;
+            }
+        }
+        ",
+    );
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    let has_back_edge = main.blocks.iter().any(|(id, block)| {
+        matches!(block.terminator, mir::instr::Terminator::Branch(target) if target <= id)
+    });
+    assert!(has_back_edge, "range loop should loop: {main:#?}");
+    assert!(
+        main.blocks
+            .iter()
+            .any(|(_, block)| matches!(block.terminator, mir::instr::Terminator::CondBranch(..))),
+        "range loop should branch on the cursor: {main:#?}"
+    );
+}
+
+#[test]
+fn let_else_lowers_to_a_conditional_binding() {
+    let module = lower(
+        r"
+        enum Option { Some(i32), None }
+
+        fun unwrap_or(opt: Option, fallback: i32) -> i32 {
+            let Option::Some(x) = opt else {
+                return fallback;
+            };
+            x
+        }
+        ",
+    );
+    let func = module
+        .functions
+        .values()
+        .find(|function| function.name == "unwrap_or")
+        .expect("missing unwrap_or");
+    let block_id = |label: &str| {
+        func.blocks
+            .iter()
+            .find_map(|(id, block)| (block.label.as_deref() == Some(label)).then_some(id))
+            .unwrap_or_else(|| panic!("missing block {label}: {func:#?}"))
+    };
+    let matched = block_id("let_else_match");
+    let diverge = block_id("let_else_diverge");
+    let merge = block_id("let_else_merge");
+
+    assert!(
+        func.blocks.iter().any(|(_, block)| matches!(
+            block.terminator,
+            mir::instr::Terminator::CondBranch(_, then, otherwise)
+                if then == matched && otherwise == diverge
+        )),
+        "let-else must branch on the pattern test: {func:#?}"
+    );
+    assert!(
+        matches!(
+            func.blocks[matched].terminator,
+            mir::instr::Terminator::Branch(target) if target == merge
+        ),
+        "the matched block must bind and fall through to the merge block: {func:#?}"
+    );
+
+    let reaches = |start, want: &dyn Fn(&mir::block::Block) -> bool| {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let block = &func.blocks[id];
+            if want(block) {
+                return true;
+            }
+            match block.terminator {
+                mir::instr::Terminator::Branch(target) => stack.push(target),
+                mir::instr::Terminator::CondBranch(_, then, otherwise) => {
+                    stack.push(then);
+                    stack.push(otherwise);
+                }
+                _ => {}
+            }
+        }
+        false
+    };
+    assert!(
+        reaches(diverge, &|block| {
+            matches!(block.terminator, mir::instr::Terminator::Return(_))
+        }),
+        "the diverging else block must end in a return: {func:#?}"
+    );
+    assert!(
+        !reaches(diverge, &|block| block.label.as_deref()
+            == Some("let_else_merge")),
+        "the else path never falls through past the statement: {func:#?}"
+    );
+}
+
+#[test]
+fn let_else_activates_drop_flags_only_on_the_matched_path() {
+    let module = lower(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard { id: i32 }
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        enum Maybe { Some(Guard), None }
+
+        fun unwrap_or(maybe: Maybe, fallback: i32) -> i32 {
+            let Maybe::Some(g) = maybe else {
+                return fallback;
+            };
+            g.id
+        }
+        "#,
+    );
+    let func = module
+        .functions
+        .values()
+        .find(|function| function.name == "unwrap_or")
+        .expect("missing unwrap_or");
+    let block_id = |label: &str| {
+        func.blocks
+            .iter()
+            .find_map(|(id, block)| (block.label.as_deref() == Some(label)).then_some(id))
+            .unwrap_or_else(|| panic!("missing block {label}: {func:#?}"))
+    };
+    let matched = block_id("let_else_match");
+    let diverge = block_id("let_else_diverge");
+    let defines = |value: mir::value::Value| {
+        func.blocks
+            .iter()
+            .flat_map(|(_, block)| {
+                block
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, inst)| (block.value_at(index), inst))
+            })
+            .find(|(candidate, _)| *candidate == value)
+            .map(|(_, inst)| inst)
+    };
+    let stores_bool = |block: &mir::block::Block, expect: bool| {
+        block
+            .insts
+            .iter()
+            .filter_map(move |inst| match inst.kind {
+                mir::instr::InstKind::Store(value, ptr) => match defines(value) {
+                    Some(defining)
+                        if matches!(
+                            defining.kind,
+                            mir::instr::InstKind::Const(mir::instr::ConstValue::Bool(b)) if b == expect
+                        ) =>
+                    {
+                        Some(ptr)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let flag = stores_bool(&func.blocks[matched], true)
+        .into_iter()
+        .next()
+        .expect("the matched block must activate the drop flag");
+    let test_block = func
+        .blocks
+        .iter()
+        .map(|(id, _)| id)
+        .find(|id| {
+            matches!(
+                func.blocks[*id].terminator,
+                mir::instr::Terminator::CondBranch(_, then, otherwise)
+                    if then == matched && otherwise == diverge
+            )
+        })
+        .expect("missing the pattern test block");
+    assert!(
+        stores_bool(&func.blocks[test_block], false)
+            .into_iter()
+            .any(|ptr| ptr == flag),
+        "the drop flag must start inactive before the branch: {func:#?}"
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![diverge];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let block = &func.blocks[id];
+        assert!(
+            !stores_bool(block, true).into_iter().any(|ptr| ptr == flag),
+            "the else path must not activate the drop flag: {func:#?}"
+        );
+        match block.terminator {
+            mir::instr::Terminator::Branch(target) => stack.push(target),
+            mir::instr::Terminator::CondBranch(_, then, otherwise) => {
+                stack.push(then);
+                stack.push(otherwise);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn let_else_with_an_irrefutable_pattern_binds_unconditionally() {
+    let module = lower(
+        r"
+        fun main() -> i32 {
+            let (a, b) = (1, 2) else {
+                return 0;
+            };
+            a + b
+        }
+        ",
+    );
+    let main = module
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("missing main");
+    assert!(
+        !main
+            .blocks
+            .iter()
+            .any(|(_, block)| block.label.as_deref() == Some("let_else_match")),
+        "an irrefutable pattern needs no conditional binding: {main:#?}"
+    );
+    assert!(
+        main.blocks
+            .iter()
+            .flat_map(|(_, block)| block.insts.iter())
+            .filter(|inst| matches!(inst.kind, mir::instr::InstKind::ExtractValue(..)))
+            .count()
+            >= 2,
+        "both tuple elements should be extracted into bindings: {main:#?}"
+    );
+}

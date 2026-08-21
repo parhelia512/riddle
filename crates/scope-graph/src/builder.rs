@@ -1063,10 +1063,21 @@ impl<'a> ScopeGraphBuilder<'a> {
         edges: &mut Vec<EdgeId>,
     ) -> NodeId {
         match &body.stmts[sid] {
-            Stmt::Let { pat, ty, init, .. } => {
+            Stmt::Let {
+                pat,
+                ty,
+                init,
+                else_,
+                ..
+            } => {
                 self.emit_type_references(ty, current_scope, nodes, edges);
                 if let Some(init) = init {
                     self.walk_expr_for_refs(body_id, body, *init, current_scope, nodes, edges);
+                }
+                if let Some(else_) = else_ {
+                    // The else block runs when the pattern did not match, so
+                    // the bindings are not visible inside it.
+                    self.walk_expr_for_refs(body_id, body, *else_, current_scope, nodes, edges);
                 }
 
                 // `let` bindings become visible only after the initializer, and
@@ -1079,7 +1090,13 @@ impl<'a> ScopeGraphBuilder<'a> {
                 }
                 current_scope
             }
-            Stmt::Break | Stmt::Continue => current_scope,
+            Stmt::Break { value } => {
+                if let Some(v) = value {
+                    self.walk_expr_for_refs(body_id, body, *v, current_scope, nodes, edges);
+                }
+                current_scope
+            }
+            Stmt::Continue => current_scope,
             Stmt::Expr { expr } => {
                 self.walk_expr_for_refs(body_id, body, *expr, current_scope, nodes, edges);
                 current_scope
@@ -1182,6 +1199,9 @@ impl<'a> ScopeGraphBuilder<'a> {
             }
             Expr::While { condition, body: b } => {
                 self.walk_expr_for_refs(body_id, body, *condition, current_scope, nodes, edges);
+                self.walk_expr_for_refs(body_id, body, *b, current_scope, nodes, edges);
+            }
+            Expr::Loop { body: b } => {
                 self.walk_expr_for_refs(body_id, body, *b, current_scope, nodes, edges);
             }
             Expr::For {

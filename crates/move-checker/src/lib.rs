@@ -194,9 +194,18 @@ pub fn analyze(hir: &HirFile, type_result: &TypeCheckResult) -> AnalysisResult {
         trait_env: &type_result.trait_env,
         reference_flow: &reference_flow,
         result,
+        loop_break_values: Vec::new(),
+        loop_break_states: Vec::new(),
     };
     a.analyze_all_bodies();
     a.result
+}
+
+/// break 跳出点的 move 状态快照，用于合并 `loop` 出口状态。
+struct MoveStateSnapshot {
+    bindings: MoveBindings,
+    moved_places: HashSet<Place>,
+    moved_sites: HashMap<Place, (Option<TextRange>, String)>,
 }
 
 struct Analyzer<'a> {
@@ -205,6 +214,10 @@ struct Analyzer<'a> {
     trait_env: &'a TraitEnv,
     reference_flow: &'a ReferenceFlow,
     result: AnalysisResult,
+    /// 每层 `loop` 收集带值 break 的操作数与跳出点的 move 状态。
+    /// while/for 也压入空帧，保证内层 break 不会泄漏到外层 loop。
+    loop_break_values: Vec<Vec<ExprId>>,
+    loop_break_states: Vec<Vec<MoveStateSnapshot>>,
 }
 
 impl Analyzer<'_> {
@@ -272,6 +285,8 @@ impl Analyzer<'_> {
             Expr::If { .. } => self.move_check_if(ctx, expr_id),
 
             Expr::While { .. } => self.move_check_while(ctx, expr_id),
+
+            Expr::Loop { .. } => self.move_check_loop(ctx, expr_id),
 
             Expr::For { .. } => self.move_check_for(ctx, expr_id),
 
@@ -514,7 +529,9 @@ impl Analyzer<'_> {
         self.move_check_expr(ctx, condition);
         self.apply_recorded_value_use(ctx, condition);
         let mut condition_exit = ctx.clone();
+        self.push_loop_frames();
         self.move_check_expr(ctx, body);
+        self.pop_loop_frames();
         self.apply_recorded_value_use(ctx, body);
         let mut loop_head = loop_entry.clone();
         let mut loop_exit = ctx.clone();
@@ -531,12 +548,75 @@ impl Analyzer<'_> {
             self.move_check_expr(&mut iteration, condition);
             self.apply_recorded_value_use(&mut iteration, condition);
             condition_exit = iteration.clone();
+            self.push_loop_frames();
             self.move_check_expr(&mut iteration, body);
+            self.pop_loop_frames();
             self.apply_recorded_value_use(&mut iteration, body);
             self.retain_new_loop_move_diagnostics(diagnostic_count);
             loop_exit = iteration;
         }
         ctx.copy_move_state_from(&condition_exit);
+    }
+
+    fn move_check_loop(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
+        let Expr::Loop { body } = ctx.body.exprs[expr_id] else {
+            unreachable!("expected loop expression");
+        };
+        // 与 while 相同的不动点迭代；循环体至少执行一次，出口只经由 break
+        let loop_entry = ctx.clone();
+        self.push_loop_frames();
+        self.move_check_expr(ctx, body);
+        self.apply_recorded_value_use(ctx, body);
+        let (mut break_values, mut break_states) = self.pop_loop_frames();
+        let mut loop_head = loop_entry.clone();
+        let mut loop_exit = ctx.clone();
+        loop {
+            let mut next_head = loop_entry.clone();
+            next_head.merge_move_state_from(&loop_exit);
+            if next_head.same_move_state(&loop_head) {
+                break;
+            }
+            loop_head = next_head;
+            let mut iteration = loop_entry.clone();
+            iteration.copy_move_state_from(&loop_head);
+            let diagnostic_count = self.result.diagnostics.len();
+            self.push_loop_frames();
+            self.move_check_expr(&mut iteration, body);
+            self.apply_recorded_value_use(&mut iteration, body);
+            let (values, states) = self.pop_loop_frames();
+            break_values.extend(values);
+            break_states.extend(states);
+            self.retain_new_loop_move_diagnostics(diagnostic_count);
+            loop_exit = iteration;
+        }
+        if let Some(first) = break_states.first() {
+            ctx.copy_move_state_snapshot(first);
+            for state in &break_states[1..] {
+                ctx.merge_move_state_snapshot(state);
+            }
+        }
+        let mut value = OriginValue::default();
+        for break_value in break_values {
+            value.merge(ctx.expr_origin_value(break_value));
+        }
+        ctx.set_expr_origin_value(expr_id, value);
+    }
+
+    fn push_loop_frames(&mut self) {
+        self.loop_break_values.push(Vec::new());
+        self.loop_break_states.push(Vec::new());
+    }
+
+    fn pop_loop_frames(&mut self) -> (Vec<ExprId>, Vec<MoveStateSnapshot>) {
+        let values = self
+            .loop_break_values
+            .pop()
+            .expect("loop break value stack must be present");
+        let states = self
+            .loop_break_states
+            .pop()
+            .expect("loop break state stack must be present");
+        (values, states)
     }
 
     fn move_check_for(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
@@ -574,7 +654,9 @@ impl Analyzer<'_> {
         ctx.push_scope();
         Self::bind_pattern_names(ctx, pat);
         self.bind_pattern_origins(ctx, pat, &item_value);
+        self.push_loop_frames();
         self.move_check_expr(ctx, body);
+        self.pop_loop_frames();
         ctx.pop_scope();
         let mut loop_head = loop_entry.clone();
         let mut loop_exit = ctx.clone();
@@ -591,7 +673,9 @@ impl Analyzer<'_> {
             iteration.push_scope();
             Self::bind_pattern_names(&mut iteration, pat);
             self.bind_pattern_origins(&mut iteration, pat, &item_value);
+            self.push_loop_frames();
             self.move_check_expr(&mut iteration, body);
+            self.pop_loop_frames();
             self.retain_new_loop_move_diagnostics(diagnostic_count);
             iteration.pop_scope();
             loop_exit = iteration;
@@ -836,7 +920,9 @@ impl Analyzer<'_> {
     fn move_check_stmt(&mut self, ctx: &mut BodyCtx<'_>, stmt_id: StmtId) {
         let s = &ctx.body.stmts[stmt_id];
         match s {
-            Stmt::Let { pat, init, .. } => {
+            Stmt::Let {
+                pat, init, else_, ..
+            } => {
                 let pat = *pat;
                 if let Some(init) = *init {
                     self.move_check_expr(ctx, init);
@@ -845,6 +931,17 @@ impl Analyzer<'_> {
                     Self::deactivate_unretained(ctx, init, &HashSet::new());
                     self.check_explicit_reference_pattern_move(ctx, pat);
                     self.apply_recorded_value_use(ctx, init);
+                }
+                if let Some(else_) = else_ {
+                    // The else block diverges, so its moves never flow past
+                    // the statement; check it against a snapshot and restore.
+                    let bindings = ctx.bindings.clone();
+                    let moved_places = ctx.moved_places.clone();
+                    let moved_sites = ctx.moved_sites.clone();
+                    self.move_check_expr(ctx, *else_);
+                    ctx.bindings = bindings;
+                    ctx.moved_places = moved_places;
+                    ctx.moved_sites = moved_sites;
                 }
                 Self::reset_pattern_moves(ctx, pat);
             }
@@ -859,7 +956,19 @@ impl Analyzer<'_> {
                     self.apply_recorded_value_use(ctx, *v);
                 }
             }
-            Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
+            Stmt::Break { value } => {
+                if let Some(v) = value {
+                    self.move_check_expr(ctx, *v);
+                    self.apply_recorded_value_use(ctx, *v);
+                    if let Some(values) = self.loop_break_values.last_mut() {
+                        values.push(*v);
+                    }
+                }
+                if let Some(states) = self.loop_break_states.last_mut() {
+                    states.push(ctx.move_state_snapshot());
+                }
+            }
+            Stmt::Continue | Stmt::Item { .. } => {}
         }
     }
 
@@ -2459,6 +2568,27 @@ impl<'a> BodyCtx<'a> {
         self.moved_sites.clone_from(&other.moved_sites);
     }
 
+    fn move_state_snapshot(&self) -> MoveStateSnapshot {
+        MoveStateSnapshot {
+            bindings: self.bindings.clone(),
+            moved_places: self.moved_places.clone(),
+            moved_sites: self.moved_sites.clone(),
+        }
+    }
+
+    fn copy_move_state_snapshot(&mut self, snapshot: &MoveStateSnapshot) {
+        self.bindings.clone_from(&snapshot.bindings);
+        self.moved_places.clone_from(&snapshot.moved_places);
+        self.moved_sites.clone_from(&snapshot.moved_sites);
+    }
+
+    fn merge_move_state_snapshot(&mut self, snapshot: &MoveStateSnapshot) {
+        self.bindings.merge_moved_from(&snapshot.bindings);
+        self.moved_places
+            .extend(snapshot.moved_places.iter().cloned());
+        self.moved_sites.extend(snapshot.moved_sites.clone());
+    }
+
     fn merge_move_state_from(&mut self, other: &Self) {
         self.bindings.merge_moved_from(&other.bindings);
         self.moved_places.extend(other.moved_places.iter().cloned());
@@ -2849,6 +2979,9 @@ fn collect_expr_local_uses(body: &Body, id: ExprId, uses: &mut HashMap<PatternBi
             collect_expr_local_uses(body, *condition, uses);
             collect_expr_local_uses(body, *loop_body, uses);
         }
+        Expr::Loop { body: loop_body } => {
+            collect_expr_local_uses(body, *loop_body, uses);
+        }
         Expr::For {
             iterable,
             body: loop_body,
@@ -2911,9 +3044,12 @@ fn collect_block_local_uses(
 ) {
     for stmt_id in stmts {
         match &body.stmts[*stmt_id] {
-            Stmt::Let { init, .. } => {
+            Stmt::Let { init, else_, .. } => {
                 if let Some(init) = init {
                     collect_expr_local_uses(body, *init, uses);
+                }
+                if let Some(else_) = else_ {
+                    collect_expr_local_uses(body, *else_, uses);
                 }
             }
             Stmt::Expr { expr } => collect_expr_local_uses(body, *expr, uses),
@@ -2922,7 +3058,12 @@ fn collect_block_local_uses(
                     collect_expr_local_uses(body, *value, uses);
                 }
             }
-            Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
+            Stmt::Break { value } => {
+                if let Some(value) = value {
+                    collect_expr_local_uses(body, *value, uses);
+                }
+            }
+            Stmt::Continue | Stmt::Item { .. } => {}
         }
     }
     if let Some(tail) = tail {

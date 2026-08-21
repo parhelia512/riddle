@@ -1499,3 +1499,98 @@ fn dynamic_index_and_deref_stop_capture_projection_at_their_base() {
     assert!(capture.place.projections.is_empty());
     assert!(matches!(capture.ty, Type::Ref(_, false)));
 }
+
+#[test]
+fn for_loop_accepts_irrefutable_patterns() {
+    let result = check(
+        r"
+        struct Pair { left: i32, right: i32 }
+
+        fun main() {
+            let tuples = [(1i32, 2i32), (3i32, 4i32)];
+            for (a, b) in tuples {
+                let sum: i32 = a + b;
+            }
+            for (a, _) in tuples {
+                let value: i32 = a;
+            }
+            let structs = [Pair { left: 1i32, right: 2i32 }];
+            for Pair { left, right } in structs {
+                let sum: i32 = left + right;
+            }
+            for _ in tuples {}
+        }
+        ",
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn for_loop_rejects_refutable_patterns() {
+    let result = check(
+        r"
+        enum Opt { None, Some(i32) }
+
+        fun main() {
+            let opts = [Opt::Some(1i32), Opt::None];
+            for Opt::Some(inner) in opts {
+                let value: i32 = inner;
+            }
+        }
+        ",
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0057"
+                && diagnostic.message.contains("for")
+                && diagnostic.message.contains("Opt::None")
+        }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn for_loop_rejects_literal_patterns() {
+    let result = check(
+        r"
+        fun main() {
+            let values = [1i32, 2i32];
+            for 0 in values {}
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0057"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn for_loop_shape_mismatch_reports_only_the_shape_error() {
+    let result = check(
+        r"
+        fun main() {
+            let values = [1i32, 2i32];
+            for (a, b) in values {}
+        }
+        ",
+    );
+
+    assert!(!result.diagnostics.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0057"),
+        "{:#?}",
+        result.diagnostics
+    );
+}

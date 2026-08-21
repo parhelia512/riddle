@@ -70,6 +70,8 @@ ast_node!(StructExpr, StructExpr);
 ast_node!(StructExprField, StructExprField);
 ast_node!(IfStmt, IfStmt);
 ast_node!(WhileStmt, WhileStmt);
+ast_node!(LetCondition, LetCondition);
+ast_node!(LoopExpr, LoopExpr);
 ast_node!(ForExpr, ForExpr);
 ast_node!(MatchExpr, MatchExpr);
 ast_node!(MatchArm, MatchArm);
@@ -345,6 +347,18 @@ impl VarDecl {
     pub fn init(&self) -> Option<Expr> {
         support::child(&self.syntax)
     }
+
+    /// The diverging block of a `let`-`else`. The initializer may itself be a
+    /// block expression (`let x = { 1 } else { .. };`), so the block is
+    /// located relative to the `else` token rather than by child position.
+    #[must_use]
+    pub fn else_block(&self) -> Option<Block> {
+        let else_token = support::token_of(&self.syntax, SyntaxKind::Else)?;
+        self.syntax
+            .children()
+            .filter(|node| node.text_range().start() >= else_token.text_range().end())
+            .find_map(Block::cast)
+    }
 }
 
 impl FuncDecl {
@@ -395,6 +409,13 @@ impl FuncDecl {
 }
 
 impl ReturnStmt {
+    #[must_use]
+    pub fn value(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
+impl BreakStmt {
     #[must_use]
     pub fn value(&self) -> Option<Expr> {
         support::child(&self.syntax)
@@ -917,9 +938,26 @@ impl LambdaExpr {
     }
 }
 
+impl LetCondition {
+    #[must_use]
+    pub fn pattern(&self) -> Option<Pattern> {
+        support::child(&self.syntax)
+    }
+
+    #[must_use]
+    pub fn expr(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
 impl IfStmt {
     #[must_use]
     pub fn condition(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    #[must_use]
+    pub fn let_condition(&self) -> Option<LetCondition> {
         support::child(&self.syntax)
     }
 
@@ -950,15 +988,29 @@ impl WhileStmt {
     }
 
     #[must_use]
+    pub fn let_condition(&self) -> Option<LetCondition> {
+        support::child(&self.syntax)
+    }
+
+    #[must_use]
+    pub fn body(&self) -> Option<Block> {
+        support::child(&self.syntax)
+    }
+}
+
+impl LoopExpr {
+    #[must_use]
     pub fn body(&self) -> Option<Block> {
         support::child(&self.syntax)
     }
 }
 
 impl ForExpr {
+    /// The loop header pattern. As with `let`, only irrefutable patterns are
+    /// accepted downstream.
     #[must_use]
-    pub fn name(&self) -> Option<SyntaxToken> {
-        support::token_of(&self.syntax, SyntaxKind::Ident)
+    pub fn pattern(&self) -> Option<Pattern> {
+        support::child(&self.syntax)
     }
 
     #[must_use]
@@ -1766,6 +1818,7 @@ pub enum Expr {
     Block(Block),
     IfStmt(IfStmt),
     WhileStmt(WhileStmt),
+    LoopExpr(LoopExpr),
     ForExpr(ForExpr),
     MatchExpr(MatchExpr),
     ArrayExpr(ArrayExpr),
@@ -1794,6 +1847,7 @@ impl AstNode for Expr {
             SyntaxKind::Block => Some(Self::Block(Block { syntax: node })),
             SyntaxKind::IfStmt => Some(Self::IfStmt(IfStmt { syntax: node })),
             SyntaxKind::WhileStmt => Some(Self::WhileStmt(WhileStmt { syntax: node })),
+            SyntaxKind::LoopExpr => Some(Self::LoopExpr(LoopExpr { syntax: node })),
             SyntaxKind::ForExpr => Some(Self::ForExpr(ForExpr { syntax: node })),
             SyntaxKind::MatchExpr => Some(Self::MatchExpr(MatchExpr { syntax: node })),
             SyntaxKind::ArrayExpr => Some(Self::ArrayExpr(ArrayExpr { syntax: node })),
@@ -1823,6 +1877,7 @@ impl AstNode for Expr {
             Self::Block(it) => it.syntax(),
             Self::IfStmt(it) => it.syntax(),
             Self::WhileStmt(it) => it.syntax(),
+            Self::LoopExpr(it) => it.syntax(),
             Self::ForExpr(it) => it.syntax(),
             Self::MatchExpr(it) => it.syntax(),
             Self::ArrayExpr(it) => it.syntax(),

@@ -837,6 +837,7 @@ const fn is_keyword(kind: SyntaxKind) -> bool {
             | SyntaxKind::If
             | SyntaxKind::Else
             | SyntaxKind::While
+            | SyntaxKind::Loop
             | SyntaxKind::Break
             | SyntaxKind::Continue
             | SyntaxKind::Return

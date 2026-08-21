@@ -70,7 +70,7 @@ impl TypeChecker<'_> {
         };
 
         let old_return = std::mem::replace(&mut ctx.return_ty, return_ty.clone());
-        let old_loop_depth = std::mem::replace(&mut ctx.loop_depth, 0);
+        let old_loop_stack = std::mem::take(&mut ctx.loop_stack);
         ctx.lambdas.push(LambdaCtx {
             expr: expr_id,
             params: param_types.clone(),
@@ -89,7 +89,7 @@ impl TypeChecker<'_> {
         self.record_value_use(ctx, body, ValueUse::Move);
         let lambda = ctx.lambdas.pop().expect("lambda context must be present");
         ctx.return_ty = old_return;
-        ctx.loop_depth = old_loop_depth;
+        ctx.loop_stack = old_loop_stack;
 
         self.finish_lambda(ctx, expr_id, params, param_types, return_ty, lambda)
     }

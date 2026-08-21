@@ -1,8 +1,8 @@
 use super::{
-    BinaryOp, BodyCtx, Expr, ExprId, HirStructField, HirTypeRef, IntTy, ResolvedName, Stmt, StmtId,
-    StructId, TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse, Visibility, is_supported_cast,
-    is_unsafe_dst_layout_cast, struct_field_is_visible_for_owner, substitute_type,
-    type_contains_unresolved_const_param, type_ref_contains_error,
+    BinaryOp, BodyCtx, Expr, ExprId, HirStructField, HirTypeRef, IntTy, LoopCtx, ResolvedName,
+    Stmt, StmtId, StructId, TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse, Visibility,
+    is_supported_cast, is_unsafe_dst_layout_cast, struct_field_is_visible_for_owner,
+    substitute_type, type_contains_unresolved_const_param, type_ref_contains_error,
 };
 
 impl TypeChecker<'_> {
@@ -73,7 +73,7 @@ impl TypeChecker<'_> {
 
     pub(super) fn stmt_always_returns(&self, ctx: &BodyCtx<'_>, stmt_id: StmtId) -> bool {
         match &ctx.body.stmts[stmt_id] {
-            Stmt::Return { .. } | Stmt::Break | Stmt::Continue => true,
+            Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue => true,
             Stmt::Expr { expr } => self.expr_always_returns(ctx, *expr),
             Stmt::Let { init, .. } => init.is_some_and(|expr| self.expr_always_returns(ctx, expr)),
             Stmt::Item { .. } => false,
@@ -87,8 +87,10 @@ impl TypeChecker<'_> {
                 ty,
                 ty_range,
                 init,
+                else_,
             } => {
                 let pat = *pat;
+                let else_ = *else_;
                 let declared = if init.is_none() && matches!(ty, HirTypeRef::Unknown) {
                     // A delayed binding can infer its type from a later
                     // assignment, just like Rust's `let value; value = ...`.
@@ -111,6 +113,20 @@ impl TypeChecker<'_> {
                     }
                 });
 
+                if let Some(else_expr) = else_ {
+                    // Checked before the bindings are bound: the else block
+                    // runs when the pattern did not match, so it cannot see
+                    // them, and it must diverge for the bindings to be
+                    // initialized on every path past the statement.
+                    let else_ty = self.check_expr(ctx, else_expr);
+                    if !matches!(else_ty, Type::Never | Type::Error) {
+                        self.diagnostic(
+                            "E0066",
+                            "`else` block of `let`-`else` must diverge",
+                            ctx.expr_range(else_expr),
+                        );
+                    }
+                }
                 if let Some(init_ty) = init_ty {
                     if !explicit_error && !declared.is_unknown_like() {
                         self.expect_assignable(
@@ -129,7 +145,7 @@ impl TypeChecker<'_> {
                     if inferred {
                         self.expect_sized_value(&local_ty, ctx.stmt_range(stmt_id));
                     }
-                    self.bind_let_pattern(ctx, pat, &local_ty, stmt_id, true);
+                    self.bind_let_pattern(ctx, pat, &local_ty, stmt_id, true, else_.is_some());
                 } else {
                     let delayed_bindings = Self::mark_delayed_pattern(ctx, pat);
                     if matches!(ty, HirTypeRef::Unknown) {
@@ -142,7 +158,7 @@ impl TypeChecker<'_> {
                             ));
                         }
                     }
-                    self.bind_let_pattern(ctx, pat, &declared, stmt_id, false);
+                    self.bind_let_pattern(ctx, pat, &declared, stmt_id, false, else_.is_some());
                 }
                 if let Some(init) = *init {
                     let use_kind = self.pattern_value_use(ctx, pat);
@@ -163,17 +179,42 @@ impl TypeChecker<'_> {
                     self.record_value_use(ctx, value, ValueUse::Move);
                 }
             }
-            Stmt::Break => {
-                if ctx.loop_depth == 0 {
+            Stmt::Break { value } => {
+                let value = *value;
+                if ctx.loop_stack.is_empty() {
                     self.diagnostic(
                         "E0042",
                         "`break` outside of a loop",
                         ctx.stmt_range(stmt_id),
                     );
+                    if let Some(value) = value {
+                        self.check_expr(ctx, value);
+                    }
+                } else if !ctx.loop_stack.last().is_some_and(|ctx| ctx.allows_value)
+                    && value.is_some()
+                {
+                    self.diagnostic(
+                        "E0065",
+                        "`break` with a value is only allowed inside `loop`",
+                        ctx.stmt_range(stmt_id),
+                    );
+                    self.check_expr(ctx, value.expect("checked above"));
+                } else {
+                    let (ty, range) = match value {
+                        Some(value) => {
+                            let ty = self.check_expr(ctx, value);
+                            self.record_value_use(ctx, value, ValueUse::Move);
+                            (ty, ctx.expr_range(value))
+                        }
+                        None => (Type::Unit, ctx.stmt_range(stmt_id)),
+                    };
+                    if let Some(loop_ctx) = ctx.loop_stack.last_mut() {
+                        loop_ctx.break_types.push((ty, range));
+                    }
                 }
             }
             Stmt::Continue => {
-                if ctx.loop_depth == 0 {
+                if ctx.loop_stack.is_empty() {
                     self.diagnostic(
                         "E0042",
                         "`continue` outside of a loop",
@@ -304,6 +345,7 @@ impl TypeChecker<'_> {
             }
             Expr::If { .. }
             | Expr::While { .. }
+            | Expr::Loop { .. }
             | Expr::For { .. }
             | Expr::Match { .. }
             | Expr::Array { .. }
@@ -377,11 +419,31 @@ impl TypeChecker<'_> {
                     ctx.expr_range(*condition),
                 );
                 self.record_value_use(ctx, *condition, ValueUse::Move);
-                ctx.loop_depth += 1;
+                ctx.loop_stack.push(LoopCtx {
+                    allows_value: false,
+                    break_types: Vec::new(),
+                });
                 self.check_expr(ctx, *body);
-                ctx.loop_depth -= 1;
+                ctx.loop_stack.pop();
                 self.record_value_use(ctx, *body, ValueUse::Move);
                 Type::Unit
+            }
+            Expr::Loop { body } => {
+                ctx.loop_stack.push(LoopCtx {
+                    allows_value: true,
+                    break_types: Vec::new(),
+                });
+                self.check_expr(ctx, *body);
+                let loop_ctx = ctx.loop_stack.pop().expect("loop context must be present");
+                self.record_value_use(ctx, *body, ValueUse::Move);
+                let mut result = None;
+                for (ty, range) in loop_ctx.break_types {
+                    result = Some(match result {
+                        None => ty,
+                        Some(acc) => self.join_branch_types(acc, ty, "break values", range),
+                    });
+                }
+                result.unwrap_or(Type::Never)
             }
             Expr::For {
                 pat,

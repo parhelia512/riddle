@@ -31,6 +31,14 @@ fn completion_filters_keywords_globals_and_locals_by_prefix() {
         CompileOptions { use_std: false },
     );
     assert!(keywords.iter().any(|item| item.label == "return"));
+
+    let loop_source = "fun main() { loo }";
+    let loop_items = completion_items_for_source(
+        loop_source,
+        position(loop_source, loop_source.find("loo").unwrap() + 3),
+        CompileOptions { use_std: false },
+    );
+    assert!(loop_items.iter().any(|item| item.label == "loop"));
 }
 
 #[test]

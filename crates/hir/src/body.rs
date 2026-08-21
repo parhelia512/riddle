@@ -77,6 +77,10 @@ pub enum Stmt {
         ty: HirTypeRef,
         ty_range: Option<TextRange>,
         init: Option<ExprId>,
+        /// The diverging block of `let PAT = init else { .. };`. The bindings
+        /// escape to the enclosing scope, so this stays on the statement
+        /// instead of desugaring to a `match`.
+        else_: Option<ExprId>,
     },
     Expr {
         expr: ExprId,
@@ -84,7 +88,9 @@ pub enum Stmt {
     Return {
         value: Option<ExprId>,
     },
-    Break,
+    Break {
+        value: Option<ExprId>,
+    },
     Continue,
     /// `mod inner { ... }` or `use foo::bar;` inside a function body.
     /// All such items are promoted to the global `ItemTree`, so we only
@@ -144,6 +150,9 @@ pub enum Expr {
     },
     While {
         condition: ExprId,
+        body: ExprId,
+    },
+    Loop {
         body: ExprId,
     },
     For {
@@ -428,7 +437,13 @@ impl BodyPrinter<'_> {
 
     fn print_stmt(&self, stmt: StmtId, indent: usize) -> String {
         match &self.body.stmts[stmt] {
-            Stmt::Let { pat, ty, init, .. } => {
+            Stmt::Let {
+                pat,
+                ty,
+                init,
+                else_,
+                ..
+            } => {
                 let mut out = format!("let {}", self.print_pat(*pat));
                 if !matches!(ty, HirTypeRef::Unknown) {
                     out.push_str(": ");
@@ -437,6 +452,10 @@ impl BodyPrinter<'_> {
                 if let Some(init) = init {
                     out.push_str(" = ");
                     out.push_str(&self.print_expr(*init, 0, indent));
+                }
+                if let Some(else_) = else_ {
+                    out.push_str(" else ");
+                    out.push_str(&self.print_expr(*else_, 0, indent));
                 }
                 out.push(';');
                 out
@@ -450,7 +469,15 @@ impl BodyPrinter<'_> {
                 out.push(';');
                 out
             }
-            Stmt::Break => String::from("break;"),
+            Stmt::Break { value } => {
+                let mut out = String::from("break");
+                if let Some(v) = value {
+                    out.push(' ');
+                    out.push_str(&self.print_expr(*v, 0, indent));
+                }
+                out.push(';');
+                out
+            }
             Stmt::Continue => String::from("continue;"),
             Stmt::Expr { expr } => {
                 let mut out = self.print_expr(*expr, 0, indent);
@@ -558,6 +585,7 @@ impl BodyPrinter<'_> {
                 else_branch,
             } => self.print_if(*cond, *then_branch, *else_branch, indent),
             Expr::While { condition, body } => self.print_while(*condition, *body, indent),
+            Expr::Loop { body } => format!("loop {}", self.print_block_like(*body, indent)),
             Expr::For {
                 pat,
                 iterable,
@@ -752,6 +780,7 @@ impl BodyPrinter<'_> {
             Expr::Block { .. }
             | Expr::If { .. }
             | Expr::While { .. }
+            | Expr::Loop { .. }
             | Expr::For { .. }
             | Expr::Match { .. }
             | Expr::Unsafe { .. } => 0,

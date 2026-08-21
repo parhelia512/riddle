@@ -2131,3 +2131,55 @@ fn c_generic_function_item_adapter_targets_one_instantiation() {
         "{generated}"
     );
 }
+
+#[test]
+fn c_if_let_lowers_through_the_match_path() {
+    let module = lower(
+        r"
+        enum Option { Some(i32), None }
+
+        fun main() -> i32 {
+            let opt = Option::Some(7);
+            if let Option::Some(x) = opt { x } else { 0 }
+        }
+        ",
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("block_match_pattern_payload"),
+        "{generated}"
+    );
+    assert!(generated.contains("block_match_merge"), "{generated}");
+}
+
+#[test]
+fn c_while_let_re_evaluates_the_scrutinee_inside_the_loop() {
+    let module = lower(
+        r"
+        enum Option { Some(i32), None }
+
+        fun next(state: i32) -> Option {
+            if state > 0 { Option::Some(state - 1) } else { Option::None }
+        }
+
+        fun main() -> i32 {
+            let mut state = 3;
+            let mut total = 0;
+            while let Option::Some(v) = next(state) {
+                total += v;
+                state = v;
+            }
+            total
+        }
+        ",
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(generated.contains("block_loop_body_"), "{generated}");
+    assert!(
+        generated.contains("block_match_pattern_payload"),
+        "{generated}"
+    );
+    assert!(generated.contains("goto block_loop_body_"), "{generated}");
+}

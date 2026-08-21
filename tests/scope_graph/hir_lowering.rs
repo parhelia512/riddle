@@ -31,7 +31,7 @@ fn break_and_continue_parse_and_lower() {
     assert!(
         body.stmts
             .iter()
-            .any(|(_, stmt)| matches!(stmt, Stmt::Break))
+            .any(|(_, stmt)| matches!(stmt, Stmt::Break { value: None }))
     );
     assert!(
         body.stmts

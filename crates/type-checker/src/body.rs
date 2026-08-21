@@ -16,7 +16,7 @@ use hir::{
 
 use crate::{
     checker::{GenericEdge, PendingGenericCall, TypeChecker},
-    context::{BodyCtx, LambdaCtx},
+    context::{BodyCtx, LambdaCtx, LoopCtx},
     lang_items::LangItem,
     lowering::{
         builtin_callable_kind, collect_subst, generic_param_map_with_consts, substitute_type,

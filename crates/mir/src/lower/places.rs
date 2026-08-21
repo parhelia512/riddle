@@ -1,6 +1,6 @@
 use super::{
-    Body, Builder, CapturePlace, CaptureSource, DropProjection, Expr, ExprId, HirUnOp, IntTy,
-    LetPatternInput, LetSource, LetStorage, LowerCtx, PatId, Pattern, PatternBindingId,
+    Body, Builder, CapturePlace, CaptureSource, DropProjection, DropSlot, Expr, ExprId, HirUnOp,
+    IntTy, LetPatternInput, LetSource, LetStorage, LowerCtx, PatId, Pattern, PatternBindingId,
     PatternBindingMode, Projection, ResolvedName, Stmt, StmtId, Type, UnOp, Value,
     let_pattern_bindings, resolve_field_index,
 };
@@ -266,9 +266,7 @@ impl LowerCtx<'_> {
     ) {
         let stmt = &body.stmts[stmt_id];
         match stmt {
-            Stmt::Let { pat, init, ty, .. } => {
-                self.lower_let_stmt(builder, param_values, body, *pat, *init, ty);
-            }
+            Stmt::Let { .. } => self.lower_let_stmt(builder, param_values, body, stmt),
             Stmt::Expr { expr } => {
                 self.temporary_drop_scopes.push(Vec::new());
                 let value = self.lower_expr(builder, param_values, body, *expr);
@@ -286,11 +284,18 @@ impl LowerCtx<'_> {
                 builder.set_return(rv);
                 self.temporary_drop_scopes.pop();
             }
-            Stmt::Break => {
+            Stmt::Break { value } => {
                 let target = *self
                     .loop_targets
                     .last()
                     .expect("break statement outside a checked loop");
+                // 先存 break 值再 drop：值本身可能是待 drop 作用域里的局部量
+                if let Some(value) = value {
+                    let v = self.lower_expr(builder, param_values, body, *value);
+                    if let Some(slot) = target.break_slot {
+                        builder.store(v, slot);
+                    }
+                }
                 self.emit_temporary_drop_scopes_since(builder, target.temporary_drop_depth);
                 self.emit_drop_scopes_since(builder, target.drop_depth);
                 builder.set_branch(target.break_block);
@@ -313,17 +318,41 @@ impl LowerCtx<'_> {
         builder: &mut Builder,
         param_values: &[Value],
         body: &Body,
-        pat: PatId,
-        init: Option<ExprId>,
-        ty: &hir::item_tree::HirTypeRef,
+        stmt: &Stmt,
     ) {
+        let Stmt::Let {
+            pat,
+            init,
+            ty,
+            else_,
+            ..
+        } = stmt
+        else {
+            unreachable!("lower_let_stmt called for a non-let statement");
+        };
         self.temporary_drop_scopes.push(Vec::new());
-        let storage = self.lower_let_storage(builder, param_values, body, pat, init, ty);
+        let storage = self.lower_let_storage(builder, param_values, body, *pat, *init, ty);
         self.scope_map.insert(storage.root, storage.value);
+
+        // let-else 只在模式匹配成功后绑定,先求出匹配条件;不可反驳模式
+        // 没有条件,走普通绑定路径(else 块永不执行,不再降级)。
+        let condition = else_.and_then(|else_expr| {
+            let value = if self.storage_bindings.contains(&storage.root) {
+                let ty = self.convert_type(&storage.value_ty);
+                builder.load(storage.value, ty)
+            } else {
+                storage.value
+            };
+            self.lower_pattern_condition(builder, body, *pat, value, &storage.value_ty)
+                .map(|condition| (condition, else_expr))
+        });
+
         let slots = if storage.needs_drop {
             let slots =
                 self.create_drop_slots(builder, storage.value, &storage.value_ty, Vec::new());
-            if storage.delayed {
+            // 与延迟绑定同理:匹配块之外值可能未绑定,drop 标记先置
+            // inactive,匹配成功(或延迟赋值)后再激活。
+            if storage.delayed || condition.is_some() {
                 for slot in &slots {
                     let inactive = builder.bconst(false);
                     let flag = Self::drop_slot_flag_place(builder, slot);
@@ -335,6 +364,56 @@ impl LowerCtx<'_> {
             Vec::new()
         };
 
+        let Some((condition, else_expr)) = condition else {
+            self.bind_let_storage(builder, body, *pat, &storage, slots);
+            if builder.needs_return() {
+                self.emit_current_temporary_drop_scope(builder);
+            }
+            self.temporary_drop_scopes.pop();
+            return;
+        };
+
+        let match_block = builder.func.new_block_labeled("let_else_match");
+        let diverge_block = builder.func.new_block_labeled("let_else_diverge");
+        let merge_block = builder.func.new_block_labeled("let_else_merge");
+        builder.set_cond_branch(condition, match_block, diverge_block);
+
+        builder.switch_to_block(diverge_block);
+        self.lower_expr(builder, param_values, body, else_expr);
+        // E0066 已保证 else 块发散,这里只为未终止的情况兜底。
+        if builder.needs_return() {
+            self.emit_current_temporary_drop_scope(builder);
+            builder.set_unreachable();
+        }
+
+        builder.switch_to_block(match_block);
+        self.bind_let_storage(builder, body, *pat, &storage, slots.clone());
+        for slot in &slots {
+            let active = builder.bconst(true);
+            let flag = Self::drop_slot_flag_place(builder, slot);
+            builder.store(active, flag);
+        }
+        if builder.needs_return() {
+            builder.set_branch(merge_block);
+        }
+
+        builder.switch_to_block(merge_block);
+        if builder.needs_return() {
+            self.emit_current_temporary_drop_scope(builder);
+        }
+        self.temporary_drop_scopes.pop();
+    }
+
+    /// 把 let 的存储按模式拆成各个绑定,并为每个绑定登记拥有的 drop
+    /// 槽位。let-else 在匹配块里调用它,普通 let 则无条件调用。
+    fn bind_let_storage(
+        &mut self,
+        builder: &mut Builder,
+        body: &Body,
+        pat: PatId,
+        storage: &LetStorage,
+        slots: Vec<DropSlot>,
+    ) {
         let mut bound = vec![(storage.root, Vec::new())];
         if !matches!(body.pats[pat], Pattern::Binding { .. }) {
             let source = if self.storage_bindings.contains(&storage.root) {
@@ -368,10 +447,6 @@ impl LowerCtx<'_> {
         if let Some(scope) = self.drop_scopes.last_mut() {
             scope.extend(slots.into_iter().rev());
         }
-        if builder.needs_return() {
-            self.emit_current_temporary_drop_scope(builder);
-        }
-        self.temporary_drop_scopes.pop();
     }
 
     fn lower_let_storage(

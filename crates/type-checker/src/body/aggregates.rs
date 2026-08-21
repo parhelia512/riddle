@@ -1,7 +1,8 @@
 use super::{
     BodyCtx, ConstArg, Expr, ExprId, ForLoopInfo, HashMap, HashSet, HirTypeRef, HirVariantKind,
-    IntTy, MatchArm, PatId, ResolvedName, TraitId, TraitMethodCall, Type, TypeChecker, ValueUse,
-    collect_subst, generic_param_map_with_consts, pattern_has_unresolved_param, substitute_type,
+    IntTy, LoopCtx, MatchArm, PatId, ResolvedName, TraitId, TraitMethodCall, Type, TypeChecker,
+    ValueUse, collect_subst, generic_param_map_with_consts, pattern_has_unresolved_param,
+    substitute_type,
 };
 
 impl TypeChecker<'_> {
@@ -324,6 +325,27 @@ impl TypeChecker<'_> {
         }
     }
 
+    // Binds a `for` loop header pattern. Like `let`, the header has no
+    // alternative branch, so the pattern must be irrefutable.
+    fn bind_for_pattern(&mut self, ctx: &mut BodyCtx<'_>, pat: PatId, item_ty: &Type) {
+        let before = self.result.diagnostics.len();
+        self.bind_pattern(ctx, pat, item_ty);
+        self.report_duplicate_pattern_bindings(ctx, pat);
+        // A pattern whose shape already mismatched the item type reports a
+        // nonsense witness, so only well-formed patterns reach the coverage
+        // check.
+        if self.result.diagnostics.len() == before
+            && !item_ty.is_unknown_like()
+            && let Some((witness, _)) = self.missing_let_pattern(ctx, pat, item_ty)
+        {
+            self.diagnostic(
+                "E0057",
+                format!("refutable pattern in `for` loop: `{witness}` is not covered"),
+                ctx.pat_range(pat),
+            );
+        }
+    }
+
     pub(super) fn check_for(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -338,10 +360,13 @@ impl TypeChecker<'_> {
         let Some(into_iter_trait) = self.find_trait_by_name("IntoIterator") else {
             if let Type::Array(item_ty, _) = &iterable_ty {
                 ctx.push_scope();
-                self.bind_pattern(ctx, pat, item_ty);
-                ctx.loop_depth += 1;
+                self.bind_for_pattern(ctx, pat, item_ty);
+                ctx.loop_stack.push(LoopCtx {
+                    allows_value: false,
+                    break_types: Vec::new(),
+                });
                 self.check_expr(ctx, body);
-                ctx.loop_depth -= 1;
+                ctx.loop_stack.pop();
                 self.record_value_use(ctx, body, ValueUse::Move);
                 ctx.pop_scope();
                 return Type::Unit;
@@ -421,10 +446,13 @@ impl TypeChecker<'_> {
         }
 
         ctx.push_scope();
-        self.bind_pattern(ctx, pat, &item_ty);
-        ctx.loop_depth += 1;
+        self.bind_for_pattern(ctx, pat, &item_ty);
+        ctx.loop_stack.push(LoopCtx {
+            allows_value: false,
+            break_types: Vec::new(),
+        });
         self.check_expr(ctx, body);
-        ctx.loop_depth -= 1;
+        ctx.loop_stack.pop();
         self.record_value_use(ctx, body, ValueUse::Move);
         ctx.pop_scope();
 

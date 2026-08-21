@@ -1210,24 +1210,4 @@ impl LowerCtx<'_> {
         binding.place = Some(place);
         Some(place)
     }
-
-    pub(super) fn push_pattern_binding(&mut self, body: &Body, pat: PatId, value: Value, ty: Type) {
-        let mut scope = HashMap::new();
-        if matches!(body.pats[pat], Pattern::Binding { .. }) {
-            scope.insert(
-                PatternBindingId {
-                    pattern: pat,
-                    field: None,
-                },
-                PatternBindingValue::direct(
-                    value,
-                    ty,
-                    type_checker::Type::Int(type_checker::IntTy::I32),
-                    None,
-                    Vec::new(),
-                ),
-            );
-        }
-        self.pattern_bindings.push(scope);
-    }
 }

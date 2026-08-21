@@ -187,6 +187,8 @@ struct SummaryAnalyzer<'a> {
     /// `PatternBindingId` is unique per pattern site, so one flat map suffices.
     locals: HashMap<PatternBindingId, FlowValue>,
     returned: FlowValue,
+    /// 每层循环收集带值 break 的 provenance；while/for 压入空帧后丢弃。
+    loop_break_values: Vec<Vec<FlowValue>>,
 }
 
 impl<'a> SummaryAnalyzer<'a> {
@@ -204,6 +206,7 @@ impl<'a> SummaryAnalyzer<'a> {
             body: &hir.bodies[body_id],
             locals: HashMap::new(),
             returned: FlowValue::default(),
+            loop_break_values: Vec::new(),
         }
     }
 
@@ -283,6 +286,8 @@ impl<'a> SummaryAnalyzer<'a> {
             } => self.analyze_if(*cond, *then_branch, *else_branch),
 
             Expr::While { condition, body } => self.analyze_while(*condition, *body),
+
+            Expr::Loop { body } => self.analyze_loop(*body),
 
             Expr::For {
                 pat,
@@ -374,16 +379,37 @@ impl<'a> SummaryAnalyzer<'a> {
     fn analyze_while(&mut self, condition: ExprId, body: ExprId) -> FlowValue {
         self.analyze_expr(condition);
         let entry = self.locals.clone();
+        self.loop_break_values.push(Vec::new());
         self.analyze_expr(body);
+        self.loop_break_values.pop();
         self.locals = merge_two_locals(entry, self.locals.clone());
         FlowValue::default()
+    }
+
+    fn analyze_loop(&mut self, body: ExprId) -> FlowValue {
+        let entry = self.locals.clone();
+        self.loop_break_values.push(Vec::new());
+        self.analyze_expr(body);
+        let break_values = self
+            .loop_break_values
+            .pop()
+            .expect("loop break stack must be present");
+        self.locals = merge_two_locals(entry, self.locals.clone());
+        // loop 的结果值 = 所有带值 break 的 provenance 合并
+        let mut result = FlowValue::default();
+        for value in break_values {
+            result.merge(value);
+        }
+        result
     }
 
     fn analyze_for(&mut self, pat: PatId, iterable: ExprId, body: ExprId) -> FlowValue {
         let iterable_value = self.analyze_expr(iterable).iterated();
         let entry = self.locals.clone();
         self.bind_pattern_sources(pat, &iterable_value);
+        self.loop_break_values.push(Vec::new());
         self.analyze_expr(body);
+        self.loop_break_values.pop();
         self.locals = merge_two_locals(entry, self.locals.clone());
         FlowValue::default()
     }
@@ -426,9 +452,14 @@ impl<'a> SummaryAnalyzer<'a> {
 
     fn analyze_stmt(&mut self, stmt_id: StmtId) {
         match &self.body.stmts[stmt_id] {
-            Stmt::Let { pat, init, .. } => {
+            Stmt::Let {
+                pat, init, else_, ..
+            } => {
                 let (pat, init) = (*pat, *init);
                 let value = init.map(|init| self.analyze_expr(init)).unwrap_or_default();
+                if let Some(else_) = else_ {
+                    self.analyze_expr(*else_);
+                }
                 self.bind_pattern_sources(pat, &value);
             }
             Stmt::Expr { expr } => {
@@ -440,7 +471,15 @@ impl<'a> SummaryAnalyzer<'a> {
                     self.returned.merge(returned);
                 }
             }
-            Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
+            Stmt::Break { value } => {
+                if let Some(value) = value {
+                    let value = self.analyze_expr(*value);
+                    if let Some(values) = self.loop_break_values.last_mut() {
+                        values.push(value);
+                    }
+                }
+            }
+            Stmt::Continue | Stmt::Item { .. } => {}
         }
     }
 

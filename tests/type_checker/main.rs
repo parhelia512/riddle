@@ -4,6 +4,8 @@ mod diagnostic_support;
 mod dst;
 mod errors;
 mod incremental;
+mod let_conditions;
+mod let_else;
 mod structs;
 mod traits;
 #[path = "unsafe.rs"]

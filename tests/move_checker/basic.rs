@@ -1752,3 +1752,364 @@ fn by_value_operator_makes_its_closure_single_use() {
             .any(|diagnostic| { diagnostic.code == "E0100" && diagnostic.message.contains("add") })
     );
 }
+
+#[test]
+fn loop_break_moves_the_broken_value() {
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+
+        fun consume(value: Token) {}
+
+        fun f() {
+            let token = Token { value: 1 };
+            loop {
+                break token;
+            }
+            consume(token);
+        }
+        ",
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0100" && diagnostic.message.contains("token")),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn loop_result_origin_merges_break_values() {
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+
+        fun consume(value: Token) {}
+
+        fun f() {
+            let token = Token { value: 1 };
+            let result = loop {
+                break &token;
+            };
+            consume(token);
+            consume_ref(result);
+        }
+
+        fun consume_ref(value: &Token) {}
+        ",
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0304" && diagnostic.message.contains("token")),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn loop_result_borrow_ends_before_move() {
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+
+        fun consume(value: Token) {}
+
+        fun f() {
+            let token = Token { value: 1 };
+            let result = loop {
+                break &token;
+            };
+            let value = result.value;
+            consume(token);
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn loop_break_of_fresh_value_is_accepted() {
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+
+        fun consume(value: Token) {}
+
+        fun f() {
+            let kept = Token { value: 1 };
+            let result = loop {
+                break Token { value: 2 };
+            };
+            consume(result);
+            consume(kept);
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn loop_break_propagates_definite_initialization() {
+    let result = analyze(
+        r"
+        fun f() -> i32 {
+            let mut value: i32;
+            loop {
+                value = 1;
+                break;
+            }
+            value
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn loop_break_on_partial_path_keeps_use_rejected() {
+    let result = analyze(
+        r"
+        fun f(flag: bool) -> i32 {
+            let mut value: i32;
+            loop {
+                if flag {
+                    break;
+                }
+                value = 1;
+                break;
+            }
+            value
+        }
+        ",
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0059"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn if_let_arm_can_move_the_bound_payload() {
+    let result = analyze(
+        r"
+        struct Token {}
+        enum Option { Some(Token), None }
+        fun consume(value: Token) {}
+
+        fun f() {
+            let opt = Option::Some(Token {});
+            if let Option::Some(token) = opt {
+                consume(token);
+            }
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn if_let_moved_payload_cannot_be_reused_in_the_arm() {
+    let result = analyze(
+        r"
+        struct Token {}
+        enum Option { Some(Token), None }
+        fun consume(value: Token) {}
+
+        fun f() {
+            let opt = Option::Some(Token {});
+            if let Option::Some(token) = opt {
+                consume(token);
+                consume(token);
+            }
+        }
+        ",
+    );
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|message| message.contains("use of moved value") && message.contains("token")),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn while_let_body_can_move_the_bound_payload() {
+    let result = analyze(
+        r"
+        struct Token {}
+        enum Option { Some(Token), None }
+        fun consume(value: Token) {}
+
+        fun f(source: Option) {
+            let mut current = source;
+            while let Option::Some(token) = current {
+                consume(token);
+                current = Option::None;
+            }
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn if_let_branches_merge_definite_initialization() {
+    let complete = analyze(
+        r"
+        enum Option { Some(i32), None }
+
+        fun f(opt: Option) -> i32 {
+            let value: i32;
+            if let Option::Some(x) = opt { value = x; } else { value = 0; }
+            value
+        }
+        ",
+    );
+    assert!(
+        complete.diagnostics.is_empty(),
+        "{:#?}",
+        complete.diagnostics
+    );
+
+    let incomplete = analyze(
+        r"
+        enum Option { Some(i32), None }
+
+        fun f(opt: Option) -> i32 {
+            let value: i32;
+            if let Option::Some(x) = opt { value = x; }
+            value
+        }
+        ",
+    );
+    assert!(
+        incomplete
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0059"),
+        "{:#?}",
+        incomplete.diagnostics
+    );
+}
+
+#[test]
+fn for_tuple_pattern_moves_each_element_binding_independently() {
+    let result = analyze(
+        r"
+        struct Wrapper { value: i32 }
+
+        fun consume(wrapper: Wrapper) {}
+
+        fun f() {
+            let pairs = [(Wrapper { value: 1 }, Wrapper { value: 2 })];
+            for (first, second) in pairs {
+                consume(first);
+                consume(second);
+            }
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn for_tuple_pattern_rejects_use_after_moving_a_binding() {
+    let result = analyze(
+        r"
+        struct Wrapper { value: i32 }
+
+        fun consume(wrapper: Wrapper) {}
+
+        fun f() {
+            let pairs = [(Wrapper { value: 1 }, 1)];
+            for (wrapper, tag) in pairs {
+                consume(wrapper);
+                consume(wrapper);
+            }
+        }
+        ",
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0100" && diagnostic.message.contains("wrapper")),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn let_else_binding_is_initialized_after_the_statement() {
+    let result = analyze(
+        r"
+        enum Option { Some(i32), None }
+
+        fun f(opt: Option) -> i32 {
+            let Option::Some(x) = opt else {
+                return -1;
+            };
+            x
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn let_else_moves_in_the_else_block_do_not_leak() {
+    let result = analyze(
+        r"
+        enum Option { Some(i32), None }
+
+        struct Token { value: i32 }
+
+        fun consume(token: Token) {}
+
+        fun f(opt: Option) -> i32 {
+            let token = Token { value: 1 };
+            let Option::Some(x) = opt else {
+                consume(token);
+                return -1;
+            };
+            consume(token);
+            x
+        }
+        ",
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "the diverging else path must not move outer values for the fallthrough path: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn let_else_binding_can_move_out_of_the_scrutinee() {
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+
+        enum Maybe { Some(Token), None }
+
+        fun consume(token: Token) {}
+
+        fun f(maybe: Maybe) {
+            let Maybe::Some(token) = maybe else {
+                return;
+            };
+            consume(token);
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}

@@ -451,6 +451,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::LBracket
                 | SyntaxKind::If
                 | SyntaxKind::While
+                | SyntaxKind::Loop
                 | SyntaxKind::For
                 | SyntaxKind::Match
                 | SyntaxKind::Unsafe
@@ -727,9 +728,28 @@ impl<'s> Parser<'s> {
             self.ty();
         }
 
-        if self.at(SyntaxKind::Eq) {
+        let has_init = if self.at(SyntaxKind::Eq) {
             self.bump();
             self.expression();
+            true
+        } else {
+            false
+        };
+
+        if self.at(SyntaxKind::Else) {
+            self.bump();
+            // `let x else { .. }` has no value to match the pattern against.
+            if !has_init {
+                self.error_no_bump("`let`-`else` requires an initializer".to_string());
+            }
+            if self.at(SyntaxKind::LBrace) {
+                self.block();
+            } else {
+                self.error(format!(
+                    "expected block after `else`, found {:?}",
+                    self.current()
+                ));
+            }
         }
 
         self.expect(SyntaxKind::Semi);
@@ -913,6 +933,9 @@ impl<'s> Parser<'s> {
     fn loop_control_stmt(&mut self, kind: SyntaxKind) {
         let m = self.start();
         self.bump();
+        if kind == SyntaxKind::BreakStmt && self.at_expr_start() {
+            self.expression();
+        }
         self.expect(SyntaxKind::Semi);
         m.complete(self, kind);
     }
@@ -1024,7 +1047,11 @@ impl<'s> Parser<'s> {
     fn if_expr(&mut self) -> CompletedMarker {
         let m = self.start();
         self.expect(SyntaxKind::If);
-        self.expression_no_struct();
+        if self.at(SyntaxKind::Let) {
+            self.let_condition();
+        } else {
+            self.expression_no_struct();
+        }
 
         if self.at(SyntaxKind::LBrace) {
             self.block();
@@ -1055,7 +1082,11 @@ impl<'s> Parser<'s> {
     fn while_expr(&mut self) -> CompletedMarker {
         let m = self.start();
         self.expect(SyntaxKind::While);
-        self.expression_no_struct();
+        if self.at(SyntaxKind::Let) {
+            self.let_condition();
+        } else {
+            self.expression_no_struct();
+        }
 
         if self.at(SyntaxKind::LBrace) {
             self.block();
@@ -1069,10 +1100,35 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::WhileStmt)
     }
 
+    fn let_condition(&mut self) {
+        let m = self.start();
+        self.bump();
+        self.pattern();
+        self.expect(SyntaxKind::Eq);
+        self.expression_no_struct();
+        m.complete(self, SyntaxKind::LetCondition);
+    }
+
+    fn loop_expr(&mut self) -> CompletedMarker {
+        let m = self.start();
+        self.expect(SyntaxKind::Loop);
+
+        if self.at(SyntaxKind::LBrace) {
+            self.block();
+        } else {
+            self.error(format!(
+                "expected block after 'loop', found {:?}",
+                self.current()
+            ));
+        }
+
+        m.complete(self, SyntaxKind::LoopExpr)
+    }
+
     fn for_expr(&mut self) -> CompletedMarker {
         let m = self.start();
         self.expect(SyntaxKind::For);
-        self.expect(SyntaxKind::Ident);
+        self.pattern();
         self.expect(SyntaxKind::In);
         self.expression_no_struct();
 
@@ -1468,6 +1524,8 @@ impl<'s> Parser<'s> {
             SyntaxKind::If => Some(self.if_expr()),
 
             SyntaxKind::While => Some(self.while_expr()),
+
+            SyntaxKind::Loop => Some(self.loop_expr()),
 
             SyntaxKind::For => Some(self.for_expr()),
 
@@ -2299,6 +2357,7 @@ const fn is_expr_with_block(kind: SyntaxKind) -> bool {
         SyntaxKind::Block
             | SyntaxKind::IfStmt
             | SyntaxKind::WhileStmt
+            | SyntaxKind::LoopExpr
             | SyntaxKind::ForExpr
             | SyntaxKind::MatchExpr
             | SyntaxKind::UnsafeExpr

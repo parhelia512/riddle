@@ -1188,3 +1188,161 @@ fn nested_array_repeat_requires_copy_leaf_values() {
             .any(|msg| msg.contains("array repeat value must be Copy"))
     );
 }
+
+#[test]
+fn loop_break_value_types_are_joined() {
+    let result = check(
+        r"
+        fun pick(flag: bool) -> i32 {
+            let value = loop {
+                if flag {
+                    break 1;
+                }
+                break 2;
+            };
+            value
+        }
+        ",
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn loop_break_value_unifies_with_expected_type() {
+    let result = check(
+        r"
+        fun pick(flag: bool) -> i64 {
+            let value: i64 = loop {
+                if flag {
+                    break 1;
+                }
+                break 2;
+            };
+            value
+        }
+        ",
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn loop_break_values_must_have_compatible_types() {
+    let result = check(
+        r#"
+        fun pick(flag: bool) {
+            let value = loop {
+                if flag {
+                    break 1;
+                }
+                break "nope";
+            };
+        }
+        "#,
+    );
+
+    assert!(
+        messages(&result)
+            .iter()
+            .any(|msg| msg.contains("break values have incompatible types")),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn break_with_value_is_rejected_in_while_and_for() {
+    let result = check(
+        r"
+        fun f() {
+            let mut i = 0;
+            while i < 10 {
+                break 1;
+            }
+            for item in [1, 2, 3] {
+                break item;
+            }
+        }
+        ",
+    );
+
+    let diagnostics = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0065")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn break_with_value_outside_loop_is_rejected() {
+    let result = check(
+        r"
+        fun f() {
+            break 1;
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0042"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn loop_without_break_diverges() {
+    let result = check(
+        r"
+        fun forever() -> i32 {
+            loop {
+            }
+        }
+        ",
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn nested_loop_break_value_binds_to_innermost_loop() {
+    let ok = check(
+        r"
+        fun f(flag: bool) -> i32 {
+            while flag {
+                let value = loop {
+                    break 1;
+                };
+                return value;
+            }
+            0
+        }
+        ",
+    );
+    assert_eq!(ok.diagnostics, vec![]);
+
+    let rejected = check(
+        r"
+        fun f(flag: bool) {
+            loop {
+                while flag {
+                    break 1;
+                }
+            }
+        }
+        ",
+    );
+    assert!(
+        rejected
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0065"),
+        "{:#?}",
+        rejected.diagnostics
+    );
+}

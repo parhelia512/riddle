@@ -18,7 +18,7 @@ fn semantic_tokens_classifies_core_tokens() {
 
 #[test]
 fn semantic_tokens_classify_every_keyword() {
-    let source = "let fun struct if else while break continue return as self mod use mut pub super crate enum trait impl match const type extern unsafe for in where move true false";
+    let source = "let fun struct if else while loop break continue return as self mod use mut pub super crate enum trait impl match const type extern unsafe for in where move true false";
     let tokens = semantic_tokens(source);
 
     assert_eq!(

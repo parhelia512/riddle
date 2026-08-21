@@ -123,7 +123,7 @@
 
 ((identifier) @keyword.control
   (#any-of? @keyword.control
-    "if" "else" "while" "for" "in" "match" "break" "continue" "return"))
+    "if" "else" "while" "loop" "for" "in" "match" "break" "continue" "return"))
 
 ((identifier) @keyword
   (#any-of? @keyword

@@ -22,10 +22,16 @@ pub struct BodyCtx<'a> {
     /// allowed even when the binding is not `mut`; move checking enforces the
     /// definite-initialization and reassignment rules afterwards.
     pub(crate) delayed_bindings: HashSet<PatternBindingId>,
-    pub(crate) loop_depth: usize,
+    pub(crate) loop_stack: Vec<LoopCtx>,
     pub(crate) unsafe_depth: usize,
     pub(crate) lambdas: Vec<LambdaCtx>,
     source_map: &'a SourceMap,
+}
+
+pub(crate) struct LoopCtx {
+    /// `loop { }` allows `break value;`; `while`/`for` do not.
+    pub allows_value: bool,
+    pub break_types: Vec<(Type, Option<TextRange>)>,
 }
 
 impl<'a> BodyCtx<'a> {
@@ -48,7 +54,7 @@ impl<'a> BodyCtx<'a> {
             generic_params,
             bindings: ScopedBindings::default(),
             delayed_bindings: HashSet::new(),
-            loop_depth: 0,
+            loop_stack: Vec::new(),
             unsafe_depth: 0,
             lambdas: Vec::new(),
             source_map: &body.source_map,
@@ -74,7 +80,7 @@ impl<'a> BodyCtx<'a> {
             generic_params,
             bindings: ScopedBindings::default(),
             delayed_bindings: HashSet::new(),
-            loop_depth: 0,
+            loop_stack: Vec::new(),
             unsafe_depth: 0,
             lambdas: Vec::new(),
             source_map: &body.source_map,

@@ -278,6 +278,8 @@ impl PatternBindingValue {
 struct LoopTargets {
     break_block: BlockId,
     continue_block: BlockId,
+    /// `loop { }` 表达式的 break 值存放位（alloca），仅当结果类型非 Unit/Never 时存在。
+    break_slot: Option<Value>,
     drop_depth: usize,
     temporary_drop_depth: usize,
 }

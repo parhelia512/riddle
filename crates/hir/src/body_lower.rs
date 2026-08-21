@@ -199,12 +199,14 @@ impl<'a> BodyLower<'a> {
                 let ty_range = ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
                 let ty = Self::lower_optional_type(ty_ast);
                 let init = self.lower_optional_expr(var.init());
+                let else_ = var.else_block().map(|block| self.lower_block(&block));
                 Some(self.alloc_stmt(
                     Stmt::Let {
                         pat,
                         ty,
                         ty_range,
                         init,
+                        else_,
                     },
                     range,
                 ))
@@ -215,7 +217,10 @@ impl<'a> BodyLower<'a> {
                 Some(self.alloc_stmt(Stmt::Return { value }, range))
             }
 
-            ast::Stmt::BreakStmt(_) => Some(self.alloc_stmt(Stmt::Break, range)),
+            ast::Stmt::BreakStmt(b) => {
+                let value = self.lower_optional_expr(b.value());
+                Some(self.alloc_stmt(Stmt::Break { value }, range))
+            }
 
             ast::Stmt::ContinueStmt(_) => Some(self.alloc_stmt(Stmt::Continue, range)),
 
@@ -414,6 +419,8 @@ impl<'a> BodyLower<'a> {
 
             ast::Expr::WhileStmt(while_stmt) => self.lower_while_expr(&while_stmt, range),
 
+            ast::Expr::LoopExpr(loop_expr) => self.lower_loop_expr(&loop_expr, range),
+
             ast::Expr::ForExpr(for_expr) => self.lower_for_expr(&for_expr, range),
 
             ast::Expr::CallExpr(c) => {
@@ -548,6 +555,9 @@ impl<'a> BodyLower<'a> {
     }
 
     fn lower_if_expr(&mut self, if_stmt: &ast::IfStmt, range: TextRange) -> ExprId {
+        if let Some(let_condition) = if_stmt.let_condition() {
+            return self.lower_if_let_expr(if_stmt, &let_condition, range);
+        }
         let cond = self.lower_required_expr(if_stmt.condition(), "missing if condition", range);
         let then_branch =
             self.lower_required_block(if_stmt.then_branch(), "missing if body", range);
@@ -566,26 +576,118 @@ impl<'a> BodyLower<'a> {
         )
     }
 
+    // `if let pat = scrutinee { then } else { else }` lowers to a match whose
+    // wildcard arm holds the else branch (or an empty block).
+    fn lower_if_let_expr(
+        &mut self,
+        if_stmt: &ast::IfStmt,
+        condition: &ast::LetCondition,
+        range: TextRange,
+    ) -> ExprId {
+        let scrutinee =
+            self.lower_required_expr(condition.expr(), "missing if-let scrutinee", range);
+        let pat = self.lower_arm_pattern(condition.pattern());
+        let then_branch =
+            self.lower_required_block(if_stmt.then_branch(), "missing if body", range);
+        let else_branch = match if_stmt.else_branch() {
+            Some(ElseBranch::Block(block)) => self.lower_block(&block),
+            Some(ElseBranch::IfStmt(if_stmt)) => self.lower_expr(ast::Expr::IfStmt(if_stmt)),
+            None => self.alloc_expr(
+                Expr::Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                },
+                range,
+            ),
+        };
+        let wildcard = self.alloc_pat(Pattern::Wildcard, range);
+        self.alloc_expr(
+            Expr::Match {
+                scrutinee,
+                arms: vec![
+                    MatchArm {
+                        pat,
+                        guard: None,
+                        body: then_branch,
+                    },
+                    MatchArm {
+                        pat: wildcard,
+                        guard: None,
+                        body: else_branch,
+                    },
+                ],
+            },
+            range,
+        )
+    }
+
     fn lower_while_expr(&mut self, while_stmt: &ast::WhileStmt, range: TextRange) -> ExprId {
+        if let Some(let_condition) = while_stmt.let_condition() {
+            return self.lower_while_let_expr(while_stmt, &let_condition, range);
+        }
         let condition =
             self.lower_required_expr(while_stmt.condition(), "missing while condition", range);
         let body = self.lower_required_block(while_stmt.body(), "missing while body", range);
         self.alloc_expr(Expr::While { condition, body }, range)
     }
 
-    fn lower_for_expr(&mut self, for_expr: &ast::ForExpr, range: TextRange) -> ExprId {
-        let name_token = for_expr.name();
-        let pat_range = name_token
-            .as_ref()
-            .map_or(range, rowan::SyntaxToken::text_range);
-        let name = lower_name(name_token);
-        let pat = self.alloc_pat(
-            Pattern::Binding {
-                name,
-                is_mut: false,
+    // `while let pat = scrutinee { body }` lowers to a loop whose body matches
+    // on the re-evaluated scrutinee; the loop body itself is the pattern arm
+    // body so bindings stay in scope, and the wildcard arm breaks.
+    fn lower_while_let_expr(
+        &mut self,
+        while_stmt: &ast::WhileStmt,
+        condition: &ast::LetCondition,
+        range: TextRange,
+    ) -> ExprId {
+        let scrutinee =
+            self.lower_required_expr(condition.expr(), "missing while-let scrutinee", range);
+        let pat = self.lower_arm_pattern(condition.pattern());
+        let body = self.lower_required_block(while_stmt.body(), "missing while body", range);
+        let break_stmt = self.alloc_stmt(Stmt::Break { value: None }, range);
+        let break_block = self.alloc_expr(
+            Expr::Block {
+                stmts: vec![break_stmt],
+                tail: None,
             },
-            pat_range,
+            range,
         );
+        let wildcard = self.alloc_pat(Pattern::Wildcard, range);
+        let match_expr = self.alloc_expr(
+            Expr::Match {
+                scrutinee,
+                arms: vec![
+                    MatchArm {
+                        pat,
+                        guard: None,
+                        body,
+                    },
+                    MatchArm {
+                        pat: wildcard,
+                        guard: None,
+                        body: break_block,
+                    },
+                ],
+            },
+            range,
+        );
+        let loop_body = self.alloc_expr(
+            Expr::Block {
+                stmts: Vec::new(),
+                tail: Some(match_expr),
+            },
+            range,
+        );
+        self.alloc_expr(Expr::Loop { body: loop_body }, range)
+    }
+
+    fn lower_loop_expr(&mut self, loop_expr: &ast::LoopExpr, range: TextRange) -> ExprId {
+        let body = self.lower_required_block(loop_expr.body(), "missing loop body", range);
+        self.alloc_expr(Expr::Loop { body }, range)
+    }
+
+    fn lower_for_expr(&mut self, for_expr: &ast::ForExpr, range: TextRange) -> ExprId {
+        let pat = self.lower_arm_pattern(for_expr.pattern());
         let iterable = self.lower_required_expr(for_expr.iterable(), "missing for iterable", range);
         let body = self.lower_required_block(for_expr.body(), "missing for body", range);
         self.alloc_expr(

@@ -30,6 +30,8 @@ pub enum SyntaxKind {
     Else,
     #[token("while")]
     While,
+    #[token("loop")]
+    Loop,
     #[token("break")]
     Break,
     #[token("continue")]
@@ -214,7 +216,9 @@ pub enum SyntaxKind {
     PathSegment,
     IfStmt,
     WhileStmt,
+    LetCondition,
     ForExpr,
+    LoopExpr,
     BreakStmt,
     ContinueStmt,
     ReturnStmt,

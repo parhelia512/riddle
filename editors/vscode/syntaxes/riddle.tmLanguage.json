@@ -96,7 +96,7 @@
       "patterns": [
         {
           "name": "keyword.control.riddle",
-          "match": "\\b(?:if|else|while|for|in|match|break|continue|return)\\b"
+          "match": "\\b(?:if|else|while|loop|for|in|match|break|continue|return)\\b"
         },
         {
           "name": "keyword.other.riddle",

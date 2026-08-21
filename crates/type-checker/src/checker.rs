@@ -1804,7 +1804,9 @@ impl<'a> TypeChecker<'a> {
             "E0038" => vec!["use a variant pattern whose shape and fields match the enum declaration".into()],
             "E0039" => vec!["cover every possible case or add a wildcard arm".into()],
             "E0041" => vec!["every field must implement `Copy`; add the required generic bounds or remove the impl".into()],
-            "E0042" => vec!["move this statement inside a `while` or `for` loop".into()],
+            "E0042" => vec!["move this statement inside a `while`, `for`, or `loop` loop".into()],
+            "E0065" => vec!["use `loop` when the loop should produce a value, or remove the value".into()],
+            "E0066" => vec!["diverge with `return`, `break`, `continue`, or an infinite `loop`".into()],
             "E0043" => vec!["put unsized `str` or `[T]` behind a reference or raw pointer".into()],
             "E0044" => vec!["define every supertrait and remove cycles from the trait hierarchy".into()],
             "E0045" => vec!["add an explicit type annotation or use the binding where its type is known".into()],
@@ -1816,7 +1818,7 @@ impl<'a> TypeChecker<'a> {
                 vec!["use a function or anonymous function value instead".into()]
             }
             "E0048" => vec!["define the trait or a participating nominal type in the current package".into()],
-            "E0057" => vec!["a `let` has no alternative branch, so its pattern must match every value; use `match` to handle the other cases".into()],
+            "E0057" => vec!["a `let` binding or `for` loop header has no alternative branch, so its pattern must match every value; use `match` to handle the other cases".into()],
             "E0059" => vec!["assign the binding on every path before reading it".into()],
             "E0060" => vec!["use literals, constants, pure operators, casts, or aggregate values in a constant initializer".into()],
             "E0072" => vec!["insert indirection such as `&`, `*const`, or `*mut` to break the cycle".into()],
@@ -2089,6 +2091,7 @@ fn first_non_const_expr(
         | Expr::Lambda { .. }
         | Expr::If { .. }
         | Expr::While { .. }
+        | Expr::Loop { .. }
         | Expr::For { .. }
         | Expr::Match { .. }
         | Expr::Unsafe { .. }

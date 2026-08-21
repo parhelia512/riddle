@@ -709,9 +709,11 @@ impl TypeChecker<'_> {
         }
     }
 
-    /// Binds a `let` pattern. Unlike a match arm, a `let` must be irrefutable:
-    /// there is no alternative branch to take when the pattern does not match,
-    /// so a binding would otherwise read uninitialized storage.
+    /// Binds a `let` pattern. Unlike a match arm, a plain `let` must be
+    /// irrefutable: there is no alternative branch to take when the pattern
+    /// does not match, so a binding would otherwise read uninitialized
+    /// storage. A `let`-`else` supplies that alternative branch, so
+    /// `allow_refutable` skips the coverage check for it.
     pub(super) fn bind_let_pattern(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -719,6 +721,7 @@ impl TypeChecker<'_> {
         expected: &Type,
         stmt_id: StmtId,
         has_initializer: bool,
+        allow_refutable: bool,
     ) {
         let before = self.result.diagnostics.len();
         self.bind_pattern_with_mode(
@@ -732,7 +735,8 @@ impl TypeChecker<'_> {
         // A pattern whose shape already mismatched the type reports a nonsense
         // witness — `let (a, b, c) = (1, 2)` is a wrong arity, not a refutable
         // pattern — so only well-formed patterns reach the coverage check.
-        if self.result.diagnostics.len() == before
+        if !allow_refutable
+            && self.result.diagnostics.len() == before
             && !expected.is_unknown_like()
             && let Some((witness, _)) = self.missing_let_pattern(ctx, pat, expected)
         {

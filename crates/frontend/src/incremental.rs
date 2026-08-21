@@ -395,6 +395,7 @@ const fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
 
         SyntaxKind::IfStmt
         | SyntaxKind::WhileStmt
+        | SyntaxKind::LoopExpr
         | SyntaxKind::ForExpr
         | SyntaxKind::NameRef
         | SyntaxKind::NumberLit

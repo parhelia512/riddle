@@ -438,9 +438,11 @@ impl EscapeAnalyzer<'_> {
 
             Expr::Lambda { .. } => self.mark_lambda_expr(ctx, expr_id),
 
-            Expr::If { .. } | Expr::While { .. } | Expr::For { .. } | Expr::Match { .. } => {
-                self.mark_control_expr(ctx, expr_id)
-            }
+            Expr::If { .. }
+            | Expr::While { .. }
+            | Expr::Loop { .. }
+            | Expr::For { .. }
+            | Expr::Match { .. } => self.mark_control_expr(ctx, expr_id),
 
             Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => {
                 self.mark_projection_expr(ctx, expr_id)
@@ -710,6 +712,20 @@ impl EscapeAnalyzer<'_> {
                 self.mark_escaping_exprs(ctx, body);
                 ctx.escaping_exprs.contains(&body)
             }
+            Expr::Loop { body } => {
+                ctx.loop_break_stack.push(Vec::new());
+                self.mark_escaping_exprs(ctx, body);
+                let break_values = ctx
+                    .loop_break_stack
+                    .pop()
+                    .expect("loop break stack must be present");
+                let mut value = SourceValue::default();
+                for break_value in break_values {
+                    value.merge(ctx.expr_source_value(break_value));
+                }
+                ctx.set_expr_source_value(expr_id, value);
+                ctx.escaping_exprs.contains(&body)
+            }
             Expr::For {
                 pat,
                 iterable,
@@ -963,7 +979,9 @@ impl EscapeAnalyzer<'_> {
     fn escape_check_stmt(&mut self, ctx: &mut EscapeCtx<'_>, stmt_id: StmtId) {
         let s = &ctx.body.stmts[stmt_id];
         match s {
-            Stmt::Let { pat, init, .. } => {
+            Stmt::Let {
+                pat, init, else_, ..
+            } => {
                 let (pat, init) = (*pat, *init);
                 let mut bindings = HashSet::new();
                 Self::collect_pattern_bindings(ctx.body, pat, &mut bindings);
@@ -977,6 +995,9 @@ impl EscapeAnalyzer<'_> {
                     self.mark_escaping_exprs(ctx, init);
                     let value = ctx.expr_source_value(init);
                     self.bind_pattern_sources(ctx, pat, &value);
+                }
+                if let Some(else_) = else_ {
+                    self.mark_escaping_exprs(ctx, *else_);
                 }
             }
             Stmt::Expr { expr } => {
@@ -992,7 +1013,15 @@ impl EscapeAnalyzer<'_> {
                     }
                 }
             }
-            Stmt::Break | Stmt::Continue | Stmt::Item { .. } => {}
+            Stmt::Break { value } => {
+                if let Some(v) = value {
+                    self.mark_escaping_exprs(ctx, *v);
+                    if let Some(loop_values) = ctx.loop_break_stack.last_mut() {
+                        loop_values.push(*v);
+                    }
+                }
+            }
+            Stmt::Continue | Stmt::Item { .. } => {}
         }
     }
 
@@ -1590,6 +1619,8 @@ struct EscapeCtx<'a> {
     address_taken_params: HashSet<usize>,
     address_taken_lambda_params: HashSet<(ExprId, usize)>,
     lambda_stack: Vec<ExprId>,
+    /// 每个正在分析的 `loop` 表达式收集其带值 break 的操作数。
+    loop_break_stack: Vec<Vec<ExprId>>,
     lambda_locals: HashMap<ExprId, HashSet<PatternBindingId>>,
     lambda_return_sources: HashMap<ExprId, RefSources>,
     escaping_sources: RefSources,
@@ -1624,6 +1655,7 @@ impl<'a> EscapeCtx<'a> {
             address_taken_params: HashSet::new(),
             address_taken_lambda_params: HashSet::new(),
             lambda_stack: Vec::new(),
+            loop_break_stack: Vec::new(),
             lambda_locals: HashMap::new(),
             lambda_return_sources: HashMap::new(),
             escaping_sources: RefSources::new(),

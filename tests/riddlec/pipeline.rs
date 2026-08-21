@@ -2266,3 +2266,240 @@ fn std_range_for_loop_lowers_to_mir_loop() {
             .is_empty()
     );
 }
+
+#[test]
+fn loop_break_value_compiles_and_runs_to_exit_code() {
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    if !std::process::Command::new(&compiler)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping loop end-to-end test: no usable C compiler");
+        return;
+    }
+
+    let result = compile_with_options(
+        r"
+        fun main() -> i32 {
+            let mut i = 0;
+            let result = loop {
+                i += 1;
+                let inner = loop {
+                    break i > 4;
+                };
+                if inner {
+                    break i * 10;
+                }
+            };
+            result
+        }
+        ",
+        CompileOptions { use_std: false },
+    );
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    let generated = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+
+    let root = std::env::temp_dir().join(format!(
+        "riddle-loop-e2e-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("main.c");
+    let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
+    fs::write(&source, generated).unwrap();
+
+    let compile_output = std::process::Command::new(&compiler)
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compile_output.status.success(),
+        "C compile failed:\n{}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+    let run = std::process::Command::new(&executable).output().unwrap();
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(
+        run.status.code(),
+        Some(50),
+        "loop should break with i * 10 == 50"
+    );
+}
+
+#[test]
+fn if_let_and_while_let_compile_and_run_to_exit_code() {
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    if !std::process::Command::new(&compiler)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping if-let/while-let end-to-end test: no usable C compiler");
+        return;
+    }
+
+    let result = compile_with_options(
+        r"
+        enum Option { Some(i32), None }
+
+        fun next(state: i32) -> Option {
+            if state > 0 { Option::Some(state - 1) } else { Option::None }
+        }
+
+        fun main() -> i32 {
+            let opt = Option::Some(41);
+            let mut total = 0;
+            if let Option::Some(x) = opt {
+                total += x;
+            } else {
+                total += 100;
+            }
+
+            let mut state = 5;
+            while let Option::Some(v) = next(state) {
+                total += v;
+                state = v;
+            }
+            total
+        }
+        ",
+        CompileOptions { use_std: false },
+    );
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    let generated = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+
+    let root = std::env::temp_dir().join(format!(
+        "riddle-let-condition-e2e-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("main.c");
+    let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
+    fs::write(&source, generated).unwrap();
+
+    let compile_output = std::process::Command::new(&compiler)
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compile_output.status.success(),
+        "C compile failed:\n{}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+    let run = std::process::Command::new(&executable).output().unwrap();
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(
+        run.status.code(),
+        Some(51),
+        "if-let contributes 41 and the while-let chain sums 4 + 3 + 2 + 1 + 0"
+    );
+}
+
+#[test]
+fn std_for_loop_destructures_tuple_items() {
+    let result = compile(
+        r"
+            fun main() -> i32 {
+                let mut pairs: Vector<(i32, i32)> = Vector::new();
+                pairs.push((1, 10));
+                pairs.push((2, 20));
+                let mut sum = 0;
+                for (k, v) in &pairs {
+                    sum += *k + *v;
+                }
+                for (k, v) in pairs {
+                    sum += k + v;
+                }
+                sum
+            }
+            ",
+    );
+
+    assert!(
+        result.success(),
+        "parse: {:#?}\ntype: {:#?}\nanalysis: {:#?}",
+        result.parse_errors,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics
+    );
+}
+
+#[test]
+fn for_pattern_destructuring_compiles_and_runs_to_exit_code() {
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    if !std::process::Command::new(&compiler)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping for-pattern end-to-end test: no usable C compiler");
+        return;
+    }
+
+    let result = compile_with_options(
+        r"
+        struct Point { x: i32, y: i32 }
+
+        fun main() -> i32 {
+            let pairs = [(1, 10), (2, 20), (3, 30)];
+            let mut sum = 0;
+            for (a, b) in pairs {
+                sum += a + b;
+            }
+            let points = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+            for Point { x, y } in points {
+                sum += x + y;
+            }
+            sum
+        }
+        ",
+        CompileOptions { use_std: false },
+    );
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    let generated = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
+
+    let root = std::env::temp_dir().join(format!(
+        "riddle-for-pattern-e2e-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("main.c");
+    let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
+    fs::write(&source, generated).unwrap();
+
+    let compile_output = std::process::Command::new(&compiler)
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compile_output.status.success(),
+        "C compile failed:\n{}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+    let run = std::process::Command::new(&executable).output().unwrap();
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(
+        run.status.code(),
+        Some(76),
+        "tuple pairs sum 66 and struct points sum 10"
+    );
+}

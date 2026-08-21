@@ -31,9 +31,9 @@ use crate::{
 
 const COMPLETION_MARKER: &str = "__riddle_completion";
 const COMPLETION_KEYWORDS: &[&str] = &[
-    "let", "fun", "struct", "if", "else", "while", "break", "continue", "return", "as", "self",
-    "mod", "use", "mut", "pub", "super", "crate", "enum", "trait", "impl", "match", "const",
-    "type", "extern", "unsafe", "safe", "for", "in", "where", "move", "true", "false",
+    "let", "fun", "struct", "if", "else", "while", "loop", "break", "continue", "return", "as",
+    "self", "mod", "use", "mut", "pub", "super", "crate", "enum", "trait", "impl", "match",
+    "const", "type", "extern", "unsafe", "safe", "for", "in", "where", "move", "true", "false",
 ];
 pub const BUILTIN_TYPES: &[&str] = &[
     "bool", "char", "str", "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize",

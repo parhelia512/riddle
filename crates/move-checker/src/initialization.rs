@@ -66,6 +66,7 @@ pub fn check(hir: &HirFile, type_result: &TypeCheckResult, result: &mut Analysis
             body_id,
             body,
             loop_depth: 0,
+            loop_break_states: Vec::new(),
         };
         checker.analyze_expr(body.root_block, FlowState::entry());
     }
@@ -80,6 +81,7 @@ pub fn check(hir: &HirFile, type_result: &TypeCheckResult, result: &mut Analysis
             body_id,
             body,
             loop_depth: 0,
+            loop_break_states: Vec::new(),
         };
         checker.analyze_expr(body.root_block, FlowState::entry());
     }
@@ -91,6 +93,8 @@ struct Checker<'a> {
     body_id: hir::body::BodyId,
     body: &'a Body,
     loop_depth: usize,
+    /// 每层循环收集 break 跳出点的状态；while/for 压入空帧后丢弃。
+    loop_break_states: Vec<Vec<FlowState>>,
 }
 
 impl Checker<'_> {
@@ -141,6 +145,7 @@ impl Checker<'_> {
                 else_branch,
             } => self.analyze_if(cond, then_branch, else_branch, state),
             Expr::While { condition, body } => self.analyze_while(condition, body, state),
+            Expr::Loop { body } => self.analyze_loop(body, state),
             Expr::For { iterable, body, .. } => self.analyze_for(iterable, body, state),
             Expr::Match { scrutinee, arms } => self.analyze_match(scrutinee, &arms, state),
             Expr::Array { elements } | Expr::Tuple { elements } => elements
@@ -248,6 +253,7 @@ impl Checker<'_> {
 
     fn analyze_while(&mut self, condition: ExprId, body: ExprId, state: FlowState) -> FlowState {
         self.loop_depth += 1;
+        self.loop_break_states.push(Vec::new());
         let condition_state = self.analyze_expr(condition, state);
         let body_state = if condition_state.reachable {
             self.analyze_expr(body, condition_state.clone())
@@ -255,7 +261,23 @@ impl Checker<'_> {
             condition_state.clone()
         };
         self.loop_depth -= 1;
+        self.loop_break_states.pop();
         FlowState::merge_paths(condition_state, body_state)
+    }
+
+    fn analyze_loop(&mut self, body: ExprId, state: FlowState) -> FlowState {
+        self.loop_depth += 1;
+        self.loop_break_states.push(Vec::new());
+        let body_state = self.analyze_expr(body, state);
+        self.loop_depth -= 1;
+        let break_states = self
+            .loop_break_states
+            .pop()
+            .expect("loop break stack must be present");
+        // loop 体至少执行一次；出口状态 = 体尾与各 break 跳出点的合并
+        break_states
+            .into_iter()
+            .fold(body_state, FlowState::merge_paths)
     }
 
     fn analyze_for(&mut self, iterable: ExprId, body: ExprId, state: FlowState) -> FlowState {
@@ -264,8 +286,10 @@ impl Checker<'_> {
             return iterable_state;
         }
         self.loop_depth += 1;
+        self.loop_break_states.push(Vec::new());
         let body_state = self.analyze_expr(body, iterable_state.clone());
         self.loop_depth -= 1;
+        self.loop_break_states.pop();
         FlowState::merge_paths(iterable_state, body_state)
     }
 
@@ -300,10 +324,18 @@ impl Checker<'_> {
             return state;
         }
         match self.body.stmts[stmt_id].clone() {
-            Stmt::Let { pat, init, .. } => {
+            Stmt::Let {
+                pat, init, else_, ..
+            } => {
                 if let Some(init) = init {
                     let mut state = self.analyze_expr(init, state);
                     if state.reachable {
+                        if let Some(else_) = else_ {
+                            // The else block runs with the pattern unbound and
+                            // must diverge (E0066), so its end state never
+                            // flows past the statement.
+                            self.analyze_expr(else_, state.clone());
+                        }
                         self.bind_pattern(pat, &mut state);
                     }
                     state
@@ -322,7 +354,23 @@ impl Checker<'_> {
                     reachable: false,
                 }
             }
-            Stmt::Break | Stmt::Continue => FlowState {
+            Stmt::Break { value } => {
+                let state = match value {
+                    Some(value) => self.analyze_expr(value, state),
+                    None => state,
+                };
+                if let Some(states) = self.loop_break_states.last_mut() {
+                    states.push(FlowState {
+                        bindings: state.bindings.clone(),
+                        reachable: true,
+                    });
+                }
+                FlowState {
+                    bindings: state.bindings,
+                    reachable: false,
+                }
+            }
+            Stmt::Continue => FlowState {
                 bindings: state.bindings,
                 reachable: false,
             },

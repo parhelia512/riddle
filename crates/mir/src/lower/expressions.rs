@@ -83,6 +83,8 @@ impl LowerCtx<'_> {
                 body: while_body,
             } => self.lower_while_expr(builder, &input, *condition, *while_body),
 
+            Expr::Loop { body: loop_body } => self.lower_loop_expr(builder, &input, *loop_body),
+
             Expr::For {
                 pat,
                 iterable,
@@ -637,6 +639,7 @@ impl LowerCtx<'_> {
         self.loop_targets.push(LoopTargets {
             break_block: exit_block,
             continue_block: cond_block,
+            break_slot: None,
             drop_depth: self.drop_scopes.len(),
             temporary_drop_depth: self.temporary_drop_scopes.len(),
         });
@@ -648,6 +651,46 @@ impl LowerCtx<'_> {
 
         builder.switch_to_block(exit_block);
         builder.unit_const()
+    }
+
+    fn lower_loop_expr(
+        &mut self,
+        builder: &mut Builder,
+        input: &ExprLoweringInput<'_>,
+        body: ExprId,
+    ) -> Value {
+        let body_block = builder.func.new_block_labeled("loop_body");
+        let exit_block = builder.func.new_block_labeled("loop_exit");
+
+        // break 值经 alloca 槽传出：break 可在任意嵌套深度、数量不定，
+        // 且跳转前穿插 drop 代码，不适合 phi。
+        let break_slot = if matches!(input.mir_type, Type::Unit | Type::Never) {
+            None
+        } else {
+            Some(builder.alloca(input.mir_type.clone()))
+        };
+
+        builder.set_branch(body_block);
+
+        builder.switch_to_block(body_block);
+        self.loop_targets.push(LoopTargets {
+            break_block: exit_block,
+            continue_block: body_block,
+            break_slot,
+            drop_depth: self.drop_scopes.len(),
+            temporary_drop_depth: self.temporary_drop_scopes.len(),
+        });
+        self.lower_expr(builder, input.param_values, input.body, body);
+        self.loop_targets.pop();
+        if builder.needs_return() {
+            builder.set_branch(body_block);
+        }
+
+        builder.switch_to_block(exit_block);
+        match break_slot {
+            Some(slot) => builder.load(slot, input.mir_type.clone()),
+            None => builder.unit_const(),
+        }
     }
 
     fn lower_for_expression(
@@ -1393,10 +1436,18 @@ impl LowerCtx<'_> {
         builder.set_cond_branch(keep_going, body_block, exit_block);
 
         builder.switch_to_block(body_block);
-        self.push_pattern_binding(body, pat, current, i32_ty.clone());
+        self.push_match_pattern_bindings(
+            builder,
+            body,
+            pat,
+            current,
+            None,
+            &type_checker::Type::Int(type_checker::IntTy::I32),
+        );
         self.loop_targets.push(LoopTargets {
             break_block: exit_block,
             continue_block: step_block,
+            break_slot: None,
             drop_depth: self.drop_scopes.len(),
             temporary_drop_depth: self.temporary_drop_scopes.len(),
         });
@@ -1489,6 +1540,7 @@ impl LowerCtx<'_> {
         self.loop_targets.push(LoopTargets {
             break_block: exit_block,
             continue_block: step_block,
+            break_slot: None,
             drop_depth: item_drop_depth,
             temporary_drop_depth: self.temporary_drop_scopes.len(),
         });
@@ -1613,6 +1665,7 @@ impl LowerCtx<'_> {
         self.loop_targets.push(LoopTargets {
             break_block: exit_block,
             continue_block: cond_block,
+            break_slot: None,
             drop_depth: item_drop_depth,
             temporary_drop_depth: self.temporary_drop_scopes.len(),
         });
