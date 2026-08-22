@@ -35,7 +35,7 @@ use riddle_lsp::{
         references_for_document, references_for_source, rename_for_document, rename_for_source,
         semantic_token_delta, semantic_tokens_for_document, semantic_tokens_for_source,
         semantic_tokens_for_source_with_options, signature_help_for_source, to_lsp, to_lsp_mapped,
-        type_definition_for_source, workspace_symbols_for_source,
+        type_definition_for_source, workspace_symbols_for_index, workspace_symbols_for_source,
     },
 };
 use riddlec::pipeline::{CompileOptions, IntoDiagnosticExt};

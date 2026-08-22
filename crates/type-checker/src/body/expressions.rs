@@ -239,7 +239,7 @@ impl TypeChecker<'_> {
     ) -> Type {
         let ty = self.check_expr_inner(ctx, expr_id, Some(expected));
         let ty = self.finish_value_expr(ctx, expr_id, ty);
-        if Self::is_slice_coercion(expected, &ty) {
+        if Self::is_slice_coercion(expected, &ty) || Self::is_dyn_trait_coercion(expected, &ty) {
             self.result
                 .expr_coercions
                 .insert((ctx.body_id, expr_id), expected.clone());
@@ -654,6 +654,7 @@ impl TypeChecker<'_> {
                 TraitMethodCall {
                     trait_id: into_trait,
                     method: "into".into(),
+                    dynamic: false,
                 },
             );
         } else {

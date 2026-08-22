@@ -1341,6 +1341,7 @@ fn type_ref_contains_range(ty: &HirTypeRef, range: TextRange) -> bool {
                         || type_ref_contains_range(&signature.ret, range)
                 })
         }
+        HirTypeRef::DynTrait { trait_ty, .. } => type_ref_contains_range(trait_ty, range),
         HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => false,
     }
 }

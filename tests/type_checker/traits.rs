@@ -1,3 +1,6 @@
+use ast::{self, support::AstNode};
+use frontend::incremental::IncrementalParser;
+
 use crate::{check, check_with_package_ranges, messages};
 
 #[test]
@@ -18,6 +21,94 @@ fn accepts_drop_lang_item_contract() {
     );
 
     assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_dyn_trait_reference_and_method_call() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        fun call(value: &dyn Speak) -> i32 { value.speak() }
+        fun main() -> i32 {
+            let speaker = Speaker { value: 7 };
+            call(&speaker)
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_generic_dyn_trait_reference_and_method_call() {
+    let result = check(
+        r#"
+        trait Convert<T> { fun convert(&self) -> T; }
+        struct Value { value: i32 }
+        impl Convert<i32> for Value {
+            fun convert(&self) -> i32 { self.value }
+        }
+        fun call(value: &dyn Convert<i32>) -> i32 { value.convert() }
+        fun main() -> i32 {
+            let value = Value { value: 7 };
+            call(&value)
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn rejects_dyn_trait_coercion_without_an_impl() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        struct Other { value: i32 }
+        fun call(value: &dyn Speak) -> i32 { value.speak() }
+        fun main() -> i32 {
+            let other = Other { value: 7 };
+            call(&other)
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0001"),
+        "expected an invalid dyn trait coercion diagnostic, got {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn parses_nested_block_and_documentation_comments() {
+    let source = r#"
+    /** outer /* nested */ documentation */
+    /// function documentation
+    fun main() {}
+    "#;
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(source);
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+
+    let root = ast::Root::cast(parse.syntax()).expect("root syntax");
+    let function = root.stmts().find_map(|stmt| match stmt {
+        ast::Stmt::FuncDecl(function) => Some(function),
+        _ => None,
+    });
+    let function = function.expect("function declaration");
+    let docs = ast::doc_comments_for_node(function.syntax());
+    assert_eq!(
+        docs.iter().map(|token| token.text()).collect::<Vec<_>>(),
+        vec![
+            "/** outer /* nested */ documentation */",
+            "/// function documentation"
+        ]
+    );
 }
 
 #[test]

@@ -551,6 +551,13 @@ impl EscapeAnalyzer<'_> {
                 for field in &fields {
                     Self::record_ref_chain(ctx, expr_id, field.value);
                 }
+                ctx.set_expr_source_fields(
+                    expr_id,
+                    fields
+                        .iter()
+                        .map(|field| ctx.expr_source_value(field.value))
+                        .collect(),
+                );
                 fields
                     .iter()
                     .any(|field| ctx.escaping_exprs.contains(&field.value))
@@ -1567,6 +1574,7 @@ impl EscapeAnalyzer<'_> {
 fn type_may_carry_reference(ty: &Type) -> bool {
     match ty {
         Type::Ref(..)
+        | Type::DynTrait { .. }
         | Type::Ptr { .. }
         | Type::Struct(..)
         | Type::Enum(..)

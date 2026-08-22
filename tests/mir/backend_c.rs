@@ -48,6 +48,31 @@ fn c_simple_function() {
 }
 
 #[test]
+fn c_dyn_trait_reference_contains_data_and_method_slots() {
+    let module = lower(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        fun call(value: &dyn Speak) -> i32 { value.speak() }
+        fun main() -> i32 {
+            let speaker = Speaker { value: 7 };
+            call(&speaker)
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(generated.contains("riddle_t_64796e"), "{generated}");
+    assert!(
+        generated.contains("riddle_m_6d6574686f645f737065616b"),
+        "{generated}"
+    );
+    assert!(generated.contains("riddle_unit*"), "{generated}");
+}
+
+#[test]
 fn c_export_uses_c_string_abi_and_preserves_internal_str_layout() {
     let module = lower(
         r"

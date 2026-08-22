@@ -493,6 +493,7 @@ fn type_ref_contains_error(ty: &HirTypeRef) -> bool {
                         || type_ref_contains_error(&signature.ret)
                 })
         }
+        HirTypeRef::DynTrait { trait_ty, .. } => type_ref_contains_error(trait_ty),
         HirTypeRef::Never | HirTypeRef::Unknown => false,
     }
 }

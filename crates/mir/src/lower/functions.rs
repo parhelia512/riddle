@@ -8,6 +8,71 @@ use super::{
 };
 
 impl LowerCtx<'_> {
+    pub(super) fn ensure_dyn_trait_adapter(
+        &mut self,
+        trait_id: hir::item_tree::TraitId,
+        method_fid: hir::item_tree::FunctionId,
+        receiver_ty: &type_checker::Type,
+        signature: &crate::types::FnPtrType,
+    ) -> String {
+        let receiver_mir_ty = self.convert_type(receiver_ty);
+        let name = format!(
+            "__riddle_dyn_adapter_{}_{}_{}",
+            trait_id.into_raw().into_u32(),
+            method_fid.into_raw().into_u32(),
+            super::mono_type_name(&receiver_mir_ty)
+        );
+        if self
+            .module
+            .functions
+            .values()
+            .any(|function| function.name == name)
+        {
+            return name;
+        }
+
+        let mut function = Function::new(name.clone(), (*signature.ret).clone());
+        self.inherit_function_ownership(&mut function);
+        let data = function.add_param("__data".into(), Type::Ptr(Box::new(Type::Unit)));
+        let args = signature
+            .params
+            .iter()
+            .skip(1)
+            .enumerate()
+            .map(|(index, ty)| function.add_param(format!("p{index}"), ty.clone()))
+            .collect::<Vec<_>>();
+        function.blocks[function.entry].start_value = function.next_value;
+
+        let receiver_param = self.hir.item_tree.functions[method_fid]
+            .params
+            .first()
+            .map(|param| param.ty.clone());
+        let receiver_mut = receiver_param
+            .as_ref()
+            .and_then(|ty| match ty {
+                hir::item_tree::HirTypeRef::Ref(_, mutable) => Some(*mutable),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let receiver = Type::Ref(Box::new(receiver_mir_ty), receiver_mut);
+        let target = self
+            .mono_method_name_for_receiver(method_fid, receiver_ty, None)
+            .unwrap_or_else(|| self.function_name(method_fid));
+        {
+            let mut builder = Builder::new(&mut function);
+            let receiver = builder.cast(CastOp::PtrToPtr, data, receiver);
+            let mut call_args = Vec::with_capacity(args.len() + 1);
+            call_args.push(receiver);
+            call_args.extend(args);
+            let result = builder.call(FuncRef::Local(target), call_args, (*signature.ret).clone());
+            builder.set_return(
+                (!matches!(signature.ret.as_ref(), Type::Unit | Type::Never)).then_some(result),
+            );
+        }
+        self.module.add_function(function);
+        name
+    }
+
     pub(super) fn reference_storage(&self, builder: &mut Builder, ty: Type) -> Value {
         if self.gc_enabled {
             builder.heap_alloc(ty)

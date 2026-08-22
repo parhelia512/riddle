@@ -39,7 +39,13 @@ impl LowerCtx<'_> {
             | TcType::Unknown
             | TcType::Error => Type::Unit,
             TcType::Never => Type::Never,
-            TcType::Ref(inner, mutable) => Type::Ref(Box::new(self.convert_type(inner)), *mutable),
+            TcType::Ref(inner, mutable) => {
+                if matches!(inner.as_ref(), TcType::DynTrait { .. }) {
+                    self.convert_type(inner)
+                } else {
+                    Type::Ref(Box::new(self.convert_type(inner)), *mutable)
+                }
+            }
             TcType::Ptr { inner, .. } => Type::Ptr(Box::new(self.convert_type(inner))),
             TcType::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_type(e)).collect())
@@ -74,7 +80,64 @@ impl LowerCtx<'_> {
                 })
             }
             TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
+            TcType::DynTrait { trait_id, args } => self.dyn_trait_type(*trait_id, args),
         }
+    }
+
+    fn dyn_trait_type(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        args: &[type_checker::Type],
+    ) -> Type {
+        let trait_data = &self.hir.item_tree.traits[trait_id];
+        let mir_args = args
+            .iter()
+            .map(|arg| self.convert_type(arg))
+            .collect::<Vec<_>>();
+        let trait_subst = trait_data
+            .generics
+            .iter()
+            .map(|name| name.0.as_str())
+            .zip(mir_args.iter())
+            .collect::<HashMap<_, _>>();
+        let mut fields = vec![("data".into(), Type::Ptr(Box::new(Type::Unit)))];
+        let mut methods = trait_data.methods.clone();
+        methods.extend(
+            trait_data
+                .default_methods
+                .iter()
+                .map(|fid| self.hir.item_tree.functions[*fid].clone()),
+        );
+        for method in methods {
+            let Some(receiver) = method.params.first() else {
+                continue;
+            };
+            if !matches!(receiver.ty, hir::item_tree::HirTypeRef::Ref(_, _)) {
+                continue;
+            }
+            let mut params = vec![Type::Ptr(Box::new(Type::Unit))];
+            params.extend(method.params.iter().skip(1).map(|param| {
+                self.convert_hir_type_with_substs(&param.ty, &trait_subst, &HashMap::new())
+            }));
+            let ret = method.ret_type.as_ref().map_or(Type::Unit, |ty| {
+                self.convert_hir_type_with_substs(ty, &trait_subst, &HashMap::new())
+            });
+            fields.push((
+                format!("method_{}", method.name.0),
+                Type::FnPtr(FnPtrType {
+                    params,
+                    ret: Box::new(ret),
+                }),
+            ));
+        }
+        let id = trait_id.into_raw().into_u32();
+        let symbol_args = mir_args.iter().map(mono_type_symbol).collect::<Vec<_>>();
+        let name = mono_name_from_parts(&trait_data.name.0, &symbol_args);
+        Type::Struct(StructType {
+            name: format!("dyn_{name}"),
+            symbol: format!("dyn_trait::{id}::{name}"),
+            fields,
+        })
     }
 
     pub(super) fn function_item_signature(
@@ -184,7 +247,11 @@ impl LowerCtx<'_> {
                 }
             }
             hir::item_tree::HirTypeRef::Ref(inner, mutable) => {
-                Type::Ref(Box::new(self.convert_hir_type(inner)), *mutable)
+                if matches!(inner.as_ref(), hir::item_tree::HirTypeRef::DynTrait { .. }) {
+                    self.convert_hir_type(inner)
+                } else {
+                    Type::Ref(Box::new(self.convert_hir_type(inner)), *mutable)
+                }
             }
             hir::item_tree::HirTypeRef::Ptr { inner, .. } => {
                 Type::Ptr(Box::new(self.convert_hir_type(inner)))
@@ -222,6 +289,9 @@ impl LowerCtx<'_> {
                     })
                 })
             }
+            hir::item_tree::HirTypeRef::DynTrait { trait_ty, .. } => self
+                .resolve_trait_ref(trait_ty)
+                .map_or(Type::Unit, |trait_id| self.dyn_trait_type(trait_id, &[])),
         }
     }
 

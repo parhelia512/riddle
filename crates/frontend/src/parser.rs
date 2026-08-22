@@ -1700,6 +1700,7 @@ impl<'s> Parser<'s> {
                 m.complete(self, SyntaxKind::ConstType);
             }
             SyntaxKind::Impl => self.impl_trait_type(),
+            SyntaxKind::Dyn => self.dyn_trait_type(),
             SyntaxKind::Fun | SyntaxKind::Unsafe => self.removed_function_type(),
             SyntaxKind::Ident
             | SyntaxKind::SelfKw
@@ -2076,6 +2077,13 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::ImplTraitType);
     }
 
+    fn dyn_trait_type(&mut self) {
+        let m = self.start();
+        self.expect(SyntaxKind::Dyn);
+        self.generic_bound();
+        m.complete(self, SyntaxKind::DynTraitType);
+    }
+
     fn generic_bound_arg(&mut self) {
         if self.at(SyntaxKind::Ident) && self.nth(1) == SyntaxKind::Eq {
             self.bump();
@@ -2202,6 +2210,7 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Fun
                 | SyntaxKind::Unsafe
                 | SyntaxKind::Impl
+                | SyntaxKind::Dyn
         )
     }
 

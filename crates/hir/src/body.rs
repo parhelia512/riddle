@@ -886,7 +886,7 @@ impl BodyPrinter<'_> {
                 format!("[{}; {}]", Self::type_text(elem), len.display())
             }
             HirTypeRef::Const(value) => value.display(),
-            HirTypeRef::ImplTrait { .. } => ty.display(),
+            HirTypeRef::ImplTrait { .. } | HirTypeRef::DynTrait { .. } => ty.display(),
         }
     }
 

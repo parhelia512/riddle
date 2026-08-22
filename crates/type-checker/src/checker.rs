@@ -793,6 +793,10 @@ impl<'a> TypeChecker<'a> {
                 .get(id)
                 .map_or_else(|| ty.clone(), |value| self.resolve_type(value)),
             Type::Ref(inner, mutable) => Type::Ref(Box::new(self.resolve_type(inner)), *mutable),
+            Type::DynTrait { trait_id, args } => Type::DynTrait {
+                trait_id: *trait_id,
+                args: args.iter().map(|arg| self.resolve_type(arg)).collect(),
+            },
             Type::Ptr { mutable, inner } => Type::Ptr {
                 mutable: *mutable,
                 inner: Box::new(self.resolve_type(inner)),
@@ -954,6 +958,23 @@ impl<'a> TypeChecker<'a> {
                     inner: b,
                 },
             ) => am == bm && self.unify_types_inner(a, b),
+            (
+                Type::DynTrait {
+                    trait_id: lhs_id,
+                    args: lhs_args,
+                },
+                Type::DynTrait {
+                    trait_id: rhs_id,
+                    args: rhs_args,
+                },
+            ) => {
+                lhs_id == rhs_id
+                    && lhs_args.len() == rhs_args.len()
+                    && lhs_args
+                        .iter()
+                        .zip(rhs_args)
+                        .all(|(lhs, rhs)| self.unify_types_inner(lhs, rhs))
+            }
             (Type::Tuple(a), Type::Tuple(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(a, b)| self.unify_types_inner(a, b))
             }
@@ -1445,6 +1466,7 @@ impl<'a> TypeChecker<'a> {
             | HirTypeRef::Ref(_, _)
             | HirTypeRef::Ptr { .. }
             | HirTypeRef::ImplTrait { .. }
+            | HirTypeRef::DynTrait { .. }
             | HirTypeRef::Unknown
             | HirTypeRef::Error => false,
             HirTypeRef::Array(inner, _) | HirTypeRef::Slice(inner) => {
@@ -1657,6 +1679,7 @@ impl<'a> TypeChecker<'a> {
             || expected == actual
             || Self::numeric_assignable(&expected, &actual)
             || Self::is_slice_coercion(&expected, &actual)
+            || self.is_dyn_trait_coercion_allowed(&expected, &actual)
             || Self::structural_assignable(&expected, &actual)
         {
             return;
@@ -1749,6 +1772,8 @@ impl<'a> TypeChecker<'a> {
                 ty.display(self.hir),
                 if type_contains_slice(ty) {
                     "slice `[T]`"
+                } else if type_contains_dyn_trait(ty) {
+                    "trait object `dyn Trait`"
                 } else {
                     "`str`"
                 }
@@ -1956,6 +1981,44 @@ impl<'a> TypeChecker<'a> {
         )
     }
 
+    pub(crate) fn is_dyn_trait_coercion(expected: &Type, actual: &Type) -> bool {
+        matches!(
+            (expected, actual),
+            (
+                Type::Ref(expected, expected_mut),
+                Type::Ref(actual, actual_mut),
+            ) if expected_mut == actual_mut
+                && matches!(expected.as_ref(), Type::DynTrait { .. })
+                && !matches!(actual.as_ref(), Type::DynTrait { .. })
+        )
+    }
+
+    fn is_dyn_trait_coercion_allowed(&self, expected: &Type, actual: &Type) -> bool {
+        let (Type::Ref(expected_inner, expected_mut), Type::Ref(actual_inner, actual_mut)) =
+            (expected, actual)
+        else {
+            return false;
+        };
+        if expected_mut != actual_mut {
+            return false;
+        }
+        let Type::DynTrait { trait_id, args } = expected_inner.as_ref() else {
+            return false;
+        };
+        if actual_inner.is_unknown_like() {
+            return true;
+        }
+        if matches!(
+            actual_inner.as_ref(),
+            Type::Param(..) | Type::DynTrait { .. }
+        ) {
+            return false;
+        }
+        self.result
+            .trait_env
+            .type_implements_with_args_assuming(actual_inner, *trait_id, args, &[])
+    }
+
     pub(crate) fn join_numeric_types(lhs: &Type, rhs: &Type) -> Option<Type> {
         match (lhs, rhs) {
             (Type::Int(a), Type::Int(b)) if a == b => Some(Type::Int(*a)),
@@ -2013,6 +2076,9 @@ fn type_contains_infer_var(
             .iter()
             .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
         Type::FunctionItem { args, .. } => args
+            .iter()
+            .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
+        Type::DynTrait { args, .. } => args
             .iter()
             .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
         Type::CallableConstraint(signature)
@@ -2664,6 +2730,26 @@ fn type_contains_slice(ty: &Type) -> bool {
             signature.params.iter().any(type_contains_slice) || type_contains_slice(&signature.ret)
         }
         Type::FunctionItem { args, .. } => args.iter().any(type_contains_slice),
+        _ => false,
+    }
+}
+
+fn type_contains_dyn_trait(ty: &Type) -> bool {
+    match ty {
+        Type::DynTrait { .. } => true,
+        Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
+            type_contains_dyn_trait(inner)
+        }
+        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => {
+            elements.iter().any(type_contains_dyn_trait)
+        }
+        Type::CallableConstraint(signature)
+        | Type::Closure { signature, .. }
+        | Type::OpaqueCallable { signature, .. } => {
+            signature.params.iter().any(type_contains_dyn_trait)
+                || type_contains_dyn_trait(&signature.ret)
+        }
+        Type::FunctionItem { args, .. } => args.iter().any(type_contains_dyn_trait),
         _ => false,
     }
 }

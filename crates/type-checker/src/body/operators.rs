@@ -189,6 +189,7 @@ impl TypeChecker<'_> {
             TraitMethodCall {
                 trait_id,
                 method: "index".into(),
+                dynamic: false,
             },
         );
 
@@ -325,6 +326,7 @@ impl TypeChecker<'_> {
             TraitMethodCall {
                 trait_id,
                 method: method_name.into(),
+                dynamic: false,
             },
         );
 
@@ -580,6 +582,7 @@ impl TypeChecker<'_> {
             OperatorCall::Trait(TraitMethodCall {
                 trait_id,
                 method: method_name.into(),
+                dynamic: false,
             }),
         );
         let output = self

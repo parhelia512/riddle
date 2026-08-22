@@ -1010,6 +1010,20 @@ impl LowerCtx<'_> {
                 HirConstArg::Error => ConstArg::Error,
             }),
             HirTypeRef::ImplTrait { .. } => self.lower_impl_trait_for_pattern(ty, subst),
+            HirTypeRef::DynTrait { trait_ty, .. } => {
+                let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+                    return type_checker::Type::Unknown;
+                };
+                let args = match trait_ty.as_ref() {
+                    HirTypeRef::Named(path) => path
+                        .type_args
+                        .iter()
+                        .map(|arg| self.lower_hir_type_for_pattern(arg, subst))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                type_checker::Type::DynTrait { trait_id, args }
+            }
             HirTypeRef::Unknown => type_checker::Type::Unknown,
             HirTypeRef::Error => type_checker::Type::Error,
         }

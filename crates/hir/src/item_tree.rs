@@ -331,6 +331,10 @@ pub enum HirTypeRef {
         callable: Option<HirCallableSignature>,
         hidden: Option<Name>,
     },
+    DynTrait {
+        trait_ty: Box<Self>,
+        trait_range: TextRange,
+    },
     Unknown,
     Error,
 }
@@ -452,6 +456,7 @@ impl HirTypeRef {
                 }
                 display
             }
+            Self::DynTrait { trait_ty, .. } => format!("dyn {}", trait_ty.display()),
             Self::Unknown => "_".to_string(),
             Self::Error => "<error>".to_string(),
         }

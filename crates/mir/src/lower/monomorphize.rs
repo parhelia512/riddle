@@ -839,10 +839,14 @@ impl LowerCtx<'_> {
                 }
                 self.convert_hir_type(t)
             }
-            hir::item_tree::HirTypeRef::Ref(inner, mutable) => Type::Ref(
-                Box::new(self.convert_hir_type_with_substs(inner, subst, const_subst)),
-                *mutable,
-            ),
+            hir::item_tree::HirTypeRef::Ref(inner, mutable) => {
+                let inner_ty = self.convert_hir_type_with_substs(inner, subst, const_subst);
+                if matches!(inner.as_ref(), hir::item_tree::HirTypeRef::DynTrait { .. }) {
+                    inner_ty
+                } else {
+                    Type::Ref(Box::new(inner_ty), *mutable)
+                }
+            }
             hir::item_tree::HirTypeRef::Ptr { inner, .. } => Type::Ptr(Box::new(
                 self.convert_hir_type_with_substs(inner, subst, const_subst),
             )),
@@ -864,6 +868,7 @@ impl LowerCtx<'_> {
             | hir::item_tree::HirTypeRef::ImplTrait { .. }
             | hir::item_tree::HirTypeRef::Unknown
             | hir::item_tree::HirTypeRef::Error => Type::Unit,
+            hir::item_tree::HirTypeRef::DynTrait { .. } => self.convert_hir_type(t),
         }
     }
 

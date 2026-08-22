@@ -2688,7 +2688,7 @@ fn colliding_trait_method_symbols_are_disambiguated() {
 }
 
 #[test]
-fn escaping_destructured_binding_moves_the_whole_slot_to_the_heap() {
+fn escaping_destructured_binding_promotes_only_the_escaping_field() {
     let module = lower(
         r"
         struct Data { value: i32 }
@@ -2701,13 +2701,14 @@ fn escaping_destructured_binding_moves_the_whole_slot_to_the_heap() {
     );
     let func = &module.functions[module.function_order[0]];
     let entry = &func.blocks[func.entry];
-    let has_heap_alloc = entry
+    let heap_allocs = entry
         .insts
         .iter()
-        .any(|i| matches!(i.kind, mir::instr::InstKind::HeapAlloc(_)));
+        .filter(|i| matches!(i.kind, mir::instr::InstKind::HeapAlloc(_)))
+        .count();
     assert!(
-        has_heap_alloc,
-        "a reference to a destructured binding must keep its slot alive, got: {:?}",
+        heap_allocs == 1,
+        "a reference to one destructured binding should promote only its field, got: {:?}",
         entry.insts
     );
 }

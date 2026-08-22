@@ -69,6 +69,9 @@ fn project_index_contains_unopened_module_symbols_and_files() {
     assert!(index.files.contains(&fs::canonicalize(util_path).unwrap()));
     assert!(index.symbols.iter().any(|symbol| symbol.name == "main"));
     assert!(index.symbols.iter().any(|symbol| symbol.name == "helper"));
+    let symbols = workspace_symbols_for_index(&index, "helper");
+    assert!(symbols.iter().any(|symbol| symbol.name == "helper"));
+    assert!(symbols.iter().all(|symbol| symbol.location.uri != main_uri));
     let _ = fs::remove_dir_all(root);
 }
 

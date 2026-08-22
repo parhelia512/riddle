@@ -1,7 +1,7 @@
 use hir::{
     HirFile,
     body::{BodyId, ExprId},
-    item_tree::{EnumId, FunctionId, HirStruct, StructId},
+    item_tree::{EnumId, FunctionId, HirStruct, StructId, TraitId},
 };
 use rowan::TextRange;
 
@@ -34,6 +34,12 @@ pub enum Type {
     Unit,
     Never,
     Ref(Box<Self>, bool), // (inner, mutable)
+    /// A dynamically dispatched trait object. It is unsized and only valid
+    /// behind a reference or raw pointer.
+    DynTrait {
+        trait_id: TraitId,
+        args: Vec<Self>,
+    },
     /// Raw pointer type: `*const T` or `*mut T`.
     Ptr {
         mutable: bool,
@@ -135,6 +141,19 @@ impl Type {
                 let kw = if *mutable { "&mut " } else { "&" };
                 format!("{}{}", kw, inner.display(hir))
             }
+            Self::DynTrait { trait_id, args } => {
+                let name = &hir.item_tree.traits[*trait_id].name.0;
+                if args.is_empty() {
+                    format!("dyn {name}")
+                } else {
+                    let args = args
+                        .iter()
+                        .map(|arg| arg.display(hir))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("dyn {name}<{args}>")
+                }
+            }
             Self::Ptr { mutable, inner } => {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", inner.display(hir))
@@ -231,7 +250,7 @@ impl Type {
     /// Unsized types (`str` and `[T]`) can only exist behind a pointer/reference.
     pub fn is_sized(&self) -> bool {
         match self {
-            Self::Str | Self::Slice(_) => false,
+            Self::Str | Self::Slice(_) | Self::DynTrait { .. } => false,
             Self::Tuple(elements) => elements.iter().all(Self::is_sized),
             Self::Array(inner, _) => inner.is_sized(),
             Self::Struct(_, args) | Self::Enum(_, args) | Self::FunctionItem { args, .. } => {
@@ -248,9 +267,12 @@ impl Type {
 
     pub fn is_valid_value_type(&self) -> bool {
         match self {
-            Self::Str | Self::Slice(_) => false,
+            Self::Str | Self::Slice(_) | Self::DynTrait { .. } => false,
             Self::Ref(inner, _) | Self::Ptr { inner, .. } => {
-                matches!(inner.as_ref(), Self::Str | Self::Slice(_)) || inner.is_valid_value_type()
+                matches!(
+                    inner.as_ref(),
+                    Self::Str | Self::Slice(_) | Self::DynTrait { .. }
+                ) || inner.is_valid_value_type()
             }
             Self::Tuple(elements) => elements.iter().all(Self::is_valid_value_type),
             Self::Array(inner, _) => inner.is_valid_value_type(),

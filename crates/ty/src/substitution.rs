@@ -28,6 +28,16 @@ pub fn collect_subst<S: BuildHasher>(
             }
             _ => false,
         },
+        Type::DynTrait {
+            trait_id: expected_id,
+            args: expected_args,
+        } => match actual {
+            Type::DynTrait {
+                trait_id: actual_id,
+                args: actual_args,
+            } if expected_id == actual_id => collect_args_subst(expected_args, actual_args, subst),
+            _ => false,
+        },
         Type::Ptr {
             mutable: expected_mut,
             inner: expected_inner,
@@ -174,6 +184,10 @@ pub fn substitute_type<S: BuildHasher>(ty: &Type, subst: &HashMap<String, Type, 
         Type::Param(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Const(value) => Type::Const(substitute_const(value, subst)),
         Type::Ref(inner, mutable) => Type::Ref(Box::new(substitute_type(inner, subst)), *mutable),
+        Type::DynTrait { trait_id, args } => Type::DynTrait {
+            trait_id: *trait_id,
+            args: args.iter().map(|ty| substitute_type(ty, subst)).collect(),
+        },
         Type::Ptr { mutable, inner } => Type::Ptr {
             mutable: *mutable,
             inner: Box::new(substitute_type(inner, subst)),

@@ -232,6 +232,10 @@ impl TypeChecker<'_> {
             let call = TraitMethodCall {
                 trait_id,
                 method: method.function.name.0.clone(),
+                dynamic: matches!(
+                    base_ty,
+                    Type::Ref(inner, _) if matches!(inner.as_ref(), Type::DynTrait { .. })
+                ),
             };
             self.result
                 .trait_method_calls
@@ -402,7 +406,76 @@ impl TypeChecker<'_> {
         if let Some(method) = self.find_trait_bound_method(ctx, receiver_ty, method_name) {
             return Ok(Some(method));
         }
+        if let Some(method) = self.find_dyn_trait_method(ctx, receiver_ty, method_name) {
+            return Ok(Some(method));
+        }
         Ok(self.find_trait_impl_method_by_name(ctx, receiver_ty, method_name))
+    }
+
+    fn find_dyn_trait_method(
+        &self,
+        ctx: &BodyCtx<'_>,
+        receiver_ty: &Type,
+        method_name: &Name,
+    ) -> Option<ResolvedMethod> {
+        let Type::Ref(inner, _) = receiver_ty else {
+            return None;
+        };
+        let Type::DynTrait { trait_id, args } = inner.as_ref() else {
+            return None;
+        };
+        let trait_data = &self.hir.item_tree.traits[*trait_id];
+        let (fid, function) = if let Some(fid) = trait_data
+            .default_methods
+            .iter()
+            .copied()
+            .find(|fid| self.hir.item_tree.functions[*fid].name == *method_name)
+        {
+            (fid, self.hir.item_tree.functions[fid].clone())
+        } else {
+            let function = trait_data
+                .methods
+                .iter()
+                .find(|function| function.name == *method_name)
+                .cloned()?;
+            let fid = ctx.function_id?;
+            (fid, function)
+        };
+        if !function
+            .params
+            .first()
+            .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(_, _)))
+            || !function.generics.is_empty()
+            || !function.implicit_generics.is_empty()
+            || !function.const_generics.is_empty()
+            || function
+                .params
+                .iter()
+                .skip(1)
+                .any(|param| hir_type_mentions_self(&param.ty))
+            || function
+                .ret_type
+                .as_ref()
+                .is_some_and(hir_type_mentions_self)
+        {
+            return None;
+        }
+        let receiver = Type::DynTrait {
+            trait_id: *trait_id,
+            args: args.clone(),
+        };
+        let mut subst = HashMap::new();
+        subst.insert("Self".into(), receiver);
+        for (name, arg) in trait_data.generics.iter().zip(args) {
+            subst.insert(name.0.clone(), arg.clone());
+        }
+        Some(ResolvedMethod {
+            fid,
+            function,
+            subst,
+            trait_id: Some(*trait_id),
+            from_trait_bound: true,
+        })
     }
 
     pub(super) fn find_inherent_method(
@@ -1013,6 +1086,7 @@ impl TypeChecker<'_> {
             TraitMethodCall {
                 trait_id,
                 method: "index_mut".into(),
+                dynamic: false,
             },
         );
         true
@@ -1038,5 +1112,28 @@ impl TypeChecker<'_> {
             }
             _ => None,
         }
+    }
+}
+
+fn hir_type_mentions_self(ty: &HirTypeRef) -> bool {
+    match ty {
+        HirTypeRef::Named(path) => {
+            path.segments.first().is_some_and(|name| name.0 == "Self")
+                || path
+                    .segment_type_args
+                    .iter()
+                    .flat_map(|(_, args)| args)
+                    .any(hir_type_mentions_self)
+                || path.type_args.iter().any(hir_type_mentions_self)
+        }
+        HirTypeRef::Ref(inner, _)
+        | HirTypeRef::Ptr { inner, .. }
+        | HirTypeRef::Slice(inner)
+        | HirTypeRef::Array(inner, _) => hir_type_mentions_self(inner),
+        HirTypeRef::Tuple(elements) => elements.iter().any(hir_type_mentions_self),
+        HirTypeRef::ImplTrait { trait_ty, .. } | HirTypeRef::DynTrait { trait_ty, .. } => {
+            hir_type_mentions_self(trait_ty)
+        }
+        HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => false,
     }
 }

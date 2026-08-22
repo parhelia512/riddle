@@ -1409,6 +1409,9 @@ impl<'a> ScopeGraphBuilder<'a> {
                     self.emit_type_references(&signature.ret, current_scope, nodes, edges);
                 }
             }
+            HirTypeRef::DynTrait { trait_ty, .. } => {
+                self.emit_type_references(trait_ty, current_scope, nodes, edges);
+            }
             HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => {}
         }
     }

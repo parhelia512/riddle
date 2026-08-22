@@ -29,6 +29,11 @@ impl TypeChecker<'_> {
             Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
                 self.check_type_bounds_inner(ctx, inner, span);
             }
+            Type::DynTrait { args, .. } => {
+                for arg in args {
+                    self.check_type_bounds_inner(ctx, arg, span);
+                }
+            }
             Type::Tuple(elements) => {
                 for element in elements {
                     self.check_type_bounds_inner(ctx, element, span);

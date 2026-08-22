@@ -496,10 +496,12 @@ impl TypeChecker<'_> {
                 into_iter: TraitMethodCall {
                     trait_id: into_iter_trait,
                     method: "into_iter".into(),
+                    dynamic: false,
                 },
                 next: TraitMethodCall {
                     trait_id: iterator_trait,
                     method: "next".into(),
+                    dynamic: false,
                 },
                 item_ty: item_ty.clone(),
                 iter_ty: into_iter_ty.clone(),

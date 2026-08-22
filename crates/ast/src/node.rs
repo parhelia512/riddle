@@ -101,6 +101,7 @@ ast_node!(TupleType, TupleType);
 ast_node!(ArrayType, ArrayType);
 ast_node!(ConstType, ConstType);
 ast_node!(ImplTraitType, ImplTraitType);
+ast_node!(DynTraitType, DynTraitType);
 ast_node!(CallableTraitArgs, CallableTraitArgs);
 
 // patterns
@@ -293,6 +294,51 @@ pub fn attrs_for_node(node: &SyntaxNode) -> Vec<Attribute> {
         }
     }
 
+    Vec::new()
+}
+
+/// Returns documentation comments immediately preceding a syntax node.
+#[must_use]
+pub fn doc_comments_for_node(node: &SyntaxNode) -> Vec<SyntaxToken> {
+    let mut leading = Vec::new();
+    for element in node.children_with_tokens() {
+        match element {
+            rowan::NodeOrToken::Node(candidate) if candidate.kind() == SyntaxKind::Attribute => {}
+            rowan::NodeOrToken::Token(token) if token.kind().is_trivia() => {
+                if matches!(
+                    token.kind(),
+                    SyntaxKind::DocComment | SyntaxKind::DocBlockComment
+                ) {
+                    leading.push(token);
+                }
+            }
+            rowan::NodeOrToken::Node(_) | rowan::NodeOrToken::Token(_) => break,
+        }
+    }
+    if !leading.is_empty() {
+        return leading;
+    }
+
+    let Some(parent) = node.parent() else {
+        return Vec::new();
+    };
+
+    let mut docs = Vec::new();
+    for element in parent.children_with_tokens() {
+        match element {
+            rowan::NodeOrToken::Node(candidate) if candidate == *node => return docs,
+            rowan::NodeOrToken::Node(candidate) if candidate.kind() == SyntaxKind::Attribute => {}
+            rowan::NodeOrToken::Token(token) if token.kind().is_trivia() => {
+                if matches!(
+                    token.kind(),
+                    SyntaxKind::DocComment | SyntaxKind::DocBlockComment
+                ) {
+                    docs.push(token);
+                }
+            }
+            rowan::NodeOrToken::Node(_) | rowan::NodeOrToken::Token(_) => docs.clear(),
+        }
+    }
     Vec::new()
 }
 
@@ -1488,6 +1534,14 @@ impl ImplTraitType {
     }
 }
 
+impl DynTraitType {
+    #[must_use]
+    pub fn bound(&self) -> Option<GenericBound> {
+        let elements = self.syntax.children_with_tokens().collect::<Vec<_>>();
+        parse_generic_bounds(&elements).into_iter().next()
+    }
+}
+
 impl CallableTraitArgs {
     pub fn params(&self) -> impl Iterator<Item = Type> + '_ {
         let ret = self.return_type().map(|ty| ty.syntax().text_range());
@@ -1913,6 +1967,7 @@ pub enum Type {
     Array(ArrayType),
     Const(ConstType),
     ImplTrait(ImplTraitType),
+    DynTrait(DynTraitType),
 }
 
 impl AstNode for Type {
@@ -1926,6 +1981,7 @@ impl AstNode for Type {
             SyntaxKind::ArrayType => Some(Self::Array(ArrayType { syntax: node })),
             SyntaxKind::ConstType => Some(Self::Const(ConstType { syntax: node })),
             SyntaxKind::ImplTraitType => Some(Self::ImplTrait(ImplTraitType { syntax: node })),
+            SyntaxKind::DynTraitType => Some(Self::DynTrait(DynTraitType { syntax: node })),
             _ => None,
         }
     }
@@ -1940,6 +1996,7 @@ impl AstNode for Type {
             Self::Array(it) => it.syntax(),
             Self::Const(it) => it.syntax(),
             Self::ImplTrait(it) => it.syntax(),
+            Self::DynTrait(it) => it.syntax(),
         }
     }
 }

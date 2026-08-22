@@ -61,6 +61,27 @@ impl TypeChecker<'_> {
                 Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
                 *mutable,
             ),
+            HirTypeRef::DynTrait {
+                trait_ty,
+                trait_range,
+            } => {
+                let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+                    self.diagnostic(
+                        "E0047",
+                        "dyn requires a trait type",
+                        span.or(Some(*trait_range)),
+                    );
+                    return Type::Unknown;
+                };
+                let args = self.trait_ref_args(
+                    trait_id,
+                    trait_ty,
+                    &Type::Unknown,
+                    params,
+                    span.or(Some(*trait_range)),
+                );
+                Type::DynTrait { trait_id, args }
+            }
             HirTypeRef::Ptr { mutable, inner } => Type::Ptr {
                 mutable: *mutable,
                 inner: Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
@@ -158,6 +179,7 @@ impl TypeChecker<'_> {
             }
             HirTypeRef::Const(value) => value.display(),
             HirTypeRef::ImplTrait { .. } => ty.display(),
+            HirTypeRef::DynTrait { .. } => ty.display(),
         }
     }
 

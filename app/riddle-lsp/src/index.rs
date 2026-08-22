@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use lsp_types::{Location, Range};
+use lsp_types::{Location, Range, SymbolInformation, SymbolKind};
 use riddlec::pipeline::CompileOptions;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +69,33 @@ pub struct ProjectIndex {
     pub symbols: Vec<IndexedSymbol>,
     pub calls: Vec<CallEdge>,
     pub types: TypeRelations,
+}
+
+#[allow(deprecated)]
+#[must_use]
+pub fn workspace_symbols_for_index(index: &ProjectIndex, query: &str) -> Vec<SymbolInformation> {
+    let query = query.to_lowercase();
+    index
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.name.to_lowercase().contains(&query))
+        .map(|symbol| SymbolInformation {
+            name: symbol.name.clone(),
+            kind: match symbol.key.kind {
+                IndexedSymbolKind::Function => SymbolKind::FUNCTION,
+                IndexedSymbolKind::Struct => SymbolKind::STRUCT,
+                IndexedSymbolKind::Enum => SymbolKind::ENUM,
+                IndexedSymbolKind::Trait => SymbolKind::INTERFACE,
+                IndexedSymbolKind::TypeAlias => SymbolKind::TYPE_PARAMETER,
+                IndexedSymbolKind::Const => SymbolKind::CONSTANT,
+                IndexedSymbolKind::Module => SymbolKind::MODULE,
+            },
+            tags: None,
+            deprecated: None,
+            location: symbol.location.clone(),
+            container_name: None,
+        })
+        .collect()
 }
 
 impl ProjectIndex {

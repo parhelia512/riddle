@@ -130,6 +130,35 @@ impl LowerCtx<'_> {
             .cloned()?;
 
         if let hir::body::Expr::FieldAccess { base, .. } = &body.exprs[callee] {
+            if trait_call.dynamic {
+                let object = self.lower_expr(builder, param_values, body, *base);
+                let object_ty =
+                    self.convert_type(self.type_result.expr_types.get(&(body_id, *base))?);
+                let Type::Struct(struct_ty) = object_ty else {
+                    return None;
+                };
+                let field_name = format!("method_{}", trait_call.method);
+                let (slot, method_ty) =
+                    struct_ty
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, (name, ty))| {
+                            (name == &field_name).then(|| match ty {
+                                Type::FnPtr(signature) => (index, Type::FnPtr(signature.clone())),
+                                _ => (index, ty.clone()),
+                            })
+                        })?;
+                let Type::FnPtr(_) = method_ty else {
+                    return None;
+                };
+                let data = builder.extract_value(object, 0, Type::Ptr(Box::new(Type::Unit)));
+                let mut values =
+                    self.lower_expr_sequence(builder, param_values, body, expr_id, 1, args);
+                values.insert(0, data);
+                let method = builder.extract_value(object, slot, method_ty);
+                return Some(builder.call_indirect(method, values, result_ty));
+            }
             let receiver_ty = self
                 .type_result
                 .expr_types

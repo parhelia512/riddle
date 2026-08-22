@@ -418,7 +418,8 @@ const fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         | SyntaxKind::RefType
         | SyntaxKind::TupleType
         | SyntaxKind::ArrayType
-        | SyntaxKind::ImplTraitType => Some(ReparseEntry::Type),
+        | SyntaxKind::ImplTraitType
+        | SyntaxKind::DynTraitType => Some(ReparseEntry::Type),
 
         SyntaxKind::UseTree => Some(ReparseEntry::UseTree),
         SyntaxKind::UseTreeList => Some(ReparseEntry::UseTreeList),

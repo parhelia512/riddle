@@ -515,6 +515,20 @@ impl LowerCtx<'_> {
         {
             return builder.negative_iconst(*value, *ty);
         }
+        if matches!(op, HirUnOp::Ref | HirUnOp::MutRef)
+            && let Some(type_checker::Type::Ref(inner, _)) = input.tc_type
+            && let type_checker::Type::DynTrait { trait_id, .. } = inner.as_ref()
+            && let Some(value) = self.lower_dyn_trait_ref(
+                builder,
+                input.param_values,
+                input.body,
+                operand,
+                *trait_id,
+                input.mir_type,
+            )
+        {
+            return self.finish_expr(builder, input, value);
+        }
         let operand_value = if matches!(op, HirUnOp::Ref | HirUnOp::MutRef) {
             self.lower_lvalue(builder, input.param_values, input.body, operand)
         } else {
@@ -525,6 +539,63 @@ impl LowerCtx<'_> {
         }
         let value = builder.unop(convert_unop(op), operand_value, input.mir_type.clone());
         self.finish_expr(builder, input, value)
+    }
+
+    fn lower_dyn_trait_ref(
+        &mut self,
+        builder: &mut Builder,
+        param_values: &[Value],
+        body: &Body,
+        operand: ExprId,
+        trait_id: hir::item_tree::TraitId,
+        object_ty: &Type,
+    ) -> Option<Value> {
+        let Type::Struct(_) = object_ty else {
+            return None;
+        };
+        let concrete_ty = self.expr_type(operand);
+        let place = self.lower_lvalue(builder, param_values, body, operand);
+        let data = builder.cast(
+            crate::instr::CastOp::PtrToPtr,
+            place,
+            Type::Ptr(Box::new(Type::Unit)),
+        );
+        self.lower_dyn_trait_from_data(builder, data, &concrete_ty, trait_id, object_ty)
+    }
+
+    fn lower_dyn_trait_from_data(
+        &mut self,
+        builder: &mut Builder,
+        data: Value,
+        concrete_ty: &type_checker::Type,
+        trait_id: hir::item_tree::TraitId,
+        object_ty: &Type,
+    ) -> Option<Value> {
+        let Type::Struct(struct_ty) = object_ty else {
+            return None;
+        };
+        let trait_data = &self.hir.item_tree.traits[trait_id];
+        let mut methods = trait_data.methods.clone();
+        methods.extend(
+            trait_data
+                .default_methods
+                .iter()
+                .map(|fid| self.hir.item_tree.functions[*fid].clone()),
+        );
+        let mut values = vec![data];
+        for (field_name, field_ty) in struct_ty.fields.iter().skip(1) {
+            let method_name = field_name.strip_prefix("method_")?;
+            methods.iter().find(|method| method.name.0 == method_name)?;
+            let fid = self.find_trait_impl_method(trait_id, method_name, concrete_ty, None)?;
+            let Type::FnPtr(signature) = field_ty else {
+                return None;
+            };
+            let adapter = self.ensure_dyn_trait_adapter(trait_id, fid, concrete_ty, signature);
+            values.push(
+                builder.function_ref(FuncRef::Local(adapter), Type::FnPtr(signature.clone())),
+            );
+        }
+        Some(builder.struct_value(values, object_ty.clone()))
     }
 
     fn lower_block_expr(
@@ -1352,7 +1423,7 @@ impl LowerCtx<'_> {
     }
 
     pub(super) fn apply_expr_coercion(
-        &self,
+        &mut self,
         builder: &mut Builder,
         expr_id: ExprId,
         value: Value,
@@ -1371,6 +1442,19 @@ impl LowerCtx<'_> {
         else {
             return value;
         };
+        if let type_checker::Type::DynTrait { trait_id, .. } = target.as_ref()
+            && !matches!(actual.as_ref(), type_checker::Type::DynTrait { .. })
+        {
+            let object_ty = self.convert_type(target.as_ref());
+            let data = builder.cast(
+                crate::instr::CastOp::PtrToPtr,
+                value,
+                Type::Ptr(Box::new(Type::Unit)),
+            );
+            return self
+                .lower_dyn_trait_from_data(builder, data, actual, *trait_id, &object_ty)
+                .unwrap_or(value);
+        }
         let (
             type_checker::Type::Array(_, type_checker::ConstArg::Value(len)),
             type_checker::Type::Slice(_),

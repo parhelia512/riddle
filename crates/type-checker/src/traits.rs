@@ -847,7 +847,7 @@ impl TypeChecker<'_> {
                 let kind = if *mutable { "*mut" } else { "*const" };
                 format!("{kind} {}", Self::type_ref_source_text(inner))
             }
-            HirTypeRef::ImplTrait { .. } => ty.display(),
+            HirTypeRef::ImplTrait { .. } | HirTypeRef::DynTrait { .. } => ty.display(),
             HirTypeRef::Unknown => "_".to_string(),
             HirTypeRef::Error => "<error>".to_string(),
         }
@@ -1192,7 +1192,7 @@ fn type_ref_size(ty: &HirTypeRef, generics: &HashSet<&str>) -> usize {
                 .map(|element| type_ref_size(element, generics))
                 .sum::<usize>()
         }
-        HirTypeRef::ImplTrait { .. } => 1,
+        HirTypeRef::ImplTrait { .. } | HirTypeRef::DynTrait { .. } => 1,
         HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => 0,
     }
 }

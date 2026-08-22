@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::BuildHasher,
     path::PathBuf,
     sync::{
@@ -57,7 +57,7 @@ use crate::{
         prepare_type_hierarchy as hierarchy_prepare_type, subtypes as hierarchy_subtypes,
         supertypes as hierarchy_supertypes,
     },
-    index::project_index_for_root_cancellable,
+    index::{project_index_for_root_cancellable, workspace_symbols_for_index},
     inlay_hints::inlay_hints_for_document_cancellable,
     navigation::{
         definition_for_document_cancellable, document_highlights_for_document_cancellable,
@@ -473,12 +473,24 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let docs = self.docs.lock().unwrap().clone();
         let uris = docs.keys().cloned().collect::<Vec<_>>();
+        let open_uris = uris.iter().cloned().collect::<HashSet<_>>();
+        let projects = self.workspace.projects();
+        let workspace = Arc::clone(&self.workspace);
         let options = self.compile_options;
         let sessions = Arc::clone(&self.analysis_sessions);
         let revisions = Arc::clone(&self.analysis_revisions);
         let query = params.query;
         let result = tokio::task::spawn_blocking(move || {
             let mut symbols = Vec::new();
+            for project in projects {
+                if let Some(index) = workspace.snapshot(&project) {
+                    symbols.extend(
+                        workspace_symbols_for_index(&index, &query)
+                            .into_iter()
+                            .filter(|symbol| !open_uris.contains(&symbol.location.uri)),
+                    );
+                }
+            }
             for uri in uris {
                 let revision = revisions.current(&uri);
                 let cancelled = || !revisions.is_current(&uri, revision);

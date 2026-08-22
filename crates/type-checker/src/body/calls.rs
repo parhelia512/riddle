@@ -550,6 +550,7 @@ impl TypeChecker<'_> {
             TraitMethodCall {
                 trait_id,
                 method: method_name.into(),
+                dynamic: false,
             },
         );
         method.ret_type.as_ref().map_or(Type::Unit, |ty| {

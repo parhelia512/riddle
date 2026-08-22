@@ -8,11 +8,47 @@ fn raw_string(lex: &mut logos::Lexer<'_, SyntaxKind>) -> Option<()> {
     Some(())
 }
 
+fn block_comment(lex: &mut logos::Lexer<'_, SyntaxKind>) -> Option<()> {
+    let mut depth = 1usize;
+    let bytes = lex.remainder().as_bytes();
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        match &bytes[index..index + 2] {
+            b"/*" => {
+                depth += 1;
+                index += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                index += 2;
+                if depth == 0 {
+                    lex.bump(index);
+                    return Some(());
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    lex.bump(bytes.len());
+    Some(())
+}
+
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 pub enum SyntaxKind {
     #[regex(r"[ \t\r\n]+")]
     Whitespace = 0,
+
+    #[regex(r"///[^\n]*", allow_greedy = true)]
+    #[regex(r"//![^\n]*", allow_greedy = true)]
+    DocComment,
+
+    #[token("/**", block_comment)]
+    #[token("/*!", block_comment)]
+    DocBlockComment,
+
+    #[token("/*", block_comment)]
+    BlockComment,
 
     #[regex(r"//[^\n]*", allow_greedy = true)]
     LineComment,
@@ -62,6 +98,8 @@ pub enum SyntaxKind {
     Trait,
     #[token("impl")]
     Impl,
+    #[token("dyn")]
+    Dyn,
     #[token("match")]
     Match,
     #[token("const")]
@@ -244,6 +282,7 @@ pub enum SyntaxKind {
     ArrayType,
     ConstType,
     ImplTraitType,
+    DynTraitType,
     CallableTraitArgs,
     ArrayExpr,
     MatchExpr,
@@ -286,7 +325,14 @@ pub enum SyntaxKind {
 impl SyntaxKind {
     #[must_use]
     pub const fn is_trivia(self) -> bool {
-        matches!(self, Self::Whitespace | Self::LineComment)
+        matches!(
+            self,
+            Self::Whitespace
+                | Self::LineComment
+                | Self::DocComment
+                | Self::BlockComment
+                | Self::DocBlockComment
+        )
     }
 }
 

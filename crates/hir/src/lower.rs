@@ -737,6 +737,18 @@ impl Lower for Type {
                     hidden: None,
                 }
             }
+            Self::DynTrait(dyn_trait) => {
+                let Some(bound) = dyn_trait.bound() else {
+                    return HirTypeRef::Error;
+                };
+                let trait_range = trimmed_range(bound.trait_path.syntax());
+                let mut trait_path = bound.trait_path.lower();
+                trait_path.type_args = bound.type_args.into_iter().map(Lower::lower).collect();
+                HirTypeRef::DynTrait {
+                    trait_ty: Box::new(HirTypeRef::Named(trait_path)),
+                    trait_range,
+                }
+            }
         }
     }
 }

@@ -471,11 +471,12 @@ impl LowerCtx<'_> {
         let delayed = init.is_none();
         let bindings = let_pattern_bindings(body, pat);
         let is_mut = bindings.iter().any(|(_, is_mut)| *is_mut);
-        let escapes = self.current_body.is_some_and(|bid| {
-            bindings
-                .iter()
-                .any(|(id, _)| self.analysis.escapes(bid, *id))
-        });
+        let escapes = matches!(body.pats[pat], Pattern::Binding { .. })
+            && self.current_body.is_some_and(|bid| {
+                bindings
+                    .iter()
+                    .any(|(id, _)| id.field.is_none() && self.analysis.escapes(bid, *id))
+            });
         let needs_address = self.current_body.is_some_and(|bid| {
             bindings
                 .iter()
@@ -528,9 +529,8 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Bind the elements of a destructuring `let`. The whole initializer already
-    /// lives in one slot, so each binding is a projection of it rather than a
-    /// separate allocation — that keeps `&a` valid for `let (a, b) = pair`.
+    /// Bind the elements of a destructuring `let`. Non-escaping bindings stay
+    /// as projections; an escaping binding gets its own stable storage.
     pub(super) fn bind_let_pattern(
         &mut self,
         builder: &mut Builder,
@@ -693,8 +693,15 @@ impl LowerCtx<'_> {
     ) {
         let mode = self.pattern_binding_mode(id);
         let binding_ty = self.pattern_binding_type(id, value_ty);
+        let escapes = self
+            .current_body
+            .is_some_and(|body_id| self.analysis.escapes(body_id, id));
         match mode {
             PatternBindingMode::Move => match source {
+                LetSource::Place(place) if escapes => {
+                    let value = builder.load(place, self.convert_type(&binding_ty));
+                    self.bind_let_value(builder, body, id, value, &binding_ty);
+                }
                 LetSource::Place(place) => {
                     self.storage_bindings.insert(id);
                     self.scope_map.insert(id, place);

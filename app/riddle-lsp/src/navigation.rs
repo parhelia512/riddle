@@ -957,7 +957,9 @@ fn hir_type_definition(hir: &HirFile, ty: &HirTypeRef) -> Option<TextRange> {
         | HirTypeRef::Ptr { inner, .. }
         | HirTypeRef::Slice(inner)
         | HirTypeRef::Array(inner, _) => hir_type_definition(hir, inner),
-        HirTypeRef::ImplTrait { trait_ty, .. } => hir_type_definition(hir, trait_ty),
+        HirTypeRef::ImplTrait { trait_ty, .. } | HirTypeRef::DynTrait { trait_ty, .. } => {
+            hir_type_definition(hir, trait_ty)
+        }
         HirTypeRef::Never
         | HirTypeRef::Tuple(_)
         | HirTypeRef::Const(_)

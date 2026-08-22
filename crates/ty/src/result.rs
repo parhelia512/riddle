@@ -180,6 +180,7 @@ pub struct GenericCall {
 pub struct TraitMethodCall {
     pub trait_id: TraitId,
     pub method: String,
+    pub dynamic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

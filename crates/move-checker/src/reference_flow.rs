@@ -759,6 +759,7 @@ fn type_may_carry_provenance(hir: &HirFile, ty: &Type) -> bool {
 fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> bool {
     match ty {
         Type::Ref(..)
+        | Type::DynTrait { .. }
         | Type::Closure { .. }
         | Type::OpaqueCallable { .. }
         | Type::Param(..)
@@ -842,7 +843,7 @@ fn hir_type_may_carry_flow(
     visiting: &mut HashSet<TextRange>,
 ) -> bool {
     match ty {
-        hir::item_tree::HirTypeRef::Ref(..) => true,
+        hir::item_tree::HirTypeRef::Ref(..) | hir::item_tree::HirTypeRef::DynTrait { .. } => true,
         hir::item_tree::HirTypeRef::Ptr { .. } => through_raw_pointer,
         hir::item_tree::HirTypeRef::Tuple(elements) => elements
             .iter()

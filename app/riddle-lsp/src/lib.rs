@@ -33,7 +33,7 @@ pub mod test_support {
     };
     pub use crate::index::{
         IndexedSymbolKind, ProjectIndex, SymbolKey, project_index_for_document,
-        project_index_for_root,
+        project_index_for_root, workspace_symbols_for_index,
     };
     pub use crate::inlay_hints::{inlay_hints_for_document, inlay_hints_for_source};
     pub use crate::navigation::{
