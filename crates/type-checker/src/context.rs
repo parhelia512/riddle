@@ -31,6 +31,7 @@ pub struct BodyCtx<'a> {
 pub(crate) struct LoopCtx {
     /// `loop { }` allows `break value;`; `while`/`for` do not.
     pub allows_value: bool,
+    pub expected_type: Option<Type>,
     pub break_types: Vec<(Type, Option<TextRange>)>,
 }
 

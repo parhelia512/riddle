@@ -1,10 +1,10 @@
 use super::{
     BinOp, Body, Builder, CapturePlace, CaptureSource, CmpOp, EnumVariantKind, Expr, ExprId,
-    ExprLoweringInput, ForExprInput, FuncRef, HirBinOp, HirUnOp, Inst, InstKind, IntTy,
+    ExprLoweringInput, ForExprInput, FuncRef, HashMap, HirBinOp, HirUnOp, Inst, InstKind, IntTy,
     LambdaExprInput, LoopTargets, LowerCtx, OperatorCall, PatId, ResolvedName, Type, Value,
     closure_call_signature, closure_env_type, convert_binop, convert_unop, determine_cast_op,
-    is_byte_str_layout_cast, is_raw_parts_to_slice_cast, is_slice_to_raw_parts_cast,
-    parse_float_suffix, parse_int_suffix,
+    is_byte_str_layout_cast, is_dyn_object_safe_method, is_raw_parts_to_slice_cast,
+    is_slice_to_raw_parts_cast, parse_float_suffix, parse_int_suffix,
 };
 
 impl LowerCtx<'_> {
@@ -95,9 +95,10 @@ impl LowerCtx<'_> {
                 builder,
                 input.param_values,
                 input.body,
+                input.expr_id,
                 *scrutinee,
                 arms,
-                input.mir_type.clone(),
+                self.coerced_expr_type(input.expr_id, input.mir_type),
             ),
 
             Expr::Array { elements } => self.lower_array_expr(builder, &input, elements),
@@ -321,6 +322,12 @@ impl LowerCtx<'_> {
             .unwrap_or(type_checker::Type::Error)
     }
 
+    fn coerced_expr_type(&self, expr_id: ExprId, fallback: &Type) -> Type {
+        self.current_body
+            .and_then(|body_id| self.type_result.expr_coercions.get(&(body_id, expr_id)))
+            .map_or_else(|| fallback.clone(), |target| self.convert_type(target))
+    }
+
     fn lower_binary_operator_call(
         &mut self,
         builder: &mut Builder,
@@ -517,13 +524,21 @@ impl LowerCtx<'_> {
         }
         if matches!(op, HirUnOp::Ref | HirUnOp::MutRef)
             && let Some(type_checker::Type::Ref(inner, _)) = input.tc_type
-            && let type_checker::Type::DynTrait { trait_id, .. } = inner.as_ref()
+            && let type_checker::Type::DynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } = inner.as_ref()
             && let Some(value) = self.lower_dyn_trait_ref(
                 builder,
                 input.param_values,
                 input.body,
                 operand,
                 *trait_id,
+                args.iter()
+                    .map(|arg| self.convert_type(arg))
+                    .collect::<Vec<_>>(),
+                self.convert_dyn_assoc_bindings(assoc_bindings),
                 input.mir_type,
             )
         {
@@ -541,6 +556,7 @@ impl LowerCtx<'_> {
         self.finish_expr(builder, input, value)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_dyn_trait_ref(
         &mut self,
         builder: &mut Builder,
@@ -548,45 +564,100 @@ impl LowerCtx<'_> {
         body: &Body,
         operand: ExprId,
         trait_id: hir::item_tree::TraitId,
+        trait_args: Vec<Type>,
+        trait_assoc: Vec<(String, Type)>,
         object_ty: &Type,
     ) -> Option<Value> {
         let Type::Struct(_) = object_ty else {
             return None;
         };
         let concrete_ty = self.expr_type(operand);
+        if matches!(
+            concrete_ty,
+            type_checker::Type::DynTrait { .. } | type_checker::Type::OwnedDynTrait { .. }
+        ) {
+            let object = self.lower_expr(builder, param_values, body, operand);
+            return self.lower_dyn_trait_from_object(
+                builder,
+                object,
+                &concrete_ty,
+                trait_id,
+                &trait_args,
+                &trait_assoc,
+                object_ty,
+            );
+        }
         let place = self.lower_lvalue(builder, param_values, body, operand);
         let data = builder.cast(
             crate::instr::CastOp::PtrToPtr,
             place,
             Type::Ptr(Box::new(Type::Unit)),
         );
-        self.lower_dyn_trait_from_data(builder, data, &concrete_ty, trait_id, object_ty)
+        self.lower_dyn_trait_from_data(
+            builder,
+            data,
+            &concrete_ty,
+            trait_id,
+            &trait_args,
+            &trait_assoc,
+            object_ty,
+            false,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_dyn_trait_from_data(
         &mut self,
         builder: &mut Builder,
         data: Value,
         concrete_ty: &type_checker::Type,
         trait_id: hir::item_tree::TraitId,
+        trait_args: &[Type],
+        trait_assoc: &[(String, Type)],
         object_ty: &Type,
+        owned: bool,
     ) -> Option<Value> {
         let Type::Struct(struct_ty) = object_ty else {
             return None;
         };
-        let trait_data = &self.hir.item_tree.traits[trait_id];
-        let mut methods = trait_data.methods.clone();
-        methods.extend(
-            trait_data
-                .default_methods
-                .iter()
-                .map(|fid| self.hir.item_tree.functions[*fid].clone()),
-        );
+        let mut trait_subst = self.hir.item_tree.traits[trait_id]
+            .generics
+            .iter()
+            .map(|name| name.0.clone())
+            .zip(trait_args.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        for (name, ty) in trait_assoc {
+            trait_subst.insert(format!("Self::{name}"), ty.clone());
+        }
+        let methods = self.dyn_trait_methods(trait_id, &trait_subst);
         let mut values = vec![data];
         for (field_name, field_ty) in struct_ty.fields.iter().skip(1) {
-            let method_name = field_name.strip_prefix("method_")?;
-            methods.iter().find(|method| method.name.0 == method_name)?;
-            let fid = self.find_trait_impl_method(trait_id, method_name, concrete_ty, None)?;
+            let Some((method_trait_id, method_name, method_subst)) = methods
+                .iter()
+                .find(|(method_trait_id, method, _)| {
+                    is_dyn_object_safe_method(method)
+                        && self.dyn_trait_method_field_name(
+                            &methods,
+                            *method_trait_id,
+                            &method.name.0,
+                        ) == *field_name
+                })
+                .map(|(trait_id, method, subst)| (*trait_id, method.name.0.clone(), subst.clone()))
+            else {
+                continue;
+            };
+            let method_args = self.hir.item_tree.traits[method_trait_id]
+                .generics
+                .iter()
+                .map(|name| method_subst.get(&name.0).cloned().unwrap_or(Type::Unit))
+                .collect::<Vec<_>>();
+            let fid = self.find_trait_impl_method_with_mir_args(
+                method_trait_id,
+                &method_name,
+                concrete_ty,
+                Some(&method_args),
+                None,
+            )?;
             let Type::FnPtr(signature) = field_ty else {
                 return None;
             };
@@ -595,7 +666,105 @@ impl LowerCtx<'_> {
                 builder.function_ref(FuncRef::Local(adapter), Type::FnPtr(signature.clone())),
             );
         }
-        Some(builder.struct_value(values, object_ty.clone()))
+        if owned {
+            let drop_name = self.ensure_dyn_trait_drop_adapter(concrete_ty);
+            values.push(builder.function_ref(
+                FuncRef::Local(drop_name),
+                super::types::dyn_trait_drop_function_type(),
+            ));
+        }
+        let value = builder.struct_value(values, object_ty.clone());
+        self.coerced_values.insert((value, object_ty.clone()));
+        Some(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_dyn_trait_from_object(
+        &mut self,
+        builder: &mut Builder,
+        source: Value,
+        source_tc_ty: &type_checker::Type,
+        target_trait_id: hir::item_tree::TraitId,
+        target_args: &[Type],
+        target_assoc: &[(String, Type)],
+        target_object_ty: &Type,
+    ) -> Option<Value> {
+        let (source_trait_id, source_args, source_assoc, source_owned) = match source_tc_ty {
+            type_checker::Type::DynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => (*trait_id, args, assoc_bindings, false),
+            type_checker::Type::OwnedDynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => (*trait_id, args, assoc_bindings, true),
+            _ => return None,
+        };
+        let Type::Struct(source_struct) = self.convert_type(source_tc_ty) else {
+            return None;
+        };
+        let Type::Struct(target_struct) = target_object_ty else {
+            return None;
+        };
+        let source_mir_args = source_args
+            .iter()
+            .map(|arg| self.convert_type(arg))
+            .collect::<Vec<_>>();
+        let mut source_subst = self.hir.item_tree.traits[source_trait_id]
+            .generics
+            .iter()
+            .map(|name| name.0.clone())
+            .zip(source_mir_args)
+            .collect::<HashMap<_, _>>();
+        for (name, ty) in self.convert_dyn_assoc_bindings(source_assoc) {
+            source_subst.insert(format!("Self::{name}"), ty);
+        }
+        let mut target_subst = self.hir.item_tree.traits[target_trait_id]
+            .generics
+            .iter()
+            .map(|name| name.0.clone())
+            .zip(target_args.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        for (name, ty) in target_assoc {
+            target_subst.insert(format!("Self::{name}"), ty.clone());
+        }
+        let source_methods = self.dyn_trait_methods(source_trait_id, &source_subst);
+        let target_methods = self.dyn_trait_methods(target_trait_id, &target_subst);
+        let mut values = vec![builder.extract_value(source, 0, Type::Ptr(Box::new(Type::Unit)))];
+        for (field_name, field_ty) in target_struct.fields.iter().skip(1) {
+            if field_name == "drop" {
+                if !source_owned {
+                    return None;
+                }
+                let index = source_struct.fields.len().checked_sub(1)?;
+                values.push(builder.extract_value(source, index, field_ty.clone()));
+                continue;
+            }
+            let (method_trait_id, method_name) = target_methods
+                .iter()
+                .find(|(method_trait_id, method, _)| {
+                    is_dyn_object_safe_method(method)
+                        && self.dyn_trait_method_field_name(
+                            &target_methods,
+                            *method_trait_id,
+                            &method.name.0,
+                        ) == *field_name
+                })
+                .map(|(trait_id, method, _)| (*trait_id, method.name.0.clone()))?;
+            let source_field_name =
+                self.dyn_trait_method_field_name(&source_methods, method_trait_id, &method_name);
+            let source_index = source_struct
+                .fields
+                .iter()
+                .position(|(name, _)| name == &source_field_name)?;
+            values.push(builder.extract_value(source, source_index, field_ty.clone()));
+        }
+        let value = builder.struct_value(values, target_object_ty.clone());
+        self.coerced_values
+            .insert((value, target_object_ty.clone()));
+        Some(value)
     }
 
     fn lower_block_expr(
@@ -680,8 +849,19 @@ impl LowerCtx<'_> {
         if phi_args.is_empty() {
             builder.unit_const()
         } else {
-            let phi = Inst::new(InstKind::Phi(phi_args), input.mir_type.clone());
-            builder.func.push_inst(merge_block, phi)
+            let result_ty = self.coerced_expr_type(input.expr_id, input.mir_type);
+            let phi = builder.func.push_inst(
+                merge_block,
+                Inst::new(InstKind::Phi(phi_args), result_ty.clone()),
+            );
+            if self.current_body.is_some_and(|body_id| {
+                self.type_result
+                    .expr_coercions
+                    .contains_key(&(body_id, input.expr_id))
+            }) {
+                self.coerced_values.insert((phi, result_ty));
+            }
+            phi
         }
     }
 
@@ -730,15 +910,16 @@ impl LowerCtx<'_> {
         input: &ExprLoweringInput<'_>,
         body: ExprId,
     ) -> Value {
+        let result_ty = self.coerced_expr_type(input.expr_id, input.mir_type);
         let body_block = builder.func.new_block_labeled("loop_body");
         let exit_block = builder.func.new_block_labeled("loop_exit");
 
         // break 值经 alloca 槽传出：break 可在任意嵌套深度、数量不定，
         // 且跳转前穿插 drop 代码，不适合 phi。
-        let break_slot = if matches!(input.mir_type, Type::Unit | Type::Never) {
+        let break_slot = if matches!(&result_ty, Type::Unit | Type::Never) {
             None
         } else {
-            Some(builder.alloca(input.mir_type.clone()))
+            Some(builder.alloca(result_ty.clone()))
         };
 
         builder.set_branch(body_block);
@@ -759,7 +940,17 @@ impl LowerCtx<'_> {
 
         builder.switch_to_block(exit_block);
         match break_slot {
-            Some(slot) => builder.load(slot, input.mir_type.clone()),
+            Some(slot) => {
+                let value = builder.load(slot, result_ty.clone());
+                if self.current_body.is_some_and(|body_id| {
+                    self.type_result
+                        .expr_coercions
+                        .contains_key(&(body_id, input.expr_id))
+                }) {
+                    self.coerced_values.insert((value, result_ty));
+                }
+                value
+            }
             None => builder.unit_const(),
         }
     }
@@ -960,6 +1151,13 @@ impl LowerCtx<'_> {
             .current_body
             .and_then(|body| self.type_result.expr_types.get(&(body, callee)))
             .map_or(Type::Unit, |ty| self.convert_type(ty));
+        let (callee_value, callee_ty) = match &callee_ty {
+            Type::Ref(inner, _) if closure_call_signature(inner).is_some() => (
+                builder.load(callee_value, inner.as_ref().clone()),
+                inner.as_ref().clone(),
+            ),
+            _ => (callee_value, callee_ty),
+        };
         if let Some(signature) = closure_call_signature(&callee_ty) {
             let call = builder.extract_value(callee_value, 0, Type::FnPtr(signature));
             let env = builder.extract_value(callee_value, 1, closure_env_type());
@@ -1437,23 +1635,169 @@ impl LowerCtx<'_> {
         let Some(actual) = self.type_result.expr_types.get(&(body_id, expr_id)) else {
             return value;
         };
+        let target_mir_type = self.convert_type(target);
+        if self
+            .coerced_values
+            .contains(&(value, target_mir_type.clone()))
+        {
+            return value;
+        }
+        if let type_checker::Type::OwnedDynTrait {
+            trait_id,
+            args,
+            assoc_bindings: target_assoc,
+        } = target
+        {
+            if let type_checker::Type::OwnedDynTrait {
+                trait_id: actual_trait_id,
+                args: actual_args,
+                assoc_bindings: actual_assoc,
+                ..
+            } = actual
+            {
+                if actual_trait_id == trait_id
+                    && actual_args == args
+                    && actual_assoc == target_assoc
+                {
+                    return value;
+                }
+                let target_assoc = self.convert_dyn_assoc_bindings(target_assoc);
+                return self
+                    .lower_dyn_trait_from_object(
+                        builder,
+                        value,
+                        actual,
+                        *trait_id,
+                        &args
+                            .iter()
+                            .map(|arg| self.convert_type(arg))
+                            .collect::<Vec<_>>(),
+                        &target_assoc,
+                        &target_mir_type,
+                    )
+                    .unwrap_or(value);
+            }
+            let object_ty = target_mir_type;
+            let storage = builder.heap_alloc(self.convert_type(actual));
+            builder.store(value, storage);
+            let data = builder.cast(
+                crate::instr::CastOp::PtrToPtr,
+                storage,
+                Type::Ptr(Box::new(Type::Unit)),
+            );
+            if let Some(object) = self.lower_dyn_trait_from_data(
+                builder,
+                data,
+                actual,
+                *trait_id,
+                &args
+                    .iter()
+                    .map(|arg| self.convert_type(arg))
+                    .collect::<Vec<_>>(),
+                &self.convert_dyn_assoc_bindings(target_assoc),
+                &object_ty,
+                true,
+            ) {
+                return object;
+            }
+            return value;
+        }
         let (type_checker::Type::Ref(actual, _), type_checker::Type::Ref(target, target_mut)) =
             (actual, target)
         else {
             return value;
         };
-        if let type_checker::Type::DynTrait { trait_id, .. } = target.as_ref()
-            && !matches!(actual.as_ref(), type_checker::Type::DynTrait { .. })
+        if let type_checker::Type::DynTrait {
+            trait_id,
+            args,
+            assoc_bindings: target_assoc,
+        } = target.as_ref()
         {
-            let object_ty = self.convert_type(target.as_ref());
-            let data = builder.cast(
-                crate::instr::CastOp::PtrToPtr,
-                value,
-                Type::Ptr(Box::new(Type::Unit)),
-            );
-            return self
-                .lower_dyn_trait_from_data(builder, data, actual, *trait_id, &object_ty)
-                .unwrap_or(value);
+            match actual.as_ref() {
+                type_checker::Type::DynTrait {
+                    trait_id: actual_trait_id,
+                    args: actual_args,
+                    assoc_bindings: actual_assoc,
+                    ..
+                } => {
+                    if actual_trait_id == trait_id
+                        && actual_args == args
+                        && actual_assoc == target_assoc
+                    {
+                        return value;
+                    }
+                    let target_assoc = self.convert_dyn_assoc_bindings(target_assoc);
+                    return self
+                        .lower_dyn_trait_from_object(
+                            builder,
+                            value,
+                            actual.as_ref(),
+                            *trait_id,
+                            &args
+                                .iter()
+                                .map(|arg| self.convert_type(arg))
+                                .collect::<Vec<_>>(),
+                            &target_assoc,
+                            &target_mir_type,
+                        )
+                        .unwrap_or(value);
+                }
+                type_checker::Type::OwnedDynTrait {
+                    trait_id: actual_trait_id,
+                    args: actual_args,
+                    assoc_bindings: actual_assoc,
+                    ..
+                } => {
+                    if actual_trait_id == trait_id
+                        && actual_args == args
+                        && actual_assoc == target_assoc
+                    {
+                        return value;
+                    }
+                    let source = type_checker::Type::DynTrait {
+                        trait_id: *actual_trait_id,
+                        args: actual_args.clone(),
+                        assoc_bindings: actual_assoc.clone(),
+                    };
+                    let target_assoc = self.convert_dyn_assoc_bindings(target_assoc);
+                    return self
+                        .lower_dyn_trait_from_object(
+                            builder,
+                            value,
+                            &source,
+                            *trait_id,
+                            &args
+                                .iter()
+                                .map(|arg| self.convert_type(arg))
+                                .collect::<Vec<_>>(),
+                            &target_assoc,
+                            &target_mir_type,
+                        )
+                        .unwrap_or(value);
+                }
+                _ => {
+                    let data = builder.cast(
+                        crate::instr::CastOp::PtrToPtr,
+                        value,
+                        Type::Ptr(Box::new(Type::Unit)),
+                    );
+                    return self
+                        .lower_dyn_trait_from_data(
+                            builder,
+                            data,
+                            actual,
+                            *trait_id,
+                            &args
+                                .iter()
+                                .map(|arg| self.convert_type(arg))
+                                .collect::<Vec<_>>(),
+                            &self.convert_dyn_assoc_bindings(target_assoc),
+                            &target_mir_type,
+                            false,
+                        )
+                        .unwrap_or(value);
+                }
+            }
         }
         let (
             type_checker::Type::Array(_, type_checker::ConstArg::Value(len)),
@@ -1463,10 +1807,13 @@ impl LowerCtx<'_> {
             return value;
         };
         let len = builder.iconst(*len as u64, IntTy::Usize);
-        builder.struct_value(
+        let value = builder.struct_value(
             vec![value, len],
             Type::Ref(Box::new(self.convert_type(target.as_ref())), *target_mut),
-        )
+        );
+        self.coerced_values
+            .insert((value, self.convert_type(target)));
+        value
     }
 
     pub(super) fn lower_for_expr(

@@ -26,6 +26,20 @@ fn signature_help_tracks_the_active_argument() {
 }
 
 #[test]
+fn signature_help_includes_function_documentation() {
+    let source = "/// Adds two numbers.\nfun add(left: i32, right: i32) -> i32 { left + right } fun main() { add(1, 2); }";
+    let cursor = position(source, source.rfind("2)").unwrap() + 1);
+
+    let help = signature_help_for_source(source, cursor).unwrap();
+
+    let documentation = help.signatures[0].documentation.as_ref().unwrap();
+    let lsp_types::Documentation::MarkupContent(contents) = documentation else {
+        panic!("expected markdown documentation")
+    };
+    assert!(contents.value.contains("Adds two numbers."));
+}
+
+#[test]
 fn signature_help_keeps_nested_type_commas_inside_one_parameter() {
     let source =
         "fun first(pair: (i32, i32), right: i32) -> i32 { right } fun main() { first((1, 2), 3); }";

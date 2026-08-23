@@ -810,8 +810,18 @@ impl EscapeAnalyzer<'_> {
         args: &[ExprId],
     ) -> SourceValue {
         let callee_fid = self.resolve_callee(ctx, callee);
+        let callable_signature = self
+            .type_result
+            .expr_types
+            .get(&(ctx.body_id, callee))
+            .and_then(callable_signature_for_type)
+            .cloned();
+        let callable_returns_reference = callable_signature
+            .as_ref()
+            .is_some_and(|signature| type_may_carry_reference(&signature.ret));
         let mut returned = SourceValue::default();
         let mut inputs = Vec::new();
+        let mut callable_inputs = Vec::new();
         let mut pending = ctx
             .expr_sources
             .get(&callee)
@@ -862,9 +872,26 @@ impl EscapeAnalyzer<'_> {
         let param_offset = usize::from(receiver.is_some());
 
         for (i, arg) in args.iter().enumerate() {
+            self.mark_escaping_exprs(ctx, *arg);
+            let source = ctx.expr_source_value(*arg);
             let value = self.handle_call_operand(ctx, callee_fid, i + param_offset, *arg, false);
             returned.merge(value.clone());
             inputs.push(value);
+            let carries_reference = callable_signature
+                .as_ref()
+                .and_then(|signature| signature.params.get(i))
+                .is_some_and(type_may_carry_reference);
+            callable_inputs.push((source, carries_reference));
+        }
+        // ponytail: dynamic callable summaries are unavailable, so a reference-returning
+        // callback conservatively keeps its callee and every argument alive.
+        if callee_fid.is_none() && callable_returns_reference {
+            returned.merge(ctx.expr_source_value(callee));
+            for (input, carries_reference) in callable_inputs {
+                if carries_reference {
+                    returned.merge(input);
+                }
+            }
         }
         if let Some(summary) = callee_fid.and_then(|fid| self.fn_summaries.get(&fid))
             && !summary.returned_fields.is_empty()
@@ -1575,6 +1602,7 @@ fn type_may_carry_reference(ty: &Type) -> bool {
     match ty {
         Type::Ref(..)
         | Type::DynTrait { .. }
+        | Type::OwnedDynTrait { .. }
         | Type::Ptr { .. }
         | Type::Struct(..)
         | Type::Enum(..)
@@ -1601,6 +1629,16 @@ fn type_may_carry_reference(ty: &Type) -> bool {
         | Type::Unit
         | Type::Never
         | Type::Const(..) => false,
+    }
+}
+
+fn callable_signature_for_type(ty: &Type) -> Option<&ty::CallableSignature> {
+    match ty {
+        Type::Ref(inner, _) => callable_signature_for_type(inner),
+        Type::CallableConstraint(signature)
+        | Type::Closure { signature, .. }
+        | Type::OpaqueCallable { signature, .. } => Some(signature),
+        _ => None,
     }
 }
 

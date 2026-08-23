@@ -115,7 +115,7 @@ pub struct HirCallableSignature {
     pub ret: Box<HirTypeRef>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HirAssocTypeConstraint {
     pub name: Name,
     pub ty: HirTypeRef,
@@ -126,10 +126,116 @@ pub struct HirAssocTypeConstraint {
 pub struct HirParam {
     pub name: Name,
     pub name_range: TextRange,
+    /// True only for a source-level `self` receiver.
+    pub is_receiver: bool,
     pub is_mut: bool,
     pub ty: HirTypeRef,
     pub ty_range: TextRange,
     pub attrs: Vec<HirAttr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynMethodSafety {
+    Dispatchable,
+    MissingReceiver,
+    ByValueReceiver,
+    Generic,
+    ParameterUsesSelf,
+    ReturnUsesSelf,
+}
+
+impl DynMethodSafety {
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Dispatchable => "",
+            Self::MissingReceiver => "the first parameter is not a `self` receiver",
+            Self::ByValueReceiver => {
+                "by-value `self` cannot be called through a borrowed dyn object"
+            }
+            Self::Generic => "generic methods require static monomorphization",
+            Self::ParameterUsesSelf => "a non-receiver parameter mentions `Self`",
+            Self::ReturnUsesSelf => "the return type mentions `Self`",
+        }
+    }
+}
+
+#[must_use]
+pub fn dyn_method_safety(method: &HirFunction) -> DynMethodSafety {
+    let Some(receiver) = method.params.first() else {
+        return DynMethodSafety::MissingReceiver;
+    };
+    if !receiver.is_receiver {
+        return DynMethodSafety::MissingReceiver;
+    }
+    if !matches!(receiver.ty, HirTypeRef::Ref(_, _)) {
+        return DynMethodSafety::ByValueReceiver;
+    }
+    if !method.generics.is_empty()
+        || !method.implicit_generics.is_empty()
+        || !method.const_generics.is_empty()
+    {
+        return DynMethodSafety::Generic;
+    }
+    if method
+        .params
+        .iter()
+        .skip(1)
+        .any(|param| hir_type_mentions_bare_self(&param.ty))
+    {
+        return DynMethodSafety::ParameterUsesSelf;
+    }
+    if method
+        .ret_type
+        .as_ref()
+        .is_some_and(hir_type_mentions_bare_self)
+    {
+        return DynMethodSafety::ReturnUsesSelf;
+    }
+    DynMethodSafety::Dispatchable
+}
+
+fn hir_type_mentions_bare_self(ty: &HirTypeRef) -> bool {
+    match ty {
+        HirTypeRef::Named(path) => {
+            (path.segments.len() == 1 && path.segments.first().is_some_and(|name| name.0 == "Self"))
+                || path
+                    .segment_type_args
+                    .iter()
+                    .flat_map(|(_, args)| args)
+                    .any(hir_type_mentions_bare_self)
+                || path.type_args.iter().any(hir_type_mentions_bare_self)
+        }
+        HirTypeRef::Ref(inner, _)
+        | HirTypeRef::Ptr { inner, .. }
+        | HirTypeRef::Slice(inner)
+        | HirTypeRef::Array(inner, _) => hir_type_mentions_bare_self(inner),
+        HirTypeRef::Tuple(elements) => elements.iter().any(hir_type_mentions_bare_self),
+        HirTypeRef::ImplTrait {
+            trait_ty, callable, ..
+        }
+        | HirTypeRef::DynTrait {
+            trait_ty, callable, ..
+        } => {
+            hir_type_mentions_bare_self(trait_ty)
+                || callable
+                    .as_ref()
+                    .is_some_and(hir_callable_mentions_bare_self)
+                || matches!(
+                    ty,
+                    HirTypeRef::DynTrait { assoc_constraints, .. }
+                        if assoc_constraints
+                            .iter()
+                            .any(|constraint| hir_type_mentions_bare_self(&constraint.ty))
+                )
+        }
+        HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => false,
+    }
+}
+
+fn hir_callable_mentions_bare_self(signature: &HirCallableSignature) -> bool {
+    signature.params.iter().any(hir_type_mentions_bare_self)
+        || hir_type_mentions_bare_self(&signature.ret)
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +440,8 @@ pub enum HirTypeRef {
     DynTrait {
         trait_ty: Box<Self>,
         trait_range: TextRange,
+        callable: Option<HirCallableSignature>,
+        assoc_constraints: Vec<HirAssocTypeConstraint>,
     },
     Unknown,
     Error,
@@ -456,7 +564,35 @@ impl HirTypeRef {
                 }
                 display
             }
-            Self::DynTrait { trait_ty, .. } => format!("dyn {}", trait_ty.display()),
+            Self::DynTrait {
+                trait_ty,
+                callable,
+                assoc_constraints,
+                ..
+            } => {
+                let mut display = format!("dyn {}", trait_ty.display());
+                if !assoc_constraints.is_empty() {
+                    let constraints = assoc_constraints
+                        .iter()
+                        .map(|constraint| {
+                            format!("{} = {}", constraint.name.0, constraint.ty.display())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(display, "<{constraints}>").expect("writing to a String cannot fail");
+                }
+                if let Some(signature) = callable {
+                    let params = signature
+                        .params
+                        .iter()
+                        .map(Self::display)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(display, "({params}) -> {}", signature.ret.display())
+                        .expect("writing to a String cannot fail");
+                }
+                display
+            }
             Self::Unknown => "_".to_string(),
             Self::Error => "<error>".to_string(),
         }

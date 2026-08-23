@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hir::item_tree::{
     EnumId, HirCallableSignature, HirConstArg, HirPath, HirTypeRef, StructId, TraitId, TypeAliasId,
@@ -25,6 +25,10 @@ pub fn builtin_callable_kind(ty: &HirTypeRef) -> Option<ClosureKind> {
 
 impl TypeChecker<'_> {
     pub(crate) fn lower_type_alias(&mut self, type_alias: TypeAliasId) -> Type {
+        self.lower_type_alias_with_mode(type_alias, true)
+    }
+
+    fn lower_type_alias_with_mode(&mut self, type_alias: TypeAliasId, owned_dyn: bool) -> Type {
         let alias = self.hir.item_tree.type_aliases[type_alias].clone();
         if !self.lowering_type_aliases.insert(type_alias) {
             self.diagnostic(
@@ -38,10 +42,11 @@ impl TypeChecker<'_> {
             return Type::Error;
         }
         let ty = alias.ty.as_ref().map_or(Type::Unknown, |ty| {
-            self.lower_type_ref_with_params_at(
+            self.lower_type_ref_with_mode(
                 ty,
                 &HashMap::new(),
                 alias.ty_range.or(Some(alias.name_range)),
+                owned_dyn,
             )
         });
         self.lowering_type_aliases.remove(&type_alias);
@@ -54,17 +59,42 @@ impl TypeChecker<'_> {
         params: &HashMap<String, Type>,
         span: Option<TextRange>,
     ) -> Type {
+        self.lower_type_ref_with_mode(ty, params, span, true)
+    }
+
+    fn lower_type_ref_with_mode(
+        &mut self,
+        ty: &HirTypeRef,
+        params: &HashMap<String, Type>,
+        span: Option<TextRange>,
+        owned_dyn: bool,
+    ) -> Type {
         match ty {
-            HirTypeRef::Named(path) => self.lower_named_type(path, params, span),
+            HirTypeRef::Named(path) => self.lower_named_type(path, params, span, owned_dyn),
             HirTypeRef::Never => Type::Never,
             HirTypeRef::Ref(inner, mutable) => Type::Ref(
-                Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
+                Box::new(self.lower_type_ref_with_mode(inner, params, span, false)),
                 *mutable,
             ),
             HirTypeRef::DynTrait {
                 trait_ty,
                 trait_range,
+                callable,
+                assoc_constraints,
             } => {
+                if let Some(kind) = builtin_callable_kind(trait_ty) {
+                    let Some(callable) = callable else {
+                        self.diagnostic(
+                            "E0047",
+                            format!("dyn {} requires a callable signature", kind.as_str()),
+                            span.or(Some(*trait_range)),
+                        );
+                        return Type::Unknown;
+                    };
+                    return Type::CallableConstraint(
+                        self.lower_hir_callable_signature(callable, kind, params, span),
+                    );
+                }
                 let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
                     self.diagnostic(
                         "E0047",
@@ -80,17 +110,96 @@ impl TypeChecker<'_> {
                     params,
                     span.or(Some(*trait_range)),
                 );
-                Type::DynTrait { trait_id, args }
+                let mut provided = HashMap::new();
+                for constraint in assoc_constraints {
+                    if provided
+                        .insert(
+                            constraint.name.0.clone(),
+                            self.lower_type_ref_with_params_at(
+                                &constraint.ty,
+                                params,
+                                Some(constraint.range),
+                            ),
+                        )
+                        .is_some()
+                    {
+                        self.diagnostic(
+                            "E0022",
+                            format!(
+                                "dyn trait `{}` has duplicate associated type `{}`",
+                                self.hir.item_tree.traits[trait_id].name.0, constraint.name.0
+                            ),
+                            Some(constraint.range),
+                        );
+                    }
+                }
+                let mut assoc_specs = Vec::new();
+                self.collect_dyn_assoc_specs(trait_id, &mut HashSet::new(), &mut assoc_specs);
+                let known = assoc_specs
+                    .iter()
+                    .map(|alias| alias.name.0.clone())
+                    .collect::<HashSet<_>>();
+                for name in provided.keys() {
+                    if !known.contains(name) {
+                        self.diagnostic(
+                            "E0034",
+                            format!(
+                                "dyn trait `{}` has no associated type `{name}`",
+                                self.hir.item_tree.traits[trait_id].name.0
+                            ),
+                            span.or(Some(*trait_range)),
+                        );
+                    }
+                }
+                let mut assoc_bindings = Vec::new();
+                for alias in assoc_specs {
+                    if let Some(ty) = provided.remove(&alias.name.0) {
+                        assoc_bindings.push((alias.name.0, ty));
+                    } else if let Some(default) = alias.ty {
+                        assoc_bindings.push((
+                            alias.name.0,
+                            self.lower_type_ref_with_params_at(
+                                &default,
+                                params,
+                                alias.ty_range.or(Some(alias.name_range)),
+                            ),
+                        ));
+                    } else {
+                        self.diagnostic(
+                            "E0034",
+                            format!(
+                                "dyn trait `{}` requires associated type `{}`; write `{} = ...`",
+                                self.hir.item_tree.traits[trait_id].name.0,
+                                alias.name.0,
+                                alias.name.0,
+                            ),
+                            span.or(Some(*trait_range)),
+                        );
+                    }
+                }
+                if owned_dyn {
+                    Type::OwnedDynTrait {
+                        trait_id,
+                        args,
+                        assoc_bindings,
+                    }
+                } else {
+                    Type::DynTrait {
+                        trait_id,
+                        args,
+                        assoc_bindings,
+                    }
+                }
             }
             HirTypeRef::Ptr { mutable, inner } => Type::Ptr {
                 mutable: *mutable,
-                inner: Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
+                inner: Box::new(self.lower_type_ref_with_mode(inner, params, span, false)),
             },
             HirTypeRef::Tuple(elements) if elements.is_empty() => Type::Unit,
             HirTypeRef::Tuple(elements) => Type::Tuple(
                 elements
                     .iter()
-                    .map(|ty| self.lower_type_ref_with_params_at(ty, params, span))
+                    .map(|ty| self.lower_type_ref_with_mode(ty, params, span, true))
                     .collect(),
             ),
             HirTypeRef::Slice(inner) => Type::Slice(Box::new(
@@ -193,6 +302,28 @@ impl TypeChecker<'_> {
         }
     }
 
+    fn collect_dyn_assoc_specs(
+        &self,
+        trait_id: TraitId,
+        visited: &mut HashSet<TraitId>,
+        specs: &mut Vec<hir::item_tree::HirTypeAlias>,
+    ) {
+        if !visited.insert(trait_id) {
+            return;
+        }
+        let trait_data = self.hir.item_tree.traits[trait_id].clone();
+        for alias in trait_data.type_aliases {
+            if !specs.iter().any(|existing| existing.name == alias.name) {
+                specs.push(alias);
+            }
+        }
+        for bound in trait_data.supertraits {
+            if let Some(supertrait_id) = self.resolve_trait_ref(&bound.trait_ty) {
+                self.collect_dyn_assoc_specs(supertrait_id, visited, specs);
+            }
+        }
+    }
+
     pub(crate) fn lower_hir_callable_signature(
         &mut self,
         signature: &HirCallableSignature,
@@ -260,6 +391,7 @@ impl TypeChecker<'_> {
         path: &HirPath,
         params: &HashMap<String, Type>,
         span: Option<TextRange>,
+        owned_dyn: bool,
     ) -> Type {
         if let Some(ty) = self.lower_self_associated_type(path, params) {
             return ty;
@@ -269,7 +401,7 @@ impl TypeChecker<'_> {
         }
 
         if let Some(type_alias) = self.find_associated_type_alias(path) {
-            return self.lower_type_alias(type_alias);
+            return self.lower_type_alias_with_mode(type_alias, owned_dyn);
         }
 
         if let Some(name) = path.as_single_name().map(|name| name.0.as_str()) {
@@ -323,7 +455,9 @@ impl TypeChecker<'_> {
                 );
                 Type::Enum(enum_id, args)
             }
-            Some(hir::body::ResolvedName::TypeAlias(alias)) => self.lower_type_alias(alias),
+            Some(hir::body::ResolvedName::TypeAlias(alias)) => {
+                self.lower_type_alias_with_mode(alias, owned_dyn)
+            }
             _ => {
                 self.diagnostic("E0034", format!("unknown type `{}`", path.display()), span);
                 Type::Unknown

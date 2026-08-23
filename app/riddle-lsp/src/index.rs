@@ -16,7 +16,7 @@ use crate::{
 };
 use hir::{
     body::{Expr, ResolvedName},
-    item_tree::HirTypeRef,
+    item_tree::{HirTypeRef, TopLevelItem},
 };
 use type_checker::Type;
 
@@ -24,7 +24,9 @@ use type_checker::Type;
 pub enum IndexedSymbolKind {
     Function,
     Struct,
+    Field,
     Enum,
+    EnumMember,
     Trait,
     TypeAlias,
     Const,
@@ -46,6 +48,8 @@ pub struct IndexedSymbol {
     pub name: String,
     pub detail: String,
     pub location: Location,
+    pub container_name: Option<String>,
+    pub is_public: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -78,13 +82,16 @@ pub fn workspace_symbols_for_index(index: &ProjectIndex, query: &str) -> Vec<Sym
     index
         .symbols
         .iter()
+        .filter(|symbol| symbol.is_public)
         .filter(|symbol| symbol.name.to_lowercase().contains(&query))
         .map(|symbol| SymbolInformation {
             name: symbol.name.clone(),
             kind: match symbol.key.kind {
                 IndexedSymbolKind::Function => SymbolKind::FUNCTION,
                 IndexedSymbolKind::Struct => SymbolKind::STRUCT,
+                IndexedSymbolKind::Field => SymbolKind::FIELD,
                 IndexedSymbolKind::Enum => SymbolKind::ENUM,
+                IndexedSymbolKind::EnumMember => SymbolKind::ENUM_MEMBER,
                 IndexedSymbolKind::Trait => SymbolKind::INTERFACE,
                 IndexedSymbolKind::TypeAlias => SymbolKind::TYPE_PARAMETER,
                 IndexedSymbolKind::Const => SymbolKind::CONSTANT,
@@ -93,7 +100,7 @@ pub fn workspace_symbols_for_index(index: &ProjectIndex, query: &str) -> Vec<Sym
             tags: None,
             deprecated: None,
             location: symbol.location.clone(),
-            container_name: None,
+            container_name: symbol.container_name.clone(),
         })
         .collect()
 }
@@ -143,9 +150,21 @@ impl ProjectIndex {
 
 fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<IndexedSymbol> {
     let mut symbols = Vec::new();
+    collect_items(analysis, hir, &hir.item_tree.top_level, None, &mut symbols);
+    collect_unreachable_symbols(analysis, hir, &mut symbols);
+    symbols.sort_by(|left, right| left.key.cmp(&right.key));
+    symbols.dedup_by(|left, right| left.key == right.key);
+    symbols
+}
+
+fn collect_unreachable_symbols(
+    analysis: &DocumentAnalysis,
+    hir: &hir::HirFile,
+    symbols: &mut Vec<IndexedSymbol>,
+) {
     for (_, item) in hir.item_tree.functions.iter() {
-        push_symbol(
-            &mut symbols,
+        push_unreachable_symbol(
+            symbols,
             analysis,
             IndexedSymbolKind::Function,
             &item.name.0,
@@ -155,8 +174,8 @@ fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<Index
         );
     }
     for (_, item) in hir.item_tree.structs.iter() {
-        push_symbol(
-            &mut symbols,
+        push_unreachable_symbol(
+            symbols,
             analysis,
             IndexedSymbolKind::Struct,
             &item.name.0,
@@ -164,10 +183,23 @@ fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<Index
             item.name_range,
             item.visibility.is_public(),
         );
+        let container = item.name.0.clone();
+        for field in &item.fields {
+            push_unreachable_symbol_with_container(
+                symbols,
+                analysis,
+                IndexedSymbolKind::Field,
+                &field.name.0,
+                format!("{}: {}", field.name.0, field.ty.display()),
+                field.name_range,
+                Some(&container),
+                item.visibility.is_public() && field.visibility.is_public(),
+            );
+        }
     }
     for (_, item) in hir.item_tree.enums.iter() {
-        push_symbol(
-            &mut symbols,
+        push_unreachable_symbol(
+            symbols,
             analysis,
             IndexedSymbolKind::Enum,
             &item.name.0,
@@ -175,10 +207,23 @@ fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<Index
             item.name_range,
             item.visibility.is_public(),
         );
+        let container = item.name.0.clone();
+        for variant in &item.variants {
+            push_unreachable_symbol_with_container(
+                symbols,
+                analysis,
+                IndexedSymbolKind::EnumMember,
+                &variant.name.0,
+                format!("enum member {}", variant.name.0),
+                variant.name_range,
+                Some(&container),
+                item.visibility.is_public(),
+            );
+        }
     }
     for (_, item) in hir.item_tree.traits.iter() {
-        push_symbol(
-            &mut symbols,
+        push_unreachable_symbol(
+            symbols,
             analysis,
             IndexedSymbolKind::Trait,
             &item.name.0,
@@ -187,8 +232,20 @@ fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<Index
             item.visibility.is_public(),
         );
         for method in &item.methods {
-            push_symbol(
-                &mut symbols,
+            push_unreachable_symbol(
+                symbols,
+                analysis,
+                IndexedSymbolKind::Function,
+                &method.name.0,
+                format!("fun {}", method.name.0),
+                method.name_range,
+                item.visibility.is_public() && method.visibility.is_public(),
+            );
+        }
+        for fid in &item.default_methods {
+            let method = &hir.item_tree.functions[*fid];
+            push_unreachable_symbol(
+                symbols,
                 analysis,
                 IndexedSymbolKind::Function,
                 &method.name.0,
@@ -199,8 +256,8 @@ fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<Index
         }
     }
     for (_, item) in hir.item_tree.consts.iter() {
-        push_symbol(
-            &mut symbols,
+        push_unreachable_symbol(
+            symbols,
             analysis,
             IndexedSymbolKind::Const,
             &item.name.0,
@@ -210,8 +267,8 @@ fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<Index
         );
     }
     for (_, item) in hir.item_tree.type_aliases.iter() {
-        push_symbol(
-            &mut symbols,
+        push_unreachable_symbol(
+            symbols,
             analysis,
             IndexedSymbolKind::TypeAlias,
             &item.name.0,
@@ -221,8 +278,8 @@ fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<Index
         );
     }
     for (_, item) in hir.item_tree.modules.iter() {
-        push_symbol(
-            &mut symbols,
+        push_unreachable_symbol(
+            symbols,
             analysis,
             IndexedSymbolKind::Module,
             &item.name.0,
@@ -231,9 +288,243 @@ fn collect_symbols(analysis: &DocumentAnalysis, hir: &hir::HirFile) -> Vec<Index
             item.visibility.is_public(),
         );
     }
-    symbols.sort_by(|left, right| left.key.cmp(&right.key));
-    symbols.dedup_by(|left, right| left.key == right.key);
-    symbols
+}
+
+fn push_unreachable_symbol(
+    symbols: &mut Vec<IndexedSymbol>,
+    analysis: &DocumentAnalysis,
+    kind: IndexedSymbolKind,
+    name: &str,
+    detail: String,
+    range: rowan::TextRange,
+    is_public: bool,
+) {
+    push_unreachable_symbol_with_container(
+        symbols, analysis, kind, name, detail, range, None, is_public,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_unreachable_symbol_with_container(
+    symbols: &mut Vec<IndexedSymbol>,
+    analysis: &DocumentAnalysis,
+    kind: IndexedSymbolKind,
+    name: &str,
+    detail: String,
+    range: rowan::TextRange,
+    container: Option<&str>,
+    is_public: bool,
+) {
+    if symbol_key_for_range(analysis, symbols, range, kind).is_none() {
+        push_symbol(
+            symbols, analysis, kind, name, detail, range, container, is_public,
+        );
+    }
+}
+
+fn collect_items(
+    analysis: &DocumentAnalysis,
+    hir: &hir::HirFile,
+    items: &[TopLevelItem],
+    container: Option<&str>,
+    symbols: &mut Vec<IndexedSymbol>,
+) {
+    for item in items {
+        match *item {
+            TopLevelItem::Function(id) => {
+                let item = &hir.item_tree.functions[id];
+                push_symbol(
+                    symbols,
+                    analysis,
+                    IndexedSymbolKind::Function,
+                    &item.name.0,
+                    format!("fun {}", item.name.0),
+                    item.name_range,
+                    container,
+                    item.visibility.is_public(),
+                );
+            }
+            TopLevelItem::Struct(id) => {
+                let item = &hir.item_tree.structs[id];
+                let is_public = item.visibility.is_public();
+                push_symbol(
+                    symbols,
+                    analysis,
+                    IndexedSymbolKind::Struct,
+                    &item.name.0,
+                    format!("struct {}", item.name.0),
+                    item.name_range,
+                    container,
+                    is_public,
+                );
+                let member_container = joined_container(container, &item.name.0);
+                for field in &item.fields {
+                    push_symbol(
+                        symbols,
+                        analysis,
+                        IndexedSymbolKind::Field,
+                        &field.name.0,
+                        format!("{}: {}", field.name.0, field.ty.display()),
+                        field.name_range,
+                        Some(&member_container),
+                        is_public && field.visibility.is_public(),
+                    );
+                }
+            }
+            TopLevelItem::Enum(id) => {
+                let item = &hir.item_tree.enums[id];
+                let is_public = item.visibility.is_public();
+                push_symbol(
+                    symbols,
+                    analysis,
+                    IndexedSymbolKind::Enum,
+                    &item.name.0,
+                    format!("enum {}", item.name.0),
+                    item.name_range,
+                    container,
+                    is_public,
+                );
+                let member_container = joined_container(container, &item.name.0);
+                for variant in &item.variants {
+                    push_symbol(
+                        symbols,
+                        analysis,
+                        IndexedSymbolKind::EnumMember,
+                        &variant.name.0,
+                        format!("enum member {}", variant.name.0),
+                        variant.name_range,
+                        Some(&member_container),
+                        is_public,
+                    );
+                    if let hir::item_tree::HirVariantKind::Struct(fields) = &variant.kind {
+                        let variant_container =
+                            joined_container(Some(&member_container), &variant.name.0);
+                        for field in fields {
+                            push_symbol(
+                                symbols,
+                                analysis,
+                                IndexedSymbolKind::Field,
+                                &field.name.0,
+                                format!("{}: {}", field.name.0, field.ty.display()),
+                                field.name_range,
+                                Some(&variant_container),
+                                is_public && field.visibility.is_public(),
+                            );
+                        }
+                    }
+                }
+            }
+            TopLevelItem::Trait(id) => {
+                let item = &hir.item_tree.traits[id];
+                let is_public = item.visibility.is_public();
+                push_symbol(
+                    symbols,
+                    analysis,
+                    IndexedSymbolKind::Trait,
+                    &item.name.0,
+                    format!("trait {}", item.name.0),
+                    item.name_range,
+                    container,
+                    is_public,
+                );
+                let member_container = joined_container(container, &item.name.0);
+                for method in &item.methods {
+                    push_symbol(
+                        symbols,
+                        analysis,
+                        IndexedSymbolKind::Function,
+                        &method.name.0,
+                        format!("fun {}", method.name.0),
+                        method.name_range,
+                        Some(&member_container),
+                        is_public && method.visibility.is_public(),
+                    );
+                }
+                for fid in &item.default_methods {
+                    let method = &hir.item_tree.functions[*fid];
+                    push_symbol(
+                        symbols,
+                        analysis,
+                        IndexedSymbolKind::Function,
+                        &method.name.0,
+                        format!("fun {}", method.name.0),
+                        method.name_range,
+                        Some(&member_container),
+                        is_public && method.visibility.is_public(),
+                    );
+                }
+            }
+            TopLevelItem::Module(id) => {
+                let item = &hir.item_tree.modules[id];
+                let is_public = item.visibility.is_public();
+                push_symbol(
+                    symbols,
+                    analysis,
+                    IndexedSymbolKind::Module,
+                    &item.name.0,
+                    format!("mod {}", item.name.0),
+                    item.name_range,
+                    container,
+                    is_public,
+                );
+                if let Some(children) = item.items.as_deref() {
+                    let member_container = joined_container(container, &item.name.0);
+                    collect_items(analysis, hir, children, Some(&member_container), symbols);
+                }
+            }
+            TopLevelItem::Const(id) => {
+                let item = &hir.item_tree.consts[id];
+                push_symbol(
+                    symbols,
+                    analysis,
+                    IndexedSymbolKind::Const,
+                    &item.name.0,
+                    format!("const {}", item.name.0),
+                    item.name_range,
+                    container,
+                    item.visibility.is_public(),
+                );
+            }
+            TopLevelItem::TypeAlias(id) => {
+                let item = &hir.item_tree.type_aliases[id];
+                push_symbol(
+                    symbols,
+                    analysis,
+                    IndexedSymbolKind::TypeAlias,
+                    &item.name.0,
+                    format!("type {}", item.name.0),
+                    item.name_range,
+                    container,
+                    item.visibility.is_public(),
+                );
+            }
+            TopLevelItem::Impl(id) => {
+                let implementation = &hir.item_tree.impls[id];
+                let member_container = joined_container(
+                    container,
+                    &format!("impl {}", implementation.self_ty.display()),
+                );
+                for fid in &implementation.methods {
+                    let method = &hir.item_tree.functions[*fid];
+                    push_symbol(
+                        symbols,
+                        analysis,
+                        IndexedSymbolKind::Function,
+                        &method.name.0,
+                        format!("fun {}", method.name.0),
+                        method.name_range,
+                        Some(&member_container),
+                        method.visibility.is_public(),
+                    );
+                }
+            }
+            TopLevelItem::Use(_) => {}
+        }
+    }
+}
+
+fn joined_container(parent: Option<&str>, name: &str) -> String {
+    parent.map_or_else(|| name.to_string(), |parent| format!("{parent}::{name}"))
 }
 
 fn build_call_edges(
@@ -448,6 +739,7 @@ fn mapped_lsp_range(analysis: &DocumentAnalysis, range: rowan::TextRange) -> Opt
     LineIndex::new(mapped.source).range(mapped.source, mapped.range)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_symbol(
     symbols: &mut Vec<IndexedSymbol>,
     analysis: &DocumentAnalysis,
@@ -455,7 +747,8 @@ fn push_symbol(
     name: &str,
     detail: String,
     range: rowan::TextRange,
-    _is_public: bool,
+    container_name: Option<&str>,
+    is_public: bool,
 ) {
     let Some(source_map) = &analysis.source_map else {
         return;
@@ -484,6 +777,8 @@ fn push_symbol(
         name: name.into(),
         detail,
         location: Location { uri, range },
+        container_name: container_name.map(str::to_string),
+        is_public,
     });
 }
 

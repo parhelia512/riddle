@@ -29,9 +29,21 @@ impl TypeChecker<'_> {
             Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
                 self.check_type_bounds_inner(ctx, inner, span);
             }
-            Type::DynTrait { args, .. } => {
+            Type::DynTrait {
+                args,
+                assoc_bindings,
+                ..
+            }
+            | Type::OwnedDynTrait {
+                args,
+                assoc_bindings,
+                ..
+            } => {
                 for arg in args {
                     self.check_type_bounds_inner(ctx, arg, span);
+                }
+                for (_, ty) in assoc_bindings {
+                    self.check_type_bounds_inner(ctx, ty, span);
                 }
             }
             Type::Tuple(elements) => {
@@ -172,7 +184,7 @@ impl TypeChecker<'_> {
         }
     }
 
-    pub(super) fn current_generic_bounds(&self, ctx: &BodyCtx<'_>) -> Vec<HirGenericBound> {
+    pub(crate) fn current_generic_bounds(&self, ctx: &BodyCtx<'_>) -> Vec<HirGenericBound> {
         let mut bounds = self
             .hir
             .item_tree
@@ -434,6 +446,115 @@ impl TypeChecker<'_> {
 
     pub(super) fn trait_implies(&self, actual: TraitId, required: TraitId) -> bool {
         self.supertrait_reaches(actual, required, &mut HashSet::new())
+    }
+
+    pub(crate) fn dyn_trait_upcast_allowed(
+        &mut self,
+        actual_trait: TraitId,
+        actual_args: &[Type],
+        actual_assoc: &[(String, Type)],
+        required_trait: TraitId,
+        required_args: &[Type],
+        required_assoc: &[(String, Type)],
+    ) -> bool {
+        struct Target<'a> {
+            trait_id: TraitId,
+            args: &'a [Type],
+            assoc: &'a [(String, Type)],
+        }
+
+        fn visit(
+            checker: &mut TypeChecker<'_>,
+            current: TraitId,
+            current_args: &[Type],
+            current_assoc: &[(String, Type)],
+            target: &Target<'_>,
+            visited: &mut HashSet<TraitId>,
+        ) -> bool {
+            if current == target.trait_id {
+                return current_args.len() == target.args.len()
+                    && current_args
+                        .iter()
+                        .zip(target.args)
+                        .all(|(actual, expected)| {
+                            TypeChecker::bound_types_match(expected, actual)
+                        })
+                    && target.assoc.iter().all(|(name, expected)| {
+                        current_assoc
+                            .iter()
+                            .find(|(actual_name, _)| actual_name == name)
+                            .is_some_and(|(_, actual)| {
+                                TypeChecker::bound_types_match(expected, actual)
+                            })
+                    });
+            }
+            if !visited.insert(current) {
+                return false;
+            }
+            let trait_data = checker.hir.item_tree.traits[current].clone();
+            let params = trait_data
+                .generics
+                .iter()
+                .map(|name| name.0.clone())
+                .zip(current_args.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            for bound in trait_data.supertraits {
+                let Some(supertrait) = checker.resolve_trait_ref(&bound.trait_ty) else {
+                    continue;
+                };
+                let mut next_assoc = current_assoc.to_vec();
+                let mut assoc_params = params.clone();
+                for (name, ty) in current_assoc {
+                    assoc_params.insert(format!("Self::{name}"), ty.clone());
+                }
+                let next_args = checker.trait_ref_args(
+                    supertrait,
+                    &bound.trait_ty,
+                    &Type::Unknown,
+                    &assoc_params,
+                    None,
+                );
+                for constraint in bound.assoc_constraints {
+                    let ty = checker.lower_type_ref_with_params_at(
+                        &constraint.ty,
+                        &assoc_params,
+                        Some(constraint.range),
+                    );
+                    if let Some(existing) = next_assoc
+                        .iter_mut()
+                        .find(|(name, _)| *name == constraint.name.0)
+                    {
+                        existing.1 = ty;
+                    } else {
+                        next_assoc.push((constraint.name.0, ty));
+                    }
+                }
+                if visit(
+                    checker,
+                    supertrait,
+                    &next_args,
+                    &next_assoc,
+                    target,
+                    visited,
+                ) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        visit(
+            self,
+            actual_trait,
+            actual_args,
+            actual_assoc,
+            &Target {
+                trait_id: required_trait,
+                args: required_args,
+                assoc: required_assoc,
+            },
+            &mut HashSet::new(),
+        )
     }
 
     pub(crate) fn supertrait_reaches(

@@ -1,6 +1,6 @@
 use super::{
-    Body, Builder, BuiltinOperator, Expr, ExprId, FuncRef, HirBinOp, HirTypeRef, HirUnOp, Inst,
-    InstKind, IntTy, LowerCtx, PathAnchor, ResolvedName, Type, UnOp, Value,
+    Body, Builder, BuiltinOperator, Expr, ExprId, FuncRef, HashMap, HirBinOp, HirTypeRef, HirUnOp,
+    Inst, InstKind, IntTy, LowerCtx, PathAnchor, ResolvedName, Type, UnOp, Value,
     builtin_comparison_types, comparison_trait, convert_cmp_op, convert_unop,
 };
 
@@ -132,12 +132,33 @@ impl LowerCtx<'_> {
         if let hir::body::Expr::FieldAccess { base, .. } = &body.exprs[callee] {
             if trait_call.dynamic {
                 let object = self.lower_expr(builder, param_values, body, *base);
+                let base_tc_ty = self.type_result.expr_types.get(&(body_id, *base))?;
+                let base_tc_ty = match base_tc_ty {
+                    type_checker::Type::Ref(inner, _) => inner.as_ref(),
+                    ty => ty,
+                };
+                let (root_trait_id, root_args) = match base_tc_ty {
+                    type_checker::Type::DynTrait { trait_id, args, .. }
+                    | type_checker::Type::OwnedDynTrait { trait_id, args, .. } => (*trait_id, args),
+                    _ => return None,
+                };
+                let root_subst = self.hir.item_tree.traits[root_trait_id]
+                    .generics
+                    .iter()
+                    .map(|name| name.0.clone())
+                    .zip(root_args.iter().map(|arg| self.convert_type(arg)))
+                    .collect::<HashMap<_, _>>();
+                let methods = self.dyn_trait_methods(root_trait_id, &root_subst);
                 let object_ty =
                     self.convert_type(self.type_result.expr_types.get(&(body_id, *base))?);
                 let Type::Struct(struct_ty) = object_ty else {
                     return None;
                 };
-                let field_name = format!("method_{}", trait_call.method);
+                let field_name = self.dyn_trait_method_field_name(
+                    &methods,
+                    trait_call.trait_id,
+                    &trait_call.method,
+                );
                 let (slot, method_ty) =
                     struct_ty
                         .fields
@@ -568,6 +589,17 @@ impl LowerCtx<'_> {
         receiver_ty: &type_checker::Type,
         rhs_ty: Option<&type_checker::Type>,
     ) -> Option<hir::item_tree::FunctionId> {
+        self.find_trait_impl_method_with_mir_args(trait_id, method_name, receiver_ty, None, rhs_ty)
+    }
+
+    pub(super) fn find_trait_impl_method_with_mir_args(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        method_name: &str,
+        receiver_ty: &type_checker::Type,
+        trait_args: Option<&[Type]>,
+        rhs_ty: Option<&type_checker::Type>,
+    ) -> Option<hir::item_tree::FunctionId> {
         let receiver_ty = self.substitute_tc_type(receiver_ty);
         let dereferenced = match &receiver_ty {
             type_checker::Type::Ref(inner, _) => Some(inner.as_ref()),
@@ -580,6 +612,9 @@ impl LowerCtx<'_> {
                 };
                 if self.resolve_trait_ref(candidate_trait) != Some(trait_id)
                     || !self.impl_type_matches(candidate, receiver_ty)
+                    || trait_args.is_some_and(|args| {
+                        !self.impl_trait_args_match_mir(candidate, receiver_ty, args)
+                    })
                     || !self.impl_trait_args_match(candidate, receiver_ty, rhs_ty)
                 {
                     continue;

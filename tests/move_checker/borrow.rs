@@ -878,6 +878,33 @@ fn unknown_external_reference_return_is_conservative() {
 }
 
 #[test]
+fn dyn_callable_returned_reference_keeps_argument_borrowed() {
+    let result = analyze(
+        r#"
+        fun call(callback: &dyn Fn(&mut i32) -> &mut i32, value: &mut i32) -> &mut i32 {
+            callback(value)
+        }
+        fun update(value: &mut i32) { *value += 1; }
+
+        fun f(callback: &dyn Fn(&mut i32) -> &mut i32) {
+            let mut value = 1;
+            let reference = call(callback, &mut value);
+            update(&mut value);
+            *reference;
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0302"),
+        "expected the dynamic callback result to keep `value` borrowed: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn moving_one_field_into_a_closure_leaves_the_other_field_available() {
     let result = analyze(
         r"

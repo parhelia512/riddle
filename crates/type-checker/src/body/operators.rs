@@ -910,10 +910,38 @@ impl TypeChecker<'_> {
                     Type::Error
                 }
             }
-            UnaryOp::Ref => Type::Ref(Box::new(operand_ty), false),
+            UnaryOp::Ref => Type::Ref(
+                Box::new(match operand_ty {
+                    Type::OwnedDynTrait {
+                        trait_id,
+                        args,
+                        assoc_bindings,
+                    } => Type::DynTrait {
+                        trait_id,
+                        args,
+                        assoc_bindings,
+                    },
+                    ty => ty,
+                }),
+                false,
+            ),
             UnaryOp::MutRef => {
                 self.check_assign_mut(ctx, operand, ctx.expr_range(operand));
-                Type::Ref(Box::new(operand_ty), true)
+                Type::Ref(
+                    Box::new(match operand_ty {
+                        Type::OwnedDynTrait {
+                            trait_id,
+                            args,
+                            assoc_bindings,
+                        } => Type::DynTrait {
+                            trait_id,
+                            args,
+                            assoc_bindings,
+                        },
+                        ty => ty,
+                    }),
+                    true,
+                )
             }
             UnaryOp::Deref => match &operand_ty {
                 Type::Ref(inner, _) => *inner.clone(),

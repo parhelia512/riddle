@@ -1,10 +1,17 @@
 use super::{
-    BodyCtx, Expr, ExprId, FunctionId, HashMap, HashSet, HirFunction, HirTypeRef, LangItem, Name,
-    PatternBindingId, PendingGenericCall, ResolvedMethod, ResolvedName, TraitId, TraitMethodCall,
-    Type, TypeChecker, UnaryOp, ValueUse, bound_target_param, callable_signature_type,
-    collect_subst, expected_has_param, generic_param_map_with_consts, method_is_visible_for_owner,
-    record_generic_arg_spans, substitute_type, type_has_unresolved_inference,
+    BodyCtx, DynMethodSafety, Expr, ExprId, FunctionId, HashMap, HashSet, HirFunction, HirTypeRef,
+    LangItem, Name, PatternBindingId, PendingGenericCall, ResolvedMethod, ResolvedName, TraitId,
+    TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse, bound_target_param,
+    callable_signature_type, collect_subst, dyn_method_safety, expected_has_param,
+    generic_param_map_with_consts, method_is_visible_for_owner, record_generic_arg_spans,
+    substitute_type, type_has_unresolved_inference,
 };
+
+pub(super) enum MethodLookupError {
+    Private(FunctionId),
+    Ambiguous(String),
+    NotObjectSafe(String),
+}
 
 impl TypeChecker<'_> {
     pub(super) fn check_method_call(
@@ -41,7 +48,7 @@ impl TypeChecker<'_> {
                 }
                 return Type::Error;
             }
-            Err(private_method) => {
+            Err(MethodLookupError::Private(private_method)) => {
                 for arg in args {
                     self.check_expr(ctx, *arg);
                     self.record_value_use(ctx, *arg, ValueUse::Move);
@@ -66,6 +73,16 @@ impl TypeChecker<'_> {
                     ),
                     span,
                 );
+                return Type::Error;
+            }
+            Err(
+                MethodLookupError::Ambiguous(message) | MethodLookupError::NotObjectSafe(message),
+            ) => {
+                for arg in args {
+                    self.check_expr(ctx, *arg);
+                    self.record_value_use(ctx, *arg, ValueUse::Move);
+                }
+                self.diagnostic("E0013", message, span);
                 return Type::Error;
             }
         };
@@ -232,10 +249,11 @@ impl TypeChecker<'_> {
             let call = TraitMethodCall {
                 trait_id,
                 method: method.function.name.0.clone(),
-                dynamic: matches!(
-                    base_ty,
-                    Type::Ref(inner, _) if matches!(inner.as_ref(), Type::DynTrait { .. })
-                ),
+                dynamic: matches!(base_ty, Type::OwnedDynTrait { .. })
+                    || matches!(
+                        base_ty,
+                        Type::Ref(inner, _) if matches!(inner.as_ref(), Type::DynTrait { .. })
+                    ),
             };
             self.result
                 .trait_method_calls
@@ -399,83 +417,159 @@ impl TypeChecker<'_> {
         ctx: &BodyCtx<'_>,
         receiver_ty: &Type,
         method_name: &Name,
-    ) -> Result<Option<ResolvedMethod>, FunctionId> {
+    ) -> Result<Option<ResolvedMethod>, MethodLookupError> {
         if let Some(method) = self.find_inherent_method(ctx, receiver_ty, method_name)? {
             return Ok(Some(method));
         }
         if let Some(method) = self.find_trait_bound_method(ctx, receiver_ty, method_name) {
             return Ok(Some(method));
         }
-        if let Some(method) = self.find_dyn_trait_method(ctx, receiver_ty, method_name) {
+        if let Some(method) = self.find_dyn_trait_method(ctx, receiver_ty, method_name)? {
             return Ok(Some(method));
         }
         Ok(self.find_trait_impl_method_by_name(ctx, receiver_ty, method_name))
     }
 
     fn find_dyn_trait_method(
-        &self,
+        &mut self,
         ctx: &BodyCtx<'_>,
         receiver_ty: &Type,
         method_name: &Name,
-    ) -> Option<ResolvedMethod> {
-        let Type::Ref(inner, _) = receiver_ty else {
-            return None;
+    ) -> Result<Option<ResolvedMethod>, MethodLookupError> {
+        let (trait_id, args, assoc_bindings) = match receiver_ty {
+            Type::OwnedDynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => (trait_id, args, assoc_bindings),
+            Type::Ref(inner, _) => match inner.as_ref() {
+                Type::DynTrait {
+                    trait_id,
+                    args,
+                    assoc_bindings,
+                }
+                | Type::OwnedDynTrait {
+                    trait_id,
+                    args,
+                    assoc_bindings,
+                } => (trait_id, args, assoc_bindings),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
         };
-        let Type::DynTrait { trait_id, args } = inner.as_ref() else {
-            return None;
+        let candidates = self
+            .dyn_trait_methods(*trait_id)
+            .into_iter()
+            .filter(|(_, function, _)| function.name == *method_name)
+            .collect::<Vec<_>>();
+        let Some((method_trait_id, function, default_fid)) = candidates.first().cloned() else {
+            return Ok(None);
         };
-        let trait_data = &self.hir.item_tree.traits[*trait_id];
-        let (fid, function) = if let Some(fid) = trait_data
-            .default_methods
+        let distinct_traits = candidates
             .iter()
-            .copied()
-            .find(|fid| self.hir.item_tree.functions[*fid].name == *method_name)
-        {
-            (fid, self.hir.item_tree.functions[fid].clone())
-        } else {
-            let function = trait_data
-                .methods
+            .map(|(trait_id, _, _)| *trait_id)
+            .collect::<HashSet<_>>();
+        if distinct_traits.len() > 1 {
+            let names = candidates
                 .iter()
-                .find(|function| function.name == *method_name)
-                .cloned()?;
-            let fid = ctx.function_id?;
-            (fid, function)
+                .map(|(trait_id, _, _)| self.hir.item_tree.traits[*trait_id].name.0.clone())
+                .collect::<Vec<_>>();
+            return Err(MethodLookupError::Ambiguous(format!(
+                "ambiguous method `{}` on dyn trait: provided by {}",
+                method_name.0,
+                names
+                    .into_iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )));
+        }
+        let Some(fid) = default_fid.or(ctx.function_id) else {
+            return Ok(None);
         };
-        if !function
-            .params
-            .first()
-            .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(_, _)))
-            || !function.generics.is_empty()
-            || !function.implicit_generics.is_empty()
-            || !function.const_generics.is_empty()
-            || function
-                .params
-                .iter()
-                .skip(1)
-                .any(|param| hir_type_mentions_self(&param.ty))
-            || function
-                .ret_type
-                .as_ref()
-                .is_some_and(hir_type_mentions_self)
-        {
-            return None;
+        let safety = dyn_method_safety(&function);
+        if !matches!(safety, DynMethodSafety::Dispatchable) {
+            return Err(MethodLookupError::NotObjectSafe(format!(
+                "method `{}` exists on trait `{}` but is not object-safe for dynamic dispatch: {}",
+                method_name.0,
+                self.hir.item_tree.traits[method_trait_id].name.0,
+                safety.reason()
+            )));
         }
         let receiver = Type::DynTrait {
             trait_id: *trait_id,
             args: args.clone(),
+            assoc_bindings: assoc_bindings.clone(),
         };
         let mut subst = HashMap::new();
-        subst.insert("Self".into(), receiver);
-        for (name, arg) in trait_data.generics.iter().zip(args) {
+        subst.insert("Self".into(), receiver.clone());
+        for (name, arg) in self.hir.item_tree.traits[*trait_id]
+            .generics
+            .iter()
+            .zip(args)
+        {
             subst.insert(name.0.clone(), arg.clone());
         }
-        Some(ResolvedMethod {
+        for (name, arg) in assoc_bindings {
+            subst.insert(format!("Self::{name}"), arg.clone());
+        }
+        let subst = self
+            .supertrait_subst(
+                *trait_id,
+                method_trait_id,
+                &receiver,
+                &subst,
+                &mut HashSet::new(),
+            )
+            .unwrap_or(subst);
+        Ok(Some(ResolvedMethod {
             fid,
             function,
             subst,
-            trait_id: Some(*trait_id),
+            trait_id: Some(method_trait_id),
             from_trait_bound: true,
-        })
+        }))
+    }
+
+    fn dyn_trait_methods(
+        &self,
+        trait_id: TraitId,
+    ) -> Vec<(TraitId, HirFunction, Option<FunctionId>)> {
+        fn collect(
+            checker: &TypeChecker<'_>,
+            trait_id: TraitId,
+            visited: &mut HashSet<TraitId>,
+            methods: &mut Vec<(TraitId, HirFunction, Option<FunctionId>)>,
+        ) {
+            if !visited.insert(trait_id) {
+                return;
+            }
+            let trait_data = &checker.hir.item_tree.traits[trait_id];
+            for method in &trait_data.methods {
+                if !methods.iter().any(|(existing_trait, existing, _)| {
+                    *existing_trait == trait_id && existing.name == method.name
+                }) {
+                    methods.push((trait_id, method.clone(), None));
+                }
+            }
+            for fid in &trait_data.default_methods {
+                let method = checker.hir.item_tree.functions[*fid].clone();
+                if !methods.iter().any(|(existing_trait, existing, _)| {
+                    *existing_trait == trait_id && existing.name == method.name
+                }) {
+                    methods.push((trait_id, method, Some(*fid)));
+                }
+            }
+            for bound in &trait_data.supertraits {
+                if let Some(supertrait_id) = checker.resolve_trait_ref(&bound.trait_ty) {
+                    collect(checker, supertrait_id, visited, methods);
+                }
+            }
+        }
+
+        let mut methods = Vec::new();
+        collect(self, trait_id, &mut HashSet::new(), &mut methods);
+        methods
     }
 
     pub(super) fn find_inherent_method(
@@ -483,7 +577,7 @@ impl TypeChecker<'_> {
         ctx: &BodyCtx<'_>,
         receiver_ty: &Type,
         method_name: &Name,
-    ) -> Result<Option<ResolvedMethod>, FunctionId> {
+    ) -> Result<Option<ResolvedMethod>, MethodLookupError> {
         let receiver_self_ty = match receiver_ty {
             Type::Ref(inner, _) => inner.as_ref(),
             other => other,
@@ -534,7 +628,7 @@ impl TypeChecker<'_> {
             }
         }
 
-        private.map_or(Ok(None), Err)
+        private.map_or(Ok(None), |fid| Err(MethodLookupError::Private(fid)))
     }
 
     pub(super) fn find_trait_impl_method_by_name(
@@ -838,6 +932,47 @@ impl TypeChecker<'_> {
 
     pub(super) fn receiver_argument_type(base_ty: &Type, expected: &Type) -> Type {
         match (base_ty, expected) {
+            (
+                Type::OwnedDynTrait {
+                    trait_id: actual_id,
+                    args: actual_args,
+                    assoc_bindings: actual_assoc,
+                },
+                Type::Ref(expected_inner, _),
+            ) if matches!(
+                expected_inner.as_ref(),
+                Type::DynTrait {
+                    trait_id: expected_id,
+                    args: expected_args,
+                    assoc_bindings: expected_assoc,
+                } if actual_id == expected_id
+                    && actual_args == expected_args
+                    && actual_assoc == expected_assoc
+            ) =>
+            {
+                expected.clone()
+            }
+            (Type::Ref(inner, _), Type::Ref(expected_inner, _))
+                if matches!(
+                    (inner.as_ref(), expected_inner.as_ref()),
+                    (
+                        Type::OwnedDynTrait {
+                            trait_id: actual_id,
+                            args: actual_args,
+                            assoc_bindings: actual_assoc,
+                        },
+                        Type::DynTrait {
+                            trait_id: expected_id,
+                            args: expected_args,
+                            assoc_bindings: expected_assoc,
+                        },
+                    ) if actual_id == expected_id
+                        && actual_args == expected_args
+                        && actual_assoc == expected_assoc
+                ) =>
+            {
+                expected.clone()
+            }
             (Type::Ref(actual, true), Type::Ref(expected, false)) if actual == expected => {
                 Type::Ref(actual.clone(), false)
             }
@@ -1112,28 +1247,5 @@ impl TypeChecker<'_> {
             }
             _ => None,
         }
-    }
-}
-
-fn hir_type_mentions_self(ty: &HirTypeRef) -> bool {
-    match ty {
-        HirTypeRef::Named(path) => {
-            path.segments.first().is_some_and(|name| name.0 == "Self")
-                || path
-                    .segment_type_args
-                    .iter()
-                    .flat_map(|(_, args)| args)
-                    .any(hir_type_mentions_self)
-                || path.type_args.iter().any(hir_type_mentions_self)
-        }
-        HirTypeRef::Ref(inner, _)
-        | HirTypeRef::Ptr { inner, .. }
-        | HirTypeRef::Slice(inner)
-        | HirTypeRef::Array(inner, _) => hir_type_mentions_self(inner),
-        HirTypeRef::Tuple(elements) => elements.iter().any(hir_type_mentions_self),
-        HirTypeRef::ImplTrait { trait_ty, .. } | HirTypeRef::DynTrait { trait_ty, .. } => {
-            hir_type_mentions_self(trait_ty)
-        }
-        HirTypeRef::Never | HirTypeRef::Const(_) | HirTypeRef::Unknown | HirTypeRef::Error => false,
     }
 }

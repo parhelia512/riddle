@@ -363,6 +363,7 @@ impl TypeChecker<'_> {
                 self.bind_for_pattern(ctx, pat, item_ty);
                 ctx.loop_stack.push(LoopCtx {
                     allows_value: false,
+                    expected_type: None,
                     break_types: Vec::new(),
                 });
                 self.check_expr(ctx, body);
@@ -449,6 +450,7 @@ impl TypeChecker<'_> {
         self.bind_for_pattern(ctx, pat, &item_ty);
         ctx.loop_stack.push(LoopCtx {
             allows_value: false,
+            expected_type: None,
             break_types: Vec::new(),
         });
         self.check_expr(ctx, body);
@@ -631,10 +633,11 @@ impl TypeChecker<'_> {
             };
             let elem_span = ctx.expr_range(*element);
             element_ty = Some(match element_ty {
-                None => ty,
+                None => expected_element.cloned().unwrap_or(ty),
                 Some(prev) => {
-                    self.expect_assignable(&prev, &ty, "array element", elem_span);
-                    prev.or(ty)
+                    let candidate = expected_element.cloned().unwrap_or(ty);
+                    self.expect_assignable(&prev, &candidate, "array element", elem_span);
+                    prev.or(candidate)
                 }
             });
         }

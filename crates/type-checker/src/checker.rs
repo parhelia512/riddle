@@ -32,6 +32,7 @@ pub struct TypeChecker<'a> {
     pub(crate) pending_move_uses: HashSet<(BodyId, ExprId)>,
     pub(crate) pending_delayed_bindings: Vec<(BodyId, PatternBindingId, Option<TextRange>)>,
     pub(crate) pending_generic_calls: Vec<PendingGenericCall>,
+    active_trait_assumptions: Vec<TraitBound>,
 }
 
 struct PendingLambda {
@@ -112,6 +113,7 @@ impl<'a> TypeChecker<'a> {
             pending_move_uses: HashSet::new(),
             pending_delayed_bindings: Vec::new(),
             pending_generic_calls: Vec::new(),
+            active_trait_assumptions: Vec::new(),
         }
     }
 
@@ -647,6 +649,10 @@ impl<'a> TypeChecker<'a> {
             return_ty.clone(),
             params,
         );
+        let previous_assumptions = std::mem::take(&mut self.active_trait_assumptions);
+        let function_bounds = self.current_generic_bounds(&ctx);
+        self.active_trait_assumptions =
+            self.lower_trait_env_bounds(&function_bounds, &ctx.generic_params);
         self.check_type_bounds_inner(
             &ctx,
             &return_ty,
@@ -706,6 +712,7 @@ impl<'a> TypeChecker<'a> {
             }
         }
         self.finish_inference(&ctx);
+        self.active_trait_assumptions = previous_assumptions;
     }
 
     fn function_generic_params(
@@ -793,9 +800,29 @@ impl<'a> TypeChecker<'a> {
                 .get(id)
                 .map_or_else(|| ty.clone(), |value| self.resolve_type(value)),
             Type::Ref(inner, mutable) => Type::Ref(Box::new(self.resolve_type(inner)), *mutable),
-            Type::DynTrait { trait_id, args } => Type::DynTrait {
+            Type::DynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => Type::DynTrait {
                 trait_id: *trait_id,
                 args: args.iter().map(|arg| self.resolve_type(arg)).collect(),
+                assoc_bindings: assoc_bindings
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.resolve_type(ty)))
+                    .collect(),
+            },
+            Type::OwnedDynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => Type::OwnedDynTrait {
+                trait_id: *trait_id,
+                args: args.iter().map(|arg| self.resolve_type(arg)).collect(),
+                assoc_bindings: assoc_bindings
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.resolve_type(ty)))
+                    .collect(),
             },
             Type::Ptr { mutable, inner } => Type::Ptr {
                 mutable: *mutable,
@@ -864,6 +891,7 @@ impl<'a> TypeChecker<'a> {
             Type::FunctionItem { function, args } => {
                 Some(self.function_item_signature(*function, args))
             }
+            Type::Ref(inner, _) => self.callable_signature_for_type(inner),
             _ => None,
         }
     }
@@ -962,10 +990,12 @@ impl<'a> TypeChecker<'a> {
                 Type::DynTrait {
                     trait_id: lhs_id,
                     args: lhs_args,
+                    assoc_bindings: lhs_assoc,
                 },
                 Type::DynTrait {
                     trait_id: rhs_id,
                     args: rhs_args,
+                    assoc_bindings: rhs_assoc,
                 },
             ) => {
                 lhs_id == rhs_id
@@ -974,6 +1004,27 @@ impl<'a> TypeChecker<'a> {
                         .iter()
                         .zip(rhs_args)
                         .all(|(lhs, rhs)| self.unify_types_inner(lhs, rhs))
+                    && self.unify_assoc_bindings(lhs_assoc, rhs_assoc)
+            }
+            (
+                Type::OwnedDynTrait {
+                    trait_id: lhs_id,
+                    args: lhs_args,
+                    assoc_bindings: lhs_assoc,
+                },
+                Type::OwnedDynTrait {
+                    trait_id: rhs_id,
+                    args: rhs_args,
+                    assoc_bindings: rhs_assoc,
+                },
+            ) => {
+                lhs_id == rhs_id
+                    && lhs_args.len() == rhs_args.len()
+                    && lhs_args
+                        .iter()
+                        .zip(rhs_args)
+                        .all(|(lhs, rhs)| self.unify_types_inner(lhs, rhs))
+                    && self.unify_assoc_bindings(lhs_assoc, rhs_assoc)
             }
             (Type::Tuple(a), Type::Tuple(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(a, b)| self.unify_types_inner(a, b))
@@ -1004,6 +1055,15 @@ impl<'a> TypeChecker<'a> {
                 ),
             _ => lhs == rhs || Self::numeric_assignable(&lhs, &rhs),
         }
+    }
+
+    fn unify_assoc_bindings(&mut self, lhs: &[(String, Type)], rhs: &[(String, Type)]) -> bool {
+        lhs.len() == rhs.len()
+            && lhs.iter().all(|(name, lhs)| {
+                rhs.iter()
+                    .find(|(rhs_name, _)| rhs_name == name)
+                    .is_some_and(|(_, rhs)| self.unify_types_inner(lhs, rhs))
+            })
     }
 
     fn unify_special_types(&mut self, lhs: &Type, rhs: &Type) -> Option<bool> {
@@ -1680,6 +1740,7 @@ impl<'a> TypeChecker<'a> {
             || Self::numeric_assignable(&expected, &actual)
             || Self::is_slice_coercion(&expected, &actual)
             || self.is_dyn_trait_coercion_allowed(&expected, &actual)
+            || self.is_owned_dyn_trait_coercion_allowed(&expected, &actual)
             || Self::structural_assignable(&expected, &actual)
         {
             return;
@@ -1813,6 +1874,12 @@ impl<'a> TypeChecker<'a> {
             "E0010" => vec!["ensure tuple element counts match".into()],
             "E0011" => vec!["use a valid numeric suffix and keep the literal within that type's range".into()],
             "E0012" => vec!["this source and target type pair does not support `as` conversion".into()],
+            "E0013" if message.contains("ambiguous method") => {
+                vec!["use a trait-specific forwarding method or split the object bounds".into()]
+            }
+            "E0013" if message.contains("not object-safe") => {
+                vec!["use a borrowed receiver and avoid `Self`, by-value `self`, or generic methods".into()]
+            }
             "E0013" => vec!["check the impl block and receiver type".into()],
             "E0020" | "E0024" => vec!["remove the duplicate definition".into()],
             "E0031" if message == "cannot call a mutable closure through an immutable binding" => {
@@ -1989,11 +2056,15 @@ impl<'a> TypeChecker<'a> {
                 Type::Ref(actual, actual_mut),
             ) if expected_mut == actual_mut
                 && matches!(expected.as_ref(), Type::DynTrait { .. })
-                && !matches!(actual.as_ref(), Type::DynTrait { .. })
+                && !matches!(actual.as_ref(), Type::Param(..))
         )
     }
 
-    fn is_dyn_trait_coercion_allowed(&self, expected: &Type, actual: &Type) -> bool {
+    pub(crate) fn is_owned_dyn_trait_coercion(expected: &Type, actual: &Type) -> bool {
+        matches!(expected, Type::OwnedDynTrait { .. }) && !matches!(actual, Type::DynTrait { .. })
+    }
+
+    fn is_dyn_trait_coercion_allowed(&mut self, expected: &Type, actual: &Type) -> bool {
         let (Type::Ref(expected_inner, expected_mut), Type::Ref(actual_inner, actual_mut)) =
             (expected, actual)
         else {
@@ -2002,21 +2073,134 @@ impl<'a> TypeChecker<'a> {
         if expected_mut != actual_mut {
             return false;
         }
-        let Type::DynTrait { trait_id, args } = expected_inner.as_ref() else {
+        let Type::DynTrait {
+            trait_id,
+            args,
+            assoc_bindings: expected_assoc,
+        } = expected_inner.as_ref()
+        else {
             return false;
         };
         if actual_inner.is_unknown_like() {
             return true;
         }
-        if matches!(
-            actual_inner.as_ref(),
-            Type::Param(..) | Type::DynTrait { .. }
-        ) {
-            return false;
+        match actual_inner.as_ref() {
+            Type::DynTrait {
+                trait_id: actual_id,
+                args: actual_args,
+                assoc_bindings: actual_assoc,
+            }
+            | Type::OwnedDynTrait {
+                trait_id: actual_id,
+                args: actual_args,
+                assoc_bindings: actual_assoc,
+            } => {
+                return self.dyn_trait_upcast_allowed(
+                    *actual_id,
+                    actual_args,
+                    actual_assoc,
+                    *trait_id,
+                    args,
+                    expected_assoc,
+                );
+            }
+            Type::Param(param) => {
+                let assumptions = self.active_trait_assumptions.clone();
+                return assumptions.iter().any(|bound| {
+                    bound.ty == Type::Param(param.clone())
+                        && self.dyn_trait_upcast_allowed(
+                            bound.trait_id,
+                            &bound.trait_args,
+                            &bound
+                                .assoc_constraints
+                                .iter()
+                                .map(|constraint| (constraint.name.clone(), constraint.ty.clone()))
+                                .collect::<Vec<_>>(),
+                            *trait_id,
+                            args,
+                            expected_assoc,
+                        )
+                });
+            }
+            _ => {}
         }
         self.result
             .trait_env
             .type_implements_with_args_assuming(actual_inner, *trait_id, args, &[])
+            && self.dyn_assoc_bindings_match_concrete(actual_inner, *trait_id, args, expected_assoc)
+    }
+
+    fn is_owned_dyn_trait_coercion_allowed(&mut self, expected: &Type, actual: &Type) -> bool {
+        let Type::OwnedDynTrait {
+            trait_id,
+            args,
+            assoc_bindings: expected_assoc,
+        } = expected
+        else {
+            return false;
+        };
+        if actual.is_unknown_like() {
+            return true;
+        }
+        match actual {
+            Type::OwnedDynTrait {
+                trait_id: actual_id,
+                args: actual_args,
+                assoc_bindings: actual_assoc,
+            } => {
+                return self.dyn_trait_upcast_allowed(
+                    *actual_id,
+                    actual_args,
+                    actual_assoc,
+                    *trait_id,
+                    args,
+                    expected_assoc,
+                );
+            }
+            Type::Param(param) => {
+                let assumptions = self.active_trait_assumptions.clone();
+                return assumptions.iter().any(|bound| {
+                    bound.ty == Type::Param(param.clone())
+                        && self.dyn_trait_upcast_allowed(
+                            bound.trait_id,
+                            &bound.trait_args,
+                            &bound
+                                .assoc_constraints
+                                .iter()
+                                .map(|constraint| (constraint.name.clone(), constraint.ty.clone()))
+                                .collect::<Vec<_>>(),
+                            *trait_id,
+                            args,
+                            expected_assoc,
+                        )
+                });
+            }
+            Type::DynTrait { .. } => return false,
+            _ => {}
+        }
+        self.result
+            .trait_env
+            .type_implements_with_args_assuming(actual, *trait_id, args, &[])
+            && self.dyn_assoc_bindings_match_concrete(actual, *trait_id, args, expected_assoc)
+    }
+
+    fn dyn_assoc_bindings_match_concrete(
+        &self,
+        actual: &Type,
+        trait_id: hir::item_tree::TraitId,
+        args: &[Type],
+        expected: &[(String, Type)],
+    ) -> bool {
+        expected.iter().all(|(name, expected_ty)| {
+            self.result
+                .trait_env
+                .associated_type_with_args(actual, trait_id, args, name)
+                .is_some_and(|actual_ty| {
+                    expected_ty.is_unknown_like()
+                        || actual_ty.is_unknown_like()
+                        || expected_ty == &actual_ty
+                })
+        })
     }
 
     pub(crate) fn join_numeric_types(lhs: &Type, rhs: &Type) -> Option<Type> {
@@ -2078,8 +2262,18 @@ fn type_contains_infer_var(
         Type::FunctionItem { args, .. } => args
             .iter()
             .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
-        Type::DynTrait { args, .. } => args
+        Type::DynTrait {
+            args,
+            assoc_bindings,
+            ..
+        }
+        | Type::OwnedDynTrait {
+            args,
+            assoc_bindings,
+            ..
+        } => args
             .iter()
+            .chain(assoc_bindings.iter().map(|(_, ty)| ty))
             .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
         Type::CallableConstraint(signature)
         | Type::Closure { signature, .. }
@@ -2736,7 +2930,7 @@ fn type_contains_slice(ty: &Type) -> bool {
 
 fn type_contains_dyn_trait(ty: &Type) -> bool {
     match ty {
-        Type::DynTrait { .. } => true,
+        Type::DynTrait { .. } | Type::OwnedDynTrait { .. } => true,
         Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
             type_contains_dyn_trait(inner)
         }

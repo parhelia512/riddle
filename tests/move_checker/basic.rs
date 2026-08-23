@@ -1627,6 +1627,25 @@ fn fn_once_parameter_is_consumed_by_its_first_call() {
 }
 
 #[test]
+fn borrowed_dyn_callable_preserves_argument_borrow_modes() {
+    let result = analyze(
+        r#"
+        fun call(callback: &dyn Fn(&[i32], &mut [i32]) -> i32, mut token: [i32; 1]) -> i32 {
+            callback(&token, &mut token)
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0300" && diagnostic.message.contains("token")
+        }),
+        "expected the callback borrow modes to conflict: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn shared_pattern_capture_blocks_later_move() {
     let result = analyze(
         r"

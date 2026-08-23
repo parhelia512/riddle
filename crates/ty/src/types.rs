@@ -39,6 +39,14 @@ pub enum Type {
     DynTrait {
         trait_id: TraitId,
         args: Vec<Self>,
+        assoc_bindings: Vec<(String, Self)>,
+    },
+    /// An owned, sized trait object. The MIR representation stores a heap
+    /// data pointer, method table, and type-specific drop function.
+    OwnedDynTrait {
+        trait_id: TraitId,
+        args: Vec<Self>,
+        assoc_bindings: Vec<(String, Self)>,
     },
     /// Raw pointer type: `*const T` or `*mut T`.
     Ptr {
@@ -141,17 +149,46 @@ impl Type {
                 let kw = if *mutable { "&mut " } else { "&" };
                 format!("{}{}", kw, inner.display(hir))
             }
-            Self::DynTrait { trait_id, args } => {
+            Self::DynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => {
                 let name = &hir.item_tree.traits[*trait_id].name.0;
-                if args.is_empty() {
+                let mut parts = Vec::new();
+                if !args.is_empty() {
+                    parts.extend(args.iter().map(|arg| arg.display(hir)).collect::<Vec<_>>());
+                }
+                parts.extend(
+                    assoc_bindings
+                        .iter()
+                        .map(|(name, ty)| format!("{name} = {}", ty.display(hir))),
+                );
+                if parts.is_empty() {
                     format!("dyn {name}")
                 } else {
-                    let args = args
+                    format!("dyn {name}<{}>", parts.join(", "))
+                }
+            }
+            Self::OwnedDynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => {
+                let name = &hir.item_tree.traits[*trait_id].name.0;
+                let mut parts = Vec::new();
+                if !args.is_empty() {
+                    parts.extend(args.iter().map(|arg| arg.display(hir)).collect::<Vec<_>>());
+                }
+                parts.extend(
+                    assoc_bindings
                         .iter()
-                        .map(|arg| arg.display(hir))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("dyn {name}<{args}>")
+                        .map(|(name, ty)| format!("{name} = {}", ty.display(hir))),
+                );
+                if parts.is_empty() {
+                    format!("dyn {name}")
+                } else {
+                    format!("dyn {name}<{}>", parts.join(", "))
                 }
             }
             Self::Ptr { mutable, inner } => {

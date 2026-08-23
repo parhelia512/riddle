@@ -32,6 +32,8 @@ impl LowerCtx<'_> {
                 type_checker::Type::FunctionItem { .. }
                     | type_checker::Type::Closure { .. }
                     | type_checker::Type::OpaqueCallable { .. }
+                    | type_checker::Type::CallableConstraint(_)
+                    | type_checker::Type::OwnedDynTrait { .. }
             )
         {
             let flag = builder.alloca(Type::Bool);
@@ -147,11 +149,27 @@ impl LowerCtx<'_> {
             type_checker::Type::FunctionItem { .. }
                 | type_checker::Type::Closure { .. }
                 | type_checker::Type::OpaqueCallable { .. }
+                | type_checker::Type::CallableConstraint(_)
         ) {
             let closure = builder.load(place, self.convert_type(&ty));
             let env = builder.extract_value(closure, 1, closure_env_type());
             let drop = builder.extract_value(closure, 2, closure_drop_function_type());
             builder.call_indirect(drop, vec![env], Type::Unit);
+            return;
+        }
+        if matches!(ty, type_checker::Type::OwnedDynTrait { .. }) {
+            let object = builder.load(place, self.convert_type(&ty));
+            let data = builder.extract_value(object, 0, Type::Ptr(Box::new(Type::Unit)));
+            let drop_index = match self.convert_type(&ty) {
+                Type::Struct(struct_ty) => struct_ty.fields.len().saturating_sub(1),
+                _ => return,
+            };
+            let drop = builder.extract_value(
+                object,
+                drop_index,
+                super::types::dyn_trait_drop_function_type(),
+            );
+            builder.call_indirect(drop, vec![data], Type::Unit);
             return;
         }
         if let Some(trait_id) = self
@@ -247,6 +265,8 @@ impl LowerCtx<'_> {
                 type_checker::Type::FunctionItem { .. }
                     | type_checker::Type::Closure { .. }
                     | type_checker::Type::OpaqueCallable { .. }
+                    | type_checker::Type::CallableConstraint(_)
+                    | type_checker::Type::OwnedDynTrait { .. }
             )
         {
             return true;

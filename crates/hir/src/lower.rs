@@ -275,6 +275,7 @@ impl Lower for Param {
         HirParam {
             name,
             name_range,
+            is_receiver: false,
             is_mut,
             ty,
             ty_range,
@@ -534,6 +535,7 @@ fn lower_trait_method(method: &ast::FuncDecl) -> HirFunction {
                     let is_ref = param.is_ref();
                     let is_mut = param.is_mut();
                     let mut param = param.lower();
+                    param.is_receiver = is_self;
                     if is_self {
                         param.ty = self_receiver_type(is_ref, is_mut, param.ty_range);
                     }
@@ -747,6 +749,19 @@ impl Lower for Type {
                 HirTypeRef::DynTrait {
                     trait_ty: Box::new(HirTypeRef::Named(trait_path)),
                     trait_range,
+                    callable: bound.callable.as_ref().map(lower_callable_signature),
+                    assoc_constraints: bound
+                        .assoc_constraints
+                        .into_iter()
+                        .map(|constraint| {
+                            let range = trimmed_range(constraint.ty.syntax());
+                            HirAssocTypeConstraint {
+                                name: Name(constraint.name),
+                                ty: constraint.ty.lower(),
+                                range,
+                            }
+                        })
+                        .collect(),
                 }
             }
         }

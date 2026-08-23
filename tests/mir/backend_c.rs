@@ -52,14 +52,16 @@ fn c_dyn_trait_reference_contains_data_and_method_slots() {
     let module = lower(
         r#"
         trait Speak { fun speak(&self) -> i32; }
+        type SpeakObject = dyn Speak;
         struct Speaker { value: i32 }
         impl Speak for Speaker {
             fun speak(&self) -> i32 { self.value }
         }
         fun call(value: &dyn Speak) -> i32 { value.speak() }
+        fun call_alias(value: &SpeakObject) -> i32 { value.speak() }
         fun main() -> i32 {
             let speaker = Speaker { value: 7 };
-            call(&speaker)
+            call(&speaker) + call_alias(&speaker)
         }
         "#,
     );
@@ -70,6 +72,272 @@ fn c_dyn_trait_reference_contains_data_and_method_slots() {
         "{generated}"
     );
     assert!(generated.contains("riddle_unit*"), "{generated}");
+}
+
+#[test]
+fn c_owned_dyn_trait_uses_heap_storage_and_dynamic_drop() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        #[lang = "copy"]
+        trait Copy {}
+        trait Base { fun base(&self) -> i32; }
+        trait Speak<T>: Base { fun speak(&self) -> T; }
+        struct Speaker { value: i32 }
+        impl Copy for Speaker {}
+        impl Base for Speaker {
+            fun base(&self) -> i32 { self.value }
+        }
+        impl Speak<i32> for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        fun make() -> dyn Speak<i32> {
+            loop {
+                break Speaker { value: 7 };
+            }
+        }
+        fun wrap<T>(value: T) -> dyn Speak<i32>
+        where T: Speak<i32>
+        { value }
+        fun call(value: dyn Speak<i32>) -> i32 { value.speak() }
+        fun take_base(value: &dyn Base) -> i32 { value.base() }
+        fun take(value: &dyn Speak<i32>) -> i32 { value.speak() }
+        fun main() -> i32 {
+            let speaker = Speaker { value: 7 };
+            let parent_source: dyn Speak<i32> = Speaker { value: 7 };
+            let parent: dyn Base = parent_source;
+            let parent_borrow = &parent;
+            let owned: dyn Speak<i32> = Speaker { value: 7 };
+            let borrowed = &owned;
+            let values: [dyn Speak<i32>; 2] = [
+                Speaker { value: 3 },
+                Speaker { value: 4 },
+            ];
+            if call(make()) == 7
+                && call(wrap(Speaker { value: 7 })) == 7
+                && call(speaker) == 7
+                && call(speaker) == 7
+                && take(&owned) == 7
+                && borrowed.speak() == 7
+                && take_base(parent_borrow) == 7
+                && values[0].speak() + values[1].speak() == 7
+            { 0 } else { 1 }
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(generated.contains("rgc_alloc"), "{generated}");
+    assert!(generated.contains("rgc_free"), "{generated}");
+    assert!(
+        generated.contains(&c_function("__riddle_dyn_drop_Speaker")),
+        "{generated}"
+    );
+
+    let no_gc = CBackend::without_gc().compile(&module).unwrap();
+    assert!(no_gc.contains("riddle_alloc"), "{no_gc}");
+    assert!(no_gc.contains("riddle_free"), "{no_gc}");
+    assert!(!no_gc.contains("rgc_alloc"), "{no_gc}");
+
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let compiler_name = Path::new(&compiler)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let is_clang_cl = compiler_name == "clang-cl" || compiler_name.starts_with("clang-cl-");
+    let is_msvc = compiler_name == "cl" || is_clang_cl;
+    if !Command::new(&compiler)
+        .arg(if is_msvc { "/?" } else { "--version" })
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping owned dyn trait C run: no usable C compiler");
+        return;
+    }
+
+    for (label, generated, runtime) in [
+        (
+            "gc",
+            generated,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/crates/gc/src/runtime.c"
+            )),
+        ),
+        (
+            "no-gc",
+            no_gc,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/crates/gc/src/no_gc_runtime.c"
+            )),
+        ),
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "riddle-c-owned-dyn-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.c");
+        let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
+        fs::write(&source, format!("{generated}\n{runtime}")).unwrap();
+
+        let mut command = Command::new(&compiler);
+        if is_msvc {
+            command.args(["/std:c11", "/W4", "/WX"]);
+            if is_clang_cl && cfg!(all(windows, target_arch = "x86")) {
+                command.arg("--target=i686-pc-windows-msvc");
+            }
+            command
+                .arg(&source)
+                .arg(format!("/Fe{}", executable.display()));
+        } else {
+            command
+                .args(["-std=c11", "-pedantic-errors", "-Wall", "-Werror"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable);
+        }
+        let compile_output = command.output().unwrap();
+        assert!(
+            compile_output.status.success(),
+            "{label} C11 compile failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile_output.stdout),
+            String::from_utf8_lossy(&compile_output.stderr)
+        );
+        let run = Command::new(&executable).output().unwrap();
+        assert_eq!(
+            run.status.code(),
+            Some(0),
+            "{label} native program exited with {}",
+            run.status
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn c_dyn_trait_supertrait_methods_compile_and_run() {
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let compiler_name = Path::new(&compiler)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let is_clang_cl = compiler_name == "clang-cl" || compiler_name.starts_with("clang-cl-");
+    let is_msvc = compiler_name == "cl" || is_clang_cl;
+    if !Command::new(&compiler)
+        .arg(if is_msvc { "/?" } else { "--version" })
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping dyn trait C test: no usable C compiler");
+        return;
+    }
+
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        trait Loud: Speak { fun volume(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        impl Loud for Speaker {
+            fun volume(&self) -> i32 { self.value + 1 }
+        }
+        fun choose(value: &Speaker) -> &dyn Loud {
+            if true { value } else { value }
+        }
+        fun call(value: &dyn Loud) -> i32 { value.speak() + value.volume() }
+        fun call_speak(value: &dyn Speak) -> i32 { value.speak() }
+        fun main() -> i32 {
+            let speaker = Speaker { value: 7 };
+            let loud: &dyn Loud = &speaker;
+            let quiet: &dyn Speak = loud;
+            let borrowed = quiet;
+            if call(choose(&speaker)) == 15
+                && call_speak(quiet) == 7
+                && call_speak(borrowed) == 7
+            { 0 } else { 1 }
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    let root = std::env::temp_dir().join(format!(
+        "riddle-c-dyn-trait-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("main.c");
+    let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
+    fs::write(&source, generated).unwrap();
+
+    let mut command = Command::new(&compiler);
+    if is_msvc {
+        command.args(["/std:c11", "/W4", "/WX"]);
+        if is_clang_cl && cfg!(all(windows, target_arch = "x86")) {
+            command.arg("--target=i686-pc-windows-msvc");
+        }
+        command
+            .arg(&source)
+            .arg(format!("/Fe{}", executable.display()));
+    } else {
+        command
+            .args(["-std=c11", "-pedantic-errors", "-Wall", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable);
+    }
+    let compile_output = command.output().unwrap();
+    assert!(
+        compile_output.status.success(),
+        "C11 compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile_output.stdout),
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+    let run = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "native program exited with {}",
+        run.status
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn c_dyn_trait_duplicate_parent_slots_compile() {
+    let module = lower(
+        r#"
+        trait Left { fun name(&self) -> i32; }
+        trait Right { fun name(&self) -> i32; }
+        trait Both: Left + Right {}
+        struct Speaker { value: i32 }
+        impl Left for Speaker {
+            fun name(&self) -> i32 { self.value }
+        }
+        impl Right for Speaker {
+            fun name(&self) -> i32 { self.value + 1 }
+        }
+        impl Both for Speaker {}
+        fun make() -> dyn Both { Speaker { value: 7 } }
+        "#,
+    );
+    assert!(CBackend::new().compile(&module).is_ok());
 }
 
 #[test]
@@ -593,6 +861,140 @@ fn c_named_function_value_uses_empty_environment_adapter() {
         "{generated}"
     );
     assert!(generated.contains(&c_function("apply__")), "{generated}");
+}
+
+#[test]
+fn c_dyn_callable_value_and_reference_use_closure_abi() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        fun increment(value: i32) -> i32 { value + 1 }
+        fun apply(value: dyn Fn(i32) -> i32, input: i32) -> i32 { value(input) }
+        fun apply_ref(value: &dyn Fn(i32) -> i32, input: i32) -> i32 { value(input) }
+        fun main() -> i32 {
+            let callback: dyn Fn(i32) -> i32 = increment;
+            let callback_ref: dyn Fn(i32) -> i32 = increment;
+            apply(callback, 41) + apply_ref(&callback_ref, 41)
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    assert!(
+        generated.contains(&c_function("__riddle_fn_adapter_increment")),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!(".{}(", c_member("call"))),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(&format!(".{}", c_member("env"))),
+        "{generated}"
+    );
+}
+
+#[test]
+fn c_dyn_callable_closure_runs_with_gc_and_without_gc() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        fun apply_mut(mut value: &mut dyn FnMut(i32) -> i32, input: i32) -> i32 {
+            value(input)
+        }
+        fun apply_once(value: dyn FnOnce() -> i32) -> i32 { value() }
+        fun main() -> i32 {
+            let mut total = 0;
+            let mut callback: dyn FnMut(i32) -> i32 = fun(value: i32) {
+                total += value;
+                total
+            };
+            let first = apply_mut(&mut callback, 2);
+            let once: dyn FnOnce() -> i32 = fun() { first + 40 };
+            if apply_once(once) == 42 { 0 } else { 1 }
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let compiler_name = Path::new(&compiler)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let is_clang_cl = compiler_name == "clang-cl" || compiler_name.starts_with("clang-cl-");
+    let is_msvc = compiler_name == "cl" || is_clang_cl;
+    if !Command::new(&compiler)
+        .arg(if is_msvc { "/?" } else { "--version" })
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping dyn callable C run: no usable C compiler");
+        return;
+    }
+
+    let generated = CBackend::new().compile(&module).unwrap();
+    let no_gc = CBackend::without_gc().compile(&module).unwrap();
+    for (label, generated, runtime) in [
+        (
+            "gc",
+            generated,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/crates/gc/src/runtime.c"
+            )),
+        ),
+        (
+            "no-gc",
+            no_gc,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/crates/gc/src/no_gc_runtime.c"
+            )),
+        ),
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "riddle-c-dyn-callable-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.c");
+        let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
+        fs::write(&source, format!("{generated}\n{runtime}")).unwrap();
+
+        let mut command = Command::new(&compiler);
+        if is_msvc {
+            command.args(["/std:c11", "/W4", "/WX"]);
+            if is_clang_cl && cfg!(all(windows, target_arch = "x86")) {
+                command.arg("--target=i686-pc-windows-msvc");
+            }
+            command
+                .arg(&source)
+                .arg(format!("/Fe{}", executable.display()));
+        } else {
+            command
+                .args(["-std=c11", "-pedantic-errors", "-Wall", "-Werror"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable);
+        }
+        let compile_output = command.output().unwrap();
+        assert!(
+            compile_output.status.success(),
+            "{label} C11 compile failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile_output.stdout),
+            String::from_utf8_lossy(&compile_output.stderr)
+        );
+        let run = Command::new(&executable).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "{label} native program failed");
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[test]

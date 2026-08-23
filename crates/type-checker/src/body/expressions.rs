@@ -202,7 +202,14 @@ impl TypeChecker<'_> {
                 } else {
                     let (ty, range) = match value {
                         Some(value) => {
-                            let ty = self.check_expr(ctx, value);
+                            let expected = ctx
+                                .loop_stack
+                                .last()
+                                .and_then(|loop_ctx| loop_ctx.expected_type.clone());
+                            let ty = match expected.as_ref() {
+                                Some(expected) => self.check_expr_expected(ctx, value, expected),
+                                None => self.check_expr(ctx, value),
+                            };
                             self.record_value_use(ctx, value, ValueUse::Move);
                             (ty, ctx.expr_range(value))
                         }
@@ -239,7 +246,10 @@ impl TypeChecker<'_> {
     ) -> Type {
         let ty = self.check_expr_inner(ctx, expr_id, Some(expected));
         let ty = self.finish_value_expr(ctx, expr_id, ty);
-        if Self::is_slice_coercion(expected, &ty) || Self::is_dyn_trait_coercion(expected, &ty) {
+        if Self::is_slice_coercion(expected, &ty)
+            || Self::is_dyn_trait_coercion(expected, &ty)
+            || Self::is_owned_dyn_trait_coercion(expected, &ty)
+        {
             self.result
                 .expr_coercions
                 .insert((ctx.body_id, expr_id), expected.clone());
@@ -421,6 +431,7 @@ impl TypeChecker<'_> {
                 self.record_value_use(ctx, *condition, ValueUse::Move);
                 ctx.loop_stack.push(LoopCtx {
                     allows_value: false,
+                    expected_type: None,
                     break_types: Vec::new(),
                 });
                 self.check_expr(ctx, *body);
@@ -431,6 +442,7 @@ impl TypeChecker<'_> {
             Expr::Loop { body } => {
                 ctx.loop_stack.push(LoopCtx {
                     allows_value: true,
+                    expected_type: expected.cloned(),
                     break_types: Vec::new(),
                 });
                 self.check_expr(ctx, *body);

@@ -78,7 +78,14 @@ impl TypeChecker<'_> {
                 .or_else(|| self.callable_bound_for_type(ctx, &resolved_callee))
         };
         if let Some(signature) = signature {
-            return self.check_callable_value_call(ctx, callee, args, &signature, span);
+            return self.check_callable_value_call(
+                ctx,
+                callee,
+                &resolved_callee,
+                args,
+                &signature,
+                span,
+            );
         }
         let Type::FunctionItem { function: fid, .. } = callee_ty else {
             for arg in args {
@@ -109,6 +116,7 @@ impl TypeChecker<'_> {
         &mut self,
         ctx: &mut BodyCtx<'_>,
         callee: ExprId,
+        callee_ty: &Type,
         args: &[ExprId],
         signature: &CallableSignature,
         span: Option<rowan::TextRange>,
@@ -122,8 +130,20 @@ impl TypeChecker<'_> {
                 ClosureKind::FnOnce => ValueUse::Move,
             },
         );
-        if signature.kind == ClosureKind::FnMut {
-            self.check_mutable_closure_binding(ctx, callee);
+        match (signature.kind, callee_ty) {
+            (ClosureKind::FnMut, Type::Ref(_, true)) => {}
+            (ClosureKind::FnMut, Type::Ref(_, false)) => self.diagnostic(
+                "E0031",
+                "cannot call a mutable closure through an immutable reference",
+                ctx.expr_range(callee),
+            ),
+            (ClosureKind::FnMut, _) => self.check_mutable_closure_binding(ctx, callee),
+            (ClosureKind::FnOnce, Type::Ref(..)) => self.diagnostic(
+                "E0035",
+                "cannot call an `FnOnce` value through a reference; pass it by value",
+                ctx.expr_range(callee),
+            ),
+            _ => {}
         }
         if signature.is_unsafe {
             self.require_unsafe(ctx, "calling an unsafe function", span);

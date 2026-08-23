@@ -8,6 +8,7 @@ use item_tree::{
 use la_arena::Arena;
 use lower::{AstLower, Lower};
 use rowan::TextRange;
+use syntax::SyntaxNode;
 
 use ast::{
     self, Root,
@@ -36,12 +37,16 @@ pub struct HirFile {
     /// True when the standard library prelude was appended to the source.
     /// Items outside `package_ranges` belong to the standard library.
     pub std_loaded: bool,
+    /// Documentation comments attached to syntax nodes, kept in source order.
+    pub doc_comments: Vec<(TextRange, Vec<String>)>,
 }
 
 #[must_use]
 pub fn lower_root(root: &Root) -> HirFile {
     let package_range = root.syntax().text_range();
     let internal_attrs = lower::lower_internal_attrs(root.syntax());
+    let mut doc_comments = Vec::new();
+    collect_doc_comments(root.syntax(), &mut doc_comments);
     let mut hir = HirFile {
         item_tree: ItemTree {
             functions: Arena::new(),
@@ -63,11 +68,27 @@ pub fn lower_root(root: &Root) -> HirFile {
         internal_attrs,
         package_ranges: vec![package_range],
         std_loaded: false,
+        doc_comments,
     };
 
     let top = lower_items(&mut hir, root.stmts().collect());
     hir.item_tree.top_level = top;
     hir
+}
+
+fn collect_doc_comments(node: &SyntaxNode, comments: &mut Vec<(TextRange, Vec<String>)>) {
+    let docs = ast::doc_comments_for_node(node);
+    if !docs.is_empty() {
+        comments.push((
+            node.text_range(),
+            docs.into_iter()
+                .map(|token| token.text().to_string())
+                .collect(),
+        ));
+    }
+    for child in node.children() {
+        collect_doc_comments(&child, comments);
+    }
 }
 
 impl HirFile {
@@ -370,6 +391,7 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: &ast::ImplDecl) -> item_tree
 
 fn apply_self_receiver_types(func: &mut item_tree::HirFunction, receivers: &[(bool, bool, bool)]) {
     for (param, (is_self, is_ref, is_mut)) in func.params.iter_mut().zip(receivers) {
+        param.is_receiver = *is_self;
         if !*is_self {
             continue;
         }

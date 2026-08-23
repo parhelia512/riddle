@@ -76,6 +76,56 @@ fn project_index_contains_unopened_module_symbols_and_files() {
 }
 
 #[test]
+fn workspace_index_preserves_nested_members_and_public_visibility() {
+    let root = temp_root("workspace-index-members");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"app\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.rid"),
+        r#"
+        pub mod api {
+            pub struct Widget { pub value: i32, hidden: i32 }
+            pub enum Choice { Ready, Waiting }
+            pub trait Read { pub fun read(&self) -> i32; }
+            impl Widget {
+                pub fun read(&self) -> i32 { self.value }
+            }
+        }
+        fun private_helper() {}
+        "#,
+    )
+    .unwrap();
+
+    let index = project_index_for_root(
+        &root,
+        &HashMap::new(),
+        CompileOptions { use_std: false },
+        &AnalysisSessions::default(),
+    )
+    .unwrap()
+    .unwrap();
+
+    let value = workspace_symbols_for_index(&index, "value");
+    assert_eq!(value.len(), 1);
+    assert_eq!(value[0].container_name.as_deref(), Some("api::Widget"));
+    let ready = workspace_symbols_for_index(&index, "ready");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].container_name.as_deref(), Some("api::Choice"));
+    let reads = workspace_symbols_for_index(&index, "read");
+    assert!(reads.iter().any(|symbol| {
+        symbol.container_name.as_deref() == Some("api::Read")
+            && symbol.kind == lsp_types::SymbolKind::FUNCTION
+    }));
+    assert!(workspace_symbols_for_index(&index, "hidden").is_empty());
+    assert!(workspace_symbols_for_index(&index, "private_helper").is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn stale_project_index_generation_is_not_installed() {
     let workspace = WorkspaceState::default();
     let project = PathBuf::from("project");

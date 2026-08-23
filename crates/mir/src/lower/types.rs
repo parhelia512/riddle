@@ -1,7 +1,7 @@
 use super::{
-    FloatTy, FnPtrType, HashMap, IntTy, LowerCtx, ResolvedName, StructType, Type,
-    closure_value_type, is_self_associated_path, mono_name_from_parts, mono_type_name,
-    mono_type_symbol, tc_const_arg_to_usize,
+    FloatTy, FnPtrType, HashMap, HashSet, IntTy, LowerCtx, ResolvedName, StructType, Type,
+    closure_value_type, is_dyn_object_safe_method, is_self_associated_path, mono_name_from_parts,
+    mono_type_name, mono_type_symbol, tc_const_arg_to_usize,
 };
 
 impl LowerCtx<'_> {
@@ -39,13 +39,19 @@ impl LowerCtx<'_> {
             | TcType::Unknown
             | TcType::Error => Type::Unit,
             TcType::Never => Type::Never,
-            TcType::Ref(inner, mutable) => {
-                if matches!(inner.as_ref(), TcType::DynTrait { .. }) {
-                    self.convert_type(inner)
-                } else {
-                    Type::Ref(Box::new(self.convert_type(inner)), *mutable)
+            TcType::Ref(inner, mutable) => match inner.as_ref() {
+                TcType::DynTrait {
+                    trait_id,
+                    args,
+                    assoc_bindings,
                 }
-            }
+                | TcType::OwnedDynTrait {
+                    trait_id,
+                    args,
+                    assoc_bindings,
+                } => self.dyn_trait_type(*trait_id, args, assoc_bindings, false),
+                _ => Type::Ref(Box::new(self.convert_type(inner)), *mutable),
+            },
             TcType::Ptr { inner, .. } => Type::Ptr(Box::new(self.convert_type(inner))),
             TcType::Tuple(elems) => {
                 Type::Tuple(elems.iter().map(|e| self.convert_type(e)).collect())
@@ -80,35 +86,70 @@ impl LowerCtx<'_> {
                 })
             }
             TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
-            TcType::DynTrait { trait_id, args } => self.dyn_trait_type(*trait_id, args),
+            TcType::DynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => self.dyn_trait_type(*trait_id, args, assoc_bindings, false),
+            TcType::OwnedDynTrait {
+                trait_id,
+                args,
+                assoc_bindings,
+            } => self.dyn_trait_type(*trait_id, args, assoc_bindings, true),
         }
     }
 
-    fn dyn_trait_type(
+    pub(super) fn dyn_trait_type(
         &self,
         trait_id: hir::item_tree::TraitId,
         args: &[type_checker::Type],
+        assoc_bindings: &[(String, type_checker::Type)],
+        owned: bool,
     ) -> Type {
-        let trait_data = &self.hir.item_tree.traits[trait_id];
         let mir_args = args
             .iter()
             .map(|arg| self.convert_type(arg))
             .collect::<Vec<_>>();
-        let trait_subst = trait_data
+        let mir_assoc_bindings = assoc_bindings
+            .iter()
+            .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
+            .collect::<Vec<_>>();
+        self.dyn_trait_type_from_mir_args(trait_id, &mir_args, &mir_assoc_bindings, owned)
+    }
+
+    pub(super) fn convert_dyn_assoc_bindings(
+        &self,
+        assoc_bindings: &[(String, type_checker::Type)],
+    ) -> Vec<(String, Type)> {
+        assoc_bindings
+            .iter()
+            .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
+            .collect()
+    }
+
+    pub(super) fn dyn_trait_type_from_mir_args(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        mir_args: &[Type],
+        assoc_bindings: &[(String, Type)],
+        owned: bool,
+    ) -> Type {
+        let trait_data = &self.hir.item_tree.traits[trait_id];
+        let mut trait_subst = trait_data
             .generics
             .iter()
-            .map(|name| name.0.as_str())
-            .zip(mir_args.iter())
+            .map(|name| name.0.clone())
+            .zip(mir_args.iter().cloned())
             .collect::<HashMap<_, _>>();
+        for (name, ty) in assoc_bindings {
+            trait_subst.insert(format!("Self::{name}"), ty.clone());
+        }
         let mut fields = vec![("data".into(), Type::Ptr(Box::new(Type::Unit)))];
-        let mut methods = trait_data.methods.clone();
-        methods.extend(
-            trait_data
-                .default_methods
-                .iter()
-                .map(|fid| self.hir.item_tree.functions[*fid].clone()),
-        );
-        for method in methods {
+        let methods = self.dyn_trait_methods(trait_id, &trait_subst);
+        for (method_trait_id, method, method_subst) in &methods {
+            if !is_dyn_object_safe_method(method) {
+                continue;
+            }
             let Some(receiver) = method.params.first() else {
                 continue;
             };
@@ -116,28 +157,208 @@ impl LowerCtx<'_> {
                 continue;
             }
             let mut params = vec![Type::Ptr(Box::new(Type::Unit))];
+            let method_subst = method_subst
+                .iter()
+                .map(|(name, ty)| (name.as_str(), ty))
+                .collect::<HashMap<_, _>>();
             params.extend(method.params.iter().skip(1).map(|param| {
-                self.convert_hir_type_with_substs(&param.ty, &trait_subst, &HashMap::new())
+                self.convert_hir_type_with_substs(&param.ty, &method_subst, &HashMap::new())
             }));
             let ret = method.ret_type.as_ref().map_or(Type::Unit, |ty| {
-                self.convert_hir_type_with_substs(ty, &trait_subst, &HashMap::new())
+                self.convert_hir_type_with_substs(ty, &method_subst, &HashMap::new())
             });
             fields.push((
-                format!("method_{}", method.name.0),
+                self.dyn_trait_method_field_name(&methods, *method_trait_id, &method.name.0),
                 Type::FnPtr(FnPtrType {
                     params,
                     ret: Box::new(ret),
                 }),
             ));
         }
+        if owned {
+            fields.push(("drop".into(), dyn_trait_drop_function_type()));
+        }
         let id = trait_id.into_raw().into_u32();
-        let symbol_args = mir_args.iter().map(mono_type_symbol).collect::<Vec<_>>();
+        let symbol_args = mir_args
+            .iter()
+            .map(mono_type_symbol)
+            .chain(
+                assoc_bindings
+                    .iter()
+                    .map(|(name, ty)| format!("{name}={}", mono_type_symbol(ty))),
+            )
+            .collect::<Vec<_>>();
         let name = mono_name_from_parts(&trait_data.name.0, &symbol_args);
+        let prefix = if owned { "owned_dyn" } else { "dyn" };
         Type::Struct(StructType {
-            name: format!("dyn_{name}"),
-            symbol: format!("dyn_trait::{id}::{name}"),
+            name: format!("{prefix}_{name}"),
+            symbol: format!("{prefix}_trait::{id}::{name}"),
             fields,
         })
+    }
+
+    pub(super) fn dyn_trait_hir_args_with_substs(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        ty: &hir::item_tree::HirTypeRef,
+        subst: &HashMap<&str, &Type>,
+        const_subst: &HashMap<&str, usize>,
+    ) -> Vec<Type> {
+        let explicit = match ty {
+            hir::item_tree::HirTypeRef::Named(path) => path.type_args.as_slice(),
+            _ => &[],
+        };
+        let trait_data = &self.hir.item_tree.traits[trait_id];
+        let mut values = subst
+            .iter()
+            .map(|(name, ty)| ((*name).to_string(), (*ty).clone()))
+            .collect::<HashMap<_, _>>();
+        trait_data
+            .generics
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let arg = explicit.get(index).or_else(|| {
+                    trait_data
+                        .generic_defaults
+                        .get(index)
+                        .and_then(Option::as_ref)
+                });
+                let ty = arg.map_or(Type::Unit, |arg| {
+                    let refs = values
+                        .iter()
+                        .map(|(name, ty)| (name.as_str(), ty))
+                        .collect::<HashMap<_, _>>();
+                    self.convert_hir_type_with_substs(arg, &refs, const_subst)
+                });
+                values.insert(name.0.clone(), ty.clone());
+                ty
+            })
+            .collect()
+    }
+
+    fn dyn_trait_hir_args(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        ty: &hir::item_tree::HirTypeRef,
+    ) -> Vec<Type> {
+        self.dyn_trait_hir_args_with_substs(trait_id, ty, &HashMap::new(), &HashMap::new())
+    }
+
+    pub(super) fn dyn_trait_methods(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        root_subst: &HashMap<String, Type>,
+    ) -> Vec<(
+        hir::item_tree::TraitId,
+        hir::item_tree::HirFunction,
+        HashMap<String, Type>,
+    )> {
+        fn collect(
+            ctx: &LowerCtx<'_>,
+            trait_id: hir::item_tree::TraitId,
+            subst: HashMap<String, Type>,
+            visited: &mut HashSet<hir::item_tree::TraitId>,
+            methods: &mut Vec<(
+                hir::item_tree::TraitId,
+                hir::item_tree::HirFunction,
+                HashMap<String, Type>,
+            )>,
+        ) {
+            if !visited.insert(trait_id) {
+                return;
+            }
+            let trait_data = &ctx.hir.item_tree.traits[trait_id];
+            for method in &trait_data.methods {
+                if !methods.iter().any(|(existing_trait, existing, _)| {
+                    *existing_trait == trait_id && existing.name == method.name
+                }) {
+                    methods.push((trait_id, method.clone(), subst.clone()));
+                }
+            }
+            for fid in &trait_data.default_methods {
+                let method = ctx.hir.item_tree.functions[*fid].clone();
+                if !methods.iter().any(|(existing_trait, existing, _)| {
+                    *existing_trait == trait_id && existing.name == method.name
+                }) {
+                    methods.push((trait_id, method, subst.clone()));
+                }
+            }
+            for bound in &trait_data.supertraits {
+                if let Some(supertrait_id) = ctx.resolve_trait_ref(&bound.trait_ty) {
+                    let supertrait = &ctx.hir.item_tree.traits[supertrait_id];
+                    let explicit = match &bound.trait_ty {
+                        hir::item_tree::HirTypeRef::Named(path) => path.type_args.as_slice(),
+                        _ => &[],
+                    };
+                    let mut values = subst.clone();
+                    let mut next_subst: HashMap<String, Type> = supertrait
+                        .generics
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| {
+                            let arg = explicit.get(index).or_else(|| {
+                                supertrait
+                                    .generic_defaults
+                                    .get(index)
+                                    .and_then(Option::as_ref)
+                            });
+                            let ty = arg.map_or(Type::Unit, |arg| {
+                                let refs = values
+                                    .iter()
+                                    .map(|(name, ty)| (name.as_str(), ty))
+                                    .collect::<HashMap<_, _>>();
+                                ctx.convert_hir_type_with_substs(arg, &refs, &HashMap::new())
+                            });
+                            values.insert(name.0.clone(), ty.clone());
+                            (name.0.clone(), ty)
+                        })
+                        .collect();
+                    for (name, ty) in &values {
+                        if name.starts_with("Self::") {
+                            next_subst.insert(name.clone(), ty.clone());
+                        }
+                    }
+                    collect(ctx, supertrait_id, next_subst, visited, methods);
+                }
+            }
+        }
+
+        let mut methods = Vec::new();
+        collect(
+            self,
+            trait_id,
+            root_subst.clone(),
+            &mut HashSet::new(),
+            &mut methods,
+        );
+        methods
+    }
+
+    pub(super) fn dyn_trait_method_field_name(
+        &self,
+        methods: &[(
+            hir::item_tree::TraitId,
+            hir::item_tree::HirFunction,
+            HashMap<String, Type>,
+        )],
+        method_trait_id: hir::item_tree::TraitId,
+        method_name: &str,
+    ) -> String {
+        let duplicate = methods
+            .iter()
+            .filter(|(_, method, _)| method.name.0 == method_name)
+            .count()
+            > 1;
+        if duplicate {
+            format!(
+                "method_{}_{}",
+                method_trait_id.into_raw().into_u32(),
+                method_name
+            )
+        } else {
+            format!("method_{method_name}")
+        }
     }
 
     pub(super) fn function_item_signature(
@@ -179,6 +400,10 @@ impl LowerCtx<'_> {
     }
 
     pub(super) fn convert_hir_type(&self, t: &hir::item_tree::HirTypeRef) -> Type {
+        self.convert_hir_type_with_mode(t, true)
+    }
+
+    fn convert_hir_type_with_mode(&self, t: &hir::item_tree::HirTypeRef, owned_dyn: bool) -> Type {
         match t {
             hir::item_tree::HirTypeRef::Never => Type::Never,
             hir::item_tree::HirTypeRef::Named(path) => {
@@ -186,7 +411,7 @@ impl LowerCtx<'_> {
                 if let Some(ResolvedName::TypeAlias(alias)) = resolved
                     && let Some(ty) = &self.hir.item_tree.type_aliases[*alias].ty
                 {
-                    return self.convert_hir_type(ty);
+                    return self.convert_hir_type_with_mode(ty, owned_dyn);
                 }
                 if let Some(ty) = self.convert_self_associated_type(path) {
                     return ty;
@@ -247,24 +472,28 @@ impl LowerCtx<'_> {
                 }
             }
             hir::item_tree::HirTypeRef::Ref(inner, mutable) => {
-                if matches!(inner.as_ref(), hir::item_tree::HirTypeRef::DynTrait { .. }) {
-                    self.convert_hir_type(inner)
+                let inner_ty = self.convert_hir_type_with_mode(inner, false);
+                if self.hir_type_is_dyn_trait(inner) {
+                    inner_ty
                 } else {
-                    Type::Ref(Box::new(self.convert_hir_type(inner)), *mutable)
+                    Type::Ref(Box::new(inner_ty), *mutable)
                 }
             }
             hir::item_tree::HirTypeRef::Ptr { inner, .. } => {
-                Type::Ptr(Box::new(self.convert_hir_type(inner)))
+                Type::Ptr(Box::new(self.convert_hir_type_with_mode(inner, false)))
             }
             hir::item_tree::HirTypeRef::Tuple(elems) if elems.is_empty() => Type::Unit,
-            hir::item_tree::HirTypeRef::Tuple(elems) => {
-                Type::Tuple(elems.iter().map(|e| self.convert_hir_type(e)).collect())
-            }
+            hir::item_tree::HirTypeRef::Tuple(elems) => Type::Tuple(
+                elems
+                    .iter()
+                    .map(|e| self.convert_hir_type_with_mode(e, true))
+                    .collect(),
+            ),
             hir::item_tree::HirTypeRef::Slice(inner) => {
-                Type::Slice(Box::new(self.convert_hir_type(inner)))
+                Type::Slice(Box::new(self.convert_hir_type_with_mode(inner, true)))
             }
             hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
-                Box::new(self.convert_hir_type(inner)),
+                Box::new(self.convert_hir_type_with_mode(inner, true)),
                 self.hir_const_arg_to_usize(len, &HashMap::new()),
             ),
             hir::item_tree::HirTypeRef::Const(_)
@@ -283,16 +512,87 @@ impl LowerCtx<'_> {
                         params: signature
                             .params
                             .iter()
-                            .map(|param| self.convert_hir_type(param))
+                            .map(|param| self.convert_hir_type_with_mode(param, true))
                             .collect(),
-                        ret: Box::new(self.convert_hir_type(&signature.ret)),
+                        ret: Box::new(self.convert_hir_type_with_mode(&signature.ret, true)),
                     })
                 })
             }
-            hir::item_tree::HirTypeRef::DynTrait { trait_ty, .. } => self
-                .resolve_trait_ref(trait_ty)
-                .map_or(Type::Unit, |trait_id| self.dyn_trait_type(trait_id, &[])),
+            hir::item_tree::HirTypeRef::DynTrait {
+                trait_ty,
+                callable,
+                assoc_constraints,
+                ..
+            } => callable.as_ref().map_or_else(
+                || {
+                    self.resolve_trait_ref(trait_ty)
+                        .map_or(Type::Unit, |trait_id| {
+                            let args = self.dyn_trait_hir_args(trait_id, trait_ty);
+                            let assoc_bindings = assoc_constraints
+                                .iter()
+                                .map(|constraint| {
+                                    (
+                                        constraint.name.0.clone(),
+                                        self.convert_hir_type_with_mode(&constraint.ty, true),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            self.dyn_trait_type_from_mir_args(
+                                trait_id,
+                                &args,
+                                &assoc_bindings,
+                                owned_dyn,
+                            )
+                        })
+                },
+                |signature| {
+                    closure_value_type(FnPtrType {
+                        params: signature
+                            .params
+                            .iter()
+                            .map(|param| self.convert_hir_type_with_mode(param, true))
+                            .collect(),
+                        ret: Box::new(self.convert_hir_type_with_mode(&signature.ret, true)),
+                    })
+                },
+            ),
         }
+    }
+
+    pub(super) fn hir_type_is_dyn_trait(&self, ty: &hir::item_tree::HirTypeRef) -> bool {
+        fn visit(
+            ctx: &LowerCtx<'_>,
+            ty: &hir::item_tree::HirTypeRef,
+            visited: &mut HashSet<hir::item_tree::TypeAliasId>,
+        ) -> bool {
+            let hir::item_tree::HirTypeRef::Named(path) = ty else {
+                return matches!(
+                    ty,
+                    hir::item_tree::HirTypeRef::DynTrait { callable: None, .. }
+                );
+            };
+            let alias = ctx
+                .hir
+                .type_resolutions
+                .get(&path.range)
+                .and_then(|resolved| match resolved {
+                    ResolvedName::TypeAlias(alias) => Some(*alias),
+                    _ => None,
+                })
+                .or_else(|| ctx.find_associated_type_alias(path));
+            let Some(alias) = alias else {
+                return false;
+            };
+            if !visited.insert(alias) {
+                return false;
+            }
+            ctx.hir.item_tree.type_aliases[alias]
+                .ty
+                .as_ref()
+                .is_some_and(|target| visit(ctx, target, visited))
+        }
+
+        visit(self, ty, &mut HashSet::new())
     }
 
     pub(super) fn find_associated_type_alias(
@@ -560,4 +860,11 @@ impl LowerCtx<'_> {
             fields,
         })
     }
+}
+
+pub(super) fn dyn_trait_drop_function_type() -> Type {
+    Type::FnPtr(FnPtrType {
+        params: vec![Type::Ptr(Box::new(Type::Unit))],
+        ret: Box::new(Type::Unit),
+    })
 }

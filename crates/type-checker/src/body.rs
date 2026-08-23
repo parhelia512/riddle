@@ -7,9 +7,9 @@ use hir::{
         PatternBindingId, ResolvedName, Stmt, StmtId, UnaryOp,
     },
     item_tree::{
-        FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound, HirStructField,
-        HirTypeRef, HirVariantKind, ItemTree, ModuleId, StructId, TopLevelItem, TraitId,
-        Visibility,
+        DynMethodSafety, FunctionId, HirAssocTypeConstraint, HirFunction, HirGenericBound,
+        HirStructField, HirTypeRef, HirVariantKind, ItemTree, ModuleId, StructId, TopLevelItem,
+        TraitId, Visibility, dyn_method_safety,
     },
     place::Projection,
 };
@@ -303,6 +303,21 @@ fn type_has_param_where(ty: &Type, predicate: &impl Fn(&str) -> bool) -> bool {
         Type::Struct(_, args) | Type::Enum(_, args) | Type::FunctionItem { args, .. } => {
             args.iter().any(|arg| type_has_param_where(arg, predicate))
         }
+        Type::DynTrait {
+            args,
+            assoc_bindings,
+            ..
+        }
+        | Type::OwnedDynTrait {
+            args,
+            assoc_bindings,
+            ..
+        } => {
+            args.iter().any(|arg| type_has_param_where(arg, predicate))
+                || assoc_bindings
+                    .iter()
+                    .any(|(_, ty)| type_has_param_where(ty, predicate))
+        }
         Type::CallableConstraint(signature)
         | Type::Closure { signature, .. }
         | Type::OpaqueCallable { signature, .. } => {
@@ -345,6 +360,21 @@ fn type_has_unresolved_inference(ty: &Type) -> bool {
         }
         Type::Struct(_, args) | Type::Enum(_, args) | Type::FunctionItem { args, .. } => {
             args.iter().any(type_has_unresolved_inference)
+        }
+        Type::DynTrait {
+            args,
+            assoc_bindings,
+            ..
+        }
+        | Type::OwnedDynTrait {
+            args,
+            assoc_bindings,
+            ..
+        } => {
+            args.iter().any(type_has_unresolved_inference)
+                || assoc_bindings
+                    .iter()
+                    .any(|(_, ty)| type_has_unresolved_inference(ty))
         }
         Type::CallableConstraint(signature)
         | Type::Closure { signature, .. }

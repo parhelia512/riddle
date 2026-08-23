@@ -31,11 +31,16 @@ pub fn collect_subst<S: BuildHasher>(
         Type::DynTrait {
             trait_id: expected_id,
             args: expected_args,
+            assoc_bindings: expected_assoc,
         } => match actual {
             Type::DynTrait {
                 trait_id: actual_id,
                 args: actual_args,
-            } if expected_id == actual_id => collect_args_subst(expected_args, actual_args, subst),
+                assoc_bindings: actual_assoc,
+            } if expected_id == actual_id => {
+                collect_args_subst(expected_args, actual_args, subst)
+                    && collect_assoc_subst(expected_assoc, actual_assoc, subst)
+            }
             _ => false,
         },
         Type::Ptr {
@@ -55,6 +60,21 @@ pub fn collect_subst<S: BuildHasher>(
         Type::Slice(expected_inner) => match actual {
             Type::Slice(actual_inner) | Type::Array(actual_inner, _) => {
                 collect_subst(expected_inner, actual_inner, subst)
+            }
+            _ => false,
+        },
+        Type::OwnedDynTrait {
+            trait_id: expected_id,
+            args: expected_args,
+            assoc_bindings: expected_assoc,
+        } => match actual {
+            Type::OwnedDynTrait {
+                trait_id: actual_id,
+                args: actual_args,
+                assoc_bindings: actual_assoc,
+            } if expected_id == actual_id => {
+                collect_args_subst(expected_args, actual_args, subst)
+                    && collect_assoc_subst(expected_assoc, actual_assoc, subst)
             }
             _ => false,
         },
@@ -128,6 +148,20 @@ fn collect_args_subst<S: BuildHasher>(
             .all(|(expected, actual)| collect_subst(expected, actual, subst))
 }
 
+fn collect_assoc_subst<S: BuildHasher>(
+    expected: &[(String, Type)],
+    actual: &[(String, Type)],
+    subst: &mut HashMap<String, Type, S>,
+) -> bool {
+    expected.len() == actual.len()
+        && expected.iter().all(|(name, expected)| {
+            actual
+                .iter()
+                .find(|(actual_name, _)| actual_name == name)
+                .is_some_and(|(_, actual)| collect_subst(expected, actual, subst))
+        })
+}
+
 fn collect_signature_subst<S: BuildHasher>(
     expected: &CallableSignature,
     actual: &CallableSignature,
@@ -184,9 +218,29 @@ pub fn substitute_type<S: BuildHasher>(ty: &Type, subst: &HashMap<String, Type, 
         Type::Param(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Const(value) => Type::Const(substitute_const(value, subst)),
         Type::Ref(inner, mutable) => Type::Ref(Box::new(substitute_type(inner, subst)), *mutable),
-        Type::DynTrait { trait_id, args } => Type::DynTrait {
+        Type::DynTrait {
+            trait_id,
+            args,
+            assoc_bindings,
+        } => Type::DynTrait {
             trait_id: *trait_id,
             args: args.iter().map(|ty| substitute_type(ty, subst)).collect(),
+            assoc_bindings: assoc_bindings
+                .iter()
+                .map(|(name, ty)| (name.clone(), substitute_type(ty, subst)))
+                .collect(),
+        },
+        Type::OwnedDynTrait {
+            trait_id,
+            args,
+            assoc_bindings,
+        } => Type::OwnedDynTrait {
+            trait_id: *trait_id,
+            args: args.iter().map(|ty| substitute_type(ty, subst)).collect(),
+            assoc_bindings: assoc_bindings
+                .iter()
+                .map(|(name, ty)| (name.clone(), substitute_type(ty, subst)))
+                .collect(),
         },
         Type::Ptr { mutable, inner } => Type::Ptr {
             mutable: *mutable,

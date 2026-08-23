@@ -43,6 +43,377 @@ fn accepts_dyn_trait_reference_and_method_call() {
 }
 
 #[test]
+fn accepts_dyn_trait_alias_in_owned_and_borrowed_positions() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        type SpeakObject = dyn Speak;
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        fun borrowed(value: &SpeakObject) -> i32 { value.speak() }
+        fun owned(value: SpeakObject) -> i32 { value.speak() }
+        fun make() -> SpeakObject { Speaker { value: 7 } }
+        fun main() -> i32 {
+            let speaker = Speaker { value: 7 };
+            borrowed(&speaker) + owned(make())
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_owned_dyn_trait_value_and_method_call() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        fun call(value: dyn Speak) -> i32 { value.speak() }
+        fun make() -> dyn Speak { Speaker { value: 7 } }
+        fun main() -> i32 { call(make()) }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_dyn_callable_value_and_reference() {
+    let result = check(
+        r#"
+        fun increment(value: i32) -> i32 { value + 1 }
+        fun apply(value: dyn Fn(i32) -> i32, input: i32) -> i32 { value(input) }
+        fun apply_ref(value: &dyn Fn(i32) -> i32, input: i32) -> i32 { value(input) }
+        fun main() -> i32 {
+            let callback: dyn Fn(i32) -> i32 = increment;
+            let borrowed = &callback;
+            apply(callback, 41) + apply_ref(borrowed, 41)
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_dyn_fn_mut_and_fn_once_boundaries() {
+    let result = check(
+        r#"
+        fun apply_mut(value: &mut dyn FnMut(i32) -> i32, input: i32) -> i32 { value(input) }
+        fun apply_once(value: dyn FnOnce() -> i32) -> i32 { value() }
+        fun main() -> i32 {
+            let mut total = 0;
+            let mut callback: dyn FnMut(i32) -> i32 = fun(value: i32) {
+                total += value;
+                total
+            };
+            let first = apply_mut(&mut callback, 2);
+            let once: dyn FnOnce() -> i32 = fun() { first };
+            apply_once(once)
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn rejects_immutable_dyn_fn_mut_and_dyn_fn_once_references() {
+    let result = check(
+        r#"
+        fun call_mut(value: &dyn FnMut() -> i32) -> i32 { value() }
+        fun call_once(value: &mut dyn FnOnce() -> i32) -> i32 { value() }
+        "#,
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0031" && diagnostic.message.contains("immutable reference")
+        }),
+        "expected immutable FnMut reference diagnostic: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0035" && diagnostic.message.contains("FnOnce")
+        }),
+        "expected FnOnce reference diagnostic: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn accepts_borrowing_owned_dyn_trait_value() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        fun take(value: &dyn Speak) -> i32 { value.speak() }
+        fun main() -> i32 {
+            let speaker: dyn Speak = Speaker { value: 2 };
+            let borrowed = &speaker;
+            take(&speaker) + borrowed.speak()
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_dyn_trait_upcast() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        trait Loud: Speak { fun volume(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        impl Loud for Speaker {
+            fun volume(&self) -> i32 { self.value + 1 }
+        }
+        fun take(value: &dyn Speak) -> i32 { value.speak() }
+        fun main() -> i32 {
+            let loud: dyn Loud = Speaker { value: 2 };
+            let parent: dyn Speak = loud;
+            let borrowed: &dyn Speak = &parent;
+            take(borrowed)
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_generic_owned_dyn_trait_factory() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        fun wrap<T>(value: T) -> dyn Speak
+        where T: Speak
+        { value }
+        fun main() -> i32 { wrap(Speaker { value: 2 }).speak() }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_generic_dyn_trait_factory_with_associated_binding() {
+    let result = check(
+        r#"
+        trait Producer {
+            type Item;
+            fun get(&self) -> Self::Item;
+        }
+        struct Number { value: i32 }
+        impl Producer for Number {
+            type Item = i32;
+            fun get(&self) -> i32 { self.value }
+        }
+        fun wrap<T>(value: T) -> dyn Producer<Item = i32>
+        where T: Producer<Item = i32>
+        { value }
+        fun main() -> i32 { wrap(Number { value: 2 }).get() }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_owned_dyn_trait_array_literal() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        fun main() -> i32 {
+            let values: [dyn Speak; 2] = [
+                Speaker { value: 1 },
+                Speaker { value: 2 },
+            ];
+            values[0].speak() + values[1].speak()
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn rejects_ambiguous_dyn_trait_method() {
+    let result = check(
+        r#"
+        trait Left { fun name(&self) -> i32; }
+        trait Right { fun name(&self) -> i32; }
+        trait Both: Left + Right {}
+        struct Speaker { value: i32 }
+        impl Left for Speaker {
+            fun name(&self) -> i32 { self.value }
+        }
+        impl Right for Speaker {
+            fun name(&self) -> i32 { self.value + 1 }
+        }
+        impl Both for Speaker {}
+        fun call(value: &dyn Both) -> i32 { value.name() }
+        "#,
+    );
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|message| message.contains("ambiguous method")),
+        "{msgs:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|message| message.contains("unknown method `name`")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn reports_non_object_safe_dyn_trait_method() {
+    let result = check(
+        r#"
+        trait Duplicate { fun duplicate(self) -> Self; }
+        struct Speaker { value: i32 }
+        impl Duplicate for Speaker {
+            fun duplicate(self) -> Self { self }
+        }
+        fun call(value: &dyn Duplicate) -> &dyn Duplicate { value.duplicate() }
+        "#,
+    );
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|message| message.contains("not object-safe")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn accepts_dyn_trait_associated_type_binding_and_projection() {
+    let result = check(
+        r#"
+        trait Producer {
+            type Item;
+            fun get(&self) -> Self::Item;
+        }
+        struct Number { value: i32 }
+        impl Producer for Number {
+            type Item = i32;
+            fun get(&self) -> i32 { self.value }
+        }
+        fun read(value: &dyn Producer<Item = i32>) -> i32 { value.get() }
+        fun main() -> i32 {
+            let number = Number { value: 7 };
+            read(&number)
+        }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn reports_missing_dyn_trait_associated_type_binding() {
+    let result = check(
+        r#"
+        trait Producer {
+            type Item;
+            fun get(&self) -> Self::Item;
+        }
+        fun read(value: &dyn Producer) -> i32 { value.get() }
+        "#,
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0034"
+                && diagnostic
+                    .message
+                    .contains("requires associated type `Item`")
+        }),
+        "expected a missing dyn associated type diagnostic, got {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn rejects_dyn_trait_associated_type_mismatch() {
+    let result = check(
+        r#"
+        trait Producer {
+            type Item;
+            fun get(&self) -> Self::Item;
+        }
+        struct Number { value: i32 }
+        impl Producer for Number {
+            type Item = i32;
+            fun get(&self) -> i32 { self.value }
+        }
+        fun read(value: &dyn Producer<Item = bool>) -> bool { value.get() }
+        fun main() -> bool {
+            let number = Number { value: 7 };
+            read(&number)
+        }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0001"),
+        "expected an associated type coercion diagnostic, got {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn accepts_owned_generic_dyn_trait_value_and_method_call() {
+    let result = check(
+        r#"
+        trait Convert<T> { fun convert(&self) -> T; }
+        struct Value { value: i32 }
+        impl Convert<i32> for Value {
+            fun convert(&self) -> i32 { self.value }
+        }
+        fun call(value: dyn Convert<i32>) -> i32 { value.convert() }
+        fun make() -> dyn Convert<i32> { Value { value: 7 } }
+        fun main() -> i32 { call(make()) }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn rejects_owned_dyn_trait_coercion_without_an_impl() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        struct Other { value: i32 }
+        fun make() -> dyn Speak { Other { value: 7 } }
+        "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0001"),
+        "expected an invalid owned dyn trait coercion diagnostic, got {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn accepts_generic_dyn_trait_reference_and_method_call() {
     let result = check(
         r#"
@@ -56,6 +427,44 @@ fn accepts_generic_dyn_trait_reference_and_method_call() {
             let value = Value { value: 7 };
             call(&value)
         }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_supertrait_methods_on_dyn_trait_reference() {
+    let result = check(
+        r#"
+        trait Speak { fun speak(&self) -> i32; }
+        trait Loud: Speak { fun volume(&self) -> i32; }
+        struct Speaker { value: i32 }
+        impl Speak for Speaker {
+            fun speak(&self) -> i32 { self.value }
+        }
+        impl Loud for Speaker {
+            fun volume(&self) -> i32 { self.value + 1 }
+        }
+        fun call(value: &dyn Loud) -> i32 { value.speak() + value.volume() }
+        "#,
+    );
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn accepts_generic_supertrait_methods_on_dyn_trait_reference() {
+    let result = check(
+        r#"
+        trait Read<T> { fun read(&self) -> T; }
+        trait Loud<T>: Read<T> { fun volume(&self) -> T; }
+        struct Speaker { value: i32 }
+        impl Read<i32> for Speaker {
+            fun read(&self) -> i32 { self.value }
+        }
+        impl Loud<i32> for Speaker {
+            fun volume(&self) -> i32 { self.value + 1 }
+        }
+        fun call(value: &dyn Loud<i32>) -> i32 { value.read() + value.volume() }
         "#,
     );
     assert_eq!(result.diagnostics, vec![]);

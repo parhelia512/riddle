@@ -245,7 +245,11 @@ const fn type_symbol_kind(kind: IndexedSymbolKind) -> Option<SymbolKind> {
         IndexedSymbolKind::Enum => Some(SymbolKind::ENUM),
         IndexedSymbolKind::Trait => Some(SymbolKind::INTERFACE),
         IndexedSymbolKind::TypeAlias => Some(SymbolKind::TYPE_PARAMETER),
-        IndexedSymbolKind::Function | IndexedSymbolKind::Const | IndexedSymbolKind::Module => None,
+        IndexedSymbolKind::Function
+        | IndexedSymbolKind::Field
+        | IndexedSymbolKind::EnumMember
+        | IndexedSymbolKind::Const
+        | IndexedSymbolKind::Module => None,
     }
 }
 

@@ -1610,14 +1610,12 @@ impl Analyzer<'_> {
         }
 
         let inputs = args.to_vec();
-        let modes = match self.type_result.expr_types.get(&(ctx.body_id, callee)) {
-            Some(
-                Type::CallableConstraint(signature)
-                | Type::Closure { signature, .. }
-                | Type::OpaqueCallable { signature, .. },
-            ) => signature.params.iter().map(type_ref_kind).collect(),
-            _ => vec![None; inputs.len()],
-        };
+        let modes = self
+            .type_result
+            .expr_types
+            .get(&(ctx.body_id, callee))
+            .and_then(callable_parameter_modes)
+            .unwrap_or_else(|| vec![None; inputs.len()]);
         (inputs, modes, None)
     }
 
@@ -2935,6 +2933,18 @@ const fn type_ref_kind(ty: &Type) -> Option<BorrowKind> {
     match ty {
         Type::Ref(_, true) => Some(BorrowKind::Mutable),
         Type::Ref(_, false) => Some(BorrowKind::Shared),
+        _ => None,
+    }
+}
+
+fn callable_parameter_modes(ty: &Type) -> Option<Vec<Option<BorrowKind>>> {
+    match ty {
+        Type::Ref(inner, _) => callable_parameter_modes(inner),
+        Type::CallableConstraint(signature)
+        | Type::Closure { signature, .. }
+        | Type::OpaqueCallable { signature, .. } => {
+            Some(signature.params.iter().map(type_ref_kind).collect())
+        }
         _ => None,
     }
 }

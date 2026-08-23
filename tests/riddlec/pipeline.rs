@@ -83,6 +83,52 @@ fn no_gc_allows_forwarding_an_input_reference() {
 }
 
 #[test]
+fn no_gc_rejects_reference_escape_through_dyn_callable() {
+    let result = compile_with_options_and_gc(
+        r#"
+        fun identity(value: &mut i32) -> &mut i32 { value }
+        fun call(callback: &dyn Fn(&mut i32) -> &mut i32, value: &mut i32) -> &mut i32 {
+            callback(value)
+        }
+        fun escaped() -> &mut i32 {
+            let mut value = 1;
+            let callback: dyn Fn(&mut i32) -> &mut i32 = identity;
+            call(&callback, &mut value)
+        }
+        "#,
+        CompileOptions { use_std: false },
+        false,
+    );
+
+    assert!(
+        result
+            .analysis_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0310"),
+        "expected dynamic callable reference escape diagnostic: {:#?}",
+        result.analysis_diagnostics
+    );
+    assert!(result.mir_module.is_none());
+}
+
+#[test]
+fn no_gc_allows_forwarding_reference_through_dyn_callable() {
+    let result = compile_with_options_and_gc(
+        r#"
+        fun identity(value: &mut i32) -> &mut i32 { value }
+        fun call(callback: &dyn Fn(&mut i32) -> &mut i32, value: &mut i32) -> &mut i32 {
+            callback(value)
+        }
+        "#,
+        CompileOptions { use_std: false },
+        false,
+    );
+
+    assert!(result.success(), "{:#?}", result.analysis_diagnostics);
+    assert!(result.mir_module.is_some());
+}
+
+#[test]
 fn no_gc_allows_an_owned_escaping_closure() {
     let result = compile_with_options_and_gc(
         r"

@@ -1,8 +1,8 @@
 use super::{
-    BuiltinOperator, ExprId, HashMap, HashSet, LowerCtx, MirSubst, ResolvedName, Type,
-    builtin_operator, builtin_operator_supports, is_self_output, mono_type_name,
-    operator_params_match, primitive_scalar_name, returns_unit, tc_const_arg_to_usize,
-    trait_operator_contract, type_matches_self,
+    BuiltinOperator, ExprId, FnPtrType, HashMap, HashSet, LowerCtx, MirSubst, ResolvedName, Type,
+    builtin_operator, builtin_operator_supports, closure_value_type, is_self_associated_path,
+    is_self_output, mono_type_name, operator_params_match, primitive_scalar_name, returns_unit,
+    tc_const_arg_to_usize, trait_operator_contract, type_matches_self,
 };
 
 impl LowerCtx<'_> {
@@ -528,6 +528,66 @@ impl LowerCtx<'_> {
         expected == actual
     }
 
+    pub(super) fn impl_trait_args_match_mir(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+        expected_args: &[Type],
+    ) -> bool {
+        let Some(trait_ty) = imp.trait_ty.as_ref() else {
+            return false;
+        };
+        let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+            return false;
+        };
+        let receiver_ty = self.substitute_tc_type(receiver_ty);
+        let receiver_mir = self.convert_type(&receiver_ty);
+        let impl_subst = self.impl_mir_subst(imp, &receiver_ty).unwrap_or_default();
+        let mut values = impl_subst
+            .types
+            .iter()
+            .map(|(name, ty)| (name.clone(), ty.clone()))
+            .collect::<HashMap<_, _>>();
+        values.insert("Self".into(), receiver_mir);
+        let const_subst = impl_subst
+            .consts
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect::<HashMap<_, _>>();
+        let explicit = match trait_ty {
+            hir::item_tree::HirTypeRef::Named(path) => path.type_args.as_slice(),
+            _ => &[],
+        };
+        let trait_data = &self.hir.item_tree.traits[trait_id];
+        let actual_args = trait_data
+            .generics
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let arg = explicit.get(index).or_else(|| {
+                    trait_data
+                        .generic_defaults
+                        .get(index)
+                        .and_then(Option::as_ref)
+                });
+                let ty = arg.map_or(Type::Unit, |arg| {
+                    let refs = values
+                        .iter()
+                        .map(|(name, ty)| (name.as_str(), ty))
+                        .collect::<HashMap<_, _>>();
+                    self.convert_hir_type_with_substs(arg, &refs, &const_subst)
+                });
+                values.insert(name.0.clone(), ty.clone());
+                ty
+            })
+            .collect::<Vec<_>>();
+        actual_args.len() == expected_args.len()
+            && actual_args
+                .iter()
+                .zip(expected_args)
+                .all(|(actual, expected)| actual == expected)
+    }
+
     pub(super) fn resolve_trait_ref(
         &self,
         ty: &hir::item_tree::HirTypeRef,
@@ -801,6 +861,16 @@ impl LowerCtx<'_> {
         subst: &HashMap<&str, &Type>,
         const_subst: &HashMap<&str, usize>,
     ) -> Type {
+        self.convert_hir_type_with_substs_mode(t, subst, const_subst, true)
+    }
+
+    fn convert_hir_type_with_substs_mode(
+        &self,
+        t: &hir::item_tree::HirTypeRef,
+        subst: &HashMap<&str, &Type>,
+        const_subst: &HashMap<&str, usize>,
+        owned_dyn: bool,
+    ) -> Type {
         match t {
             hir::item_tree::HirTypeRef::Never => Type::Never,
             hir::item_tree::HirTypeRef::Named(path) => {
@@ -808,7 +878,18 @@ impl LowerCtx<'_> {
                     self.hir.type_resolutions.get(&path.range)
                     && let Some(ty) = &self.hir.item_tree.type_aliases[*alias].ty
                 {
-                    return self.convert_hir_type_with_substs(ty, subst, const_subst);
+                    return self.convert_hir_type_with_substs_mode(
+                        ty,
+                        subst,
+                        const_subst,
+                        owned_dyn,
+                    );
+                }
+                if is_self_associated_path(path) {
+                    let key = format!("Self::{}", path.segments[1].0);
+                    if let Some((_, ty)) = subst.iter().find(|(name, _)| **name == key) {
+                        return (*ty).clone();
+                    }
                 }
                 if let Some(name) = path.as_single_name().map(|name| name.0.as_str())
                     && let Some(ty) = subst.get(name)
@@ -840,35 +921,96 @@ impl LowerCtx<'_> {
                 self.convert_hir_type(t)
             }
             hir::item_tree::HirTypeRef::Ref(inner, mutable) => {
-                let inner_ty = self.convert_hir_type_with_substs(inner, subst, const_subst);
-                if matches!(inner.as_ref(), hir::item_tree::HirTypeRef::DynTrait { .. }) {
+                let inner_ty =
+                    self.convert_hir_type_with_substs_mode(inner, subst, const_subst, false);
+                if self.hir_type_is_dyn_trait(inner) {
                     inner_ty
                 } else {
                     Type::Ref(Box::new(inner_ty), *mutable)
                 }
             }
             hir::item_tree::HirTypeRef::Ptr { inner, .. } => Type::Ptr(Box::new(
-                self.convert_hir_type_with_substs(inner, subst, const_subst),
+                self.convert_hir_type_with_substs_mode(inner, subst, const_subst, false),
             )),
             hir::item_tree::HirTypeRef::Tuple(elems) if elems.is_empty() => Type::Unit,
             hir::item_tree::HirTypeRef::Tuple(elems) => Type::Tuple(
                 elems
                     .iter()
-                    .map(|elem| self.convert_hir_type_with_substs(elem, subst, const_subst))
+                    .map(|elem| {
+                        self.convert_hir_type_with_substs_mode(elem, subst, const_subst, true)
+                    })
                     .collect(),
             ),
             hir::item_tree::HirTypeRef::Slice(inner) => Type::Slice(Box::new(
-                self.convert_hir_type_with_substs(inner, subst, const_subst),
+                self.convert_hir_type_with_substs_mode(inner, subst, const_subst, true),
             )),
             hir::item_tree::HirTypeRef::Array(inner, len) => Type::Array(
-                Box::new(self.convert_hir_type_with_substs(inner, subst, const_subst)),
+                Box::new(self.convert_hir_type_with_substs_mode(inner, subst, const_subst, true)),
                 self.hir_const_arg_to_usize(len, const_subst),
             ),
             hir::item_tree::HirTypeRef::Const(_)
             | hir::item_tree::HirTypeRef::ImplTrait { .. }
             | hir::item_tree::HirTypeRef::Unknown
             | hir::item_tree::HirTypeRef::Error => Type::Unit,
-            hir::item_tree::HirTypeRef::DynTrait { .. } => self.convert_hir_type(t),
+            hir::item_tree::HirTypeRef::DynTrait {
+                trait_ty,
+                callable,
+                assoc_constraints,
+                ..
+            } => callable.as_ref().map_or_else(
+                || {
+                    self.resolve_trait_ref(trait_ty)
+                        .map_or(Type::Unit, |trait_id| {
+                            let args = self.dyn_trait_hir_args_with_substs(
+                                trait_id,
+                                trait_ty,
+                                subst,
+                                const_subst,
+                            );
+                            let assoc_bindings = assoc_constraints
+                                .iter()
+                                .map(|constraint| {
+                                    (
+                                        constraint.name.0.clone(),
+                                        self.convert_hir_type_with_substs(
+                                            &constraint.ty,
+                                            subst,
+                                            const_subst,
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            self.dyn_trait_type_from_mir_args(
+                                trait_id,
+                                &args,
+                                &assoc_bindings,
+                                owned_dyn,
+                            )
+                        })
+                },
+                |signature| {
+                    closure_value_type(FnPtrType {
+                        params: signature
+                            .params
+                            .iter()
+                            .map(|param| {
+                                self.convert_hir_type_with_substs_mode(
+                                    param,
+                                    subst,
+                                    const_subst,
+                                    true,
+                                )
+                            })
+                            .collect(),
+                        ret: Box::new(self.convert_hir_type_with_substs_mode(
+                            &signature.ret,
+                            subst,
+                            const_subst,
+                            true,
+                        )),
+                    })
+                },
+            ),
         }
     }
 

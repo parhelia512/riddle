@@ -45,6 +45,44 @@ fn logical_operators_lower_to_short_circuit_control_flow() {
 }
 
 #[test]
+fn dyn_trait_vtable_preserves_associated_type_projection() {
+    let (_, type_result, analysis, module) = compile(
+        r#"
+        trait Producer {
+            type Item;
+            fun get(&self) -> Self::Item;
+        }
+        struct Number { value: i32 }
+        impl Producer for Number {
+            type Item = i32;
+            fun get(&self) -> i32 { self.value }
+        }
+        fun read(value: &dyn Producer<Item = i32>) -> i32 { value.get() }
+        fun main() -> i32 {
+            let number = Number { value: 7 };
+            read(&number)
+        }
+        "#,
+    );
+    assert_eq!(type_result.diagnostics, vec![]);
+    assert_eq!(analysis.diagnostics, vec![]);
+    let read = module
+        .functions
+        .values()
+        .find(|function| function.name == "read")
+        .expect("missing read");
+    assert!(
+        read.blocks.iter().any(|(_, block)| {
+            block.insts.iter().any(|inst| {
+                matches!(inst.kind, mir::instr::InstKind::CallIndirect(..))
+                    && inst.ty == mir::types::Type::Int(mir::types::IntTy::I32)
+            })
+        }),
+        "dyn associated-type call must retain its i32 return type: {read:#?}"
+    );
+}
+
+#[test]
 fn discarded_temporaries_drop_moved_and_remaining_fields() {
     let (_, types, moves, module) = compile(
         r#"

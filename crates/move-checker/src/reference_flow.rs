@@ -760,6 +760,7 @@ fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> b
     match ty {
         Type::Ref(..)
         | Type::DynTrait { .. }
+        | Type::OwnedDynTrait { .. }
         | Type::Closure { .. }
         | Type::OpaqueCallable { .. }
         | Type::Param(..)

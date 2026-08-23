@@ -8,6 +8,39 @@ use super::{
 };
 
 impl LowerCtx<'_> {
+    pub(super) fn ensure_dyn_trait_drop_adapter(
+        &mut self,
+        receiver_ty: &type_checker::Type,
+    ) -> String {
+        let receiver_mir_ty = self.convert_type(receiver_ty);
+        let name = format!(
+            "__riddle_dyn_drop_{}",
+            super::mono_type_name(&receiver_mir_ty)
+        );
+        if self
+            .module
+            .functions
+            .values()
+            .any(|function| function.name == name)
+        {
+            return name;
+        }
+
+        let mut function = Function::new(name.clone(), Type::Unit);
+        self.inherit_function_ownership(&mut function);
+        let data = function.add_param("__data".into(), Type::Ptr(Box::new(Type::Unit)));
+        function.blocks[function.entry].start_value = function.next_value;
+        {
+            let mut builder = Builder::new(&mut function);
+            let typed = builder.cast(CastOp::PtrToPtr, data, Type::Ptr(Box::new(receiver_mir_ty)));
+            self.emit_drop_glue(&mut builder, typed, receiver_ty);
+            builder.heap_free(data);
+            builder.set_return(None);
+        }
+        self.module.add_function(function);
+        name
+    }
+
     pub(super) fn ensure_dyn_trait_adapter(
         &mut self,
         trait_id: hir::item_tree::TraitId,
@@ -105,6 +138,7 @@ impl LowerCtx<'_> {
     ) -> Function {
         let body = &self.hir.bodies[body_id];
         self.expr_cache.clear();
+        self.coerced_values.clear();
         self.scope_map.clear();
         self.drop_scopes.clear();
         self.drop_slots.clear();

@@ -8,7 +8,7 @@ use hir::{
         BinaryOp as HirBinOp, Body, BodyId, Expr, ExprId, LiteralPattern, MatchArm, PatId, Pattern,
         PatternBindingId, ResolvedName, Stmt, StmtId, UnaryOp as HirUnOp,
     },
-    item_tree::{HirTypeRef, PathAnchor},
+    item_tree::{DynMethodSafety, HirTypeRef, PathAnchor, dyn_method_safety},
     place::Projection,
 };
 use type_checker::{
@@ -78,6 +78,7 @@ pub fn lower_hir<S: BuildHasher>(
         method_impls,
         default_methods,
         expr_cache: HashMap::new(),
+        coerced_values: HashSet::new(),
         current_body: None,
         current_function: None,
         scope_map: HashMap::new(),
@@ -163,6 +164,8 @@ struct LowerCtx<'a> {
     method_impls: HashMap<hir::item_tree::FunctionId, hir::item_tree::ImplId>,
     default_methods: HashMap<hir::item_tree::FunctionId, hir::item_tree::TraitId>,
     expr_cache: HashMap<ExprId, Value>,
+    /// Values already converted to their expression's target representation.
+    coerced_values: HashSet<(Value, Type)>,
     /// The `BodyId` currently being lowered, used to look up `expr_types`.
     current_body: Option<BodyId>,
     current_function: Option<hir::item_tree::FunctionId>,
@@ -343,6 +346,7 @@ struct LoweringState {
     capture_access: HashMap<CapturePlace, CaptureAccess>,
     current_lambda: Option<ExprId>,
     current_body: Option<BodyId>,
+    coerced_values: HashSet<(Value, Type)>,
 }
 
 impl LowerCtx<'_> {
@@ -360,6 +364,7 @@ impl LowerCtx<'_> {
             capture_access: std::mem::take(&mut self.capture_access),
             current_lambda: self.current_lambda,
             current_body: self.current_body,
+            coerced_values: std::mem::take(&mut self.coerced_values),
         }
     }
 
@@ -376,6 +381,7 @@ impl LowerCtx<'_> {
         self.capture_access = state.capture_access;
         self.current_lambda = state.current_lambda;
         self.current_body = state.current_body;
+        self.coerced_values = state.coerced_values;
     }
 }
 
@@ -1054,4 +1060,9 @@ fn is_byte_str_layout_cast(source: &Type, target: &Type) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Returns whether a trait method can be represented in a borrowed dyn-trait table.
+pub(super) fn is_dyn_object_safe_method(method: &hir::item_tree::HirFunction) -> bool {
+    matches!(dyn_method_safety(method), DynMethodSafety::Dispatchable)
 }

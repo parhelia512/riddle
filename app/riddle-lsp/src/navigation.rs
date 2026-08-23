@@ -13,8 +13,8 @@ use hir::{
     },
 };
 use lsp_types::{
-    DocumentChanges, DocumentHighlight, DocumentHighlightKind, GotoDefinitionResponse, Hover,
-    HoverContents, Location, MarkupContent, MarkupKind, OneOf,
+    DocumentChanges, DocumentHighlight, DocumentHighlightKind, Documentation,
+    GotoDefinitionResponse, Hover, HoverContents, Location, MarkupContent, MarkupKind, OneOf,
     OptionalVersionedTextDocumentIdentifier, ParameterInformation, ParameterLabel, Position,
     PrepareRenameResponse, SignatureHelp, SignatureInformation, TextDocumentEdit, TextEdit,
     WorkspaceEdit,
@@ -603,6 +603,9 @@ fn signature_help_from_analysis(
     let label = symbol.detail;
     label.starts_with("fun ").then_some(())?;
     let parameters = signature_parameters(&label);
+    let documentation = symbol
+        .definition
+        .and_then(|range| documentation_for_symbol(analysis, range));
     let active_parameter =
         active_parameter + u32::from(parameters.first().is_some_and(is_receiver_parameter));
     let active_parameter = u32::try_from(parameters.len())
@@ -612,7 +615,12 @@ fn signature_help_from_analysis(
     Some(SignatureHelp {
         signatures: vec![SignatureInformation {
             label,
-            documentation: None,
+            documentation: documentation.map(|value| {
+                Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                })
+            }),
             parameters: Some(parameters),
             active_parameter: None,
         }],
@@ -771,10 +779,17 @@ fn hover_from_analysis(
     }
     let symbol = symbol_at(&document.text, analysis, position)?;
     let range = LineIndex::new(&document.text).range(&document.text, symbol.origin)?;
+    let documentation = symbol
+        .definition
+        .and_then(|range| documentation_for_symbol(analysis, range));
+    let value = documentation.map_or_else(
+        || format!("```riddle\n{}\n```", symbol.detail),
+        |documentation| format!("```riddle\n{}\n```\n\n{}", symbol.detail, documentation),
+    );
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: format!("```riddle\n{}\n```", symbol.detail),
+            value,
         }),
         range: Some(range),
     })
@@ -980,6 +995,48 @@ fn definition_name_range(hir: &HirFile, definition: &DefRef) -> Option<TextRange
 
 fn range_contains(range: TextRange, inner: TextRange) -> bool {
     range.start() <= inner.start() && inner.end() <= range.end()
+}
+
+fn documentation_for_symbol(analysis: &DocumentAnalysis, target: TextRange) -> Option<String> {
+    let hir = analysis.result.hir.as_ref()?;
+    hir.doc_comments
+        .iter()
+        .filter(|(range, _)| range_contains(*range, target))
+        .min_by_key(|(range, _)| range.len())
+        .map(|(_, comments)| {
+            comments
+                .iter()
+                .map(|comment| normalize_doc_comment(comment))
+                .filter(|comment| !comment.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|documentation| !documentation.is_empty())
+}
+
+fn normalize_doc_comment(comment: &str) -> String {
+    let comment = comment.trim();
+    if let Some(comment) = comment
+        .strip_prefix("///")
+        .or_else(|| comment.strip_prefix("//!"))
+    {
+        return comment.trim_start().to_string();
+    }
+    let Some(comment) = comment
+        .strip_prefix("/**")
+        .or_else(|| comment.strip_prefix("/*!"))
+    else {
+        return comment.to_string();
+    };
+    let comment = comment.strip_suffix("*/").unwrap_or(comment);
+    comment
+        .lines()
+        .map(str::trim)
+        .map(|line| line.strip_prefix('*').map_or(line, str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn implementation_from_analysis(

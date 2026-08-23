@@ -12,6 +12,7 @@ impl LowerCtx<'_> {
         builder: &mut Builder,
         param_values: &[Value],
         body: &Body,
+        expr_id: ExprId,
         scrutinee: ExprId,
         arms: &[MatchArm],
         result_ty: Type,
@@ -102,8 +103,18 @@ impl LowerCtx<'_> {
         if phi_args.is_empty() {
             builder.unit_const()
         } else {
-            let phi = Inst::new(InstKind::Phi(phi_args), result_ty);
-            builder.func.push_inst(merge_block, phi)
+            let phi = builder.func.push_inst(
+                merge_block,
+                Inst::new(InstKind::Phi(phi_args), result_ty.clone()),
+            );
+            if self.current_body.is_some_and(|body_id| {
+                self.type_result
+                    .expr_coercions
+                    .contains_key(&(body_id, expr_id))
+            }) {
+                self.coerced_values.insert((phi, result_ty));
+            }
+            phi
         }
     }
 
@@ -967,6 +978,15 @@ impl LowerCtx<'_> {
         ty: &hir::item_tree::HirTypeRef,
         subst: &HashMap<String, type_checker::Type>,
     ) -> type_checker::Type {
+        self.lower_hir_type_for_pattern_mode(ty, subst, true)
+    }
+
+    fn lower_hir_type_for_pattern_mode(
+        &self,
+        ty: &hir::item_tree::HirTypeRef,
+        subst: &HashMap<String, type_checker::Type>,
+        owned_dyn: bool,
+    ) -> type_checker::Type {
         use hir::item_tree::{HirConstArg, HirTypeRef};
         use type_checker::ConstArg;
 
@@ -974,25 +994,25 @@ impl LowerCtx<'_> {
             HirTypeRef::Never => type_checker::Type::Never,
             HirTypeRef::Named(path) => self.lower_named_hir_type_for_pattern(path, subst),
             HirTypeRef::Ref(inner, mutable) => type_checker::Type::Ref(
-                Box::new(self.lower_hir_type_for_pattern(inner, subst)),
+                Box::new(self.lower_hir_type_for_pattern_mode(inner, subst, false)),
                 *mutable,
             ),
             HirTypeRef::Ptr { mutable, inner } => type_checker::Type::Ptr {
                 mutable: *mutable,
-                inner: Box::new(self.lower_hir_type_for_pattern(inner, subst)),
+                inner: Box::new(self.lower_hir_type_for_pattern_mode(inner, subst, false)),
             },
             HirTypeRef::Tuple(items) if items.is_empty() => type_checker::Type::Unit,
             HirTypeRef::Tuple(items) => type_checker::Type::Tuple(
                 items
                     .iter()
-                    .map(|item| self.lower_hir_type_for_pattern(item, subst))
+                    .map(|item| self.lower_hir_type_for_pattern_mode(item, subst, true))
                     .collect(),
             ),
-            HirTypeRef::Slice(inner) => {
-                type_checker::Type::Slice(Box::new(self.lower_hir_type_for_pattern(inner, subst)))
-            }
+            HirTypeRef::Slice(inner) => type_checker::Type::Slice(Box::new(
+                self.lower_hir_type_for_pattern_mode(inner, subst, true),
+            )),
             HirTypeRef::Array(inner, len) => type_checker::Type::Array(
-                Box::new(self.lower_hir_type_for_pattern(inner, subst)),
+                Box::new(self.lower_hir_type_for_pattern_mode(inner, subst, true)),
                 match len {
                     HirConstArg::Value(value) => ConstArg::Value(*value),
                     HirConstArg::Param(name) => match subst.get(&name.0) {
@@ -1010,7 +1030,43 @@ impl LowerCtx<'_> {
                 HirConstArg::Error => ConstArg::Error,
             }),
             HirTypeRef::ImplTrait { .. } => self.lower_impl_trait_for_pattern(ty, subst),
-            HirTypeRef::DynTrait { trait_ty, .. } => {
+            HirTypeRef::DynTrait {
+                trait_ty,
+                callable,
+                assoc_constraints,
+                ..
+            } => {
+                if let Some(callable) = callable {
+                    let kind = match trait_ty.as_ref() {
+                        HirTypeRef::Named(path) => {
+                            match path.segments.last().map(|name| name.0.as_str()) {
+                                Some("Fn") => type_checker::ClosureKind::Fn,
+                                Some("FnMut") => type_checker::ClosureKind::FnMut,
+                                Some("FnOnce") => type_checker::ClosureKind::FnOnce,
+                                _ => return type_checker::Type::Unknown,
+                            }
+                        }
+                        _ => return type_checker::Type::Unknown,
+                    };
+                    return type_checker::Type::CallableConstraint(
+                        type_checker::CallableSignature {
+                            is_unsafe: false,
+                            kind,
+                            params: callable
+                                .params
+                                .iter()
+                                .map(|param| {
+                                    self.lower_hir_type_for_pattern_mode(param, subst, true)
+                                })
+                                .collect(),
+                            ret: Box::new(self.lower_hir_type_for_pattern_mode(
+                                &callable.ret,
+                                subst,
+                                true,
+                            )),
+                        },
+                    );
+                }
                 let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
                     return type_checker::Type::Unknown;
                 };
@@ -1018,11 +1074,32 @@ impl LowerCtx<'_> {
                     HirTypeRef::Named(path) => path
                         .type_args
                         .iter()
-                        .map(|arg| self.lower_hir_type_for_pattern(arg, subst))
+                        .map(|arg| self.lower_hir_type_for_pattern_mode(arg, subst, true))
                         .collect(),
                     _ => Vec::new(),
                 };
-                type_checker::Type::DynTrait { trait_id, args }
+                let assoc_bindings = assoc_constraints
+                    .iter()
+                    .map(|constraint| {
+                        (
+                            constraint.name.0.clone(),
+                            self.lower_hir_type_for_pattern_mode(&constraint.ty, subst, true),
+                        )
+                    })
+                    .collect();
+                if owned_dyn {
+                    type_checker::Type::OwnedDynTrait {
+                        trait_id,
+                        args,
+                        assoc_bindings,
+                    }
+                } else {
+                    type_checker::Type::DynTrait {
+                        trait_id,
+                        args,
+                        assoc_bindings,
+                    }
+                }
             }
             HirTypeRef::Unknown => type_checker::Type::Unknown,
             HirTypeRef::Error => type_checker::Type::Error,
