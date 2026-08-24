@@ -440,6 +440,10 @@ try {
         item.labelDetails.detail === '(&self)' &&
         item.labelDetails.description === 'bool' &&
         item.insertText === 'is_empty' &&
+        item.insertTextFormat === 1 &&
+        item.textEdit?.newText === 'is_empty' &&
+        item.textEdit?.range?.start?.character === completionText.indexOf('c.i') + 2 &&
+        item.textEdit?.range?.end?.character === completionText.indexOf('c.i') + 3 &&
         item.kind === 2,
     ),
   );

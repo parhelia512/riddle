@@ -2,8 +2,8 @@ use super::{
     BodyCtx, DynMethodSafety, Expr, ExprId, FunctionId, HashMap, HashSet, HirFunction, HirTypeRef,
     LangItem, Name, PatternBindingId, PendingGenericCall, ResolvedMethod, ResolvedName, TraitId,
     TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse, bound_target_param,
-    callable_signature_type, collect_subst, dyn_method_safety, expected_has_param,
-    generic_param_map_with_consts, method_is_visible_for_owner, record_generic_arg_spans,
+    callable_signature_type, collect_subst, dyn_method_safety, generic_param_map_with_consts,
+    method_is_visible_for_owner, pattern_has_unresolved_param, record_generic_arg_spans,
     substitute_type, type_has_unresolved_inference,
 };
 
@@ -325,7 +325,7 @@ impl TypeChecker<'_> {
                 .map(|ty| substitute_type(&ty, subst));
             let actual = match callable_expected.as_ref() {
                 Some(expected) => self.check_expr_expected(ctx, *arg, expected),
-                None if expected_has_param(&expected) => self.check_expr(ctx, *arg),
+                None if pattern_has_unresolved_param(&pattern, subst) => self.check_expr(ctx, *arg),
                 None => self.check_expr_expected(ctx, *arg, &expected),
             };
             if let Some(expected) = callable_expected.as_ref() {

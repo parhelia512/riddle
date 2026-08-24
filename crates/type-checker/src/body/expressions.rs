@@ -317,7 +317,7 @@ impl TypeChecker<'_> {
                     {
                         Type::Int(IntTy::Usize)
                     } else if let Some(ResolvedName::EnumVariant(enum_id, _)) = resolved {
-                        self.enum_variant_type(*enum_id, expected)
+                        self.enum_variant_type(ctx, *enum_id, expected, path, span)
                     } else {
                         self.type_of_resolved_name(ctx, resolved.as_ref())
                     }

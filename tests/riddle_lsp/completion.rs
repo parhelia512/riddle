@@ -54,6 +54,28 @@ fn completion_matches_free_functions_case_insensitively() {
 }
 
 #[test]
+fn completion_uses_a_precise_plain_text_edit_for_the_prefix() {
+    let source = "fun helper(value: i32) -> i32 {}\nfun main() { hel }";
+    let prefix_start = source.rfind("hel").unwrap();
+    let cursor = position(source, prefix_start + 3);
+    let items = completion_items_for_source(source, cursor, CompileOptions { use_std: false });
+    let helper = items.iter().find(|item| item.label == "helper").unwrap();
+
+    assert_eq!(
+        helper.insert_text_format,
+        Some(lsp_types::InsertTextFormat::PLAIN_TEXT)
+    );
+    let Some(lsp_types::CompletionTextEdit::Edit(edit)) = helper.text_edit.as_ref() else {
+        panic!("expected a text edit: {helper:#?}");
+    };
+    assert_eq!(
+        edit.range,
+        Range::new(position(source, prefix_start), cursor)
+    );
+    assert_eq!(edit.new_text, "helper");
+}
+
+#[test]
 fn completion_includes_struct_and_enum_names_in_type_positions() {
     let source = "struct Point {}\nenum State { Ready }\nfun inspect(value: ) {}";
     let items = completion_items_for_source(

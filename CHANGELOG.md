@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.2.2] - 2026-08-25
+
+### Added
+
+- `riddle fmt` formats Riddle files or standard input, checks formatting without writing, and shares its implementation with LSP formatting requests.
+- Dynamic trait objects, associated types, comments and documentation comments, control-flow patterns, and loop expressions are supported across the compiler and editor tooling (`b418f16`, `c3c58be`, `4df93b0`).
+- LSP workspace indexing and richer completion edits now cover project modules, auto-imports, macros, and editor formatting (`c3c58be`, `4df93b0`).
+- The root distribution package now installs `clue`, `riddle-lsp`, `riddlec`, and `riddle`.
+
+### Changed
+
+- Stable and nightly archives include the `riddle` command alongside the existing compiler, project, and language-server binaries.
+- Release and cross-target CI now use the repository's Rust 1.97.1 toolchain and validate the complete distribution entry points (`cfc7b49`, `d720322`, `b677277`, `baf8645`).
+- Formal release validation and published platform builds resolve dependencies from the committed `Cargo.lock`.
+- VS Code, IntelliJ IDEA, and Zed package metadata is aligned with the `0.2.2` release.
+
+### Fixed
+
+- Generic expected types now flow through unit enum variants such as `Option::None`, including explicit enum type arguments; explicit arguments on payload variants are no longer silently ignored.
+- `riddle fmt` now rejects parser and lexer errors with a non-zero status before writing, while its output preserves comments, attributes, intentional blank lines, and the source line-ending style for supported syntax.
+- `riddle fmt` keeps glob imports, array const generics, nested unit values, and dereference expressions lexically tight instead of inserting whitespace that changes the intended layout.
+- `riddle fmt` keeps generic arguments tight in `impl`, trait, `dyn`, and `where` headers instead of treating them as comparison operators.
+- Pattern checking, move-state convergence, dynamic dispatch lowering, and associated-type substitutions no longer accept the previously reported invalid states (`b418f16`, `4df93b0`).
+
+### Maintenance
+
+- Standard-library, Clue dependency, release documentation, and CI configuration were synchronized for the release (`d22e74a`, `15a3729`, `471dc39`).
+
 ## [0.2.1] - 2026-08-11
 
 ### Added

@@ -35,7 +35,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 
 [package]
@@ -44,6 +44,7 @@ version.workspace = true
 edition.workspace = true
 publish = false
 autotests = false
+default-run = "riddle"
 
 [dependencies]
 clap = { version = "=4.5.61", features = ["derive", "string"] }
@@ -71,6 +72,10 @@ required-features = ["install-bins"]
 name = "riddlec"
 path = "app/riddlec/src/main.rs"
 required-features = ["install-bins"]
+
+[[bin]]
+name = "riddle"
+path = "app/riddle/src/main.rs"
 
 [dev-dependencies]
 ast = { path = "crates/ast" }

@@ -2,8 +2,8 @@ use super::{
     BodyCtx, CallableSignature, ClosureKind, Expr, ExprId, GenericEdge, HashMap, HirFunction,
     HirTypeRef, HirVariantKind, LabelStyle, PendingGenericCall, ResolvedName, SourceLabel, TraitId,
     TraitMethodCall, Type, TypeChecker, ValueUse, bound_target_param, builtin_callable_kind,
-    callable_signature_type, collect_subst, expected_has_param, generic_param_map_with_consts,
-    grows_generic_arg, pattern_has_unresolved_param, record_generic_arg_spans, substitute_type,
+    callable_signature_type, collect_subst, generic_param_map_with_consts, grows_generic_arg,
+    pattern_has_unresolved_param, record_generic_arg_spans, substitute_type,
     type_has_unresolved_inference,
 };
 
@@ -45,8 +45,8 @@ impl TypeChecker<'_> {
                 *enum_id,
                 *variant_index,
                 args,
-                expected,
-                span,
+                &impl_type_args,
+                (expected, span),
             );
         }
 
@@ -449,7 +449,7 @@ impl TypeChecker<'_> {
                 .map(|ty| substitute_type(&ty, subst));
             let actual = match callable_expected.as_ref() {
                 Some(expected) => self.check_expr_expected(ctx, *arg, expected),
-                None if expected_has_param(&expected) => self.check_expr(ctx, *arg),
+                None if pattern_has_unresolved_param(&pattern, subst) => self.check_expr(ctx, *arg),
                 None => self.check_expr_expected(ctx, *arg, &expected),
             };
             if let Some(expected) = callable_expected.as_ref() {
@@ -591,9 +591,10 @@ impl TypeChecker<'_> {
         enum_id: hir::item_tree::EnumId,
         variant_index: usize,
         args: &[ExprId],
-        expected: Option<&Type>,
-        span: Option<rowan::TextRange>,
+        type_args: &[HirTypeRef],
+        expected_span: (Option<&Type>, Option<rowan::TextRange>),
     ) -> Type {
+        let (expected, span) = expected_span;
         let enum_data = &self.hir.item_tree.enums[enum_id];
         let Some(variant) = enum_data.variants.get(variant_index) else {
             for arg in args {
@@ -613,6 +614,30 @@ impl TypeChecker<'_> {
                 .collect::<HashMap<_, _>>(),
             _ => HashMap::new(),
         };
+        if !type_args.is_empty() {
+            let expected_count = enum_data.generics.len() + enum_data.const_generics.len();
+            if type_args.len() != expected_count {
+                self.diagnostic(
+                    "E0032",
+                    format!(
+                        "type `{}` expects {expected_count} type argument(s), got {}",
+                        enum_data.name.0,
+                        type_args.len()
+                    ),
+                    span,
+                );
+            }
+            for (name, type_arg) in enum_data
+                .generics
+                .iter()
+                .chain(enum_data.const_generics.iter())
+                .zip(type_args)
+            {
+                let lowered =
+                    self.lower_type_ref_with_params_at(type_arg, &ctx.generic_params, span);
+                subst.insert(name.0.clone(), lowered);
+            }
+        }
         let params = generic_param_map_with_consts(
             enum_data.generics.iter().map(|name| name.0.as_str()),
             enum_data.const_generics.iter().map(|name| name.0.as_str()),
@@ -693,21 +718,49 @@ impl TypeChecker<'_> {
     }
 
     pub(super) fn enum_variant_type(
-        &self,
+        &mut self,
+        ctx: &BodyCtx<'_>,
         enum_id: hir::item_tree::EnumId,
         expected: Option<&Type>,
+        path: &hir::item_tree::HirPath,
+        span: Option<rowan::TextRange>,
     ) -> Type {
-        if let Some(Type::Enum(expected_id, args)) = expected
+        let enum_data = &self.hir.item_tree.enums[enum_id];
+        let resolved_expected = expected.map(|ty| self.resolve_type(ty));
+        let mut args = if let Some(Type::Enum(expected_id, args)) = resolved_expected.as_ref()
             && *expected_id == enum_id
         {
-            return Type::Enum(enum_id, args.clone());
+            args.clone()
+        } else {
+            enum_data
+                .generics
+                .iter()
+                .chain(enum_data.const_generics.iter())
+                .map(|_| Type::Unknown)
+                .collect()
+        };
+        let enum_segment = path.segments.len().checked_sub(2);
+        let explicit = enum_segment
+            .map(|index| path.type_args_for_segment(index))
+            .filter(|args| !args.is_empty())
+            .unwrap_or(path.type_args.as_slice());
+        if !explicit.is_empty() {
+            let expected_count = enum_data.generics.len() + enum_data.const_generics.len();
+            if explicit.len() != expected_count {
+                self.diagnostic(
+                    "E0032",
+                    format!(
+                        "type `{}` expects {expected_count} type argument(s), got {}",
+                        enum_data.name.0,
+                        explicit.len()
+                    ),
+                    span,
+                );
+            }
+            for (slot, arg) in args.iter_mut().zip(explicit) {
+                *slot = self.lower_type_ref_with_params_at(arg, &ctx.generic_params, span);
+            }
         }
-        let args = self.hir.item_tree.enums[enum_id]
-            .generics
-            .iter()
-            .chain(self.hir.item_tree.enums[enum_id].const_generics.iter())
-            .map(|_| Type::Unknown)
-            .collect();
         Type::Enum(enum_id, args)
     }
 

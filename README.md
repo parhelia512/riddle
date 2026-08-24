@@ -4,9 +4,9 @@
   [GitHub][github] | [文档][docs] | [更新日志][changelog] | [English](README-en.md)
 </div>
 
-这是 [Riddle][github] 的主源码仓库，包含编译器（`riddlec`）、项目工具（`clue`）和语言服务器（`riddle-lsp`）。
+这是 [Riddle][github] 的主源码仓库，包含格式化工具（`riddle fmt`）、编译器（`riddlec`）、项目工具（`clue`）和语言服务器（`riddle-lsp`）。
 
-Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.0` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。当前版本仍处于技术预览阶段：语言和工具链仍可能发生不兼容变化。
+Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.2` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。当前版本仍处于技术预览阶段：语言和工具链仍可能发生不兼容变化。
 
 ## 为什么选择 Riddle？
 
@@ -19,6 +19,7 @@ Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.0` 提供
 ## 工具
 
 - `riddlec`：检查 Riddle 源码并生成 C；
+- `riddle fmt`：按统一风格格式化 Riddle 源码，也可用 `--check` 检查格式；
 - `clue`：管理 Riddle 包、依赖、工作区、构建目标与安装产物；
 - `riddle-lsp`：为编辑器提供诊断、工作区索引、自动导入补全、高级导航、重命名、格式化和语义高亮。
 
@@ -58,9 +59,9 @@ Set-Location riddle
 cargo install --path . --features install-bins --force --target-dir "$env:TEMP\riddle-install"
 ```
 
-上述两种方式都会安装 `clue`、`riddle-lsp` 和 `riddlec` 三个二进制。
+上述两种方式都会安装 `clue`、`riddle-lsp`、`riddlec` 和 `riddle` 四个二进制。
 
-如果只想构建这三个可安装二进制，请指定根发行包（root distribution package），避免 workspace 中同名开发包重复输出：
+如果只想构建这四个可安装二进制，请指定根发行包（root distribution package），避免 workspace 中同名开发包重复输出：
 
 ```bash
 cargo build -p riddle --release --features install-bins --bins
@@ -77,7 +78,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-`install-bins` 只用于根发行包。不要在 workspace 测试命令中添加 `--all-features`，否则根发行包与成员 crate 的 `clue`、`riddlec` 会产生同名输出警告；上面的独立 `cargo check` 会覆盖这三个安装入口。
+`install-bins` 只用于根发行包。不要在 workspace 测试命令中添加 `--all-features`，否则根发行包与成员 crate 的 `clue`、`riddlec` 会产生同名输出警告；上面的独立 `cargo check` 会覆盖这四个安装入口。
 
 Clippy 会检查默认启用的全部规则并把告警视为错误，不使用新增的 `#[allow(clippy::...)]` 绕过源码问题。
 

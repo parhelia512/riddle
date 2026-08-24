@@ -9,7 +9,10 @@ use hir::item_tree::{
     HirAttr, HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem,
     Visibility,
 };
-use lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
+use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
+    InsertTextFormat, TextEdit,
+};
 use riddlec::{
     pipeline::{CompileOptions, CompileResult},
     proc_macro::{ProcMacroKind, STANDARD_DERIVE_MACROS, STANDARD_FUNCTION_MACROS},
@@ -26,7 +29,7 @@ use crate::{
     imports::import_edit,
     server::Document,
     session::AnalysisSessions,
-    text::{is_identifier_continue, offset_for_position, text_range},
+    text::{LineIndex, is_identifier_continue, offset_for_position, text_range},
 };
 
 const COMPLETION_MARKER: &str = "__riddle_completion";
@@ -178,16 +181,18 @@ pub fn completion_items_for_document<S: BuildHasher>(
         if cancelled() {
             return Ok(None);
         }
-        return Ok(Some(project_completion_items(
+        let mut items = project_completion_items(
             &analysis,
             &path,
             &document.text,
             &site,
             fallback_result.as_ref(),
-        )));
+        );
+        attach_completion_edits(&document.text, &site, &mut items);
+        return Ok(Some(items));
     }
 
-    Ok(standalone_completion_items(
+    let mut items = standalone_completion_items(
         uri,
         document,
         &site,
@@ -195,7 +200,11 @@ pub fn completion_items_for_document<S: BuildHasher>(
         sessions,
         fallback_sessions,
         &cancelled,
-    ))
+    );
+    if let Some(items) = &mut items {
+        attach_completion_edits(&document.text, &site, items);
+    }
+    Ok(items)
 }
 
 fn project_completion_overlays<S: BuildHasher>(
@@ -303,6 +312,20 @@ fn standalone_completion_items(
     collect_standard_macro_completions(site, &mut items);
     sort_and_dedup_completion_items(&mut items);
     Some(items)
+}
+
+fn attach_completion_edits(source: &str, site: &CompletionSite, items: &mut [CompletionItem]) {
+    let Some(range) = LineIndex::new(source).range(source, text_range(site.start, site.end)) else {
+        return;
+    };
+    for item in items {
+        let new_text = item
+            .insert_text
+            .clone()
+            .unwrap_or_else(|| item.label.clone());
+        item.text_edit = Some(CompletionTextEdit::Edit(TextEdit::new(range, new_text)));
+        item.insert_text_format = Some(InsertTextFormat::PLAIN_TEXT);
+    }
 }
 
 fn sort_and_dedup_completion_items(items: &mut Vec<CompletionItem>) {
@@ -567,6 +590,7 @@ pub fn completion_items_for_source(
         fallback.as_ref().and_then(|result| result.hir.as_ref()),
     );
     collect_standard_macro_completions(&site, &mut items);
+    attach_completion_edits(source, &site, &mut items);
     items
 }
 

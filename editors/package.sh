@@ -18,7 +18,7 @@ rm -f "$dist/riddle-vscode.vsix" "$dist/riddle-helix.zip" "$dist/riddle-intellij
 (
     cd "$root/intellij"
     bash ./gradlew --no-daemon buildPlugin
-    intellij_package=$(find build/distributions -maxdepth 1 -type f -name 'riddle-intellij-*.zip' -print -quit)
+    intellij_package=$(find build/distributions -maxdepth 1 -type f -name 'riddle-intellij-*.zip' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')
     test -n "$intellij_package"
     cp "$intellij_package" "$dist/riddle-intellij.zip"
 )

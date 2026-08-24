@@ -224,6 +224,96 @@ fn generic_call_inference_keeps_nested_constructor_expected_type() {
 }
 
 #[test]
+fn generic_call_reuses_inferred_type_for_unit_enum_variants() {
+    let result = check(
+        r#"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        fun replace<T>(destination: &mut T, source: T) -> T { source }
+
+        struct Holder<V> {
+            slot: Option<V>,
+        }
+
+        struct Ops {}
+
+        impl Ops {
+            fun replace<T>(&self, destination: &mut T, source: T) -> T { source }
+        }
+
+        fun bare<V>(holder: &mut Holder<V>) {
+            let old = replace(&mut holder.slot, Option::None);
+        }
+
+        fun explicit<V>(holder: &mut Holder<V>) {
+            let old = replace(&mut holder.slot, Option::<V>::None);
+        }
+
+        fun method<V>(ops: &Ops, holder: &mut Holder<V>) {
+            let old = ops.replace(&mut holder.slot, Option::None);
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn explicit_unit_enum_variant_type_args_override_expected_type() {
+    let result = check(
+        r#"
+        enum Option<T> { Some(T), None }
+
+        fun take(value: Option<bool>) {}
+
+        fun main() {
+            take(Option::<i32>::None);
+        }
+        "#,
+    );
+
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0001")
+            .count(),
+        1,
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn explicit_enum_variant_call_type_args_override_expected_type() {
+    let result = check(
+        r#"
+        enum Option<T> { Some(T), None }
+
+        fun take(value: Option<bool>) {}
+
+        fun main() {
+            take(Option::<i32>::Some(1));
+        }
+        "#,
+    );
+
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0001")
+            .count(),
+        1,
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn callable_bounds_constrain_generic_function_items() {
     let result = check(
         r"

@@ -6,10 +6,10 @@
 
 This is the main source code repository for [Riddle][github]. It contains the
 compiler (`riddlec`), project tooling (`clue`), and a language server
-(`riddle-lsp`).
+(`riddle-lsp`), together with the `riddle fmt` formatter.
 
 Riddle is an experimental programming language inspired by Rust and Go. As of
-`v0.2.0`, it provides type checking, a move checker, borrow and escape
+`v0.2.2`, it provides type checking, a move checker, borrow and escape
 analysis, unsafe semantics, a bundled standard library, a C backend, project
 tooling, and an LSP. This is a technology preview: the language and toolchain
 may still change without compatibility guarantees.
@@ -34,8 +34,9 @@ may still change without compatibility guarantees.
 ## Tools
 
 - `riddlec`: checks Riddle source and generates C;
+- `riddle fmt`: formats Riddle source or checks it with `--check`;
 - `clue`: manages Riddle packages, dependencies, workspaces, build targets, and installed artifacts;
-- `riddle-lsp`: provides editor diagnostics and semantic highlighting.
+- `riddle-lsp`: provides editor diagnostics, completion, formatting, and semantic highlighting.
 
 The [`editors`](./editors) directory contains `riddle-lsp` integrations for
 Helix, VS Code, Zed, and IntelliJ IDEA 2026.1+.
@@ -81,9 +82,9 @@ Set-Location riddle
 cargo install --path . --features install-bins --force --target-dir "$env:TEMP\riddle-install"
 ```
 
-Both methods install `clue`, `riddle-lsp`, and `riddlec`.
+Both methods install `clue`, `riddle-lsp`, `riddlec`, and `riddle`.
 
-To build only the installable binaries, target the root distribution package so
+To build only the four installable binaries, target the root distribution package so
 the workspace's development packages do not emit duplicate binaries:
 
 ```bash
@@ -104,7 +105,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 `install-bins` is only for the root distribution package. Do not add
 `--all-features` to the workspace test command: that enables root and member
 `clue`/`riddlec` binaries with identical output names. The separate
-`cargo check` above covers all three installation entry points.
+`cargo check` above covers all four installation entry points.
 
 Clippy checks every default-enabled lint and treats warnings as errors. Source
 issues must not be bypassed with new `#[allow(clippy::...)]` attributes.

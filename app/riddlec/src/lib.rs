@@ -1,4 +1,5 @@
 pub mod diagnostics;
+pub mod fmt;
 pub mod pipeline;
 pub mod proc_macro;
 pub mod target;

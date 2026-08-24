@@ -11,6 +11,16 @@ fn formatting_normalizes_layout_without_touching_tokens() {
 }
 
 #[test]
+fn formatting_keeps_documentation_comments_and_crlf() {
+    let source = "/// docs\r\nfun main(){/* details\r\n * stay */let value=1;}\r\n";
+
+    assert_eq!(
+        format_source(source, 4, true),
+        "/// docs\r\nfun main() {\r\n    /* details\r\n * stay */ let value = 1;\r\n}\r\n"
+    );
+}
+
+#[test]
 fn signature_help_tracks_the_active_argument() {
     let source = "fun add(left: i32, right: i32) -> i32 { left + right } fun main() { add(1, 2); }";
     let cursor = position(source, source.rfind("2)").unwrap() + 1);

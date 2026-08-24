@@ -263,10 +263,6 @@ const fn callable_signature_type(signature: CallableSignature) -> Type {
     Type::CallableConstraint(signature)
 }
 
-fn expected_has_param(ty: &Type) -> bool {
-    type_has_param_where(ty, &|_| true)
-}
-
 fn record_generic_arg_spans(
     pattern: &Type,
     params: &HashMap<String, Type>,

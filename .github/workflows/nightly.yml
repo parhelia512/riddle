@@ -161,7 +161,7 @@ jobs:
 
           mkdir -p dist
 
-          for name in clue riddle-lsp riddlec; do
+          for name in clue riddle-lsp riddlec riddle; do
             if [ -f "$BIN_DIR/$name" ]; then
               cp "$BIN_DIR/$name" "dist/$name"
             elif [ -f "$BIN_DIR/$name.exe" ]; then
