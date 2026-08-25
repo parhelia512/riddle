@@ -1019,6 +1019,7 @@ fn normalize_doc_comment(comment: &str) -> String {
     if let Some(comment) = comment
         .strip_prefix("///")
         .or_else(|| comment.strip_prefix("//!"))
+        .or_else(|| comment.strip_prefix("//<"))
     {
         return comment.trim_start().to_string();
     }
@@ -1350,7 +1351,16 @@ pub fn source_uri(current_uri: &lsp_types::Url, path: &Path) -> Option<lsp_types
     if path.as_os_str().is_empty() {
         Some(current_uri.clone())
     } else {
-        lsp_types::Url::from_file_path(path).ok()
+        #[cfg(target_arch = "wasm32")]
+        {
+            // wasm32-unknown-unknown has no host filesystem URL conversion.
+            let _ = path;
+            Some(current_uri.clone())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            lsp_types::Url::from_file_path(path).ok()
+        }
     }
 }
 
