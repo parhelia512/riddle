@@ -264,6 +264,7 @@ impl ProjectArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(target_arch = "wasm32"))]
     ctrlc::set_handler(clue::request_cancellation)
         .map_err(|error| format!("failed to install Ctrl+C handler: {error}"))?;
     let cli = Cli::parse();

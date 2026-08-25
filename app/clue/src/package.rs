@@ -856,29 +856,36 @@ impl Resolver {
                 format!("registry package `{package}` is not cached for offline use")
             })?
         } else {
-            let (_, registry_config) = self.config.registry(Some(registry))?;
-            let url = format!(
-                "{}/{}",
-                index.trim_end_matches('/'),
-                sparse_path(package)
-                    .display()
-                    .to_string()
-                    .replace('\\', "/")
-            );
-            let mut request = reqwest::blocking::Client::builder()
-                .user_agent(format!("clue/{}", env!("CARGO_PKG_VERSION")))
-                .build()?
-                .get(&url);
-            if let Some(token) = &registry_config.token {
-                request = request.bearer_auth(token);
+            #[cfg(target_arch = "wasm32")]
+            {
+                bail!("network package resolution is unavailable in wasm builds");
             }
-            let response = request.send()?.error_for_status()?;
-            let text = response.text()?;
-            if let Some(parent) = cache.parent() {
-                fs::create_dir_all(parent)?;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let (_, registry_config) = self.config.registry(Some(registry))?;
+                let url = format!(
+                    "{}/{}",
+                    index.trim_end_matches('/'),
+                    sparse_path(package)
+                        .display()
+                        .to_string()
+                        .replace('\\', "/")
+                );
+                let mut request = reqwest::blocking::Client::builder()
+                    .user_agent(format!("clue/{}", env!("CARGO_PKG_VERSION")))
+                    .build()?
+                    .get(&url);
+                if let Some(token) = &registry_config.token {
+                    request = request.bearer_auth(token);
+                }
+                let response = request.send()?.error_for_status()?;
+                let text = response.text()?;
+                if let Some(parent) = cache.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                atomic_write(&cache, text.as_bytes())?;
+                text
             }
-            atomic_write(&cache, text.as_bytes())?;
-            text
         };
         let versions = text
             .lines()
@@ -980,128 +987,145 @@ impl Resolver {
     }
 
     fn materialize_registry(&self, candidate: &Candidate) -> anyhow::Result<()> {
-        let index = candidate.source.trim_start_matches("registry+");
-        let destination = registry_source_dir(
-            &self.config.home,
-            index,
-            &candidate.name,
-            &candidate.version,
-        );
-        if let Some(cached) = cached_package_root(&destination)
-            && manifest::read(&cached, ProjectKind::Binary).is_ok()
+        #[cfg(target_arch = "wasm32")]
         {
-            return Ok(());
+            let _ = candidate;
+            bail!("network package downloads are unavailable in wasm builds");
         }
-        if destination.exists() {
-            remove_cache_entry(&destination)?;
-        }
-        if self.config.offline {
-            bail!(
-                "package `{} {}` is not cached for offline use",
-                candidate.name,
-                candidate.version
-            );
-        }
-        let archive_url = candidate.archive.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "registry entry for `{} {}` has no archive URL and registry has no API URL",
-                candidate.name,
-                candidate.version
-            )
-        })?;
-        let archive_url = if archive_url.ends_with("/download")
-            || archive_url.ends_with(".gz")
-            || archive_url.ends_with(".cluepkg")
+        #[cfg(not(target_arch = "wasm32"))]
         {
-            archive_url.to_owned()
-        } else {
-            format!(
-                "{archive_url}/v1/crates/{}/{}/download",
-                candidate.name, candidate.version
-            )
-        };
-        let response = reqwest::blocking::Client::builder()
-            .user_agent(format!("clue/{}", env!("CARGO_PKG_VERSION")))
-            .build()?
-            .get(archive_url)
-            .send()?
-            .error_for_status()?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
-        {
-            bail!(
-                "package archive exceeds the {} MiB limit",
-                MAX_ARCHIVE_BYTES / 1024 / 1024
+            let index = candidate.source.trim_start_matches("registry+");
+            let destination = registry_source_dir(
+                &self.config.home,
+                index,
+                &candidate.name,
+                &candidate.version,
             );
-        }
-        let bytes = response.bytes()?;
-        if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
-            bail!(
-                "package archive exceeds the {} MiB limit",
-                MAX_ARCHIVE_BYTES / 1024 / 1024
-            );
-        }
-        let actual = sha256(&bytes);
-        if !candidate.checksum.is_empty() && actual != candidate.checksum {
-            bail!(
-                "checksum mismatch for `{} {}`: expected {}, got {actual}",
-                candidate.name,
-                candidate.version,
-                candidate.checksum
-            );
-        }
-        let temp = destination.with_extension(format!("tmp-{}", std::process::id()));
-        if temp.exists() {
-            remove_cache_entry(&temp)?;
-        }
-        fs::create_dir_all(&temp)?;
-        let result = (|| {
-            let mut archive = tar::Archive::new(GzDecoder::new(bytes.as_ref()));
-            let mut unpacked = 0_u64;
-            let mut entries = 0_usize;
-            for entry in archive.entries()? {
-                let mut entry = entry?;
-                entries += 1;
-                if entries > MAX_ARCHIVE_ENTRIES {
-                    bail!("package archive has too many entries");
-                }
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_symlink() || entry_type.is_hard_link() {
-                    bail!("package archive contains a link");
-                }
-                if !entry_type.is_file() && !entry_type.is_dir() {
-                    bail!("package archive contains an unsupported entry type");
-                }
-                unpacked = unpacked.saturating_add(entry.size());
-                if unpacked > MAX_UNPACKED_BYTES {
-                    bail!(
-                        "package archive exceeds the {} MiB unpacked limit",
-                        MAX_UNPACKED_BYTES / 1024 / 1024
-                    );
-                }
-                if !entry.unpack_in(&temp)? {
-                    bail!("package archive contains an unsafe path");
-                }
+            if let Some(cached) = cached_package_root(&destination)
+                && manifest::read(&cached, ProjectKind::Binary).is_ok()
+            {
+                return Ok(());
             }
-            let cached = cached_package_root(&temp).ok_or_else(|| {
+            if destination.exists() {
+                remove_cache_entry(&destination)?;
+            }
+            if self.config.offline {
+                bail!(
+                    "package `{} {}` is not cached for offline use",
+                    candidate.name,
+                    candidate.version
+                );
+            }
+            let archive_url = candidate.archive.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "package archive does not contain `{}`",
-                    manifest::CLUE_PROJECT_FILE_NAME
+                    "registry entry for `{} {}` has no archive URL and registry has no API URL",
+                    candidate.name,
+                    candidate.version
                 )
             })?;
-            manifest::read(&cached, ProjectKind::Binary)
-                .context("package archive has an invalid manifest")?;
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
+            let archive_url = if archive_url.ends_with("/download")
+                || archive_url.ends_with(".gz")
+                || archive_url.ends_with(".cluepkg")
+            {
+                archive_url.to_owned()
+            } else {
+                format!(
+                    "{archive_url}/v1/crates/{}/{}/download",
+                    candidate.name, candidate.version
+                )
+            };
+            let bytes = {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    bail!("network package downloads are unavailable in wasm builds");
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let response = reqwest::blocking::Client::builder()
+                        .user_agent(format!("clue/{}", env!("CARGO_PKG_VERSION")))
+                        .build()?
+                        .get(archive_url)
+                        .send()?
+                        .error_for_status()?;
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
+                    {
+                        bail!(
+                            "package archive exceeds the {} MiB limit",
+                            MAX_ARCHIVE_BYTES / 1024 / 1024
+                        );
+                    }
+                    response.bytes()?
+                }
+            };
+            if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+                bail!(
+                    "package archive exceeds the {} MiB limit",
+                    MAX_ARCHIVE_BYTES / 1024 / 1024
+                );
             }
-            fs::rename(&temp, &destination)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = remove_cache_entry(&temp);
+            let actual = sha256(&bytes);
+            if !candidate.checksum.is_empty() && actual != candidate.checksum {
+                bail!(
+                    "checksum mismatch for `{} {}`: expected {}, got {actual}",
+                    candidate.name,
+                    candidate.version,
+                    candidate.checksum
+                );
+            }
+            let temp = destination.with_extension(format!("tmp-{}", std::process::id()));
+            if temp.exists() {
+                remove_cache_entry(&temp)?;
+            }
+            fs::create_dir_all(&temp)?;
+            let result = (|| {
+                let mut archive = tar::Archive::new(GzDecoder::new(bytes.as_ref()));
+                let mut unpacked = 0_u64;
+                let mut entries = 0_usize;
+                for entry in archive.entries()? {
+                    let mut entry = entry?;
+                    entries += 1;
+                    if entries > MAX_ARCHIVE_ENTRIES {
+                        bail!("package archive has too many entries");
+                    }
+                    let entry_type = entry.header().entry_type();
+                    if entry_type.is_symlink() || entry_type.is_hard_link() {
+                        bail!("package archive contains a link");
+                    }
+                    if !entry_type.is_file() && !entry_type.is_dir() {
+                        bail!("package archive contains an unsupported entry type");
+                    }
+                    unpacked = unpacked.saturating_add(entry.size());
+                    if unpacked > MAX_UNPACKED_BYTES {
+                        bail!(
+                            "package archive exceeds the {} MiB unpacked limit",
+                            MAX_UNPACKED_BYTES / 1024 / 1024
+                        );
+                    }
+                    if !entry.unpack_in(&temp)? {
+                        bail!("package archive contains an unsafe path");
+                    }
+                }
+                let cached = cached_package_root(&temp).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "package archive does not contain `{}`",
+                        manifest::CLUE_PROJECT_FILE_NAME
+                    )
+                })?;
+                manifest::read(&cached, ProjectKind::Binary)
+                    .context("package archive has an invalid manifest")?;
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&temp, &destination)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = remove_cache_entry(&temp);
+            }
+            result
         }
-        result
     }
 
     fn lock_file(&self, state: SolveState) -> anyhow::Result<LockFile> {
@@ -1618,44 +1642,52 @@ pub(crate) fn publish(
     registry: Option<&str>,
     dry_run: bool,
 ) -> anyhow::Result<PathBuf> {
-    let root = fs::canonicalize(root)?;
-    let config = Config::load(&root)?;
-    let manifest = manifest::read(&root, ProjectKind::Binary)?;
-    let (registry_name, registry) = config.registry(registry)?;
-    if let Some(allowed) = &manifest.publish
-        && !allowed.iter().any(|allowed| allowed == registry_name)
+    #[cfg(target_arch = "wasm32")]
     {
-        bail!(
-            "package `{}` cannot be published to registry `{registry_name}`",
-            manifest.name
-        );
+        let _ = (root, registry, dry_run);
+        bail!("publishing packages is unavailable in wasm builds");
     }
-    let archive = archive(&root)?;
-    if dry_run {
-        return Ok(archive);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let root = fs::canonicalize(root)?;
+        let config = Config::load(&root)?;
+        let manifest = manifest::read(&root, ProjectKind::Binary)?;
+        let (registry_name, registry) = config.registry(registry)?;
+        if let Some(allowed) = &manifest.publish
+            && !allowed.iter().any(|allowed| allowed == registry_name)
+        {
+            bail!(
+                "package `{}` cannot be published to registry `{registry_name}`",
+                manifest.name
+            );
+        }
+        let archive = archive(&root)?;
+        if dry_run {
+            return Ok(archive);
+        }
+        let api = registry
+            .api
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("registry has no API URL configured"))?;
+        let file_name = archive
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("package.cluepkg")
+            .to_owned();
+        let bytes = fs::read(&archive)?;
+        let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(file_name);
+        let form = reqwest::blocking::multipart::Form::new().part("package", part);
+        let mut request = reqwest::blocking::Client::builder()
+            .user_agent(format!("clue/{}", env!("CARGO_PKG_VERSION")))
+            .build()?
+            .post(format!("{}/v1/crates/new", api.trim_end_matches('/')))
+            .multipart(form);
+        if let Some(token) = &registry.token {
+            request = request.bearer_auth(token);
+        }
+        request.send()?.error_for_status()?;
+        Ok(archive)
     }
-    let api = registry
-        .api
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("registry has no API URL configured"))?;
-    let file_name = archive
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("package.cluepkg")
-        .to_owned();
-    let bytes = fs::read(&archive)?;
-    let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(file_name);
-    let form = reqwest::blocking::multipart::Form::new().part("package", part);
-    let mut request = reqwest::blocking::Client::builder()
-        .user_agent(format!("clue/{}", env!("CARGO_PKG_VERSION")))
-        .build()?
-        .post(format!("{}/v1/crates/new", api.trim_end_matches('/')))
-        .multipart(form);
-    if let Some(token) = &registry.token {
-        request = request.bearer_auth(token);
-    }
-    request.send()?.error_for_status()?;
-    Ok(archive)
 }
 
 pub(crate) fn install_path(
