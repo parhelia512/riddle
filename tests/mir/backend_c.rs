@@ -2418,7 +2418,15 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
             let wrapped8 = wrap8(255u8, 1u8);
             let shifted = shift(-4i32, 1i32);
             let nan = cast(divide_float(zero, zero));
-            if wrapped == -2147483648i32 && wrapped8 == 0u8 && shifted == -2i32 && nan == 0 {
+            let radix_sum = 0b1010_0000 + 0o17 + 0x10 + 1_000;
+            let typed: u16 = 0xff_ffu16;
+            if wrapped == -2147483648i32
+                && wrapped8 == 0u8
+                && shifted == -2i32
+                && nan == 0
+                && radix_sum == 1191
+                && typed == 65535u16
+            {
                 0
             } else {
                 1

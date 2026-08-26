@@ -521,6 +521,55 @@ fn parses_nested_block_and_documentation_comments() {
 }
 
 #[test]
+fn attaches_only_double_slash_angle_comments_to_the_previous_node() {
+    let source = r#"
+        struct Point {
+            x: i32, //< horizontal coordinate
+            y: i32, ///< remains a leading-style doc comment
+            z: i32,
+            w: i32, //< vertical coordinate
+        }
+    "#;
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source(source);
+    assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+    let root = ast::Root::cast(parse.syntax()).expect("root syntax");
+    let structure = root.stmts().find_map(|stmt| match stmt {
+        ast::Stmt::StructDecl(structure) => Some(structure),
+        _ => None,
+    });
+    let structure = structure.expect("struct declaration");
+    let fields = structure
+        .field_list()
+        .expect("field list")
+        .fields()
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        ast::doc_comments_for_node(fields[0].syntax())
+            .iter()
+            .map(|token| token.text())
+            .collect::<Vec<_>>(),
+        vec!["//< horizontal coordinate"]
+    );
+    assert!(ast::doc_comments_for_node(fields[1].syntax()).is_empty());
+    assert_eq!(
+        ast::doc_comments_for_node(fields[2].syntax())
+            .iter()
+            .map(|token| token.text())
+            .collect::<Vec<_>>(),
+        vec!["///< remains a leading-style doc comment"]
+    );
+    assert_eq!(
+        ast::doc_comments_for_node(fields[3].syntax())
+            .iter()
+            .map(|token| token.text())
+            .collect::<Vec<_>>(),
+        vec!["//< vertical coordinate"]
+    );
+}
+
+#[test]
 fn rejects_invalid_drop_lang_item_contracts() {
     for source in [
         r#"#[lang = "drop"] trait Drop<T> { fun drop(&mut self); }"#,
@@ -2048,13 +2097,48 @@ fn reports_unknown_generic_trait_bound() {
 }
 
 #[test]
-#[should_panic(expected = "expected Greater")]
-fn rejects_bounds_outside_function_generics_for_now() {
-    let _ = check(
+fn checks_struct_and_enum_inline_bounds() {
+    let result = check(
         r"
-        trait Marker {}
-        struct Box<T: Marker> { value: T }
+        trait First {}
+        trait Second {}
+
+        struct Good {}
+        struct FirstOnly {}
+        struct Bad {}
+
+        impl First for Good {}
+        impl Second for Good {}
+        impl First for FirstOnly {}
+
+        struct Box<T: First + Second> { value: T }
+        enum Slot<T: First> { Some(T), None }
+
+        fun main() {
+            let good_box = Box { value: Good {} };
+            let good_slot = Slot::Some(Good {});
+            let missing_second = Box { value: FirstOnly {} };
+            let bad_box = Box { value: Bad {} };
+            let bad_slot = Slot::Some(Bad {});
+        }
         ",
+    );
+
+    let msgs = messages(&result);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("type `Bad` does not satisfy bound `First` for `Box`")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("type `Bad` does not satisfy bound `First` for `Slot`")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|msg| msg.contains("type `FirstOnly` does not satisfy bound `Second` for `Box`")),
+        "{msgs:?}"
     );
 }
 

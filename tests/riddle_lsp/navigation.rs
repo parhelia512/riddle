@@ -75,6 +75,21 @@ fn hover_includes_function_documentation() {
 }
 
 #[test]
+fn hover_includes_trailing_function_documentation() {
+    let source = "fun add(left: i32, right: i32) -> i32 { left + right } //< Adds two numbers.\nfun main() { add(1, 2); }";
+    let hover = hover_for_source(
+        source,
+        position(source, source.rfind("add(1, 2)").unwrap() + 1),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let HoverContents::Markup(contents) = hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(contents.value.contains("Adds two numbers."));
+}
+
+#[test]
 fn hover_shows_complete_type_declarations() {
     let source = r"enum Foo {
     A,

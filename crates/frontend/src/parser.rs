@@ -880,7 +880,7 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Struct);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params(false, false);
+            self.generic_params(true, false);
         }
         if self.at(SyntaxKind::Where) {
             self.where_clause();
@@ -1777,7 +1777,7 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Enum);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params(false, false);
+            self.generic_params(true, false);
         }
         if self.at(SyntaxKind::Where) {
             self.where_clause();

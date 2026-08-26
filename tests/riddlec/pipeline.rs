@@ -1870,6 +1870,29 @@ fn rejects_non_finite_float_literals() {
 }
 
 #[test]
+fn malformed_radix_integer_literals_report_one_lowering_error() {
+    for literal in ["0x", "0x_", "0b102", "0o8"] {
+        let result = compile_with_options(
+            &format!("fun main() {{ let value = {literal}; }}"),
+            CompileOptions { use_std: false },
+        );
+
+        assert!(
+            result.parse_errors.is_empty(),
+            "{literal}: {:#?}",
+            result.parse_errors
+        );
+        assert_eq!(
+            result.hir_diagnostics.len(),
+            1,
+            "{literal}: {:#?}",
+            result.hir_diagnostics
+        );
+        assert_eq!(result.hir_diagnostics[0].message, "invalid integer literal");
+    }
+}
+
+#[test]
 fn unit_uses_empty_tuple_syntax() {
     let result = compile_with_options(
         r"

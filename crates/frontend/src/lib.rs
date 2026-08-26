@@ -169,4 +169,22 @@ mod tests {
             4
         );
     }
+
+    #[test]
+    fn parses_radix_and_separated_integer_literals() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            fun main() {
+                let binary = 0b1010_0101u8;
+                let octal = 0o7_7;
+                let decimal = 1_000_000i32;
+                let hexadecimal = 0xff_ffusize;
+                match hexadecimal { 0xFFFF => {}, _ => {} }
+            }
+            ",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+    }
 }

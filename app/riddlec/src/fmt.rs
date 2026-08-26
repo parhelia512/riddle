@@ -168,7 +168,8 @@ impl SourceFormatter {
                                 | SyntaxKind::RParen
                                 | SyntaxKind::RBracket
                         )
-                    ) {
+                    ) && !next.is_some_and(SyntaxKind::is_trivia)
+                    {
                         self.newline();
                     }
                 } else {
@@ -202,7 +203,9 @@ impl SourceFormatter {
             SyntaxKind::Semi => {
                 trim_spaces(&mut self.output);
                 self.output.push(';');
-                if self.delimiters.last() == Some(&SyntaxKind::LBracket) {
+                if self.delimiters.last() == Some(&SyntaxKind::LBracket)
+                    || next.is_some_and(SyntaxKind::is_trivia)
+                {
                     self.output.push(' ');
                 } else {
                     self.newline();
@@ -213,6 +216,7 @@ impl SourceFormatter {
                 self.output.push(',');
                 if self.delimiters.last() == Some(&SyntaxKind::LBrace)
                     && self.generic_angle_depth == 0
+                    && !next.is_some_and(SyntaxKind::is_trivia)
                 {
                     self.newline();
                 } else {
@@ -310,7 +314,8 @@ impl SourceFormatter {
                     | SyntaxKind::RParen
                     | SyntaxKind::RBracket
             )
-        ) {
+        ) && !next.is_some_and(SyntaxKind::is_trivia)
+        {
             self.newline();
         }
     }
@@ -616,7 +621,21 @@ mod tests {
         let source = "/// docs\nfun main(){/* keep\n * detail */let value=1;}// tail\n";
         assert_eq!(
             format_source(source, FormatOptions::default()),
-            "/// docs\nfun main() {\n    /* keep\n * detail */ let value = 1;\n}\n// tail\n"
+            "/// docs\nfun main() {\n    /* keep\n * detail */ let value = 1;\n} // tail\n"
+        );
+    }
+
+    #[test]
+    fn keeps_trailing_comments_on_their_source_line() {
+        let source = "struct Point{x:i32, //< x coordinate\ny:i32,}\nfun main(){let value=1;// note\n}\nfun documented() {} //< docs\n";
+        let formatted = format_source(source, FormatOptions::default());
+        assert_eq!(
+            formatted,
+            "struct Point {\n    x: i32, //< x coordinate\n    y: i32,\n}\nfun main() {\n    let value = 1; // note\n}\nfun documented() {} //< docs\n"
+        );
+        assert_eq!(
+            format_source(&formatted, FormatOptions::default()),
+            formatted
         );
     }
 

@@ -297,7 +297,11 @@ pub fn attrs_for_node(node: &SyntaxNode) -> Vec<Attribute> {
     Vec::new()
 }
 
-/// Returns documentation comments immediately preceding a syntax node.
+/// Returns documentation comments attached to a syntax node.
+///
+/// A `//<` line comment immediately following a node is treated as a trailing
+/// documentation comment. `///` and block documentation comments keep their
+/// existing leading-comment behavior.
 #[must_use]
 pub fn doc_comments_for_node(node: &SyntaxNode) -> Vec<SyntaxToken> {
     let mut leading = Vec::new();
@@ -316,17 +320,21 @@ pub fn doc_comments_for_node(node: &SyntaxNode) -> Vec<SyntaxToken> {
         }
     }
     if !leading.is_empty() {
+        leading.extend(trailing_doc_comments_for_node(node));
         return leading;
     }
 
     let Some(parent) = node.parent() else {
-        return Vec::new();
+        return trailing_doc_comments_for_node(node);
     };
 
     let mut docs = Vec::new();
     for element in parent.children_with_tokens() {
         match element {
-            rowan::NodeOrToken::Node(candidate) if candidate == *node => return docs,
+            rowan::NodeOrToken::Node(candidate) if candidate == *node => {
+                docs.extend(trailing_doc_comments_for_node(node));
+                return docs;
+            }
             rowan::NodeOrToken::Node(candidate) if candidate.kind() == SyntaxKind::Attribute => {}
             rowan::NodeOrToken::Token(token) if token.kind().is_trivia() => {
                 if matches!(
@@ -340,6 +348,61 @@ pub fn doc_comments_for_node(node: &SyntaxNode) -> Vec<SyntaxToken> {
         }
     }
     Vec::new()
+}
+
+fn trailing_doc_comments_for_node(node: &SyntaxNode) -> Vec<SyntaxToken> {
+    let Some(parent) = node.parent() else {
+        return Vec::new();
+    };
+
+    let mut after_node = false;
+    for element in parent.children_with_tokens() {
+        match element {
+            rowan::NodeOrToken::Node(candidate) if candidate == *node => {
+                after_node = true;
+            }
+            _ if !after_node => {}
+            rowan::NodeOrToken::Token(token) if token.kind() == SyntaxKind::Whitespace => {
+                if token.text().contains(['\n', '\r']) {
+                    return Vec::new();
+                }
+            }
+            rowan::NodeOrToken::Token(token) if token.kind() == SyntaxKind::Comma => {}
+            rowan::NodeOrToken::Token(token)
+                if token.kind() == SyntaxKind::LineComment && token.text().starts_with("//<") =>
+            {
+                return vec![token];
+            }
+            rowan::NodeOrToken::Node(candidate) => {
+                return leading_trailing_doc_comment(&candidate)
+                    .into_iter()
+                    .collect();
+            }
+            rowan::NodeOrToken::Token(_) => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
+fn leading_trailing_doc_comment(node: &SyntaxNode) -> Option<SyntaxToken> {
+    for element in node.children_with_tokens() {
+        match element {
+            rowan::NodeOrToken::Node(candidate) if candidate.kind() == SyntaxKind::Attribute => {}
+            rowan::NodeOrToken::Token(token) if token.kind() == SyntaxKind::Whitespace => {
+                if token.text().contains(['\n', '\r']) {
+                    return None;
+                }
+            }
+            rowan::NodeOrToken::Token(token)
+                if token.kind() == SyntaxKind::LineComment && token.text().starts_with("//<") =>
+            {
+                return Some(token);
+            }
+            rowan::NodeOrToken::Token(token) if token.kind().is_trivia() => {}
+            rowan::NodeOrToken::Node(_) | rowan::NodeOrToken::Token(_) => return None,
+        }
+    }
+    None
 }
 
 fn unquote_string(text: &str) -> String {

@@ -139,7 +139,13 @@ pub enum SyntaxKind {
     #[regex(r"_[a-zA-Z0-9_]+")]
     Ident,
 
-    #[regex(r"[0-9]+(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)?")]
+    #[regex(
+        r"0x_*[0-9a-fA-F][0-9a-fA-F_]*(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)?"
+    )]
+    #[regex(r"0o_*[0-7][0-7_]*(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)?")]
+    #[regex(r"0b_*[01][01_]*(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)?")]
+    #[regex(r"0[xob][a-zA-Z0-9_]*", priority = 1)]
+    #[regex(r"[0-9][0-9_]*(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)?")]
     Number,
 
     #[token("->")]
