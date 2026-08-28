@@ -645,6 +645,12 @@ impl LowerCtx<'_> {
             return None;
         }
         let alias_name = path.segments[1].0.as_str();
+        // Monomorphized default methods carry the concrete associated types
+        // of the implementing impl in their substitution.
+        let key = format!("Self::{}", alias_name);
+        if let Some(ty) = self.generic_subst.get(&key) {
+            return Some(ty.clone());
+        }
         let imp = self.impl_for_method(self.current_function?)?;
         if let Some(alias_id) = imp
             .type_aliases

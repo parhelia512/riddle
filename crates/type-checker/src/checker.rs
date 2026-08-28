@@ -12,6 +12,7 @@ use hir::{
 };
 
 use crate::{
+    body::bound_target_param,
     context::BodyCtx,
     lang_items::{LangItem, RegisterResult},
     result::{Diagnostic, LabelStyle, Severity, SourceLabel, TypeCheckResult},
@@ -781,8 +782,31 @@ impl<'a> TypeChecker<'a> {
             } else {
                 params.insert("Self".into(), self_ty);
             }
-        } else if self.trait_for_default_method(function_id).is_some() {
+        } else if let Some(trait_id) = self.trait_for_default_method(function_id) {
             params.insert("Self".into(), Type::Param("Self".into()));
+            // Associated types stay abstract while checking the default body;
+            // each `Self::Item` becomes a `Param` placeholder that MIR
+            // monomorphization substitutes with the implementing impl's type.
+            // Supertraits may declare them (`Iterator::Item` on an extending
+            // trait), so collect aliases across the whole trait family.
+            let mut family = std::collections::VecDeque::from([trait_id]);
+            let mut seen: HashSet<hir::item_tree::TraitId> = HashSet::from([trait_id]);
+            while let Some(current) = family.pop_front() {
+                for bound in &self.hir.item_tree.traits[current].supertraits {
+                    if let Some(super_id) = self.resolve_trait_ref(&bound.trait_ty)
+                        && seen.insert(super_id)
+                    {
+                        family.push_back(super_id);
+                    }
+                }
+            }
+            for member in &seen {
+                for alias in &self.hir.item_tree.traits[*member].type_aliases {
+                    params
+                        .entry(format!("Self::{}", alias.name.0))
+                        .or_insert_with(|| Type::Param(alias.name.0.clone()));
+                }
+            }
         }
         params
     }
@@ -905,6 +929,108 @@ impl<'a> TypeChecker<'a> {
             _ => self
                 .callable_impl_for_type(ty)
                 .map(|(signature, _)| signature),
+        }
+    }
+
+    /// Binds the generic parameters appearing inside a callable bound signature
+    /// from the concrete signature of the argument value, so calls like
+    /// `map(iter, closure)` infer the closure's parameter and return types.
+    pub(crate) fn collect_callable_argument_subst(
+        &mut self,
+        expected: &Type,
+        actual: &Type,
+        subst: &mut HashMap<String, Type>,
+    ) {
+        let Type::CallableConstraint(expected_signature) = expected else {
+            return;
+        };
+        let Some(actual_signature) = self.callable_signature_for_type(actual) else {
+            return;
+        };
+        for (expected_param, actual_param) in expected_signature
+            .params
+            .iter()
+            .zip(actual_signature.params.iter())
+        {
+            let _ = self.unify_types(expected_param, actual_param);
+            self.last_occurs_error = None;
+            crate::lowering::collect_subst(expected_param, actual_param, subst);
+        }
+        let _ = self.unify_types(&expected_signature.ret, &actual_signature.ret);
+        self.last_occurs_error = None;
+        crate::lowering::collect_subst(&expected_signature.ret, &actual_signature.ret, subst);
+    }
+
+    /// Binds params that appear only inside where-clause associated-type
+    /// bindings: for `I: Iterator<Item = T>` with `I` already substituted to
+    /// a concrete type, `T` unifies with that type's `Item`.
+    pub(crate) fn collect_bound_assoc_subst(
+        &mut self,
+        function: &HirFunction,
+        impl_generic_names: &[String],
+        subst: &mut HashMap<String, Type>,
+    ) {
+        for bound in &function.generic_bounds {
+            let Some(param) = bound_target_param(bound) else {
+                continue;
+            };
+            let Some(target_ty) = subst.get(param) else {
+                continue;
+            };
+            let target_ty = self.resolve_type(target_ty);
+            if target_ty.is_unknown_like() {
+                continue;
+            }
+            let Some(trait_id) = self.resolve_trait_ref(&bound.trait_ty) else {
+                continue;
+            };
+            for constraint in &bound.assoc_constraints {
+                let Some(actual) =
+                    self.result
+                        .trait_env
+                        .associated_type(&target_ty, trait_id, &constraint.name.0)
+                else {
+                    continue;
+                };
+                let actual = self.resolve_type(&actual);
+                // Lower the constraint's value type against the callee's own
+                // generic names so `Item = T` yields `Param("T")`, which
+                // collect_subst can bind in the call's substitution.
+                let mut bound_params = HashMap::new();
+                for name in impl_generic_names {
+                    bound_params.insert(name.clone(), Type::Param(name.clone()));
+                }
+                for name in function
+                    .generics
+                    .iter()
+                    .chain(function.implicit_generics.iter())
+                {
+                    bound_params.insert(name.0.clone(), Type::Param(name.0.clone()));
+                }
+                let pattern = self.lower_type_ref_with_params_at(
+                    &constraint.ty,
+                    &bound_params,
+                    Some(constraint.range),
+                );
+                // Seeded entries hold fresh inference variables and
+                // `collect_subst` never overwrites occupied entries, so bind
+                // every constraint param whose slot is still unresolved by
+                // overwriting it with the concrete associated type.
+                for name in bound_params.keys() {
+                    if !crate::body::type_has_param_where(&pattern, &|candidate| {
+                        candidate == name.as_str()
+                    }) {
+                        continue;
+                    }
+                    if let Some(existing) = subst.get(name)
+                        && !existing.is_unknown_like()
+                        && !matches!(existing, Type::InferVar(_))
+                    {
+                        continue;
+                    }
+                    subst.insert(name.clone(), actual.clone());
+                }
+            }
         }
     }
 

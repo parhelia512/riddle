@@ -197,7 +197,7 @@ impl TypeChecker<'_> {
         )
     }
 
-    fn check_callable_value_call(
+    pub(super) fn check_callable_value_call(
         &mut self,
         ctx: &mut BodyCtx<'_>,
         callee: ExprId,
@@ -345,6 +345,17 @@ impl TypeChecker<'_> {
             (&mut subst, &mut generic_arg_spans),
             span,
         );
+
+        // Params that appear only inside where-clause associated-type
+        // bindings (`I: Iterator<Item = T>`) get bound from the concrete
+        // type substituted for the target param, since no argument mentions
+        // them directly.
+        let impl_generic_names = impl_generics
+            .iter()
+            .chain(function.implicit_generics.iter().map(|name| &name.0))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.collect_bound_assoc_subst(&function, &impl_generic_names, &mut subst);
 
         if let (Some(expected), Some(return_ty)) = (expected, function.ret_type.as_ref()) {
             let return_pattern = self.lower_type_ref_with_params_at(
@@ -540,6 +551,7 @@ impl TypeChecker<'_> {
             if let Some(expected) = callable_expected.as_ref() {
                 let _ = self.unify_types(expected, &actual);
                 self.last_occurs_error = None;
+                self.collect_callable_argument_subst(expected, &actual, subst);
             }
             collect_subst(&pattern, &actual, subst);
             let expected = substitute_type(&pattern, subst);

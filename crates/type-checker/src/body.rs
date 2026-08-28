@@ -283,7 +283,7 @@ fn pattern_has_unresolved_param(ty: &Type, subst: &HashMap<String, Type>) -> boo
     type_has_param_where(ty, &|name| subst.get(name).is_none_or(generic_arg_unknown))
 }
 
-fn type_has_param_where(ty: &Type, predicate: &impl Fn(&str) -> bool) -> bool {
+pub(crate) fn type_has_param_where(ty: &Type, predicate: &impl Fn(&str) -> bool) -> bool {
     match ty {
         Type::Param(name) | Type::Const(ConstArg::Param(name)) => predicate(name),
         Type::Ref(inner, _) | Type::Slice(inner) | Type::Ptr { inner, .. } => {
@@ -330,7 +330,7 @@ fn type_has_param_where(ty: &Type, predicate: &impl Fn(&str) -> bool) -> bool {
     }
 }
 
-fn bound_target_param(bound: &HirGenericBound) -> Option<&str> {
+pub(crate) fn bound_target_param(bound: &HirGenericBound) -> Option<&str> {
     match &bound.target_ty {
         HirTypeRef::Named(path)
             if matches!(path.anchor, hir::item_tree::PathAnchor::Plain)

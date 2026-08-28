@@ -599,11 +599,16 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) -> Type {
         let return_ty = self.resolve_type(&ctx.return_ty);
-        let operand_expected = match (expected, return_ty) {
-            (Some(success), Type::Enum(result_id, args))
-                if args.len() == 2 && self.hir.item_tree.enums[result_id].name.0 == "Result" =>
+        let operand_expected = match (expected, &return_ty) {
+            (Some(success), Type::Enum(enum_id, args))
+                if args.len() == 2 && self.hir.item_tree.enums[*enum_id].name.0 == "Result" =>
             {
-                Some(Type::Enum(result_id, vec![success.clone(), Type::Unknown]))
+                Some(Type::Enum(*enum_id, vec![success.clone(), Type::Unknown]))
+            }
+            (Some(success), Type::Enum(enum_id, args))
+                if args.len() == 1 && self.hir.item_tree.enums[*enum_id].name.0 == "Option" =>
+            {
+                Some(Type::Enum(*enum_id, vec![success.clone()]))
             }
             _ => None,
         };
@@ -616,12 +621,39 @@ impl TypeChecker<'_> {
         self.record_value_use(ctx, operand, ValueUse::Move);
 
         let Type::Enum(result_id, result_args) = &operand_ty else {
-            self.diagnostic("E0061", "`?` requires a Result value as its operand", span);
+            self.diagnostic(
+                "E0061",
+                "`?` requires a Result or Option value as its operand",
+                span,
+            );
             return Type::Error;
         };
-        let is_result = self.hir.item_tree.enums[*result_id].name.0 == "Result";
-        if !is_result || result_args.len() != 2 {
-            self.diagnostic("E0061", "`?` requires a Result value as its operand", span);
+        let enum_name = self.hir.item_tree.enums[*result_id].name.0.clone();
+        if enum_name == "Option" && result_args.len() == 1 {
+            let Type::Enum(return_id, return_args) = &return_ty else {
+                self.diagnostic(
+                    "E0062",
+                    "the `?` operator can only be used in a function returning Option",
+                    span,
+                );
+                return result_args[0].clone();
+            };
+            if *return_id != *result_id || return_args.len() != 1 {
+                self.diagnostic(
+                    "E0062",
+                    "the `?` operator can only be used in a function returning Option",
+                    span,
+                );
+                return result_args[0].clone();
+            }
+            return result_args[0].clone();
+        }
+        if enum_name != "Result" || result_args.len() != 2 {
+            self.diagnostic(
+                "E0061",
+                "`?` requires a Result or Option value as its operand",
+                span,
+            );
             return Type::Error;
         }
 
@@ -654,21 +686,36 @@ impl TypeChecker<'_> {
 
     fn check_try_error_conversion(
         &mut self,
-        ctx: &BodyCtx<'_>,
+        ctx: &mut BodyCtx<'_>,
         expr_id: ExprId,
         source_error: &Type,
         target_error: &Type,
         span: Option<rowan::TextRange>,
     ) {
-        let Some(into_trait) = self.find_trait_by_name("Into") else {
-            self.report_try_conversion_error(source_error, target_error, span);
+        if self.check_try_into_conversion(ctx, expr_id, source_error, target_error, span) {
             return;
+        }
+        if self.check_try_from_conversion(ctx, expr_id, source_error, target_error, span) {
+            return;
+        }
+        self.report_try_conversion_error(source_error, target_error, span);
+    }
+
+    fn check_try_into_conversion(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        source_error: &Type,
+        target_error: &Type,
+        span: Option<rowan::TextRange>,
+    ) -> bool {
+        let Some(into_trait) = self.find_trait_by_name("Into") else {
+            return false;
         };
         let Some(method) =
             self.find_trait_impl_method(source_error, Some(target_error), None, into_trait, "into")
         else {
-            self.report_try_conversion_error(source_error, target_error, span);
-            return;
+            return false;
         };
         let converted = method.function.ret_type.as_ref().map_or(Type::Unit, |ty| {
             substitute_type(
@@ -683,16 +730,7 @@ impl TypeChecker<'_> {
                 &method.subst,
             )
         });
-        if Self::bound_types_match(target_error, &converted) {
-            self.result.trait_method_calls.insert(
-                (ctx.body_id, expr_id),
-                TraitMethodCall {
-                    trait_id: into_trait,
-                    method: "into".into(),
-                    dynamic: false,
-                },
-            );
-        } else {
+        if !Self::bound_types_match(target_error, &converted) {
             self.diagnostic(
                 "E0063",
                 format!(
@@ -702,7 +740,69 @@ impl TypeChecker<'_> {
                 ),
                 span,
             );
+            return true;
         }
+        self.result.trait_method_calls.insert(
+            (ctx.body_id, expr_id),
+            TraitMethodCall {
+                trait_id: into_trait,
+                method: "into".into(),
+                dynamic: false,
+            },
+        );
+        true
+    }
+
+    fn check_try_from_conversion(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        source_error: &Type,
+        target_error: &Type,
+        span: Option<rowan::TextRange>,
+    ) -> bool {
+        let Some(from_trait) = self.find_trait_by_name("From") else {
+            return false;
+        };
+        let Some(method) =
+            self.find_trait_impl_method(target_error, Some(source_error), None, from_trait, "from")
+        else {
+            return false;
+        };
+        let converted = method.function.ret_type.as_ref().map_or(Type::Unit, |ty| {
+            substitute_type(
+                &self.lower_type_ref_with_params_at(
+                    ty,
+                    &method.subst,
+                    method
+                        .function
+                        .ret_type_range
+                        .or(Some(method.function.name_range)),
+                ),
+                &method.subst,
+            )
+        });
+        if !Self::bound_types_match(target_error, &converted) {
+            self.diagnostic(
+                "E0063",
+                format!(
+                    "`From::from` returns `{}`, not the enclosing Result error type `{}`",
+                    converted.display(self.hir),
+                    target_error.display(self.hir)
+                ),
+                span,
+            );
+            return true;
+        }
+        self.result.trait_method_calls.insert(
+            (ctx.body_id, expr_id),
+            TraitMethodCall {
+                trait_id: from_trait,
+                method: "from".into(),
+                dynamic: false,
+            },
+        );
+        true
     }
 
     fn report_try_conversion_error(

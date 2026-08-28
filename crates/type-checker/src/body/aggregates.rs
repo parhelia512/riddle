@@ -356,6 +356,7 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) -> Type {
         let iterable_ty = self.check_expr(ctx, iterable);
+        let iterable_ty = self.resolve_type(&iterable_ty);
         self.record_value_use(ctx, iterable, ValueUse::Move);
         let Some(into_iter_trait) = self.find_trait_by_name("IntoIterator") else {
             if let Type::Array(item_ty, _) = &iterable_ty {
@@ -389,9 +390,11 @@ impl TypeChecker<'_> {
 
         let item_ty = self
             .associated_type_for(ctx, &iterable_ty, into_iter_trait, "Item")
+            .map(|ty| self.resolve_type(&ty))
             .unwrap_or(Type::Unknown);
         let into_iter_ty = self
             .associated_type_for(ctx, &iterable_ty, into_iter_trait, "IntoIter")
+            .map(|ty| self.resolve_type(&ty))
             .unwrap_or(Type::Unknown);
 
         if item_ty.is_unknown_like() || into_iter_ty.is_unknown_like() {

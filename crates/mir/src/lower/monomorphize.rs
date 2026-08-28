@@ -1,6 +1,6 @@
 use super::{
-    BuiltinOperator, ExprId, FnPtrType, HashMap, HashSet, LowerCtx, MirSubst, ResolvedName, Type,
-    builtin_operator, builtin_operator_supports, closure_value_type, is_self_associated_path,
+    BuiltinOperator, Expr, ExprId, FnPtrType, HashMap, HashSet, LowerCtx, MirSubst, ResolvedName,
+    Type, builtin_operator, builtin_operator_supports, closure_value_type, is_self_associated_path,
     is_self_output, mono_type_name, operator_params_match, primitive_scalar_name, returns_unit,
     tc_const_arg_to_usize, trait_operator_contract, type_matches_self,
 };
@@ -135,6 +135,10 @@ impl LowerCtx<'_> {
                 .zip(trait_args)
                 .map(|(name, ty)| (name.0.clone(), ty)),
         );
+        // The default body refers to the trait's associated types
+        // (`Self::Item`), so resolve them from the concrete impl that is
+        // monomorphizing this body; otherwise they lower to placeholders.
+        self.insert_impl_assoc_types(trait_id, receiver_ty, &mut tc_subst, None);
         let mir_subst = tc_subst
             .iter()
             .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
@@ -151,12 +155,76 @@ impl LowerCtx<'_> {
         Some(mono_name)
     }
 
+    /// Resolves the trait's associated types from the concrete impl that
+    /// matches `receiver_ty`, inserting both `Self::Name` and `Name` keys so
+    /// default-method bodies and signatures substitute them concretely.
+    fn insert_impl_assoc_types(
+        &mut self,
+        trait_id: hir::item_tree::TraitId,
+        receiver_ty: &type_checker::Type,
+        tc_subst: &mut HashMap<String, type_checker::Type>,
+        mut mir_subst: Option<&mut HashMap<String, Type>>,
+    ) {
+        // Associated types may come from supertrait impls (e.g. `Item` lives
+        // on `Iterator` while the default method belongs to an extending
+        // trait), so walk the whole trait family.
+        let mut family = std::collections::VecDeque::from([trait_id]);
+        let mut seen: HashSet<hir::item_tree::TraitId> = HashSet::from([trait_id]);
+        while let Some(current) = family.pop_front() {
+            for bound in &self.hir.item_tree.traits[current].supertraits {
+                if let Some(super_id) = self.resolve_trait_ref(&bound.trait_ty)
+                    && seen.insert(super_id)
+                {
+                    family.push_back(super_id);
+                }
+            }
+        }
+        for (_, candidate) in self.hir.item_tree.impls.iter() {
+            let Some(candidate_trait) = candidate.trait_ty.as_ref() else {
+                continue;
+            };
+            let Some(candidate_id) = self.resolve_trait_ref(candidate_trait) else {
+                continue;
+            };
+            if !seen.contains(&candidate_id) || !self.impl_type_matches(candidate, receiver_ty) {
+                continue;
+            }
+            if let Some(subst) = self.impl_mir_subst(candidate, receiver_ty) {
+                for alias_id in &candidate.type_aliases {
+                    let alias = &self.hir.item_tree.type_aliases[*alias_id];
+                    let Some(alias_ty) = alias.ty.as_ref() else {
+                        continue;
+                    };
+                    let resolved = self.lower_hir_type_for_pattern(alias_ty, &subst.tc_types);
+                    let resolved_mir = self.convert_type(&resolved);
+                    tc_subst.insert(format!("Self::{}", alias.name.0), resolved.clone());
+                    tc_subst.insert(alias.name.0.clone(), resolved);
+                    if let Some(mir_subst) = mir_subst.as_deref_mut() {
+                        mir_subst.insert(format!("Self::{}", alias.name.0), resolved_mir.clone());
+                        mir_subst.insert(alias.name.0.clone(), resolved_mir);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
     pub(super) fn mono_function_name(
         &mut self,
         fid: hir::item_tree::FunctionId,
         callee: ExprId,
     ) -> Option<String> {
         let body_id = self.current_body?;
+        // Trait default methods are reached through a receiver even though
+        // they belong to no impl; carry the receiver so `Self` and the
+        // trait's associated types substitute concretely.
+        let receiver = if self.default_methods.contains_key(&fid)
+            && let Expr::FieldAccess { base, .. } = &self.hir.bodies[body_id].exprs[callee]
+        {
+            self.type_result.expr_types.get(&(body_id, *base)).cloned()
+        } else {
+            None
+        };
         let tc_args = if let Some(call) = self.type_result.generic_calls.get(&(body_id, callee)) {
             call.args.clone()
         } else {
@@ -165,13 +233,14 @@ impl LowerCtx<'_> {
                 _ => return None,
             }
         };
-        self.mono_function_name_for_args(fid, &tc_args)
+        self.mono_function_name_for_args(fid, &tc_args, receiver)
     }
 
     pub(super) fn mono_function_name_for_args(
         &mut self,
         fid: hir::item_tree::FunctionId,
         tc_args: &[type_checker::Type],
+        receiver_tc: Option<type_checker::Type>,
     ) -> Option<String> {
         if !self.hir.function_bodies.contains_key(&fid) {
             return None;
@@ -238,7 +307,16 @@ impl LowerCtx<'_> {
             .collect::<HashMap<_, _>>();
         let self_tc_ty = imp
             .as_ref()
-            .map(|imp| self.lower_hir_type_for_pattern(&imp.self_ty, &outer_tc_subst));
+            .map(|imp| self.lower_hir_type_for_pattern(&imp.self_ty, &outer_tc_subst))
+            .or_else(|| {
+                receiver_tc.as_ref().map(|receiver| {
+                    let receiver = match receiver {
+                        type_checker::Type::Ref(inner, _) => inner.as_ref().clone(),
+                        other => other.clone(),
+                    };
+                    self.substitute_tc_type(&receiver)
+                })
+            });
         let self_mir_ty = self_tc_ty.as_ref().map(|ty| self.convert_type(ty));
         if let Some(self_ty) = &self_mir_ty {
             subst.insert("Self".into(), self_ty.clone());
@@ -259,6 +337,17 @@ impl LowerCtx<'_> {
         let mut tc_subst = tc_subst;
         if let Some(self_ty) = self_tc_ty {
             tc_subst.insert("Self".into(), self_ty);
+        }
+        if self.default_methods.contains_key(&fid)
+            && let Some(receiver) = &receiver_tc
+            && let Some(trait_id) = self.default_methods.get(&fid)
+        {
+            let receiver = match receiver {
+                type_checker::Type::Ref(inner, _) => inner.as_ref().clone(),
+                other => other.clone(),
+            };
+            let receiver = self.substitute_tc_type(&receiver);
+            self.insert_impl_assoc_types(*trait_id, &receiver, &mut tc_subst, Some(&mut subst));
         }
         let mono_name = format!("{}__{}", self.method_symbol_base(fid), suffix);
         self.mono_functions.insert(key, mono_name.clone());

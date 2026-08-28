@@ -1,7 +1,7 @@
 use super::{
-    BinaryOp, BodyCtx, FloatTy, HashMap, HashSet, HirAssocTypeConstraint, HirGenericBound,
-    HirTypeRef, IntTy, LangItem, TraitBound, TraitId, Type, TypeChecker, bound_target_param,
-    builtin_callable_kind,
+    BinaryOp, BodyCtx, ClosureKind, FloatTy, HashMap, HashSet, HirAssocTypeConstraint,
+    HirGenericBound, HirTypeRef, IntTy, LangItem, TraitBound, TraitId, Type, TypeChecker,
+    bound_target_param, builtin_callable_kind,
 };
 
 impl TypeChecker<'_> {
@@ -406,6 +406,21 @@ impl TypeChecker<'_> {
         })
     }
 
+    /// Whether a callable with `actual`'s kind can be used where `required` is
+    /// demanded: `Fn` values also satisfy `FnMut` and `FnOnce` demands.
+    fn callable_kind_satisfies(actual: ClosureKind, required: ClosureKind) -> bool {
+        use ClosureKind::{Fn as KFn, FnMut as KFnMut, FnOnce as KFnOnce};
+        matches!(
+            (actual, required),
+            (KFn, KFn)
+                | (KFn, KFnMut)
+                | (KFn, KFnOnce)
+                | (KFnMut, KFnMut)
+                | (KFnMut, KFnOnce)
+                | (KFnOnce, KFnOnce)
+        )
+    }
+
     pub(super) fn impl_bounds_satisfied(
         &mut self,
         imp: &hir::item_tree::HirImpl,
@@ -413,6 +428,52 @@ impl TypeChecker<'_> {
         assumptions: &[TraitBound],
     ) -> bool {
         imp.generic_bounds.iter().all(|bound| {
+            // Callable bounds (`F: FnMut(A) -> R`) have no trait impls; they
+            // are satisfied structurally by the argument's own callable
+            // signature, with kind widening (Fn coerces to FnMut/FnOnce).
+            if let Some(required_kind) = builtin_callable_kind(&bound.trait_ty)
+                && let Some(required_callable) = bound.callable.as_ref()
+            {
+                let actual_ty = self.lower_type_ref_with_params_at(
+                    &bound.target_ty,
+                    subst,
+                    Some(bound.target_range),
+                );
+                let actual_ty = self.resolve_type(&actual_ty);
+                if actual_ty.is_unknown_like() {
+                    return true;
+                }
+                let required = self.lower_hir_callable_signature(
+                    required_callable,
+                    required_kind,
+                    subst,
+                    Some(bound.trait_range),
+                );
+                let Some(actual_signature) = self.callable_signature_for_type(&actual_ty) else {
+                    return false;
+                };
+                if !Self::callable_kind_satisfies(actual_signature.kind, required.kind) {
+                    return false;
+                }
+                if actual_signature.params.len() != required.params.len() {
+                    return false;
+                }
+                for (required_param, actual_param) in
+                    required.params.iter().zip(actual_signature.params.iter())
+                {
+                    if !self.unify_types(required_param, actual_param) {
+                        self.last_occurs_error = None;
+                        return false;
+                    }
+                    self.last_occurs_error = None;
+                }
+                if !self.unify_types(&required.ret, &actual_signature.ret) {
+                    self.last_occurs_error = None;
+                    return false;
+                }
+                self.last_occurs_error = None;
+                return true;
+            }
             let actual = self.lower_type_ref_with_params_at(
                 &bound.target_ty,
                 subst,

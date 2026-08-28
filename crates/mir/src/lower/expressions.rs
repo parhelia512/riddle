@@ -1206,6 +1206,9 @@ impl LowerCtx<'_> {
         ) {
             return self.finish_expr(builder, input, value);
         }
+        if let Some(value) = self.lower_bound_trait_call(builder, input, callee, args) {
+            return self.finish_expr(builder, input, value);
+        }
         let Some(target) = self.callee_function_id(callee) else {
             let value = self.lower_indirect_call_expr(builder, input, callee, args);
             return self.finish_expr(builder, input, value);
@@ -1421,6 +1424,48 @@ impl LowerCtx<'_> {
         values.push(receiver);
         values.extend(args);
         Some(builder.call(FuncRef::Local(name), values, input.mir_type.clone()))
+    }
+
+    // Lowers a method call whose receiver satisfies a where-clause trait
+    // bound (`I: Iterator`): the checker records these as non-dynamic trait
+    // method calls, and the concrete impl resolves per receiver at MIR time.
+    fn lower_bound_trait_call(
+        &mut self,
+        builder: &mut Builder,
+        input: &ExprLoweringInput<'_>,
+        callee: ExprId,
+        args: &[ExprId],
+    ) -> Option<Value> {
+        let body_id = self.current_body?;
+        let call = match self.type_result.trait_method_calls.get(&(body_id, callee)) {
+            Some(call) => call.clone(),
+            None => {
+                return None;
+            }
+        };
+        if call.dynamic {
+            return None;
+        }
+        let base = match &input.body.exprs[callee] {
+            Expr::FieldAccess { base, .. } => *base,
+            _ => {
+                return None;
+            }
+        };
+        let receiver_ty = match self.type_result.expr_types.get(&(body_id, base)) {
+            Some(ty) => ty,
+            None => {
+                return None;
+            }
+        };
+        let fid = match self.find_trait_impl_method(call.trait_id, &call.method, receiver_ty, None)
+        {
+            Some(fid) => fid,
+            None => {
+                return None;
+            }
+        };
+        Some(self.lower_named_call_expr(builder, input, callee, args, fid))
     }
 
     fn lower_indirect_call_expr(
@@ -1771,25 +1816,37 @@ impl LowerCtx<'_> {
         let type_checker::Type::Enum(return_id, _) = &return_ty else {
             return self.lower_expr(builder, param_values, body, operand);
         };
-        if result_id != return_id || result_args.len() != 2 {
+        let enum_data = &self.hir.item_tree.enums[*result_id];
+        let is_result = enum_data.name.0 == "Result";
+        let is_option = enum_data.name.0 == "Option";
+        let expected_args = match (is_result, is_option) {
+            (true, _) => 2,
+            (_, true) => 1,
+            _ => 0,
+        };
+        if result_id != return_id || expected_args == 0 || result_args.len() != expected_args {
             return self.lower_expr(builder, param_values, body, operand);
         }
 
         let operand_value = self.lower_expr(builder, param_values, body, operand);
         let operand_mir_ty = self.convert_type(&operand_tc_ty);
         let tag = builder.extract_value(operand_value, 0, Type::Int(IntTy::U32));
-        let enum_data = &self.hir.item_tree.enums[*result_id];
+        let (ok_variant_name, err_variant_name) = if is_result {
+            ("Ok", "Err")
+        } else {
+            ("Some", "None")
+        };
         let Some(ok_variant) = enum_data
             .variants
             .iter()
-            .position(|variant| variant.name.0 == "Ok")
+            .position(|variant| variant.name.0 == ok_variant_name)
         else {
             return operand_value;
         };
         let Some(err_variant) = enum_data
             .variants
             .iter()
-            .position(|variant| variant.name.0 == "Err")
+            .position(|variant| variant.name.0 == err_variant_name)
         else {
             return operand_value;
         };
@@ -1817,15 +1874,23 @@ impl LowerCtx<'_> {
             _ => Type::Unit,
         };
         let error_value = builder.extract_value(operand_value, err_offset, error_mir_ty);
-        let error_tc_ty = result_args[1].clone();
-        let converted_error =
-            self.convert_try_error(builder, expr_id, error_value, &error_tc_ty, &return_ty);
+        let converted_error = if is_result {
+            let error_tc_ty = result_args[1].clone();
+            self.convert_try_error(builder, expr_id, error_value, &error_tc_ty, &return_ty)
+        } else {
+            error_value
+        };
         let return_mir_ty = self.current_function_return_mir_type();
+        let error_payloads = if is_result {
+            vec![converted_error]
+        } else {
+            Vec::new()
+        };
         let error_result = self.lower_enum_variant_value(
             builder,
             *return_id,
             err_variant,
-            vec![converted_error],
+            error_payloads,
             return_mir_ty,
         );
         self.emit_current_drop_scope(builder);
@@ -1878,13 +1943,25 @@ impl LowerCtx<'_> {
             type_checker::Type::Enum(_, return_args) => return_args.get(1).unwrap_or(error_ty),
             _ => error_ty,
         };
-        let Some(fid) =
-            self.find_trait_impl_method(call.trait_id, &call.method, error_ty, Some(target_error))
-        else {
+        // `Into` impls have the source error as their self type, while `From`
+        // impls receive the target error as self and take the source as trait
+        // argument, so the lookup direction depends on the recorded trait.
+        let is_from = self.hir.item_tree.traits[call.trait_id].name.0 == "From";
+        let (receiver_error, trait_arg_error) = if is_from {
+            (target_error, error_ty)
+        } else {
+            (error_ty, target_error)
+        };
+        let Some(fid) = self.find_trait_impl_method(
+            call.trait_id,
+            &call.method,
+            receiver_error,
+            Some(trait_arg_error),
+        ) else {
             return error_value;
         };
         let name = self
-            .mono_method_name_for_receiver(fid, error_ty, Some(target_error))
+            .mono_method_name_for_receiver(fid, receiver_error, Some(trait_arg_error))
             .unwrap_or_else(|| self.function_name(fid));
         let return_ty = self.hir.item_tree.functions[fid]
             .ret_type

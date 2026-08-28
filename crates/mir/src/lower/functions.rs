@@ -835,7 +835,7 @@ impl LowerCtx<'_> {
             name.clone()
         } else {
             let target = self
-                .mono_function_name_for_args(fid, &args)
+                .mono_function_name_for_args(fid, &args, None)
                 .unwrap_or_else(|| self.function_name(fid));
             let name = format!("__riddle_fn_adapter_{target}");
             self.function_adapters.insert(key, name.clone());

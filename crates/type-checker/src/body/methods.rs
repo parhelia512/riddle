@@ -31,6 +31,19 @@ impl TypeChecker<'_> {
         let method = match self.find_method(ctx, &base_ty, &method_name) {
             Ok(Some(method)) => method,
             Ok(None) => {
+                // Fall back to calling a callable stored in a field
+                // (`self.f(x)` where `f` is a closure / `impl FnMut` field).
+                if let Some(ret) = self.check_callable_field_call(
+                    ctx,
+                    callee,
+                    base,
+                    &base_ty,
+                    &method_name,
+                    args,
+                    span,
+                ) {
+                    return ret;
+                }
                 for arg in args {
                     self.check_expr(ctx, *arg);
                     self.record_value_use(ctx, *arg, ValueUse::Move);
@@ -93,6 +106,36 @@ impl TypeChecker<'_> {
             (expected, span),
             (base_ty, method),
         )
+    }
+
+    /// Resolves `base.name(args)` when `name` is not a method but a field
+    /// holding a callable value (a closure, function item, or a generic
+    /// parameter constrained by a callable bound).
+    #[allow(clippy::too_many_arguments)]
+    fn check_callable_field_call(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        callee: ExprId,
+        base: ExprId,
+        base_ty: &Type,
+        field_name: &Name,
+        args: &[ExprId],
+        span: Option<rowan::TextRange>,
+    ) -> Option<Type> {
+        if base_ty.is_unknown_like() {
+            return None;
+        }
+        let field_ty = self.check_field_access(ctx, base, field_name, None, span);
+        let field_ty = self.resolve_type(&field_ty);
+        let signature = self
+            .callable_signature_for_type(&field_ty)
+            .or_else(|| self.callable_bound_for_type(ctx, &field_ty))?;
+        // Type the callee as the field's callable type so MIR lowers the call
+        // as an indirect call through the loaded field value.
+        self.result
+            .expr_types
+            .insert((ctx.body_id, callee), field_ty.clone());
+        Some(self.check_callable_value_call(ctx, callee, &field_ty, args, &signature, span))
     }
 
     fn check_resolved_method_call(
@@ -331,6 +374,7 @@ impl TypeChecker<'_> {
             if let Some(expected) = callable_expected.as_ref() {
                 let _ = self.unify_types(expected, &actual);
                 self.last_occurs_error = None;
+                self.collect_callable_argument_subst(expected, &actual, subst);
             }
             collect_subst(&pattern, &actual, subst);
             let expected = substitute_type(&pattern, subst);
@@ -895,6 +939,18 @@ impl TypeChecker<'_> {
                     Some(constraint.range),
                 );
                 supertrait_subst.insert(format!("Self::{}", constraint.name.0), ty);
+            }
+            // Associated types of the resolved trait that the bound does not
+            // constrain stay abstract; map them to the body's own
+            // `Self::Item`-style placeholders so signatures like
+            // `Option<Self::Item>` lower to abstract-but-consistent types.
+            for alias in &self.hir.item_tree.traits[method_trait_id].type_aliases {
+                let key = format!("Self::{}", alias.name.0);
+                if !supertrait_subst.contains_key(&key)
+                    && let Some(ty) = ctx.generic_params.get(&key)
+                {
+                    supertrait_subst.insert(key, ty.clone());
+                }
             }
             subst.extend(supertrait_subst);
             return Some(ResolvedMethod {

@@ -799,6 +799,9 @@ impl<'s> Parser<'s> {
             self.param();
             while self.at(SyntaxKind::Comma) {
                 self.bump();
+                if self.at(SyntaxKind::RParen) || self.at(SyntaxKind::Eof) {
+                    break;
+                }
                 self.param();
             }
         }

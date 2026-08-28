@@ -548,7 +548,7 @@ const PRODUCER_SPAN_CASES: &[DiagnosticSpanCase] = &[
     ),
     (
         "E0061",
-        "`?` requires a Result value",
+        "`?` requires a Result or Option value as its operand",
         "fun main() { 1?; }",
         "1?",
         "1?",

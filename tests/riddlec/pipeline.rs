@@ -1291,7 +1291,9 @@ fn try_requires_result_operand() {
             .type_result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("`?` requires a Result value")),
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("`?` requires a Result or Option value as its operand")),
         "{:#?}",
         result.type_result.diagnostics
     );
