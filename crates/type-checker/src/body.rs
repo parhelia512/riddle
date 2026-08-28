@@ -296,7 +296,10 @@ fn type_has_param_where(ty: &Type, predicate: &impl Fn(&str) -> bool) -> bool {
             type_has_param_where(inner, predicate)
                 || matches!(len, ConstArg::Param(name) if predicate(name))
         }
-        Type::Struct(_, args) | Type::Enum(_, args) | Type::FunctionItem { args, .. } => {
+        Type::Struct(_, args)
+        | Type::Enum(_, args)
+        | Type::FunctionItem { args, .. }
+        | Type::OpaqueTrait { args, .. } => {
             args.iter().any(|arg| type_has_param_where(arg, predicate))
         }
         Type::DynTrait {
@@ -354,9 +357,10 @@ fn type_has_unresolved_inference(ty: &Type) -> bool {
             type_has_unresolved_inference(inner)
                 || matches!(len, ConstArg::Unknown | ConstArg::Error)
         }
-        Type::Struct(_, args) | Type::Enum(_, args) | Type::FunctionItem { args, .. } => {
-            args.iter().any(type_has_unresolved_inference)
-        }
+        Type::Struct(_, args)
+        | Type::Enum(_, args)
+        | Type::FunctionItem { args, .. }
+        | Type::OpaqueTrait { args, .. } => args.iter().any(type_has_unresolved_inference),
         Type::DynTrait {
             args,
             assoc_bindings,
@@ -479,7 +483,7 @@ fn type_contains_unresolved_const_param(ty: &Type, params: &HashMap<String, Type
             type_contains_unresolved_const_param(inner, params)
                 || matches!(len, ConstArg::Param(name) if !matches!(params.get(name), Some(Type::Const(_))))
         }
-        Type::Struct(_, args) | Type::Enum(_, args) => args
+        Type::Struct(_, args) | Type::Enum(_, args) | Type::OpaqueTrait { args, .. } => args
             .iter()
             .any(|arg| type_contains_unresolved_const_param(arg, params)),
         Type::FunctionItem { args, .. } => args
@@ -536,7 +540,7 @@ fn grows_generic_arg(ty: &Type, params: &HashMap<String, Type>) -> bool {
         Type::Tuple(elements) => elements
             .iter()
             .any(|element| contains_current_param(element, params)),
-        Type::Struct(_, args) | Type::Enum(_, args) => {
+        Type::Struct(_, args) | Type::Enum(_, args) | Type::OpaqueTrait { args, .. } => {
             args.iter().any(|arg| contains_current_param(arg, params))
         }
         _ => false,
@@ -555,7 +559,7 @@ fn contains_current_param(ty: &Type, params: &HashMap<String, Type>) -> bool {
         Type::Tuple(elements) => elements
             .iter()
             .any(|element| contains_current_param(element, params)),
-        Type::Struct(_, args) | Type::Enum(_, args) => {
+        Type::Struct(_, args) | Type::Enum(_, args) | Type::OpaqueTrait { args, .. } => {
             args.iter().any(|arg| contains_current_param(arg, params))
         }
         _ => false,

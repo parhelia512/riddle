@@ -71,13 +71,98 @@ impl TypeChecker<'_> {
 
         let callee_ty = self.check_expr(ctx, callee);
         let resolved_callee = self.resolve_type(&callee_ty);
+        if let Type::Closure {
+            id,
+            generics,
+            signature,
+            ..
+        } = &resolved_callee
+            && !generics.is_empty()
+        {
+            if !type_args.is_empty() && type_args.len() != generics.len() {
+                self.diagnostic(
+                    "E0032",
+                    format!(
+                        "anonymous function expects {} type argument(s), got {}",
+                        generics.len(),
+                        type_args.len()
+                    ),
+                    span,
+                );
+            }
+            let concrete = generics
+                .iter()
+                .enumerate()
+                .map(|(index, _)| match type_args.get(index) {
+                    Some(arg) => self.lower_type_ref_with_params_at(
+                        arg,
+                        &ctx.generic_params,
+                        ctx.expr_range(callee),
+                    ),
+                    None => self.fresh_infer(),
+                })
+                .collect::<Vec<_>>();
+            let subst = generics
+                .iter()
+                .cloned()
+                .zip(concrete.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            let instantiated = CallableSignature {
+                is_unsafe: signature.is_unsafe,
+                kind: signature.kind,
+                params: signature
+                    .params
+                    .iter()
+                    .map(|param| substitute_type(param, &subst))
+                    .collect(),
+                ret: Box::new(substitute_type(&signature.ret, &subst)),
+            };
+            let result = self.check_callable_value_call(
+                ctx,
+                callee,
+                &resolved_callee,
+                args,
+                &instantiated,
+                span,
+            );
+            let generic_bounds = match &self.hir.bodies[id.body].exprs[id.expr] {
+                Expr::Lambda { generic_bounds, .. } => generic_bounds.clone(),
+                _ => Vec::new(),
+            };
+            let resolved_subst = subst
+                .iter()
+                .map(|(name, ty)| (name.clone(), self.resolve_type(ty)))
+                .collect();
+            self.check_item_bounds(
+                ctx,
+                "anonymous function",
+                &generic_bounds,
+                &resolved_subst,
+                span,
+            );
+            let concrete = concrete.iter().map(|arg| self.resolve_type(arg)).collect();
+            self.result.generic_calls.insert(
+                (ctx.body_id, callee),
+                crate::result::GenericCall { args: concrete },
+            );
+            return result;
+        }
+        let callable_impl = self.callable_impl_for_type(&resolved_callee);
         let signature = if matches!(resolved_callee, Type::FunctionItem { .. }) {
             None
         } else {
-            self.callable_signature_for_type(&resolved_callee)
+            callable_impl
+                .as_ref()
+                .map(|(signature, _)| signature.clone())
+                .or_else(|| self.callable_signature_for_type(&resolved_callee))
                 .or_else(|| self.callable_bound_for_type(ctx, &resolved_callee))
         };
         if let Some(signature) = signature {
+            if let Some((_, method)) = callable_impl {
+                self.result
+                    .callable_impl_calls
+                    .insert((ctx.body_id, expr_id), method);
+            }
             return self.check_callable_value_call(
                 ctx,
                 callee,

@@ -224,6 +224,109 @@ fn generic_call_inference_keeps_nested_constructor_expected_type() {
 }
 
 #[test]
+fn general_impl_trait_and_advanced_callables_type_check() {
+    let result = check(
+        r"
+        trait Value {
+            fun value(&self) -> i32;
+        }
+
+        impl Value for i32 {
+            fun value(&self) -> i32 { *self }
+        }
+
+        struct Adder { amount: i32 }
+
+        impl Fn(i32) -> i32 for Adder {
+            fun call(&self, value: i32) -> i32 { value + self.amount }
+        }
+
+        fun read(value: impl Value) -> i32 { value.value() }
+        fun make() -> impl Value { 7i32 }
+
+        fun main() -> i32 {
+            let first = fun<T: Value>((left, _): (T, T)) -> i32 { left.value() };
+            let fib = fun(n: i32) -> i32 {
+                if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+            };
+            let add = Adder { amount: 2 };
+            read(make()) + first::<i32>((add(3), 0)) + fib(6)
+        }
+        ",
+    );
+
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn generic_anonymous_function_checks_bounds_at_call_site() {
+    let result = check(
+        r"
+        trait Value {}
+        struct Missing {}
+
+        fun main() {
+            let use_value = fun<T: Value>(value: T) { value };
+            use_value(Missing {});
+        }
+        ",
+    );
+
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0035" && diagnostic.message.contains("does not satisfy bound")
+    }));
+}
+
+#[test]
+fn generic_anonymous_function_can_capture_and_recurse() {
+    let result = check(
+        r"
+        trait Value {
+            fun value(&self) -> i32;
+        }
+        impl Value for i32 {
+            fun value(&self) -> i32 { *self }
+        }
+
+        fun make<T: Value>(value: T) -> impl Fn() -> i32 {
+            fun() -> i32 { value.value() }
+        }
+
+        fun main() {
+            let recurse = fun<T>(value: T) -> T {
+                if true { value } else { recurse::<T>(value) }
+            };
+            let _ = make(7i32);
+            let _ = recurse::<i32>(1);
+        }
+        ",
+    );
+
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn generic_impl_trait_return_preserves_trait_arguments() {
+    let result = check(
+        r"
+        trait Marker<T> {
+            fun value(&self) -> i32;
+        }
+        struct Wrapper<T> {
+            value: T,
+        }
+        impl<T> Marker<T> for Wrapper<T> {
+            fun value(&self) -> i32 { 1 }
+        }
+        fun make<T>(value: T) -> impl Marker<T> { Wrapper { value } }
+        fun main() -> i32 { make(1).value() }
+        ",
+    );
+
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
 fn generic_call_reuses_inferred_type_for_unit_enum_variants() {
     let result = check(
         r#"

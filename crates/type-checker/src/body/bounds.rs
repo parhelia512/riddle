@@ -64,6 +64,11 @@ impl TypeChecker<'_> {
                     self.check_type_bounds_inner(ctx, arg, span);
                 }
             }
+            Type::OpaqueTrait { args, .. } => {
+                for arg in args {
+                    self.check_type_bounds_inner(ctx, arg, span);
+                }
+            }
             Type::Struct(struct_id, args) => {
                 for arg in args {
                     self.check_type_bounds_inner(ctx, arg, span);
@@ -202,6 +207,11 @@ impl TypeChecker<'_> {
         if let Some(function) = ctx.function {
             bounds.extend(function.generic_bounds.clone());
         }
+        bounds.extend(
+            ctx.lambdas
+                .iter()
+                .flat_map(|lambda| lambda.generic_bounds.clone()),
+        );
         bounds
     }
 
@@ -228,6 +238,14 @@ impl TypeChecker<'_> {
             return true;
         }
         let trait_args = self.trait_ref_args(trait_id, trait_ref, &actual, subst, None);
+        if let Type::OpaqueTrait {
+            trait_id: opaque_trait,
+            args: opaque_args,
+            ..
+        } = &actual
+        {
+            return self.trait_implies(*opaque_trait, trait_id) && opaque_args == &trait_args;
+        }
         if let Type::Param(param) = &actual {
             return self.param_has_trait_bound(
                 ctx,

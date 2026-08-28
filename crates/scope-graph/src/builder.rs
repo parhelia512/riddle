@@ -1071,8 +1071,32 @@ impl<'a> ScopeGraphBuilder<'a> {
                 ..
             } => {
                 self.emit_type_references(ty, current_scope, nodes, edges);
+                let recursive_scope = init.and_then(|init| {
+                    matches!(body.pats[*pat], Pattern::Binding { .. })
+                        .then_some(())
+                        .filter(|_| match &body.exprs[init] {
+                            Expr::Lambda {
+                                params, ret_type, ..
+                            } => {
+                                params.iter().all(|param| {
+                                    !matches!(param.ty, hir::item_tree::HirTypeRef::Unknown)
+                                }) && !matches!(ret_type, hir::item_tree::HirTypeRef::Unknown)
+                            }
+                            _ => false,
+                        })
+                        .map(|()| {
+                            self.walk_pat_for_bindings(body, *pat, current_scope, nodes, edges)
+                        })
+                });
                 if let Some(init) = init {
-                    self.walk_expr_for_refs(body_id, body, *init, current_scope, nodes, edges);
+                    self.walk_expr_for_refs(
+                        body_id,
+                        body,
+                        *init,
+                        recursive_scope.unwrap_or(current_scope),
+                        nodes,
+                        edges,
+                    );
                 }
                 if let Some(else_) = else_ {
                     // The else block runs when the pattern did not match, so
@@ -1082,7 +1106,9 @@ impl<'a> ScopeGraphBuilder<'a> {
 
                 // `let` bindings become visible only after the initializer, and
                 // ride the same pattern machinery as match arms and for loops.
-                self.walk_pat_for_bindings(body, *pat, current_scope, nodes, edges)
+                recursive_scope.unwrap_or_else(|| {
+                    self.walk_pat_for_bindings(body, *pat, current_scope, nodes, edges)
+                })
             }
             Stmt::Return { value } => {
                 if let Some(v) = value {
@@ -1243,6 +1269,7 @@ impl<'a> ScopeGraphBuilder<'a> {
         edges: &mut Vec<EdgeId>,
     ) {
         let Expr::Lambda {
+            generic_bounds,
             params,
             ret_type,
             body: lambda_body,
@@ -1251,14 +1278,19 @@ impl<'a> ScopeGraphBuilder<'a> {
         else {
             unreachable!("walk_lambda_for_refs requires a lambda expression");
         };
-        let lambda_scope = self.sg.alloc_node(Node::Scope(ScopeKind::FunctionScope));
+        let mut lambda_scope = self.sg.alloc_node(Node::Scope(ScopeKind::FunctionScope));
         nodes.push(lambda_scope);
         let edge = self
             .sg
             .add_edge(lambda_scope, current_scope, EdgeKind::Lex, 0);
         edges.push(edge);
+        self.emit_bound_type_references(generic_bounds, lambda_scope, nodes, edges);
         for (index, param) in params.iter().enumerate() {
             self.emit_type_references(&param.ty, lambda_scope, nodes, edges);
+            if let Some(pat) = param.pat {
+                self.emit_pat_bindings(body, pat, &mut lambda_scope, nodes, edges);
+                continue;
+            }
             let pop = self.sg.alloc_node(Node::PopSymbol {
                 name: param.name.clone(),
                 define: DefRef::LambdaParam {

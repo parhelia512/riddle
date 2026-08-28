@@ -676,6 +676,11 @@ impl ImplDecl {
     }
 
     #[must_use]
+    pub fn callable_trait_args(&self) -> Option<CallableTraitArgs> {
+        self.syntax.descendants().find_map(CallableTraitArgs::cast)
+    }
+
+    #[must_use]
     pub fn has_for(&self) -> bool {
         self.syntax
             .children_with_tokens()
@@ -1030,6 +1035,16 @@ impl LambdaExpr {
 
     #[must_use]
     pub fn param_list(&self) -> Option<ParamList> {
+        support::child(&self.syntax)
+    }
+
+    #[must_use]
+    pub fn generic_params(&self) -> Option<GenericParams> {
+        support::child(&self.syntax)
+    }
+
+    #[must_use]
+    pub fn where_clause(&self) -> Option<WhereClause> {
         support::child(&self.syntax)
     }
 
@@ -1703,6 +1718,11 @@ impl Param {
 
     #[must_use]
     pub fn ty(&self) -> Option<Type> {
+        support::child(&self.syntax)
+    }
+
+    #[must_use]
+    pub fn pattern(&self) -> Option<Pattern> {
         support::child(&self.syntax)
     }
 

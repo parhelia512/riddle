@@ -835,10 +835,16 @@ impl<'s> Parser<'s> {
             self.bump();
         }
         self.expect(SyntaxKind::Fun);
+        if self.at(SyntaxKind::Less) {
+            self.generic_params(true, false);
+        }
         self.lambda_param_list();
         if self.at(SyntaxKind::Arrow) {
             self.bump();
             self.ty();
+        }
+        if self.at(SyntaxKind::Where) {
+            self.where_clause();
         }
         self.block();
         m.complete(self, SyntaxKind::LambdaExpr)
@@ -863,10 +869,7 @@ impl<'s> Parser<'s> {
 
     fn lambda_param(&mut self) {
         let m = self.start();
-        if self.at(SyntaxKind::Mut) {
-            self.bump();
-        }
-        self.expect(SyntaxKind::Ident);
+        self.pattern();
         if self.at(SyntaxKind::Colon) {
             self.bump();
             self.ty();
@@ -1917,7 +1920,11 @@ impl<'s> Parser<'s> {
             self.generic_params(true, false);
         }
 
-        self.ty();
+        if self.at_callable_trait_path() {
+            self.impl_callable_trait_type();
+        } else {
+            self.ty();
+        }
 
         // optional "for" ty
         if self.at(SyntaxKind::For) {
@@ -1937,6 +1944,21 @@ impl<'s> Parser<'s> {
 
         self.expect(SyntaxKind::RBrace);
         m.complete(self, SyntaxKind::ImplDecl);
+    }
+
+    fn at_callable_trait_path(&self) -> bool {
+        if self.current() != SyntaxKind::Ident || self.nth(1) != SyntaxKind::LParen {
+            return false;
+        }
+        let token = &self.tokens[self.current_non_trivia_pos];
+        matches!(&self.source[token.span.clone()], "Fn" | "FnMut" | "FnOnce")
+    }
+
+    fn impl_callable_trait_type(&mut self) {
+        let m = self.start();
+        self.path();
+        self.callable_trait_args();
+        m.complete(self, SyntaxKind::NamedType);
     }
 
     fn impl_item(&mut self) {

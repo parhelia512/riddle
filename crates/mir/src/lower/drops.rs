@@ -25,6 +25,12 @@ impl LowerCtx<'_> {
         projection: Vec<DropProjection>,
     ) -> Vec<DropSlot> {
         let ty = self.substitute_tc_type(ty);
+        if matches!(
+            ty,
+            type_checker::Type::Closure { ref generics, .. } if !generics.is_empty()
+        ) {
+            return Vec::new();
+        }
         if self.type_result.trait_env.type_has_explicit_drop(&ty)
             || matches!(ty, type_checker::Type::Enum(..))
             || matches!(
@@ -146,6 +152,12 @@ impl LowerCtx<'_> {
         let ty = self.substitute_tc_type(ty);
         if matches!(
             ty,
+            type_checker::Type::Closure { ref generics, .. } if !generics.is_empty()
+        ) {
+            return;
+        }
+        if matches!(
+            ty,
             type_checker::Type::FunctionItem { .. }
                 | type_checker::Type::Closure { .. }
                 | type_checker::Type::OpaqueCallable { .. }
@@ -259,6 +271,12 @@ impl LowerCtx<'_> {
             return false;
         }
         let ty = self.substitute_tc_type(ty);
+        if matches!(
+            ty,
+            type_checker::Type::Closure { ref generics, .. } if !generics.is_empty()
+        ) {
+            return false;
+        }
         if self.type_result.trait_env.type_has_explicit_drop(&ty)
             || matches!(
                 &ty,

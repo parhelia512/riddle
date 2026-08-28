@@ -801,9 +801,9 @@ fn closure_diagnostic_spans_point_at_the_relevant_source() {
         ),
         (
             "E0047",
-            "only impl Fn",
-            "trait Display {} fun show(value: impl Display) {}",
-            "impl Display",
+            "requires a callable signature",
+            "fun show(value: impl Fn) {}",
+            "impl Fn",
             false,
         ),
         (

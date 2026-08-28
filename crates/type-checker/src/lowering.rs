@@ -227,29 +227,50 @@ impl TypeChecker<'_> {
                 callable,
                 hidden,
             } => {
-                let Some(kind) = builtin_callable_kind(trait_ty) else {
-                    self.diagnostic(
-                        "E0047",
-                        "only impl Fn, impl FnMut, and impl FnOnce are currently supported",
-                        span.or(Some(*trait_range)),
-                    );
-                    return Type::Unknown;
-                };
-                let Some(callable) = callable else {
-                    self.diagnostic(
-                        "E0047",
-                        format!("impl {} requires a callable signature", kind.as_str()),
-                        span.or(Some(*trait_range)),
-                    );
-                    return Type::Unknown;
-                };
-                hidden.as_ref().map_or_else(
-                    || Type::OpaqueCallable {
+                if let Some(kind) = builtin_callable_kind(trait_ty) {
+                    let Some(callable) = callable else {
+                        self.diagnostic(
+                            "E0047",
+                            format!("impl {} requires a callable signature", kind.as_str()),
+                            span.or(Some(*trait_range)),
+                        );
+                        return Type::Unknown;
+                    };
+                    if let Some(hidden) = hidden {
+                        return Type::Param(hidden.0.clone());
+                    }
+                    return Type::OpaqueCallable {
                         id: OpaqueCallableId(*trait_range),
                         signature: self.lower_hir_callable_signature(callable, kind, params, span),
-                    },
-                    |hidden| Type::Param(hidden.0.clone()),
-                )
+                    };
+                }
+                if let Some(hidden) = hidden {
+                    return Type::Param(hidden.0.clone());
+                }
+                let Some(trait_id) = self.resolve_trait_ref(trait_ty) else {
+                    self.diagnostic(
+                        "E0023",
+                        format!(
+                            "impl Trait references unknown trait `{}`",
+                            trait_ty.display()
+                        ),
+                        span.or(Some(*trait_range)),
+                    );
+                    return Type::Unknown;
+                };
+                let args = match trait_ty.as_ref() {
+                    HirTypeRef::Named(path) => path
+                        .type_args
+                        .iter()
+                        .map(|arg| self.lower_type_ref_with_params_at(arg, params, span))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                Type::OpaqueTrait {
+                    id: OpaqueCallableId(*trait_range),
+                    trait_id,
+                    args,
+                }
             }
             HirTypeRef::Unknown => Type::Unknown,
             HirTypeRef::Error => Type::Error,

@@ -186,6 +186,8 @@ pub enum Expr {
     },
     Lambda {
         is_move: bool,
+        generics: Vec<Name>,
+        generic_bounds: Vec<crate::item_tree::HirGenericBound>,
         params: Vec<LambdaParam>,
         ret_type: HirTypeRef,
         ret_type_range: Option<TextRange>,
@@ -229,6 +231,7 @@ pub struct LambdaParam {
     pub name: Name,
     pub name_range: Option<TextRange>,
     pub is_mut: bool,
+    pub pat: Option<PatId>,
     pub ty: HirTypeRef,
     pub ty_range: Option<TextRange>,
 }

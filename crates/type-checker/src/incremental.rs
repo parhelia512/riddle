@@ -66,6 +66,7 @@ struct CachedBody {
     expr_coercions: Vec<(ExprId, Type)>,
     generic_calls: Vec<(ExprId, GenericCall)>,
     trait_method_calls: Vec<(ExprId, TraitMethodCall)>,
+    callable_impl_calls: Vec<(ExprId, FunctionId)>,
     operator_calls: Vec<(ExprId, OperatorCall)>,
     for_loops: Vec<(ExprId, ForLoopInfo)>,
     lambda_infos: Vec<(ExprId, LambdaInfo)>,
@@ -251,6 +252,7 @@ impl IncrementalTypeChecker {
         let expr_coercions = entries_for_body(&checker.result.expr_coercions, body_id);
         let generic_calls = entries_for_body(&checker.result.generic_calls, body_id);
         let trait_method_calls = entries_for_body(&checker.result.trait_method_calls, body_id);
+        let callable_impl_calls = entries_for_body(&checker.result.callable_impl_calls, body_id);
         let operator_calls = entries_for_body(&checker.result.operator_calls, body_id);
         let for_loops = entries_for_body(&checker.result.for_loops, body_id);
         let lambda_infos = entries_for_body(&checker.result.lambda_infos, body_id);
@@ -277,6 +279,7 @@ impl IncrementalTypeChecker {
                 expr_coercions,
                 generic_calls,
                 trait_method_calls,
+                callable_impl_calls,
                 operator_calls,
                 for_loops,
                 lambda_infos,
@@ -347,6 +350,12 @@ fn replay_cached_body(
             .result
             .trait_method_calls
             .insert((body_id, *expr), call.clone());
+    }
+    for (expr, function) in &cached.callable_impl_calls {
+        checker
+            .result
+            .callable_impl_calls
+            .insert((body_id, *expr), *function);
     }
     for (expr, call) in &cached.operator_calls {
         checker

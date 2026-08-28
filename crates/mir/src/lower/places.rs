@@ -162,7 +162,7 @@ impl LowerCtx<'_> {
             .and_then(|body_id| self.type_result.expr_types.get(&(body_id, expr_id)))
             .cloned()
             .unwrap_or(type_checker::Type::Unknown);
-        let ty = self.convert_type(&tc_ty);
+        let ty = self.convert_expr_type(body, expr_id, &tc_ty);
         let value = self.lower_expr(builder, param_values, body, expr_id);
         let extends_to_block = self
             .current_body
@@ -459,8 +459,11 @@ impl LowerCtx<'_> {
         ty: &hir::item_tree::HirTypeRef,
     ) -> LetStorage {
         let value_ty = init
-            .and_then(|init_expr| self.adjusted_expr_type(init_expr))
-            .cloned()
+            .and_then(|init_expr| {
+                self.adjusted_expr_type(init_expr)
+                    .cloned()
+                    .map(|ty| self.specialize_expr_type(body, init_expr, &ty))
+            })
             .or_else(|| {
                 self.current_body
                     .and_then(|body_id| self.type_result.pattern_types.get(&(body_id, pat)))
@@ -487,12 +490,12 @@ impl LowerCtx<'_> {
             field: None,
         };
         let value = if escapes {
-            let ptr = self.reference_storage(builder, self.let_storage_type(init, &value_ty));
+            let ptr = self.reference_storage(builder, self.let_storage_type(body, init, &value_ty));
             self.initialize_let_storage(builder, param_values, body, init, ptr);
             self.storage_bindings.insert(root);
             ptr
         } else if delayed || is_mut || needs_address || needs_drop {
-            let ptr = builder.alloca(self.let_storage_type(init, &value_ty));
+            let ptr = builder.alloca(self.let_storage_type(body, init, &value_ty));
             self.initialize_let_storage(builder, param_values, body, init, ptr);
             self.storage_bindings.insert(root);
             ptr
@@ -510,9 +513,19 @@ impl LowerCtx<'_> {
         }
     }
 
-    fn let_storage_type(&self, init: Option<ExprId>, value_ty: &type_checker::Type) -> Type {
-        init.and_then(|expr| self.adjusted_expr_type(expr))
-            .map_or_else(|| self.convert_type(value_ty), |ty| self.convert_type(ty))
+    fn let_storage_type(
+        &self,
+        body: &Body,
+        init: Option<ExprId>,
+        value_ty: &type_checker::Type,
+    ) -> Type {
+        let Some(expr) = init else {
+            return self.convert_type(value_ty);
+        };
+        let Some(ty) = self.adjusted_expr_type(expr) else {
+            return self.convert_type(value_ty);
+        };
+        self.convert_expr_type(body, expr, ty)
     }
 
     fn initialize_let_storage(
@@ -911,8 +924,13 @@ impl LowerCtx<'_> {
                     .map(|arg| self.substitute_tc_type(arg))
                     .collect(),
             },
-            TcType::Closure { id, signature } => TcType::Closure {
+            TcType::Closure {
+                id,
+                generics,
+                signature,
+            } => TcType::Closure {
                 id: *id,
+                generics: generics.clone(),
                 signature: type_checker::CallableSignature {
                     is_unsafe: signature.is_unsafe,
                     kind: signature.kind,
@@ -936,6 +954,14 @@ impl LowerCtx<'_> {
                         .collect(),
                     ret: Box::new(self.substitute_tc_type(&signature.ret)),
                 },
+            },
+            TcType::OpaqueTrait { id, trait_id, args } => TcType::OpaqueTrait {
+                id: *id,
+                trait_id: *trait_id,
+                args: args
+                    .iter()
+                    .map(|arg| self.substitute_tc_type(arg))
+                    .collect(),
             },
             TcType::CallableConstraint(signature) => {
                 TcType::CallableConstraint(type_checker::CallableSignature {

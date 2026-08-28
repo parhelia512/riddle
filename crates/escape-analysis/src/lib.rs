@@ -1612,7 +1612,8 @@ fn type_may_carry_reference(ty: &Type) -> bool {
         | Type::Error
         | Type::FunctionItem { .. }
         | Type::Closure { .. }
-        | Type::OpaqueCallable { .. } => true,
+        | Type::OpaqueCallable { .. }
+        | Type::OpaqueTrait { .. } => true,
         Type::Tuple(elements) => elements.iter().any(type_may_carry_reference),
         Type::Slice(inner) | Type::Array(inner, _) => type_may_carry_reference(inner),
         Type::CallableConstraint(signature) => {

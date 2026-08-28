@@ -62,10 +62,6 @@ impl<T, E> Result<T, E> {
             Result::Err(error) => Option::Some(error),
         }
     }
-
-    pub fun unwarp(self) -> T {
-        self.unwrap()
-    }
 }
 
 impl<T: crate::std::marker::Copy, E: crate::std::marker::Copy> crate::std::marker::Copy for Result<T, E> {}

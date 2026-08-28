@@ -21,6 +21,7 @@ pub use result::{
     TypeCheckResult, ValueUse,
 };
 pub use trait_env::TraitEnv;
+pub use ty::substitute_type;
 pub use types::{
     CallableSignature, ClosureId, ClosureKind, ConstArg, FloatTy, IntTy, OpaqueCallableId, Type,
 };

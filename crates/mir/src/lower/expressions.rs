@@ -1,10 +1,11 @@
 use super::{
     BinOp, Body, Builder, CapturePlace, CaptureSource, CmpOp, EnumVariantKind, Expr, ExprId,
-    ExprLoweringInput, ForExprInput, FuncRef, HashMap, HirBinOp, HirUnOp, Inst, InstKind, IntTy,
-    LambdaExprInput, LoopTargets, LowerCtx, OperatorCall, PatId, ResolvedName, Type, Value,
-    closure_call_signature, closure_env_type, convert_binop, convert_unop, determine_cast_op,
-    is_byte_str_layout_cast, is_dyn_object_safe_method, is_raw_parts_to_slice_cast,
-    is_slice_to_raw_parts_cast, parse_float_suffix, parse_int_suffix,
+    ExprLoweringInput, FnPtrType, ForExprInput, FuncRef, HashMap, HirBinOp, HirUnOp, Inst,
+    InstKind, IntTy, LambdaExprInput, LambdaFunctionInput, LambdaInfo, LoopTargets, LowerCtx,
+    OperatorCall, PatId, ResolvedName, Type, Value, closure_call_signature, closure_env_type,
+    convert_binop, convert_unop, determine_cast_op, is_byte_str_layout_cast,
+    is_dyn_object_safe_method, is_raw_parts_to_slice_cast, is_slice_to_raw_parts_cast,
+    parse_float_suffix, parse_int_suffix,
 };
 
 impl LowerCtx<'_> {
@@ -27,7 +28,7 @@ impl LowerCtx<'_> {
         let tc_type = self
             .current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, expr_id)));
-        let mir_type = tc_type.map_or(Type::Unit, |t| self.convert_type(t));
+        let mir_type = tc_type.map_or(Type::Unit, |t| self.convert_expr_type(body, expr_id, t));
         let diverges = matches!(mir_type, Type::Never);
         let input = ExprLoweringInput {
             param_values,
@@ -320,6 +321,82 @@ impl LowerCtx<'_> {
             .and_then(|body| self.type_result.expr_types.get(&(body, expr)))
             .cloned()
             .unwrap_or(type_checker::Type::Error)
+    }
+
+    pub(super) fn convert_expr_type(
+        &self,
+        body: &Body,
+        expr_id: ExprId,
+        tc_type: &type_checker::Type,
+    ) -> Type {
+        self.opaque_hidden_for_expr(body, expr_id, tc_type)
+            .map_or_else(
+                || self.convert_type(tc_type),
+                |hidden| self.convert_type(&hidden),
+            )
+    }
+
+    pub(super) fn specialize_expr_type(
+        &self,
+        body: &Body,
+        expr_id: ExprId,
+        tc_type: &type_checker::Type,
+    ) -> type_checker::Type {
+        self.opaque_hidden_for_expr(body, expr_id, tc_type)
+            .unwrap_or_else(|| tc_type.clone())
+    }
+
+    fn opaque_hidden_for_expr(
+        &self,
+        body: &Body,
+        expr_id: ExprId,
+        tc_type: &type_checker::Type,
+    ) -> Option<type_checker::Type> {
+        let type_checker::Type::OpaqueTrait { id, .. } = tc_type else {
+            return None;
+        };
+        let body_id = self.current_body?;
+        let callee = match &body.exprs[expr_id] {
+            hir::body::Expr::Call { callee, .. } => *callee,
+            hir::body::Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(binding)),
+                ..
+            } => {
+                let init = body.stmts.iter().find_map(|(_, stmt)| match stmt {
+                    hir::body::Stmt::Let { pat, init, .. } if *pat == binding.pattern => *init,
+                    _ => None,
+                })?;
+                return self.opaque_hidden_for_expr(body, init, tc_type);
+            }
+            hir::body::Expr::FieldAccess { base, .. } => {
+                return self.opaque_hidden_for_expr(body, *base, tc_type);
+            }
+            _ => return None,
+        };
+        let generic_call = self.type_result.generic_calls.get(&(body_id, callee))?;
+        let hir::body::Expr::Path {
+            resolved: Some(ResolvedName::Function(fid)),
+            ..
+        } = &body.exprs[callee]
+        else {
+            return None;
+        };
+        let mut names = Vec::new();
+        if let Some(impl_id) = self.method_impls.get(fid) {
+            let imp = &self.hir.item_tree.impls[*impl_id];
+            names.extend(imp.generics.iter().map(|name| name.0.clone()));
+            names.extend(imp.const_generics.iter().map(|name| name.0.clone()));
+        }
+        let function = &self.hir.item_tree.functions[*fid];
+        names.extend(function.generics.iter().map(|name| name.0.clone()));
+        names.extend(function.implicit_generics.iter().map(|name| name.0.clone()));
+        names.extend(function.const_generics.iter().map(|name| name.0.clone()));
+        let subst = names
+            .into_iter()
+            .zip(generic_call.args.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        let hidden = self.type_result.opaque_hidden_types.get(id)?;
+        Some(type_checker::substitute_type(hidden, &subst))
     }
 
     fn coerced_expr_type(&self, expr_id: ExprId, fallback: &Type) -> Type {
@@ -1080,6 +1157,15 @@ impl LowerCtx<'_> {
         callee: ExprId,
         args: &[ExprId],
     ) -> Value {
+        if let Some(value) = self.lower_recursive_lambda_call(builder, input, callee, args) {
+            return self.finish_expr(builder, input, value);
+        }
+        if let Some(value) = self.lower_generic_lambda_call(builder, input, callee, args) {
+            return self.finish_expr(builder, input, value);
+        }
+        if let Some(value) = self.lower_callable_impl_call(builder, input, callee, args) {
+            return self.finish_expr(builder, input, value);
+        }
         if let Some(value) = self.lower_static_trait_call(
             builder,
             input.param_values,
@@ -1125,6 +1211,216 @@ impl LowerCtx<'_> {
             return self.finish_expr(builder, input, value);
         };
         self.lower_named_call_expr(builder, input, callee, args, target)
+    }
+
+    fn lower_recursive_lambda_call(
+        &mut self,
+        builder: &mut Builder,
+        input: &ExprLoweringInput<'_>,
+        callee: ExprId,
+        args: &[ExprId],
+    ) -> Option<Value> {
+        let body_id = self.current_body?;
+        let type_checker::Type::Closure { id, generics, .. } =
+            self.type_result.expr_types.get(&(body_id, callee))?
+        else {
+            return None;
+        };
+        if !generics.is_empty() || self.current_lambda != Some(id.expr) || body_id != id.body {
+            return None;
+        }
+        let name = self.lambda_functions.get(&(id.body, id.expr))?.clone();
+        let mut values = Vec::with_capacity(args.len() + 1);
+        values.push(self.current_lambda_env?);
+        values.extend(self.lower_expr_sequence(
+            builder,
+            input.param_values,
+            input.body,
+            input.expr_id,
+            1,
+            args,
+        ));
+        Some(builder.call(FuncRef::Local(name), values, input.mir_type.clone()))
+    }
+
+    fn lower_generic_lambda_call(
+        &mut self,
+        builder: &mut Builder,
+        input: &ExprLoweringInput<'_>,
+        callee: ExprId,
+        args: &[ExprId],
+    ) -> Option<Value> {
+        let caller_body = self.current_body?;
+        let type_checker::Type::Closure {
+            id,
+            generics,
+            signature,
+        } = self.type_result.expr_types.get(&(caller_body, callee))?
+        else {
+            return None;
+        };
+        if generics.is_empty() {
+            return None;
+        }
+        let concrete = &self
+            .type_result
+            .generic_calls
+            .get(&(caller_body, callee))?
+            .args;
+        let info = self
+            .type_result
+            .lambda_infos
+            .get(&(id.body, id.expr))
+            .cloned()
+            .unwrap_or(LambdaInfo {
+                captures: Vec::new(),
+                kind: signature.kind,
+            });
+        let tc_subst = generics
+            .iter()
+            .cloned()
+            .zip(concrete.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        let instantiated = type_checker::CallableSignature {
+            is_unsafe: signature.is_unsafe,
+            kind: signature.kind,
+            params: signature
+                .params
+                .iter()
+                .map(|param| type_checker::substitute_type(param, &tc_subst))
+                .collect(),
+            ret: Box::new(type_checker::substitute_type(&signature.ret, &tc_subst)),
+        };
+        let (capture_types, _) = self.lambda_environment_type("generic_lambda", &info);
+        let suffix = concrete
+            .iter()
+            .map(|ty| super::mono_type_name(&self.convert_type(ty)))
+            .chain(capture_types.iter().map(super::mono_type_name))
+            .collect::<Vec<_>>()
+            .join("_");
+        let key = (id.body, id.expr, suffix.clone());
+        let recursive = self.current_body == Some(id.body)
+            && self.current_lambda == Some(id.expr)
+            && self.current_lambda_env.is_some();
+        let name = if let Some(name) = self.generic_lambda_functions.get(&key) {
+            name.clone()
+        } else {
+            let offset = self.hir.bodies[id.body]
+                .source_map
+                .expr_ranges
+                .get(&id.expr)
+                .map_or(0, |range| u32::from(range.start()));
+            let name = self.qualify_current_symbol(format!(
+                "__riddle_lambda_{offset}_{}",
+                if suffix.is_empty() { "unit" } else { &suffix }
+            ));
+            self.generic_lambda_functions.insert(key, name.clone());
+            let (params, lambda_body) = match &self.hir.bodies[id.body].exprs[id.expr] {
+                Expr::Lambda { params, body, .. } => (params.clone(), *body),
+                _ => return None,
+            };
+            let mut call_params = Vec::with_capacity(instantiated.params.len() + 1);
+            call_params.push(closure_env_type());
+            call_params.extend(instantiated.params.iter().map(|ty| self.convert_type(ty)));
+            let call_signature = FnPtrType {
+                params: call_params,
+                ret: Box::new(self.convert_type(&instantiated.ret)),
+            };
+            let mut merged_tc_subst = self.generic_tc_subst.clone();
+            merged_tc_subst.extend(tc_subst.clone());
+            let mut mir_subst: HashMap<String, Type> = tc_subst
+                .iter()
+                .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
+                .collect();
+            mir_subst.extend(self.generic_subst.clone());
+            let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, merged_tc_subst);
+            let old_subst = std::mem::replace(&mut self.generic_subst, mir_subst);
+            let (_, env_struct) = self.lambda_environment_type(&name, &info);
+            self.lower_lambda_function(&LambdaFunctionInput {
+                body_id: id.body,
+                expr_id: id.expr,
+                params: &params,
+                body: lambda_body,
+                name: &name,
+                call_signature: &call_signature,
+                info: &info,
+                capture_types: &capture_types,
+                env_struct: &env_struct,
+            });
+            self.lower_lambda_drop_function(
+                &format!("{name}_drop"),
+                &info,
+                &capture_types,
+                &env_struct,
+                !info.captures.is_empty() && self.analysis.lambda_escapes(id.body, id.expr),
+            );
+            self.generic_subst = old_subst;
+            self.generic_tc_subst = old_tc_subst;
+            name
+        };
+        let (_, env_struct) = self.lambda_environment_type(&name, &info);
+        let mut values = Vec::with_capacity(args.len() + 1);
+        let heap_env = !info.captures.is_empty() && self.analysis.lambda_escapes(id.body, id.expr);
+        let env = if recursive {
+            self.current_lambda_env?
+        } else {
+            self.lower_lambda_environment(
+                builder,
+                input.param_values,
+                &info,
+                &capture_types,
+                &env_struct,
+                heap_env,
+            )
+        };
+        values.push(env);
+        values.extend(self.lower_expr_sequence(
+            builder,
+            input.param_values,
+            input.body,
+            input.expr_id,
+            1,
+            args,
+        ));
+        Some(builder.call(FuncRef::Local(name), values, input.mir_type.clone()))
+    }
+
+    fn lower_callable_impl_call(
+        &mut self,
+        builder: &mut Builder,
+        input: &ExprLoweringInput<'_>,
+        callee: ExprId,
+        args: &[ExprId],
+    ) -> Option<Value> {
+        let body_id = self.current_body?;
+        let fid = *self
+            .type_result
+            .callable_impl_calls
+            .get(&(body_id, input.expr_id))?;
+        let receiver_ty = self.type_result.expr_types.get(&(body_id, callee))?;
+        let receiver_param = self.hir.item_tree.functions[fid].params.first()?.ty.clone();
+        let name = self
+            .mono_method_name_for_receiver(fid, receiver_ty, None)
+            .unwrap_or_else(|| self.function_name(fid));
+        let receiver = self.lower_receiver_arg(
+            builder,
+            input.param_values,
+            input.body,
+            callee,
+            &receiver_param,
+        );
+        let args = self.lower_expr_sequence(
+            builder,
+            input.param_values,
+            input.body,
+            input.expr_id,
+            1,
+            args,
+        );
+        let mut values = Vec::with_capacity(args.len() + 1);
+        values.push(receiver);
+        values.extend(args);
+        Some(builder.call(FuncRef::Local(name), values, input.mir_type.clone()))
     }
 
     fn lower_indirect_call_expr(

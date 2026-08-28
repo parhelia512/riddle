@@ -414,7 +414,7 @@ impl TypeChecker<'_> {
         if matches!(tr.name.0.as_str(), "Fn" | "FnMut" | "FnOnce") {
             self.diagnostic(
                 "E0048",
-                "callable capabilities are implemented only by functions and anonymous functions",
+                "callable trait names are reserved by the compiler",
                 Some(tr.name_range),
             );
         }
@@ -477,11 +477,7 @@ impl TypeChecker<'_> {
         };
 
         if crate::lowering::builtin_callable_kind(trait_ty).is_some() {
-            self.diagnostic(
-                "E0048",
-                "callable capabilities are implemented only by functions and anonymous functions",
-                imp.trait_ty_range.or(Some(imp.self_ty_range)),
-            );
+            self.check_callable_impl(imp, trait_ty);
             return;
         }
 
@@ -503,6 +499,83 @@ impl TypeChecker<'_> {
         self.check_impl_paterson(imp, &self_ty_text);
         self.check_trait_impl(&self_ty_text, &tr, imp);
         self.check_supertrait_dependencies(&self_ty_text, trait_id, imp);
+    }
+
+    fn check_callable_impl(&mut self, imp: &HirImpl, trait_ty: &HirTypeRef) {
+        let Some(kind) = crate::lowering::builtin_callable_kind(trait_ty) else {
+            return;
+        };
+        let Some(callable) = imp.callable.as_ref() else {
+            self.diagnostic(
+                "E0047",
+                format!("impl {} requires a callable signature", kind.as_str()),
+                imp.trait_ty_range,
+            );
+            return;
+        };
+        let Some(fid) = imp
+            .methods
+            .iter()
+            .copied()
+            .find(|fid| self.hir.item_tree.functions[*fid].name.0 == "call")
+        else {
+            self.diagnostic(
+                "E0021",
+                "callable impl is missing required method `call`",
+                imp.trait_ty_range,
+            );
+            return;
+        };
+        let function = self.hir.item_tree.functions[fid].clone();
+        let params = crate::lowering::generic_param_map_with_consts(
+            imp.generics.iter().map(|name| name.0.as_str()),
+            imp.const_generics.iter().map(|name| name.0.as_str()),
+        );
+        let expected =
+            self.lower_hir_callable_signature(callable, kind, &params, imp.trait_ty_range);
+        let actual_params = function
+            .params
+            .iter()
+            .skip(1)
+            .map(|param| {
+                self.lower_type_ref_with_params_at(&param.ty, &params, Some(param.ty_range))
+            })
+            .collect::<Vec<_>>();
+        let actual_ret = function.ret_type.as_ref().map_or(Type::Unit, |ret| {
+            self.lower_type_ref_with_params_at(ret, &params, function.ret_type_range)
+        });
+        let receiver_ok = function.params.first().is_some_and(|receiver| {
+            matches!(
+                (kind, &receiver.ty),
+                (crate::types::ClosureKind::Fn, HirTypeRef::Ref(_, false))
+                    | (crate::types::ClosureKind::FnMut, HirTypeRef::Ref(_, true))
+                    | (crate::types::ClosureKind::FnOnce, HirTypeRef::Named(_))
+            )
+        });
+        let signature_ok = actual_params.len() == expected.params.len()
+            && actual_params
+                .iter()
+                .zip(&expected.params)
+                .all(|(actual, expected)| self.unify_types(actual, expected))
+            && self.unify_types(&actual_ret, &expected.ret);
+        if receiver_ok && signature_ok {
+            return;
+        }
+        self.diagnostic(
+            "E0020",
+            format!(
+                "method `call` does not match `{}({}) -> {}`",
+                kind.as_str(),
+                expected
+                    .params
+                    .iter()
+                    .map(|ty| ty.display(self.hir))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                expected.ret.display(self.hir)
+            ),
+            Some(function.name_range),
+        );
     }
 
     fn check_impl_paterson(&mut self, imp: &HirImpl, self_ty_text: &str) {
@@ -908,7 +981,10 @@ fn uncovered_orphan_param(ty: &Type, prefix: &str) -> Option<String> {
             };
             name.strip_prefix(prefix).map(str::to_string)
         }),
-        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => elements
+        Type::Tuple(elements)
+        | Type::Struct(_, elements)
+        | Type::Enum(_, elements)
+        | Type::OpaqueTrait { args: elements, .. } => elements
             .iter()
             .find_map(|ty| uncovered_orphan_param(ty, prefix)),
         Type::FunctionItem { args, .. } => args
@@ -933,9 +1009,10 @@ fn coherence_type_is_valid(ty: &Type) -> bool {
         }
         Type::Tuple(elements) => elements.iter().all(coherence_type_is_valid),
         Type::Array(inner, len) => coherence_type_is_valid(inner) && coherence_const_is_valid(len),
-        Type::Struct(_, args) | Type::Enum(_, args) | Type::FunctionItem { args, .. } => {
-            args.iter().all(coherence_type_is_valid)
-        }
+        Type::Struct(_, args)
+        | Type::Enum(_, args)
+        | Type::FunctionItem { args, .. }
+        | Type::OpaqueTrait { args, .. } => args.iter().all(coherence_type_is_valid),
         Type::CallableConstraint(signature)
         | Type::Closure { signature, .. }
         | Type::OpaqueCallable { signature, .. } => {
@@ -1098,7 +1175,7 @@ fn coherence_type_occurs(name: &str, ty: &Type, subst: &HashMap<String, Type>) -
             .iter()
             .any(|element| coherence_type_occurs(name, element, subst)),
         Type::Array(inner, _) => coherence_type_occurs(name, inner, subst),
-        Type::Struct(_, args) | Type::Enum(_, args) => args
+        Type::Struct(_, args) | Type::Enum(_, args) | Type::OpaqueTrait { args, .. } => args
             .iter()
             .any(|arg| coherence_type_occurs(name, arg, subst)),
         Type::FunctionItem { args, .. } => args

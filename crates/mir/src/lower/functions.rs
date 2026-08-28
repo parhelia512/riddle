@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 use super::{
     Body, BodyId, Builder, CaptureAccess, CaptureMode, CapturePlace, CaptureSource, CastOp, Expr,
     ExprId, FuncRef, Function, IntTy, LambdaCapture, LambdaExprInput, LambdaFunctionInput,
-    LambdaInfo, LowerCtx, Projection, StructType, Type, Value, closure_call_signature,
-    closure_drop_function_type, closure_env_type,
+    LambdaInfo, LetPatternInput, LetSource, LowerCtx, Projection, StructType, Type, Value,
+    closure_call_signature, closure_drop_function_type, closure_env_type,
 };
 
 impl LowerCtx<'_> {
@@ -280,35 +280,14 @@ impl LowerCtx<'_> {
         let (capture_types, env_struct) = self.lambda_environment_type(&name, &info);
 
         let heap_env = !info.captures.is_empty() && self.analysis.lambda_escapes(body_id, expr_id);
-        let env_value = if info.captures.is_empty() {
-            Self::null_env(builder)
-        } else {
-            let env_ty = Type::Struct(env_struct.clone());
-            let env_ptr = if heap_env {
-                builder.heap_alloc(env_ty)
-            } else {
-                builder.alloca(env_ty)
-            };
-            for (index, (capture, capture_ty)) in
-                info.captures.iter().zip(&capture_types).enumerate()
-            {
-                let field_ty = env_struct.fields[index].1.clone();
-                let value = match capture.mode {
-                    CaptureMode::Shared | CaptureMode::Mutable => {
-                        self.capture_place(builder, outer_params, &capture.place, capture_ty)
-                    }
-                    CaptureMode::Value => {
-                        self.capture_value(builder, outer_params, &capture.place, capture_ty)
-                    }
-                };
-                let field = builder.field_ptr(env_ptr, index, field_ty);
-                builder.store(value, field);
-                if capture.mode == CaptureMode::Value && self.type_needs_drop(&capture.ty, 0) {
-                    self.clear_drop_slots_for_capture(builder, &capture.place);
-                }
-            }
-            builder.cast(CastOp::PtrToPtr, env_ptr, closure_env_type())
-        };
+        let env_value = self.lower_lambda_environment(
+            builder,
+            outer_params,
+            &info,
+            &capture_types,
+            &env_struct,
+            heap_env,
+        );
 
         if needs_lowering {
             self.lower_lambda_function(&LambdaFunctionInput {
@@ -339,7 +318,11 @@ impl LowerCtx<'_> {
         builder.struct_value(vec![call, env_value, drop], ty.clone())
     }
 
-    fn lambda_environment_type(&self, name: &str, info: &LambdaInfo) -> (Vec<Type>, StructType) {
+    pub(super) fn lambda_environment_type(
+        &self,
+        name: &str,
+        info: &LambdaInfo,
+    ) -> (Vec<Type>, StructType) {
         let capture_types = info
             .captures
             .iter()
@@ -373,6 +356,43 @@ impl LowerCtx<'_> {
                 fields,
             },
         )
+    }
+
+    pub(super) fn lower_lambda_environment(
+        &mut self,
+        builder: &mut Builder,
+        outer_params: &[Value],
+        info: &LambdaInfo,
+        capture_types: &[Type],
+        env_struct: &StructType,
+        heap_env: bool,
+    ) -> Value {
+        if info.captures.is_empty() {
+            return Self::null_env(builder);
+        }
+        let env_ty = Type::Struct(env_struct.clone());
+        let env_ptr = if heap_env {
+            builder.heap_alloc(env_ty)
+        } else {
+            builder.alloca(env_ty)
+        };
+        for (index, (capture, capture_ty)) in info.captures.iter().zip(capture_types).enumerate() {
+            let field_ty = env_struct.fields[index].1.clone();
+            let value = match capture.mode {
+                CaptureMode::Shared | CaptureMode::Mutable => {
+                    self.capture_place(builder, outer_params, &capture.place, capture_ty)
+                }
+                CaptureMode::Value => {
+                    self.capture_value(builder, outer_params, &capture.place, capture_ty)
+                }
+            };
+            let field = builder.field_ptr(env_ptr, index, field_ty);
+            builder.store(value, field);
+            if capture.mode == CaptureMode::Value && self.type_needs_drop(&capture.ty, 0) {
+                self.clear_drop_slots_for_capture(builder, &capture.place);
+            }
+        }
+        builder.cast(CastOp::PtrToPtr, env_ptr, closure_env_type())
     }
 
     pub(super) fn capture_environment_name(&self, capture: &LambdaCapture) -> String {
@@ -427,6 +447,7 @@ impl LowerCtx<'_> {
         let mut function = Function::new(name.to_string(), (*call_signature.ret).clone());
         self.inherit_function_ownership(&mut function);
         let env_param = function.add_param("__env".into(), closure_env_type());
+        self.current_lambda_env = Some(env_param);
         let param_values = params
             .iter()
             .zip(call_signature.params.iter().skip(1))
@@ -460,6 +481,7 @@ impl LowerCtx<'_> {
         input: &LambdaFunctionInput<'_>,
         values: &[Value],
     ) {
+        let body = &self.hir.bodies[input.body_id];
         for (index, value) in values.iter().enumerate() {
             let ty = input.call_signature.params[index + 1].clone();
             let tc_ty =
@@ -482,22 +504,54 @@ impl LowerCtx<'_> {
             };
             if let Some(storage) = storage {
                 builder.store(*value, storage);
-                self.parameter_storage.insert(
+                if input.params[index].pat.is_none() {
+                    self.parameter_storage.insert(
+                        CaptureSource::LambdaParam {
+                            lambda: input.expr_id,
+                            index,
+                        },
+                        storage,
+                    );
+                }
+            }
+            let slots = if needs_drop {
+                let place = storage.expect("Drop lambda parameter has storage");
+                self.create_drop_slots(builder, place, &tc_ty, Vec::new())
+            } else {
+                Vec::new()
+            };
+            if let Some(pat) = input.params[index].pat {
+                let source = storage.map_or(LetSource::Value(*value), LetSource::Place);
+                let mut bound = Vec::new();
+                self.bind_let_pattern(
+                    builder,
+                    body,
+                    LetPatternInput {
+                        pat,
+                        source,
+                        value_ty: &tc_ty,
+                        projection: Vec::new(),
+                    },
+                    &mut bound,
+                );
+                for (id, projection) in bound {
+                    let owned = slots
+                        .iter()
+                        .filter(|slot| slot.projection.starts_with(&projection))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    self.register_drop_slots(CaptureSource::Pattern(id), &owned);
+                }
+            } else if needs_drop {
+                self.register_drop_slots(
                     CaptureSource::LambdaParam {
                         lambda: input.expr_id,
                         index,
                     },
-                    storage,
+                    &slots,
                 );
             }
-            if needs_drop {
-                let place = storage.expect("Drop lambda parameter has storage");
-                let source = CaptureSource::LambdaParam {
-                    lambda: input.expr_id,
-                    index,
-                };
-                let slots = self.create_drop_slots(builder, place, &tc_ty, Vec::new());
-                self.register_drop_slots(source, &slots);
+            if !slots.is_empty() {
                 self.drop_scopes[0].splice(0..0, slots.into_iter().rev());
             }
         }

@@ -96,9 +96,11 @@ pub fn lower_hir<S: BuildHasher>(
         mono_methods: HashMap::new(),
         loop_targets: Vec::new(),
         lambda_functions: HashMap::new(),
+        generic_lambda_functions: HashMap::new(),
         function_adapters: HashMap::new(),
         capture_access: HashMap::new(),
         current_lambda: None,
+        current_lambda_env: None,
         lambda_counter: 0,
         active_consts: HashSet::new(),
         package_names,
@@ -186,9 +188,11 @@ struct LowerCtx<'a> {
     mono_methods: HashMap<(hir::item_tree::FunctionId, String), String>,
     loop_targets: Vec<LoopTargets>,
     lambda_functions: HashMap<(BodyId, ExprId), String>,
+    generic_lambda_functions: HashMap<(BodyId, ExprId, String), String>,
     function_adapters: HashMap<(hir::item_tree::FunctionId, Vec<type_checker::Type>), String>,
     capture_access: HashMap<CapturePlace, CaptureAccess>,
     current_lambda: Option<ExprId>,
+    current_lambda_env: Option<Value>,
     lambda_counter: u32,
     active_consts: HashSet<hir::item_tree::ConstId>,
     package_names: &'a [String],
@@ -345,6 +349,7 @@ struct LoweringState {
     pattern_bindings: Vec<HashMap<PatternBindingId, PatternBindingValue>>,
     capture_access: HashMap<CapturePlace, CaptureAccess>,
     current_lambda: Option<ExprId>,
+    current_lambda_env: Option<Value>,
     current_body: Option<BodyId>,
     coerced_values: HashSet<(Value, Type)>,
 }
@@ -363,6 +368,7 @@ impl LowerCtx<'_> {
             pattern_bindings: std::mem::take(&mut self.pattern_bindings),
             capture_access: std::mem::take(&mut self.capture_access),
             current_lambda: self.current_lambda,
+            current_lambda_env: self.current_lambda_env.take(),
             current_body: self.current_body,
             coerced_values: std::mem::take(&mut self.coerced_values),
         }
@@ -380,6 +386,7 @@ impl LowerCtx<'_> {
         self.pattern_bindings = state.pattern_bindings;
         self.capture_access = state.capture_access;
         self.current_lambda = state.current_lambda;
+        self.current_lambda_env = state.current_lambda_env;
         self.current_body = state.current_body;
         self.coerced_values = state.coerced_values;
     }

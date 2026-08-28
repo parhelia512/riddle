@@ -184,7 +184,8 @@ impl LowerCtx<'_> {
                 .type_result
                 .expr_types
                 .get(&(body_id, *base))
-                .cloned()?;
+                .cloned()
+                .map(|ty| self.specialize_expr_type(body, *base, &ty))?;
             let rhs_ty = args
                 .first()
                 .and_then(|arg| self.type_result.expr_types.get(&(body_id, *arg)))
@@ -601,11 +602,20 @@ impl LowerCtx<'_> {
         rhs_ty: Option<&type_checker::Type>,
     ) -> Option<hir::item_tree::FunctionId> {
         let receiver_ty = self.substitute_tc_type(receiver_ty);
+        let opaque_hidden = match &receiver_ty {
+            type_checker::Type::OpaqueTrait { id, .. } => self
+                .type_result
+                .opaque_hidden_types
+                .get(id)
+                .map(|hidden| self.substitute_tc_type(hidden)),
+            _ => None,
+        };
+        let receiver_ty = opaque_hidden.as_ref().unwrap_or(&receiver_ty);
         let dereferenced = match &receiver_ty {
             type_checker::Type::Ref(inner, _) => Some(inner.as_ref()),
             _ => None,
         };
-        for receiver_ty in std::iter::once(&receiver_ty).chain(dereferenced) {
+        for receiver_ty in std::iter::once(receiver_ty).chain(dereferenced) {
             for (_, candidate) in self.hir.item_tree.impls.iter() {
                 let Some(candidate_trait) = candidate.trait_ty.as_ref() else {
                     continue;
@@ -655,7 +665,7 @@ impl LowerCtx<'_> {
         let base_ty = self
             .current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, base)))
-            .map_or(Type::Unit, |t| self.convert_type(t));
+            .map_or(Type::Unit, |t| self.convert_expr_type(body, base, t));
 
         match expected {
             hir::item_tree::HirTypeRef::Ref(_, _) if matches!(base_ty, Type::Ref(_, _)) => {

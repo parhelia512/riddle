@@ -49,6 +49,7 @@ pub struct TypeCheckResult {
     pub expr_coercions: HashMap<(BodyId, ExprId), Type>,
     pub generic_calls: HashMap<(BodyId, ExprId), GenericCall>,
     pub trait_method_calls: HashMap<(BodyId, ExprId), TraitMethodCall>,
+    pub callable_impl_calls: HashMap<(BodyId, ExprId), FunctionId>,
     pub operator_calls: HashMap<(BodyId, ExprId), OperatorCall>,
     pub for_loops: HashMap<(BodyId, ExprId), ForLoopInfo>,
     pub lambda_infos: HashMap<(BodyId, ExprId), LambdaInfo>,

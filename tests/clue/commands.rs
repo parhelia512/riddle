@@ -1988,6 +1988,159 @@ fn inferred_lambda_parameter_move_is_rejected_by_clue_check() {
 }
 
 #[test]
+fn advanced_callables_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping advanced callable runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("advanced-callables");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"trait Value { fun value(&self) -> i32; }
+impl Value for i32 { fun value(&self) -> i32 { *self } }
+
+struct Adder { amount: i32 }
+impl Fn(i32) -> i32 for Adder {
+    fun call(&self, value: i32) -> i32 { value + self.amount }
+}
+struct Identity<T> { marker: T }
+impl<T> Fn(T) -> T for Identity<T> {
+    fun call(&self, value: T) -> T { value }
+}
+
+fun read(value: impl Value) -> i32 { value.value() }
+fun make() -> impl Value { 7i32 }
+
+fun main() -> i32 {
+    let first = fun<T: Value>((left, _): (T, T)) -> i32 { left.value() };
+    let fib = fun(n: i32) -> i32 {
+        if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+    };
+    let add = Adder { amount: 2 };
+    let identity = Identity { marker: 0 };
+    if read(make()) == 7 && first::<i32>((9, 0)) == 9
+        && add(3) == 5 && identity(4) == 4 && fib(10) == 55 { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn generic_callable_capture_and_recursion_compile_and_run() {
+    if c_compiler().is_none() {
+        eprintln!("skipping generic callable runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("generic-callables");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"trait Value { fun value(&self) -> i32; }
+impl Value for i32 { fun value(&self) -> i32 { *self } }
+
+fun make<T: Value>(value: T) -> impl Fn() -> i32 {
+    fun() -> i32 { value.value() }
+}
+
+fun main() -> i32 {
+    let captured = make(7i32);
+    let recurse = fun<T>(value: T) -> T {
+        if true { value } else { recurse::<T>(value) }
+    };
+    if captured() == 7 && recurse::<i32>(5) == 5 { 0 } else { 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn generic_lambda_capture_runs_per_instance() {
+    if c_compiler().is_none() {
+        eprintln!("skipping generic lambda capture runtime test: no C compiler found");
+        return;
+    }
+    let root = temp_root("generic-lambda-capture");
+    fs::create_dir_all(&root).unwrap();
+    assert!(clue(&["new", "app"], &root).status.success());
+    fs::write(
+        root.join("app/src/main.rid"),
+        r#"trait Value { fun value(&self) -> i32; }
+impl Value for i32 { fun value(&self) -> i32 { *self } }
+
+trait Marker<T> { fun mark(&self) -> i32; }
+struct MarkerValue<T> { value: T }
+impl<T> Marker<T> for MarkerValue<T> { fun mark(&self) -> i32 { 1 } }
+fun make_marker<T>(value: T) -> impl Marker<T> { MarkerValue { value } }
+
+fun outer<T: Value>(value: T) -> i32 {
+    let apply = fun<U>(ignored: U) -> i32 { value.value() };
+    apply::<bool>(true)
+}
+
+fun main() -> i32 {
+    let base = 3;
+    let choose = fun<T>(value: T, again: bool) -> i32 {
+        if again { choose::<T>(value, false) } else { base }
+    };
+    let marker = make_marker(5i32);
+    let marker_bool = make_marker(true);
+    if choose::<i32>(9, true) == 3
+        && outer(11i32) == 11
+        && marker.mark() == 1
+        && marker_bool.mark() == 1
+    {
+        0
+    } else {
+        1
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["run", "app"], &root);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn standard_option_and_result_do_not_expose_unwarp() {
+    let std_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/std");
+    for file in ["option.rid", "result.rid"] {
+        let source = fs::read_to_string(std_root.join(file)).expect("read standard library source");
+        assert!(!source.contains("unwarp"), "legacy typo remains in {file}");
+    }
+}
+
+#[test]
 fn nested_dynamic_array_move_drops_selected_element_once() {
     if c_compiler().is_none() {
         eprintln!("skipping nested array Drop runtime test: no C compiler found");
@@ -3390,7 +3543,7 @@ fun parses_pat(source: &str) -> bool {
 
 #[proc_macro_derive(SynAnswer)]
 pub fun derive_answer(input: TokenStream) -> TokenStream {
-    let item = parse::<Item>(input.clone()).unwarp();
+    let item = parse::<Item>(input.clone()).unwrap();
     match item {
         Item::Struct(_) => {},
         _ => {},

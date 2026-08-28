@@ -66,11 +66,17 @@ pub enum Type {
     },
     Closure {
         id: ClosureId,
+        generics: Vec<String>,
         signature: CallableSignature,
     },
     OpaqueCallable {
         id: OpaqueCallableId,
         signature: CallableSignature,
+    },
+    OpaqueTrait {
+        id: OpaqueCallableId,
+        trait_id: TraitId,
+        args: Vec<Self>,
     },
     CallableConstraint(CallableSignature),
     InferVar(u32),
@@ -242,6 +248,19 @@ impl Type {
             Self::OpaqueCallable { signature, .. } => {
                 format_callable_signature(signature, "impl ", hir)
             }
+            Self::OpaqueTrait { trait_id, args, .. } => {
+                let name = &hir.item_tree.traits[*trait_id].name.0;
+                if args.is_empty() {
+                    format!("impl {name}")
+                } else {
+                    let args = args
+                        .iter()
+                        .map(|arg| arg.display(hir))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("impl {name}<{args}>")
+                }
+            }
             Self::CallableConstraint(signature) => format_callable_signature(signature, "", hir),
             Self::InferVar(_) | Self::Unknown => "_".to_string(),
             Self::Param(name) => name.clone(),
@@ -293,6 +312,7 @@ impl Type {
             Self::Struct(_, args) | Self::Enum(_, args) | Self::FunctionItem { args, .. } => {
                 args.iter().all(Self::is_sized)
             }
+            Self::OpaqueTrait { args, .. } => args.iter().all(Self::is_sized),
             Self::CallableConstraint(signature)
             | Self::Closure { signature, .. }
             | Self::OpaqueCallable { signature, .. } => {
@@ -316,6 +336,7 @@ impl Type {
             Self::Struct(_, args) | Self::Enum(_, args) => {
                 args.iter().all(Self::is_valid_value_type)
             }
+            Self::OpaqueTrait { args, .. } => args.iter().all(Self::is_valid_value_type),
             Self::CallableConstraint(signature)
             | Self::Closure { signature, .. }
             | Self::OpaqueCallable { signature, .. } => {

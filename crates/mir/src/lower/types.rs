@@ -75,6 +75,7 @@ impl LowerCtx<'_> {
                     .collect(),
                 ret: Box::new(self.convert_type(&signature.ret)),
             }),
+            TcType::Closure { generics, .. } if !generics.is_empty() => Type::Unit,
             TcType::Closure { signature, .. } | TcType::OpaqueCallable { signature, .. } => {
                 closure_value_type(FnPtrType {
                     params: signature
@@ -85,6 +86,11 @@ impl LowerCtx<'_> {
                     ret: Box::new(self.convert_type(&signature.ret)),
                 })
             }
+            TcType::OpaqueTrait { id, .. } => self
+                .type_result
+                .opaque_hidden_types
+                .get(id)
+                .map_or(Type::Unit, |hidden| self.convert_type(hidden)),
             TcType::Param(name) => self.generic_subst.get(name).cloned().unwrap_or(Type::Unit),
             TcType::DynTrait {
                 trait_id,
@@ -500,12 +506,24 @@ impl LowerCtx<'_> {
             | hir::item_tree::HirTypeRef::Unknown
             | hir::item_tree::HirTypeRef::Error => Type::Unit,
             hir::item_tree::HirTypeRef::ImplTrait {
-                callable, hidden, ..
+                callable,
+                hidden,
+                trait_range,
+                ..
             } => {
                 if let Some(hidden) = hidden
                     && let Some(ty) = self.generic_subst.get(&hidden.0)
                 {
                     return ty.clone();
+                }
+                if callable.is_none()
+                    && let Some(hidden) = self
+                        .type_result
+                        .opaque_hidden_types
+                        .get(&type_checker::OpaqueCallableId(*trait_range))
+                        .cloned()
+                {
+                    return self.convert_type(&hidden);
                 }
                 callable.as_ref().map_or(Type::Unit, |signature| {
                     closure_value_type(FnPtrType {

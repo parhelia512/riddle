@@ -6,12 +6,117 @@ use super::{
 };
 
 impl TypeChecker<'_> {
+    pub(super) fn declared_recursive_lambda_type(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        expr_id: ExprId,
+        binding: PatternBindingId,
+    ) -> Option<Type> {
+        let Expr::Lambda {
+            generics,
+            params,
+            ret_type,
+            ret_type_range,
+            ..
+        } = &ctx.body.exprs[expr_id]
+        else {
+            return None;
+        };
+        if params
+            .iter()
+            .any(|param| matches!(param.ty, HirTypeRef::Unknown))
+            || matches!(ret_type, HirTypeRef::Unknown)
+        {
+            return None;
+        }
+        let generics = generics.clone();
+        let previous_generics = generics
+            .iter()
+            .map(|name| {
+                (
+                    name.0.clone(),
+                    ctx.generic_params
+                        .insert(name.0.clone(), Type::Param(name.0.clone())),
+                )
+            })
+            .collect::<Vec<_>>();
+        let referenced = self.lambda_references_binding(ctx, expr_id, binding);
+        let declared = if referenced {
+            let generics = generics
+                .iter()
+                .map(|name| name.0.clone())
+                .collect::<Vec<_>>();
+            let params = params
+                .iter()
+                .map(|param| {
+                    self.lower_type_ref_with_params_at(
+                        &param.ty,
+                        &ctx.generic_params,
+                        param.ty_range.or(param.name_range),
+                    )
+                })
+                .collect();
+            let ret =
+                self.lower_type_ref_with_params_at(ret_type, &ctx.generic_params, *ret_type_range);
+            Some(Type::Closure {
+                id: ClosureId {
+                    body: ctx.body_id,
+                    expr: expr_id,
+                },
+                generics,
+                signature: CallableSignature {
+                    is_unsafe: false,
+                    kind: ClosureKind::Fn,
+                    params,
+                    ret: Box::new(ret),
+                },
+            })
+        } else {
+            None
+        };
+        for (name, previous) in previous_generics {
+            if let Some(previous) = previous {
+                ctx.generic_params.insert(name, previous);
+            } else {
+                ctx.generic_params.remove(&name);
+            }
+        }
+        declared
+    }
+
+    fn lambda_references_binding(
+        &self,
+        ctx: &BodyCtx<'_>,
+        expr_id: ExprId,
+        binding: PatternBindingId,
+    ) -> bool {
+        let Expr::Lambda { body, .. } = &ctx.body.exprs[expr_id] else {
+            return false;
+        };
+        let Some(body_range) = ctx.expr_range(*body) else {
+            return false;
+        };
+        ctx.body.exprs.iter().any(|(id, expr)| {
+            matches!(
+                expr,
+                Expr::Path {
+                    resolved: Some(ResolvedName::PatternBinding(id)),
+                    ..
+                } if *id == binding
+            ) && ctx.expr_range(id).is_some_and(|range| {
+                body_range.start() <= range.start() && range.end() <= body_range.end()
+            })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn check_lambda(
         &mut self,
         ctx: &mut BodyCtx<'_>,
         expr_id: ExprId,
         is_move: bool,
+        generics: &[hir::Name],
+        generic_bounds: &[hir::item_tree::HirGenericBound],
         params: &[hir::body::LambdaParam],
         ret_type: &HirTypeRef,
         ret_type_range: Option<rowan::TextRange>,
@@ -19,6 +124,16 @@ impl TypeChecker<'_> {
         expected: Option<&Type>,
     ) -> Type {
         let expected = expected.map(|ty| self.callable_type(ty));
+        let previous_generics = generics
+            .iter()
+            .map(|name| {
+                (
+                    name.0.clone(),
+                    ctx.generic_params
+                        .insert(name.0.clone(), Type::Param(name.0.clone())),
+                )
+            })
+            .collect::<Vec<_>>();
         let expected_fn = match expected.as_ref() {
             Some(Type::CallableConstraint(signature)) => {
                 Some((signature.params.as_slice(), signature.ret.as_ref()))
@@ -71,14 +186,26 @@ impl TypeChecker<'_> {
 
         let old_return = std::mem::replace(&mut ctx.return_ty, return_ty.clone());
         let old_loop_stack = std::mem::take(&mut ctx.loop_stack);
+        let closure_id = ClosureId {
+            body: ctx.body_id,
+            expr: expr_id,
+        };
         ctx.lambdas.push(LambdaCtx {
             expr: expr_id,
+            generic_bounds: generic_bounds.to_vec(),
             params: param_types.clone(),
             param_mutability: params.iter().map(|param| param.is_mut).collect(),
             is_move,
             outer_patterns: ctx.bindings.ids(),
+            recursive_binding: ctx.bindings.closure_binding(closure_id),
             captures: Vec::new(),
         });
+        for (param, ty) in params.iter().zip(&param_types) {
+            if let Some(pat) = param.pat {
+                self.bind_pattern(ctx, pat, ty);
+                self.report_duplicate_pattern_bindings(ctx, pat);
+            }
+        }
         let actual = self.check_expr_expected(ctx, body, &return_ty);
         self.expect_assignable(
             &return_ty,
@@ -91,13 +218,30 @@ impl TypeChecker<'_> {
         ctx.return_ty = old_return;
         ctx.loop_stack = old_loop_stack;
 
-        self.finish_lambda(ctx, expr_id, params, param_types, return_ty, lambda)
+        for (name, previous) in previous_generics {
+            if let Some(previous) = previous {
+                ctx.generic_params.insert(name, previous);
+            } else {
+                ctx.generic_params.remove(&name);
+            }
+        }
+        self.finish_lambda(
+            ctx,
+            expr_id,
+            generics,
+            params,
+            param_types,
+            return_ty,
+            lambda,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_lambda(
         &mut self,
         ctx: &mut BodyCtx<'_>,
         expr_id: ExprId,
+        generics: &[hir::Name],
         params: &[hir::body::LambdaParam],
         param_types: Vec<Type>,
         return_ty: Type,
@@ -149,6 +293,7 @@ impl TypeChecker<'_> {
                 body: ctx.body_id,
                 expr: expr_id,
             },
+            generics: generics.iter().map(|name| name.0.clone()).collect(),
             signature: CallableSignature {
                 is_unsafe: false,
                 kind,
@@ -164,7 +309,9 @@ impl TypeChecker<'_> {
     ) -> Option<CaptureSource> {
         let lambda = ctx.lambdas.last()?;
         match resolved? {
-            ResolvedName::PatternBinding(id) if lambda.outer_patterns.contains(id) => {
+            ResolvedName::PatternBinding(id)
+                if lambda.outer_patterns.contains(id) && lambda.recursive_binding != Some(*id) =>
+            {
                 Some(CaptureSource::Pattern(*id))
             }
             ResolvedName::Param(index) => Some(CaptureSource::Param(*index)),

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use hir::{
     body::{Body, BodyId, ExprId, PatternBindingId, ResolvedName, SourceMap, StmtId},
-    item_tree::{ConstId, FunctionId, HirConst, HirFunction},
+    item_tree::{ConstId, FunctionId, HirConst, HirFunction, HirGenericBound},
 };
 use rowan::TextRange;
 
@@ -141,10 +141,12 @@ impl<'a> BodyCtx<'a> {
 
 pub struct LambdaCtx {
     pub(crate) expr: ExprId,
+    pub(crate) generic_bounds: Vec<HirGenericBound>,
     pub(crate) params: Vec<Type>,
     pub(crate) param_mutability: Vec<bool>,
     pub(crate) is_move: bool,
     pub(crate) outer_patterns: HashSet<PatternBindingId>,
+    pub(crate) recursive_binding: Option<PatternBindingId>,
     pub(crate) captures: Vec<LambdaCapture>,
 }
 
@@ -218,5 +220,19 @@ impl ScopedBindings {
             .iter()
             .flat_map(|scope| scope.values().map(|binding| binding.id))
             .collect()
+    }
+
+    pub(crate) fn closure_binding(
+        &self,
+        closure: crate::types::ClosureId,
+    ) -> Option<PatternBindingId> {
+        self.scopes
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.values())
+            .find_map(|binding| {
+                matches!(&binding.ty, Type::Closure { id, .. } if *id == closure)
+                    .then_some(binding.id)
+            })
     }
 }

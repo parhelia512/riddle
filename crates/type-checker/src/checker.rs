@@ -846,13 +846,23 @@ impl<'a> TypeChecker<'a> {
                 function: *function,
                 args: args.iter().map(|arg| self.resolve_type(arg)).collect(),
             },
-            Type::Closure { id, signature } => Type::Closure {
+            Type::Closure {
+                id,
+                generics,
+                signature,
+            } => Type::Closure {
                 id: *id,
+                generics: generics.clone(),
                 signature: self.resolve_callable_signature(signature),
             },
             Type::OpaqueCallable { id, signature } => Type::OpaqueCallable {
                 id: *id,
                 signature: self.resolve_callable_signature(signature),
+            },
+            Type::OpaqueTrait { id, trait_id, args } => Type::OpaqueTrait {
+                id: *id,
+                trait_id: *trait_id,
+                args: args.iter().map(|arg| self.resolve_type(arg)).collect(),
             },
             Type::CallableConstraint(signature) => {
                 Type::CallableConstraint(self.resolve_callable_signature(signature))
@@ -892,8 +902,54 @@ impl<'a> TypeChecker<'a> {
                 Some(self.function_item_signature(*function, args))
             }
             Type::Ref(inner, _) => self.callable_signature_for_type(inner),
-            _ => None,
+            _ => self
+                .callable_impl_for_type(ty)
+                .map(|(signature, _)| signature),
         }
+    }
+
+    pub(crate) fn callable_impl_for_type(
+        &mut self,
+        ty: &Type,
+    ) -> Option<(CallableSignature, FunctionId)> {
+        let ty = match ty {
+            Type::Ref(inner, _) => inner.as_ref(),
+            ty => ty,
+        };
+        let impls = self
+            .hir
+            .item_tree
+            .impls
+            .iter()
+            .map(|(_, imp)| imp.clone())
+            .collect::<Vec<_>>();
+        for imp in impls {
+            let Some(trait_ty) = imp.trait_ty.as_ref() else {
+                continue;
+            };
+            let Some(kind) = crate::lowering::builtin_callable_kind(trait_ty) else {
+                continue;
+            };
+            let Some(signature) = imp.callable.as_ref() else {
+                continue;
+            };
+            let Some(subst) = self.impl_subst_from_self_ty(&imp, ty) else {
+                continue;
+            };
+            let Some(fid) = imp
+                .methods
+                .iter()
+                .copied()
+                .find(|fid| self.hir.item_tree.functions[*fid].name.0 == "call")
+            else {
+                continue;
+            };
+            return Some((
+                self.lower_hir_callable_signature(signature, kind, &subst, imp.trait_ty_range),
+                fid,
+            ));
+        }
+        None
     }
 
     fn function_item_signature(&mut self, fid: FunctionId, args: &[Type]) -> CallableSignature {
@@ -1042,6 +1098,23 @@ impl<'a> TypeChecker<'a> {
                 },
             ) => {
                 af == bf
+                    && aa.len() == ba.len()
+                    && aa.iter().zip(ba).all(|(a, b)| self.unify_types_inner(a, b))
+            }
+            (
+                Type::OpaqueTrait {
+                    id: aid,
+                    trait_id: atrait,
+                    args: aa,
+                },
+                Type::OpaqueTrait {
+                    id: bid,
+                    trait_id: btrait,
+                    args: ba,
+                },
+            ) => {
+                aid == bid
+                    && atrait == btrait
                     && aa.len() == ba.len()
                     && aa.iter().zip(ba).all(|(a, b)| self.unify_types_inner(a, b))
             }
@@ -1725,6 +1798,10 @@ impl<'a> TypeChecker<'a> {
             self.expect_opaque_callable_assignable(id, &signature, actual, span, occurs_span);
             return;
         }
+        if let Type::OpaqueTrait { id, trait_id, args } = self.resolve_type(expected) {
+            self.expect_opaque_trait_assignable(id, trait_id, &args, actual, span);
+            return;
+        }
         if self.unify_types(expected, actual) {
             return;
         }
@@ -1822,6 +1899,54 @@ impl<'a> TypeChecker<'a> {
         );
     }
 
+    fn expect_opaque_trait_assignable(
+        &mut self,
+        id: OpaqueCallableId,
+        trait_id: hir::item_tree::TraitId,
+        args: &[Type],
+        actual: &Type,
+        span: Option<TextRange>,
+    ) {
+        let actual = self.resolve_type(actual);
+        if actual.is_unknown_like() || actual.is_never() {
+            return;
+        }
+        if matches!(actual, Type::OpaqueTrait { id: actual_id, .. } if actual_id == id) {
+            return;
+        }
+        if !self
+            .result
+            .trait_env
+            .type_implements_with_args_assuming(&actual, trait_id, args, &[])
+        {
+            self.diagnostic(
+                "E0035",
+                format!(
+                    "opaque return type `{}` does not satisfy `{}`",
+                    actual.display(self.hir),
+                    self.hir.item_tree.traits[trait_id].name.0
+                ),
+                span,
+            );
+            return;
+        }
+        let Some(previous) = self.result.opaque_hidden_types.get(&id).cloned() else {
+            self.result.opaque_hidden_types.insert(id, actual);
+            return;
+        };
+        if !self.unify_types(&previous, &actual) {
+            self.diagnostic(
+                "E0002",
+                format!(
+                    "opaque return has incompatible concrete types: {} and {}",
+                    previous.display(self.hir),
+                    actual.display(self.hir)
+                ),
+                span,
+            );
+        }
+    }
+
     pub(crate) fn expect_sized_value(&mut self, ty: &Type, span: Option<TextRange>) {
         if ty.is_valid_value_type() {
             return;
@@ -1902,12 +2027,9 @@ impl<'a> TypeChecker<'a> {
             "E0043" => vec!["put unsized `str` or `[T]` behind a reference or raw pointer".into()],
             "E0044" => vec!["define every supertrait and remove cycles from the trait hierarchy".into()],
             "E0045" => vec!["add an explicit type annotation or use the binding where its type is known".into()],
-            "E0047" if message.contains("only impl Fn") => {
-                vec!["use an explicit generic parameter and where-clause for other traits".into()]
-            }
             "E0047" => vec!["remove the duplicate or overlapping trait implementation".into()],
-            "E0048" if message.contains("implemented only by functions") => {
-                vec!["use a function or anonymous function value instead".into()]
+            "E0048" if message.contains("callable trait names are reserved") => {
+                vec!["use another name for a user-defined trait".into()]
             }
             "E0048" => vec!["define the trait or a participating nominal type in the current package".into()],
             "E0057" => vec!["a `let` binding or `for` loop header has no alternative branch, so its pattern must match every value; use `match` to handle the other cases".into()],
@@ -2259,7 +2381,7 @@ fn type_contains_infer_var(
         Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => elements
             .iter()
             .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
-        Type::FunctionItem { args, .. } => args
+        Type::FunctionItem { args, .. } | Type::OpaqueTrait { args, .. } => args
             .iter()
             .any(|ty| type_contains_infer_var(needle, ty, infer_values, visited)),
         Type::DynTrait {
@@ -2915,9 +3037,10 @@ fn type_contains_slice(ty: &Type) -> bool {
         Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
             type_contains_slice(inner)
         }
-        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => {
-            elements.iter().any(type_contains_slice)
-        }
+        Type::Tuple(elements)
+        | Type::Struct(_, elements)
+        | Type::Enum(_, elements)
+        | Type::OpaqueTrait { args: elements, .. } => elements.iter().any(type_contains_slice),
         Type::CallableConstraint(signature)
         | Type::Closure { signature, .. }
         | Type::OpaqueCallable { signature, .. } => {
@@ -2934,9 +3057,10 @@ fn type_contains_dyn_trait(ty: &Type) -> bool {
         Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Array(inner, _) => {
             type_contains_dyn_trait(inner)
         }
-        Type::Tuple(elements) | Type::Struct(_, elements) | Type::Enum(_, elements) => {
-            elements.iter().any(type_contains_dyn_trait)
-        }
+        Type::Tuple(elements)
+        | Type::Struct(_, elements)
+        | Type::Enum(_, elements)
+        | Type::OpaqueTrait { args: elements, .. } => elements.iter().any(type_contains_dyn_trait),
         Type::CallableConstraint(signature)
         | Type::Closure { signature, .. }
         | Type::OpaqueCallable { signature, .. } => {

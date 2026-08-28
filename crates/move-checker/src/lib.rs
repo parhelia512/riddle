@@ -508,11 +508,15 @@ impl Analyzer<'_> {
         };
         self.move_check_expr(ctx, cond);
         self.apply_recorded_value_use(ctx, cond);
+        let branch_entry = ctx.move_state_snapshot();
         self.move_check_expr(ctx, then_branch);
         self.apply_recorded_value_use(ctx, then_branch);
         if let Some(else_branch) = else_branch {
+            let then_exit = ctx.move_state_snapshot();
+            ctx.copy_move_state_snapshot(&branch_entry);
             self.move_check_expr(ctx, else_branch);
             self.apply_recorded_value_use(ctx, else_branch);
+            ctx.merge_move_state_snapshot(&then_exit);
         }
         let mut value = ctx.expr_origin_value(then_branch);
         if let Some(else_branch) = else_branch {

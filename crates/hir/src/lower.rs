@@ -164,7 +164,7 @@ pub fn lower_generic_bounds(
     bounds
 }
 
-fn lower_callable_signature(callable: &ast::CallableTraitArgs) -> HirCallableSignature {
+pub(crate) fn lower_callable_signature(callable: &ast::CallableTraitArgs) -> HirCallableSignature {
     HirCallableSignature {
         params: callable.params().map(Lower::lower).collect(),
         ret: Box::new(
@@ -175,14 +175,38 @@ fn lower_callable_signature(callable: &ast::CallableTraitArgs) -> HirCallableSig
     }
 }
 
-fn assign_implicit_generics(params: &mut [HirParam]) -> Vec<Name> {
+fn assign_implicit_generics(
+    params: &mut [HirParam],
+    generic_bounds: &mut Vec<HirGenericBound>,
+) -> Vec<Name> {
     let mut names = Vec::new();
     for (index, param) in params.iter_mut().enumerate() {
-        let HirTypeRef::ImplTrait { hidden, .. } = &mut param.ty else {
+        let HirTypeRef::ImplTrait {
+            trait_ty,
+            trait_range,
+            callable,
+            hidden,
+        } = &mut param.ty
+        else {
             continue;
         };
         let name = Name(format!("#impl{index}"));
         *hidden = Some(name.clone());
+        generic_bounds.push(HirGenericBound {
+            param: name.clone(),
+            target_ty: HirTypeRef::Named(HirPath {
+                anchor: PathAnchor::Plain,
+                segments: vec![name.clone()],
+                segment_type_args: Vec::new(),
+                type_args: Vec::new(),
+                range: *trait_range,
+            }),
+            target_range: param.ty_range,
+            trait_ty: *trait_ty.clone(),
+            trait_range: *trait_range,
+            callable: callable.clone(),
+            assoc_constraints: Vec::new(),
+        });
         names.push(name);
     }
     names
@@ -297,12 +321,12 @@ impl AstLower for FuncDecl {
         let generic_params = self.generic_params();
         let generics = lower_generic_params(generic_params.clone());
         let const_generics = lower_const_generic_params(generic_params.clone());
-        let generic_bounds = lower_generic_bounds(generic_params, self.where_clause());
+        let mut generic_bounds = lower_generic_bounds(generic_params, self.where_clause());
         let mut params: Vec<HirParam> = self
             .param_list()
             .map(|pl| pl.params().map(Lower::lower).collect())
             .unwrap_or_default();
-        let implicit_generics = assign_implicit_generics(&mut params);
+        let implicit_generics = assign_implicit_generics(&mut params, &mut generic_bounds);
         let ret_type_ast = self.return_type();
         let ret_type_range = ret_type_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
         let ret_type = ret_type_ast.map(Lower::lower);
@@ -544,7 +568,8 @@ fn lower_trait_method(method: &ast::FuncDecl) -> HirFunction {
                 .collect()
         })
         .unwrap_or_default();
-    let implicit_generics = assign_implicit_generics(&mut params);
+    let mut generic_bounds = lower_generic_bounds(method.generic_params(), method.where_clause());
+    let implicit_generics = assign_implicit_generics(&mut params, &mut generic_bounds);
     let ret_type_ast = method.return_type();
     let ret_type_range = ret_type_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
     let ret_type = ret_type_ast.map(Lower::lower);
@@ -557,7 +582,7 @@ fn lower_trait_method(method: &ast::FuncDecl) -> HirFunction {
         generics: lower_generic_params(generic_params.clone()),
         implicit_generics,
         const_generics: lower_const_generic_params(generic_params.clone()),
-        generic_bounds: lower_generic_bounds(generic_params, method.where_clause()),
+        generic_bounds,
         params,
         ret_type,
         ret_type_range,

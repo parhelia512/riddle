@@ -1,8 +1,9 @@
 use super::{
-    BinaryOp, BodyCtx, Expr, ExprId, HirStructField, HirTypeRef, IntTy, LoopCtx, ResolvedName,
-    Stmt, StmtId, StructId, TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse, Visibility,
-    is_supported_cast, is_unsafe_dst_layout_cast, struct_field_is_visible_for_owner,
-    substitute_type, type_contains_unresolved_const_param, type_ref_contains_error,
+    BinaryOp, BodyCtx, Expr, ExprId, HirStructField, HirTypeRef, IntTy, LoopCtx, Pattern,
+    PatternBindingId, ResolvedName, Stmt, StmtId, StructId, TraitMethodCall, Type, TypeChecker,
+    UnaryOp, ValueUse, Visibility, is_supported_cast, is_unsafe_dst_layout_cast,
+    struct_field_is_visible_for_owner, substitute_type, type_contains_unresolved_const_param,
+    type_ref_contains_error,
 };
 
 impl TypeChecker<'_> {
@@ -91,7 +92,23 @@ impl TypeChecker<'_> {
             } => {
                 let pat = *pat;
                 let else_ = *else_;
-                let declared = if init.is_none() && matches!(ty, HirTypeRef::Unknown) {
+                let recursive_lambda = init.and_then(|expr| {
+                    matches!(ctx.body.pats[pat], Pattern::Binding { .. })
+                        .then(|| {
+                            self.declared_recursive_lambda_type(
+                                ctx,
+                                expr,
+                                PatternBindingId {
+                                    pattern: pat,
+                                    field: None,
+                                },
+                            )
+                        })
+                        .flatten()
+                });
+                let declared = if let Some(recursive) = recursive_lambda.clone() {
+                    recursive
+                } else if init.is_none() && matches!(ty, HirTypeRef::Unknown) {
                     // A delayed binding can infer its type from a later
                     // assignment, just like Rust's `let value; value = ...`.
                     self.fresh_infer()
@@ -104,6 +121,9 @@ impl TypeChecker<'_> {
                     self.diagnostic("E0034", "invalid type annotation", ctx.stmt_range(stmt_id));
                 } else {
                     self.check_type_bounds(ctx, &declared, ctx.stmt_range(stmt_id));
+                }
+                if let Some(recursive) = recursive_lambda {
+                    self.bind_pattern(ctx, pat, &recursive);
                 }
                 let init_ty = init.map(|expr| {
                     if explicit_error || declared.is_unknown_like() {
@@ -508,15 +528,18 @@ impl TypeChecker<'_> {
             } => self.check_call(ctx, expr_id, *callee, args, type_args, expected),
             Expr::Lambda {
                 is_move,
+                generics,
+                generic_bounds,
                 params,
                 ret_type,
                 ret_type_range,
                 body,
-                ..
             } => self.check_lambda(
                 ctx,
                 expr_id,
                 *is_move,
+                generics,
+                generic_bounds,
                 params,
                 ret_type,
                 *ret_type_range,

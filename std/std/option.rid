@@ -53,10 +53,6 @@ impl<T> Option<T> {
             Option::None => fallback,
         }
     }
-
-    pub fun unwarp(self) -> T {
-        self.unwrap()
-    }
 }
 
 impl<T: crate::std::marker::Copy> crate::std::marker::Copy for Option<T> {}

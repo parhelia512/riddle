@@ -314,6 +314,7 @@ pub struct HirImpl {
     /// The trait being implemented, if any (`Trait` in `impl Trait for T`).
     pub trait_ty: Option<HirTypeRef>,
     pub trait_ty_range: Option<TextRange>,
+    pub callable: Option<HirCallableSignature>,
     pub generics: Vec<Name>,
     pub const_generics: Vec<Name>,
     pub generic_bounds: Vec<HirGenericBound>,

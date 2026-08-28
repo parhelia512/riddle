@@ -763,6 +763,7 @@ fn type_may_carry_flow(hir: &HirFile, ty: &Type, through_raw_pointer: bool) -> b
         | Type::OwnedDynTrait { .. }
         | Type::Closure { .. }
         | Type::OpaqueCallable { .. }
+        | Type::OpaqueTrait { .. }
         | Type::Param(..)
         | Type::InferVar(..)
         | Type::Unknown

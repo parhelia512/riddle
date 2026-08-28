@@ -111,12 +111,16 @@ pub fn collect_subst<S: BuildHasher>(
         },
         Type::Closure {
             id: expected_id,
+            generics: expected_generics,
             signature: expected,
         } => match actual {
             Type::Closure {
                 id: actual_id,
+                generics: actual_generics,
                 signature: actual,
-            } if expected_id == actual_id => collect_signature_subst(expected, actual, subst),
+            } if expected_id == actual_id && expected_generics == actual_generics => {
+                collect_signature_subst(expected, actual, subst)
+            }
             _ => false,
         },
         Type::OpaqueCallable {
@@ -127,6 +131,20 @@ pub fn collect_subst<S: BuildHasher>(
                 id: actual_id,
                 signature: actual,
             } if expected_id == actual_id => collect_signature_subst(expected, actual, subst),
+            _ => false,
+        },
+        Type::OpaqueTrait {
+            id: expected_id,
+            trait_id: expected_trait_id,
+            args: expected_args,
+        } => match actual {
+            Type::OpaqueTrait {
+                id: actual_id,
+                trait_id: actual_trait_id,
+                args: actual_args,
+            } if expected_id == actual_id && expected_trait_id == actual_trait_id => {
+                collect_args_subst(expected_args, actual_args, subst)
+            }
             _ => false,
         },
         Type::CallableConstraint(expected) => {
@@ -269,8 +287,13 @@ pub fn substitute_type<S: BuildHasher>(ty: &Type, subst: &HashMap<String, Type, 
             function: *function,
             args: args.iter().map(|ty| substitute_type(ty, subst)).collect(),
         },
-        Type::Closure { id, signature } => Type::Closure {
+        Type::Closure {
+            id,
+            generics,
+            signature,
+        } => Type::Closure {
             id: *id,
+            generics: generics.clone(),
             signature: CallableSignature {
                 is_unsafe: signature.is_unsafe,
                 kind: signature.kind,
@@ -294,6 +317,11 @@ pub fn substitute_type<S: BuildHasher>(ty: &Type, subst: &HashMap<String, Type, 
                     .collect(),
                 ret: Box::new(substitute_type(&signature.ret, subst)),
             },
+        },
+        Type::OpaqueTrait { id, trait_id, args } => Type::OpaqueTrait {
+            id: *id,
+            trait_id: *trait_id,
+            args: args.iter().map(|ty| substitute_type(ty, subst)).collect(),
         },
         Type::CallableConstraint(signature) => Type::CallableConstraint(CallableSignature {
             is_unsafe: signature.is_unsafe,

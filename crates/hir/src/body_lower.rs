@@ -10,7 +10,7 @@ use rowan::{TextRange, ast::SyntaxNodePtr};
 use syntax::{SyntaxKind, SyntaxToken};
 
 use super::{
-    HirFile,
+    HirFile, Name,
     body::{
         BinaryOp, Body, BodyItem, Diagnostic, Expr, ExprId, FieldPat, LabelStyle, LambdaParam,
         LiteralPattern, MatchArm, PatId, Pattern, Severity, SourceLabel, SourceMap, Stmt, StmtId,
@@ -701,17 +701,58 @@ impl<'a> BodyLower<'a> {
     }
 
     fn lower_lambda_expr(&mut self, lambda: &ast::LambdaExpr, range: TextRange) -> ExprId {
+        let generic_params = lambda.generic_params();
+        let generics = super::lower::lower_generic_params(generic_params.clone());
+        let generic_bounds =
+            super::lower::lower_generic_bounds(generic_params, lambda.where_clause());
         let params = lambda
             .param_list()
             .map(|list| {
                 list.params()
-                    .map(|param| {
-                        let name_token = param.name();
+                    .enumerate()
+                    .map(|(index, param)| {
+                        let ast_pattern = param.pattern();
+                        let binding = match ast_pattern.as_ref() {
+                            Some(ast::Pattern::Binding(binding)) => {
+                                binding.name().map(|name| (name, binding.is_mut()))
+                            }
+                            Some(ast::Pattern::Enum(pattern))
+                                if !pattern.is_tuple() && !pattern.is_struct() =>
+                            {
+                                pattern.path().and_then(|path| {
+                                    if path.is_absolute() {
+                                        return None;
+                                    }
+                                    let mut segments = path.segments();
+                                    let segment = segments.next()?;
+                                    if segments.next().is_some() || !segment.type_args().is_empty()
+                                    {
+                                        return None;
+                                    }
+                                    segment
+                                        .name_token()
+                                        .filter(|name| name.kind() == syntax::SyntaxKind::Ident)
+                                        .map(|name| (name, false))
+                                })
+                            }
+                            _ => None,
+                        };
+                        let pat = binding
+                            .is_none()
+                            .then_some(ast_pattern)
+                            .flatten()
+                            .map(|pattern| self.lower_pattern(pattern));
+                        let (name_token, is_mut) =
+                            binding.map_or((None, false), |(name, is_mut)| (Some(name), is_mut));
                         let ty = param.ty();
                         LambdaParam {
-                            name: lower_name(name_token.clone()),
+                            name: name_token.clone().map_or_else(
+                                || Name(format!("#arg{index}")),
+                                |name| Name(name.text().into()),
+                            ),
                             name_range: name_token.map(|token| token.text_range()),
-                            is_mut: param.is_mut(),
+                            is_mut,
+                            pat,
                             ty_range: ty.as_ref().map(|ty| trimmed_range(ty.syntax())),
                             ty: Self::lower_optional_type(ty),
                         }
@@ -727,6 +768,8 @@ impl<'a> BodyLower<'a> {
         self.alloc_expr(
             Expr::Lambda {
                 is_move: lambda.is_move(),
+                generics,
+                generic_bounds,
                 params,
                 ret_type,
                 ret_type_range,

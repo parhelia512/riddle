@@ -332,6 +332,12 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: &ast::ImplDecl) -> item_tree
             None,
         )
     };
+    let callable = i
+        .has_for()
+        .then(|| i.callable_trait_args())
+        .flatten()
+        .as_ref()
+        .map(lower::lower_callable_signature);
     let generic_params = i.generic_params();
     let generics = lower::lower_generic_params(generic_params.clone());
     let const_generics = lower::lower_const_generic_params(generic_params.clone());
@@ -379,6 +385,7 @@ pub(crate) fn lower_impl_decl(hir: &mut HirFile, i: &ast::ImplDecl) -> item_tree
         self_ty_range,
         trait_ty,
         trait_ty_range,
+        callable,
         generics,
         const_generics,
         generic_bounds,

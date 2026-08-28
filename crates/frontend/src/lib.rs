@@ -89,12 +89,24 @@ mod tests {
     #[test]
     fn anonymous_functions_keep_named_nongeneric_parameters() {
         let mut parser = IncrementalParser::new();
-        let pattern =
-            parser.set_source("fun main() { let f = fun((left, right): (i32, i32)) { left }; }");
-        assert!(!pattern.errors.is_empty());
+        let parse = parser.set_source("fun main() { let f = fun(value: i32) { value }; }");
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+    }
 
-        let generic = parser.set_source("fun main() { let f = fun<T>(value: T) { value }; }");
-        assert!(!generic.errors.is_empty());
+    #[test]
+    fn accepts_generic_anonymous_function_patterns_and_callable_impls() {
+        let mut parser = IncrementalParser::new();
+        let source = r"
+            struct Adder { amount: i32 }
+            impl Fn(i32) -> i32 for Adder {
+                fun call(&self, value: i32) -> i32 { value + self.amount }
+            }
+            fun main() {
+                let first = fun<T>((left, _): (T, T)) -> T { left };
+            }
+        ";
+        let parse = parser.set_source(source);
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
     }
 
     #[test]

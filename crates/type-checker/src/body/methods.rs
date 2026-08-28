@@ -424,10 +424,48 @@ impl TypeChecker<'_> {
         if let Some(method) = self.find_trait_bound_method(ctx, receiver_ty, method_name) {
             return Ok(Some(method));
         }
+        if let Some(method) = self.find_opaque_trait_method(ctx, receiver_ty, method_name) {
+            return Ok(Some(method));
+        }
         if let Some(method) = self.find_dyn_trait_method(ctx, receiver_ty, method_name)? {
             return Ok(Some(method));
         }
         Ok(self.find_trait_impl_method_by_name(ctx, receiver_ty, method_name))
+    }
+
+    fn find_opaque_trait_method(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        receiver_ty: &Type,
+        method_name: &Name,
+    ) -> Option<ResolvedMethod> {
+        let Type::OpaqueTrait { trait_id, args, .. } = receiver_ty else {
+            return None;
+        };
+        let (method_trait_id, function) =
+            self.find_supertrait_method(*trait_id, method_name, &mut HashSet::new())?;
+        let mut subst = HashMap::from([(String::from("Self"), receiver_ty.clone())]);
+        for (name, arg) in self.hir.item_tree.traits[*trait_id]
+            .generics
+            .iter()
+            .zip(args)
+        {
+            subst.insert(name.0.clone(), arg.clone());
+        }
+        let subst = self.supertrait_subst(
+            *trait_id,
+            method_trait_id,
+            receiver_ty,
+            &subst,
+            &mut HashSet::new(),
+        )?;
+        Some(ResolvedMethod {
+            fid: ctx.function_id?,
+            function,
+            subst,
+            trait_id: Some(method_trait_id),
+            from_trait_bound: true,
+        })
     }
 
     fn find_dyn_trait_method(

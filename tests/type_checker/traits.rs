@@ -2621,25 +2621,15 @@ fn no_std_mode_rejects_incomplete_lang_item_signatures() {
 }
 
 #[test]
-fn rejects_general_impl_trait_and_manual_callable_impls() {
-    let general = check(
-        r"
-        trait Display {}
-        fun show(value: impl Display) {}
-        ",
-    );
-    assert!(general.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0047" && diagnostic.message.contains("only impl Fn")
-    }));
-
-    let manual = check(
+fn rejects_callable_impl_without_signature() {
+    let result = check(
         r"
         struct Callable {}
         impl Fn for Callable {}
         ",
     );
-    assert!(manual.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0048" && diagnostic.message.contains("implemented only by functions")
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0047" && diagnostic.message.contains("requires a callable signature")
     }));
 }
 
