@@ -2,6 +2,7 @@ mod backend_c;
 mod builder;
 mod display;
 mod lower;
+mod std_behavior;
 
 use ast::{self, support::AstNode};
 use frontend::incremental::IncrementalParser;

@@ -1,0 +1,136 @@
+// File access built on the C stdio facade. The runtime provides thin
+// `riddle_fs_*` wrappers around `<stdio.h>` so the extern signatures here
+// never clash with the platform's own `FILE` typedef. The handle travels as
+// `usize` because pointer null-comparison is not available yet.
+use crate::std::result::Result;
+use crate::std::string::String;
+use crate::std::vector::Vector;
+
+unsafe extern "C" {
+    fun riddle_fs_fopen(path: &str, mode: &str) -> usize;
+    safe fun riddle_fs_fclose(stream: usize) -> i32;
+    safe fun riddle_fs_fread(buffer: *mut u8, size: usize, count: usize, stream: usize) -> usize;
+    safe fun riddle_fs_fwrite(buffer: *const u8, size: usize, count: usize, stream: usize) -> usize;
+    safe fun riddle_fs_fflush(stream: usize) -> i32;
+}
+
+#[derive(Debug)]
+pub enum FsError {
+    OpenFailed,
+    ReadFailed,
+    WriteFailed,
+}
+
+pub struct FsFile {
+    stream: usize,
+}
+
+impl FsFile {
+    pub fun open(path: &str) -> Result<FsFile, FsError> {
+        FsFile::with_mode(path, "r")
+    }
+
+    pub fun create(path: &str) -> Result<FsFile, FsError> {
+        FsFile::with_mode(path, "w")
+    }
+
+    pub fun append(path: &str) -> Result<FsFile, FsError> {
+        FsFile::with_mode(path, "a")
+    }
+
+    fun with_mode(path: &str, mode: &str) -> Result<FsFile, FsError> {
+        let stream = unsafe { riddle_fs_fopen(path, mode) };
+        if stream == 0usize {
+            Result::Err(FsError::OpenFailed)
+        } else {
+            Result::Ok(FsFile { stream })
+        }
+    }
+
+    // Reads up to `buffer.len()` bytes; returns how many bytes were read.
+    pub fun read(&mut self, buffer: &mut [u8]) -> Result<usize, FsError> {
+        if buffer.len() == 0usize {
+            return Result::Ok(0usize);
+        }
+        let ptr = buffer.as_mut_ptr();
+        let count = unsafe { riddle_fs_fread(ptr, 1usize, buffer.len(), self.stream) };
+        Result::Ok(count)
+    }
+
+    pub fun write(&mut self, buffer: &[u8]) -> Result<usize, FsError> {
+        if buffer.len() == 0usize {
+            return Result::Ok(0usize);
+        }
+        let ptr = buffer.as_ptr();
+        let count = unsafe { riddle_fs_fwrite(ptr, 1usize, buffer.len(), self.stream) };
+        if count == 0usize {
+            Result::Err(FsError::WriteFailed)
+        } else {
+            Result::Ok(count)
+        }
+    }
+
+    pub fun flush(&mut self) -> Result<(), FsError> {
+        let code = unsafe { riddle_fs_fflush(self.stream) };
+        if code == 0i32 {
+            Result::Ok(())
+        } else {
+            Result::Err(FsError::WriteFailed)
+        }
+    }
+
+    pub fun read_to_string(&mut self) -> Result<String, FsError> {
+        let mut bytes: Vector<u8> = Vector::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let count = match self.read(&mut chunk) {
+                Result::Ok(count) => count,
+                Result::Err(err) => { return Result::Err(err); },
+            };
+            if count == 0usize {
+                break;
+            }
+            let mut index = 0usize;
+            while index < count {
+                bytes.push(chunk[index]);
+                index += 1usize;
+            }
+        }
+        // SAFETY: `&[u8]` and `&str` share layout; the bytes were read from
+        // the file and are reinterpreted without validation.
+        let text: &str = unsafe { bytes.as_slice() as &str };
+        Result::Ok(String::from_str(text))
+    }
+}
+
+impl Drop for FsFile {
+    fun drop(&mut self) {
+        if self.stream != 0usize {
+            unsafe { riddle_fs_fclose(self.stream) };
+            self.stream = 0usize;
+        }
+    }
+}
+
+pub fun read_to_string(path: &str) -> Result<String, FsError> {
+    let opened = FsFile::open(path);
+    let mut file = match opened {
+        Result::Ok(value) => value,
+        Result::Err(err) => { return Result::Err(err); },
+    };
+    file.read_to_string()
+}
+
+pub fun write(path: &str, contents: &str) -> Result<(), FsError> {
+    let opened = FsFile::create(path);
+    let mut file = match opened {
+        Result::Ok(value) => value,
+        Result::Err(err) => { return Result::Err(err); },
+    };
+    let written = file.write(contents.as_bytes());
+    match written {
+        Result::Ok(_) => {},
+        Result::Err(err) => { return Result::Err(err); },
+    }
+    file.flush()
+}

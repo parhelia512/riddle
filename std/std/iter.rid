@@ -1,9 +1,130 @@
 use crate::std::option::Option;
+use crate::std::vector::Vector;
 
 pub trait Iterator {
     type Item;
 
     fun next(&mut self) -> Option<Self::Item>;
+
+    fun count(&mut self) -> usize {
+        let mut total = 0usize;
+        loop {
+            match self.next() {
+                Option::Some(_) => { total += 1usize; },
+                Option::None => { break; },
+            }
+        }
+        total
+    }
+
+    fun nth(&mut self, n: usize) -> Option<Self::Item> {
+        let mut remaining = n;
+        loop {
+            if remaining == 0usize {
+                break;
+            }
+            match self.next() {
+                Option::Some(_) => { remaining -= 1usize; },
+                Option::None => { return Option::None; },
+            }
+        }
+        self.next()
+    }
+
+    fun fold<B>(self, init: B, mut f: impl FnMut(B, Self::Item) -> B) -> B {
+        let mut acc = init;
+        let mut runner = self;
+        loop {
+            match runner.next() {
+                Option::Some(value) => { acc = f(acc, value); },
+                Option::None => { break; },
+            }
+        }
+        acc
+    }
+
+    fun for_each(&mut self, mut f: impl FnMut(Self::Item) -> ()) {
+        loop {
+            match self.next() {
+                Option::Some(value) => { f(value); },
+                Option::None => { break; },
+            }
+        }
+    }
+
+    fun all(&mut self, mut predicate: impl FnMut(Self::Item) -> bool) -> bool {
+        loop {
+            match self.next() {
+                Option::Some(value) => {
+                    let keep = predicate(value);
+                    if !keep {
+                        return false;
+                    }
+                },
+                Option::None => { return true; },
+            }
+        }
+    }
+
+    fun any(&mut self, mut predicate: impl FnMut(Self::Item) -> bool) -> bool {
+        loop {
+            match self.next() {
+                Option::Some(value) => {
+                    let matches = predicate(value);
+                    if matches {
+                        return true;
+                    }
+                },
+                Option::None => { return false; },
+            }
+        }
+    }
+
+    fun find(&mut self, mut predicate: impl FnMut(&Self::Item) -> bool) -> Option<Self::Item> {
+        loop {
+            match self.next() {
+                Option::Some(value) => {
+                    let matches = predicate(&value);
+                    if matches {
+                        return Option::Some(value);
+                    }
+                },
+                Option::None => { return Option::None; },
+            }
+        }
+    }
+
+    fun position(&mut self, mut predicate: impl FnMut(&Self::Item) -> bool) -> Option<usize> {
+        let mut index = 0usize;
+        loop {
+            match self.next() {
+                Option::Some(value) => {
+                    let matches = predicate(&value);
+                    if matches {
+                        return Option::Some(index);
+                    }
+                    index += 1usize;
+                },
+                Option::None => { return Option::None; },
+            }
+        }
+    }
+
+    fun map<U, F>(self, f: F) -> Map<Self, F, Self::Item, U>
+    where F: FnMut(Self::Item) -> U {
+        let adapter: Map<Self, F, Self::Item, U> = Map { iter: self, f };
+        adapter
+    }
+
+    fun filter<F>(self, predicate: F) -> Filter<Self, F, Self::Item>
+    where F: FnMut(&Self::Item) -> bool {
+        let adapter: Filter<Self, F, Self::Item> = Filter { iter: self, predicate };
+        adapter
+    }
+}
+
+pub trait DoubleEndedIterator: Iterator {
+    fun next_back(&mut self) -> Option<Self::Item>;
 }
 
 pub trait IntoIterator {
@@ -11,4 +132,232 @@ pub trait IntoIterator {
     type IntoIter;
 
     fun into_iter(self) -> Self::IntoIter;
+}
+
+// Lazy adapters ---------------------------------------------------------------
+
+pub struct Enumerate<I, T> {
+    iter: I,
+    index: usize,
+}
+
+impl<I, T> Iterator for Enumerate<I, T>
+where I: Iterator<Item = T> {
+    type Item = (usize, T);
+
+    fun next(&mut self) -> Option<(usize, T)> {
+        match self.iter.next() {
+            Option::Some(value) => {
+                let index = self.index;
+                self.index += 1usize;
+                Option::Some((index, value))
+            },
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<I, T> IntoIterator for Enumerate<I, T>
+where I: Iterator<Item = T> {
+    type Item = (usize, T);
+    type IntoIter = Enumerate<I, T>;
+
+    fun into_iter(self) -> Enumerate<I, T> {
+        self
+    }
+}
+
+pub struct Take<I, T> {
+    iter: I,
+    remaining: usize,
+}
+
+impl<I, T> Iterator for Take<I, T>
+where I: Iterator<Item = T> {
+    type Item = T;
+
+    fun next(&mut self) -> Option<T> {
+        if self.remaining == 0usize {
+            return Option::None;
+        }
+        let next = self.iter.next();
+        let taken = next.is_some();
+        if taken {
+            self.remaining -= 1usize;
+        }
+        next
+    }
+}
+
+impl<I, T> IntoIterator for Take<I, T>
+where I: Iterator<Item = T> {
+    type Item = T;
+    type IntoIter = Take<I, T>;
+
+    fun into_iter(self) -> Take<I, T> {
+        self
+    }
+}
+
+pub struct Zip<A, B, TA, TB> {
+    a: A,
+    b: B,
+}
+
+impl<A, B, TA, TB> Iterator for Zip<A, B, TA, TB>
+where A: Iterator<Item = TA>,
+      B: Iterator<Item = TB> {
+    type Item = (TA, TB);
+
+    fun next(&mut self) -> Option<(TA, TB)> {
+        let first = self.a.next();
+        let first = match first {
+            Option::Some(value) => value,
+            Option::None => { return Option::None; },
+        };
+        let second = self.b.next();
+        let second = match second {
+            Option::Some(value) => value,
+            Option::None => { return Option::None; },
+        };
+        Option::Some((first, second))
+    }
+}
+
+impl<A, B, TA, TB> IntoIterator for Zip<A, B, TA, TB>
+where A: Iterator<Item = TA>,
+      B: Iterator<Item = TB> {
+    type Item = (TA, TB);
+    type IntoIter = Zip<A, B, TA, TB>;
+
+    fun into_iter(self) -> Zip<A, B, TA, TB> {
+        self
+    }
+}
+
+// Lazy map/filter adapters ----------------------------------------------------
+
+pub struct Map<I, F, T, U> {
+    iter: I,
+    f: F,
+}
+
+impl<I, F, T, U> Iterator for Map<I, F, T, U>
+where I: Iterator<Item = T>,
+      F: FnMut(T) -> U {
+    type Item = U;
+
+    fun next(&mut self) -> Option<U> {
+        match self.iter.next() {
+            Option::Some(value) => Option::Some(self.f(value)),
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<I, F, T, U> IntoIterator for Map<I, F, T, U>
+where I: Iterator<Item = T>,
+      F: FnMut(T) -> U {
+    type Item = U;
+    type IntoIter = Map<I, F, T, U>;
+
+    fun into_iter(self) -> Map<I, F, T, U> {
+        self
+    }
+}
+
+pub struct Filter<I, F, T> {
+    iter: I,
+    predicate: F,
+}
+
+impl<I, F, T> Iterator for Filter<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> bool {
+    type Item = T;
+
+    fun next(&mut self) -> Option<T> {
+        loop {
+            match self.iter.next() {
+                Option::Some(value) => {
+                    let keep = self.predicate(&value);
+                    if keep {
+                        return Option::Some(value);
+                    }
+                },
+                Option::None => { return Option::None; },
+            }
+        }
+    }
+}
+
+impl<I, F, T> IntoIterator for Filter<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> bool {
+    type Item = T;
+    type IntoIter = Filter<I, F, T>;
+
+    fun into_iter(self) -> Filter<I, F, T> {
+        self
+    }
+}
+
+// Adapter constructors --------------------------------------------------------
+
+pub fun enumerate<I, T>(iterator: I) -> Enumerate<I, T>
+where I: Iterator<Item = T> {
+    let adapter: Enumerate<I, T> = Enumerate {
+        iter: iterator,
+        index: 0usize,
+    };
+    adapter
+}
+
+pub fun take<I, T>(iterator: I, n: usize) -> Take<I, T>
+where I: Iterator<Item = T> {
+    let adapter: Take<I, T> = Take {
+        iter: iterator,
+        remaining: n,
+    };
+    adapter
+}
+
+pub fun zip<A, B, TA, TB>(a: A, b: B) -> Zip<A, B, TA, TB>
+where A: Iterator<Item = TA>,
+      B: Iterator<Item = TB> {
+    let adapter: Zip<A, B, TA, TB> = Zip { a, b };
+    adapter
+}
+
+// Eager collection helpers ----------------------------------------------------
+
+// Builds a vector by mapping every remaining item eagerly. The lazy
+// `Iterator::map` stores the callable in a struct field.
+pub fun map_into<I, T, U>(iterator: &mut I, mut f: impl FnMut(T) -> U) -> Vector<U>
+where I: Iterator<Item = T> {
+    let mut out = Vector::new();
+    loop {
+        match iterator.next() {
+            Option::Some(value) => { out.push(f(value)); },
+            Option::None => { break; },
+        }
+    }
+    out
+}
+
+pub fun filter_into<I, T>(iterator: &mut I, mut predicate: impl FnMut(&T) -> bool) -> Vector<T>
+where I: Iterator<Item = T> {
+    let mut out = Vector::new();
+    loop {
+        match iterator.next() {
+            Option::Some(value) => {
+                let keep = predicate(&value);
+                if keep {
+                    out.push(value);
+                }
+            },
+            Option::None => { break; },
+        }
+    }
+    out
 }

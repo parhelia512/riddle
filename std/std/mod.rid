@@ -6,6 +6,7 @@ pub mod convert;
 pub mod default;
 pub mod env;
 pub mod ffi;
+pub mod fs;
 pub mod fmt;
 pub mod hash;
 pub mod io;

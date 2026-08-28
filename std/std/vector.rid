@@ -34,6 +34,19 @@ impl<T> Vector<T> {
         }
     }
 
+    // Collects every remaining item of `iterator` into a new vector.
+    pub fun from_iterator<I>(iterator: &mut I) -> Vector<T>
+    where I: Iterator<Item = T> {
+        let mut out = Vector::new();
+        loop {
+            match iterator.next() {
+                Option::Some(value) => { out.push(value); },
+                Option::None => { break; },
+            }
+        }
+        out
+    }
+
     pub fun len(&self) -> usize {
         self.len
     }

@@ -30,4 +30,9 @@ impl<T> HashSet<T> {
     where T: Hash + Eq {
         self.values.contains_key(value)
     }
+
+    pub fun remove(&mut self, value: &T) -> bool
+    where T: Hash + Eq {
+        self.values.remove(value).is_some()
+    }
 }

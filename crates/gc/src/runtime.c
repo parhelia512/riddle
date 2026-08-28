@@ -399,3 +399,22 @@ void *rgc_realloc(void *ptr, size_t size) {
 
     return next;
 }
+
+/* ---- std::fs shim (avoids clashing with <stdio.h> prototypes) ---- */
+#include <stdio.h>
+#include <stdint.h>
+size_t riddle_fs_fopen(const char *path, const char *mode) {
+    return (size_t)(uintptr_t)fopen(path, mode);
+}
+int riddle_fs_fclose(size_t stream) {
+    return fclose((FILE *)(uintptr_t)stream);
+}
+size_t riddle_fs_fread(void *buffer, size_t size, size_t count, size_t stream) {
+    return fread(buffer, size, count, (FILE *)(uintptr_t)stream);
+}
+size_t riddle_fs_fwrite(void *buffer, size_t size, size_t count, size_t stream) {
+    return fwrite(buffer, size, count, (FILE *)(uintptr_t)stream);
+}
+int riddle_fs_fflush(size_t stream) {
+    return fflush((FILE *)(uintptr_t)stream);
+}

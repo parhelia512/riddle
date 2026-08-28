@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Collections gained `remove`: `HashMap` uses backward-shift deletion for its linear-probe table, `TreeMap` performs CLRS red-black deletion with delete-fixup plus arena compaction, and `HashSet`/`TreeSet` forward to their backing maps.
+- `Iterator` provides the default methods `count`, `nth`, `fold`, `for_each`, `all`, `any`, `find`, and `position`; `std::iter` additionally offers the eager `map_into` / `filter_into`, `DoubleEndedIterator` with `SliceIter::next_back`, and the lazy adapters `enumerate` / `take` / `zip` (constructible via free functions and iterable in `for` loops); `Vector::from_iterator` collects any iterator.
+- `std::convert::From` is available; `?` falls back to `From` impls when no `Into` impl matches and now also propagates through `Option` operands inside functions returning `Option`.
+- Calls through callable struct fields (`self.f(x)` where `f` holds a closure or a generic parameter constrained by `Fn`/`FnMut`/`FnOnce`) are supported; impl callable bounds are satisfied structurally by closure signatures with kind widening.
+- Lazy `Iterator::map` / `Iterator::filter` store their callable in an adapter and chain through `for` loops.
+- `std::fs` introduces `FsFile` (`open` / `create` / `append` / `read` / `write` / `flush` / `read_to_string`), `FsError`, and whole-file `read_to_string` / `write` helpers, backed by new `riddle_fs_*` runtime shims; `Drop` closes the handle.
+- `String` implements `From<&str>`.
+- End-to-end behavior tests cover collection removal, iterator combinators, `?` conversions, and file round-trips (`tests/mir/std_behavior.rs`).
+
+### Changed
+
+- The parser accepts trailing commas in function parameter lists.
+- Method calls on values that satisfy a where-clause trait bound now dispatch statically to the implementing impl instead of lowering to an invalid indirect call.
+- Where-clause associated-type bindings (`I: Iterator<Item = T>`) bind type parameters that appear in no argument, including across generic function calls into MIR monomorphization.
+- Trait default method bodies substitute `Self` and supertrait associated types (e.g. `Iterator::Item`) from the implementing impl when monomorphized through a generic-call path.
+- Closure and named-function arguments now drive inference of generic parameters that appear only in callable bounds or in where-clause associated-type bindings (`I: Iterator<Item = T>`).
+- `for` loops resolve the iterable type (and its `IntoIterator` associated types) through pending inference variables before trait lookup.
+- Trait default method bodies substitute associated types (`Self::Item`) from the implementing impl during monomorphization, both in the type checker and the MIR.
+- `E0061`'s message now reads "`?` requires a Result or Option value as its operand".
+
 ## [0.2.2] - 2026-08-25
 
 ### Added

@@ -28,4 +28,9 @@ impl<T> TreeSet<T> {
     where T: Ord {
         self.values.contains_key(value)
     }
+
+    pub fun remove(&mut self, value: &T) -> bool
+    where T: Ord {
+        self.values.remove(value).is_some()
+    }
 }

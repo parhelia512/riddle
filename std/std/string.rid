@@ -400,3 +400,9 @@ impl IntoIterator for &str {
         }
     }
 }
+
+impl crate::std::convert::From<&str> for String {
+    fun from(value: &str) -> String {
+        String::from_str(value)
+    }
+}

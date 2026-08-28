@@ -103,6 +103,148 @@ impl<K, V> HashMap<K, V> {
         }
     }
 
+    pub fun remove(&mut self, key: &K) -> Option<V>
+    where K: Hash + Eq {
+        let capacity = self.buckets.len();
+        if capacity == 0usize {
+            return Option::None;
+        }
+        let located = self.find_entry_bucket(key);
+        let entry_index = match located {
+            Option::Some((entry, bucket)) => {
+                self.set_bucket(bucket, HashBucket::Empty);
+                self.backward_shift(bucket, capacity);
+                entry
+            },
+            Option::None => { return Option::None; },
+        };
+
+        // Remove the parallel entries, then relocate the formerly last entry's
+        // bucket pointer; its hash is read after the swap because the swap
+        // moved the key into the vacated slot.
+        let last = self.keys.len() - 1usize;
+        let moved_home = if entry_index != last {
+            match self.keys.get(last) {
+                Option::Some(stored) => stored.hash() % capacity,
+                Option::None => 0usize,
+            }
+        } else {
+            0usize
+        };
+        self.keys.swap(entry_index, last);
+        self.keys.pop();
+
+        if entry_index != last {
+            let mut probe = moved_home;
+            let mut scanning = true;
+            while scanning {
+                let matches_last = match self.buckets.get(probe) {
+                    Option::Some(bucket) => match *bucket {
+                        HashBucket::Occupied(occupied) => occupied == last,
+                        HashBucket::Empty => false,
+                    },
+                    Option::None => false,
+                };
+                if matches_last {
+                    match self.buckets.get_mut(probe) {
+                        Option::Some(mut slot) => { *slot = HashBucket::Occupied(entry_index); },
+                        Option::None => {},
+                    }
+                    scanning = false;
+                } else {
+                    probe = (probe + 1usize) % capacity;
+                }
+            }
+        }
+
+        self.values.swap(entry_index, last);
+        let value = self.values.pop();
+        value
+    }
+
+    fun find_entry_bucket(&self, key: &K) -> Option<(usize, usize)>
+    where K: Hash + Eq {
+        let capacity = self.buckets.len();
+        if capacity == 0usize {
+            return Option::None;
+        }
+        let mut bucket_index = key.hash() % capacity;
+        let mut scanned = 0usize;
+        while scanned < capacity {
+            let bucket = self.bucket_at(bucket_index);
+            match bucket {
+                HashBucket::Empty => { return Option::None; },
+                HashBucket::Occupied(entry_index) => {
+                    match self.keys.get(entry_index) {
+                        Option::Some(stored) => {
+                            if stored.eq(key) {
+                                return Option::Some((entry_index, bucket_index));
+                            }
+                        },
+                        Option::None => { return Option::None; },
+                    }
+                },
+            }
+            bucket_index = (bucket_index + 1usize) % capacity;
+            scanned += 1usize;
+        }
+        Option::None
+    }
+
+    fun bucket_at(&self, index: usize) -> HashBucket {
+        match self.buckets.get(index) {
+            Option::Some(bucket) => *bucket,
+            Option::None => HashBucket::Empty,
+        }
+    }
+
+    fun set_bucket(&mut self, index: usize, bucket: HashBucket) {
+        match self.buckets.get_mut(index) {
+            Option::Some(mut slot) => { *slot = bucket; },
+            Option::None => {},
+        }
+    }
+
+    // Backward-shift deletion for linear probing: entries after the emptied
+    // bucket move into it whenever their home position lies before the empty
+    // slot on their probe path, keeping every lookup chain intact.
+    fun backward_shift(&mut self, removed_bucket: usize, capacity: usize)
+    where K: Hash {
+        if capacity == 0usize {
+            return;
+        }
+        let mut empty = removed_bucket;
+        let mut current = removed_bucket;
+        let mut scanning = true;
+        while scanning {
+            current = (current + 1usize) % capacity;
+            let next_entry = match self.bucket_at(current) {
+                HashBucket::Empty => 0usize,
+                HashBucket::Occupied(occupied) => occupied + 1usize,
+            };
+            if next_entry == 0usize {
+                scanning = false;
+                break;
+            }
+            let entry_index = next_entry - 1usize;
+            let home = match self.keys.get(entry_index) {
+                Option::Some(stored) => stored.hash() % capacity,
+                Option::None => 0usize,
+            };
+            if home == 0usize && self.keys.get(entry_index).is_none() {
+                scanning = false;
+                break;
+            }
+            let empty_distance = (empty + capacity - home) % capacity;
+            let current_distance = (current + capacity - home) % capacity;
+            if empty_distance < current_distance {
+                self.set_bucket(empty, HashBucket::Occupied(entry_index));
+                self.set_bucket(current, HashBucket::Empty);
+                empty = current;
+            }
+        }
+    }
+
     pub fun iter(&self) -> HashMapIter<K, V> {
         HashMapIter {
             keys: self.keys.as_slice(),
