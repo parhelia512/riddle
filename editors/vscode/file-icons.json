@@ -1,0 +1,13 @@
+{
+  "iconDefinitions": {
+    "riddle": {
+      "iconPath": "./icons/riddle.svg"
+    }
+  },
+  "fileExtensions": {
+    "rid": "riddle"
+  },
+  "languageIds": {
+    "riddle": "riddle"
+  }
+}

@@ -4,6 +4,7 @@ import com.intellij.execution.configurations.GeneralCommandLine
 import com.intellij.lang.Language
 import com.intellij.openapi.fileTypes.LanguageFileType
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.IconLoader
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.platform.lsp.api.LspServerSupportProvider
 import com.intellij.platform.lsp.api.ProjectWideLspServerDescriptor
@@ -14,10 +15,11 @@ object RiddleLanguage : Language("Riddle") {
 }
 
 object RiddleFileType : LanguageFileType(RiddleLanguage) {
+    private val icon = IconLoader.getIcon("/icons/riddle.svg", javaClass)
     override fun getName() = "Riddle"
     override fun getDescription() = "Riddle source file"
     override fun getDefaultExtension() = "rid"
-    override fun getIcon(): Icon? = null
+    override fun getIcon(): Icon = icon
 }
 
 class RiddleLspServerSupportProvider : LspServerSupportProvider {
