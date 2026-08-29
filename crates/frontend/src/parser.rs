@@ -135,6 +135,16 @@ impl ExprRestrictions {
     };
 }
 
+/// Saved parser state for speculative parsing (bracket-lambda vs array).
+struct SpeculationPoint {
+    pos: usize,
+    current_non_trivia_pos: usize,
+    current_kind: SyntaxKind,
+    pending_split_greater: usize,
+    events_len: usize,
+    errors_len: usize,
+}
+
 pub struct Parser<'s> {
     source: &'s str,
     tokens: Vec<Token>,
@@ -853,6 +863,83 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::LambdaExpr)
     }
 
+    /// Snapshot of all parser state that speculative parsing may advance.
+    fn speculation_point(&self) -> SpeculationPoint {
+        SpeculationPoint {
+            pos: self.pos,
+            current_non_trivia_pos: self.current_non_trivia_pos,
+            current_kind: self.current_kind,
+            pending_split_greater: self.pending_split_greater,
+            events_len: self.events.len(),
+            errors_len: self.errors.len(),
+        }
+    }
+
+    fn rollback_to(&mut self, point: SpeculationPoint) {
+        self.pos = point.pos;
+        self.current_non_trivia_pos = point.current_non_trivia_pos;
+        self.current_kind = point.current_kind;
+        self.pending_split_greater = point.pending_split_greater;
+        self.events.truncate(point.events_len);
+        self.errors.truncate(point.errors_len);
+    }
+
+    /// `[params -> body]` bracket lambda, e.g. `[it -> it * 2]`.
+    ///
+    /// Speculative: returns `None` without recording any diagnostic when the
+    /// bracket group turns out not to be a lambda (caller rolls back and
+    /// reinterprets it as an array literal / index). Diagnostics are only
+    /// emitted once the `->` has committed us to the lambda reading.
+    fn try_bracket_lambda_expr(&mut self) -> Option<CompletedMarker> {
+        let m = self.start();
+        if self.at(SyntaxKind::Move) {
+            self.bump();
+        }
+        if !self.at(SyntaxKind::LBracket) {
+            m.abandon(self);
+            return None;
+        }
+        self.bump();
+        if !matches!(
+            self.current(),
+            SyntaxKind::Arrow | SyntaxKind::RBracket | SyntaxKind::Eof
+        ) {
+            self.bracket_lambda_params();
+        }
+        if !self.at(SyntaxKind::Arrow) {
+            m.abandon(self);
+            return None;
+        }
+        self.bump();
+        self.expression();
+        self.expect(SyntaxKind::RBracket);
+        Some(m.complete(self, SyntaxKind::BracketLambdaExpr))
+    }
+
+    fn bracket_lambda_params(&mut self) {
+        let m = self.start();
+        self.lambda_param();
+        while self.at(SyntaxKind::Comma) {
+            self.bump();
+            if matches!(self.current(), SyntaxKind::Arrow | SyntaxKind::RBracket) {
+                break;
+            }
+            self.lambda_param();
+        }
+        m.complete(self, SyntaxKind::ParamList);
+    }
+
+    /// `[` in expression-start position: bracket lambda if the group contains
+    /// a top-level `->`, array literal otherwise.
+    fn bracket_lambda_or_array(&mut self) -> CompletedMarker {
+        let point = self.speculation_point();
+        if let Some(lambda) = self.try_bracket_lambda_expr() {
+            return lambda;
+        }
+        self.rollback_to(point);
+        self.array_expr()
+    }
+
     fn lambda_param_list(&mut self) {
         let m = self.start();
         self.expect(SyntaxKind::LParen);
@@ -1340,6 +1427,16 @@ impl<'s> Parser<'s> {
                 m.complete(self, SyntaxKind::FieldExpr)
             }
             SyntaxKind::LBracket => {
+                // Trailing bracket lambda (`c.map [it -> it * 2]`,
+                // `f(args) [acc, v -> acc + v]`); fall back to indexing.
+                let point = self.speculation_point();
+                let arg_list = self.start();
+                if self.try_bracket_lambda_expr().is_some() {
+                    arg_list.complete(self, SyntaxKind::ArgList);
+                    return m.complete(self, SyntaxKind::CallExpr);
+                }
+                arg_list.abandon(self);
+                self.rollback_to(point);
                 self.bump();
                 self.expression();
                 self.expect(SyntaxKind::RBracket);
@@ -1541,12 +1638,23 @@ impl<'s> Parser<'s> {
 
             SyntaxKind::Fun => Some(self.lambda_expr()),
             SyntaxKind::Move if self.nth(1) == SyntaxKind::Fun => Some(self.lambda_expr()),
+            SyntaxKind::Move if self.nth(1) == SyntaxKind::LBracket => {
+                let point = self.speculation_point();
+                match self.try_bracket_lambda_expr() {
+                    Some(lambda) => Some(lambda),
+                    None => {
+                        self.rollback_to(point);
+                        self.error("expected 'fun' after 'move'".into());
+                        None
+                    }
+                }
+            }
             SyntaxKind::Move => {
                 self.error("expected 'fun' after 'move'".into());
                 None
             }
 
-            SyntaxKind::LBracket => Some(self.array_expr()),
+            SyntaxKind::LBracket => Some(self.bracket_lambda_or_array()),
 
             SyntaxKind::LParen => Some(self.paren_expr(restrictions)),
 

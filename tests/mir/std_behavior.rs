@@ -259,6 +259,77 @@ fn std_iterator_combinators_and_eager_maps_run() {
 }
 
 #[test]
+fn std_bracket_lambdas_run() {
+    let (code, stdout) = compile_and_run(
+        r#"
+        use crate::std::iter::{Iterator, IntoIterator};
+
+        struct Counter {
+            index: usize,
+            limit: usize,
+        }
+
+        impl Iterator for Counter {
+            type Item = i32;
+
+            fun next(&mut self) -> Option<i32> {
+                if self.index < self.limit {
+                    self.index += 1usize;
+                    Option::Some(self.index as i32)
+                } else {
+                    Option::None
+                }
+            }
+        }
+
+        fun invoke(action: impl Fn() -> i32) -> i32 { action() }
+
+        fun main() -> i32 {
+            // Bracket lambda passed inside the argument list; parameter
+            // types inferred from the expected callable signature.
+            let sum = Counter { index: 0usize, limit: 5usize }
+                .fold(0i32, [acc, v -> acc + v]);
+            if sum != 15i32 { return 1; }
+
+            // `it` convention on a reference parameter.
+            let mut counter2 = Counter { index: 0usize, limit: 5usize };
+            if counter2.find([it -> *it == 4i32]).unwrap_or(0i32) != 4i32 { return 2; }
+
+            // Lazy chain with trailing method bracket lambdas.
+            let chained = Counter { index: 0usize, limit: 5usize }
+                .map [v -> v + 1i32]
+                .filter [it -> *it > 3i32];
+            let mut total = 0i32;
+            for value in chained {
+                total += value;
+            }
+            if total != 15i32 { return 3; }
+
+            // Zero-parameter lambda with move capture.
+            let base = 10i32;
+            let offset = move [ -> base + 5i32];
+            if invoke(offset) != 15i32 { return 4; }
+
+            // Bracket lambda bound to a variable and called directly.
+            let double = [it -> it * 2i32];
+            if double(21i32) != 42i32 { return 5; }
+
+            // Mutable capture through a zero-parameter bracket lambda (FnMut).
+            let mut count = 0i32;
+            let mut bump = [ -> { count += 1i32; count }];
+            bump();
+            bump();
+            if count != 2i32 { return 6; }
+
+            0
+        }
+        "#,
+        true,
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
 fn std_question_operator_supports_from_and_option() {
     let (code, stdout) = compile_and_run(
         r#"

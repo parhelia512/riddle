@@ -408,6 +408,7 @@ const fn reparse_entry(kind: SyntaxKind) -> Option<ReparseEntry> {
         | SyntaxKind::ParenExpr
         | SyntaxKind::CallExpr
         | SyntaxKind::LambdaExpr
+        | SyntaxKind::BracketLambdaExpr
         | SyntaxKind::FieldExpr
         | SyntaxKind::StructExpr
         | SyntaxKind::StructExprField

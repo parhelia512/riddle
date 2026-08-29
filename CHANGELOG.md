@@ -4,6 +4,7 @@
 
 ### Added
 
+- Bracket lambdas `[params -> body]` provide a short anonymous-function form: `[it -> it * 2]` (single parameter, conventionally named `it`), `[acc, v -> acc + v]`, `[v: &i32 -> *v > 3]`, `[(left, _) -> left]`, zero-parameter `[ -> body]`, block bodies `[v -> { ... }]`, and `move [v -> base + v]`. Parameter and return types infer from the expected callable signature. A bracket group containing a top-level `->` is a lambda; otherwise it stays an array literal or index, and `expr [params -> body]` in postfix position calls `expr` with the lambda (typically a method: `values.map [v -> v * 2]`). Bracket lambdas lower to the same closure representation as `fun(...)`; generics and `where` clauses remain `fun`-only.
 - Collections gained `remove`: `HashMap` uses backward-shift deletion for its linear-probe table, `TreeMap` performs CLRS red-black deletion with delete-fixup plus arena compaction, and `HashSet`/`TreeSet` forward to their backing maps.
 - `Iterator` provides the default methods `count`, `nth`, `fold`, `for_each`, `all`, `any`, `find`, and `position`; `std::iter` additionally offers the eager `map_into` / `filter_into`, `DoubleEndedIterator` with `SliceIter::next_back`, and the lazy adapters `enumerate` / `take` / `zip` (constructible via free functions and iterable in `for` loops); `Vector::from_iterator` collects any iterator.
 - `std::convert::From` is available; `?` falls back to `From` impls when no `Into` impl matches and now also propagates through `Option` operands inside functions returning `Option`.

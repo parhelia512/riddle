@@ -199,4 +199,175 @@ mod tests {
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
     }
+
+    fn tree_has(parse: &crate::tree_builder::Parse, kind: syntax::SyntaxKind) -> bool {
+        parse.syntax().descendants().any(|node| node.kind() == kind)
+    }
+
+    #[test]
+    fn parses_bracket_lambda_in_expression_position() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            fun main() {
+                let f = [v -> v * 2];
+                let g = [acc, v -> acc + v];
+                let h = [v: &i32 -> *v > 3];
+                let z = [ -> 42];
+                let m = move [v -> base + v];
+                let p = [(l, _) -> l];
+            }
+            ",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert!(tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(!tree_has(&parse, syntax::SyntaxKind::ArrayExpr));
+    }
+
+    #[test]
+    fn parses_bracket_lambda_multi_statement_body() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            fun main() {
+                let classify = [v -> { let sq = v * v; if sq > 10 { 1 } else { 0 } }];
+            }
+            ",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert!(tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+    }
+
+    #[test]
+    fn array_literals_are_not_confused_with_bracket_lambdas() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            fun main() {
+                let values = [1, 2, 3];
+                let repeated = [0i32; 3];
+                let single = [values];
+                let nested = [[1, 2], [3, 4]];
+            }
+            ",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert!(tree_has(&parse, syntax::SyntaxKind::ArrayExpr));
+        assert!(!tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+    }
+
+    #[test]
+    fn array_of_bracket_lambdas_keeps_array_root() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            fun main() {
+                let lambdas = [[v -> v], [v -> v * 2]];
+            }
+            ",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert!(tree_has(&parse, syntax::SyntaxKind::ArrayExpr));
+        assert_eq!(
+            parse
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == syntax::SyntaxKind::BracketLambdaExpr)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn array_containing_fun_lambda_is_not_misjudged_as_bracket_lambda() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            fun main() {
+                let lambdas = [fun(x) -> i32 { x }];
+            }
+            ",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert!(tree_has(&parse, syntax::SyntaxKind::ArrayExpr));
+        assert!(!tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+    }
+
+    #[test]
+    fn indexing_expressions_are_not_confused_with_bracket_lambdas() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            struct Row { values: [i32; 4] }
+            fun pick(values: [i32; 4], index: usize) -> i32 { values[index] }
+            fun main(row: Row, f: impl Fn(i32) -> i32) -> i32 {
+                let first = row.values[0usize];
+                let second = pick(row.values, 1usize);
+                let third = f(2i32);
+                let applied = [3i32][0usize];
+                first + second + third + applied
+            }
+            ",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert!(tree_has(&parse, syntax::SyntaxKind::IndexExpr));
+        assert!(!tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+    }
+
+    #[test]
+    fn parses_trailing_bracket_lambda_calls() {
+        let mut parser = IncrementalParser::new();
+            let parse = parser.set_source(
+                r#"
+            fun apply(action: impl Fn() -> ()) { action() }
+            fun main() {
+                apply([ -> println("hello")]);
+            }
+            "#,
+            );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+    }
+
+    #[test]
+    fn parses_bracket_lambda_call_after_call_expression() {
+        // `f(args) [lambda]` reads as calling the partial result with the
+        // lambda (uniform with `(expr)(args)`); indexing without `->` is
+        // unaffected.
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            fun fold(values: [i32; 3], init: i32) -> i32 { init }
+            fun main(values: [i32; 3]) -> i32 {
+                let mapped = values.map [v -> v * 2];
+                let indexed = fold(values, 0i32)[0usize];
+                mapped.len()
+            }
+            ",
+        );
+
+        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
+        assert!(tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(tree_has(&parse, syntax::SyntaxKind::IndexExpr));
+    }
+
+    #[test]
+    fn move_before_array_literal_is_rejected() {
+        let mut parser = IncrementalParser::new();
+        let parse = parser.set_source(
+            r"
+            fun main() {
+                let values = move [0, 1];
+            }
+            ",
+        );
+
+        assert!(!parse.errors.is_empty());
+    }
 }

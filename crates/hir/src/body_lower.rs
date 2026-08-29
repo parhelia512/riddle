@@ -443,6 +443,8 @@ impl<'a> BodyLower<'a> {
 
             ast::Expr::LambdaExpr(lambda) => self.lower_lambda_expr(&lambda, range),
 
+            ast::Expr::BracketLambdaExpr(lambda) => self.lower_bracket_lambda_expr(&lambda, range),
+
             ast::Expr::MatchExpr(match_expr) => self.lower_match_expr(&match_expr, range),
 
             ast::Expr::ArrayExpr(array) => self.lower_array_expr(&array, range),
@@ -705,8 +707,52 @@ impl<'a> BodyLower<'a> {
         let generics = super::lower::lower_generic_params(generic_params.clone());
         let generic_bounds =
             super::lower::lower_generic_bounds(generic_params, lambda.where_clause());
-        let params = lambda
-            .param_list()
+        let params = self.lower_lambda_params(lambda.param_list());
+        let ret_type = lambda.return_type();
+        let ret_type_range = ret_type.as_ref().map(|ty| trimmed_range(ty.syntax()));
+        let ret_type = Self::lower_optional_type(ret_type);
+        let body =
+            self.lower_required_block(lambda.body(), "missing anonymous function body", range);
+        self.alloc_expr(
+            Expr::Lambda {
+                is_move: lambda.is_move(),
+                generics,
+                generic_bounds,
+                params,
+                ret_type,
+                ret_type_range,
+                body,
+            },
+            range,
+        )
+    }
+
+    fn lower_bracket_lambda_expr(
+        &mut self,
+        lambda: &ast::BracketLambdaExpr,
+        range: TextRange,
+    ) -> ExprId {
+        let params = self.lower_lambda_params(lambda.param_list());
+        let body = match self.lower_optional_expr(lambda.body()) {
+            Some(expr) => self.alloc_expr(Expr::Block { stmts: Vec::new(), tail: Some(expr) }, range),
+            None => self.missing_expr("missing lambda body", range),
+        };
+        self.alloc_expr(
+            Expr::Lambda {
+                is_move: lambda.is_move(),
+                generics: Vec::new(),
+                generic_bounds: Vec::new(),
+                params,
+                ret_type: HirTypeRef::Unknown,
+                ret_type_range: None,
+                body,
+            },
+            range,
+        )
+    }
+
+    fn lower_lambda_params(&mut self, param_list: Option<ast::ParamList>) -> Vec<LambdaParam> {
+        param_list
             .map(|list| {
                 list.params()
                     .enumerate()
@@ -759,24 +805,7 @@ impl<'a> BodyLower<'a> {
                     })
                     .collect()
             })
-            .unwrap_or_default();
-        let ret_type = lambda.return_type();
-        let ret_type_range = ret_type.as_ref().map(|ty| trimmed_range(ty.syntax()));
-        let ret_type = Self::lower_optional_type(ret_type);
-        let body =
-            self.lower_required_block(lambda.body(), "missing anonymous function body", range);
-        self.alloc_expr(
-            Expr::Lambda {
-                is_move: lambda.is_move(),
-                generics,
-                generic_bounds,
-                params,
-                ret_type,
-                ret_type_range,
-                body,
-            },
-            range,
-        )
+            .unwrap_or_default()
     }
 
     fn lower_match_expr(&mut self, match_expr: &ast::MatchExpr, range: TextRange) -> ExprId {

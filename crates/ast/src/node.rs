@@ -63,6 +63,7 @@ ast_node!(UnaryExpr, UnaryExpr);
 ast_node!(ParenExpr, ParenExpr);
 ast_node!(CallExpr, CallExpr);
 ast_node!(LambdaExpr, LambdaExpr);
+ast_node!(BracketLambdaExpr, BracketLambdaExpr);
 ast_node!(ArgList, ArgList);
 ast_node!(FieldExpr, FieldExpr);
 ast_node!(IndexExpr, IndexExpr);
@@ -1062,6 +1063,24 @@ impl LambdaExpr {
     }
 }
 
+impl BracketLambdaExpr {
+    #[must_use]
+    pub fn is_move(&self) -> bool {
+        support::token_of(&self.syntax, SyntaxKind::Move).is_some()
+    }
+
+    #[must_use]
+    pub fn param_list(&self) -> Option<ParamList> {
+        support::child(&self.syntax)
+    }
+
+    /// The single-expression body after `->`.
+    #[must_use]
+    pub fn body(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+
 impl LetCondition {
     #[must_use]
     pub fn pattern(&self) -> Option<Pattern> {
@@ -1949,6 +1968,7 @@ pub enum Expr {
     ParenExpr(ParenExpr),
     CallExpr(CallExpr),
     LambdaExpr(LambdaExpr),
+    BracketLambdaExpr(BracketLambdaExpr),
     FieldExpr(FieldExpr),
     IndexExpr(IndexExpr),
     StructExpr(StructExpr),
@@ -1978,6 +1998,9 @@ impl AstNode for Expr {
             SyntaxKind::ParenExpr => Some(Self::ParenExpr(ParenExpr { syntax: node })),
             SyntaxKind::CallExpr => Some(Self::CallExpr(CallExpr { syntax: node })),
             SyntaxKind::LambdaExpr => Some(Self::LambdaExpr(LambdaExpr { syntax: node })),
+            SyntaxKind::BracketLambdaExpr => {
+                Some(Self::BracketLambdaExpr(BracketLambdaExpr { syntax: node }))
+            }
             SyntaxKind::FieldExpr => Some(Self::FieldExpr(FieldExpr { syntax: node })),
             SyntaxKind::IndexExpr => Some(Self::IndexExpr(IndexExpr { syntax: node })),
             SyntaxKind::StructExpr => Some(Self::StructExpr(StructExpr { syntax: node })),
@@ -2008,6 +2031,7 @@ impl AstNode for Expr {
             Self::ParenExpr(it) => it.syntax(),
             Self::CallExpr(it) => it.syntax(),
             Self::LambdaExpr(it) => it.syntax(),
+            Self::BracketLambdaExpr(it) => it.syntax(),
             Self::FieldExpr(it) => it.syntax(),
             Self::IndexExpr(it) => it.syntax(),
             Self::StructExpr(it) => it.syntax(),

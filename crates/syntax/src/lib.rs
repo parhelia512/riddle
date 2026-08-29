@@ -275,6 +275,7 @@ pub enum SyntaxKind {
     ParenExpr,
     CallExpr,
     LambdaExpr,
+    BracketLambdaExpr,
     ArgList,
     FieldExpr,
     IndexExpr,
