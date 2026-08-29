@@ -885,6 +885,18 @@ fn builtin_comparison_types(
                     type_checker::Type::Ref(inner_rhs, false)
                 ) if matches!(inner_lhs.as_ref(), type_checker::Type::Str)
                     && matches!(inner_rhs.as_ref(), type_checker::Type::Str)
+            ) || matches!(
+                (lhs, rhs),
+                (
+                    type_checker::Type::Ptr {
+                        inner: inner_lhs,
+                        mutable: mut_lhs,
+                    },
+                    type_checker::Type::Ptr {
+                        inner: inner_rhs,
+                        mutable: mut_rhs,
+                    },
+                ) if inner_lhs == inner_rhs && mut_lhs == mut_rhs
             )
         }
         HirBinOp::Lt | HirBinOp::Gt | HirBinOp::LtEq | HirBinOp::GtEq => {

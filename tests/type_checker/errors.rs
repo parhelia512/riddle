@@ -1346,3 +1346,99 @@ fn nested_loop_break_value_binds_to_innermost_loop() {
         rejected.diagnostics
     );
 }
+
+#[test]
+fn generic_parameter_cast_reports_e0012() {
+    let result = check(
+        r"
+        fun convert<T>(value: T) -> i32 {
+            value as i32
+        }
+        ",
+    );
+
+    let messages = messages(&result);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("cannot cast `T` to `i32`")),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn unknown_method_on_struct_reports_single_error() {
+    let result = check(
+        r"
+        struct Point { x: i32, y: i32 }
+
+        fun use_it(point: Point) -> i32 {
+            point.magnitude(3)
+        }
+        ",
+    );
+
+    let messages = messages(&result);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("unknown method `magnitude`")),
+        "{:#?}",
+        result.diagnostics
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("unknown field `magnitude`")),
+        "method misses must not also report a field error: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn unknown_method_on_struct_reports_single_error_for_callable_shape() {
+    let result = check(
+        r"
+        struct Text { body: i32 }
+
+        fun use_it(text: Text) -> i32 {
+            text.shatter(1)
+        }
+        ",
+    );
+
+    let messages = messages(&result);
+    let method_errors = messages
+        .iter()
+        .filter(|message| message.contains("shatter"))
+        .count();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("unknown method `shatter`")),
+        "{:#?}",
+        result.diagnostics
+    );
+    assert_eq!(
+        method_errors, 1,
+        "expected exactly one diagnostic mentioning `shatter`: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn pointer_null_comparison_type_checks() {
+    let result = check(
+        r"
+        fun probe() -> bool {
+            let value = 5i32;
+            let pointer = &value as *const i32;
+            let null = 0usize as *const i32;
+            pointer == null
+        }
+        ",
+    );
+
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}

@@ -1244,13 +1244,25 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::LBrace);
 
         if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
-            self.match_arm();
-            while self.at(SyntaxKind::Comma) {
-                self.bump();
-                if self.at(SyntaxKind::RBrace) {
-                    break;
+            let mut arm_ends_with_block = self.match_arm();
+            loop {
+                if self.at(SyntaxKind::Comma) {
+                    self.bump();
+                    if self.at(SyntaxKind::RBrace) || self.at(SyntaxKind::Eof) {
+                        break;
+                    }
+                    arm_ends_with_block = self.match_arm();
+                    continue;
                 }
-                self.match_arm();
+                // A block-bodied arm may omit its trailing comma: the arm's
+                // own closing `}` already terminates it, so keep parsing
+                // arms instead of derailing into expression-error cascades.
+                if arm_ends_with_block && !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof)
+                {
+                    arm_ends_with_block = self.match_arm();
+                    continue;
+                }
+                break;
             }
         }
 
@@ -1266,7 +1278,10 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::UnsafeExpr)
     }
 
-    fn match_arm(&mut self) {
+    /// Parses one `pattern [if guard] => expr` arm. Returns whether the arm
+    /// body is an expression-with-block, whose closing `}` ends the arm and
+    /// makes the trailing comma optional.
+    fn match_arm(&mut self) -> bool {
         self.attrs();
         let m = self.start();
 
@@ -1278,9 +1293,11 @@ impl<'s> Parser<'s> {
         }
 
         self.expect(SyntaxKind::FatArrow);
-        self.expression();
+        let body = self.expression();
+        let ends_with_block = body.is_some_and(|expr| is_expr_with_block(expr.kind(self)));
 
         m.complete(self, SyntaxKind::MatchArm);
+        ends_with_block
     }
 
     fn expr_bp(&mut self, min_bp: u8) -> Option<CompletedMarker> {
@@ -1392,6 +1409,19 @@ impl<'s> Parser<'s> {
             // binary
             if bare_block {
                 break;
+            }
+            // range
+            if matches!(op, SyntaxKind::DotDot | SyntaxKind::DotDotEq) {
+                const RANGE_BP: u8 = 1;
+                if RANGE_BP < min_bp {
+                    break;
+                }
+                let m = lhs.precede(self);
+                self.bump(); // '..' | '..='
+                self.expr_bp_restricted(RANGE_BP + 1, restrictions);
+                lhs = m.complete(self, SyntaxKind::RangeExpr);
+                bare_block = false;
+                continue;
             }
             let Some((l_bp, r_bp)) = infix_binding_power(op) else {
                 break;

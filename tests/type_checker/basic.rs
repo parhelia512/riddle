@@ -671,8 +671,7 @@ fn infers_const_generic_array_length_for_function_call() {
 
 #[test]
 fn reports_uninferred_generic_function_type_arg() {
-    let result = check(
-        r"
+    let source = r"
         fun make<T>() -> T {
             1
         }
@@ -680,15 +679,48 @@ fn reports_uninferred_generic_function_type_arg() {
         fun main() {
             let x = make();
         }
+        ";
+    let result = check(source);
+
+    let diag = result
+        .diagnostics
+        .iter()
+        .find(|diag| diag.code == "E0005")
+        .expect("uninferred type argument diagnostic");
+    assert_eq!(
+        diag.message,
+        "cannot infer type argument `T` for function `make`"
+    );
+    assert_eq!(diag.labels.len(), 2);
+    assert_eq!(&source[diag.labels[0].range.clone()], "make()");
+    assert_eq!(
+        diag.labels[1].style,
+        type_checker::LabelStyle::Secondary
+    );
+    assert_eq!(&source[diag.labels[1].range.clone()], "x");
+    assert_eq!(
+        diag.labels[1].message,
+        "consider giving `x` an explicit type"
+    );
+    assert!(diag
+        .notes
+        .iter()
+        .any(|note| note.contains("explicit type annotation")));
+
+    let annotated = check(
+        r"
+        fun make<T>() -> T {
+            1
+        }
+
+        fun main() {
+            let x: i32 = make();
+        }
         ",
     );
-
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diag| diag.message.contains("cannot infer type argument"))
-    );
+    // The dummy body still reports its own E0001 return mismatch, but the
+    // annotation must resolve the E0005 inference failure.
+    assert!(annotated.diagnostics.iter().all(|diag| diag.code != "E0005"));
 }
 
 #[test]

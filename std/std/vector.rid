@@ -47,6 +47,18 @@ impl<T> Vector<T> {
         out
     }
 
+    // Builds a vector holding `count` clones of `value`.
+    pub fun from_elem(value: T, count: usize) -> Vector<T>
+    where T: crate::std::clone::Clone {
+        let mut out = Vector::new();
+        let mut index = 0usize;
+        while index < count {
+            out.push(value.clone());
+            index += 1usize;
+        }
+        out
+    }
+
     pub fun len(&self) -> usize {
         self.len
     }
@@ -115,6 +127,108 @@ impl<T> Vector<T> {
             unsafe { self.data[left] = self.data[right]; }
             unsafe { self.data[right] = value; }
         }
+    }
+
+    pub fun insert(&mut self, index: usize, value: T) {
+        if index > self.len {
+            panic("Vector insert index out of bounds");
+        }
+        if self.len == self.capacity {
+            let item_size = size_of::<T>();
+            if item_size == 0usize {
+                panic("Vector does not support zero-sized elements");
+            }
+            let next_capacity = if self.capacity == 0usize {
+                4usize
+            } else {
+                self.capacity * 2usize
+            };
+            if next_capacity < self.capacity {
+                panic("Vector capacity overflow");
+            }
+            let bytes = next_capacity * item_size;
+            if bytes / item_size != next_capacity {
+                panic("Vector allocation size overflow");
+            }
+            self.data = rgc_realloc(self.data as *mut u8, bytes) as *mut T;
+            self.capacity = next_capacity;
+        }
+        let mut position = self.len;
+        while position > index {
+            let moved = unsafe { self.data[position - 1usize] };
+            unsafe { self.data[position] = moved; }
+            position -= 1usize;
+        }
+        unsafe { self.data[index] = value; }
+        self.len += 1usize;
+    }
+
+    pub fun remove(&mut self, index: usize) -> T {
+        if index >= self.len {
+            panic("Vector remove index out of bounds");
+        }
+        let value = unsafe { self.data[index] };
+        self.len -= 1usize;
+        let mut position = index;
+        while position < self.len {
+            let moved = unsafe { self.data[position + 1usize] };
+            unsafe { self.data[position] = moved; }
+            position += 1usize;
+        }
+        value
+    }
+
+    pub fun contains(&self, value: &T) -> bool
+    where T: crate::std::cmp::PartialEq {
+        let mut index = 0usize;
+        while index < self.len {
+            let candidate = unsafe { &self.data[index] };
+            let matches = candidate.eq(value);
+            if matches {
+                return true;
+            }
+            index += 1usize;
+        }
+        false
+    }
+
+    pub fun sort(&mut self)
+    where T: crate::std::cmp::PartialOrd {
+        let mut index = 1usize;
+        while index < self.len {
+            let mut position = index;
+            while position > 0usize {
+                let current = unsafe { &self.data[position] };
+                let previous = unsafe { &self.data[position - 1usize] };
+                let is_smaller = current.lt(previous);
+                if !is_smaller {
+                    break;
+                }
+                self.swap(position, position - 1usize);
+                position -= 1usize;
+            }
+            index += 1usize;
+        }
+    }
+
+    pub fun retain(&mut self, mut predicate: impl FnMut(&T) -> bool) {
+        let mut write = 0usize;
+        let mut read = 0usize;
+        while read < self.len {
+            let candidate = unsafe { &self.data[read] };
+            let keep = predicate(candidate);
+            if keep {
+                if write != read {
+                    let moved = unsafe { self.data[read] };
+                    unsafe { self.data[write] = moved; }
+                }
+                write += 1usize;
+            } else {
+                let dropped = unsafe { self.data[read] };
+            }
+            read += 1usize;
+        }
+        self.len = write;
     }
 
     pub fun clear(&mut self) {

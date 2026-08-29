@@ -88,6 +88,7 @@ move-checker = { path = "crates/move-checker" }
 riddle-lsp = { path = "app/riddle-lsp", features = ["test"] }
 rowan = "0.16.1"
 scope-graph = { path = "crates/scope-graph" }
+syntax = { path = "crates/syntax" }
 tower-lsp = "0.20.0"
 type-checker = { path = "crates/type-checker" }
 
@@ -99,6 +100,14 @@ path = "tests/mir/main.rs"
 [[test]]
 name = "move_checker"
 path = "tests/move_checker/main.rs"
+
+[[test]]
+name = "escape_analysis"
+path = "tests/escape_analysis/main.rs"
+
+[[test]]
+name = "frontend"
+path = "tests/frontend/main.rs"
 
 [[test]]
 name = "riddle_lsp"

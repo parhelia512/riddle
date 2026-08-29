@@ -418,3 +418,159 @@ size_t riddle_fs_fwrite(void *buffer, size_t size, size_t count, size_t stream) 
 int riddle_fs_fflush(size_t stream) {
     return fflush((FILE *)(uintptr_t)stream);
 }
+
+/* ---- std::time / std::random / std::fs (metadata + directory) shims ---- */
+#if defined(_WIN32)
+#include <windows.h>
+void riddle_sleep_ms(uint64_t milliseconds) {
+    Sleep((DWORD)milliseconds);
+}
+#else
+#include <time.h>
+void riddle_sleep_ms(uint64_t milliseconds) {
+    struct timespec request;
+    request.tv_sec = (time_t)(milliseconds / 1000u);
+    request.tv_nsec = (long)((milliseconds % 1000u) * 1000000u);
+    nanosleep(&request, NULL);
+}
+#endif
+
+uint32_t riddle_random_u32(void) {
+#if defined(_WIN32)
+    static uint32_t state = 0;
+    if (state == 0) {
+        state = (uint32_t)GetTickCount() ^ (uint32_t)(uintptr_t)&state;
+        if (state == 0) {
+            state = 0x9e3779b9u;
+        }
+    }
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+#else
+    uint32_t value = 0;
+    FILE *source = fopen("/dev/urandom", "rb");
+    if (source != NULL) {
+        size_t read = fread(&value, sizeof(value), 1, source);
+        (void)read;
+        fclose(source);
+    }
+    if (value == 0) {
+        value = (uint32_t)time(0) ^ 0x9e3779b9u;
+    }
+    return value;
+#endif
+}
+
+uint64_t riddle_random_u64(void) {
+    uint64_t low = riddle_random_u32();
+    uint64_t high = riddle_random_u32();
+    return (high << 32) | low;
+}
+
+/* MinGW and MSVC both provide the POSIX `stat` spelling in <sys/stat.h>. */
+#include <sys/stat.h>
+typedef struct stat RiddleStat;
+#define RIDDLE_STAT(path, out) stat(path, out)
+#define RIDDLE_IFDIR(mode) ((mode) & S_IFDIR)
+#define RIDDLE_IFREG(mode) ((mode) & S_IFREG)
+
+int riddle_fs_exists(const char *path) {
+    RiddleStat info;
+    return RIDDLE_STAT(path, &info) == 0;
+}
+
+uint64_t riddle_fs_size(const char *path) {
+    RiddleStat info;
+    if (RIDDLE_STAT(path, &info) != 0) {
+        return 0;
+    }
+    return (uint64_t)info.st_size;
+}
+
+int riddle_fs_is_file(const char *path) {
+    RiddleStat info;
+    if (RIDDLE_STAT(path, &info) != 0) {
+        return 0;
+    }
+    return RIDDLE_IFREG(info.st_mode) != 0;
+}
+
+int riddle_fs_is_dir(const char *path) {
+    RiddleStat info;
+    if (RIDDLE_STAT(path, &info) != 0) {
+        return 0;
+    }
+    return RIDDLE_IFDIR(info.st_mode) != 0;
+}
+
+size_t riddle_fs_read_dir(
+    const char *path,
+    void *names_buffer,
+    void *lens_buffer,
+    size_t capacity
+) {
+    const uint8_t **names_out = (const uint8_t **)names_buffer;
+    size_t *lens_out = (size_t *)lens_buffer;
+    size_t count = 0;
+    size_t seen = 0;
+#if defined(_WIN32)
+    WIN32_FIND_DATAA entry;
+    char pattern[4096];
+    size_t path_len = strlen(path);
+    if (path_len + 3 >= sizeof(pattern)) {
+        return 0;
+    }
+    memcpy(pattern, path, path_len);
+    pattern[path_len] = '\\'; /* backslash */
+    pattern[path_len + 1] = '*';
+    pattern[path_len + 2] = '\0';
+    HANDLE handle = FindFirstFileA(pattern, &entry);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    do {
+        const char *name = entry.cFileName;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        seen += 1;
+        if (count >= capacity) {
+            continue;
+        }
+        size_t len = strlen(name);
+        uint8_t *buffer = (uint8_t *)rgc_alloc(len + 1);
+        memcpy(buffer, name, len + 1);
+        names_out[count] = buffer;
+        lens_out[count] = len;
+        count += 1;
+    } while (FindNextFileA(handle, &entry));
+    FindClose(handle);
+#else
+#include <dirent.h>
+    DIR *dir = opendir(path);
+    if (dir == NULL) {
+        return 0;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        seen += 1;
+        if (count >= capacity) {
+            continue;
+        }
+        size_t len = strlen(name);
+        uint8_t *buffer = (uint8_t *)rgc_alloc(len + 1);
+        memcpy(buffer, name, len + 1);
+        names_out[count] = buffer;
+        lens_out[count] = len;
+        count += 1;
+    }
+    closedir(dir);
+#endif
+    return seen > count ? seen : count;
+}

@@ -615,3 +615,48 @@ const fn assign_operator_trait(op: BinaryOp) -> Option<(LangItem, &'static str)>
         _ => return None,
     })
 }
+
+/// Direct sub-expressions of `expr`, except lambda bodies, which live in
+/// separate `Body` arenas. Block statements are handled by the walker.
+pub(crate) fn child_exprs(expr: &Expr) -> Vec<ExprId> {
+    match expr {
+        Expr::Binary { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Expr::Unary { operand, .. } => vec![*operand],
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let mut children = vec![*cond, *then_branch];
+            children.extend(*else_branch);
+            children
+        }
+        Expr::While { condition, body } => vec![*condition, *body],
+        Expr::Loop { body } => vec![*body],
+        Expr::For {
+            iterable, body, ..
+        } => vec![*iterable, *body],
+        Expr::Match { scrutinee, arms } => {
+            let mut children = vec![*scrutinee];
+            for arm in arms {
+                children.extend(arm.guard);
+                children.push(arm.body);
+            }
+            children
+        }
+        Expr::Array { elements } | Expr::Tuple { elements } => elements.clone(),
+        Expr::ArrayRepeat { value, len } => vec![*value, *len],
+        Expr::Struct { fields, .. } => fields.iter().map(|field| field.value).collect(),
+        Expr::Call { callee, args, .. } => {
+            let mut children = Vec::with_capacity(args.len() + 1);
+            children.push(*callee);
+            children.extend_from_slice(args);
+            children
+        }
+        Expr::FieldAccess { base, .. } | Expr::Cast { base, .. } => vec![*base],
+        Expr::IndexAccess { base, index } => vec![*base, *index],
+        Expr::Unsafe { body } => vec![*body],
+        Expr::Try { operand } => vec![*operand],
+        _ => Vec::new(),
+    }
+}

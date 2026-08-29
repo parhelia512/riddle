@@ -258,6 +258,24 @@ impl<K, V> HashMap<K, V> {
         self.find_entry(key).is_some()
     }
 
+    /// Returns the stored value for `key`, inserting `default` first when the
+    /// key is absent. The key is consumed because `insert` stores it by value.
+    pub fun get_or_insert(&mut self, key: K, default: V) -> &mut V
+    where K: Hash + Eq {
+        if self.contains_key(&key) {
+            match self.get_mut(&key) {
+                Option::Some(value) => { return value; },
+                Option::None => { crate::std::panic::panic("get_or_insert: entry missing") },
+            }
+        }
+        self.insert(key, default);
+        let last = self.values.len() - 1usize;
+        match self.values.get_mut(last) {
+            Option::Some(value) => value,
+            Option::None => { crate::std::panic::panic("get_or_insert: entry missing after insert") },
+        }
+    }
+
     fun find_entry(&self, key: &K) -> Option<usize>
     where K: Hash + Eq {
         let capacity = self.buckets.len();

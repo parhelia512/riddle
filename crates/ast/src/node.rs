@@ -67,6 +67,7 @@ ast_node!(BracketLambdaExpr, BracketLambdaExpr);
 ast_node!(ArgList, ArgList);
 ast_node!(FieldExpr, FieldExpr);
 ast_node!(IndexExpr, IndexExpr);
+ast_node!(RangeExpr, RangeExpr);
 ast_node!(StructExpr, StructExpr);
 ast_node!(StructExprField, StructExprField);
 ast_node!(IfStmt, IfStmt);
@@ -1315,6 +1316,27 @@ impl IndexExpr {
     }
 }
 
+impl RangeExpr {
+    #[must_use]
+    pub fn start(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+
+    #[must_use]
+    pub fn end(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 1)
+    }
+
+    #[must_use]
+    pub fn inclusive(&self) -> bool {
+        self.syntax.children_with_tokens().any(|element| {
+            element
+                .as_token()
+                .is_some_and(|token| token.kind() == SyntaxKind::DotDotEq)
+        })
+    }
+}
+
 impl StructExpr {
     #[must_use]
     pub fn path(&self) -> Option<Path> {
@@ -1988,6 +2010,7 @@ pub enum Expr {
     UnsafeExpr(UnsafeExpr),
     CastExpr(CastExpr),
     TryExpr(TryExpr),
+    RangeExpr(RangeExpr),
 }
 
 impl AstNode for Expr {
@@ -2019,6 +2042,7 @@ impl AstNode for Expr {
             SyntaxKind::UnsafeExpr => Some(Self::UnsafeExpr(UnsafeExpr { syntax: node })),
             SyntaxKind::CastExpr => Some(Self::CastExpr(CastExpr { syntax: node })),
             SyntaxKind::TryExpr => Some(Self::TryExpr(TryExpr { syntax: node })),
+            SyntaxKind::RangeExpr => Some(Self::RangeExpr(RangeExpr { syntax: node })),
             SyntaxKind::NameRef => Some(Self::NameRef(NameRefExpr { syntax: node })),
             _ => None,
         }
@@ -2051,6 +2075,7 @@ impl AstNode for Expr {
             Self::UnsafeExpr(it) => it.syntax(),
             Self::CastExpr(it) => it.syntax(),
             Self::TryExpr(it) => it.syntax(),
+            Self::RangeExpr(it) => it.syntax(),
         }
     }
 }

@@ -912,6 +912,60 @@ pub(super) fn expand_standard_format_macro(
     Ok(output)
 }
 
+pub(super) fn expand_standard_vec_macro(
+    input: &ProcMacroTokenStream,
+    call_site: &Range<usize>,
+) -> Result<ProcMacroTokenStream, (Range<usize>, String)> {
+    let stem = format!("__riddle_vec_{}_{}", call_site.start, call_site.end);
+    let mut segments = vec![ProcMacroTokenStream::default()];
+    for tree in &input.trees {
+        if matches!(tree, ProcMacroTokenTree::Punct { value: ';', .. }) {
+            segments.push(ProcMacroTokenStream::default());
+        } else {
+            segments.last_mut().unwrap().trees.push(tree.clone());
+        }
+    }
+    let source = if segments.len() == 1 {
+        let elements =
+            split_macro_arguments(input).map_err(|error| (call_site.clone(), format!("vec! {error}")))?;
+        let mut source = format!("{{ let mut {stem} = crate::std::vector::Vector::new();");
+        for element in elements {
+            let _ = write!(source, "{stem}.push(({}));", element.to_source());
+        }
+        let _ = write!(source, "{stem} }}");
+        source
+    } else if segments.len() == 2 {
+        let [element, count] = segments.as_slice() else {
+            unreachable!("two `;` segments were collected");
+        };
+        if element.is_empty() || count.is_empty() {
+            return Err((
+                call_site.clone(),
+                "vec![elem; count] requires an element before `;` and a count after it".into(),
+            ));
+        }
+        let elements = split_macro_arguments(element)
+            .map_err(|error| (call_site.clone(), format!("vec! {error}")))?;
+        if elements.len() > 1 {
+            return Err((
+                call_site.clone(),
+                "vec![elem; count] takes a single element before `;`".into(),
+            ));
+        }
+        format!(
+            "crate::std::vector::Vector::from_elem(({}), ({}))",
+            elements[0].to_source(),
+            count.to_source(),
+        )
+    } else {
+        return Err((
+            call_site.clone(),
+            "vec! accepts `[elem, ...]` or `[elem; count]`".into(),
+        ));
+    };
+    standard_macro_output("vec", &source, call_site)
+}
+
 pub(super) fn expand_standard_panic_macro(
     input: &ProcMacroTokenStream,
     call_site: &Range<usize>,
@@ -1138,18 +1192,61 @@ fn parse_standard_format_arguments(
         ));
     }
     let format = parse_format_literal(text).map_err(|message| (format_span.clone(), message))?;
-    let values = arguments.into_iter().skip(1).collect::<Vec<_>>();
-    let placeholders = format.arguments.len();
-    if placeholders != values.len() {
-        return Err((
-            format_span,
-            format!(
-                "format string contains {placeholders} placeholder(s), but {} argument(s) were supplied",
-                values.len()
-            ),
-        ));
-    }
+    let supplied = arguments.into_iter().skip(1).collect::<Vec<_>>();
+    let values = resolve_standard_format_values(&format, &supplied, &format_span)?;
     Ok((format, values))
+}
+
+/// Maps each format placeholder to the argument token stream it references:
+/// `{}` consumes the next sequential argument (its own counter, independent
+/// of explicit `{0}` references), `{0}` borrows argument `0`, and `{name}`
+/// synthesizes a reference to the call-site local `name`. Every supplied
+/// positional argument must be referenced at least once.
+fn resolve_standard_format_values(
+    format: &StandardFormatString,
+    supplied: &[ProcMacroTokenStream],
+    format_span: &Range<usize>,
+) -> Result<Vec<ProcMacroTokenStream>, (Range<usize>, String)> {
+    let mut counter = 0usize;
+    let mut values = Vec::with_capacity(format.arguments.len());
+    for argument in &format.arguments {
+        match &argument.source {
+            StandardArgumentSource::Next => {
+                if counter >= supplied.len() {
+                    return Err((
+                        format_span.clone(),
+                        format!(
+                            "format string references more than the {} supplied argument(s)",
+                            supplied.len()
+                        ),
+                    ));
+                }
+                values.push(supplied[counter].clone());
+                counter += 1;
+            }
+            StandardArgumentSource::Positional(index) => {
+                let Some(value) = supplied.get(*index) else {
+                    return Err((
+                        format_span.clone(),
+                        format!(
+                            "invalid format argument index `{index}`: only {} argument(s) were supplied",
+                            supplied.len()
+                        ),
+                    ));
+                };
+                values.push(value.clone());
+            }
+            StandardArgumentSource::Named(name) => {
+                values.push(ProcMacroTokenStream {
+                    trees: vec![ProcMacroTokenTree::Ident {
+                        text: name.clone(),
+                        span: format_span.clone(),
+                    }],
+                });
+            }
+        }
+    }
+    Ok(values)
 }
 
 pub(super) fn expand_standard_quote_macro(
@@ -1364,6 +1461,17 @@ struct StandardFormatString {
 
 struct StandardFormatArgument {
     trait_kind: StandardFormatTrait,
+    source: StandardArgumentSource,
+}
+
+#[derive(Clone)]
+enum StandardArgumentSource {
+    /// `{}` — the next sequential argument.
+    Next,
+    /// `{0}` — an explicit argument index.
+    Positional(usize),
+    /// `{name}` — implicit capture of a local variable at the call site.
+    Named(String),
 }
 
 struct DecodedLiteralChar {
@@ -1382,25 +1490,26 @@ fn parse_format_literal(text: &str) -> Result<StandardFormatString, String> {
                 segments.last_mut().unwrap().push('{');
                 index += 2;
             }
-            DecodedLiteralChar { value: '{', .. } if next(1) == Some('}') => {
-                arguments.push(StandardFormatArgument {
-                    trait_kind: StandardFormatTrait::Display,
-                });
-                segments.push(String::new());
-                index += 2;
-            }
-            DecodedLiteralChar { value: '{', .. } if next(1) == Some(':') => {
-                if next(2) != Some('?') || next(3) != Some('}') {
+            DecodedLiteralChar { value: '{', .. } => {
+                let Some(close_index) = chars[index + 1..]
+                    .iter()
+                    .position(|character| character.value == '}')
+                    .map(|offset| index + 1 + offset)
+                else {
+                    let open = '{';
+                    return Err(format!("unmatched `{open}` in format string"));
+                };
+                let spec: String = chars[index + 1..close_index]
+                    .iter()
+                    .map(|character| character.value)
+                    .collect();
+                if spec.contains('{') {
                     return Err(unsupported_format_placeholder_message());
                 }
-                arguments.push(StandardFormatArgument {
-                    trait_kind: StandardFormatTrait::Debug,
-                });
+                let (trait_kind, source) = parse_placeholder_spec(&spec)?;
+                arguments.push(StandardFormatArgument { trait_kind, source });
                 segments.push(String::new());
-                index += 4;
-            }
-            DecodedLiteralChar { value: '{', .. } => {
-                return Err(unsupported_format_placeholder_message());
+                index = close_index + 1;
             }
             DecodedLiteralChar { value: '}', .. } if next(1) == Some('}') => {
                 segments.last_mut().unwrap().push('}');
@@ -1422,10 +1531,48 @@ fn parse_format_literal(text: &str) -> Result<StandardFormatString, String> {
     })
 }
 
+fn parse_placeholder_spec(
+    spec: &str,
+) -> Result<(StandardFormatTrait, StandardArgumentSource), String> {
+    let (selector, debug) = match spec.strip_suffix(":?") {
+        Some(selector) => (selector, true),
+        None => (spec, false),
+    };
+    let trait_kind = if debug {
+        StandardFormatTrait::Debug
+    } else {
+        StandardFormatTrait::Display
+    };
+    let source = if selector.is_empty() {
+        StandardArgumentSource::Next
+    } else if selector.chars().all(|character| character.is_ascii_digit()) {
+        let Ok(parsed) = selector.parse::<usize>() else {
+            return Err(unsupported_format_placeholder_message());
+        };
+        StandardArgumentSource::Positional(parsed)
+    } else if is_format_identifier(selector) {
+        StandardArgumentSource::Named(selector.to_string())
+    } else {
+        return Err(unsupported_format_placeholder_message());
+    };
+    Ok((trait_kind, source))
+}
+
+fn is_format_identifier(text: &str) -> bool {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 fn unsupported_format_placeholder_message() -> String {
     let open = '{';
     let close = '}';
-    format!("only `{open}{close}` and `{open}:?{close}` format placeholders are supported")
+    format!(
+        "only `{open}{close}`, `{open}0{close}`, and `{open}name{close}` format placeholders (each optionally with `:?`) are supported"
+    )
 }
 
 fn decode_string_literal(text: &str) -> Option<Vec<DecodedLiteralChar>> {

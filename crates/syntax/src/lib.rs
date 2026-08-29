@@ -231,6 +231,10 @@ pub enum SyntaxKind {
 
     #[token(".")]
     Dot,
+    #[token("..")]
+    DotDot,
+    #[token("..=")]
+    DotDotEq,
     #[token(":")]
     Colon,
     #[token("::")]
@@ -279,6 +283,7 @@ pub enum SyntaxKind {
     ArgList,
     FieldExpr,
     IndexExpr,
+    RangeExpr,
     StructExpr,
     StructExprField,
     NamedType,

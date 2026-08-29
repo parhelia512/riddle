@@ -256,6 +256,106 @@ fn standard_format_macro_expands_to_string_and_type_checks() {
 }
 
 #[test]
+fn standard_vec_macro_expands_and_type_checks() {
+    let source = r#"
+        fun main() -> i32 {
+            let list = vec![1, 2, 3,];
+            let empty: Vector<i32> = vec![];
+            let repeated = vec![7; 4usize];
+            let nested = vec![vec![1, 2], vec![3]];
+            if list.len() == 3usize
+                && empty.is_empty()
+                && repeated.len() == 4usize
+                && nested.len() == 2usize
+            {
+                0
+            } else {
+                1
+            }
+        }
+    "#;
+    let expanded = expand_standard_macros(source);
+
+    assert!(
+        expanded.diagnostics.is_empty(),
+        "{:?}\n{}",
+        expanded.diagnostics,
+        expanded.source
+    );
+    assert!(!expanded.source.contains("vec!"));
+    assert!(expanded.source.contains("crate :: std :: vector :: Vector :: new"));
+    assert!(expanded.source.contains(". push ("));
+    assert!(expanded
+        .source
+        .contains("crate :: std :: vector :: Vector :: from_elem"));
+    let vec_occurrences = expanded
+        .macro_occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence.name == "vec" && occurrence.kind == ProcMacroKind::FunctionLike
+        })
+        .count();
+    // The two vec! calls nested inside `nested`'s input are not parsed as
+    // separate MacroCall nodes, so only the four top-level calls report.
+    assert_eq!(vec_occurrences, 4);
+
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(
+        result.success(),
+        "macro={:?} parse={:?} hir={:?} type={:?}\n{}",
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.hir_diagnostics,
+        result.type_result.diagnostics,
+        expanded.source
+    );
+}
+
+#[test]
+fn standard_vec_macro_empty_form_hints_at_user_binding() {
+    // Empty `vec![]` expands to a block binding a hidden `__riddle_vec_*`
+    // temporary around `Vector::new`, so the inference failure surfaces in
+    // expanded code. The diagnostic must skip the synthetic binding and hint
+    // at the user's `t` instead.
+    let source = r#"
+        fun main() -> i32 {
+            let t = vec![];
+            0
+        }
+    "#;
+    let expanded = expand_standard_macros(source);
+    assert!(
+        expanded.diagnostics.is_empty(),
+        "{:?}\n{}",
+        expanded.diagnostics,
+        expanded.source
+    );
+
+    let result = check_with_options(source, CompileOptions { use_std: true });
+    assert!(!result.success());
+    let diag = result
+        .type_result
+        .diagnostics
+        .iter()
+        .find(|diag| diag.code == "E0005")
+        .expect("uninferred type argument diagnostic");
+    assert_eq!(
+        diag.message,
+        "cannot infer type argument `T` for function `new`"
+    );
+    assert_eq!(diag.labels.len(), 2);
+    assert_eq!(&source[diag.labels[1].range.clone()], "t");
+    assert_eq!(
+        diag.labels[1].message,
+        "consider giving `t` an explicit type"
+    );
+    assert!(diag
+        .notes
+        .iter()
+        .any(|note| note.contains("explicit type annotation")));
+}
+
+#[test]
 fn standard_debug_derive_expands_and_type_checks() {
     let source = r#"
         #[derive(Debug)]
@@ -544,7 +644,7 @@ fn standard_formatting_macros_reject_invalid_format_strings() {
     assert!(
         mismatch.diagnostics[0]
             .message
-            .contains("2 placeholder(s), but 1 argument(s)")
+            .contains("references more than the 1 supplied argument(s)")
     );
 
     let open = '{';
@@ -554,7 +654,9 @@ fn standard_formatting_macros_reject_invalid_format_strings() {
     assert_eq!(unsupported.diagnostics.len(), 1);
     assert_eq!(
         unsupported.diagnostics[0].message,
-        format!("only `{open}{close}` and `{open}:?{close}` format placeholders are supported")
+        format!(
+            "only `{open}{close}`, `{open}0{close}`, and `{open}name{close}` format placeholders (each optionally with `:?`) are supported"
+        )
     );
 
     let format_mismatch = expand_standard_macros(r#"fun main() { let _ = format!("{} {}", 1); }"#);
@@ -562,7 +664,7 @@ fn standard_formatting_macros_reject_invalid_format_strings() {
     assert!(
         format_mismatch.diagnostics[0]
             .message
-            .contains("2 placeholder(s), but 1 argument(s)")
+            .contains("references more than the 1 supplied argument(s)")
     );
 
     let format_unsupported =
@@ -570,7 +672,9 @@ fn standard_formatting_macros_reject_invalid_format_strings() {
     assert_eq!(format_unsupported.diagnostics.len(), 1);
     assert_eq!(
         format_unsupported.diagnostics[0].message,
-        format!("only `{open}{close}` and `{open}:?{close}` format placeholders are supported")
+        format!(
+            "only `{open}{close}`, `{open}0{close}`, and `{open}name{close}` format placeholders (each optionally with `:?`) are supported"
+        )
     );
 
     let panic_mismatch = expand_standard_macros(r#"fun main() { panic!("{} {}", 1); }"#);
@@ -578,7 +682,7 @@ fn standard_formatting_macros_reject_invalid_format_strings() {
     assert!(
         panic_mismatch.diagnostics[0]
             .message
-            .contains("2 placeholder(s), but 1 argument(s)")
+            .contains("references more than the 1 supplied argument(s)")
     );
 }
 

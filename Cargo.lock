@@ -1296,6 +1296,7 @@ dependencies = [
  "riddlec",
  "rowan",
  "scope-graph",
+ "syntax",
  "tokio",
  "tower-lsp",
  "type-checker",

@@ -121,6 +121,18 @@ pub trait Iterator {
         let adapter: Filter<Self, F, Self::Item> = Filter { iter: self, predicate };
         adapter
     }
+
+    fun collect(self) -> Vector<Self::Item> {
+        let mut out = Vector::new();
+        let mut runner = self;
+        loop {
+            match runner.next() {
+                Option::Some(value) => { out.push(value); },
+                Option::None => { break; },
+            }
+        }
+        out
+    }
 }
 
 pub trait DoubleEndedIterator: Iterator {
@@ -360,4 +372,91 @@ where I: Iterator<Item = T> {
         }
     }
     out
+}
+
+pub struct Skip<I, T> {
+    iter: I,
+    remaining: usize,
+}
+
+impl<I, T> Iterator for Skip<I, T>
+where I: Iterator<Item = T> {
+    type Item = T;
+
+    fun next(&mut self) -> Option<T> {
+        while self.remaining > 0usize {
+            self.remaining -= 1usize;
+            match self.iter.next() {
+                Option::Some(_) => {},
+                Option::None => { return Option::None; },
+            }
+        }
+        self.iter.next()
+    }
+}
+
+impl<I, T> IntoIterator for Skip<I, T>
+where I: Iterator<Item = T> {
+    type Item = T;
+    type IntoIter = Skip<I, T>;
+
+    fun into_iter(self) -> Skip<I, T> {
+        self
+    }
+}
+
+pub fun skip<I, T>(iterator: I, n: usize) -> Skip<I, T>
+where I: Iterator<Item = T> {
+    let adapter: Skip<I, T> = Skip {
+        iter: iterator,
+        remaining: n,
+    };
+    adapter
+}
+
+
+pub fun min<I, T>(mut iterator: I) -> Option<T>
+where I: Iterator<Item = T>,
+      T: crate::std::cmp::PartialOrd {
+    let mut best: Option<T> = Option::None;
+    loop {
+        match iterator.next() {
+            Option::Some(value) => {
+                match best {
+                    Option::Some(current) => {
+                        let is_smaller = value.lt(&current);
+                        if is_smaller {
+                            best = Option::Some(value);
+                        }
+                    },
+                    Option::None => { best = Option::Some(value); },
+                }
+            },
+            Option::None => { break; },
+        }
+    }
+    best
+}
+
+pub fun max<I, T>(mut iterator: I) -> Option<T>
+where I: Iterator<Item = T>,
+      T: crate::std::cmp::PartialOrd {
+    let mut best: Option<T> = Option::None;
+    loop {
+        match iterator.next() {
+            Option::Some(value) => {
+                match best {
+                    Option::Some(current) => {
+                        let is_larger = value.gt(&current);
+                        if is_larger {
+                            best = Option::Some(value);
+                        }
+                    },
+                    Option::None => { best = Option::Some(value); },
+                }
+            },
+            Option::None => { break; },
+        }
+    }
+    best
 }

@@ -19,6 +19,7 @@ pub mod option;
 pub mod panic;
 pub mod parse;
 pub mod prelude;
+pub mod random;
 pub mod result;
 pub mod slice;
 pub mod string;

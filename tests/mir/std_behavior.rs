@@ -429,3 +429,350 @@ fn std_fs_roundtrips_file_content() {
     let (code, stdout) = compile_and_run(source, true);
     assert_eq!(code, 0, "stdout: {stdout}");
 }
+
+#[test]
+fn std_option_result_combinators_compile_and_run() {
+    let source = r#"
+        use crate::std::option::Option;
+        use crate::std::result::Result;
+
+        enum AppError {
+            Bad,
+        }
+
+        fun main() -> i32 {
+            let fallback = Option::Some(5i32).unwrap_or_else([ -> 0i32 ]);
+            let none: Option<i32> = Option::None;
+            let mapped = none.map_or(9i32, [v -> v * 2i32]);
+            let recovered = none.or_else([ -> Option::Some(3i32) ]).unwrap();
+            let chained = Option::Some(1i32).and(Option::Some(2i32)).unwrap();
+            let converted = match Result::Err(AppError::Bad).map_err([_ -> 7i32]) {
+                Result::Ok(_) => 0i32,
+                Result::Err(code) => code,
+            };
+            let errored = Result::Ok(4i32).map_or(0i32, [v -> v + 1i32]);
+            if fallback == 5i32 && mapped == 9i32 && recovered == 3i32
+                && chained == 2i32 && converted == 7i32 && errored == 5i32
+            { 0 } else { 1 }
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn range_syntax_iterates_exclusive_and_inclusive() {
+    let source = r#"
+        fun main() -> i32 {
+            let mut total = 0;
+            for i in 0..5 {
+                total += i;
+            }
+            for i in 0..=4 {
+                total += i * 10;
+            }
+            let mut parts = 0;
+            for i in 1 + 1..4 + 1 {
+                parts += i;
+            }
+            let mut empty = 0;
+            for _i in 5..5 {
+                empty += 1;
+            }
+            let mut single = 0;
+            for i in 3..=3 {
+                single = i;
+            }
+            if total == 110 && parts == 9 && empty == 0 && single == 3 { 0 } else { 1 }
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn string_split_replace_and_ascii_case_roundtrip() {
+    let source = r#"
+        use crate::std::string::String;
+
+        fun main() -> i32 {
+            let csv = String::from_str("alpha,beta,,gamma");
+            let parts = csv.split(",");
+            if parts.len() != 4usize { return 1; }
+            if parts.get(0usize).unwrap_or(&String::new()).as_str() != "alpha" { return 2; }
+            if parts.get(2usize).unwrap_or(&String::new()).as_str() != "" { return 3; }
+            if csv.replace(",", ";").as_str() != "alpha;beta;;gamma" { return 4; }
+            if String::from_str("no-sep").replace(",", "x").as_str() != "no-sep" { return 5; }
+            if String::from_str("MixEd123!").to_ascii_uppercase().as_str() != "MIXED123!" { return 6; }
+            if String::from_str("MixEd123!").to_ascii_lowercase().as_str() != "mixed123!" { return 7; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn vector_insert_remove_sort_contains_retain_roundtrip() {
+    let source = r#"
+        use crate::std::vector::Vector;
+
+        fun main() -> i32 {
+            let mut v = Vector::new();
+            v.push(3i32);
+            v.push(1i32);
+            v.insert(1usize, 2i32);
+            if *v.get(0usize).unwrap_or(&0) != 3i32 { return 1; }
+            if *v.get(1usize).unwrap_or(&0) != 2i32 { return 2; }
+            if *v.get(2usize).unwrap_or(&0) != 1i32 { return 3; }
+            v.sort();
+            if *v.get(0usize).unwrap_or(&0) != 1i32 { return 4; }
+            if *v.get(2usize).unwrap_or(&0) != 3i32 { return 5; }
+            if !v.contains(&2i32) { return 6; }
+            let removed = v.remove(0usize);
+            if removed != 1i32 || v.len() != 2usize { return 7; }
+            v.retain([x -> *x >= 2i32]);
+            if v.len() != 2usize { return 8; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn iterator_collect_skip_min_max_roundtrip() {
+    let source = r#"
+        use crate::std::iter::{Iterator, IntoIterator};
+
+        fun main() -> i32 {
+            let collected = crate::std::ops::range(0, 10).collect();
+            if collected.len() != 10usize { return 1; }
+            if *collected.get(3usize).unwrap_or(&0) != 3i32 { return 2; }
+            let mut skipped_sum = 0;
+            for value in crate::std::iter::skip(crate::std::ops::range(0, 10).into_iter(), 8usize) {
+                skipped_sum += value;
+            }
+            if skipped_sum != 17 { return 3; }
+            let mut taken = crate::std::iter::take(crate::std::ops::range(0, 10).into_iter(), 2usize);
+            let taken_count = taken.count();
+            if taken_count != 2usize { return 4; }
+            let smallest = crate::std::iter::min(crate::std::ops::range(0, 10).collect().into_iter());
+            match smallest {
+                Option::Some(0i32) => {},
+                _ => { return 5; },
+            }
+            let largest = crate::std::iter::max(crate::std::ops::range(0, 10).collect().into_iter());
+            match largest {
+                Option::Some(9i32) => {},
+                _ => { return 6; },
+            }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn hash_map_get_or_insert_counts_once() {
+    let source = r#"
+        use crate::std::collections::hash_map::HashMap;
+
+        fun main() -> i32 {
+            let mut counts = HashMap::new();
+            let slot = counts.get_or_insert(7i32, 0i32);
+            *slot += 1i32;
+            let slot2 = counts.get_or_insert(7i32, 100i32);
+            if *slot2 != 1i32 { return 1; }
+            if !counts.contains_key(&7i32) { return 2; }
+            if counts.len() != 1usize { return 3; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn parse_wide_integers_and_radix_roundtrip() {
+    let source = r#"
+        use crate::std::parse::{parse_i64, parse_u64, parse_usize, parse_with_radix};
+        use crate::std::option::Option;
+
+        fun main() -> i32 {
+            match parse_i64("-9223372036854775808") {
+                Option::Some(v) => { if v != -9223372036854775807i64 - 1i64 { return 1; } },
+                Option::None => { return 2; },
+            }
+            match parse_i64("9223372036854775808") {
+                Option::None => {},
+                Option::Some(_) => { return 3; },
+            }
+            match parse_u64("18446744073709551615") {
+                Option::Some(v) => { if v != 18446744073709551615u64 { return 4; } },
+                Option::None => { return 5; },
+            }
+            match parse_with_radix("ff", 16) {
+                Option::Some(v) => { if v != 255i64 { return 6; } },
+                Option::None => { return 7; },
+            }
+            match parse_with_radix("-2a", 16) {
+                Option::Some(v) => { if v != -42i64 { return 8; } },
+                Option::None => { return 9; },
+            }
+            match parse_with_radix("1010", 2) {
+                Option::Some(v) => { if v != 10i64 { return 10; } },
+                Option::None => { return 11; },
+            }
+            match parse_with_radix("1", 37) {
+                Option::None => {},
+                Option::Some(_) => { return 12; },
+            }
+            match parse_usize("12345") {
+                Option::Some(v) => { if v != 12345usize { return 13; } },
+                Option::None => { return 14; },
+            }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn format_placeholders_positional_named_and_debug() {
+    let source = r#"
+        fun main() -> i32 {
+            let name = "riddle";
+            let version = 42i32;
+            println!("hello {name} v{version}!");
+            println!("{0} then {1} then {0} and {}", 1i32, 2i32, 3i32);
+            println!("debug: {version:?} hex {}", 7i32);
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(stdout.contains("hello riddle v42!"), "stdout: {stdout}");
+    assert!(stdout.contains("1 then 2 then 1 and 1"), "stdout: {stdout}");
+    assert!(stdout.contains("debug: 42 hex 7"), "stdout: {stdout}");
+}
+
+#[test]
+fn generic_bound_dispatch_compiles_and_runs() {
+    // Regression: trait-method calls on a generic `T` inside a generic
+    // function used to miscompile when the operand was a match payload
+    // binding (its storage was lazily materialized inside one arm and read
+    // from sibling arms that never executed it).
+    let source = r#"
+        use crate::std::iter::{Iterator, IntoIterator};
+        use crate::std::option::Option;
+
+        fun pick<I, T>(mut iterator: I) -> Option<T>
+        where I: Iterator<Item = T>,
+              T: crate::std::cmp::PartialOrd {
+            let mut best: Option<T> = Option::None;
+            loop {
+                match iterator.next() {
+                    Option::Some(value) => {
+                        match best {
+                            Option::Some(current) => {
+                                let is_smaller = value.lt(&current);
+                                if is_smaller {
+                                    best = Option::Some(value);
+                                }
+                            },
+                            Option::None => { best = Option::Some(value); },
+                        }
+                    },
+                    Option::None => { break; },
+                }
+            }
+            best
+        }
+
+        fun compare_only<T: crate::std::cmp::PartialOrd>(a: T, b: T) -> bool {
+            a.lt(&b)
+        }
+
+        fun main() -> i32 {
+            let smallest = pick(crate::std::ops::range(0, 10).collect().into_iter());
+            match smallest {
+                Option::Some(0i32) => {},
+                _ => { return 1; },
+            }
+            if compare_only(3i32, 5i32) { 0 } else { 2 }
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn adapter_methods_resolve_and_run() {
+    // Regression: method calls directly on adapter types (`taken.count()`)
+    // used to report E0013 because the receiver type still contained a
+    // pending inference variable at method-lookup time.
+    let source = r#"
+        use crate::std::iter::IntoIterator;
+
+        fun main() -> i32 {
+            let mut taken = crate::std::iter::take(crate::std::ops::range(0, 10).into_iter(), 2usize);
+            let taken_count = taken.count();
+            let mut skipped = crate::std::iter::skip(crate::std::ops::range(0, 10).into_iter(), 8usize);
+            let skipped_count = skipped.count();
+            let mut enumerated = crate::std::iter::enumerate(crate::std::ops::range(0, 10).into_iter());
+            let enumerated_count = enumerated.count();
+            if taken_count == 2usize
+                && skipped_count == 2usize
+                && enumerated_count == 10usize
+            { 0 } else { 1 }
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn vec_macro_builds_lists_repeats_and_empty_vectors() {
+    let source = r#"
+        fun main() -> i32 {
+            let list = vec![1, 2, 3];
+            let mut total = 0i32;
+            for value in list {
+                total += value;
+            }
+            if total != 6i32 { return 1; }
+
+            // The repeat form clones a non-Copy element into every slot.
+            let strings = vec![String::from_str("x"); 3usize];
+            let mut joined = String::new();
+            for value in strings {
+                joined.push_str(value.as_str());
+            }
+            if joined.as_str() != "xxx" { return 2; }
+
+            // The empty form infers its element type from the binding.
+            let mut empty: Vector<String> = vec![];
+            empty.push(String::from_str("first"));
+            empty.push(String::from_str("second"));
+            if empty.len() != 2usize { return 3; }
+            if empty.get(1usize).unwrap_or(&String::new()).as_str() != "second" { return 4; }
+
+            // Nested vectors and a zero-count repeat.
+            let nested = vec![vec![1, 2], vec![3]];
+            let mut nested_total = 0i32;
+            for outer in nested {
+                for value in outer {
+                    nested_total += value;
+                }
+            }
+            if nested_total != 6i32 { return 5; }
+            if vec![9; 0usize].len() != 0usize { return 6; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}

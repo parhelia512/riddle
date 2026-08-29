@@ -39,3 +39,144 @@ pub fun parse_i32(value: &str) -> Option<i32> {
         Option::Some(output as i32)
     }
 }
+
+pub fun parse_u64(value: &str) -> Option<u64> {
+    if value.is_empty() {
+        return Option::None;
+    }
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    let mut output = 0u64;
+    let limit = 18446744073709551615u64;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte < 48u8 || byte > 57u8 {
+            return Option::None;
+        }
+        let digit = (byte - 48u8) as u64;
+        if output > limit / 10u64
+            || (output == limit / 10u64 && digit > limit % 10u64) {
+            return Option::None;
+        }
+        output = output * 10u64 + digit;
+        index += 1usize;
+    }
+    Option::Some(output)
+}
+
+pub fun parse_i64(value: &str) -> Option<i64> {
+    if value.is_empty() {
+        return Option::None;
+    }
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    let mut negative = false;
+    if bytes[0usize] == 45u8 {
+        negative = true;
+        index = 1usize;
+        if index == bytes.len() {
+            return Option::None;
+        }
+    }
+    let limit = if negative { 9223372036854775808u64 } else { 9223372036854775807u64 };
+    let mut output = 0u64;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte < 48u8 || byte > 57u8 {
+            return Option::None;
+        }
+        let digit = (byte - 48u8) as u64;
+        if output > limit / 10u64
+            || (output == limit / 10u64 && digit > limit % 10u64) {
+            return Option::None;
+        }
+        output = output * 10u64 + digit;
+        index += 1usize;
+    }
+    if negative {
+        if output == 9223372036854775808u64 {
+            Option::Some(-9223372036854775807i64 - 1i64)
+        } else {
+            Option::Some(-(output as i64))
+        }
+    } else {
+        Option::Some(output as i64)
+    }
+}
+
+pub fun parse_usize(value: &str) -> Option<usize> {
+    let parsed = parse_u64(value);
+    match parsed {
+        Option::Some(number) => {
+            let narrowed = number as usize;
+            if (narrowed as u64) == number {
+                Option::Some(narrowed)
+            } else {
+                Option::None
+            }
+        },
+        Option::None => Option::None,
+    }
+}
+
+pub fun parse_with_radix(value: &str, radix: u32) -> Option<i64> {
+    if radix < 2u32 || radix > 36u32 {
+        return Option::None;
+    }
+    if value.is_empty() {
+        return Option::None;
+    }
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    let mut negative = false;
+    if bytes[0usize] == 45u8 {
+        negative = true;
+        index = 1usize;
+        if index == bytes.len() {
+            return Option::None;
+        }
+    }
+    let radix_u64 = radix as u64;
+    let mut output = 0u64;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let digit_value_option = digit_value(byte);
+        let digit = match digit_value_option {
+            Option::Some(value) => {
+                if (value as u32) >= radix {
+                    return Option::None;
+                }
+                value as u64
+            },
+            Option::None => {
+                return Option::None;
+            },
+        };
+        output = output * radix_u64 + digit;
+        index += 1usize;
+    }
+    if output > 0x7FFFFFFFFFFFFFFFu64 {
+        return Option::None;
+    }
+    if negative {
+        if output == 9223372036854775808u64 {
+            Option::Some(-9223372036854775807i64 - 1i64)
+        } else {
+            Option::Some(-(output as i64))
+        }
+    } else {
+        Option::Some(output as i64)
+    }
+}
+
+fun digit_value(byte: u8) -> Option<u8> {
+    if byte >= 48u8 && byte <= 57u8 {
+        Option::Some(byte - 48u8)
+    } else if byte >= 97u8 && byte <= 122u8 {
+        Option::Some(byte - 87u8)
+    } else if byte >= 65u8 && byte <= 90u8 {
+        Option::Some(byte - 55u8)
+    } else {
+        Option::None
+    }
+}

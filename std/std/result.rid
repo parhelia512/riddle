@@ -62,6 +62,41 @@ impl<T, E> Result<T, E> {
             Result::Err(error) => Option::Some(error),
         }
     }
+
+    pub fun expect(self, message: &str) -> T {
+        match self {
+            Result::Ok(value) => value,
+            Result::Err(_) => crate::std::panic::panic(message),
+        }
+    }
+
+    pub fun unwrap_or_else(self, function: impl FnOnce() -> T) -> T {
+        match self {
+            Result::Ok(value) => value,
+            Result::Err(_) => function(),
+        }
+    }
+
+    pub fun map_err<F>(self, function: impl FnOnce(E) -> F) -> Result<T, F> {
+        match self {
+            Result::Ok(value) => Result::Ok(value),
+            Result::Err(error) => Result::Err(function(error)),
+        }
+    }
+
+    pub fun map_or<U>(self, default: U, function: impl FnOnce(T) -> U) -> U {
+        match self {
+            Result::Ok(value) => function(value),
+            Result::Err(_) => default,
+        }
+    }
+
+    pub fun and<U>(self, other: Result<U, E>) -> Result<U, E> {
+        match self {
+            Result::Ok(_) => other,
+            Result::Err(error) => Result::Err(error),
+        }
+    }
 }
 
 impl<T: crate::std::marker::Copy, E: crate::std::marker::Copy> crate::std::marker::Copy for Result<T, E> {}

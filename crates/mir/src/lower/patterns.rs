@@ -648,7 +648,7 @@ impl LowerCtx<'_> {
     }
 
     fn insert_match_pattern_binding(
-        &self,
+        &mut self,
         builder: &mut Builder,
         id: PatternBindingId,
         input: MatchBindingInput<'_>,
@@ -658,7 +658,37 @@ impl LowerCtx<'_> {
         let binding_ty = self.pattern_binding_type(id, input.value_ty);
         let mir_ty = self.convert_type(&binding_ty);
         let (value, place) = match mode {
-            PatternBindingMode::Move => (input.value, input.place),
+            PatternBindingMode::Move => {
+                let (value, place) = (input.value, input.place);
+                let storage = self.current_body.map(|bid| {
+                    let escapes = self.analysis.escapes(bid, id);
+                    let needs_address = self.analysis.local_needs_address(bid, id);
+                    (escapes, needs_address)
+                });
+                if place.is_none()
+                    && storage.is_some_and(|(escapes, needs_address)| escapes || needs_address)
+                {
+                    // Address-taken match payload: materialize the storage
+                    // at the binding point, which dominates every later use
+                    // in the arm. Lazy materialization inside a nested arm
+                    // would define the place in a block that sibling arms
+                    // never execute, leaving their reads indeterminate.
+                    // Like `let` storage, only genuinely escaping values go
+                    // to the GC heap; address-taken values stay on the stack.
+                    let (escapes, _) = storage.unwrap_or((false, false));
+                    let place = if escapes {
+                        self.reference_storage(builder, mir_ty.clone())
+                    } else {
+                        builder.alloca(mir_ty.clone())
+                    };
+                    builder.store(value, place);
+                    self.storage_bindings.insert(id);
+                    self.scope_map.insert(id, place);
+                    (value, Some(place))
+                } else {
+                    (value, place)
+                }
+            }
             PatternBindingMode::Ref | PatternBindingMode::RefMut => {
                 let place = self.materialize_pattern_place(
                     builder,

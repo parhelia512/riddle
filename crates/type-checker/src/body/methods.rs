@@ -28,6 +28,12 @@ impl TypeChecker<'_> {
         let base = *base;
         let method_name = field.clone();
         let base_ty = self.check_place_expr(ctx, base);
+        // Resolve pending inference variables in the receiver before method
+        // lookup: a chained constructor like `take(range.into_iter(), 2)`
+        // leaves the adapter's iterator parameter as an inference variable
+        // until later, and trait-impl lookup (e.g. `Iterator` for
+        // `Take<I, T> where I: Iterator<Item = T>`) cannot match on it.
+        let base_ty = self.resolve_type(&base_ty);
         let method = match self.find_method(ctx, &base_ty, &method_name) {
             Ok(Some(method)) => method,
             Ok(None) => {
@@ -125,7 +131,7 @@ impl TypeChecker<'_> {
         if base_ty.is_unknown_like() {
             return None;
         }
-        let field_ty = self.check_field_access(ctx, base, field_name, None, span);
+        let field_ty = self.field_access_type(ctx, base, field_name, None, span, false)?;
         let field_ty = self.resolve_type(&field_ty);
         let signature = self
             .callable_signature_for_type(&field_ty)
@@ -1085,6 +1091,23 @@ impl TypeChecker<'_> {
         expected: Option<&Type>,
         span: Option<rowan::TextRange>,
     ) -> Type {
+        self.field_access_type(ctx, base, field, expected, span, true)
+            .unwrap_or(Type::Error)
+    }
+
+    /// Resolves the type of `base.field`. When `report` is false the field
+    /// lookup stays silent: the callable-field call fallback uses this so a
+    /// `base.name(args)` miss reports a single "unknown method" error instead
+    /// of pairing it with a misleading "unknown field" diagnostic.
+    fn field_access_type(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        base: ExprId,
+        field: &Name,
+        expected: Option<&Type>,
+        span: Option<rowan::TextRange>,
+        report: bool,
+    ) -> Option<Type> {
         let base_ty = self.check_expr(ctx, base);
         let base_value_ty = match &base_ty {
             Type::Ref(inner, _) => inner.as_ref(),
@@ -1092,24 +1115,28 @@ impl TypeChecker<'_> {
         };
         if let Type::Tuple(elements) = base_value_ty {
             let Ok(index) = field.0.parse::<usize>() else {
-                self.diagnostic(
-                    "E0006",
-                    format!("tuple type has no field `{}`", field.0),
-                    span,
-                );
-                return Type::Error;
+                if report {
+                    self.diagnostic(
+                        "E0006",
+                        format!("tuple type has no field `{}`", field.0),
+                        span,
+                    );
+                }
+                return None;
             };
             let Some(field_ty) = elements.get(index).cloned() else {
-                self.diagnostic(
-                    "E0006",
-                    format!(
-                        "tuple index `{}` is out of bounds for type {}",
-                        field.0,
-                        base_ty.display(self.hir)
-                    ),
-                    span,
-                );
-                return Type::Error;
+                if report {
+                    self.diagnostic(
+                        "E0006",
+                        format!(
+                            "tuple index `{}` is out of bounds for type {}",
+                            field.0,
+                            base_ty.display(self.hir)
+                        ),
+                        span,
+                    );
+                }
+                return None;
             };
             if let Some(expected) = expected
                 && type_has_unresolved_inference(&field_ty)
@@ -1117,7 +1144,7 @@ impl TypeChecker<'_> {
                 let _ = self.unify_types(&field_ty, expected);
                 self.last_occurs_error = None;
             }
-            return field_ty;
+            return Some(field_ty);
         }
         let struct_ref = match &base_ty {
             Type::Struct(id, args) => Some((*id, args.as_slice())),
@@ -1129,7 +1156,7 @@ impl TypeChecker<'_> {
         };
 
         let Some((struct_id, args)) = struct_ref else {
-            if !base_ty.is_unknown_like() {
+            if report && !base_ty.is_unknown_like() {
                 self.diagnostic(
                     "E0006",
                     format!(
@@ -1140,7 +1167,7 @@ impl TypeChecker<'_> {
                     span,
                 );
             }
-            return Type::Error;
+            return None;
         };
 
         let strukt = self.hir.item_tree.structs[struct_id].clone();
@@ -1150,12 +1177,14 @@ impl TypeChecker<'_> {
             .iter()
             .find(|candidate| candidate.name == *field)
         else {
-            self.diagnostic(
-                "E0006",
-                format!("unknown field `{}` on struct `{}`", field.0, strukt.name.0),
-                span,
-            );
-            return Type::Error;
+            if report {
+                self.diagnostic(
+                    "E0006",
+                    format!("unknown field `{}` on struct `{}`", field.0, strukt.name.0),
+                    span,
+                );
+            }
+            return None;
         };
         self.check_struct_field_visibility(ctx, struct_id, field, span);
 
@@ -1166,7 +1195,7 @@ impl TypeChecker<'_> {
             let _ = self.unify_types(&field_ty, expected);
             self.last_occurs_error = None;
         }
-        field_ty
+        Some(field_ty)
     }
 
     /// Check that the LHS of an assignment targets a mutable binding.

@@ -221,8 +221,8 @@ mod tests {
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
-        assert!(tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
-        assert!(!tree_has(&parse, syntax::SyntaxKind::ArrayExpr));
+        assert!(tree_has(parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(!tree_has(parse, syntax::SyntaxKind::ArrayExpr));
     }
 
     #[test]
@@ -237,7 +237,7 @@ mod tests {
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
-        assert!(tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(tree_has(parse, syntax::SyntaxKind::BracketLambdaExpr));
     }
 
     #[test]
@@ -255,8 +255,8 @@ mod tests {
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
-        assert!(tree_has(&parse, syntax::SyntaxKind::ArrayExpr));
-        assert!(!tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(tree_has(parse, syntax::SyntaxKind::ArrayExpr));
+        assert!(!tree_has(parse, syntax::SyntaxKind::BracketLambdaExpr));
     }
 
     #[test]
@@ -271,7 +271,7 @@ mod tests {
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
-        assert!(tree_has(&parse, syntax::SyntaxKind::ArrayExpr));
+        assert!(tree_has(parse, syntax::SyntaxKind::ArrayExpr));
         assert_eq!(
             parse
                 .syntax()
@@ -294,8 +294,8 @@ mod tests {
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
-        assert!(tree_has(&parse, syntax::SyntaxKind::ArrayExpr));
-        assert!(!tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(tree_has(parse, syntax::SyntaxKind::ArrayExpr));
+        assert!(!tree_has(parse, syntax::SyntaxKind::BracketLambdaExpr));
     }
 
     #[test]
@@ -316,21 +316,21 @@ mod tests {
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
-        assert!(tree_has(&parse, syntax::SyntaxKind::IndexExpr));
-        assert!(!tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(tree_has(parse, syntax::SyntaxKind::IndexExpr));
+        assert!(!tree_has(parse, syntax::SyntaxKind::BracketLambdaExpr));
     }
 
     #[test]
     fn parses_trailing_bracket_lambda_calls() {
         let mut parser = IncrementalParser::new();
-            let parse = parser.set_source(
-                r#"
+        let parse = parser.set_source(
+            r#"
             fun apply(action: impl Fn() -> ()) { action() }
             fun main() {
                 apply([ -> println("hello")]);
             }
             "#,
-            );
+        );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
     }
@@ -353,8 +353,8 @@ mod tests {
         );
 
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
-        assert!(tree_has(&parse, syntax::SyntaxKind::BracketLambdaExpr));
-        assert!(tree_has(&parse, syntax::SyntaxKind::IndexExpr));
+        assert!(tree_has(parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(tree_has(parse, syntax::SyntaxKind::IndexExpr));
     }
 
     #[test]

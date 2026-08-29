@@ -677,6 +677,21 @@ impl TypeChecker<'_> {
                     if matches!(lhs.as_ref(), Type::Str)
                         && matches!(rhs.as_ref(), Type::Str)
             )
+            // Raw pointers of the same pointee compare by address; this is
+            // what makes null checks (`p == 0usize as *const T`) possible.
+            || matches!(
+                (lhs_ty, rhs_ty),
+                (
+                    Type::Ptr {
+                        inner: lhs,
+                        mutable: lhs_mut,
+                    },
+                    Type::Ptr {
+                        inner: rhs,
+                        mutable: rhs_mut,
+                    },
+                ) if lhs == rhs && lhs_mut == rhs_mut
+            )
     }
 
     pub(super) fn is_builtin_binary_operator(op: BinaryOp, lhs_ty: &Type, rhs_ty: &Type) -> bool {

@@ -44,6 +44,57 @@ impl IntoIterator for Range {
     }
 }
 
+pub struct RangeInclusive {
+    start: i32,
+    end: i32,
+    exhausted: bool,
+}
+
+impl RangeInclusive {
+    pub fun new(start: i32, end: i32) -> RangeInclusive {
+        RangeInclusive {
+            start,
+            end,
+            exhausted: false,
+        }
+    }
+}
+
+pub fun range_inclusive(start: i32, end: i32) -> RangeInclusive {
+    RangeInclusive::new(start, end)
+}
+
+impl Iterator for RangeInclusive {
+    type Item = i32;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.exhausted {
+            return Option::None;
+        }
+        if self.start < self.end {
+            let value = self.start;
+            self.start += 1;
+            Option::Some(value)
+        } else {
+            self.exhausted = true;
+            if self.start == self.end {
+                Option::Some(self.start)
+            } else {
+                Option::None
+            }
+        }
+    }
+}
+
+impl IntoIterator for RangeInclusive {
+    type Item = i32;
+    type IntoIter = RangeInclusive;
+
+    fun into_iter(self) -> Self::IntoIter {
+        self
+    }
+}
+
 #[lang = "add"]
 pub trait Add<Rhs = Self> {
     type Output;

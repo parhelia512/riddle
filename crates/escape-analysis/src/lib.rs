@@ -862,14 +862,45 @@ impl EscapeAnalyzer<'_> {
             let param = self.hir.item_tree.functions[fid].params.first()?;
             Some((*base, matches!(param.ty, HirTypeRef::Ref(..))))
         });
+        // Bound-dispatch method calls (`value.lt(...)` resolved through
+        // `T: PartialOrd`) record no `FunctionItem` for the callee, so the
+        // receiver's by-ref `self` cannot be confirmed. Conservatively treat
+        // the receiver as borrowed: an address-taken receiver gets its place
+        // materialized at the binding site, which dominates every later use.
+        let conservative_receiver =
+            receiver.is_none() && matches!(ctx.body.exprs[callee], Expr::FieldAccess { .. });
 
         if let Some((receiver, by_ref)) = receiver {
             let value = self.handle_call_operand(ctx, callee_fid, 0, receiver, by_ref);
             returned.merge(value.clone());
             inputs.push(value);
+        } else if conservative_receiver {
+            let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee] else {
+                unreachable!("callee shape checked above");
+            };
+            let receiver = *base;
+            self.mark_escaping_exprs(ctx, receiver);
+            // Borrowing a receiver that is already a reference reborrows the
+            // existing reference; only value-typed receivers need a place.
+            let receiver_is_reference = self
+                .type_result
+                .expr_types
+                .get(&(ctx.body_id, receiver))
+                .is_some_and(|ty| matches!(ty, Type::Ref(..)));
+            let sources = if receiver_is_reference {
+                RefSources::new()
+            } else {
+                self.place_sources(ctx, receiver)
+            };
+            Self::mark_address_taken(ctx, &sources);
+            let value = SourceValue::from_sources(sources);
+            // No callee summary is available, so — unlike the resolved path —
+            // the receiver is only borrowed, never treated as escaping.
+            returned.merge(value.clone());
+            inputs.push(value);
         }
 
-        let param_offset = usize::from(receiver.is_some());
+        let param_offset = usize::from(receiver.is_some() || conservative_receiver);
 
         for (i, arg) in args.iter().enumerate() {
             self.mark_escaping_exprs(ctx, *arg);
@@ -930,6 +961,12 @@ impl EscapeAnalyzer<'_> {
         let mut returned = SourceValue::default();
         for operand in operands {
             self.mark_escaping_exprs(ctx, *operand);
+            // Trait-dispatched operators (`==` / `<` on a generic `T`) call
+            // the impl with both operands by reference. Mark them
+            // address-taken so pattern-binding operands materialize their
+            // storage at the binding site instead of lazily inside one arm.
+            let sources = self.place_sources(ctx, *operand);
+            Self::mark_address_taken(ctx, &sources);
             returned.merge(ctx.expr_source_value(*operand));
         }
         if self.expr_may_carry_reference(ctx, result) {

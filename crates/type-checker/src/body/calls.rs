@@ -1,10 +1,10 @@
 use super::{
-    BodyCtx, CallableSignature, ClosureKind, Expr, ExprId, GenericEdge, HashMap, HirFunction,
-    HirTypeRef, HirVariantKind, LabelStyle, PendingGenericCall, ResolvedName, SourceLabel, TraitId,
-    TraitMethodCall, Type, TypeChecker, ValueUse, bound_target_param, builtin_callable_kind,
-    callable_signature_type, collect_subst, generic_param_map_with_consts, grows_generic_arg,
-    pattern_has_unresolved_param, record_generic_arg_spans, substitute_type,
-    type_has_unresolved_inference,
+    Body, BodyCtx, BodyId, CallableSignature, ClosureKind, Expr, ExprId, GenericEdge, HashMap,
+    HirFunction, HirTypeRef, HirVariantKind, LabelStyle, Pattern, PendingGenericCall, ResolvedName,
+    SourceLabel, Stmt, TraitId, TraitMethodCall, Type, TypeChecker, ValueUse, bound_target_param,
+    builtin_callable_kind, callable_signature_type, child_exprs, collect_subst,
+    generic_param_map_with_consts, grows_generic_arg, pattern_has_unresolved_param,
+    record_generic_arg_spans, substitute_type, type_has_unresolved_inference,
 };
 
 impl TypeChecker<'_> {
@@ -1038,14 +1038,45 @@ impl TypeChecker<'_> {
                 .iter()
                 .any(|name| subst.get(name).is_none_or(type_has_unresolved_inference));
             if unresolved {
-                self.diagnostic(
-                    "E0005",
-                    format!(
+                let unresolved_names = call
+                    .inferred_names
+                    .iter()
+                    .filter(|name| subst.get(*name).is_none_or(type_has_unresolved_inference))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let message = match unresolved_names.as_slice() {
+                    [name] => format!(
+                        "cannot infer type argument `{name}` for {} `{}`",
+                        call.kind, function.name.0
+                    ),
+                    _ => format!(
                         "cannot infer type argument(s) for {} `{}`",
                         call.kind, function.name.0
                     ),
-                    call.span,
-                );
+                };
+                let diagnostics_before = self.result.diagnostics.len();
+                self.diagnostic("E0005", message, call.span);
+                if self.result.diagnostics.len() == diagnostics_before {
+                    continue;
+                }
+                let hint = call
+                    .span
+                    .and_then(|span| self.enclosing_binding_hint(ctx.body_id, span));
+                let diagnostic = self
+                    .result
+                    .diagnostics
+                    .last_mut()
+                    .expect("diagnostic was pushed above");
+                diagnostic.notes = vec![
+                    "the unresolved type argument must be determined by a call argument or an explicit type annotation".into(),
+                ];
+                if let Some((name, range)) = hint {
+                    diagnostic.labels.push(SourceLabel {
+                        range,
+                        message: format!("consider giving `{name}` an explicit type"),
+                        style: LabelStyle::Secondary,
+                    });
+                }
                 continue;
             }
 
@@ -1075,6 +1106,73 @@ impl TypeChecker<'_> {
                     span: call.span,
                 });
             }
+        }
+    }
+
+    /// Locates the outermost user-written `let` binding whose initializer
+    /// contains `inner`, binds a plain name, and carries no type annotation —
+    /// the natural place to add one. Standard macro expansions bind hidden
+    /// `__riddle_*` temporaries (e.g. the `Vector::new` inside `vec![]`), so
+    /// those are skipped in favor of the binding a user can actually annotate.
+    fn enclosing_binding_hint(
+        &self,
+        body_id: BodyId,
+        inner: rowan::TextRange,
+    ) -> Option<(String, rowan::TextRange)> {
+        let body = &self.hir.bodies[body_id];
+        let mut hint = None;
+        self.collect_binding_hint(body, body.root_block, inner, &mut hint);
+        hint
+    }
+
+    fn collect_binding_hint(
+        &self,
+        body: &Body,
+        expr: ExprId,
+        inner: rowan::TextRange,
+        hint: &mut Option<(String, rowan::TextRange)>,
+    ) {
+        if hint.is_some() {
+            return;
+        }
+        let Some(range) = body.source_map.expr_ranges.get(&expr).copied() else {
+            return;
+        };
+        if !range.contains(inner.start()) {
+            return;
+        }
+        if let Expr::Block { stmts, tail } = &body.exprs[expr] {
+            for stmt_id in stmts {
+                let Some(stmt_range) = body.source_map.stmt_ranges.get(stmt_id).copied() else {
+                    continue;
+                };
+                if !stmt_range.contains(inner.start()) {
+                    continue;
+                }
+                if let Stmt::Let {
+                    pat,
+                    ty,
+                    init: Some(init),
+                    ..
+                } = &body.stmts[*stmt_id]
+                {
+                    if matches!(ty, HirTypeRef::Unknown)
+                        && let Pattern::Binding { name, .. } = &body.pats[*pat]
+                        && !name.0.starts_with("__riddle_")
+                        && let Some(pat_range) = body.source_map.pat_ranges.get(pat).copied()
+                    {
+                        *hint = Some((name.0.clone(), pat_range));
+                    }
+                    self.collect_binding_hint(body, *init, inner, hint);
+                }
+            }
+            if let Some(tail) = tail {
+                self.collect_binding_hint(body, *tail, inner, hint);
+            }
+            return;
+        }
+        for child in child_exprs(&body.exprs[expr]) {
+            self.collect_binding_hint(body, child, inner, hint);
         }
     }
 

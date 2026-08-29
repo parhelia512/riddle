@@ -134,3 +134,80 @@ pub fun write(path: &str, contents: &str) -> Result<(), FsError> {
     }
     file.flush()
 }
+
+unsafe extern "C" {
+    safe fun riddle_fs_exists(path: &str) -> i32;
+    safe fun riddle_fs_size(path: &str) -> u64;
+    safe fun riddle_fs_is_file(path: &str) -> i32;
+    safe fun riddle_fs_is_dir(path: &str) -> i32;
+    safe fun riddle_fs_read_dir(
+        path: &str,
+        names_out: *mut *const u8,
+        lens_out: *mut usize,
+        capacity: usize,
+    ) -> usize;
+}
+
+#[derive(Debug)]
+pub struct FileMetadata {
+    pub size: u64,
+    pub is_file: bool,
+    pub is_dir: bool,
+}
+
+pub fun exists(path: &str) -> bool {
+    let found = unsafe { riddle_fs_exists(path) };
+    found != 0i32
+}
+
+pub fun metadata(path: &str) -> Option<FileMetadata> {
+    if !exists(path) {
+        return Option::None;
+    }
+    let size = unsafe { riddle_fs_size(path) };
+    let file_flag = unsafe { riddle_fs_is_file(path) };
+    let dir_flag = unsafe { riddle_fs_is_dir(path) };
+    Option::Some(FileMetadata {
+        size,
+        is_file: file_flag != 0i32,
+        is_dir: dir_flag != 0i32,
+    })
+}
+
+pub fun read_dir(path: &str) -> Vector<String> {
+    let mut capacity = 32usize;
+    loop {
+        let mut names = Vector::new();
+        let mut lens = Vector::new();
+        let mut slot = 0usize;
+        while slot < capacity {
+            names.push(0usize as *const u8);
+            lens.push(0usize);
+            slot += 1usize;
+        }
+        let count = unsafe {
+            riddle_fs_read_dir(
+                path,
+                names.as_ptr() as *mut *const u8,
+                lens.as_ptr() as *mut usize,
+                capacity,
+            )
+        };
+        if count > capacity {
+            capacity = count + 8usize;
+            continue;
+        }
+        let mut entries = Vector::new();
+        let name_base = names.as_ptr();
+        let length_base = lens.as_ptr();
+        let mut index = 0usize;
+        while index < count {
+            let pointer: *const u8 = unsafe { name_base[index] } as *const u8;
+            let length: usize = unsafe { length_base[index] };
+            let bytes: &[u8] = unsafe { (pointer, length) as &[u8] };
+            entries.push(String::from_utf8(bytes).unwrap_or(String::new()));
+            index += 1usize;
+        }
+        return entries;
+    }
+}

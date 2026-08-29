@@ -17,7 +17,7 @@ use super::{
         expand_standard_assert_comparison_macro, expand_standard_assert_macro,
         expand_standard_derive_macro, expand_standard_format_macro, expand_standard_panic_macro,
         expand_standard_panic_shorthand_macro, expand_standard_print_macro,
-        expand_standard_quote_macro,
+        expand_standard_quote_macro, expand_standard_vec_macro,
     },
     token_stream::{ProcMacroDelimiter, ProcMacroTokenStream, ProcMacroTokenTree},
 };
@@ -1327,6 +1327,7 @@ fn expand_function_action(
         let expanded = match imported.macro_name.as_str() {
             "quote" => expand_standard_quote_macro(&input, &call_site),
             "format" => expand_standard_format_macro(&input, &call_site),
+            "vec" => expand_standard_vec_macro(&input, &call_site),
             "panic" => expand_standard_panic_macro(&input, &call_site, original_source),
             "print" | "println" => {
                 expand_standard_print_macro(&imported.macro_name, &input, &call_site)

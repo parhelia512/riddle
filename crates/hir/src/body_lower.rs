@@ -7,7 +7,7 @@ use ast::{
     support::{AstNode, trimmed_range},
 };
 use rowan::{TextRange, ast::SyntaxNodePtr};
-use syntax::{SyntaxKind, SyntaxToken};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 use super::{
     HirFile, Name,
@@ -143,6 +143,25 @@ impl<'a> BodyLower<'a> {
         expr.map(|expr| self.lower_expr(expr))
     }
 
+    /// Lowers an optional expression slot owned by `owner`. A slot holding an
+    /// unexpanded macro call — the proc-macro layer failed to expand it and
+    /// already reported the error at the same span — lowers to `Expr::Missing`
+    /// without a diagnostic, so one expansion failure does not cascade into
+    /// misleading missing-expression or uninitialized-binding errors.
+    fn lower_expr_slot(&mut self, expr: Option<ast::Expr>, owner: &SyntaxNode) -> Option<ExprId> {
+        if let Some(expr) = expr {
+            return Some(self.lower_expr(expr));
+        }
+        if owner
+            .children()
+            .any(|child| child.kind() == SyntaxKind::MacroCall)
+        {
+            let range = trimmed_range(owner);
+            return Some(self.alloc_expr(Expr::Missing, range));
+        }
+        None
+    }
+
     fn lower_required_expr(
         &mut self,
         expr: Option<ast::Expr>,
@@ -198,7 +217,7 @@ impl<'a> BodyLower<'a> {
                 let ty_ast = var.ty();
                 let ty_range = ty_ast.as_ref().map(|ty| trimmed_range(ty.syntax()));
                 let ty = Self::lower_optional_type(ty_ast);
-                let init = self.lower_optional_expr(var.init());
+                let init = self.lower_expr_slot(var.init(), var.syntax());
                 let else_ = var.else_block().map(|block| self.lower_block(&block));
                 Some(self.alloc_stmt(
                     Stmt::Let {
@@ -225,8 +244,9 @@ impl<'a> BodyLower<'a> {
             ast::Stmt::ContinueStmt(_) => Some(self.alloc_stmt(Stmt::Continue, range)),
 
             ast::Stmt::ExprStmt(es) => {
-                let expr =
-                    self.lower_required_expr(es.expr(), "missing expression statement", range);
+                let expr = self
+                    .lower_expr_slot(es.expr(), es.syntax())
+                    .unwrap_or_else(|| self.missing_expr("missing expression statement", range));
                 Some(self.alloc_stmt(Stmt::Expr { expr }, range))
             }
 
@@ -463,7 +483,53 @@ impl<'a> BodyLower<'a> {
                     self.lower_required_expr(idx.index(), "missing index expression", range);
                 self.alloc_expr(Expr::IndexAccess { base, index }, range)
             }
+
+            ast::Expr::RangeExpr(range_expr) => self.lower_range_expr(&range_expr, range),
         }
+    }
+
+    /// Desugars `start..end` / `start..=end` into a call to
+    /// `crate::std::ops::range` / `range_inclusive`, whose results implement
+    /// `IntoIterator`, so the rest of the pipeline sees an ordinary call.
+    fn lower_range_expr(&mut self, range_expr: &ast::RangeExpr, range: TextRange) -> ExprId {
+        let start = self.lower_required_expr(range_expr.start(), "missing range start", range);
+        let end = self.lower_required_expr(range_expr.end(), "missing range end", range);
+        let function = if range_expr.inclusive() {
+            "range_inclusive"
+        } else {
+            "range"
+        };
+        self.lower_std_call(&["std", "ops", function], vec![start, end], range)
+    }
+
+    /// Builds a call to a `crate::std::...` free function from a desugared
+    /// expression; the synthesized path resolves like a user-written one.
+    fn lower_std_call(&mut self, segments: &[&str], args: Vec<ExprId>, range: TextRange) -> ExprId {
+        let path = HirPath {
+            anchor: PathAnchor::Crate,
+            segments: segments
+                .iter()
+                .map(|segment| Name(segment.to_string()))
+                .collect(),
+            segment_type_args: Vec::new(),
+            type_args: Vec::new(),
+            range,
+        };
+        let callee = self.alloc_expr(
+            Expr::Path {
+                path,
+                resolved: None,
+            },
+            range,
+        );
+        self.alloc_expr(
+            Expr::Call {
+                callee,
+                args,
+                type_args: Vec::new(),
+            },
+            range,
+        )
     }
 
     fn lower_number_expr(&mut self, number: &ast::NumberExpr, range: TextRange) -> ExprId {
@@ -734,7 +800,13 @@ impl<'a> BodyLower<'a> {
     ) -> ExprId {
         let params = self.lower_lambda_params(lambda.param_list());
         let body = match self.lower_optional_expr(lambda.body()) {
-            Some(expr) => self.alloc_expr(Expr::Block { stmts: Vec::new(), tail: Some(expr) }, range),
+            Some(expr) => self.alloc_expr(
+                Expr::Block {
+                    stmts: Vec::new(),
+                    tail: Some(expr),
+                },
+                range,
+            ),
             None => self.missing_expr("missing lambda body", range),
         };
         self.alloc_expr(

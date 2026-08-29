@@ -154,6 +154,22 @@ impl String {
     pub fun slice(&self, start: usize, end: usize) -> Option<&str> {
         self.as_str().slice(start, end)
     }
+
+    pub fun split(&self, separator: &str) -> Vector<String> {
+        self.as_str().split(separator)
+    }
+
+    pub fun replace(&self, from: &str, to: &str) -> String {
+        self.as_str().replace(from, to)
+    }
+
+    pub fun to_ascii_uppercase(&self) -> String {
+        self.as_str().to_ascii_uppercase()
+    }
+
+    pub fun to_ascii_lowercase(&self) -> String {
+        self.as_str().to_ascii_lowercase()
+    }
 }
 
 impl str {
@@ -249,6 +265,77 @@ impl str {
             end -= 1usize;
         }
         self.slice(start, end).unwrap_or("")
+    }
+
+    pub fun split(&self, separator: &str) -> Vector<String> {
+        let mut parts = Vector::new();
+        let separator_length = separator.len();
+        let mut start = 0usize;
+        loop {
+            let remaining = self.slice(start, self.len()).unwrap_or("");
+            match remaining.find(separator) {
+                Option::Some(offset) => {
+                    let piece = self.slice(start, start + offset).unwrap_or("");
+                    parts.push(String::from_str(piece));
+                    start = start + offset + separator_length;
+                },
+                Option::None => {
+                    let piece = self.slice(start, self.len()).unwrap_or("");
+                    parts.push(String::from_str(piece));
+                    break;
+                },
+            }
+        }
+        parts
+    }
+
+    pub fun replace(&self, from: &str, to: &str) -> String {
+        if from.is_empty() {
+            return String::from_str(self);
+        }
+        let parts = self.split(from);
+        let mut output = String::new();
+        let mut first = true;
+        for part in parts {
+            if !first {
+                output.push_str(to);
+            }
+            output.push_str(part.as_str());
+            first = false;
+        }
+        output
+    }
+
+    pub fun to_ascii_uppercase(&self) -> String {
+        let mut output = String::new();
+        let bytes = self.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte >= 97u8 && byte <= 122u8 {
+                output.bytes.push(byte - 32u8);
+            } else {
+                output.bytes.push(byte);
+            }
+            index += 1usize;
+        }
+        output
+    }
+
+    pub fun to_ascii_lowercase(&self) -> String {
+        let mut output = String::new();
+        let bytes = self.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte >= 65u8 && byte <= 90u8 {
+                output.bytes.push(byte + 32u8);
+            } else {
+                output.bytes.push(byte);
+            }
+            index += 1usize;
+        }
+        output
     }
 }
 
