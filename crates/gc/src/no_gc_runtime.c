@@ -1,5 +1,10 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void riddle_memory_fail(void) {
     abort();

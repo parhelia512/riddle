@@ -180,6 +180,10 @@ impl CBackend {
             writeln!(out, "// Compile: cc out.c -o out").unwrap();
         }
         writeln!(out).unwrap();
+        writeln!(out, "#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)").unwrap();
+        writeln!(out, "#define _POSIX_C_SOURCE 199309L").unwrap();
+        writeln!(out, "#endif").unwrap();
+        writeln!(out).unwrap();
         writeln!(out, "#include <stddef.h>").unwrap();
         writeln!(out, "#include <stdint.h>").unwrap();
         writeln!(out, "#include <stdbool.h>").unwrap();
