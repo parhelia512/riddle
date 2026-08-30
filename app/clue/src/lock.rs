@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Error, ErrorKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) const LOCK_VERSION: u32 = 3;
 
@@ -122,8 +122,7 @@ pub(crate) fn write_if_changed(path: &Path, expected: &LockFile) -> io::Result<(
             format!("failed to serialize `{}`: {error}", path.display()),
         )
     })?;
-    let guard_path = path.with_extension("lock.guard");
-    let guard = FileGuard::acquire(&guard_path)?;
+    let guard = FileGuard::acquire(&guard_path(path))?;
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
     let result = (|| {
         fs::write(&temp, text)?;
@@ -132,4 +131,71 @@ pub(crate) fn write_if_changed(path: &Path, expected: &LockFile) -> io::Result<(
     let _ = fs::remove_file(&temp);
     drop(guard);
     result
+}
+
+/// The write guard lives under the project's `.clue/` directory instead of
+/// next to `Clue.lock`: the guard must be a stable path that is never itself
+/// replaced (locking `Clue.lock` directly would not survive the atomic
+/// rename-over, and Windows cannot replace a locked file), but a
+/// `Clue.lock.guard` in the project root pollutes the user's tree. `.clue/`
+/// is clue's private, gitignored state directory.
+fn guard_path(path: &Path) -> PathBuf {
+    let guard = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".clue")
+        .join("lock-guard");
+    let _ = fs::create_dir_all(guard.parent().unwrap_or_else(|| Path::new(".")));
+    guard
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lock_file() -> LockFile {
+        LockFile {
+            version: LOCK_VERSION,
+            package: vec![LockPackage {
+                name: "demo".into(),
+                version: "0.1.0".into(),
+                source: String::new(),
+                path: "src/main.rid".into(),
+                dependencies: Vec::new(),
+                source_hash: "abc".into(),
+                checksum: String::new(),
+                features: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn write_guard_lives_in_the_clue_directory_not_the_project_root() {
+        let root = std::env::temp_dir().join(format!(
+            "clue-lock-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let lock_path = root.join("Clue.lock");
+
+        write_if_changed(&lock_path, &lock_file()).unwrap();
+
+        assert!(lock_path.is_file());
+        assert!(!root.join("Clue.lock.guard").exists());
+        assert!(root.join(".clue").join("lock-guard").exists());
+        let written = read(&lock_path).unwrap().unwrap();
+        assert_eq!(written, lock_file());
+
+        // Rewriting identical content must not touch the lock file.
+        let before = fs::metadata(&lock_path).unwrap().modified().unwrap();
+        write_if_changed(&lock_path, &lock_file()).unwrap();
+        let after = fs::metadata(&lock_path).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
