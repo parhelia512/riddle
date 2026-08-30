@@ -1,10 +1,33 @@
 use crate::std::cmp::Eq;
 use crate::std::hash::Hash;
 use crate::std::collections::hash_map::HashMap;
+use crate::std::option::Option;
 
-#[derive(Debug)]
 pub struct HashSet<T> {
     values: HashMap<T, bool>,
+}
+
+impl<T> crate::std::fmt::Debug for HashSet<T>
+where T: crate::std::fmt::Debug {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        formatter.write_str("{")?;
+        let mut iter = self.values.iter();
+        let mut first = true;
+        loop {
+            match iter.next() {
+                Option::Some((value, _)) => {
+                    if first {
+                        first = false;
+                    } else {
+                        formatter.write_str(", ")?;
+                    }
+                    crate::std::fmt::write_debug(value, &mut *formatter)?;
+                },
+                Option::None => { break; },
+            }
+        }
+        formatter.write_str("}")
+    }
 }
 
 impl<T> HashSet<T> {

@@ -27,9 +27,15 @@ pub struct StrIter {
     index: usize,
 }
 
-#[derive(Debug)]
 pub struct String {
     bytes: Vector<u8>,
+}
+
+impl crate::std::fmt::Debug for String {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        let slice: &str = self.as_str();
+        crate::std::fmt::write_debug(&slice, formatter)
+    }
 }
 
 impl String {

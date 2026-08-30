@@ -926,8 +926,8 @@ pub(super) fn expand_standard_vec_macro(
         }
     }
     let source = if segments.len() == 1 {
-        let elements =
-            split_macro_arguments(input).map_err(|error| (call_site.clone(), format!("vec! {error}")))?;
+        let elements = split_macro_arguments(input)
+            .map_err(|error| (call_site.clone(), format!("vec! {error}")))?;
         let mut source = format!("{{ let mut {stem} = crate::std::vector::Vector::new();");
         for element in elements {
             let _ = write!(source, "{stem}.push(({}));", element.to_source());

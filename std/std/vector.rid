@@ -12,11 +12,26 @@ unsafe extern "C" {
     safe fun rgc_free(data: *mut u8);
 }
 
-#[derive(Debug)]
 pub struct Vector<T> {
     data: *mut T,
     len: usize,
     capacity: usize,
+}
+
+impl<T> crate::std::fmt::Debug for Vector<T>
+where T: crate::std::fmt::Debug {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        formatter.write_str("[")?;
+        let mut index = 0usize;
+        while index < self.len {
+            if index > 0usize {
+                formatter.write_str(", ")?;
+            }
+            crate::std::fmt::write_debug(unsafe { &self.data[index] }, &mut *formatter)?;
+            index += 1usize;
+        }
+        formatter.write_str("]")
+    }
 }
 
 pub struct VectorIntoIter<T> {

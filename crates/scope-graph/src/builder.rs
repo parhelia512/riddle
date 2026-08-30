@@ -570,6 +570,12 @@ impl<'a> ScopeGraphBuilder<'a> {
         for bound in bounds {
             self.emit_type_references(&bound.target_ty, current_scope, nodes, edges);
             self.emit_type_references(&bound.trait_ty, current_scope, nodes, edges);
+            if let Some(signature) = &bound.callable {
+                for param in &signature.params {
+                    self.emit_type_references(param, current_scope, nodes, edges);
+                }
+                self.emit_type_references(&signature.ret, current_scope, nodes, edges);
+            }
             for constraint in &bound.assoc_constraints {
                 self.emit_type_references(&constraint.ty, current_scope, nodes, edges);
             }

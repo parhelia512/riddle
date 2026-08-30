@@ -1411,12 +1411,22 @@ fn replace_function_output(
     call_site: Range<usize>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
+    let detail = |candidate: &TokenDocument| {
+        candidate
+            .parse()
+            .parse
+            .errors
+            .first()
+            .map(|error| format!(": {}", error.message))
+            .unwrap_or_default()
+    };
     let mut candidate = document.clone();
     candidate.replace(parsed, call_range, replacement.clone());
     if candidate.parse().parse.errors.is_empty() {
         *document = candidate;
         return true;
     }
+    let direct_detail = detail(&candidate);
     if let Some(statement) = call
         .syntax()
         .ancestors()
@@ -1428,10 +1438,19 @@ fn replace_function_output(
             *document = candidate;
             return true;
         }
+        let statement_detail = detail(&candidate);
+        diagnostics.push(diagnostic(
+            call_site,
+            format!(
+                "function-like macro output is not valid in this position{direct_detail}; as a statement{statement_detail}"
+            ),
+            Severity::Error,
+        ));
+        return false;
     }
     diagnostics.push(diagnostic(
         call_site,
-        "function-like macro output is not valid in this position".into(),
+        format!("function-like macro output is not valid in this position{direct_detail}"),
         Severity::Error,
     ));
     false

@@ -122,6 +122,42 @@ pub trait Iterator {
         adapter
     }
 
+    fun chain<J>(self, other: J) -> Chain<Self, J, Self::Item>
+    where J: Iterator<Item = Self::Item> {
+        let adapter: Chain<Self, J, Self::Item> = Chain {
+            first: self,
+            second: other,
+            first_done: false,
+        };
+        adapter
+    }
+
+    fun take_while<F>(self, predicate: F) -> TakeWhile<Self, F, Self::Item>
+    where F: FnMut(&Self::Item) -> bool {
+        let adapter: TakeWhile<Self, F, Self::Item> = TakeWhile {
+            iter: self,
+            predicate,
+            done: false,
+        };
+        adapter
+    }
+
+    fun skip_while<F>(self, predicate: F) -> SkipWhile<Self, F, Self::Item>
+    where F: FnMut(&Self::Item) -> bool {
+        let adapter: SkipWhile<Self, F, Self::Item> = SkipWhile {
+            iter: self,
+            predicate,
+            skipping: true,
+        };
+        adapter
+    }
+
+    fun inspect<F>(self, f: F) -> Inspect<Self, F, Self::Item>
+    where F: FnMut(&Self::Item) -> () {
+        let adapter: Inspect<Self, F, Self::Item> = Inspect { iter: self, f };
+        adapter
+    }
+
     fun collect(self) -> Vector<Self::Item> {
         let mut out = Vector::new();
         let mut runner = self;
@@ -314,6 +350,157 @@ where I: Iterator<Item = T>,
     }
 }
 
+pub struct Chain<I, J, T> {
+    first: I,
+    second: J,
+    first_done: bool,
+}
+
+impl<I, J, T> Iterator for Chain<I, J, T>
+where I: Iterator<Item = T>,
+      J: Iterator<Item = T> {
+    type Item = T;
+
+    fun next(&mut self) -> Option<T> {
+        if !self.first_done {
+            match self.first.next() {
+                Option::Some(value) => { return Option::Some(value); },
+                Option::None => { self.first_done = true; },
+            }
+        }
+        self.second.next()
+    }
+}
+
+impl<I, J, T> IntoIterator for Chain<I, J, T>
+where I: Iterator<Item = T>,
+      J: Iterator<Item = T> {
+    type Item = T;
+    type IntoIter = Chain<I, J, T>;
+
+    fun into_iter(self) -> Chain<I, J, T> {
+        self
+    }
+}
+
+pub struct TakeWhile<I, F, T> {
+    iter: I,
+    predicate: F,
+    done: bool,
+}
+
+impl<I, F, T> Iterator for TakeWhile<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> bool {
+    type Item = T;
+
+    fun next(&mut self) -> Option<T> {
+        if self.done {
+            return Option::None;
+        }
+        match self.iter.next() {
+            Option::Some(value) => {
+                if self.predicate(&value) {
+                    Option::Some(value)
+                } else {
+                    self.done = true;
+                    Option::None
+                }
+            },
+            Option::None => {
+                self.done = true;
+                Option::None
+            },
+        }
+    }
+}
+
+impl<I, F, T> IntoIterator for TakeWhile<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> bool {
+    type Item = T;
+    type IntoIter = TakeWhile<I, F, T>;
+
+    fun into_iter(self) -> TakeWhile<I, F, T> {
+        self
+    }
+}
+
+pub struct SkipWhile<I, F, T> {
+    iter: I,
+    predicate: F,
+    skipping: bool,
+}
+
+impl<I, F, T> Iterator for SkipWhile<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> bool {
+    type Item = T;
+
+    fun next(&mut self) -> Option<T> {
+        if self.skipping {
+            loop {
+                match self.iter.next() {
+                    Option::Some(value) => {
+                        if !self.predicate(&value) {
+                            self.skipping = false;
+                            return Option::Some(value);
+                        }
+                    },
+                    Option::None => {
+                        self.skipping = false;
+                        return Option::None;
+                    },
+                }
+            }
+        }
+        self.iter.next()
+    }
+}
+
+impl<I, F, T> IntoIterator for SkipWhile<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> bool {
+    type Item = T;
+    type IntoIter = SkipWhile<I, F, T>;
+
+    fun into_iter(self) -> SkipWhile<I, F, T> {
+        self
+    }
+}
+
+pub struct Inspect<I, F, T> {
+    iter: I,
+    f: F,
+}
+
+impl<I, F, T> Iterator for Inspect<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> () {
+    type Item = T;
+
+    fun next(&mut self) -> Option<T> {
+        match self.iter.next() {
+            Option::Some(value) => {
+                self.f(&value);
+                Option::Some(value)
+            },
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<I, F, T> IntoIterator for Inspect<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> () {
+    type Item = T;
+    type IntoIter = Inspect<I, F, T>;
+
+    fun into_iter(self) -> Inspect<I, F, T> {
+        self
+    }
+}
+
 // Adapter constructors --------------------------------------------------------
 
 pub fun enumerate<I, T>(iterator: I) -> Enumerate<I, T>
@@ -338,6 +525,46 @@ pub fun zip<A, B, TA, TB>(a: A, b: B) -> Zip<A, B, TA, TB>
 where A: Iterator<Item = TA>,
       B: Iterator<Item = TB> {
     let adapter: Zip<A, B, TA, TB> = Zip { a, b };
+    adapter
+}
+
+pub fun chain<I, J, T>(first: I, second: J) -> Chain<I, J, T>
+where I: Iterator<Item = T>,
+      J: Iterator<Item = T> {
+    let adapter: Chain<I, J, T> = Chain {
+        first,
+        second,
+        first_done: false,
+    };
+    adapter
+}
+
+pub fun take_while<I, F, T>(iterator: I, predicate: F) -> TakeWhile<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> bool {
+    let adapter: TakeWhile<I, F, T> = TakeWhile {
+        iter: iterator,
+        predicate,
+        done: false,
+    };
+    adapter
+}
+
+pub fun skip_while<I, F, T>(iterator: I, predicate: F) -> SkipWhile<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> bool {
+    let adapter: SkipWhile<I, F, T> = SkipWhile {
+        iter: iterator,
+        predicate,
+        skipping: true,
+    };
+    adapter
+}
+
+pub fun inspect<I, F, T>(iterator: I, f: F) -> Inspect<I, F, T>
+where I: Iterator<Item = T>,
+      F: FnMut(&T) -> () {
+    let adapter: Inspect<I, F, T> = Inspect { iter: iterator, f };
     adapter
 }
 

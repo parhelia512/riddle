@@ -2,7 +2,6 @@ use crate::std::cmp::{Ord, Ordering};
 use crate::std::option::Option;
 use crate::std::vector::Vector;
 
-#[derive(Debug)]
 struct TreeNode<K, V> {
     key: K,
     value: V,
@@ -12,11 +11,16 @@ struct TreeNode<K, V> {
     red: bool,
 }
 
-#[derive(Debug)]
 pub struct TreeMap<K, V> {
     nodes: Vector<TreeNode<K, V>>,
     root: Option<usize>,
     size: usize,
+}
+
+pub struct TreeMapIter<K, V> {
+    tree: &TreeMap<K, V>,
+    current: Option<usize>,
+    remaining: usize,
 }
 
 impl<K, V> TreeMap<K, V> {
@@ -645,5 +649,105 @@ impl<K, V> TreeMap<K, V> {
             Option::Some(mut node) => { node.red = red; },
             Option::None => {},
         }
+    }
+
+    // Leftmost descendant of the subtree rooted at `index`.
+    fun first_index(&self, index: Option<usize>) -> Option<usize> {
+        let mut current = index;
+        while current.is_some() {
+            let node_index = current.unwrap_or(0usize);
+            let next = self.left(node_index);
+            if next.is_none() {
+                return current;
+            }
+            current = next;
+        }
+        Option::None
+    }
+
+    pub fun iter(&self) -> TreeMapIter<K, V> {
+        TreeMapIter {
+            tree: self,
+            current: self.first_index(self.root),
+            remaining: self.size,
+        }
+    }
+}
+
+impl<K, V> crate::std::iter::Iterator for TreeMapIter<K, V> {
+    type Item = (&K, &V);
+
+    fun next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0usize {
+            return Option::None;
+        }
+        let index = match self.current {
+            Option::Some(index) => index,
+            Option::None => { return Option::None; },
+        };
+        self.remaining -= 1usize;
+        let node = self.tree.nodes.get(index);
+        // In-order successor: the leftmost node of the right subtree, or the
+        // nearest ancestor whose left subtree we have not finished.
+        if self.tree.right(index).is_some() {
+            self.current = self.tree.first_index(self.tree.right(index));
+        } else {
+            let mut candidate = index;
+            let mut climbing = true;
+            while climbing {
+                let parent = match self.tree.parent(candidate) {
+                    Option::Some(parent) => parent,
+                    Option::None => {
+                        self.current = Option::None;
+                        climbing = false;
+                        break;
+                    },
+                };
+                if self.tree.is_left_child(candidate, parent) {
+                    self.current = Option::Some(parent);
+                    climbing = false;
+                } else {
+                    candidate = parent;
+                }
+            }
+        }
+        match node {
+            Option::Some(node) => Option::Some((&node.key, &node.value)),
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<K, V> crate::std::iter::IntoIterator for &TreeMap<K, V> {
+    type Item = (&K, &V);
+    type IntoIter = TreeMapIter<K, V>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<K, V> crate::std::fmt::Debug for TreeMap<K, V>
+where K: crate::std::fmt::Debug, V: crate::std::fmt::Debug {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        formatter.write_str("{")?;
+        let mut iter = self.iter();
+        let mut first = true;
+        loop {
+            match iter.next() {
+                Option::Some((key, value)) => {
+                    if first {
+                        first = false;
+                    } else {
+                        formatter.write_str(", ")?;
+                    }
+                    crate::std::fmt::write_debug(key, &mut *formatter)?;
+                    formatter.write_str(": ")?;
+                    crate::std::fmt::write_debug(value, &mut *formatter)?;
+                },
+                Option::None => { break; },
+            }
+        }
+        formatter.write_str("}")
     }
 }

@@ -259,6 +259,47 @@ fn std_iterator_combinators_and_eager_maps_run() {
 }
 
 #[test]
+fn std_iterator_lazy_helpers_chain_and_short_circuit() {
+    let (code, stdout) = compile_and_run(
+        r#"
+        use crate::std::iter::{Iterator, IntoIterator};
+
+        fun main() -> i32 {
+            let chained = crate::std::ops::range(0, 3).into_iter()
+                .chain(crate::std::ops::range(3, 5).into_iter());
+            let chained_total = chained.fold(0i32, fun(acc: i32, value: i32) -> i32 {
+                acc + value
+            });
+            if chained_total != 10i32 { return 1; }
+
+            let taken = crate::std::ops::range(0, 10).into_iter()
+                .take_while(fun(value: &i32) -> bool { *value < 4i32 });
+            if taken.fold(0i32, fun(acc: i32, value: i32) -> i32 {
+                acc + value
+            }) != 6i32 { return 2; }
+
+            let skipped = crate::std::ops::range(0, 6).into_iter()
+                .skip_while(fun(value: &i32) -> bool { *value < 3i32 });
+            if skipped.fold(0i32, fun(acc: i32, value: i32) -> i32 {
+                acc + value
+            }) != 12i32 { return 3; }
+
+            let mut inspected_total = 0i32;
+            let inspected = crate::std::ops::range(1, 4).into_iter()
+                .inspect(fun(value: &i32) -> () { inspected_total += *value; });
+            let copied_total = inspected.fold(0i32, fun(acc: i32, value: i32) -> i32 {
+                acc + value
+            });
+            if inspected_total != 6i32 || copied_total != 6i32 { return 4; }
+            0
+        }
+        "#,
+        true,
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
 fn std_bracket_lambdas_run() {
     let (code, stdout) = compile_and_run(
         r#"

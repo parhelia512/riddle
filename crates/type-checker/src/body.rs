@@ -633,9 +633,7 @@ pub(crate) fn child_exprs(expr: &Expr) -> Vec<ExprId> {
         }
         Expr::While { condition, body } => vec![*condition, *body],
         Expr::Loop { body } => vec![*body],
-        Expr::For {
-            iterable, body, ..
-        } => vec![*iterable, *body],
+        Expr::For { iterable, body, .. } => vec![*iterable, *body],
         Expr::Match { scrutinee, arms } => {
             let mut children = vec![*scrutinee];
             for arm in arms {

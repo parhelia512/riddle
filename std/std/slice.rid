@@ -11,6 +11,39 @@ pub struct SliceIterMut<T> {
     index: usize,
 }
 
+impl<T> crate::std::fmt::Debug for [T]
+where T: crate::std::fmt::Debug {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        formatter.write_str("[")?;
+        let mut index = 0usize;
+        while index < self.len() {
+            if index > 0usize {
+                formatter.write_str(", ")?;
+            }
+            crate::std::fmt::write_debug(&self[index], &mut *formatter)?;
+            index += 1usize;
+        }
+        formatter.write_str("]")
+    }
+}
+
+impl<T> crate::std::fmt::Debug for &[T]
+where T: crate::std::fmt::Debug {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        let values = *self;
+        formatter.write_str("[")?;
+        let mut index = 0usize;
+        while index < values.len() {
+            if index > 0usize {
+                formatter.write_str(", ")?;
+            }
+            crate::std::fmt::write_debug(&values[index], &mut *formatter)?;
+            index += 1usize;
+        }
+        formatter.write_str("]")
+    }
+}
+
 impl<T> [T] {
     pub fun len(&self) -> usize {
         // SAFETY: `&[T]` is laid out as a `(pointer, length)` pair.

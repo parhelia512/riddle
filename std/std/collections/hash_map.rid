@@ -3,7 +3,6 @@ use crate::std::hash::Hash;
 use crate::std::option::Option;
 use crate::std::vector::Vector;
 
-#[derive(Debug)]
 enum HashBucket {
     Empty,
     Occupied(usize),
@@ -22,11 +21,36 @@ fun occupy_hash_bucket(
     }
 }
 
-#[derive(Debug)]
 pub struct HashMap<K, V> {
     buckets: Vector<HashBucket>,
     keys: Vector<K>,
     values: Vector<V>,
+}
+
+impl<K, V> crate::std::fmt::Debug for HashMap<K, V>
+where K: crate::std::fmt::Debug, V: crate::std::fmt::Debug {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        formatter.write_str("{")?;
+        let mut index = 0usize;
+        while index < self.keys.len() {
+            let key = match self.keys.get(index) {
+                Option::Some(key) => key,
+                Option::None => { break; },
+            };
+            let value = match self.values.get(index) {
+                Option::Some(value) => value,
+                Option::None => { break; },
+            };
+            if index > 0usize {
+                formatter.write_str(", ")?;
+            }
+            crate::std::fmt::write_debug(key, &mut *formatter)?;
+            formatter.write_str(": ")?;
+            crate::std::fmt::write_debug(value, &mut *formatter)?;
+            index += 1usize;
+        }
+        formatter.write_str("}")
+    }
 }
 
 pub struct HashMapIter<K, V> {

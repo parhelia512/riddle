@@ -1625,7 +1625,7 @@ fun main() -> i32 {
 }
 
 #[test]
-fn standard_containers_derive_debug_and_run() {
+fn standard_containers_debug_and_run() {
     if c_compiler().is_none() {
         eprintln!("skipping std container Debug test: no C compiler found");
         return;
@@ -1644,6 +1644,9 @@ fun main() -> i32 {
 
     let mut vector = Vector::new();
     vector.push(4);
+    let slice = vector.as_slice();
+    let empty_vector: Vector<i32> = vec![];
+    let array = [11, 12];
 
     let mut hash_map = HashMap::new();
     hash_map.insert(5, 6);
@@ -1659,6 +1662,9 @@ fun main() -> i32 {
     println!("{:?}", result);
     println!("{:?}", text);
     println!("{:?}", vector);
+    println!("{:?}", slice);
+    println!("{:?}", empty_vector);
+    println!("{:?}", array);
     println!("{:?}", hash_map);
     println!("{:?}", hash_set);
     println!("{:?}", tree_map);
@@ -1677,21 +1683,12 @@ fun main() -> i32 {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in [
-        "Some(1)",
-        "Ok(2)",
-        "String { bytes: Vector { data:",
-        "Vector { data:",
-        "HashMap { buckets:",
-        "HashSet { values:",
-        "TreeMap { nodes:",
-        "TreeSet { values:",
-    ] {
-        assert!(
-            stdout.contains(expected),
-            "missing `{expected}` in:\n{stdout}"
-        );
-    }
+    assert!(
+        stdout.replace("\r\n", "\n").ends_with(
+            "Some(1)\nOk(2)\n\"three\"\n[4]\n[4]\n[]\n[11, 12]\n{5: 6}\n{7}\n{8: 9}\n{10}\n"
+        ),
+        "unexpected Debug output:\n{stdout}"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

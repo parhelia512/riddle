@@ -283,11 +283,17 @@ fn standard_vec_macro_expands_and_type_checks() {
         expanded.source
     );
     assert!(!expanded.source.contains("vec!"));
-    assert!(expanded.source.contains("crate :: std :: vector :: Vector :: new"));
+    assert!(
+        expanded
+            .source
+            .contains("crate :: std :: vector :: Vector :: new")
+    );
     assert!(expanded.source.contains(". push ("));
-    assert!(expanded
-        .source
-        .contains("crate :: std :: vector :: Vector :: from_elem"));
+    assert!(
+        expanded
+            .source
+            .contains("crate :: std :: vector :: Vector :: from_elem")
+    );
     let vec_occurrences = expanded
         .macro_occurrences
         .iter()
@@ -344,15 +350,16 @@ fn standard_vec_macro_empty_form_hints_at_user_binding() {
         "cannot infer type argument `T` for function `new`"
     );
     assert_eq!(diag.labels.len(), 2);
-    assert_eq!(&source[diag.labels[1].range.clone()], "t");
+    assert_eq!(&source[diag.labels[1].range], "t");
     assert_eq!(
         diag.labels[1].message,
         "consider giving `t` an explicit type"
     );
-    assert!(diag
-        .notes
-        .iter()
-        .any(|note| note.contains("explicit type annotation")));
+    assert!(
+        diag.notes
+            .iter()
+            .any(|note| note.contains("explicit type annotation"))
+    );
 }
 
 #[test]

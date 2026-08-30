@@ -1,9 +1,32 @@
 use crate::std::cmp::Ord;
 use crate::std::collections::tree_map::TreeMap;
+use crate::std::option::Option;
 
-#[derive(Debug)]
 pub struct TreeSet<T> {
     values: TreeMap<T, ()>,
+}
+
+impl<T> crate::std::fmt::Debug for TreeSet<T>
+where T: crate::std::fmt::Debug {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        formatter.write_str("{")?;
+        let mut iter = self.values.iter();
+        let mut first = true;
+        loop {
+            match iter.next() {
+                Option::Some((value, _)) => {
+                    if first {
+                        first = false;
+                    } else {
+                        formatter.write_str(", ")?;
+                    }
+                    crate::std::fmt::write_debug(value, &mut *formatter)?;
+                },
+                Option::None => { break; },
+            }
+        }
+        formatter.write_str("}")
+    }
 }
 
 impl<T> TreeSet<T> {

@@ -16,6 +16,22 @@ pub struct IterMut<T, const N: usize> {
     index: usize,
 }
 
+impl<T, const N: usize> crate::std::fmt::Debug for [T; N]
+where T: crate::std::fmt::Debug {
+    fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
+        formatter.write_str("[")?;
+        let mut index = 0usize;
+        while index < N {
+            if index > 0usize {
+                formatter.write_str(", ")?;
+            }
+            crate::std::fmt::write_debug(&self[index], &mut *formatter)?;
+            index += 1usize;
+        }
+        formatter.write_str("]")
+    }
+}
+
 impl<T> Iterator for IntoIter<T> {
     type Item = T;
 
