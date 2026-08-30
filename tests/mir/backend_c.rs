@@ -196,6 +196,7 @@ fn c_owned_dyn_trait_uses_heap_storage_and_dynamic_drop() {
             }
             command
                 .arg(&source)
+                .arg(format!("/Fo{}.obj", executable.display()))
                 .arg(format!("/Fe{}", executable.display()));
         } else {
             command
@@ -294,6 +295,7 @@ fn c_dyn_trait_supertrait_methods_compile_and_run() {
         }
         command
             .arg(&source)
+            .arg(format!("/Fo{}.obj", executable.display()))
             .arg(format!("/Fe{}", executable.display()));
     } else {
         command
@@ -976,6 +978,7 @@ fn c_dyn_callable_closure_runs_with_gc_and_without_gc() {
             }
             command
                 .arg(&source)
+                .arg(format!("/Fo{}.obj", executable.display()))
                 .arg(format!("/Fe{}", executable.display()));
         } else {
             command
@@ -2459,6 +2462,7 @@ fn c_backend_numeric_semantics_compile_and_run_as_strict_c11() {
         }
         command
             .arg(&source)
+            .arg(format!("/Fo{}.obj", executable.display()))
             .arg(format!("/Fe{}", executable.display()));
     } else {
         command

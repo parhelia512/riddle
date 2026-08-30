@@ -184,6 +184,17 @@ impl CBackend {
         writeln!(out, "#define _POSIX_C_SOURCE 199309L").unwrap();
         writeln!(out, "#endif").unwrap();
         writeln!(out).unwrap();
+        writeln!(
+            out,
+            "#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)"
+        )
+        .unwrap();
+        writeln!(out, "#define _CRT_SECURE_NO_WARNINGS").unwrap();
+        writeln!(out, "#endif").unwrap();
+        writeln!(out, "#if defined(_MSC_VER)").unwrap();
+        writeln!(out, "#pragma warning(disable: 4100 4101 4102 4127 4189)").unwrap();
+        writeln!(out, "#endif").unwrap();
+        writeln!(out).unwrap();
         writeln!(out, "#include <stddef.h>").unwrap();
         writeln!(out, "#include <stdint.h>").unwrap();
         writeln!(out, "#include <stdbool.h>").unwrap();

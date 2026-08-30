@@ -2,6 +2,10 @@
 #define _POSIX_C_SOURCE 199309L
 #endif
 
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <setjmp.h>
@@ -23,9 +27,8 @@
 typedef struct RgcHeader RgcHeader;
 typedef struct RgcMarkStack RgcMarkStack;
 
-#if defined(_MSC_VER) && defined(_M_IX86)
-/* MSVC's C11 mode omits max_align_t on x86, where double provides the
- * fundamental 8-byte alignment guaranteed by malloc. */
+#if defined(_MSC_VER)
+/* MSVC's C11 mode omits max_align_t; double matches malloc's alignment. */
 typedef double RgcMaxAlign;
 #else
 typedef max_align_t RgcMaxAlign;
@@ -473,12 +476,17 @@ uint64_t riddle_random_u64(void) {
     return (high << 32) | low;
 }
 
-/* MinGW and MSVC both provide the POSIX `stat` spelling in <sys/stat.h>. */
+/* Keep the file-type tests available in strict POSIX feature-test modes. */
 #include <sys/stat.h>
 typedef struct stat RiddleStat;
 #define RIDDLE_STAT(path, out) stat(path, out)
+#if defined(_WIN32)
 #define RIDDLE_IFDIR(mode) ((mode) & S_IFDIR)
 #define RIDDLE_IFREG(mode) ((mode) & S_IFREG)
+#else
+#define RIDDLE_IFDIR(mode) S_ISDIR(mode)
+#define RIDDLE_IFREG(mode) S_ISREG(mode)
+#endif
 
 int riddle_fs_exists(const char *path) {
     RiddleStat info;

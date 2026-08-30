@@ -65,6 +65,7 @@ fn compile_and_run(source: &str, gc: bool) -> (i32, String) {
         command
             .args(["/std:c11", "/W4"])
             .arg(&c_source)
+            .arg(format!("/Fo{}.obj", executable.display()))
             .arg(format!("/Fe{}", executable.display()));
     } else {
         command
