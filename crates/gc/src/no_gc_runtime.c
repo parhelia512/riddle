@@ -54,13 +54,17 @@ int riddle_fs_fflush(size_t stream) {
 }
 
 /* ---- std::time / std::random / std::fs (metadata + directory) shims ---- */
+#include <time.h>
+int64_t riddle_time(void *value) {
+    return (int64_t)time((time_t *)value);
+}
+
 #if defined(_WIN32)
 #include <windows.h>
 void riddle_sleep_ms(uint64_t milliseconds) {
     Sleep((DWORD)milliseconds);
 }
 #else
-#include <time.h>
 void riddle_sleep_ms(uint64_t milliseconds) {
     struct timespec request;
     request.tv_sec = (time_t)(milliseconds / 1000u);

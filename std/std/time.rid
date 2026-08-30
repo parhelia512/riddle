@@ -1,10 +1,10 @@
 unsafe extern "C" {
-    safe fun time(value: *mut i64) -> i64;
+    safe fun riddle_time(value: *mut i64) -> i64;
     safe fun riddle_sleep_ms(milliseconds: u64);
 }
 
 pub fun time_now() -> i64 {
-    time(0usize as *mut i64)
+    riddle_time(0usize as *mut i64)
 }
 
 pub struct Duration {
