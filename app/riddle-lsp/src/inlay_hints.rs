@@ -102,6 +102,16 @@ pub fn inlay_hints_from_analysis(
         return Vec::new();
     };
     let mut hints = type_hints_from_analysis(document_source, analysis, hir);
+    hints.extend(lambda_type_hints_from_analysis(
+        document_source,
+        analysis,
+        hir,
+    ));
+    hints.extend(chain_type_hints_from_analysis(
+        document_source,
+        analysis,
+        hir,
+    ));
     hints.extend(parameter_hints_from_analysis(document_source, analysis));
 
     // LSP ranges have an exclusive end: a hint on range.end.line is only
@@ -150,27 +160,13 @@ fn type_hints_from_analysis(
             let Some(init_range) = body.source_map.expr_ranges.get(init).copied() else {
                 continue;
             };
-            if analysis
-                .result
-                .hir_diagnostics
-                .iter()
-                .chain(type_result.diagnostics.iter())
-                .filter(|diagnostic| diagnostic.severity == type_checker::Severity::Error)
-                .flat_map(|diagnostic| &diagnostic.labels)
-                .any(|label| ranges_overlap(label.range, init_range))
-            {
+            if error_overlaps(analysis, init_range) {
                 continue;
             }
             let Some(ty) = type_result.expr_types.get(&(body_id, *init)) else {
                 continue;
             };
-            if matches!(
-                ty,
-                type_checker::Type::Unknown
-                    | type_checker::Type::Error
-                    | type_checker::Type::InferVar(_)
-                    | type_checker::Type::Never
-            ) {
+            if !is_displayable_type(ty) {
                 continue;
             }
             let Some(name_range) = analysis.local_authored_range(*name_range) else {
@@ -192,6 +188,150 @@ fn type_hints_from_analysis(
         }
     }
     hints
+}
+
+/// Type hints for unannotated lambda parameters (`[v -> v * 2]` shows
+/// `v: i32`), resolved from the call-site-substituted closure signature.
+fn lambda_type_hints_from_analysis(
+    document_source: &str,
+    analysis: &DocumentAnalysis,
+    hir: &hir::HirFile,
+) -> Vec<InlayHint> {
+    let types = &analysis.result.type_result;
+    let mut hints = Vec::new();
+    for (body_id, body) in hir.bodies.iter() {
+        for (expr_id, expr) in body.exprs.iter() {
+            let Expr::Lambda { params, .. } = expr else {
+                continue;
+            };
+            let Some(inferred) = types
+                .expr_types
+                .get(&(body_id, expr_id))
+                .and_then(type_checker::Type::callable_signature)
+            else {
+                continue;
+            };
+            for (parameter, ty) in params.iter().zip(&inferred.params) {
+                if !matches!(parameter.ty, HirTypeRef::Unknown) {
+                    continue;
+                }
+                let Some(name_range) = parameter.name_range else {
+                    continue;
+                };
+                if !is_displayable_type(ty) {
+                    continue;
+                }
+                let Some(name_range) = analysis.local_authored_range(name_range) else {
+                    continue;
+                };
+                hints.push(type_hint(
+                    crate::diagnostics::position(document_source, usize::from(name_range.end())),
+                    format!(": {}", ty.display(hir)),
+                ));
+            }
+        }
+    }
+    hints
+}
+
+/// Result-type hints for links of a method chain that is broken across lines
+/// (`xs.iter()\n    .map(f)` shows `: Map<..>` after the call), in the style of
+/// IntelliJ's chained-call type hints.
+fn chain_type_hints_from_analysis(
+    document_source: &str,
+    analysis: &DocumentAnalysis,
+    hir: &hir::HirFile,
+) -> Vec<InlayHint> {
+    let types = &analysis.result.type_result;
+    let line_index = LineIndex::new(document_source);
+    let mut hints = Vec::new();
+    for (body_id, body) in hir.bodies.iter() {
+        for (expr_id, expr) in body.exprs.iter() {
+            let Expr::Call { callee, .. } = expr else {
+                continue;
+            };
+            let Expr::FieldAccess { base, .. } = &body.exprs[*callee] else {
+                continue;
+            };
+            let Expr::Call { .. } = body.exprs[*base] else {
+                continue;
+            };
+            let (Some(call_range), Some(base_range)) = (
+                body.source_map.expr_ranges.get(&expr_id).copied(),
+                body.source_map.expr_ranges.get(base).copied(),
+            ) else {
+                continue;
+            };
+            let Some(call_end) =
+                line_index.position(document_source, usize::from(call_range.end()))
+            else {
+                continue;
+            };
+            let Some(base_end) =
+                line_index.position(document_source, usize::from(base_range.end()))
+            else {
+                continue;
+            };
+            // The field-access range includes its receiver, so compare line
+            // endings instead: a formatted multiline chain puts the receiver's
+            // closing paren on an earlier line than this call's own `)`.
+            if base_end.line == call_end.line {
+                continue;
+            }
+            let Some(ty) = types.expr_types.get(&(body_id, expr_id)) else {
+                continue;
+            };
+            if !is_displayable_type(ty) {
+                continue;
+            }
+            let Some(call_range) = analysis.local_authored_range(call_range) else {
+                continue;
+            };
+            if error_overlaps(analysis, call_range) {
+                continue;
+            }
+            hints.push(type_hint(
+                crate::diagnostics::position(document_source, usize::from(call_range.end())),
+                format!(": {}", ty.display(hir)),
+            ));
+        }
+    }
+    hints
+}
+
+#[must_use]
+pub(crate) fn is_displayable_type(ty: &type_checker::Type) -> bool {
+    !matches!(
+        ty,
+        type_checker::Type::Unknown
+            | type_checker::Type::Error
+            | type_checker::Type::InferVar(_)
+            | type_checker::Type::Never
+    )
+}
+
+fn error_overlaps(analysis: &DocumentAnalysis, range: rowan::TextRange) -> bool {
+    analysis
+        .result
+        .hir_diagnostics
+        .iter()
+        .chain(analysis.result.type_result.diagnostics.iter())
+        .filter(|diagnostic| diagnostic.severity == type_checker::Severity::Error)
+        .flat_map(|diagnostic| &diagnostic.labels)
+        .any(|label| ranges_overlap(label.range, range))
+}
+
+fn type_hint(position: lsp_types::Position, label: String) -> InlayHint {
+    InlayHint {
+        position,
+        label: InlayHintLabel::String(label),
+        kind: Some(InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: None,
+        padding_left: None,
+        padding_right: None,
+        data: None,
+    }
 }
 
 fn parameter_hints_from_analysis(

@@ -572,3 +572,45 @@ fn document_edit_version(
         .find(|document| document.text_document.uri == *uri)
         .and_then(|document| document.text_document.version)
 }
+
+#[test]
+fn hover_shows_inferred_lambda_parameter_type() {
+    let source = "fun apply(f: impl Fn(i32) -> i32) -> i32 { f(1) } fun main() { let doubled = apply([v -> v * 2]); }";
+    let declaration_hover = hover_for_source(
+        source,
+        position(source, source.rfind("[v ->").unwrap() + 1),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let HoverContents::Markup(declaration_contents) = declaration_hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(declaration_contents.value.contains("parameter v: i32"));
+
+    let use_hover = hover_for_source(
+        source,
+        position(source, source.rfind("v * 2").unwrap()),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let HoverContents::Markup(use_contents) = use_hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(use_contents.value.contains("parameter v: i32"));
+}
+
+#[test]
+fn hover_shows_instantiated_method_signature() {
+    let source = "trait Show { fun show(self) -> i32; } struct Boxed { value: i32 } impl Show for Boxed { fun show(self) -> i32 { self.value } } fun main() { let b = Boxed { value: 1 }; let n = b.show(); }";
+
+    let hover = hover_for_source(
+        source,
+        position(source, source.rfind(".show()").unwrap() + 1),
+        CompileOptions { use_std: false },
+    )
+    .unwrap();
+    let HoverContents::Markup(contents) = hover.contents else {
+        panic!("expected markup hover")
+    };
+    assert!(contents.value.contains("fun show(self: Boxed) -> i32"));
+}

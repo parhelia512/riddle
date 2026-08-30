@@ -33,7 +33,7 @@ use scope_graph::{
     },
 };
 use syntax::SyntaxKind;
-use type_checker::{Type, TypeCheckResult};
+use type_checker::{CallableSignature, Type, TypeCheckResult};
 
 use crate::{
     analysis::{AnalysisDepth, DocumentAnalysis, analyze_document_cancellable},
@@ -735,7 +735,8 @@ fn is_receiver_parameter(parameter: &ParameterInformation) -> bool {
     let ParameterLabel::Simple(label) = &parameter.label else {
         return false;
     };
-    matches!(label.trim(), "self" | "&self" | "&mut self" | "mut self")
+    let label = label.trim();
+    matches!(label, "self" | "&self" | "&mut self" | "mut self") || label.starts_with("self:")
 }
 
 fn hover_from_analysis(
@@ -1568,7 +1569,13 @@ fn field_access_symbol(
         );
     }
     if let Some(Type::FunctionItem { function, .. }) = types.expr_types.get(&(body_id, expr_id)) {
-        return Some(function_symbol(hir, *function, origin));
+        let mut symbol = function_symbol(hir, *function, origin);
+        if let Some(signature) = types.method_signatures.get(&(body_id, expr_id)) {
+            symbol.detail =
+                format_instantiated_method(hir, &hir.item_tree.functions[*function], signature)
+                    .unwrap_or(symbol.detail);
+        }
+        return Some(symbol);
     }
 
     let struct_id = receiver_struct_id(types.expr_types.get(&(body_id, *base))?)?;
@@ -1853,21 +1860,24 @@ fn body_declaration_symbol(
                 }
             }
         }
-        for (_, expr) in body.exprs.iter() {
+        for (lambda_expr, expr) in body.exprs.iter() {
             let Expr::Lambda { params, .. } = expr else {
                 continue;
             };
-            for parameter in params {
+            for (index, parameter) in params.iter().enumerate() {
                 if parameter
                     .name_range
                     .is_some_and(|range| analysis.local_range(range) == Some(origin))
                 {
-                    return Some(parameter_symbol(
-                        &parameter.name,
-                        &parameter.ty,
+                    let displayed =
+                        inferred_lambda_parameter_type(hir, types, body_id, lambda_expr, index)
+                            .unwrap_or_else(|| parameter.ty.display());
+                    return Some(Symbol {
                         origin,
-                        parameter.name_range,
-                    ));
+                        detail: format!("parameter {}: {}", parameter.name.0, displayed),
+                        definition: parameter.name_range,
+                        implementations: Vec::new(),
+                    });
                 }
             }
         }
@@ -2687,7 +2697,7 @@ fn symbol_for_definition(
             body_id,
             lambda,
             index,
-        } => lambda_parameter_symbol(hir, body_id, lambda, index, origin),
+        } => lambda_parameter_symbol(hir, types, body_id, lambda, index, origin),
         DefRef::ConstParam { name } => Some(Symbol {
             origin,
             detail: format!("const parameter {}", name.0),
@@ -2714,6 +2724,7 @@ fn symbol_for_definition(
 
 fn lambda_parameter_symbol(
     hir: &HirFile,
+    types: &TypeCheckResult,
     body_id: BodyId,
     lambda: ExprId,
     index: usize,
@@ -2723,12 +2734,32 @@ fn lambda_parameter_symbol(
         return None;
     };
     let parameter = params.get(index)?;
-    Some(parameter_symbol(
-        &parameter.name,
-        &parameter.ty,
+    let displayed = inferred_lambda_parameter_type(hir, types, body_id, lambda, index)
+        .unwrap_or_else(|| parameter.ty.display());
+    Some(Symbol {
         origin,
-        parameter.name_range,
-    ))
+        detail: format!("parameter {}: {}", parameter.name.0, displayed),
+        definition: parameter.name_range,
+        implementations: Vec::new(),
+    })
+}
+
+/// The type-checker-inferred type of an unannotated lambda parameter, rendered
+/// for hover. Returns `None` when inference failed or the parameter is typed in
+/// the source, in which case the declared type is displayed instead.
+fn inferred_lambda_parameter_type(
+    hir: &HirFile,
+    types: &TypeCheckResult,
+    body_id: BodyId,
+    lambda: ExprId,
+    index: usize,
+) -> Option<String> {
+    let signature = types
+        .expr_types
+        .get(&(body_id, lambda))?
+        .callable_signature()?;
+    let ty = signature.params.get(index)?;
+    crate::inlay_hints::is_displayable_type(ty).then(|| ty.display(hir))
 }
 
 fn parameter_symbol(
@@ -2803,12 +2834,50 @@ fn trait_method_symbol(
         }
         _ => trait_method_implementations(hir, trait_id, method_name),
     };
+    let detail = types
+        .method_signatures
+        .get(&(body_id, expr_id))
+        .and_then(|signature| format_instantiated_method(hir, method, signature))
+        .unwrap_or_else(|| format_function(method));
     Some(Symbol {
         origin,
-        detail: format_function(method),
+        detail,
         definition: Some(method.name_range),
         implementations: actual,
     })
+}
+
+/// Renders a method signature with the call-site-substituted parameter and
+/// return types (`fun map(self: Iter<i32>, f: impl Fn(i32) -> u8) -> Map<..>`).
+/// Returns `None` when the recorded signature shape no longer matches the
+/// declared method, falling back to the declared signature.
+fn format_instantiated_method(
+    hir: &HirFile,
+    function: &HirFunction,
+    signature: &CallableSignature,
+) -> Option<String> {
+    if signature.params.len() != function.params.len() {
+        return None;
+    }
+    let params = function
+        .params
+        .iter()
+        .zip(&signature.params)
+        .map(|(parameter, ty)| {
+            if parameter.is_receiver {
+                format!("self: {}", ty.display(hir))
+            } else {
+                format!("{}: {}", parameter.name.0, ty.display(hir))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let safety = if signature.is_unsafe { "unsafe " } else { "" };
+    Some(format!(
+        "{safety}fun {}({params}) -> {}",
+        function.name.0,
+        signature.ret.display(hir)
+    ))
 }
 
 fn trait_method_declaration_symbol(

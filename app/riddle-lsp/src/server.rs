@@ -18,35 +18,43 @@ use lsp_types::{
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CallHierarchyServerCapability, CodeActionKind, CodeActionParams, CodeActionResponse,
     CompletionList, CompletionOptions, CompletionParams, CompletionResponse, CompletionTriggerKind,
-    DeclarationCapability, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DeclarationCapability, DiagnosticOptions, DiagnosticServerCapabilities,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
-    FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
+    DocumentDiagnosticReport, DocumentDiagnosticReportResult, DocumentFormattingParams,
+    DocumentHighlight, DocumentHighlightParams, DocumentLink, DocumentLinkOptions,
+    DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse, FileSystemWatcher,
+    FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport,
     GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
     HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
     InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf, PositionEncodingKind,
-    PrepareRenameResponse, ReferenceParams, Registration, RenameOptions, RenameParams,
-    SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
-    SignatureHelpOptions, SignatureHelpParams, SymbolInformation, TextDocumentPositionParams,
-    TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
-    TypeDefinitionProviderCapability, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchyRegistrationOptions, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams,
-    WorkspaceEdit, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
-    WorkspaceSymbolParams,
+    PrepareRenameResponse, ReferenceParams, Registration, RelatedFullDocumentDiagnosticReport,
+    RenameOptions, RenameParams, SelectionRange, SelectionRangeParams,
+    SelectionRangeProviderCapability, SemanticTokens, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SymbolInformation, TextDocumentPositionParams, TextDocumentRegistrationOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchyRegistrationOptions,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkspaceEdit,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use riddlec::pipeline::CompileOptions;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::{
-    code_actions::quick_fixes,
+    code_actions::{
+        analysis_fixes_for_document_cancellable, has_analysis_fix_diagnostics,
+        organize_imports_action, quick_fixes,
+    },
     completion::{
         completion_items_for_document, completion_trigger_characters, completion_trigger_is_active,
     },
     diagnostics::{self, DiagnosticSessions, collect_workspace_diagnostics_cancellable},
+    document_link::document_links_for_text,
     editor_features::{
         document_symbols_for_document_cancellable, folding_ranges, format_source,
         workspace_symbols_for_document_cancellable,
@@ -59,6 +67,9 @@ use crate::{
     },
     index::{project_index_for_root_cancellable, workspace_symbols_for_index},
     inlay_hints::inlay_hints_for_document_cancellable,
+    manifest_lsp::{
+        is_manifest_uri, manifest_completions, manifest_document_symbols, manifest_hover,
+    },
     navigation::{
         definition_for_document_cancellable, document_highlights_for_document_cancellable,
         hover_for_document_cancellable, implementation_for_document_cancellable,
@@ -66,6 +77,7 @@ use crate::{
         rename_for_document_cancellable, signature_help_for_document_cancellable,
         type_definition_for_document_cancellable, validate_identifier,
     },
+    selection_range::selection_ranges_for_text,
     semantic_tokens::{
         semantic_token_delta, semantic_tokens_for_document_cancellable, semantic_tokens_legend,
     },
@@ -158,6 +170,23 @@ impl RequestRevisions {
     }
 }
 
+const ORGANIZE_IMPORTS_KIND: &str = "source.organizeImports";
+
+/// LSP code action kinds are hierarchical: a request for `source` also covers
+/// `source.organizeImports`, and an empty kind string means "everything".
+fn code_action_kind_requested(only: Option<&[CodeActionKind]>, kind: &str) -> bool {
+    let Some(only) = only else {
+        return true;
+    };
+    only.iter().any(|requested| {
+        let requested = requested.as_str();
+        requested.is_empty()
+            || requested == kind
+            || kind.starts_with(&format!("{requested}."))
+            || requested.starts_with(&format!("{kind}."))
+    })
+}
+
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         position_encoding: Some(PositionEncodingKind::UTF16),
@@ -192,6 +221,17 @@ fn server_capabilities() -> ServerCapabilities {
             ..SignatureHelpOptions::default()
         }),
         inlay_hint_provider: Some(OneOf::Left(true)),
+        selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        document_link_provider: Some(DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+        }),
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+            identifier: None,
+            inter_file_dependencies: true,
+            workspace_diagnostics: false,
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+        })),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(
             SemanticTokensOptions {
                 legend: semantic_tokens_legend(),
@@ -423,11 +463,90 @@ impl LanguageServer for Backend {
         Ok(Some(folding_ranges(&document.text)))
     }
 
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let text = {
+            let docs = self.docs.lock().unwrap();
+            docs.get(&params.text_document.uri)
+                .map(|document| document.text.clone())
+        };
+        Ok(text.map(|text| selection_ranges_for_text(&text, &params.positions)))
+    }
+
+    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
+        let uri = params.text_document.uri;
+        let text = {
+            let docs = self.docs.lock().unwrap();
+            docs.get(&uri).map(|document| document.text.clone())
+        };
+        let module_dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+        Ok(text.map(|text| document_links_for_text(&text, module_dir.as_deref())))
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+        // Fast path: the push pipeline keeps this set current (debounced), so a
+        // pull for the already-synced version is served from the cache. This
+        // matters because clients that see the pull capability stop listening
+        // to pushes and pull after every change.
+        {
+            let document_version = {
+                let docs = self.docs.lock().unwrap();
+                docs.get(&uri).and_then(|document| document.version)
+            };
+            if let Some(version) = document_version {
+                let published = self.published.lock().unwrap();
+                if let Some(entry) = published.get(&uri)
+                    && entry.version == Some(version)
+                {
+                    return Ok(full_diagnostic_report(entry.diagnostics.clone()));
+                }
+            }
+        }
+        // Stale or missing: recompute through the shared cached sessions — a
+        // fresh session set here would recompile the whole project per pull.
+        let docs = self.docs.lock().unwrap().clone();
+        let options = self.compile_options;
+        let diagnostic_sessions = Arc::clone(&self.diagnostic_sessions);
+        let target = uri.clone();
+        let diagnostics = tokio::task::spawn_blocking(move || {
+            let mut sessions = diagnostic_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            collect_workspace_diagnostics_cancellable(&docs, options, &mut sessions, || false)
+                .and_then(|published| {
+                    published
+                        .into_iter()
+                        .find(|entry| entry.uri == target)
+                        .map(|entry| entry.diagnostics)
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        Ok(full_diagnostic_report(diagnostics))
+    }
+
     async fn document_symbol(
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
+        if is_manifest_uri(&uri) {
+            let text = {
+                let docs = self.docs.lock().unwrap();
+                docs.get(&uri).map(|document| document.text.clone())
+            };
+            return Ok(text.map(|text| manifest_document_symbols(&text)));
+        }
         let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
             return Ok(None);
         };
@@ -492,6 +611,9 @@ impl LanguageServer for Backend {
                 }
             }
             for uri in uris {
+                if is_manifest_uri(&uri) {
+                    continue;
+                }
                 let revision = revisions.current(&uri);
                 let cancelled = || !revisions.is_current(&uri, revision);
                 if let Some(found) = workspace_symbols_for_document_cancellable(
@@ -695,6 +817,14 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
         }
+        if is_manifest_uri(&uri) {
+            let text = {
+                let docs = self.docs.lock().unwrap();
+                docs.get(&uri).map(|document| document.text.clone())
+            };
+            let items = text.map(|text| manifest_completions(&text, position));
+            return Ok(items.map(CompletionResponse::Array));
+        }
         let Some((docs, text, analysis_revision)) = self.analysis_snapshot(&uri) else {
             return Ok(Some(CompletionResponse::Array(Vec::new())));
         };
@@ -757,6 +887,13 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        if is_manifest_uri(&uri) {
+            let text = {
+                let docs = self.docs.lock().unwrap();
+                docs.get(&uri).map(|document| document.text.clone())
+            };
+            return Ok(text.and_then(|text| manifest_hover(&text, position)));
+        }
         let Some((docs, text, revision)) = self.analysis_snapshot(&uri) else {
             return Ok(None);
         };
@@ -1250,11 +1387,11 @@ impl LanguageServer for Backend {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        if params.context.only.as_ref().is_some_and(|kinds| {
-            !kinds
-                .iter()
-                .any(|kind| kind.as_str().is_empty() || kind == &CodeActionKind::QUICKFIX)
-        }) {
+        let only = params.context.only.as_deref();
+        let quickfixes_requested =
+            code_action_kind_requested(only, CodeActionKind::QUICKFIX.as_str());
+        let organize_requested = code_action_kind_requested(only, ORGANIZE_IMPORTS_KIND);
+        if !quickfixes_requested && !organize_requested {
             return Ok(Some(Vec::new()));
         }
         let uri = params.text_document.uri;
@@ -1267,13 +1404,35 @@ impl LanguageServer for Backend {
         if published.version != document.version {
             return Ok(Some(Vec::new()));
         }
-        let diagnostics = params
-            .context
-            .diagnostics
-            .into_iter()
-            .filter(|diagnostic| published.diagnostics.contains(diagnostic))
-            .collect::<Vec<_>>();
-        Ok(Some(quick_fixes(&uri, document.version, &diagnostics)))
+        let mut actions: CodeActionResponse = Vec::new();
+        if quickfixes_requested {
+            let diagnostics = params
+                .context
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| published.diagnostics.contains(diagnostic))
+                .cloned()
+                .collect::<Vec<_>>();
+            actions.extend(quick_fixes(
+                &uri,
+                document.version,
+                &document.text,
+                &diagnostics,
+            ));
+            if has_analysis_fix_diagnostics(&diagnostics)
+                && let Some(fixes) = self
+                    .analysis_quick_fixes(&uri, document.version, diagnostics)
+                    .await
+            {
+                actions.extend(fixes);
+            }
+        }
+        if organize_requested
+            && let Some(action) = organize_imports_action(&uri, document.version, &document.text)
+        {
+            actions.push(action);
+        }
+        Ok(Some(actions))
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -1404,6 +1563,53 @@ fn bump_related_revisions(
 }
 
 impl Backend {
+    /// Analysis-based quick fixes (unresolved names, unknown methods, missing
+    /// trait members); `None` means the analysis went stale and the response
+    /// is dropped.
+    async fn analysis_quick_fixes(
+        &self,
+        uri: &lsp_types::Url,
+        version: Option<i32>,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) -> Option<CodeActionResponse> {
+        let Some((docs, text, revision)) = self.analysis_snapshot(uri) else {
+            return Some(Vec::new());
+        };
+        let analysis_uri = uri.clone();
+        let options = self.compile_options;
+        let sessions = Arc::clone(&self.analysis_sessions);
+        let revisions = Arc::clone(&self.analysis_revisions);
+        let result = tokio::task::spawn_blocking(move || {
+            let cancelled = || !revisions.is_current(&analysis_uri, revision);
+            analysis_fixes_for_document_cancellable(
+                &analysis_uri,
+                &docs,
+                options,
+                &sessions,
+                version,
+                &diagnostics,
+                &cancelled,
+            )
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())
+        .ok()?;
+        match result {
+            Ok(fixes) if self.analysis_is_current(uri, &text, revision) => Some(fixes),
+            // The document changed while analyzing: drop the stale response.
+            Ok(_) => None,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("unresolved-name fixes failed: {error}"),
+                    )
+                    .await;
+                None
+            }
+        }
+    }
+
     pub(crate) fn new(
         client: Client,
         compile_options: CompileOptions,
@@ -1616,6 +1822,18 @@ impl Backend {
             });
         }
     }
+}
+
+fn full_diagnostic_report(items: Vec<lsp_types::Diagnostic>) -> DocumentDiagnosticReportResult {
+    DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+        RelatedFullDocumentDiagnosticReport {
+            related_documents: None,
+            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                result_id: None,
+                items,
+            },
+        },
+    ))
 }
 
 async fn publish_diagnostics(

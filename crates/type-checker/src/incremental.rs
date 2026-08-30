@@ -22,7 +22,7 @@ use crate::{
         Diagnostic, ForLoopInfo, GenericCall, LambdaInfo, OperatorCall, PatternBindingMode,
         TraitMethodCall, ValueUse,
     },
-    types::{OpaqueCallableId, Type},
+    types::{CallableSignature, OpaqueCallableId, Type},
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +75,7 @@ struct CachedBody {
     pattern_binding_modes: Vec<(PatternBindingId, PatternBindingMode)>,
     value_uses: Vec<(ExprId, ValueUse)>,
     opaque_hidden_types: Vec<(OpaqueCallableId, Type)>,
+    method_signatures: Vec<(ExprId, CallableSignature)>,
     generic_edges: Vec<GenericEdge>,
 }
 
@@ -262,6 +263,7 @@ impl IncrementalTypeChecker {
         let pattern_binding_modes =
             entries_for_body(&checker.result.pattern_binding_modes, body_id);
         let value_uses = entries_for_body(&checker.result.value_uses, body_id);
+        let method_signatures = entries_for_body(&checker.result.method_signatures, body_id);
         let opaque_hidden_types = checker
             .result
             .opaque_hidden_types
@@ -288,6 +290,7 @@ impl IncrementalTypeChecker {
                 pattern_binding_modes,
                 value_uses,
                 opaque_hidden_types,
+                method_signatures,
                 generic_edges,
             },
         );
@@ -401,6 +404,12 @@ fn replay_cached_body(
     }
     for (id, ty) in &cached.opaque_hidden_types {
         checker.result.opaque_hidden_types.insert(*id, ty.clone());
+    }
+    for (expr, signature) in &cached.method_signatures {
+        checker
+            .result
+            .method_signatures
+            .insert((body_id, *expr), signature.clone());
     }
     checker.generic_edges.extend(generic_edges);
     true

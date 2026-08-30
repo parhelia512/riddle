@@ -134,12 +134,28 @@ pub fn collect_workspace_diagnostics_cancellable<S: BuildHasher>(
     } = document_groups(docs);
 
     let mut by_uri = BTreeMap::<Url, Vec<Diagnostic>>::new();
+    // Manifest buffers get schema diagnostics computed from the open text
+    // (the project pipeline reads `Clue.toml` from disk and reports deep
+    // errors as CLUE0001 on the same document).
+    for (uri, document) in docs {
+        if crate::manifest_lsp::is_manifest_uri(uri) {
+            by_uri.insert(
+                uri.clone(),
+                crate::manifest_lsp::manifest_diagnostics(&document.text),
+            );
+        }
+    }
     let mut live_standalone = HashSet::new();
     let mut live_projects = HashSet::new();
     let analysis_sessions = Arc::clone(&sessions.analysis);
     for uri in standalone {
         if cancelled() {
             return None;
+        }
+        // Manifest buffers only carry schema diagnostics (pre-pass above);
+        // they are not riddle sources.
+        if crate::manifest_lsp::is_manifest_uri(&uri) {
+            continue;
         }
         let Some(document) = docs.get(&uri) else {
             continue;

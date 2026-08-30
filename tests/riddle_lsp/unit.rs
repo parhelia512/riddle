@@ -4,6 +4,7 @@ mod diagnostics;
 mod editing;
 mod editor_features;
 mod hierarchy;
+mod manifest;
 mod navigation;
 mod project_features;
 mod semantic_tokens;
@@ -12,9 +13,9 @@ mod workspace_diagnostics;
 mod workspace_index;
 
 use lsp_types::{
-    DiagnosticSeverity, DocumentChanges, GotoDefinitionResponse, HoverContents, InlayHintLabel,
-    ParameterLabel, Position, PrepareRenameResponse, Range, SemanticToken, SemanticTokens,
-    TextDocumentContentChangeEvent,
+    CompletionItemKind, DiagnosticSeverity, DocumentChanges, GotoDefinitionResponse, HoverContents,
+    InlayHintLabel, InsertTextFormat, ParameterLabel, Position, PrepareRenameResponse, Range,
+    SemanticToken, SemanticTokens, TextDocumentContentChangeEvent,
 };
 use riddle_lsp::{
     parse_args,
@@ -27,13 +28,16 @@ use riddle_lsp::{
         collect_workspace_diagnostics, collect_workspace_diagnostics_cancellable,
         collect_workspace_diagnostics_with_sessions, completion_items_for_document,
         completion_items_for_source, definition_for_document, definition_for_source,
-        discover_projects, document_highlights_for_source, document_symbols_for_source,
-        documents_for_uri, folding_ranges, format_source, hover_for_document,
-        hover_for_document_cancellable, hover_for_source, implementation_for_source,
-        inlay_hints_for_document, inlay_hints_for_source, prepare_rename_for_document,
+        discover_projects, document_highlights_for_source, document_links_for_source,
+        document_symbols_for_source, documents_for_uri, folding_ranges, format_source,
+        hover_for_document, hover_for_document_cancellable, hover_for_source,
+        implementation_for_source, inlay_hints_for_document, inlay_hints_for_source,
+        manifest_completions, manifest_diagnostics, manifest_document_symbols, manifest_hover,
+        offset_for_position, organize_imports_for_source, prepare_rename_for_document,
         prepare_rename_for_source, project_index_for_document, project_index_for_root, quick_fixes,
-        references_for_document, references_for_source, rename_for_document, rename_for_source,
-        semantic_token_delta, semantic_tokens_for_document, semantic_tokens_for_source,
+        quick_fixes_for_source, references_for_document, references_for_source,
+        rename_for_document, rename_for_source, selection_ranges_for_source, semantic_token_delta,
+        semantic_tokens_for_document, semantic_tokens_for_source,
         semantic_tokens_for_source_with_options, signature_help_for_source, to_lsp, to_lsp_mapped,
         type_definition_for_source, workspace_symbols_for_index, workspace_symbols_for_source,
     },

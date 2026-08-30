@@ -965,3 +965,106 @@ fn completion_preserves_std_member_items_through_document_sessions() {
         "{items:#?}"
     );
 }
+
+#[test]
+fn completion_offers_missing_trait_methods_in_impl_body() {
+    let source = "trait Shape { fun area(self) -> f64; }\nstruct Square {}\nimpl Shape for Square {\n    ar\n}\n";
+    let cursor = position(source, source.find("ar\n").unwrap() + 2);
+
+    let items = completion_items_for_source(source, cursor, CompileOptions { use_std: false });
+
+    let area = items
+        .iter()
+        .find(|item| item.label == "area")
+        .unwrap_or_else(|| {
+            panic!(
+                "missing `area`; got {:?}",
+                items.iter().map(|item| &item.label).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(area.kind, Some(CompletionItemKind::METHOD));
+    assert_eq!(area.insert_text_format, Some(InsertTextFormat::SNIPPET));
+    assert!(
+        area.insert_text
+            .as_deref()
+            .is_some_and(|text| text.contains("fun area(self) -> f64 {"))
+    );
+}
+
+#[test]
+fn completion_offers_missing_associated_types_in_impl_body() {
+    let source =
+        "trait Shape { type Unit; }\nstruct Square {}\nimpl Shape for Square {\n    Un\n}\n";
+    let cursor = position(source, source.find("Un\n").unwrap() + 2);
+
+    let items = completion_items_for_source(source, cursor, CompileOptions { use_std: false });
+
+    assert!(
+        items
+            .iter()
+            .any(|item| item.label == "Unit"
+                && item.kind == Some(CompletionItemKind::TYPE_PARAMETER))
+    );
+}
+
+#[test]
+fn completion_hides_implemented_trait_members() {
+    let source = "trait Shape { fun area(self) -> f64; }\nstruct Square {}\nimpl Shape for Square {\n    fun area(self) -> f64 { 1 }\n    ar\n}\n";
+    let cursor = position(source, source.rfind("ar\n").unwrap() + 2);
+
+    let items = completion_items_for_source(source, cursor, CompileOptions { use_std: false });
+
+    assert!(!items.iter().any(|item| item.label == "area"));
+}
+
+#[test]
+fn completion_filters_declaration_keywords_in_expression_positions() {
+    let source = "fun main() { let value = 1 + str }";
+    let cursor = position(source, source.find("str }").unwrap() + 3);
+
+    let items = completion_items_for_source(source, cursor, CompileOptions { use_std: false });
+
+    assert!(!items.iter().any(|item| item.label == "struct"));
+    assert!(!items.iter().any(|item| item.label == "impl"));
+}
+
+#[test]
+fn completion_keeps_declaration_keywords_at_statement_starts() {
+    let source = "fun main() { le }";
+    let cursor = position(source, source.find("le }").unwrap() + 2);
+
+    let items = completion_items_for_source(source, cursor, CompileOptions { use_std: false });
+
+    assert!(items.iter().any(|item| item.label == "let"));
+
+    let expression_source = "fun main() { let value = 1 + le }";
+    let expression_items = completion_items_for_source(
+        expression_source,
+        position(
+            expression_source,
+            expression_source.find("le }").unwrap() + 2,
+        ),
+        CompileOptions { use_std: false },
+    );
+    assert!(!expression_items.iter().any(|item| item.label == "let"));
+}
+
+#[test]
+fn completion_offers_statement_snippets() {
+    let source = "fun main() { mat }";
+    let cursor = position(source, source.find("mat }").unwrap() + 3);
+
+    let items = completion_items_for_source(source, cursor, CompileOptions { use_std: false });
+
+    let snippet = items
+        .iter()
+        .find(|item| item.label == "match" && item.kind == Some(CompletionItemKind::SNIPPET))
+        .expect("match snippet expected");
+    assert_eq!(snippet.insert_text_format, Some(InsertTextFormat::SNIPPET));
+    assert!(
+        snippet
+            .insert_text
+            .as_deref()
+            .is_some_and(|text| text.starts_with("match "))
+    );
+}

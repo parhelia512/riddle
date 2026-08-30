@@ -13,7 +13,11 @@ async function activate(context) {
     'Riddle Language Server',
     { command, args },
     {
-      documentSelector: [{ scheme: 'file', language: 'riddle' }],
+      documentSelector: [
+        { scheme: 'file', language: 'riddle' },
+        { scheme: 'file', pattern: '**/Clue.toml' },
+        { scheme: 'untitled', pattern: 'Clue.toml' },
+      ],
     },
   );
 

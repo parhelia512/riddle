@@ -8,7 +8,7 @@ use rowan::TextRange;
 
 use crate::{
     TraitEnv,
-    types::{ClosureKind, OpaqueCallableId, Type},
+    types::{CallableSignature, ClosureKind, OpaqueCallableId, Type},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +58,10 @@ pub struct TypeCheckResult {
     pub pattern_binding_modes: HashMap<(BodyId, PatternBindingId), PatternBindingMode>,
     pub value_uses: HashMap<(BodyId, ExprId), ValueUse>,
     pub opaque_hidden_types: HashMap<OpaqueCallableId, Type>,
+    /// Instantiated method signatures at each resolved method call, keyed by
+    /// the callee field-access expression. Parameters include the concrete
+    /// receiver as the first entry.
+    pub method_signatures: HashMap<(BodyId, ExprId), CallableSignature>,
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,

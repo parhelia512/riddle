@@ -175,3 +175,124 @@ fn inlay_hints_resolve_same_named_methods_by_receiver_type() {
     assert!(labels.contains(&"left_value: "));
     assert!(!labels.contains(&"right_value: "));
 }
+
+#[test]
+fn inlay_hints_show_inferred_lambda_parameter_types() {
+    let source = "fun apply(f: impl Fn(i32) -> i32) -> i32 { f(1) } fun main() { let doubled = apply([v -> v * 2]); }";
+    let v_name = source.rfind("[v ->").unwrap() + 2;
+
+    let hints = inlay_hints_for_source(
+        source,
+        Range::new(Position::new(0, 0), position(source, source.len())),
+    );
+
+    assert!(hints.iter().any(|hint| {
+        hint.position == position(source, v_name)
+            && matches!(&hint.label, InlayHintLabel::String(label) if label == ": i32")
+    }));
+}
+
+#[test]
+fn inlay_hints_skip_annotated_lambda_parameters() {
+    let source =
+        "fun apply(f: impl Fn(i32) -> i32) -> i32 { f(1) } fun main() { apply([v: i32 -> v]); }";
+    let v_name = source.rfind("[v: i32").unwrap() + 2;
+
+    let hints = inlay_hints_for_source(
+        source,
+        Range::new(Position::new(0, 0), position(source, source.len())),
+    );
+
+    assert!(
+        !hints
+            .iter()
+            .any(|hint| hint.position == position(source, v_name))
+    );
+}
+
+#[test]
+fn inlay_hints_show_result_types_on_multiline_chains() {
+    let source = "struct Counter { value: i32 } impl Counter { fun inc(self) -> Counter { Counter { value: self.value + 1 } } } fun main() {\n    let c = Counter { value: 0 }\n        .inc()\n        .inc();\n}\n";
+    let chain_end = source.rfind(")").unwrap() + 1;
+
+    let hints = inlay_hints_for_source(
+        source,
+        Range::new(Position::new(0, 0), position(source, source.len())),
+    );
+
+    assert!(hints.iter().any(|hint| {
+        hint.position == position(source, chain_end)
+            && matches!(&hint.label, InlayHintLabel::String(label) if label == ": Counter")
+    }));
+}
+
+#[test]
+fn inlay_hints_skip_result_types_on_single_line_chains() {
+    let source = "struct Counter { value: i32 } impl Counter { fun inc(self) -> Counter { Counter { value: self.value + 1 } } } fun main() { let c = Counter { value: 0 }.inc().inc(); }";
+    let chain_end = source.rfind(")").unwrap();
+
+    let hints = inlay_hints_for_source(
+        source,
+        Range::new(Position::new(0, 0), position(source, source.len())),
+    );
+
+    assert!(
+        !hints
+            .iter()
+            .any(|hint| hint.position == position(source, chain_end))
+    );
+}
+
+#[test]
+fn selection_ranges_nest_from_identifier_to_file() {
+    let source = "fun main() {\n    let value = 1 + 2;\n}\n";
+    let cursor = Position::new(1, 10);
+
+    let ranges = selection_ranges_for_source(source, &[cursor]);
+
+    let Some(Some(selection)) = ranges.first() else {
+        panic!("expected a selection range")
+    };
+    let mut chain = vec![selection.range.clone()];
+    let mut current = selection.parent.as_deref();
+    while let Some(ancestor) = current {
+        chain.push(ancestor.range.clone());
+        current = ancestor.parent.as_deref();
+    }
+    assert!(chain.windows(2).all(|pair| {
+        let (inner, outer) = (&pair[0], &pair[1]);
+        outer.start.line < inner.start.line
+            || (outer.start.line == inner.start.line
+                && outer.start.character <= inner.start.character)
+    }));
+    let innermost = &chain[0];
+    assert_eq!(innermost.start, Position::new(1, 8));
+    let outermost = chain.last().unwrap();
+    assert_eq!(outermost.start, Position::new(0, 0));
+}
+
+#[test]
+fn selection_ranges_skip_unresolvable_positions() {
+    let source = "fun main() {}\n";
+    let ranges = selection_ranges_for_source(source, &[Position::new(0, 5), Position::new(9, 0)]);
+    assert_eq!(ranges.len(), 2);
+    assert!(ranges[0].is_some());
+    assert!(ranges[1].is_none());
+}
+
+#[test]
+fn document_links_point_at_module_files() {
+    let root = temp_root("document-links");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("util.rid"), "fun helper() {}\n").unwrap();
+    let source = "mod util;\nmod missing;\nmod nested {\n}\n";
+
+    let links = document_links_for_source(source, Some(&root));
+
+    assert_eq!(links.len(), 1);
+    let target = links[0].target.as_ref().unwrap().as_str();
+    assert!(target.ends_with("util.rid"));
+    assert_eq!(links[0].range.start.character, 4);
+
+    let _ = fs::remove_dir_all(root);
+}

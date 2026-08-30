@@ -62,7 +62,7 @@ pub fn import_edit(source: &str, path: &str) -> Option<TextEdit> {
     })
 }
 
-fn parse_root(source: &str) -> Option<Root> {
+pub(crate) fn parse_root(source: &str) -> Option<Root> {
     let tokens = frontend::lexer::lex(source);
     let (events, tokens, errors, parsed_source) =
         frontend::parser::Parser::new(source, tokens).parse();

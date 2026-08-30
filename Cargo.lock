@@ -1315,10 +1315,12 @@ dependencies = [
  "riddlec",
  "rowan",
  "scope-graph",
+ "semver",
  "serde",
  "serde_json",
  "syntax",
  "tokio",
+ "toml_edit",
  "tower-lsp",
  "type-checker",
 ]

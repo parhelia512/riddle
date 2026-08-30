@@ -13,6 +13,8 @@ const fixUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-fix.rid')).href;
 const completionUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-completion.rid')).href;
 const generalCompletionUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-general-completion.rid')).href;
 const navigationUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-navigation.rid')).href;
+const codeActionUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-code-action.rid')).href;
+const linksUri = pathToFileURL(join(smokeRoot, 'links.rid')).href;
 const untitledUri = 'untitled:riddle-lsp-untitled.rid';
 const untitledText = 'fun target() -> i32 { 1 }\nfun main() { target(); }\n';
 const navigationText = [
@@ -40,6 +42,8 @@ const projectMainText = [
 ].join('\n');
 const projectUtilText = 'pub fun make() -> i32 { 1 }\n';
 mkdirSync(join(projectRoot, 'src'), { recursive: true });
+writeFileSync(join(smokeRoot, 'helpers.rid'), 'pub fun support() -> i32 { 7 }\n');
+writeFileSync(join(smokeRoot, 'links.rid'), 'mod helpers;\nmod gone;\nfun main() { let n = helpers::support(); }\n');
 mkdirSync(secondWorkspaceRoot, { recursive: true });
 writeFileSync(
   join(projectRoot, 'Clue.toml'),
@@ -153,6 +157,7 @@ try {
   assert.deepEqual(triggerCharacters, ['.', ':']);
   assert.deepEqual(initialized.result.capabilities.signatureHelpProvider.triggerCharacters, ['(', ',']);
   assert.equal(initialized.result.capabilities.inlayHintProvider, true);
+  assert.equal(initialized.result.capabilities.selectionRangeProvider, true);
   assert.equal(initialized.result.capabilities.semanticTokensProvider.full.delta, true);
   assert.equal(initialized.result.capabilities.workspace.workspaceFolders.supported, true);
 
@@ -349,6 +354,107 @@ try {
   });
   const staleCodeActions = await read((message) => message.id === 23);
   assert.deepEqual(staleCodeActions.result, []);
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: codeActionUri,
+        languageId: 'riddle',
+        version: 1,
+        text: 'mod util {\n    pub fun helper() -> i32 { 1 }\n}\n\nuse zzz;\nuse aaa;\n\nfun main() {\n    let n = helper();\n}\n\ntrait Show { fun show(self) -> i32; }\nstruct Boxed {}\nimpl Show for Boxed { }\nfun show_case() {\n    let boxed = Boxed {};\n    let shown = boxed.showw();\n}\n',
+      },
+    },
+  });
+  const codeActionDiagnostics = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === codeActionUri &&
+      message.params.version === 1 &&
+      message.params.diagnostics.some((diagnostic) => diagnostic.code === 'E0050'),
+  );
+  const unresolvedHelper = codeActionDiagnostics.params.diagnostics.find(
+    (diagnostic) => diagnostic.code === 'E0050',
+  );
+  send({
+    jsonrpc: '2.0',
+    id: 24,
+    method: 'textDocument/codeAction',
+    params: {
+      textDocument: { uri: codeActionUri },
+      range: unresolvedHelper.range,
+      context: { diagnostics: [unresolvedHelper], only: ['quickfix'] },
+    },
+  });
+  const importActions = await read((message) => message.id === 24);
+  const importAction = importActions.result.find(
+    (action) => action.title === 'Import `helper` from `util::helper`',
+  );
+  assert(importAction);
+  assert.equal(importAction.kind, 'quickfix');
+  assert.equal(importAction.isPreferred, false);
+  assert.deepEqual(importAction.edit.documentChanges[0].edits, [
+    {
+      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+      newText: 'use util::helper;\n',
+    },
+  ]);
+
+  send({
+    jsonrpc: '2.0',
+    id: 25,
+    method: 'textDocument/codeAction',
+    params: {
+      textDocument: { uri: codeActionUri },
+      range: unresolvedHelper.range,
+      context: { diagnostics: [unresolvedHelper] },
+    },
+  });
+  const allActions = await read((message) => message.id === 25);
+  const organizeAction = allActions.result.find(
+    (action) => action.title === 'Organize imports',
+  );
+  assert(organizeAction);
+  assert.equal(organizeAction.kind, 'source.organizeImports');
+  assert.equal(organizeAction.edit.documentChanges[0].textDocument.uri, codeActionUri);
+  assert.equal(organizeAction.edit.documentChanges[0].edits.length, 1);
+  assert.equal(organizeAction.edit.documentChanges[0].edits[0].newText, 'use aaa;\nuse zzz;');
+
+  const missingShow = codeActionDiagnostics.params.diagnostics.find(
+    (diagnostic) => diagnostic.code === 'E0026',
+  );
+  const typoMethod = codeActionDiagnostics.params.diagnostics.find(
+    (diagnostic) => diagnostic.code === 'E0013',
+  );
+  assert(missingShow);
+  assert(typoMethod);
+  send({
+    jsonrpc: '2.0',
+    id: 141,
+    method: 'textDocument/codeAction',
+    params: {
+      textDocument: { uri: codeActionUri },
+      range: missingShow.range,
+      context: { diagnostics: [missingShow, typoMethod] },
+    },
+  });
+  const implActions = await read((message) => message.id === 141);
+  const implementAction = implActions.result.find(
+    (action) => action.title === 'Implement `show` from `Show`',
+  );
+  assert(implementAction);
+  assert.equal(implementAction.kind, 'quickfix');
+  assert(
+    implementAction.edit.documentChanges[0].edits.some((edit) =>
+      edit.newText.includes('fun show(self) -> i32 {'),
+    ),
+  );
+  const suggestAction = implActions.result.find(
+    (action) => action.title === 'Did you mean `show`?',
+  );
+  assert(suggestAction);
+  assert.equal(suggestAction.kind, 'quickfix');
   send({
     jsonrpc: '2.0',
     id: 3,
@@ -361,6 +467,143 @@ try {
   const inlayHints = await read((message) => message.id === 3);
   assert.equal(inlayHints.result.length, 2);
   assert.equal(inlayHints.result.filter((hint) => hint.label === ': Foo').length, 2);
+
+  const lambdaUri = pathToFileURL(join(smokeRoot, 'riddle-lsp-lambda.rid')).href;
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: lambdaUri,
+        languageId: 'riddle',
+        version: 1,
+        text: 'fun apply(f: impl Fn(i32) -> i32) -> i32 { f(1) }\nfun main() {\n    let doubled = apply([v -> v * 2]);\n}\n',
+      },
+    },
+  });
+  send({
+    jsonrpc: '2.0',
+    id: 140,
+    method: 'textDocument/inlayHint',
+    params: {
+      textDocument: { uri: lambdaUri },
+      range: { start: { line: 0, character: 0 }, end: { line: 4, character: 0 } },
+    },
+  });
+  const lambdaHints = await read((message) => message.id === 140);
+  assert(
+    lambdaHints.result.some(
+      (hint) => hint.label === ': i32' && hint.kind === 1 && hint.position.line === 2,
+    ),
+  );
+
+  send({
+    jsonrpc: '2.0',
+    id: 142,
+    method: 'textDocument/selectionRange',
+    params: {
+      textDocument: { uri: lambdaUri },
+      positions: [{ line: 2, character: 30 }],
+    },
+  });
+  const selectionRanges = await read((message) => message.id === 142);
+  assert(Array.isArray(selectionRanges.result) && selectionRanges.result.length === 1);
+  let selection = selectionRanges.result[0];
+  let depth = 1;
+  while (selection.parent) {
+    depth += 1;
+    selection = selection.parent;
+    assert(
+      selection.range.start.line <= selection.range.end.line,
+      'ancestor ranges must stay within the document',
+    );
+  }
+  assert(depth >= 3, `expected a nested selection chain, got depth ${depth}`);
+
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: linksUri,
+        languageId: 'riddle',
+        version: 1,
+        text: 'mod helpers;\nmod gone;\nfun main() { let n = helpers::support(); }\n',
+      },
+    },
+  });
+  send({
+    jsonrpc: '2.0',
+    id: 144,
+    method: 'textDocument/documentLink',
+    params: { textDocument: { uri: linksUri } },
+  });
+  const linksResult = await read((message) => message.id === 144);
+  assert.equal(linksResult.result.length, 1);
+  assert(linksResult.result[0].target.endsWith('helpers.rid'));
+
+  send({
+    jsonrpc: '2.0',
+    id: 145,
+    method: 'textDocument/diagnostic',
+    params: { textDocument: { uri: linksUri } },
+  });
+  const pullDiagnostics = await read((message) => message.id === 145);
+  assert(Array.isArray(pullDiagnostics.result.items));
+
+  const badManifestUri = pathToFileURL(join(smokeRoot, 'bad-manifest', 'Clue.toml')).href;
+  mkdirSync(join(smokeRoot, 'bad-manifest'), { recursive: true });
+  const badManifestText = '[package]\nname = "smoke"\nmistake = true\nversion = "0.1.0"\n';
+  writeFileSync(join(smokeRoot, 'bad-manifest', 'Clue.toml'), badManifestText);
+  send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: badManifestUri,
+        languageId: 'toml',
+        version: 1,
+        text: badManifestText,
+      },
+    },
+  });
+  const manifestDiagnostics = await read(
+    (message) =>
+      message.method === 'textDocument/publishDiagnostics' &&
+      message.params.uri === badManifestUri &&
+      message.params.diagnostics.some((diagnostic) => diagnostic.code === 'CLUE0003'),
+  );
+  assert(
+    manifestDiagnostics.params.diagnostics.some((diagnostic) =>
+      diagnostic.message.includes('unknown key `package.mistake`'),
+    ),
+  );
+  send({
+    jsonrpc: '2.0',
+    id: 146,
+    method: 'textDocument/completion',
+    params: {
+      textDocument: { uri: badManifestUri },
+      position: { line: 3, character: 0 },
+    },
+  });
+  const manifestCompletions = await read((message) => message.id === 146);
+  assert(
+    manifestCompletions.result.some((item) => item.label === 'license'),
+    'expected package key completions',
+  );
+  send({
+    jsonrpc: '2.0',
+    id: 147,
+    method: 'textDocument/hover',
+    params: {
+      textDocument: { uri: badManifestUri },
+      position: { line: 1, character: 3 },
+    },
+  });
+  const manifestHover = await read((message) => message.id === 147);
+  assert(manifestHover.result);
+  assert(manifestHover.result.contents.value.includes('**package.name**'));
 
   const lastBurstVersion = 14;
   for (let version = 3; version <= lastBurstVersion; version += 1) {
@@ -844,7 +1087,7 @@ try {
     },
   });
   const signatureHelp = await read((message) => message.id === 40);
-  assert.match(signatureHelp.result.signatures[0].label, /fun show\(&self\) -> i32/);
+  assert.match(signatureHelp.result.signatures[0].label, /fun show\(self: Value\) -> i32/);
 
   send({
     jsonrpc: '2.0',

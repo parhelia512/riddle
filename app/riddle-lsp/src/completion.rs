@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ast::{ImplDecl, support::AstNode};
 use hir::body::{BodyId, Expr, Pattern, ResolvedName, Stmt};
 use hir::item_tree::{
     HirAttr, HirFunction, HirTypeRef, HirUseTree, HirUseTreeKind, StructId, TopLevelItem,
@@ -26,10 +27,11 @@ use scope_graph::{DefRef, Node, NodeId, RefOrigin, ScopeGraph};
 use syntax::SyntaxKind;
 
 use crate::{
-    imports::import_edit,
+    code_actions::trait_method_signature,
+    imports::{import_edit, parse_root},
     server::Document,
     session::AnalysisSessions,
-    text::{LineIndex, is_identifier_continue, offset_for_position, text_range},
+    text::{LineIndex, is_identifier_continue, offset_for_position, text_range, text_size},
 };
 
 const COMPLETION_MARKER: &str = "__riddle_completion";
@@ -67,6 +69,16 @@ enum CompletionContext {
     Import,
     StructField,
     PatternField,
+    ImplBody,
+}
+
+/// What [`completion_site`] precomputes for an `ImplBody` context: the trait
+/// being implemented (by its simple name) and the members the impl already
+/// provides, so missing trait members can be offered.
+struct ImplBodyInfo {
+    trait_name: String,
+    method_names: Vec<String>,
+    type_alias_names: Vec<String>,
 }
 
 struct CompletionSite {
@@ -75,6 +87,8 @@ struct CompletionSite {
     prefix: String,
     context: CompletionContext,
     macro_kind: Option<ProcMacroKind>,
+    stmt_start: bool,
+    impl_body: Option<ImplBodyInfo>,
 }
 
 /// Computes completion items for an open document.
@@ -324,7 +338,9 @@ fn attach_completion_edits(source: &str, site: &CompletionSite, items: &mut [Com
             .clone()
             .unwrap_or_else(|| item.label.clone());
         item.text_edit = Some(CompletionTextEdit::Edit(TextEdit::new(range, new_text)));
-        item.insert_text_format = Some(InsertTextFormat::PLAIN_TEXT);
+        if item.insert_text_format != Some(InsertTextFormat::SNIPPET) {
+            item.insert_text_format = Some(InsertTextFormat::PLAIN_TEXT);
+        }
     }
 }
 
@@ -355,7 +371,8 @@ fn rank_existing_completions(site: &CompletionSite, items: &mut [CompletionItem]
         | CompletionContext::Associated
         | CompletionContext::Import
         | CompletionContext::StructField
-        | CompletionContext::PatternField => 0,
+        | CompletionContext::PatternField
+        | CompletionContext::ImplBody => 0,
         CompletionContext::General | CompletionContext::Type => 1,
     };
     for item in items {
@@ -427,6 +444,32 @@ fn collect_auto_import_completions(
         item.additional_text_edits = Some(vec![edit]);
         out.push(item);
     }
+}
+
+/// An import route stripped of completion-only detail, shared with the
+/// unresolved-name quick fixes.
+pub(crate) struct ImportRoute {
+    pub(crate) label: String,
+    pub(crate) path: String,
+}
+
+/// Import routes that bring an item named `name` into scope, hidden and
+/// unavailable items filtered out.
+pub(crate) fn import_routes_for_name(
+    hir: &hir::HirFile,
+    graph: &ScopeGraph,
+    name: &str,
+) -> Vec<ImportRoute> {
+    auto_import_routes(hir, graph)
+        .into_iter()
+        .filter(|route| route.label == name)
+        .filter(|route| definition_is_available_for_completion(hir, graph, &route.definition))
+        .take(8)
+        .map(|route| ImportRoute {
+            label: route.label,
+            path: route.path,
+        })
+        .collect()
 }
 
 fn auto_import_routes(hir: &hir::HirFile, graph: &ScopeGraph) -> Vec<AutoImportRoute> {
@@ -564,6 +607,14 @@ pub fn completion_items_for_source(
         return Vec::new();
     };
     let mut analyzed_source = marked_completion_source(source, &site);
+    if site.context == CompletionContext::ImplBody {
+        // A bare identifier is not a valid impl member, so the marker would
+        // break parsing and take the item tree down with it. Substitute a
+        // well-formed placeholder method instead; the marker reference is not
+        // used in this context.
+        let marker_range = site.start..site.start + COMPLETION_MARKER.len();
+        analyzed_source.replace_range(marker_range, "fun __riddle_completion() {}");
+    }
     let analyze = if completion_needs_type_check(site.context) {
         riddlec::pipeline::check_with_options
     } else {
@@ -571,7 +622,10 @@ pub fn completion_items_for_source(
     };
     let mut resolved = analyze(&analyzed_source, compile_options);
     let marker_end = site.start + COMPLETION_MARKER.len();
-    if resolved.hir.is_none() && !analyzed_source[marker_end..].trim_start().starts_with(';') {
+    if resolved.hir.is_none()
+        && site.context != CompletionContext::ImplBody
+        && !analyzed_source[marker_end..].trim_start().starts_with(';')
+    {
         analyzed_source.insert(marker_end, ';');
         resolved = analyze(&analyzed_source, compile_options);
     }
@@ -624,6 +678,54 @@ fn completion_site(source: &str, position: lsp_types::Position) -> Option<Comple
         prefix: source[start..offset].into(),
         context,
         macro_kind: macro_completion_kind(source, start, end),
+        stmt_start: stmt_start_position(before),
+        impl_body: (context == CompletionContext::ImplBody)
+            .then(|| impl_body_info(source, start))
+            .flatten(),
+    })
+}
+
+/// Statement and item starts follow a block brace or a semicolon (or begin the
+/// file); everywhere else keywords like `let` or `struct` would be noise.
+fn stmt_start_position(before: &str) -> bool {
+    before
+        .trim_end()
+        .chars()
+        .next_back()
+        .is_none_or(|ch| matches!(ch, '{' | '}' | ';'))
+}
+
+/// Resolves the enclosing `impl` block for an `ImplBody` completion site.
+fn impl_body_info(source: &str, offset: usize) -> Option<ImplBodyInfo> {
+    let root = parse_root(source)?;
+    let impl_decl = root
+        .syntax()
+        .descendants()
+        .filter_map(ImplDecl::cast)
+        .find(|decl| decl.syntax().text_range().contains(text_size(offset)))?;
+    // `impl Trait for Target`: the first type child is the trait, the second
+    // the implementing type (matching the HIR lowering).
+    let trait_ast = impl_decl.has_for().then(|| impl_decl.self_type()).flatten();
+    let trait_text = trait_ast?.syntax().text().to_string();
+    let trait_name = trait_text
+        .rsplit("::")
+        .next()?
+        .split('<')
+        .next()?
+        .trim()
+        .to_string();
+    let method_names = impl_decl
+        .methods()
+        .filter_map(|method| method.name().map(|name| name.to_string()))
+        .collect();
+    let type_alias_names = impl_decl
+        .type_aliases()
+        .filter_map(|alias| alias.name().map(|name| name.to_string()))
+        .collect();
+    Some(ImplBodyInfo {
+        trait_name,
+        method_names,
+        type_alias_names,
     })
 }
 
@@ -782,6 +884,11 @@ fn syntax_completion_context(source: &str, start: usize, end: usize) -> Option<C
         match node.kind() {
             SyntaxKind::UseTree => return Some(CompletionContext::Import),
             SyntaxKind::NamedType => return Some(CompletionContext::Type),
+            // Completing inside a method of the impl is regular expression
+            // completion; only positions directly in the impl body offer the
+            // trait's missing members.
+            SyntaxKind::FuncDecl => return None,
+            SyntaxKind::ImplDecl => return Some(CompletionContext::ImplBody),
             _ => {}
         }
     }
@@ -808,9 +915,19 @@ fn completion_items_from_result(
     let mut items = Vec::new();
 
     if site.context == CompletionContext::General {
-        items.extend(COMPLETION_KEYWORDS.iter().map(|keyword| {
-            completion_item(keyword, CompletionItemKind::KEYWORD, Some("keyword".into()))
-        }));
+        // Declarations (`struct`, `impl`, …) only make sense at statement and
+        // item starts; expression positions get the control/value keywords.
+        items.extend(
+            COMPLETION_KEYWORDS
+                .iter()
+                .filter(|keyword| site.stmt_start || !DECLARATION_KEYWORDS.contains(keyword))
+                .map(|keyword| {
+                    completion_item(keyword, CompletionItemKind::KEYWORD, Some("keyword".into()))
+                }),
+        );
+        if site.stmt_start {
+            items.extend(statement_snippet_items());
+        }
     }
     if matches!(
         site.context,
@@ -823,6 +940,14 @@ fn completion_items_from_result(
                 Some("builtin type".into()),
             )
         }));
+    }
+
+    // Missing trait members only need the item tree, not resolved references.
+    if site.context == CompletionContext::ImplBody
+        && let Some(info) = &site.impl_body
+        && let Some(hir) = resolved.hir.as_ref().or(fallback_hir)
+    {
+        collect_missing_trait_members(hir, info, &mut items);
     }
 
     if let (Some(hir), Some(scope_graph)) = (resolved.hir.as_ref(), resolved.scope_graph.as_ref()) {
@@ -882,6 +1007,9 @@ fn completion_items_from_result(
             }
             CompletionContext::Import => {
                 collect_import_completions(hir, scope_graph, &mut items);
+            }
+            CompletionContext::ImplBody => {
+                // Handled before this match: it only needs the item tree.
             }
             CompletionContext::StructField | CompletionContext::PatternField => {
                 let checked_types;
@@ -1698,6 +1826,90 @@ fn completion_item(
         kind: Some(kind),
         detail,
         ..CompletionItem::default()
+    }
+}
+
+/// Keywords that introduce declarations and bindings; offered only at
+/// statement and item starts.
+const DECLARATION_KEYWORDS: &[&str] = &[
+    "let", "fun", "struct", "mod", "use", "mut", "pub", "enum", "trait", "impl", "const", "type",
+    "extern", "where", "else",
+];
+
+/// Common statement templates offered alongside the keywords at statement
+/// starts. Snippet placeholders follow the LSP snippet grammar.
+fn statement_snippet_items() -> Vec<CompletionItem> {
+    let templates: &[(&str, &str, &str)] = &[
+        (
+            "match",
+            "match ${1:value} {\n    ${2:pattern} => ${3:todo!()},\n}$0",
+            "snippet: match expression",
+        ),
+        (
+            "ifelse",
+            "if ${1:cond} {\n    ${2}\n} else {\n    ${3}\n}$0",
+            "snippet: if / else",
+        ),
+        (
+            "forin",
+            "for ${1:item} in ${2:iterable} {\n    ${3}\n}$0",
+            "snippet: for loop",
+        ),
+    ];
+    templates
+        .iter()
+        .map(|(label, insert, detail)| {
+            let mut item =
+                completion_item(label, CompletionItemKind::SNIPPET, Some((*detail).into()));
+            item.insert_text = Some((*insert).into());
+            item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+            item
+        })
+        .collect()
+}
+
+/// Offers every required trait member the impl does not provide yet as a
+/// snippet completion carrying the trait's declared signature.
+fn collect_missing_trait_members(
+    hir: &hir::HirFile,
+    info: &ImplBodyInfo,
+    items: &mut Vec<CompletionItem>,
+) {
+    let Some((_, tr)) = hir
+        .item_tree
+        .traits
+        .iter()
+        .find(|(_, candidate)| candidate.name.0 == info.trait_name)
+    else {
+        return;
+    };
+    for method in &tr.methods {
+        if method.has_body || info.method_names.contains(&method.name.0) {
+            continue;
+        }
+        let signature = trait_method_signature(method);
+        let mut item = completion_item(
+            &method.name.0,
+            CompletionItemKind::METHOD,
+            Some(format!("{signature} {{ … }}")),
+        );
+        item.label_details = Some(CompletionItemLabelDetails {
+            detail: Some("implement missing trait method".into()),
+            description: Some(format!("trait {}", tr.name.0)),
+        });
+        item.insert_text = Some(format!("{signature} {{\n    $0\n}}"));
+        item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+        items.push(item);
+    }
+    for alias in &tr.type_aliases {
+        if alias.ty.is_some() || info.type_alias_names.contains(&alias.name.0) {
+            continue;
+        }
+        items.push(completion_item(
+            &alias.name.0,
+            CompletionItemKind::TYPE_PARAMETER,
+            Some(format!("associated type from trait {}", tr.name.0)),
+        ));
     }
 }
 

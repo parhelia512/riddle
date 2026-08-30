@@ -1,10 +1,10 @@
 use super::{
-    BodyCtx, DynMethodSafety, Expr, ExprId, FunctionId, HashMap, HashSet, HirFunction, HirTypeRef,
-    LangItem, Name, PatternBindingId, PendingGenericCall, ResolvedMethod, ResolvedName, TraitId,
-    TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse, bound_target_param,
-    callable_signature_type, collect_subst, dyn_method_safety, generic_param_map_with_consts,
-    method_is_visible_for_owner, pattern_has_unresolved_param, record_generic_arg_spans,
-    substitute_type, type_has_unresolved_inference,
+    BodyCtx, CallableSignature, ClosureKind, DynMethodSafety, Expr, ExprId, FunctionId, HashMap,
+    HashSet, HirFunction, HirTypeRef, LangItem, Name, PatternBindingId, PendingGenericCall,
+    ResolvedMethod, ResolvedName, TraitId, TraitMethodCall, Type, TypeChecker, UnaryOp, ValueUse,
+    bound_target_param, callable_signature_type, collect_subst, dyn_method_safety,
+    generic_param_map_with_consts, method_is_visible_for_owner, pattern_has_unresolved_param,
+    record_generic_arg_spans, substitute_type, type_has_unresolved_inference,
 };
 
 pub(super) enum MethodLookupError {
@@ -227,6 +227,34 @@ impl TypeChecker<'_> {
                 &subst,
             )
         });
+        let signature_params = std::iter::once(base_ty.clone())
+            .chain(
+                method
+                    .function
+                    .params
+                    .iter()
+                    .filter(|param| !param.is_receiver)
+                    .map(|param| {
+                        substitute_type(
+                            &self.lower_type_ref_with_params_at(
+                                &param.ty,
+                                &params,
+                                Some(param.ty_range),
+                            ),
+                            &subst,
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        self.result.method_signatures.insert(
+            (ctx.body_id, callee),
+            CallableSignature {
+                is_unsafe: method.function.is_unsafe,
+                kind: ClosureKind::Fn,
+                params: signature_params,
+                ret: Box::new(return_ty.clone()),
+            },
+        );
         if let Some(expected) = expected {
             let _ = self.unify_types(&return_ty, expected);
             self.last_occurs_error = None;

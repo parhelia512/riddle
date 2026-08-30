@@ -1424,6 +1424,25 @@ impl<'a> TypeChecker<'a> {
         for (key, call) in generic_calls {
             self.result.generic_calls.insert(key, call);
         }
+        let method_signatures = self
+            .result
+            .method_signatures
+            .iter()
+            .filter(|((checked_body, _), _)| *checked_body == body_id)
+            .map(|(key, signature)| {
+                let mut signature = signature.clone();
+                signature.params = signature
+                    .params
+                    .iter()
+                    .map(|param| self.resolve_type(param))
+                    .collect();
+                *signature.ret = self.resolve_type(&signature.ret);
+                (*key, signature)
+            })
+            .collect::<Vec<_>>();
+        for (key, signature) in method_signatures {
+            self.result.method_signatures.insert(key, signature);
+        }
         let lambdas = self
             .result
             .lambda_infos
