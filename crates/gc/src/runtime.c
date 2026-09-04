@@ -27,18 +27,19 @@
 typedef struct RgcHeader RgcHeader;
 typedef struct RgcMarkStack RgcMarkStack;
 
-#if defined(_MSC_VER)
-/* MSVC's C11 mode omits max_align_t; double matches malloc's alignment. */
-typedef double RgcMaxAlign;
-#else
-typedef max_align_t RgcMaxAlign;
-#endif
-
+/* Object headers live out-of-band in the registry array instead of in front
+   of each payload: rgc_alloc hands out the malloc block itself (suitably
+   aligned for any fundamental type per C11 7.22.3) and the collector only
+   ever scans payloads it has registered. `next` is dual purpose: while
+   occupied it links the address-hash bucket chain, while free it links the
+   recycled-slot free list. Links store slot indices +1 encoded, so 0
+   terminates a chain and slot 0 stays addressable. */
 struct RgcHeader {
-    RgcHeader *next;
+    uintptr_t start;
     size_t size;
+    uint32_t next;
     unsigned char marked;
-    RgcMaxAlign _align;
+    unsigned char occupied;
 };
 
 struct RgcMarkStack {
@@ -47,7 +48,31 @@ struct RgcMarkStack {
     size_t cap;
 };
 
-static RgcHeader *rgc_objects = NULL;
+/* Registry of headers for every live-or-garbage allocation. This is
+   GC-external metadata kept in plain malloc/realloc memory; it is never
+   scanned as a root set, so entries for garbage keep nothing alive. */
+static RgcHeader *rgc_headers = NULL;
+static size_t rgc_header_len = 0;
+static size_t rgc_header_cap = 0;
+static uint32_t rgc_free_slot = 0;
+static size_t rgc_object_count = 0;
+
+/* Address hash over occupied slots: exact-pointer membership (rgc_free,
+   rgc_realloc) is O(1) average. Buckets hold +1 encoded slot indices and
+   chain through RgcHeader.next. */
+static uint32_t *rgc_hash = NULL;
+static size_t rgc_hash_mask = 0; /* bucket count - 1 */
+
+/* Occupied slots sorted by payload address, rebuilt once at the top of
+   every collection; interior-pointer lookups during marking are then O(log
+   n) binary searches. Re-sorting per collection is O(n log n), the same
+   order as the mark pass itself, and it keeps registration O(1) the rest
+   of the time (a permanently sorted array would need an O(n) memmove per
+   allocation). */
+static uint32_t *rgc_sorted = NULL;
+static size_t rgc_sorted_len = 0;
+static size_t rgc_sorted_cap = 0;
+
 static size_t rgc_live_bytes = 0;
 static size_t rgc_next_collect = RGC_MIN_HEAP;
 static void *rgc_stack_bottom = NULL;
@@ -62,22 +87,124 @@ void *rgc_realloc(void *ptr, size_t size);
 void rgc_free(void *ptr);
 RGC_NOINLINE void rgc_collect(void);
 
-static void *rgc_payload(RgcHeader *object) {
-    return (void *)(object + 1);
+static size_t rgc_hash_of(uintptr_t start) {
+    /* Multiplicative (Knuth) hashing; malloc payloads are at least 8-byte
+       aligned, so the zeroed low bits are dropped before mixing. */
+    return (size_t)((start >> 3u) * (uintptr_t)2654435761u) & rgc_hash_mask;
 }
 
-static RgcHeader *rgc_find_object(const void *ptr) {
-    uintptr_t needle = (uintptr_t)ptr;
+static void rgc_hash_grow(void) {
+    size_t next_count = rgc_hash ? (rgc_hash_mask + 1u) * 2u : 64u;
+    uint32_t *next;
+    size_t i;
 
-    for (RgcHeader *object = rgc_objects; object; object = object->next) {
-        uintptr_t start = (uintptr_t)rgc_payload(object);
-        uintptr_t end = start + object->size;
-        if (needle >= start && needle < end) {
+    if (next_count == 0u || next_count > SIZE_MAX / sizeof(uint32_t)) {
+        rgc_panic();
+    }
+    next = (uint32_t *)malloc(next_count * sizeof(uint32_t));
+    if (!next) {
+        rgc_panic();
+    }
+    memset(next, 0, next_count * sizeof(uint32_t));
+    free(rgc_hash);
+    rgc_hash = next;
+    rgc_hash_mask = next_count - 1u;
+
+    for (i = 0; i < rgc_header_len; ++i) {
+        RgcHeader *object = &rgc_headers[i];
+        size_t bucket;
+        if (!object->occupied) {
+            continue;
+        }
+        bucket = rgc_hash_of(object->start);
+        object->next = rgc_hash[bucket];
+        rgc_hash[bucket] = (uint32_t)(i + 1u);
+    }
+}
+
+static void rgc_hash_insert(uint32_t slot) {
+    RgcHeader *object = &rgc_headers[slot];
+    size_t buckets = rgc_hash_mask + 1u;
+    size_t bucket;
+
+    /* Grow at 75% load; the +1 accounts for the slot about to be chained.
+       rgc_hash_grow rehashes occupied slots only, so `slot` is chained
+       exactly once, below. */
+    if (!rgc_hash || rgc_object_count + 1u > buckets - buckets / 4u) {
+        rgc_hash_grow();
+    }
+    bucket = rgc_hash_of(object->start);
+    object->next = rgc_hash[bucket];
+    rgc_hash[bucket] = slot + 1u;
+}
+
+static void rgc_hash_remove(uint32_t slot) {
+    RgcHeader *object = &rgc_headers[slot];
+    uint32_t *link = &rgc_hash[rgc_hash_of(object->start)];
+
+    while (*link != 0u && *link != slot + 1u) {
+        link = &rgc_headers[*link - 1u].next;
+    }
+    if (*link != 0u) {
+        *link = object->next;
+    }
+    object->next = 0u;
+}
+
+static RgcHeader *rgc_find_exact(const void *ptr) {
+    uintptr_t needle = (uintptr_t)ptr;
+    uint32_t link;
+
+    if (!rgc_hash) {
+        return NULL;
+    }
+    for (link = rgc_hash[rgc_hash_of(needle)]; link != 0u; link = rgc_headers[link - 1u].next) {
+        RgcHeader *object = &rgc_headers[link - 1u];
+        if (object->start == needle) {
             return object;
         }
     }
-
     return NULL;
+}
+
+static void rgc_register(uintptr_t start, size_t size) {
+    uint32_t slot;
+    RgcHeader *object;
+
+    if (rgc_free_slot != 0u) {
+        slot = rgc_free_slot - 1u;
+        rgc_free_slot = rgc_headers[slot].next;
+    } else {
+        if (rgc_header_len == rgc_header_cap) {
+            size_t next_cap = rgc_header_cap ? rgc_header_cap * 2u : 64u;
+            RgcHeader *next;
+            /* Slot links are 32-bit indices, capping the registry at
+               UINT32_MAX records; more could not be addressed anyway. */
+            if (next_cap < rgc_header_cap || next_cap > (size_t)UINT32_MAX) {
+                rgc_panic();
+            }
+            next = (RgcHeader *)realloc(rgc_headers, next_cap * sizeof(RgcHeader));
+            if (!next) {
+                rgc_panic();
+            }
+            rgc_headers = next;
+            rgc_header_cap = next_cap;
+        }
+        slot = (uint32_t)rgc_header_len;
+        rgc_header_len += 1u;
+    }
+
+    object = &rgc_headers[slot];
+    object->start = start;
+    object->size = size;
+    object->marked = 0;
+    object->occupied = 0;
+    object->next = 0u;
+    rgc_hash_insert(slot);
+    /* Occupy only after chaining, so a hash grow inside rgc_hash_insert
+       cannot pick this slot up twice. */
+    object->occupied = 1;
+    rgc_object_count += 1u;
 }
 
 static void rgc_mark_push(RgcMarkStack *stack, const void *ptr);
@@ -101,6 +228,74 @@ static void rgc_mark_range(RgcMarkStack *stack, const void *a, const void *b) {
         memcpy(&candidate, (const void *)cursor, sizeof(candidate));
         rgc_mark_push(stack, (const void *)candidate);
     }
+}
+
+/* qsort comparator over slot indices; the base array is a file-scope
+   global because the runtime, like the language, is single-threaded. */
+static int rgc_sorted_cmp(const void *a, const void *b) {
+    uintptr_t x = rgc_headers[*(const uint32_t *)a - 1u].start;
+    uintptr_t y = rgc_headers[*(const uint32_t *)b - 1u].start;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static void rgc_build_sorted(void) {
+    size_t i;
+    size_t len = 0;
+
+    if (rgc_object_count > rgc_sorted_cap) {
+        size_t next_cap = rgc_sorted_cap ? rgc_sorted_cap : 64u;
+        uint32_t *next;
+        if (rgc_object_count > SIZE_MAX / sizeof(uint32_t)) {
+            rgc_panic();
+        }
+        while (next_cap < rgc_object_count) {
+            next_cap *= 2u;
+        }
+        next = (uint32_t *)realloc(rgc_sorted, next_cap * sizeof(uint32_t));
+        if (!next) {
+            rgc_panic();
+        }
+        rgc_sorted = next;
+        rgc_sorted_cap = next_cap;
+    }
+
+    for (i = 0; i < rgc_header_len; ++i) {
+        if (rgc_headers[i].occupied) {
+            rgc_sorted[len] = (uint32_t)(i + 1u);
+            len += 1u;
+        }
+    }
+    rgc_sorted_len = len;
+    qsort(rgc_sorted, len, sizeof(uint32_t), rgc_sorted_cmp);
+}
+
+/* Object lookup during marking. Interior pointers (e.g. a slice into the
+   middle of a buffer) must resolve to their owning object, which needs a
+   predecessor search by address: a binary search over the address-sorted
+   index is O(log n). Between collections the index is stale, so every
+   non-marking lookup (rgc_free, rgc_realloc) uses the hash table instead. */
+static RgcHeader *rgc_find_object(const void *ptr) {
+    uintptr_t needle = (uintptr_t)ptr;
+    size_t lo = 0;
+    size_t hi = rgc_sorted_len;
+    RgcHeader *object;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2u;
+        if (rgc_headers[rgc_sorted[mid] - 1u].start <= needle) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo == 0u) {
+        return NULL;
+    }
+    object = &rgc_headers[rgc_sorted[lo - 1u] - 1u];
+    if (needle - object->start < object->size) {
+        return object;
+    }
+    return NULL;
 }
 
 static void rgc_mark_push(RgcMarkStack *stack, const void *ptr) {
@@ -137,35 +332,60 @@ static void rgc_mark_roots(
     rgc_mark_range(&stack, a, b);
     while (stack.len) {
         RgcHeader *object = stack.items[--stack.len];
-        rgc_mark_range(&stack, rgc_payload(object), (char *)rgc_payload(object) + object->size);
+        rgc_mark_range(
+            &stack,
+            (const void *)object->start,
+            (const void *)(object->start + object->size)
+        );
     }
 
     free(stack.items);
 }
 
 static void rgc_sweep(void) {
-    RgcHeader **link = &rgc_objects;
-    rgc_live_bytes = 0;
+    size_t i;
 
-    while (*link) {
-        RgcHeader *object = *link;
-        if (!object->marked) {
-            *link = object->next;
-            free(object);
+    rgc_live_bytes = 0;
+    for (i = 0; i < rgc_header_len; ++i) {
+        RgcHeader *object = &rgc_headers[i];
+        if (!object->occupied) {
             continue;
         }
-
-        object->marked = 0;
-        rgc_live_bytes += object->size;
-        link = &object->next;
+        if (object->marked) {
+            object->marked = 0;
+            rgc_live_bytes += object->size;
+            continue;
+        }
+        rgc_hash_remove((uint32_t)i);
+        free((void *)object->start);
+        object->occupied = 0;
+        object->next = rgc_free_slot;
+        rgc_free_slot = (uint32_t)(i + 1u);
+        rgc_object_count -= 1u;
     }
 
+    /* Grow the next-collection threshold with the surviving set so
+       steady-state programs do not re-collect at a fixed boundary. */
     if (rgc_live_bytes > SIZE_MAX / 2u) {
         rgc_next_collect = SIZE_MAX;
     } else {
         size_t next = rgc_live_bytes * 2u;
         rgc_next_collect = next < RGC_MIN_HEAP ? RGC_MIN_HEAP : next;
     }
+}
+
+/* ---- optional collection diagnostics ----
+   Set RGC_DEBUG_STATS=1 in the environment to print one stderr line per
+   collection: live bytes, live objects, and the next threshold. The flag
+   is read once and off by default, so ordinary runs stay silent and
+   deterministic. */
+#include <stdio.h>
+static int rgc_debug_stats(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("RGC_DEBUG_STATS") != NULL;
+    }
+    return enabled;
 }
 
 void rgc_init(void *stack_bottom) {
@@ -210,16 +430,29 @@ RGC_NOINLINE void rgc_collect(void) {
         return;
     }
 
+    rgc_build_sorted();
     rgc_mark_roots(&registers, rgc_stack_bottom, &registers, sizeof(registers));
     rgc_sweep();
+
+    if (rgc_debug_stats()) {
+        static size_t collections = 0;
+        collections += 1u;
+        fprintf(
+            stderr,
+            "rgc: collection %zu: %zu live bytes in %zu objects, next threshold %zu\n",
+            collections,
+            rgc_live_bytes,
+            rgc_object_count,
+            rgc_next_collect
+        );
+    }
 }
 
 void *rgc_alloc(size_t size) {
+    void *block;
+
     if (size == 0u) {
         size = 1u;
-    }
-    if (size > SIZE_MAX - sizeof(RgcHeader)) {
-        rgc_panic();
     }
 
     if (rgc_stack_bottom
@@ -227,40 +460,45 @@ void *rgc_alloc(size_t size) {
         rgc_collect();
     }
 
-    RgcHeader *object = (RgcHeader *)malloc(sizeof(RgcHeader) + size);
-    if (!object) {
+    block = malloc(size);
+    if (!block) {
         rgc_collect();
-        object = (RgcHeader *)malloc(sizeof(RgcHeader) + size);
-        if (!object) {
+        block = malloc(size);
+        if (!block) {
             rgc_panic();
         }
     }
 
-    object->next = rgc_objects;
-    object->size = size;
-    object->marked = 0;
-    rgc_objects = object;
+    rgc_register((uintptr_t)block, size);
     rgc_live_bytes += size;
 
-    return rgc_payload(object);
+    return block;
 }
 
 void rgc_free(void *ptr) {
+    RgcHeader *object;
+    uint32_t slot;
+
     if (!ptr) {
         return;
     }
 
-    for (RgcHeader **link = &rgc_objects; *link; link = &(*link)->next) {
-        RgcHeader *object = *link;
-        if (rgc_payload(object) == ptr) {
-            *link = object->next;
-            rgc_live_bytes -= object->size;
-            free(object);
-            return;
-        }
+    object = rgc_find_exact(ptr);
+    if (!object) {
+        return;
     }
-    // ponytail: pointers not owned by the GC are ignored; unlink walks the
-    // object list, switch to a doubly linked list if frees ever dominate.
+
+    slot = (uint32_t)(object - rgc_headers);
+    rgc_live_bytes -= object->size;
+    rgc_hash_remove(slot);
+    free((void *)object->start);
+    object->occupied = 0;
+    object->next = rgc_free_slot;
+    rgc_free_slot = slot + 1u;
+    rgc_object_count -= 1u;
+    // ponytail: pointers not owned by the GC are ignored; membership is an
+    // O(1)-average hash lookup on the exact payload address, so interior or
+    // foreign pointers never free anything they should not.
 }
 
 typedef struct {
@@ -395,12 +633,21 @@ size_t riddle_proc_diagnostic_message_length(size_t index) {
 
 void *rgc_realloc(void *ptr, size_t size) {
     // rgc_alloc may trigger a collection; ptr stays reachable through this
-    // frame (conservative stack scan) and stays linked until rgc_free below.
-    void *next = rgc_alloc(size);
+    // frame (conservative stack scan) and stays registered until rgc_free below.
+    size_t old_size = 0;
+    void *next;
 
     if (ptr) {
-        RgcHeader *object = (RgcHeader *)ptr - 1;
-        memcpy(next, ptr, object->size < size ? object->size : size);
+        RgcHeader *object = rgc_find_exact(ptr);
+        old_size = object ? object->size : 0u;
+    }
+
+    next = rgc_alloc(size);
+
+    if (ptr) {
+        if (old_size != 0u) {
+            memcpy(next, ptr, old_size < size ? old_size : size);
+        }
         rgc_free(ptr);
     }
 

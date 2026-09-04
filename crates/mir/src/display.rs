@@ -189,8 +189,8 @@ impl fmt::Display for InstFmt<'_> {
                 let args_str: Vec<String> = args.iter().map(|a| format!("v{}", a.0)).collect();
                 write!(f, "call {:?}({})", callee, args_str.join(", "))
             }
-            InstKind::Panic(message, line, column) => {
-                write!(f, "panic v{} at {line}:{column}", message.0)
+            InstKind::Panic(message, site) => {
+                write!(f, "panic v{} at {}:{}", message.0, site.line, site.column)
             }
             InstKind::FunctionRef(function) => write!(f, "function_ref {function:?}"),
             InstKind::CallIndirect(callee, args) => {

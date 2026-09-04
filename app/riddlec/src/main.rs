@@ -2,7 +2,6 @@ use clap::{ArgAction, Parser};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -77,36 +76,21 @@ fn main() {
             process::exit(1);
         }
     };
-    if matches!(opts.backend, Some(BackendKind::C)) && opts.files.len() != 1 {
-        eprintln!("riddlec: C backend accepts exactly one input file");
-        process::exit(1);
+
+    if opts.backend.is_some() {
+        // The C backend compiles every input as one program: files are
+        // concatenated into a single package so they can reference each
+        // other's items, with source maps preserved for panic locations.
+        let errors = compile_program(&opts.files, &opts, target);
+        if errors > 0 {
+            process::exit(1);
+        }
+        return;
     }
 
     let mut total_errors = 0;
-    let mut generated_code = String::new();
-
     for file in &opts.files {
-        let (errors, code) = compile_file(file, &opts, target);
-        total_errors += errors;
-        generated_code.push_str(&code);
-    }
-
-    if !generated_code.is_empty() {
-        if matches!(opts.backend, Some(BackendKind::C)) {
-            total_errors += write_c(&generated_code, opts.output.as_deref(), &opts.files);
-        } else {
-            match opts.output {
-                Some(ref path) => {
-                    if let Err(e) = fs::write(path, &generated_code) {
-                        eprintln!("riddlec: cannot write to `{}`: {e}", path.display());
-                        total_errors += 1;
-                    }
-                }
-                None => {
-                    let _ = io::stdout().write_all(generated_code.as_bytes());
-                }
-            }
-        }
+        total_errors += compile_file(file, &opts, target);
     }
 
     if total_errors > 0 {
@@ -114,12 +98,86 @@ fn main() {
     }
 }
 
-fn compile_file(file: &Path, opts: &Opts, target: TargetTriple) -> (usize, String) {
+/// Loads and macro-expands every input file, merging them into one package.
+///
+/// Returns the combined source plus per-file source maps so diagnostics and
+/// generated panic locations keep pointing at the original files.
+fn load_program_sources(files: &[PathBuf]) -> Result<pipeline::LoadedSource, PathBuf> {
+    let mut combined = String::new();
+    let mut files_loaded = Vec::new();
+    let mut source_map = pipeline::SourceMap::default();
+    for file in files {
+        let mut loaded = pipeline::load_source_file(file).map_err(|error| {
+            eprintln!("riddlec: cannot read `{}`: {error}", file.display());
+            file.clone()
+        })?;
+        let expansion = riddlec::proc_macro::expand_standard_macros(&loaded.source);
+        loaded.apply_expansion(expansion.source, &expansion.mappings);
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        let offset = combined.len();
+        combined.push_str(&loaded.source);
+        source_map.extend(loaded.source_map, offset);
+        files_loaded.extend(loaded.files);
+    }
+    Ok(pipeline::LoadedSource {
+        source: combined,
+        files: files_loaded,
+        source_map,
+    })
+}
+
+fn compile_program(files: &[PathBuf], opts: &Opts, target: TargetTriple) -> usize {
+    let loaded = match load_program_sources(files) {
+        Ok(loaded) => loaded,
+        Err(_) => return 1,
+    };
+    let options = pipeline::CompileOptions {
+        use_std: opts.use_std,
+    };
+    let package_range = 0..loaded.source.len();
+    let package_ranges = std::slice::from_ref(&package_range);
+    let result = pipeline::compile_package_with_options(&loaded.source, package_ranges, options);
+
+    let entry_name = files.first().map_or_else(
+        || "<unknown>".to_string(),
+        |file| file.display().to_string(),
+    );
+    if opts.verbose {
+        println!("target: {target}");
+        diagnostics::report_verbose(&result, Some(&loaded.source), &entry_name);
+        println!();
+    }
+
+    let mut errors = diagnostics::report_mapped(&result, &loaded, &entry_name);
+    if result.success()
+        && let Some(ref module) = result.mir_module
+        && opts.backend.is_some()
+    {
+        match pipeline::generate_c_for_package_with_source_map(
+            module,
+            0,
+            true,
+            &loaded.source_map,
+            &entry_name,
+        ) {
+            Ok(code) => errors += write_c(&code, opts.output.as_deref(), files),
+            Err(error) => {
+                eprintln!("riddlec: code generation error: {error:?}");
+                errors += 1;
+            }
+        }
+    }
+    errors
+}
+
+fn compile_file(file: &Path, opts: &Opts, target: TargetTriple) -> usize {
     let mut loaded = match pipeline::load_source_file(file) {
         Ok(loaded) => loaded,
         Err(error) => {
             eprintln!("riddlec: cannot read `{}`: {error}", file.display());
-            return (1, String::new());
+            return 1;
         }
     };
     let expansion = riddlec::proc_macro::expand_standard_macros(&loaded.source);
@@ -130,65 +188,23 @@ fn compile_file(file: &Path, opts: &Opts, target: TargetTriple) -> (usize, Strin
     let package_range = 0..loaded.source.len();
     let package_ranges = std::slice::from_ref(&package_range);
     let mut result = if let Some(parse) = expansion.parse.as_ref() {
-        if opts.backend.is_some() {
-            pipeline::compile_parsed_package_with_options(
-                &loaded.source,
-                parse,
-                package_ranges,
-                options,
-            )
-        } else {
-            pipeline::check_parsed_package_with_options(
-                &loaded.source,
-                parse,
-                package_ranges,
-                options,
-            )
-        }
-    } else if opts.backend.is_some() {
-        pipeline::compile_package_with_options(&loaded.source, package_ranges, options)
+        pipeline::check_parsed_package_with_options(&loaded.source, parse, package_ranges, options)
     } else {
         pipeline::check_package_with_options(&loaded.source, package_ranges, options)
     };
     result.macro_diagnostics = expansion.diagnostics;
 
+    let source_name = file.display().to_string();
     if opts.verbose {
         if opts.files.len() > 1 {
             println!("== {} ==", file.display());
         }
         println!("target: {target}");
-        let source_name = file.display().to_string();
         diagnostics::report_verbose(&result, Some(&loaded.source), &source_name);
         println!();
     }
 
-    let source_name = file.display().to_string();
-    let mut errors = diagnostics::report_mapped(&result, &loaded, &source_name);
-    let mut generated = String::new();
-    if result.success()
-        && let Some(ref module) = result.mir_module
-        && let Some(backend) = opts.backend
-    {
-        match generate(module, backend, &source_name) {
-            Ok(code) => generated = code,
-            Err(error) => {
-                eprintln!("riddlec: code generation error: {error:?}");
-                errors += 1;
-            }
-        }
-    }
-    (errors, generated)
-}
-
-fn generate(
-    module: &mir::Module,
-    backend: BackendKind,
-    source_name: &str,
-) -> Result<String, Box<dyn std::fmt::Debug>> {
-    match backend {
-        BackendKind::C => pipeline::generate_c_with_gc_and_source(module, true, source_name)
-            .map_err(|e| Box::new(e) as Box<dyn std::fmt::Debug>),
-    }
+    diagnostics::report_mapped(&result, &loaded, &source_name)
 }
 
 fn parse_args<I, T>(args: I) -> Result<Opts, clap::Error>

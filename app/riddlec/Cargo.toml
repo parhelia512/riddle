@@ -5,6 +5,9 @@ edition.workspace = true
 publish = false
 autotests = false
 
+[dev-dependencies]
+gc = { path = "../../crates/gc" }
+
 [dependencies]
 ast = { path = "../../crates/ast" }
 clap = { version = "=4.5.61", features = ["derive"] }

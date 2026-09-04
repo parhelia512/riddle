@@ -1,6 +1,7 @@
 use crate::func::Function;
 use crate::instr::{
-    BinOp, CastOp, CmpOp, ConstValue, FloatWidth, Inst, InstKind, IntWidth, Terminator, UnOp,
+    BinOp, CastOp, CmpOp, ConstValue, FloatWidth, Inst, InstKind, IntWidth, PanicSite, Terminator,
+    UnOp,
 };
 use crate::types::{FloatTy, IntTy, Type};
 use crate::value::{BlockId, FuncRef, Value};
@@ -169,8 +170,8 @@ impl<'f> Builder<'f> {
         self.emit(InstKind::Call(callee, args), ret_ty)
     }
 
-    pub fn panic(&mut self, message: Value, line: u32, column: u32) -> Value {
-        self.emit(InstKind::Panic(message, line, column), Type::Never)
+    pub fn panic(&mut self, message: Value, site: PanicSite) -> Value {
+        self.emit(InstKind::Panic(message, site), Type::Never)
     }
 
     pub fn function_ref(&mut self, function: FuncRef, ty: Type) -> Value {

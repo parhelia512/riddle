@@ -589,6 +589,13 @@ const PRODUCER_SPAN_CASES: &[DiagnosticSpanCase] = &[
         "{ 0 }",
     ),
     (
+        "E0067",
+        "cannot construct an infinite type",
+        "fun main() { let id = fun(value) { value }; id(id); }",
+        "id(id)",
+        "id(id)",
+    ),
+    (
         "E0072",
         "recursive type",
         "enum Loop { Next(Loop) }",
@@ -786,7 +793,7 @@ fn closure_diagnostic_spans_point_at_the_relevant_source() {
             true,
         ),
         (
-            "E0046",
+            "E0067",
             "infinite type",
             "fun main() { let id = fun(value) { value }; id(id); }",
             "id(id)",

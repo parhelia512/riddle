@@ -304,10 +304,11 @@ fn build_analysis(
             .mir_module
             .as_ref()
             .context("successful compilation did not produce MIR")?;
-        let c_code = pipeline::generate_c_for_package_with_gc_and_source(
+        let c_code = pipeline::generate_c_for_package_with_source_map(
             module,
             analysis.package_index,
             analysis.gc_enabled,
+            &analysis.source.source_map,
             &analysis.entry.display().to_string(),
         )
         .map_err(anyhow::Error::msg)?;

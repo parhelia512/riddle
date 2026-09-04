@@ -165,6 +165,37 @@ impl SourceMap {
         self.segments.extend(other.segments);
     }
 
+    /// Converts the segments into the source files the MIR C backend uses to
+    /// resolve panic locations back to module files.
+    #[must_use]
+    pub fn to_mir_files(&self) -> Vec<mir::SourceFile> {
+        self.segments
+            .iter()
+            .map(|segment| {
+                let mut original_start = segment.original_start;
+                if let (true, Some(original)) = (segment.synthetic.is_some(), &segment.synthetic) {
+                    // The call-site range may start on surrounding trivia;
+                    // anchor generated output at its first code character.
+                    let text = segment.source.as_ref();
+                    let end = original.end.min(text.len());
+                    for (index, ch) in text[original_start..end].char_indices() {
+                        if !ch.is_whitespace() {
+                            original_start += index;
+                            break;
+                        }
+                    }
+                }
+                mir::SourceFile {
+                    generated: segment.generated.clone(),
+                    original_start,
+                    synthetic: segment.synthetic.is_some(),
+                    path: segment.path.display().to_string(),
+                    text: segment.source.to_string(),
+                }
+            })
+            .collect()
+    }
+
     fn push(
         &mut self,
         generated: Range<usize>,
@@ -1030,6 +1061,30 @@ pub fn generate_c_for_package_with_gc_and_source(
         CBackend::without_gc()
     }
     .with_source_name(source_name)
+    .for_package(package);
+    backend.compile(module)
+}
+
+/// Generates C for one package of a MIR module, resolving panic locations
+/// against the combined-source map of the loaded package.
+///
+/// # Errors
+///
+/// Returns an error when the module cannot be represented by the C backend.
+pub fn generate_c_for_package_with_source_map(
+    module: &Module,
+    package: usize,
+    gc_enabled: bool,
+    source_map: &SourceMap,
+    source_name: &str,
+) -> Result<String, String> {
+    let mut backend = if gc_enabled {
+        CBackend::new()
+    } else {
+        CBackend::without_gc()
+    }
+    .with_source_name(source_name)
+    .with_source_files(source_map.to_mir_files())
     .for_package(package);
     backend.compile(module)
 }

@@ -710,14 +710,19 @@ impl TypeChecker<'_> {
                 ctx.expr_range(len),
             );
         }
-        let len_value = array_repeat_len(&ctx.body.exprs[len]).unwrap_or_else(|| {
-            self.diagnostic(
-                "E0002",
-                "array repeat length must be an integer literal that fits `usize`",
-                ctx.expr_range(len),
-            );
-            0
-        });
+        let len_value = array_repeat_len(&ctx.body.exprs[len])
+            .or_else(|| {
+                self.const_expr_value(ctx.body, len, &mut Vec::new())
+                    .and_then(|value| usize::try_from(value).ok())
+            })
+            .unwrap_or_else(|| {
+                self.diagnostic(
+                    "E0002",
+                    "array repeat length must be an integer literal that fits `usize`",
+                    ctx.expr_range(len),
+                );
+                0
+            });
         if let Some(expected_len) = expected_len
             && expected_len != len_value
         {

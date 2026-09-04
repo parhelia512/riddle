@@ -977,7 +977,7 @@ impl TypeChecker<'_> {
             return;
         }
         if self.last_occurs_error.take().is_some() {
-            self.diagnostic("E0046", "cannot construct an infinite type", span);
+            self.diagnostic("E0067", "cannot construct an infinite type", span);
             return;
         }
         let unsafe_mismatch = self

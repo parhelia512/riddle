@@ -216,7 +216,7 @@ fn manifest_diagnostics_flow_through_the_workspace_pipeline() {
         &docs,
         CompileOptions { use_std: false },
         &mut sessions,
-        &|| false,
+        || false,
     )
     .expect("analysis cannot be cancelled");
 

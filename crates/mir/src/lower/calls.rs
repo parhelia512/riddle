@@ -1,8 +1,9 @@
 use super::{
     Body, Builder, BuiltinOperator, Expr, ExprId, FuncRef, HashMap, HirBinOp, HirTypeRef, HirUnOp,
-    Inst, InstKind, IntTy, LowerCtx, PathAnchor, ResolvedName, Type, UnOp, Value,
+    Inst, InstKind, IntTy, LowerCtx, PanicSite, PathAnchor, ResolvedName, Type, UnOp, Value,
     builtin_comparison_types, comparison_trait, convert_cmp_op, convert_unop,
 };
+use crate::source_map::line_column;
 
 impl LowerCtx<'_> {
     pub(super) fn is_std_range_expr(&self, expr: ExprId) -> bool {
@@ -81,9 +82,16 @@ impl LowerCtx<'_> {
                 let message = self.lower_expr(builder, param_values, body, *args.first()?);
                 let range = body.source_map.expr_ranges.get(&callee)?;
                 let offset: usize = range.start().into();
-                // ponytail: locations use the combined source; pass file mappings into MIR when module-accurate paths are needed.
                 let (line, column) = line_column(self.source, offset);
-                Some(builder.panic(message, line, column))
+                let offset = u32::try_from(offset).ok()?;
+                Some(builder.panic(
+                    message,
+                    PanicSite {
+                        offset,
+                        line,
+                        column,
+                    },
+                ))
             }
             "panic_at" => {
                 let message = self.lower_expr(builder, param_values, body, *args.first()?);
@@ -93,10 +101,18 @@ impl LowerCtx<'_> {
                 let Expr::IntLiteral { value: column, .. } = body.exprs[*args.get(2)?] else {
                     return None;
                 };
+                // The expansion attributes the call back to the original
+                // `panic!` position, so record the call-site offset for
+                // module-accurate file resolution in the backend.
+                let range = body.source_map.expr_ranges.get(&callee)?;
+                let offset = u32::try_from(usize::from(range.start())).ok()?;
                 Some(builder.panic(
                     message,
-                    u32::try_from(line).ok()?,
-                    u32::try_from(column).ok()?,
+                    PanicSite {
+                        offset,
+                        line: u32::try_from(line).ok()?,
+                        column: u32::try_from(column).ok()?,
+                    },
                 ))
             }
             "size_of" => {
@@ -745,21 +761,4 @@ impl LowerCtx<'_> {
         let result = Type::Ref(Box::new(output), call.method == "index_mut");
         Some(builder.call(FuncRef::Local(name), vec![receiver, index], result))
     }
-}
-
-fn line_column(source: &str, offset: usize) -> (u32, u32) {
-    let mut line = 1;
-    let mut column = 1;
-    for (index, ch) in source.char_indices() {
-        if index >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-    (line, column)
 }

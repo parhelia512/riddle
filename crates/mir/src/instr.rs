@@ -153,7 +153,7 @@ pub enum InstKind {
     Call(FuncRef, Vec<Value>),
 
     /// Abort with a user-facing panic diagnostic at the source call site.
-    Panic(Value, u32, u32),
+    Panic(Value, PanicSite),
 
     /// Obtain a typed function pointer.
     FunctionRef(FuncRef),
@@ -176,6 +176,19 @@ pub enum InstKind {
     /// SSA φ-node: `result = phi [ (val, block) ... ]`
     /// Merges values from multiple predecessor blocks.
     Phi(Vec<(Value, BlockId)>),
+}
+
+/// The source location a `panic` instruction reports.
+///
+/// `offset` points into the combined lowering source, so the C backend can
+/// resolve it to the original module file through its source-file segments.
+/// `line`/`column` are the precomputed combined-source position, used as the
+/// fallback when no segment covers the offset (single-file builds).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanicSite {
+    pub offset: u32,
+    pub line: u32,
+    pub column: u32,
 }
 
 // 终止指令

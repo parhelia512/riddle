@@ -175,6 +175,10 @@ fn c_owned_dyn_trait_uses_heap_storage_and_dynamic_drop() {
             )),
         ),
     ] {
+        let args_runtime = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/gc/src/args_runtime.c"
+        ));
         let root = std::env::temp_dir().join(format!(
             "riddle-c-owned-dyn-{label}-{}-{}",
             std::process::id(),
@@ -186,7 +190,7 @@ fn c_owned_dyn_trait_uses_heap_storage_and_dynamic_drop() {
         fs::create_dir_all(&root).unwrap();
         let source = root.join("main.c");
         let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
-        fs::write(&source, format!("{generated}\n{runtime}")).unwrap();
+        fs::write(&source, format!("{generated}\n{runtime}\n{args_runtime}")).unwrap();
 
         let mut command = Command::new(&compiler);
         if is_msvc {
@@ -543,18 +547,62 @@ fn bare_slice_values_are_rejected() {
 }
 
 #[test]
-fn c_extern_slice_abi_is_rejected() {
+fn c_extern_slice_abi_splits_into_pointer_and_length() {
     let module = lower(
         r#"
         unsafe extern "C" {
-            fun consume(values: &[i32]);
+            fun consume(values: &[i32], count: i32);
+            fun fill(values: &mut [f64], count: i32);
+        }
+
+        fun main() {
+            let data = [1, 2];
+            unsafe { consume(&data, 2); }
+        }
+        "#,
+    );
+    let generated = CBackend::new().compile(&module).unwrap();
+
+    assert!(
+        generated.contains("extern void consume(const int32_t*, size_t, int32_t);"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("extern void fill(double*, size_t, int32_t);"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("consume((const int32_t*)") && generated.contains(".ptr,"),
+        "{generated}"
+    );
+    assert!(generated.contains(".len,"), "{generated}");
+}
+
+#[test]
+fn c_extern_slice_abi_still_rejects_unsized_and_returned_slices() {
+    let by_value = lower(
+        r#"
+        unsafe extern "C" {
+            fun consume(values: [i32]);
         }
 
         fun main() {}
         "#,
     );
-    let error = CBackend::new().compile(&module).unwrap_err();
-    assert!(error.contains("pointer and length separately"), "{error}");
+    let error = CBackend::new().compile(&by_value).unwrap_err();
+    assert!(error.contains("cannot use a slice"), "{error}");
+
+    let returned = lower(
+        r#"
+        unsafe extern "C" {
+            fun produce() -> &[i32];
+        }
+
+        fun main() {}
+        "#,
+    );
+    let error = CBackend::new().compile(&returned).unwrap_err();
+    assert!(error.contains("cannot return a slice"), "{error}");
 }
 
 #[test]
@@ -1384,7 +1432,7 @@ fn c_heap_alloc_wraps_main_with_a_gc_stack_boundary() {
     );
     assert!(
         generated.contains(&format!(
-            "int main(void) {{\n  int rgc_stack_anchor = 0;\n  rgc_init(&rgc_stack_anchor);\n  return (int){user_main}();"
+            "int main(int argc, char **argv) {{\n  riddle_args_init((int32_t)argc, argv);\n  int rgc_stack_anchor = 0;\n  rgc_init(&rgc_stack_anchor);\n  return (int){user_main}();"
         )),
         "missing GC entry wrapper: {generated}"
     );

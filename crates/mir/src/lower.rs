@@ -18,7 +18,7 @@ use type_checker::{
 
 use crate::builder::Builder;
 use crate::func::Function;
-use crate::instr::{BinOp, CastOp, CmpOp, Inst, InstKind, UnOp};
+use crate::instr::{BinOp, CastOp, CmpOp, Inst, InstKind, PanicSite, UnOp};
 use crate::module::Module;
 use crate::types::{EnumVariantKind, FloatTy, FnPtrType, IntTy, StructType, Type};
 use crate::value::{BlockId, FuncRef, Value};
@@ -1023,18 +1023,27 @@ fn resolve_field_index(
 }
 
 fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
+    try_cast_op(source, target).unwrap_or_else(|| {
+        unreachable!("unsupported cast reached MIR lowering: {source:?} as {target:?}")
+    })
+}
+
+/// The cast matrix the type checker's E0012 rule admits. `cast_matrix_tests`
+/// pins every documented pair so a checker-side extension cannot silently
+/// reach the unsupported-cast ICE in [`determine_cast_op`].
+fn try_cast_op(source: &Type, target: &Type) -> Option<CastOp> {
     match (source, target) {
-        (Type::Int(IntTy::U8), Type::Char) => CastOp::IntToChar,
-        (Type::Int(_) | Type::Char, Type::Int(_)) => CastOp::IntToInt,
-        (Type::Int(_), Type::Float(_)) => CastOp::IntToFloat,
-        (Type::Float(_), Type::Int(_)) => CastOp::FloatToInt,
-        (Type::Float(_), Type::Float(_)) => CastOp::FloatToFloat,
-        (Type::Bool, Type::Int(_)) => CastOp::BoolToInt,
-        (Type::Int(_), Type::Bool) => CastOp::IntToBool,
-        (Type::Int(_), Type::Ptr(_)) => CastOp::IntToPtr,
-        (Type::Ref(source, _), Type::Ptr(target)) if source == target => CastOp::PtrToPtr,
-        (Type::Ptr(_), Type::Ptr(_)) => CastOp::PtrToPtr,
-        _ => unreachable!("unsupported cast reached MIR lowering: {source:?} as {target:?}"),
+        (Type::Int(IntTy::U8), Type::Char) => Some(CastOp::IntToChar),
+        (Type::Int(_) | Type::Char, Type::Int(_)) => Some(CastOp::IntToInt),
+        (Type::Int(_), Type::Float(_)) => Some(CastOp::IntToFloat),
+        (Type::Float(_), Type::Int(_)) => Some(CastOp::FloatToInt),
+        (Type::Float(_), Type::Float(_)) => Some(CastOp::FloatToFloat),
+        (Type::Bool, Type::Int(_)) => Some(CastOp::BoolToInt),
+        (Type::Int(_), Type::Bool) => Some(CastOp::IntToBool),
+        (Type::Int(_), Type::Ptr(_)) => Some(CastOp::IntToPtr),
+        (Type::Ref(source, _), Type::Ptr(target)) if source == target => Some(CastOp::PtrToPtr),
+        (Type::Ptr(_), Type::Ptr(_)) => Some(CastOp::PtrToPtr),
+        _ => None,
     }
 }
 
@@ -1084,4 +1093,90 @@ fn is_byte_str_layout_cast(source: &Type, target: &Type) -> bool {
 /// Returns whether a trait method can be represented in a borrowed dyn-trait table.
 pub(super) fn is_dyn_object_safe_method(method: &hir::item_tree::HirFunction) -> bool {
     matches!(dyn_method_safety(method), DynMethodSafety::Dispatchable)
+}
+
+#[cfg(test)]
+mod cast_matrix_tests {
+    use super::{CastOp, try_cast_op};
+    use crate::types::{IntTy, Type};
+
+    fn int(ty: IntTy) -> Type {
+        Type::Int(ty)
+    }
+
+    #[test]
+    fn every_documented_cast_pair_has_a_mir_lowering() {
+        let int_widths = [
+            IntTy::I8,
+            IntTy::I16,
+            IntTy::I32,
+            IntTy::I64,
+            IntTy::U8,
+            IntTy::U16,
+            IntTy::U32,
+            IntTy::U64,
+        ];
+        for source in int_widths {
+            let source = int(source);
+            assert!(
+                try_cast_op(&source, &int(IntTy::I64)).is_some(),
+                "{source:?} as int"
+            );
+            assert!(
+                try_cast_op(&source, &Type::Float(crate::types::FloatTy::F64)).is_some(),
+                "{source:?} as float"
+            );
+            assert!(
+                try_cast_op(&source, &Type::Bool).is_some(),
+                "{source:?} as bool"
+            );
+            assert!(
+                try_cast_op(&source, &Type::Ptr(Box::new(int(IntTy::U8)))).is_some(),
+                "{source:?} as *mut u8"
+            );
+        }
+        assert_eq!(
+            try_cast_op(&int(IntTy::U8), &Type::Char),
+            Some(CastOp::IntToChar)
+        );
+        assert_eq!(
+            try_cast_op(&Type::Char, &int(IntTy::I32)),
+            Some(CastOp::IntToInt)
+        );
+        assert_eq!(
+            try_cast_op(&Type::Bool, &int(IntTy::I32)),
+            Some(CastOp::BoolToInt)
+        );
+        assert_eq!(
+            try_cast_op(&Type::Float(crate::types::FloatTy::F32), &int(IntTy::U32)),
+            Some(CastOp::FloatToInt)
+        );
+        assert!(try_cast_op(&int(IntTy::I64), &int(IntTy::U8)).is_some());
+        let pointer = Type::Ptr(Box::new(int(IntTy::U8)));
+        let other_pointer = Type::Ptr(Box::new(int(IntTy::I32)));
+        assert!(
+            try_cast_op(&pointer, &other_pointer).is_some(),
+            "*u8 as *i32"
+        );
+        // Unsized references (slices, str) cannot be cast to pointers at the
+        // type-checker level, so no lowering exists for them either.
+        let byte_slice = Type::Ref(Box::new(Type::Slice(Box::new(int(IntTy::U8)))), false);
+        assert!(
+            try_cast_op(&byte_slice, &pointer).is_none(),
+            "&[u8] as *mut u8"
+        );
+    }
+
+    #[test]
+    fn pairs_the_checker_rejects_have_no_lowering() {
+        let float = Type::Float(crate::types::FloatTy::F64);
+        assert!(try_cast_op(&Type::Bool, &float).is_none(), "bool as f64");
+        assert!(try_cast_op(&float, &Type::Char).is_none(), "f64 as char");
+        assert!(try_cast_op(&Type::Str, &Type::Ptr(Box::new(int(IntTy::U8)))).is_none());
+        let array = Type::Array(Box::new(int(IntTy::I32)), 2);
+        assert!(
+            try_cast_op(&array, &int(IntTy::I32)).is_none(),
+            "[i32; 2] as i32"
+        );
+    }
 }

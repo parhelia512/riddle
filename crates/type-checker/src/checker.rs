@@ -4,7 +4,9 @@ use rowan::TextRange;
 
 use hir::{
     HirFile,
-    body::{Body, BodyId, Expr, ExprId, PatternBindingId, ResolvedName, UnaryOp},
+    body::{
+        BinaryOp as HirBinOp, Body, BodyId, Expr, ExprId, PatternBindingId, ResolvedName, UnaryOp,
+    },
     item_tree::{
         ConstId, EnumId, FunctionId, HirConstArg, HirFunction, HirPath, HirTrait, HirTypeAlias,
         HirTypeRef, HirVariantKind, InternalAttrTarget, PathAnchor, StructId, TypeAliasId,
@@ -1812,6 +1814,71 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Resolves a name used as a const-generic argument to a constant item's
+    /// compile-time value.
+    pub(crate) fn const_item_value_by_name(&self, name: &str) -> Option<usize> {
+        let id = self
+            .hir
+            .item_tree
+            .consts
+            .iter()
+            .find(|(_, konst)| konst.name.0 == name)
+            .map(|(id, _)| id)?;
+        usize::try_from(self.const_item_value(id, &mut Vec::new())?).ok()
+    }
+
+    /// Evaluates a constant item to its compile-time integer value so it can
+    /// back array lengths and const-generic arguments. Initialization cycles
+    /// are rejected as E0060 elsewhere; `active` guards against them here too.
+    pub(crate) fn const_item_value(&self, id: ConstId, active: &mut Vec<ConstId>) -> Option<u64> {
+        if active.contains(&id) {
+            return None;
+        }
+        let body_id = self.hir.const_bodies.get(&id).copied()?;
+        let body = &self.hir.bodies[body_id];
+        active.push(id);
+        let value = self.const_expr_value(body, body.root_block, active);
+        active.pop();
+        value
+    }
+
+    pub(crate) fn const_expr_value(
+        &self,
+        body: &Body,
+        expr_id: ExprId,
+        active: &mut Vec<ConstId>,
+    ) -> Option<u64> {
+        match &body.exprs[expr_id] {
+            Expr::IntLiteral { value, .. } => Some(*value),
+            Expr::BoolLiteral { value } => Some(u64::from(*value)),
+            Expr::Unary { operand, op } => {
+                let value = self.const_expr_value(body, *operand, active)?;
+                match op {
+                    // The evaluator models non-negative values only (array
+                    // lengths and const arguments); negatives stay non-const.
+                    UnaryOp::Neg if value == 0 => Some(0),
+                    UnaryOp::Pos => Some(value),
+                    UnaryOp::Not => Some(!value),
+                    _ => None,
+                }
+            }
+            Expr::Binary { lhs, rhs, op } => {
+                let lhs_value = self.const_expr_value(body, *lhs, active)?;
+                let rhs_value = self.const_expr_value(body, *rhs, active)?;
+                const_value_binary(lhs_value, rhs_value, *op)
+            }
+            Expr::Cast { base, .. } => self.const_expr_value(body, *base, active),
+            Expr::Block { tail, .. } => {
+                tail.and_then(|tail| self.const_expr_value(body, tail, active))
+            }
+            Expr::Path {
+                resolved: Some(ResolvedName::Const(referenced)),
+                ..
+            } => self.const_item_value(*referenced, active),
+            _ => None,
+        }
+    }
+
     pub(crate) fn check_generic_recursion(&mut self) {
         for i in 0..self.generic_edges.len() {
             if !self.generic_edges[i].grows {
@@ -1865,7 +1932,7 @@ impl<'a> TypeChecker<'a> {
             return self.resolve_type(&lhs);
         }
         if self.last_occurs_error.take().is_some() {
-            self.diagnostic("E0046", "cannot construct an infinite type", span);
+            self.diagnostic("E0067", "cannot construct an infinite type", span);
             return Type::Error;
         }
         if matches!(
@@ -1876,7 +1943,7 @@ impl<'a> TypeChecker<'a> {
             return self.resolve_type(&rhs);
         }
         if self.last_occurs_error.take().is_some() {
-            self.diagnostic("E0046", "cannot construct an infinite type", span);
+            self.diagnostic("E0067", "cannot construct an infinite type", span);
             return Type::Error;
         }
         if lhs.is_never() {
@@ -1951,7 +2018,7 @@ impl<'a> TypeChecker<'a> {
             return;
         }
         if self.last_occurs_error.take().is_some() {
-            self.diagnostic("E0046", "cannot construct an infinite type", occurs_span);
+            self.diagnostic("E0067", "cannot construct an infinite type", occurs_span);
             return;
         }
         let expected = self.resolve_type(expected);
@@ -2001,7 +2068,7 @@ impl<'a> TypeChecker<'a> {
         let required = Type::CallableConstraint(signature.clone());
         if !self.unify_types(&required, &actual) {
             if self.last_occurs_error.take().is_some() {
-                self.diagnostic("E0046", "cannot construct an infinite type", occurs_span);
+                self.diagnostic("E0067", "cannot construct an infinite type", occurs_span);
                 return;
             }
             let message = self
@@ -2142,6 +2209,9 @@ impl<'a> TypeChecker<'a> {
             "E0008" => vec!["only references can be dereferenced, and only arrays can be indexed".into()],
             "E0009" => vec!["check that the path names a struct definition".into()],
             "E0010" => vec!["ensure tuple element counts match".into()],
+            "E0011" if message.contains("is not supported") => {
+                vec!["scalar types are limited to the C11 portable set: integers `i8`–`i64`/`u8`–`u64` (plus `isize`/`usize`) and floats `f32`/`f64`; use the closest supported type".into()]
+            }
             "E0011" => vec!["use a valid numeric suffix and keep the literal within that type's range".into()],
             "E0012" => vec!["this source and target type pair does not support `as` conversion".into()],
             "E0013" if message.contains("ambiguous method") => {
@@ -2187,10 +2257,10 @@ impl<'a> TypeChecker<'a> {
             "E0026" => vec!["add an implementation for the required method".into()],
             "E0027" => vec!["add a type definition for the required associated type".into()],
             "E0028" | "E0029" | "E0030" => vec!["the method signature must exactly match the trait declaration: check parameter count, types, and return type".into()],
+            "E0067" => vec!["add an explicit type annotation or break the self-referential substitution cycle".into()],
             _ => Vec::new(),
         };
-        let help = (code == "E0046" && message != "cannot construct an infinite type")
-            .then(|| "wrap this operation in `unsafe { ... }`".to_string());
+        let help = (code == "E0046").then(|| "wrap this operation in `unsafe { ... }`".to_string());
         self.result.diagnostics.push(Diagnostic {
             code,
             severity: Severity::Error,
@@ -2214,11 +2284,7 @@ impl<'a> TypeChecker<'a> {
         if let Some(suffix) = suffix {
             return IntTy::parse(suffix).map_or_else(
                 || {
-                    self.diagnostic(
-                        "E0011",
-                        format!("unknown integer literal suffix `{suffix}`"),
-                        span,
-                    );
+                    self.diagnostic("E0011", integer_suffix_error(suffix), span);
                     Type::Error
                 },
                 Type::Int,
@@ -2239,11 +2305,7 @@ impl<'a> TypeChecker<'a> {
         if let Some(suffix) = suffix {
             return FloatTy::parse(suffix).map_or_else(
                 || {
-                    self.diagnostic(
-                        "E0011",
-                        format!("unknown float literal suffix `{suffix}`"),
-                        span,
-                    );
+                    self.diagnostic("E0011", float_suffix_error(suffix), span);
                     Type::Error
                 },
                 Type::Float,
@@ -2503,6 +2565,29 @@ impl<'a> TypeChecker<'a> {
     }
 }
 
+/// The lexer accepts wide literal suffixes for forward compatibility, but the
+/// type system has no such scalars: the C11 backend only maps 8–64-bit
+/// integers and `f32`/`f64`.
+const RESERVED_WIDE_TYPE_HINT: &str = "scalar types are limited to the C11 portable set: integers `i8`-`i64`/`u8`-`u64` (plus `isize`/`usize`) and floats `f32`/`f64`";
+
+fn integer_suffix_error(suffix: &str) -> String {
+    match suffix {
+        "i128" | "u128" => {
+            format!("integer literal suffix `{suffix}` is not supported; {RESERVED_WIDE_TYPE_HINT}")
+        }
+        _ => format!("unknown integer literal suffix `{suffix}`"),
+    }
+}
+
+fn float_suffix_error(suffix: &str) -> String {
+    match suffix {
+        "f16" | "f128" => {
+            format!("float literal suffix `{suffix}` is not supported; {RESERVED_WIDE_TYPE_HINT}")
+        }
+        _ => format!("unknown float literal suffix `{suffix}`"),
+    }
+}
+
 fn type_contains_infer_var(
     needle: u32,
     ty: &Type,
@@ -2564,6 +2649,29 @@ fn type_contains_infer_var(
         | Type::Const(_)
         | Type::Unknown
         | Type::Error => false,
+    }
+}
+
+/// Folds a constant binary operation over evaluated integer operands.
+fn const_value_binary(lhs: u64, rhs: u64, op: HirBinOp) -> Option<u64> {
+    match op {
+        HirBinOp::Add => Some(lhs.wrapping_add(rhs)),
+        HirBinOp::Sub => Some(lhs.wrapping_sub(rhs)),
+        HirBinOp::Mul => Some(lhs.wrapping_mul(rhs)),
+        HirBinOp::Div if rhs != 0 => Some(lhs / rhs),
+        HirBinOp::Mod if rhs != 0 => Some(lhs % rhs),
+        HirBinOp::BitAnd => Some(lhs & rhs),
+        HirBinOp::BitOr => Some(lhs | rhs),
+        HirBinOp::BitXor => Some(lhs ^ rhs),
+        HirBinOp::Shl if rhs < u64::BITS as u64 => Some(lhs << rhs),
+        HirBinOp::Shr if rhs < u64::BITS as u64 => Some(lhs >> rhs),
+        HirBinOp::Eq => Some(u64::from(lhs == rhs)),
+        HirBinOp::Neq => Some(u64::from(lhs != rhs)),
+        HirBinOp::Lt => Some(u64::from(lhs < rhs)),
+        HirBinOp::Gt => Some(u64::from(lhs > rhs)),
+        HirBinOp::LtEq => Some(u64::from(lhs <= rhs)),
+        HirBinOp::GtEq => Some(u64::from(lhs >= rhs)),
+        _ => None,
     }
 }
 

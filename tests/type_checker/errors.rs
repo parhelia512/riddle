@@ -45,8 +45,10 @@ fn rejects_scalar_types_without_portable_c11_representations() {
     let messages = messages(&result);
     for name in ["i128", "u128", "f16", "f128"] {
         assert!(
-            messages.iter().any(|message| message.contains(name)),
-            "missing diagnostic for {name}: {:#?}",
+            messages
+                .iter()
+                .any(|message| message.contains(name) && message.contains("is not supported")),
+            "missing unsupported-suffix diagnostic for {name}: {:#?}",
             result.diagnostics
         );
     }
@@ -1071,6 +1073,30 @@ fn array_type_length_must_be_literal() {
         messages(&result)
             .iter()
             .any(|msg| msg.contains("invalid type annotation"))
+    );
+}
+
+#[test]
+fn const_items_drive_array_lengths_and_repeat_counts() {
+    let result = check(
+        r"
+        const WIDTH: usize = 8;
+        const HEIGHT: usize = 4;
+
+        fun take_row(row: [i32; WIDTH]) -> i32 { row[0] }
+
+        fun main() -> i32 {
+            let row: [i32; WIDTH] = [0; WIDTH];
+            let grid: [i32; 32] = [0; WIDTH * HEIGHT];
+            take_row(row) + grid[31]
+        }
+        ",
+    );
+
+    assert!(
+        result.diagnostics.is_empty(),
+        "evaluated constants should back array types and repeats: {:#?}",
+        result.diagnostics
     );
 }
 

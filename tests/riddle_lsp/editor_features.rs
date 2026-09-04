@@ -253,10 +253,10 @@ fn selection_ranges_nest_from_identifier_to_file() {
     let Some(Some(selection)) = ranges.first() else {
         panic!("expected a selection range")
     };
-    let mut chain = vec![selection.range.clone()];
+    let mut chain = vec![selection.range];
     let mut current = selection.parent.as_deref();
     while let Some(ancestor) = current {
-        chain.push(ancestor.range.clone());
+        chain.push(ancestor.range);
         current = ancestor.parent.as_deref();
     }
     assert!(chain.windows(2).all(|pair| {

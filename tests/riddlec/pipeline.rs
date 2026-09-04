@@ -2574,3 +2574,89 @@ fn for_pattern_destructuring_compiles_and_runs_to_exit_code() {
         "tuple pairs sum 66 and struct points sum 10"
     );
 }
+
+#[test]
+fn panic_locations_resolve_to_the_original_module_file() {
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    if !std::process::Command::new(&compiler)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping panic-location end-to-end test: no usable C compiler");
+        return;
+    }
+
+    let root = temp_source_root("panic-location");
+    fs::create_dir_all(&root).unwrap();
+    let entry = root.join("main.rid");
+    fs::write(
+        &entry,
+        "mod helper;\n\nfun main() {\n    helper::boom();\n}\n",
+    )
+    .unwrap();
+    let helper = root.join("helper.rid");
+    // `panic!` sits on line 2, column 5 of helper.rid.
+    fs::write(&helper, "pub fun boom() {\n    panic!(\"exploded\");\n}\n").unwrap();
+
+    let mut loaded = load_source_file(&entry).unwrap();
+    let expansion = riddlec::proc_macro::expand_standard_macros(&loaded.source);
+    assert!(
+        expansion.diagnostics.is_empty(),
+        "{:#?}",
+        expansion.diagnostics
+    );
+    loaded.apply_expansion(expansion.source, &expansion.mappings);
+
+    let package_range = 0..loaded.source.len();
+    let result = compile_package_with_options_and_gc(
+        &loaded.source,
+        std::slice::from_ref(&package_range),
+        CompileOptions { use_std: true },
+        true,
+    );
+    assert!(result.success(), "{:#?}", result.type_result.diagnostics);
+    let module = result.mir_module.expect("successful build produces MIR");
+    let c_code = generate_c_for_package_with_source_map(
+        &module,
+        0,
+        true,
+        &loaded.source_map,
+        &entry.display().to_string(),
+    )
+    .unwrap();
+    let panic_call = c_code
+        .lines()
+        .find(|line| line.trim_start().starts_with("riddle_panic("))
+        .expect("generated C calls riddle_panic");
+    assert!(panic_call.contains("helper.rid"), "{panic_call}");
+    assert!(panic_call.contains(", 2, 5);"), "{panic_call}");
+
+    let runtime = root.join("main.runtime.c");
+    fs::write(&runtime, gc::RUNTIME_C.as_bytes()).unwrap();
+    let args_runtime = root.join("main.args.c");
+    fs::write(&args_runtime, gc::ARGS_RUNTIME_C.as_bytes()).unwrap();
+    let source = root.join("main.c");
+    fs::write(&source, c_code.as_bytes()).unwrap();
+    let executable = root.join(if cfg!(windows) { "main.exe" } else { "main" });
+    let compile_output = std::process::Command::new(&compiler)
+        .arg(&source)
+        .arg(&runtime)
+        .arg(&args_runtime)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compile_output.status.success(),
+        "C compile failed:\n{}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+    let run = std::process::Command::new(&executable).output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let _ = fs::remove_dir_all(&root);
+    assert!(
+        stderr.contains("panicked at") && stderr.contains("helper.rid:2:5:"),
+        "panic location should point at helper.rid:2:5, got: {stderr}"
+    );
+}

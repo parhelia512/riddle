@@ -94,14 +94,14 @@ fn accepts_supported_target_and_rejects_unknown_target() {
 }
 
 #[test]
-fn c_backend_rejects_multiple_inputs() {
+fn c_backend_combines_multiple_inputs_into_one_program() {
     let root = temp_root("multiple-inputs");
     fs::create_dir_all(&root).unwrap();
     let first = root.join("first.rid");
     let second = root.join("second.rid");
     let generated = root.join("combined.c");
-    fs::write(&first, "fun first() {}\n").unwrap();
-    fs::write(&second, "fun second() {}\n").unwrap();
+    fs::write(&first, "fun main() -> i32 { double(21) }\n").unwrap();
+    fs::write(&second, "pub fun double(value: i32) -> i32 { value * 2 }\n").unwrap();
 
     let output = run(&[
         Path::new("--backend"),
@@ -112,14 +112,18 @@ fn c_backend_rejects_multiple_inputs() {
         &second,
     ]);
 
-    assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("C backend accepts exactly one input file"),
+        output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!generated.exists());
+    let code = fs::read_to_string(&generated).unwrap();
+    // `double` is emitted with the standard hex-encoded function symbol.
+    let double_symbol: String = ["riddle_f_", "646f75626c65"].concat();
+    assert!(
+        code.contains(&double_symbol),
+        "second.rid items participate in the combined program"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

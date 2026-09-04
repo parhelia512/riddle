@@ -81,6 +81,7 @@ path = "app/riddle/src/main.rs"
 ast = { path = "crates/ast" }
 escape-analysis = { path = "crates/escape-analysis" }
 frontend = { path = "crates/frontend" }
+gc = { path = "crates/gc" }
 hir = { path = "crates/hir" }
 lsp-types = "0.94.1"
 mir = { path = "crates/mir" }

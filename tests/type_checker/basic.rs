@@ -1438,8 +1438,66 @@ fn self_application_reports_an_infinite_type_without_overflowing() {
     );
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0046" && diagnostic.message == "cannot construct an infinite type"
+        diagnostic.code == "E0067" && diagnostic.message == "cannot construct an infinite type"
     }));
+}
+
+#[test]
+fn same_argument_generic_recursion_is_accepted() {
+    let result = check(
+        r"
+        struct Wrap<T> { inner: T }
+
+        fun depth<T>(value: T, n: i32) -> i32 {
+            if n <= 0 { 0 } else { 1 + depth(value, n - 1) }
+        }
+
+        fun ping<T>(value: T, n: i32) -> i32 {
+            if n <= 0 { 0 } else { pong(value, n - 1) }
+        }
+
+        fun pong<T>(value: T, n: i32) -> i32 {
+            ping(value, n - 1)
+        }
+
+        fun describe<T>(value: T) -> i32 { 0 }
+
+        fun grows_without_recursing<T>(value: T) -> i32 {
+            describe(Wrap { inner: value })
+        }
+
+        fun main() -> i32 {
+            depth(1, 3) + ping(1, 2) + grows_without_recursing(1)
+        }
+        ",
+    );
+
+    assert!(
+        result.diagnostics.is_empty(),
+        "same-argument and acyclic-growing generic calls must be accepted: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn growing_generic_recursion_is_rejected() {
+    let result = check(
+        r"
+        struct Wrap<T> { inner: T }
+
+        fun f<T>(value: T) -> Wrap<T> { g(Wrap { inner: value }) }
+        fun g<T>(value: T) -> Wrap<T> { f(Wrap { inner: value }) }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0033"),
+        "a mutually-growing generic cycle must be rejected: {:#?}",
+        result.diagnostics
+    );
 }
 
 #[test]
