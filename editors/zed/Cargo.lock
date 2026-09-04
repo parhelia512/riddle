@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "riddle-zed"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "zed_extension_api",
 ]

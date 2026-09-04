@@ -6,7 +6,7 @@
 
 这是 [Riddle][github] 的主源码仓库，包含格式化工具（`riddle fmt`）、编译器（`riddlec`）、项目工具（`clue`）和语言服务器（`riddle-lsp`）。
 
-Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.2` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。当前版本仍处于技术预览阶段：语言和工具链仍可能发生不兼容变化。
+Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.3` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。当前版本仍处于技术预览阶段：语言和工具链仍可能发生不兼容变化。
 
 ## 为什么选择 Riddle？
 
