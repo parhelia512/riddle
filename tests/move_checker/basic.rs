@@ -1476,10 +1476,10 @@ fn anonymous_function_parameters_follow_move_rules() {
         struct Point { x: i32 }
 
         fun main() {
-            let consume_twice = fun(value: Point) {
+            let consume_twice = [value: Point -> {
                 let first = value;
                 let second = value;
-            };
+            }];
         }
         ",
     );
@@ -1498,11 +1498,11 @@ fn inferred_anonymous_function_parameters_follow_move_rules() {
         struct Point { x: i32 }
 
         fun main() {
-            let consume_twice = fun(value) {
+            let consume_twice = [value -> {
                 let first = value;
                 let second = value;
                 second
-            };
+            }];
             consume_twice(Point { x: 1 });
         }
         ",
@@ -1528,7 +1528,7 @@ fn value_capture_moves_non_copy_binding() {
 
         fun main() {
             let token = Token { value: 1 };
-            let once = fun() { consume(token); };
+            let once = [ -> { consume(token); }];
             let again = token;
         }
         ",
@@ -1550,7 +1550,7 @@ fn once_closure_cannot_be_called_twice() {
 
         fun main() {
             let token = Token { value: 1 };
-            let once = fun() { consume(token); };
+            let once = [ -> { consume(token); }];
             once();
             once();
         }
@@ -1571,7 +1571,7 @@ fn closure_value_moves_when_passed_by_value() {
         fun consume(f: impl Fn(i32) -> i32) {}
 
         fun test() {
-            let add_one = fun(value: i32) { value + 1 };
+            let add_one = [value: i32 -> value + 1];
             consume(add_one);
             consume(add_one);
         }
@@ -1595,7 +1595,7 @@ fn once_closure_stays_once_after_branch_join() {
 
         fun main() {
             let token = Token { value: 1 };
-            let once = fun() { consume(token); };
+            let once = [ -> { consume(token); }];
             let once = if true { once } else { once };
             once();
             once();
@@ -1657,7 +1657,7 @@ fn shared_pattern_capture_blocks_later_move() {
             let source = Token { value: 1 };
             match source {
                 token => {
-                    let read = fun() { inspect(&token) };
+                    let read = [ -> inspect(&token)];
                     consume(token);
                     read();
                 }
@@ -1683,7 +1683,7 @@ fn shared_capture_blocks_assignment_while_closure_is_live() {
         r"
         fun main() {
             let mut base = 1;
-            let read = fun() { base };
+            let read = [ -> base];
             base = 2;
             read();
         }
@@ -1757,7 +1757,7 @@ fn by_value_operator_makes_its_closure_single_use() {
         fun main() {
             let left = Token { value: 1 };
             let right = Token { value: 2 };
-            let add = fun() { left + right };
+            let add = [ -> left + right];
             add();
             add();
         }

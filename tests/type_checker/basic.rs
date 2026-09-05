@@ -243,12 +243,12 @@ fn general_impl_trait_and_advanced_callables_type_check() {
 
         fun read(value: impl Value) -> i32 { value.value() }
         fun make() -> impl Value { 7i32 }
+        fun first<T: Value>(pair: (T, T)) -> i32 { pair.0.value() }
+        fun fib(n: i32) -> i32 {
+            if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+        }
 
         fun main() -> i32 {
-            let first = fun<T: Value>((left, _): (T, T)) -> i32 { left.value() };
-            let fib = fun(n: i32) -> i32 {
-                if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
-            };
             let add = Adder { amount: 2 };
             read(make()) + first::<i32>((add(3), 0)) + fib(6)
         }
@@ -259,14 +259,15 @@ fn general_impl_trait_and_advanced_callables_type_check() {
 }
 
 #[test]
-fn generic_anonymous_function_checks_bounds_at_call_site() {
+fn generic_function_checks_bounds_at_call_site() {
     let result = check(
         r"
         trait Value {}
         struct Missing {}
 
+        fun use_value<T: Value>(value: T) -> T { value }
+
         fun main() {
-            let use_value = fun<T: Value>(value: T) { value };
             use_value(Missing {});
         }
         ",
@@ -289,13 +290,14 @@ fn generic_anonymous_function_can_capture_and_recurse() {
         }
 
         fun make<T: Value>(value: T) -> impl Fn() -> i32 {
-            fun() -> i32 { value.value() }
+            [ -> value.value()]
+        }
+
+        fun recurse<T>(value: T) -> T {
+            if true { value } else { recurse::<T>(value) }
         }
 
         fun main() {
-            let recurse = fun<T>(value: T) -> T {
-                if true { value } else { recurse::<T>(value) }
-            };
             let _ = make(7i32);
             let _ = recurse::<i32>(1);
         }
@@ -609,7 +611,7 @@ fn infers_generic_function_parameter_from_anonymous_function() {
         fun test<T>(value: T, f: impl Fn(T) -> T) { f(value); }
 
         fun main() {
-            test(1, fun(x) { x + 1 });
+            test(1, [x -> x + 1]);
         }
         ",
     );
@@ -763,7 +765,7 @@ fn infers_and_calls_anonymous_function() {
         }
 
         fun main() -> i32 {
-            let inc = fun(x) { x + 1 };
+            let inc = [x -> x + 1];
             apply(inc, 41)
         }
         ",
@@ -777,7 +779,7 @@ fn later_call_constrains_anonymous_parameter_type() {
     let result = check(
         r"
         fun main() -> i32 {
-            let identity = fun(value) { value };
+            let identity = [value -> value];
             identity(42)
         }
         ",
@@ -792,7 +794,7 @@ fn infers_shared_closure_capture() {
         r"
         fun main() -> i32 {
             let base = 1;
-            let add = fun(x: i32) { x + base };
+            let add = [x: i32 -> x + base];
             add(41)
         }
         ",
@@ -813,7 +815,7 @@ fn captures_pattern_bindings() {
         fun main() -> i32 {
             match 1 {
                 base => {
-                    let read = fun() { base };
+                    let read = [ -> base];
                     read()
                 }
             }
@@ -834,10 +836,10 @@ fn infers_mutable_closure_capture() {
         r"
         fun main() -> i32 {
             let mut total = 0;
-            let mut add = fun(value: i32) -> i32 {
+            let mut add = [value: i32 -> {
                 total += value;
                 total
-            };
+            }];
             add(1)
         }
         ",
@@ -851,7 +853,7 @@ fn infers_mutable_closure_capture() {
 
 #[test]
 fn mutable_closure_requires_mutable_binding() {
-    let source = "fun main() { let mut total = 0; let add = fun() { total += 1; }; add(); }";
+    let source = "fun main() { let mut total = 0; let add = [ -> { total += 1; }]; add(); }";
     let result = check(source);
 
     let diagnostic = result
@@ -888,7 +890,7 @@ fn infers_once_closure_capture() {
         fun consume(value: Token) {}
         fun main() {
             let token = Token { value: 1 };
-            let once = fun() { consume(token); };
+            let once = [ -> { consume(token); }];
         }
         ",
     );
@@ -909,7 +911,7 @@ fn by_value_method_receiver_makes_once_closure() {
         }
         fun main() {
             let token = Token { value: 1 };
-            let once = fun() { token.consume() };
+            let once = [ -> token.consume()];
         }
         ",
     );
@@ -929,7 +931,7 @@ fn once_closure_is_rejected_at_fn_boundary() {
         fun call(callback: impl Fn() -> ()) { callback(); }
         fun main() {
             let token = Token { value: 1 };
-            let once = fun() { consume(token); };
+            let once = [ -> { consume(token); }];
             call(once);
         }
         ",
@@ -947,9 +949,7 @@ fn nested_closure_does_not_capture_inner_parameters_in_outer_environment() {
     let result = check(
         r"
         fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
-            fun(first: i32) {
-                fun(second: i32) { base + first + second }
-            }
+            [first: i32 -> [second: i32 -> base + first + second]]
         }
         ",
     );
@@ -965,7 +965,7 @@ fn nested_closure_does_not_capture_inner_parameters_in_outer_environment() {
 
 #[test]
 fn reports_uninferred_anonymous_parameter() {
-    let result = check("fun main() { let id = fun(x) { x }; }");
+    let result = check("fun main() { let id = [x -> x]; }");
 
     assert!(result.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "E0045" && diagnostic.message.contains("parameter `x`")
@@ -1431,7 +1431,7 @@ fn self_application_reports_an_infinite_type_without_overflowing() {
     let result = check(
         r"
         fun main() {
-            let id = fun(value) { value };
+            let id = [value -> value];
             id(id);
         }
         ",
@@ -1505,8 +1505,8 @@ fn different_anonymous_function_expressions_have_different_types() {
     let result = check(
         r"
         fun main() {
-            let first = fun(value: i32) { value };
-            let second = fun(value: i32) { value };
+            let first = [value: i32 -> value];
+            let second = [value: i32 -> value];
             let selected = if true { first } else { second };
         }
         ",
@@ -1525,7 +1525,7 @@ fn impl_fn_accepts_closures_and_safe_named_functions() {
         fun increment(value: i32) -> i32 { value + 1 }
 
         fun main() -> i32 {
-            let add_two = fun(value: i32) { value + 2 };
+            let add_two = [value: i32 -> value + 2];
             apply(increment, 39) + apply(add_two, 0)
         }
         ",
@@ -1543,7 +1543,7 @@ fn callable_generic_arguments_are_fully_resolved() {
         }
         fun main() -> i32 {
             let mut total: i32 = 0;
-            let add = fun(value: i32) { total += value; total };
+            let add = [value: i32 -> { total += value; total }];
             run_mut(add, 2)
         }
         ",
@@ -1575,7 +1575,7 @@ fn explicit_callable_bound_can_name_one_callable_type() {
             f(value);
             f(value)
         }
-        fun main() -> i32 { call_twice(fun(value: i32) { value + 1 }, 1) }
+        fun main() -> i32 { call_twice([value: i32 -> value + 1], 1) }
         ",
     );
     assert_eq!(result.diagnostics, vec![]);
@@ -1604,7 +1604,7 @@ fn return_position_impl_fn_has_one_hidden_type() {
     let valid = check(
         r"
         fun make(base: i32) -> impl Fn(i32) -> i32 {
-            move fun(value: i32) { base + value }
+            move [value: i32 -> base + value]
         }
         fun main() -> i32 { make(40)(2) }
         ",
@@ -1615,9 +1615,9 @@ fn return_position_impl_fn_has_one_hidden_type() {
         r"
         fun choose(flag: bool) -> impl Fn(i32) -> i32 {
             if flag {
-                fun(value: i32) { value + 1 }
+                [value: i32 -> value + 1]
             } else {
-                fun(value: i32) { value + 2 }
+                [value: i32 -> value + 2]
             }
         }
         ",
@@ -1643,8 +1643,8 @@ fn each_impl_fn_parameter_has_an_independent_hidden_type() {
         }
         fun main() -> i32 {
             combine(
-                fun(value: i32) { value + 1 },
-                fun(value: i32) { value + 2 },
+                [value: i32 -> value + 1],
+                [value: i32 -> value + 2],
                 1,
             )
         }
@@ -1664,15 +1664,15 @@ fn callable_capability_requirements_follow_the_fn_hierarchy() {
         fun consume(value: Token) -> i32 { value.value }
 
         fun main() {
-            let shared = fun() { 1 };
-            let shared_for_mut = fun() { 1 };
-            let shared_for_once = fun() { 1 };
+            let shared = [ -> 1];
+            let shared_for_mut = [ -> 1];
+            let shared_for_once = [ -> 1];
             let mut total = 0;
-            let mutable = fun() { total += 1; total };
+            let mutable = [ -> { total += 1; total }];
             let mut other_total = 0;
-            let mutable_for_once = fun() { other_total += 1; other_total };
+            let mutable_for_once = [ -> { other_total += 1; other_total }];
             let token = Token { value: 2 };
-            let once = fun() { consume(token) };
+            let once = [ -> consume(token)];
             needs_fn(shared);
             needs_mut(shared_for_mut);
             needs_once(shared_for_once);
@@ -1692,7 +1692,7 @@ fn move_capture_does_not_make_a_read_only_closure_fn_once() {
         struct Token { value: i32 }
         fun main() {
             let token = Token { value: 1 };
-            let read = move fun() { token.value };
+            let read = move [ -> token.value];
             read();
             read();
         }
@@ -1739,7 +1739,7 @@ fn wildcard_match_does_not_make_a_closure_fn_once() {
         struct Token { value: i32 }
         fun main() {
             let token = Token { value: 1 };
-            let inspect = fun() { match token { _ => 0 } };
+            let inspect = [ -> match token { _ => 0 }];
             inspect();
             inspect();
         }
@@ -1760,7 +1760,7 @@ fn captures_only_the_referenced_struct_field() {
         struct Pair { left: i32, right: i32 }
         fun main() {
             let pair = Pair { left: 1, right: 2 };
-            let read = fun() { pair.left };
+            let read = [ -> pair.left];
         }
         ",
     );
@@ -1778,7 +1778,7 @@ fn dynamic_index_and_deref_stop_capture_projection_at_their_base() {
     let indexed = check(
         r"
         fun inspect(values: [i32; 2], index: usize) {
-            let read = fun() { values[index] };
+            let read = [ -> values[index]];
         }
         ",
     );
@@ -1794,7 +1794,7 @@ fn dynamic_index_and_deref_stop_capture_projection_at_their_base() {
     let dereferenced = check(
         r"
         fun inspect(value: &i32) {
-            let read = fun() { *value };
+            let read = [ -> *value];
         }
         ",
     );

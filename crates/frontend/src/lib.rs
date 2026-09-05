@@ -51,10 +51,10 @@ mod tests {
             }
 
             fun main() {
-                let bump = move fun(mut value: i32) {
+                let bump = move [mut value: i32 -> {
                     value += 1;
                     value
-                };
+                }];
             }
             ",
         );
@@ -87,14 +87,14 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_functions_keep_named_nongeneric_parameters() {
+    fn bracket_lambdas_keep_named_nongeneric_parameters() {
         let mut parser = IncrementalParser::new();
-        let parse = parser.set_source("fun main() { let f = fun(value: i32) { value }; }");
+        let parse = parser.set_source("fun main() { let f = [value: i32 -> value]; }");
         assert!(parse.errors.is_empty(), "{:?}", parse.errors);
     }
 
     #[test]
-    fn accepts_generic_anonymous_function_patterns_and_callable_impls() {
+    fn accepts_lambda_patterns_and_callable_impls() {
         let mut parser = IncrementalParser::new();
         let source = r"
             struct Adder { amount: i32 }
@@ -102,7 +102,7 @@ mod tests {
                 fun call(&self, value: i32) -> i32 { value + self.amount }
             }
             fun main() {
-                let first = fun<T>((left, _): (T, T)) -> T { left };
+                let first = [(left, _): (i32, i32) -> left];
             }
         ";
         let parse = parser.set_source(source);
@@ -283,19 +283,20 @@ mod tests {
     }
 
     #[test]
-    fn array_containing_fun_lambda_is_not_misjudged_as_bracket_lambda() {
+    fn removed_fun_lambda_syntax_points_at_bracket_lambdas() {
         let mut parser = IncrementalParser::new();
         let parse = parser.set_source(
             r"
             fun main() {
-                let lambdas = [fun(x) -> i32 { x }];
+                let f = fun(x) -> i32 { x };
             }
             ",
         );
 
-        assert!(parse.errors.is_empty(), "{:?}", parse.errors);
-        assert!(tree_has(parse, syntax::SyntaxKind::ArrayExpr));
-        assert!(!tree_has(parse, syntax::SyntaxKind::BracketLambdaExpr));
+        assert!(parse.errors.iter().any(|error| {
+            error.message.contains("anonymous function syntax")
+                && error.message.contains("bracket lambda")
+        }));
     }
 
     #[test]

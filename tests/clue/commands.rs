@@ -163,47 +163,45 @@ fun run_mut(mut f: impl FnMut(i32) -> i32, value: i32) -> i32 {
 }
 
 fun make_callable(base: i32) -> impl Fn(i32) -> i32 {
-    move fun(value: i32) { base + value }
+    move [value: i32 -> base + value]
 }
 
 fun make_adder(base: i32) -> impl Fn(i32) -> i32 {
-    fun(value: i32) { base + value }
+    [value: i32 -> base + value]
 }
 
 fun mutable_capture() -> i32 {
     let mut total = 0;
-    let mut add = fun(value: i32) -> i32 {
+    let mut add = [value: i32 -> {
         total += value;
         total
-    };
+    }];
     add(1);
     add(2)
 }
 
 fun value_capture() -> i32 {
     let token = Token { value: 7 };
-    let consume = fun() { take(token) };
+    let consume = [ -> take(token)];
     consume()
 }
 
 fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
-    fun(first: i32) {
-        fun(second: i32) { base + first + second }
-    }
+    [first: i32 -> [second: i32 -> base + first + second]]
 }
 
 fun match_capture() -> i32 {
-    let read = match 42 { value => fun() { value } };
+    let read = match 42 { value => [ -> value] };
     read()
 }
 
 fun shadowed_pattern_capture() -> i32 {
     match 1 {
         value => {
-            let outer = fun() { value };
+            let outer = [ -> value];
             match 2 {
                 value => {
-                    let inner = fun() { value };
+                    let inner = [ -> value];
                     outer() + inner()
                 }
             }
@@ -214,7 +212,7 @@ fun shadowed_pattern_capture() -> i32 {
 fun for_capture() -> i32 {
     let mut total = 0;
     for value in [1, 2, 3] {
-        let read = fun() { value };
+        let read = [ -> value];
         total += read();
     }
     total
@@ -242,7 +240,7 @@ fun main() -> i32 {
     let outer = nested(10);
     let inner = outer(20);
     let mut total = 0;
-    let add_total = fun(value: i32) { total += value; total };
+    let add_total = [value: i32 -> { total += value; total }];
     let made = make_callable(40);
     if (*first).value == 42 && (*second).value == 7 && while_sum == 8 && for_sum == 8
         && add(2) == 42 && mutable_capture() == 3 && value_capture() == 7
@@ -808,7 +806,7 @@ fn no_gc_build_has_no_collector_and_runs_owned_values() {
     fs::write(
         project.join("src/main.rid"),
         r#"fun make(base: i32) -> impl Fn(i32) -> i32 {
-    move fun(value: i32) { base + value }
+    move [value: i32 -> base + value]
 }
 
 fun main() -> i32 {
@@ -942,7 +940,7 @@ fun nested_field_array_ref() -> &Data {
 fun param_ref(value: Data) -> &Data { &value }
 
 fun lambda_ref() -> impl Fn(Data) -> &Data {
-    fun(value: Data) -> &Data { &value }
+    [value: Data -> &value]
 }
 
 fun main() -> i32 {
@@ -1094,13 +1092,13 @@ fun main() -> i32 {
     for value in &mut numbers { *value += 1; }
 
     let option = Some(1)
-        .map(fun(value: i32) -> i32 { value + 1 })
-        .and_then(fun(value: i32) -> Option<i32> { Some(value) })
+        .map([value: i32 -> value + 1])
+        .and_then([value: i32 -> Some(value)])
         .unwrap();
     let base: Result<i32, i32> = Result::Ok(1);
     let result = base
-        .map(fun(value: i32) -> i32 { value + 1 })
-        .and_then(fun(value: i32) -> Result<i32, i32> { read(value) })
+        .map([value: i32 -> value + 1])
+        .and_then([value: i32 -> read(value)])
         .unwrap();
 
     let key = String::from_str("count");
@@ -1963,11 +1961,11 @@ fn inferred_lambda_parameter_move_is_rejected_by_clue_check() {
     fs::write(
         root.join("app/src/main.rid"),
         r"fun main() {
-    let consume_twice = fun(value) {
+    let consume_twice = [value -> {
         let first = value;
         let second = value;
         second
-    };
+    }];
     let mut values: Vector<i32> = Vector::new();
     values.push(1);
     let result = consume_twice(values);
@@ -2009,12 +2007,12 @@ impl<T> Fn(T) -> T for Identity<T> {
 
 fun read(value: impl Value) -> i32 { value.value() }
 fun make() -> impl Value { 7i32 }
+fun first<T: Value>(pair: (T, T)) -> i32 { pair.0.value() }
+fun fib(n: i32) -> i32 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
 
 fun main() -> i32 {
-    let first = fun<T: Value>((left, _): (T, T)) -> i32 { left.value() };
-    let fib = fun(n: i32) -> i32 {
-        if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
-    };
     let add = Adder { amount: 2 };
     let identity = Identity { marker: 0 };
     if read(make()) == 7 && first::<i32>((9, 0)) == 9
@@ -2049,14 +2047,15 @@ fn generic_callable_capture_and_recursion_compile_and_run() {
 impl Value for i32 { fun value(&self) -> i32 { *self } }
 
 fun make<T: Value>(value: T) -> impl Fn() -> i32 {
-    fun() -> i32 { value.value() }
+    [ -> value.value()]
+}
+
+fun recurse<T>(value: T) -> T {
+    if true { value } else { recurse::<T>(value) }
 }
 
 fun main() -> i32 {
     let captured = make(7i32);
-    let recurse = fun<T>(value: T) -> T {
-        if true { value } else { recurse::<T>(value) }
-    };
     if captured() == 7 && recurse::<i32>(5) == 5 { 0 } else { 1 }
 }
 "#,
@@ -2086,26 +2085,24 @@ fn generic_lambda_capture_runs_per_instance() {
         root.join("app/src/main.rid"),
         r#"trait Value { fun value(&self) -> i32; }
 impl Value for i32 { fun value(&self) -> i32 { *self } }
+impl Value for bool { fun value(&self) -> i32 { if *self { 1 } else { 0 } } }
 
 trait Marker<T> { fun mark(&self) -> i32; }
 struct MarkerValue<T> { value: T }
 impl<T> Marker<T> for MarkerValue<T> { fun mark(&self) -> i32 { 1 } }
 fun make_marker<T>(value: T) -> impl Marker<T> { MarkerValue { value } }
 
-fun outer<T: Value>(value: T) -> i32 {
-    let apply = fun<U>(ignored: U) -> i32 { value.value() };
-    apply::<bool>(true)
+fun make_capture<T: Value>(value: T) -> impl Fn() -> i32 {
+    [ -> value.value()]
 }
 
 fun main() -> i32 {
-    let base = 3;
-    let choose = fun<T>(value: T, again: bool) -> i32 {
-        if again { choose::<T>(value, false) } else { base }
-    };
+    let int_capture = make_capture(9i32);
+    let bool_capture = make_capture(true);
     let marker = make_marker(5i32);
     let marker_bool = make_marker(true);
-    if choose::<i32>(9, true) == 3
-        && outer(11i32) == 11
+    if int_capture() == 9
+        && bool_capture() == 1
         && marker.mark() == 1
         && marker_bool.mark() == 1
     {
@@ -2291,9 +2288,9 @@ fn closures_capture_destructured_bindings() {
         root.join("app/src/main.rid"),
         r#"fun main() -> i32 {
     let (a, b) = (10, 20);
-    let sum = fun() -> i32 { a + b };
+    let sum = [ -> a + b];
     let (mut c, d) = (1, 2);
-    let mut bump = fun() { c = c + d; };
+    let mut bump = [ -> { c = c + d; }];
     bump();
     bump();
     print!("{}", sum() + c);
@@ -3663,8 +3660,8 @@ pub fun derive_answer(input: TokenStream) -> TokenStream {
         || !parses_expr("for item in values { item }")
         || !parses_expr("match value { Option::Some(item) if item > 0 => item, _ => 0 }")
         || !parses_expr("unsafe { value }")
-        || !parses_expr("fun(value: &i32) -> i32 { *value }")
-        || !parses_expr("move fun() { }")
+        || !parses_expr("[value: &i32 -> *value]")
+        || !parses_expr("move [ -> {}]")
         || !parses_expr("make!(value)")
         || !parses_expr("Vector::new()")
         || !parses_expr("Vector { value: 1 }")

@@ -134,7 +134,7 @@ fn no_gc_allows_an_owned_escaping_closure() {
         r"
         fun make() -> impl Fn() -> i32 {
             let value = 42;
-            move fun() -> i32 { value }
+            move [ -> value]
         }
         ",
         CompileOptions { use_std: false },
@@ -151,7 +151,7 @@ fn no_gc_rejects_a_borrowed_escaping_closure() {
         r"
         fun make() -> impl Fn() -> i32 {
             let value = 42;
-            fun() -> i32 { value }
+            [ -> value]
         }
         ",
         CompileOptions { use_std: false },
@@ -1106,11 +1106,11 @@ fn closure_returned_reference_cannot_borrow_drop_local() {
     let result = compile(
         r"
             fun main() {
-                let make = fun() -> &i32 {
+                let make = [ -> {
                     let mut values: Vector<i32> = Vector::new();
                     values.push(42);
                     &values[0]
-                };
+                }];
                 let reference = make();
                 *reference;
             }
@@ -1339,8 +1339,8 @@ fn std_p0_cli_foundations_typecheck() {
                 let value = read(1)?;
                 let base: Result<i32, i32> = Result::Ok(value);
                 base
-                    .map(fun(value: i32) -> i32 { value + 1 })
-                    .and_then(fun(value: i32) -> Result<i32, i32> { Result::Ok(value) })
+                    .map([value: i32 -> value + 1])
+                    .and_then([value: i32 -> Result::Ok(value)])
             }
 
             fun main() -> i32 {
@@ -1352,8 +1352,8 @@ fn std_p0_cli_foundations_typecheck() {
                 for value in &mut values { *value += 1; }
 
                 let mapped = Option::Some(1)
-                    .map(fun(value: i32) -> i32 { value + 1 })
-                    .and_then(fun(value: i32) -> Option<i32> { Option::Some(value) })
+                    .map([value: i32 -> value + 1])
+                    .and_then([value: i32 -> Option::Some(value)])
                     .unwrap();
 
                 let key = String::from_str("name");

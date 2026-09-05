@@ -781,7 +781,7 @@ fn c_anonymous_function_uses_typed_function_pointer() {
         }
 
         fun main() -> i32 {
-            let inc = fun(x) { x + 1 };
+            let inc = [x -> x + 1];
             apply(inc, 41)
         }
         ",
@@ -809,7 +809,7 @@ fn c_non_escaping_closure_capture_uses_stack_environment() {
         r"
         fun main() -> i32 {
             let base = 40;
-            let add = fun(value: i32) { base + value };
+            let add = [value: i32 -> base + value];
             add(2)
         }
         ",
@@ -836,7 +836,7 @@ fn c_returned_closure_keeps_parameter_alive() {
     let module = lower(
         r"
         fun make_adder(base: i32) -> impl Fn(i32) -> i32 {
-            fun(value: i32) { base + value }
+            [value: i32 -> base + value]
         }
 
         fun main() -> i32 {
@@ -870,7 +870,7 @@ fn c_gc_closure_environment_has_deterministic_drop_glue() {
 
         fun make() -> impl FnOnce() -> () {
             let guard = Guard {};
-            fun() { consume(guard); }
+            [ -> { consume(guard); }]
         }
 
         fun main() {
@@ -955,12 +955,12 @@ fn c_dyn_callable_closure_runs_with_gc_and_without_gc() {
         fun apply_once(value: dyn FnOnce() -> i32) -> i32 { value() }
         fun main() -> i32 {
             let mut total = 0;
-            let mut callback: dyn FnMut(i32) -> i32 = fun(value: i32) {
+            let mut callback: dyn FnMut(i32) -> i32 = [value: i32 -> {
                 total += value;
                 total
-            };
+            }];
             let first = apply_mut(&mut callback, 2);
-            let once: dyn FnOnce() -> i32 = fun() { first + 40 };
+            let once: dyn FnOnce() -> i32 = [ -> first + 40];
             if apply_once(once) == 42 { 0 } else { 1 }
         }
         "#,
@@ -2548,7 +2548,7 @@ fn c_closure_environment_stores_only_the_captured_field() {
                 first: First { value: 1 },
                 second: Second { value: 2 },
             };
-            let take_first = fun() { read(pair.first) };
+            let take_first = [ -> read(pair.first)];
             pair.second.value
         }
         ",
@@ -2577,7 +2577,7 @@ fn c_impl_fn_supports_closures_named_functions_and_opaque_returns() {
         fun apply(f: impl Fn(i32) -> i32, value: i32) -> i32 { f(value) }
         fun increment(value: i32) -> i32 { value + 1 }
         fun make(base: i32) -> impl Fn(i32) -> i32 {
-            move fun(value: i32) { base + value }
+            move [value: i32 -> base + value]
         }
         fun main() -> i32 {
             apply(increment, 1) + apply(make(38), 2)

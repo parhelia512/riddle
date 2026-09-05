@@ -88,7 +88,7 @@ fn lowers_move_lambda_mutable_params_and_impl_fn() {
             f(value)
         }
         fun main() {
-            let bump = move fun(mut value: i32) { value };
+            let bump = move [mut value: i32 -> value];
         }
         ",
     );
@@ -378,7 +378,7 @@ fn resolves_enum_variant_in_path() {
 
 #[test]
 fn lowers_and_resolves_anonymous_function_parameters() {
-    let (mut hir, sg) = build_hir_and_graph("fun main() { let inc = fun(x) { x + 1 }; inc(41); }");
+    let (mut hir, sg) = build_hir_and_graph("fun main() { let inc = [x -> x + 1]; inc(41); }");
     resolve_hir(&mut hir, &sg);
 
     let body = &hir.bodies[*hir.function_bodies.values().next().unwrap()];
@@ -399,7 +399,7 @@ fn lowers_and_resolves_anonymous_function_parameters() {
 #[test]
 fn resolves_pattern_bindings_for_closure_capture() {
     let (mut hir, sg) = build_hir_and_graph(
-        "fun main() -> i32 { match 1 { value => { let read = fun() { value }; read() } } }",
+        "fun main() -> i32 { match 1 { value => { let read = [ -> value]; read() } } }",
     );
     resolve_hir(&mut hir, &sg);
 

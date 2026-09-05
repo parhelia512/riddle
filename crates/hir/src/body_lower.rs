@@ -461,8 +461,6 @@ impl<'a> BodyLower<'a> {
                 )
             }
 
-            ast::Expr::LambdaExpr(lambda) => self.lower_lambda_expr(&lambda, range),
-
             ast::Expr::BracketLambdaExpr(lambda) => self.lower_bracket_lambda_expr(&lambda, range),
 
             ast::Expr::MatchExpr(match_expr) => self.lower_match_expr(&match_expr, range),
@@ -762,31 +760,6 @@ impl<'a> BodyLower<'a> {
             Expr::For {
                 pat,
                 iterable,
-                body,
-            },
-            range,
-        )
-    }
-
-    fn lower_lambda_expr(&mut self, lambda: &ast::LambdaExpr, range: TextRange) -> ExprId {
-        let generic_params = lambda.generic_params();
-        let generics = super::lower::lower_generic_params(generic_params.clone());
-        let generic_bounds =
-            super::lower::lower_generic_bounds(generic_params, lambda.where_clause());
-        let params = self.lower_lambda_params(lambda.param_list());
-        let ret_type = lambda.return_type();
-        let ret_type_range = ret_type.as_ref().map(|ty| trimmed_range(ty.syntax()));
-        let ret_type = Self::lower_optional_type(ret_type);
-        let body =
-            self.lower_required_block(lambda.body(), "missing anonymous function body", range);
-        self.alloc_expr(
-            Expr::Lambda {
-                is_move: lambda.is_move(),
-                generics,
-                generic_bounds,
-                params,
-                ret_type,
-                ret_type_range,
                 body,
             },
             range,

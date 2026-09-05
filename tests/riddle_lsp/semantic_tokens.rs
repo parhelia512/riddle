@@ -457,9 +457,7 @@ fun print_digit(n: i32){
 }
 
 fun main(){
-    let t = fun(x) {
-        x+1
-    };
+    let t = [x -> x+1];
     let v = t(1);
     print_digit(v);
 }"#;
@@ -494,21 +492,22 @@ fun main(){
             },
             SemanticTokenPosition {
                 line: 8,
-                start: 16,
+                start: 13,
                 length: 1,
                 token_type: TOKEN_PARAMETER,
                 token_modifiers_bitset: MOD_DECLARATION,
             },
+            // The lambda body's reference to its own parameter.
             SemanticTokenPosition {
-                line: 9,
-                start: 8,
+                line: 8,
+                start: 18,
                 length: 1,
                 token_type: TOKEN_PARAMETER,
                 token_modifiers_bitset: 0,
             },
             // Immutable local closure `t` at its call site in `t(1)`.
             SemanticTokenPosition {
-                line: 11,
+                line: 9,
                 start: 12,
                 length: 1,
                 token_type: TOKEN_VARIABLE,
@@ -516,7 +515,7 @@ fun main(){
             },
             // Immutable local `v` at its use site in `print_digit(v)`.
             SemanticTokenPosition {
-                line: 12,
+                line: 10,
                 start: 16,
                 length: 1,
                 token_type: TOKEN_VARIABLE,

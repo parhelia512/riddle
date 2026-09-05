@@ -189,7 +189,7 @@ fn std_iterator_combinators_and_eager_maps_run() {
 
         fun main() -> i32 {
             let counter = Counter { index: 0usize, limit: 5usize };
-            let sum = counter.fold(0i32, fun(acc: i32, value: i32) -> i32 { acc + value });
+            let sum = counter.fold(0i32, [acc: i32, value: i32 -> acc + value]);
             if sum != 15i32 { return 1; }
 
             let mut counter2 = Counter { index: 0usize, limit: 5usize };
@@ -199,23 +199,23 @@ fn std_iterator_combinators_and_eager_maps_run() {
             if counter3.nth(2usize).unwrap_or(0i32) != 3i32 { return 3; }
 
             let mut counter4 = Counter { index: 0usize, limit: 5usize };
-            if !counter4.all(fun(v: i32) -> bool { v > 0i32 }) { return 4; }
+            if !counter4.all([v: i32 -> v > 0i32]) { return 4; }
 
             let mut counter5 = Counter { index: 0usize, limit: 5usize };
-            if !counter5.any(fun(v: i32) -> bool { v > 3i32 }) { return 5; }
+            if !counter5.any([v: i32 -> v > 3i32]) { return 5; }
 
             let mut counter6 = Counter { index: 0usize, limit: 5usize };
-            if counter6.find(fun(v: &i32) -> bool { *v == 4i32 }).unwrap_or(0i32) != 4i32 {
+            if counter6.find([v: &i32 -> *v == 4i32]).unwrap_or(0i32) != 4i32 {
                 return 6;
             }
 
             let mut counter7 = Counter { index: 0usize, limit: 5usize };
-            if counter7.position(fun(v: &i32) -> bool { *v == 4i32 }).unwrap_or(9usize) != 3usize {
+            if counter7.position([v: &i32 -> *v == 4i32]).unwrap_or(9usize) != 3usize {
                 return 7;
             }
 
             let mut counter8 = Counter { index: 0usize, limit: 4usize };
-            let doubled = map_into(&mut counter8, fun(v: i32) -> i32 { v * 2i32 });
+            let doubled = map_into(&mut counter8, [v: i32 -> v * 2i32]);
             let mut total = 0i32;
             for value in doubled {
                 total += value;
@@ -223,7 +223,7 @@ fn std_iterator_combinators_and_eager_maps_run() {
             if total != 20i32 { return 8; }
 
             let mut counter9 = Counter { index: 0usize, limit: 6usize };
-            let evens = filter_into(&mut counter9, fun(v: &i32) -> bool { *v % 2i32 == 0i32 });
+            let evens = filter_into(&mut counter9, [v: &i32 -> *v % 2i32 == 0i32]);
             let mut even_total = 0i32;
             for value in evens {
                 even_total += value;
@@ -236,7 +236,7 @@ fn std_iterator_combinators_and_eager_maps_run() {
 
             // Lazy map / filter with chaining.
             let mapped = Counter { index: 0usize, limit: 4usize }
-                .map(fun(v: i32) -> i32 { v * 10i32 });
+                .map([v: i32 -> v * 10i32]);
             let mut mapped_total = 0i32;
             for value in mapped {
                 mapped_total += value;
@@ -244,8 +244,8 @@ fn std_iterator_combinators_and_eager_maps_run() {
             if mapped_total != 100i32 { return 11; }
 
             let chained = Counter { index: 0usize, limit: 5usize }
-                .map(fun(v: i32) -> i32 { v + 1i32 })
-                .filter(fun(v: &i32) -> bool { *v > 3i32 });
+                .map([v: i32 -> v + 1i32])
+                .filter([v: &i32 -> *v > 3i32]);
             let mut chained_total = 0i32;
             for value in chained {
                 chained_total += value;
@@ -268,29 +268,21 @@ fn std_iterator_lazy_helpers_chain_and_short_circuit() {
         fun main() -> i32 {
             let chained = crate::std::ops::range(0, 3).into_iter()
                 .chain(crate::std::ops::range(3, 5).into_iter());
-            let chained_total = chained.fold(0i32, fun(acc: i32, value: i32) -> i32 {
-                acc + value
-            });
+            let chained_total = chained.fold(0i32, [acc: i32, value: i32 -> acc + value]);
             if chained_total != 10i32 { return 1; }
 
             let taken = crate::std::ops::range(0, 10).into_iter()
-                .take_while(fun(value: &i32) -> bool { *value < 4i32 });
-            if taken.fold(0i32, fun(acc: i32, value: i32) -> i32 {
-                acc + value
-            }) != 6i32 { return 2; }
+                .take_while([value: &i32 -> *value < 4i32]);
+            if taken.fold(0i32, [acc: i32, value: i32 -> acc + value]) != 6i32 { return 2; }
 
             let skipped = crate::std::ops::range(0, 6).into_iter()
-                .skip_while(fun(value: &i32) -> bool { *value < 3i32 });
-            if skipped.fold(0i32, fun(acc: i32, value: i32) -> i32 {
-                acc + value
-            }) != 12i32 { return 3; }
+                .skip_while([value: &i32 -> *value < 3i32]);
+            if skipped.fold(0i32, [acc: i32, value: i32 -> acc + value]) != 12i32 { return 3; }
 
             let mut inspected_total = 0i32;
             let inspected = crate::std::ops::range(1, 4).into_iter()
-                .inspect(fun(value: &i32) -> () { inspected_total += *value; });
-            let copied_total = inspected.fold(0i32, fun(acc: i32, value: i32) -> i32 {
-                acc + value
-            });
+                .inspect([value: &i32 -> { inspected_total += *value; }]);
+            let copied_total = inspected.fold(0i32, [acc: i32, value: i32 -> acc + value]);
             if inspected_total != 6i32 || copied_total != 6i32 { return 4; }
             0
         }

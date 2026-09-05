@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Removed
+
+- **Breaking:** the `fun(params) { body }` anonymous-function syntax has been removed in favor of bracket lambdas. `fun(x) { x + 1 }` becomes `[x -> x + 1]`, and `move fun(x) { ... }` becomes `move [x -> ...]`; both now produce a dedicated parse diagnostic pointing at the bracket-lambda replacement. Bracket lambdas already cover parameter type annotations (`[x: i32 -> x]`), destructuring patterns (`[(left, _) -> left]`), zero-parameter forms (`[ -> body]`), block bodies (`[v -> { ... }]`), and postfix method-call sugar (`values.map [v -> v * 2]`). Capabilities that were `fun`-lambda-only are gone rather than migrated: generic lambda parameters and bounds, `where` clauses, return-type annotations, and self-recursive bindings — express these with named (generic) functions, which monomorphize per call site and may recurse. The syntax kind, AST node, and HIR lowering for the removed form were deleted; `syn`'s proc-macro expression classifier now recognizes bracket lambdas as `Expr::Closure` (params before the top-level `->`, body after it, including destructuring patterns) instead of `fun`-token closures.
+
+### Fixed
+
+- Lambdas inside generic functions no longer collide across monomorphized instances: the capture-environment struct and lambda symbol name now include the instance's substitution suffix, so `make::<i32>()` and `make::<bool>()` each lower their own lambda function and environment layout instead of sharing one `__riddle_lambda_N` symbol with mismatched capture types (previously a silent C-level pointer-type mismatch whenever a generic function with a capture-containing lambda was instantiated with more than one type). The instance-keyed cache reuses the former generic-lambda table; with `fun<T>` lambdas gone, non-generic lambdas in monomorphized code are its only users.
+
 ## [0.2.3] - 2026-09-05
 
 ### Added

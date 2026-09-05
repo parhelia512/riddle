@@ -62,7 +62,6 @@ ast_node!(BinaryExpr, BinaryExpr);
 ast_node!(UnaryExpr, UnaryExpr);
 ast_node!(ParenExpr, ParenExpr);
 ast_node!(CallExpr, CallExpr);
-ast_node!(LambdaExpr, LambdaExpr);
 ast_node!(BracketLambdaExpr, BracketLambdaExpr);
 ast_node!(ArgList, ArgList);
 ast_node!(FieldExpr, FieldExpr);
@@ -1029,41 +1028,6 @@ impl Block {
     }
 }
 
-impl LambdaExpr {
-    #[must_use]
-    pub fn is_move(&self) -> bool {
-        support::token_of(&self.syntax, SyntaxKind::Move).is_some()
-    }
-
-    #[must_use]
-    pub fn param_list(&self) -> Option<ParamList> {
-        support::child(&self.syntax)
-    }
-
-    #[must_use]
-    pub fn generic_params(&self) -> Option<GenericParams> {
-        support::child(&self.syntax)
-    }
-
-    #[must_use]
-    pub fn where_clause(&self) -> Option<WhereClause> {
-        support::child(&self.syntax)
-    }
-
-    pub fn return_type(&self) -> Option<Type> {
-        let arrow = support::token_of(&self.syntax, SyntaxKind::Arrow)?;
-        self.syntax
-            .children()
-            .filter(|node| node.text_range().start() > arrow.text_range().start())
-            .find_map(Type::cast)
-    }
-
-    #[must_use]
-    pub fn body(&self) -> Option<Block> {
-        support::child(&self.syntax)
-    }
-}
-
 impl BracketLambdaExpr {
     #[must_use]
     pub fn is_move(&self) -> bool {
@@ -1989,7 +1953,6 @@ pub enum Expr {
     UnaryExpr(UnaryExpr),
     ParenExpr(ParenExpr),
     CallExpr(CallExpr),
-    LambdaExpr(LambdaExpr),
     BracketLambdaExpr(BracketLambdaExpr),
     FieldExpr(FieldExpr),
     IndexExpr(IndexExpr),
@@ -2020,7 +1983,6 @@ impl AstNode for Expr {
             SyntaxKind::UnaryExpr => Some(Self::UnaryExpr(UnaryExpr { syntax: node })),
             SyntaxKind::ParenExpr => Some(Self::ParenExpr(ParenExpr { syntax: node })),
             SyntaxKind::CallExpr => Some(Self::CallExpr(CallExpr { syntax: node })),
-            SyntaxKind::LambdaExpr => Some(Self::LambdaExpr(LambdaExpr { syntax: node })),
             SyntaxKind::BracketLambdaExpr => {
                 Some(Self::BracketLambdaExpr(BracketLambdaExpr { syntax: node }))
             }
@@ -2054,7 +2016,6 @@ impl AstNode for Expr {
             Self::UnaryExpr(it) => it.syntax(),
             Self::ParenExpr(it) => it.syntax(),
             Self::CallExpr(it) => it.syntax(),
-            Self::LambdaExpr(it) => it.syntax(),
             Self::BracketLambdaExpr(it) => it.syntax(),
             Self::FieldExpr(it) => it.syntax(),
             Self::IndexExpr(it) => it.syntax(),

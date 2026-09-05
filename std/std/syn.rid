@@ -958,9 +958,7 @@ pub mod syn {
         if ident_at(tokens, start, "unsafe") {
             return Result::Ok(Expr::Unsafe(tokens.cloned()));
         }
-        if ident_at(tokens, start, "fun")
-            || (ident_at(tokens, start, "move") && ident_at(tokens, start + 1usize, "fun"))
-        {
+        if is_bracket_lambda_start(tokens, start) {
             return Result::Ok(Expr::Closure(tokens.cloned()));
         }
         if expr_binary_split(tokens) < tokens.len() {
@@ -1336,6 +1334,12 @@ pub mod syn {
             }
             match param.as_slice().get(index) {
                 Option::Some(TokenTree::Ident(_)) => index += 1usize,
+                Option::Some(TokenTree::Group(group)) => {
+                    match group.delimiter() {
+                        Delimiter::Parenthesis => index += 1usize,
+                        _ => { return false; },
+                    }
+                },
                 _ => { return false; },
             }
             if index < param.len() {
@@ -1352,37 +1356,74 @@ pub mod syn {
     }
 
     fun valid_lambda_expr(tokens: &TokenStream) -> bool {
-        let mut index = if ident_at(tokens, 0usize, "move") { 1usize } else { 0usize };
-        if !ident_at(tokens, index, "fun") {
-            return false;
-        }
-        index += 1usize;
-        let params = match tokens.as_slice().get(index) {
-            Option::Some(TokenTree::Group(group)) => {
-                match group.delimiter() {
-                    Delimiter::Parenthesis => group,
-                    _ => { return false; },
-                }
-            },
-            _ => { return false; },
-        };
-        if !valid_lambda_params(params.stream()) {
-            return false;
-        }
-        index += 1usize;
-        if punct_joint_at(tokens, index, '-') && punct_at(tokens, index + 1usize, '>') {
-            let brace = first_brace(tokens, index + 2usize);
-            if brace == tokens.len() {
-                return false;
-            }
-            let ty = token_range(tokens, index + 2usize, brace);
-            if ty.is_empty() || !valid_type(&ty) {
-                return false;
-            }
-            index = brace;
+        let mut index = 0usize;
+        if ident_at(tokens, index, "move") {
+            index += 1usize;
         }
         match tokens.as_slice().get(index) {
-            Option::Some(TokenTree::Group(group)) => index + 1usize == tokens.len() && valid_block(group),
+            Option::Some(TokenTree::Group(group)) => {
+                if index + 1usize != tokens.len() {
+                    return false;
+                }
+                match group.delimiter() {
+                    Delimiter::Bracket => {},
+                    _ => { return false; },
+                }
+                let stream = group.stream();
+                let arrow = find_top_level_arrow(stream);
+                if arrow >= stream.len() {
+                    return false;
+                }
+                if !valid_lambda_params(&token_range(stream, 0usize, arrow)) {
+                    return false;
+                }
+                let body = token_range(stream, arrow + 2usize, stream.len());
+                if body.is_empty() {
+                    return false;
+                }
+                return valid_expr(&body);
+            },
+            _ => false,
+        }
+    }
+
+    /// Index of the `-` of a top-level `->`, or `tokens.len()` when absent.
+    fun find_top_level_arrow(tokens: &TokenStream) -> usize {
+        let mut angle_depth = 0usize;
+        let mut index = 0usize;
+        while index < tokens.len() {
+            if punct_joint_at(tokens, index, '-') && punct_at(tokens, index + 1usize, '>') {
+                if angle_depth == 0usize {
+                    return index;
+                }
+                index += 2usize;
+                continue;
+            }
+            if punct_at(tokens, index, '<') {
+                angle_depth += 1usize;
+            } else if punct_at(tokens, index, '>') && angle_depth > 0usize {
+                angle_depth -= 1usize;
+            }
+            index += 1usize;
+        }
+        tokens.len()
+    }
+
+    /// `move`? `[params -> body]`: true when the token at `start` begins a
+    /// bracket lambda.
+    fun is_bracket_lambda_start(tokens: &TokenStream, start: usize) -> bool {
+        let mut index = start;
+        if ident_at(tokens, index, "move") {
+            index += 1usize;
+        }
+        match tokens.as_slice().get(index) {
+            Option::Some(TokenTree::Group(group)) => {
+                match group.delimiter() {
+                    Delimiter::Bracket => {},
+                    _ => { return false; },
+                }
+                find_top_level_arrow(group.stream()) < group.stream().len()
+            },
             _ => false,
         }
     }
@@ -1418,9 +1459,7 @@ pub mod syn {
                 _ => false,
             };
         }
-        if ident_at(&body, 0usize, "fun")
-            || (ident_at(&body, 0usize, "move") && ident_at(&body, 1usize, "fun"))
-        {
+        if is_bracket_lambda_start(&body, 0usize) {
             return valid_lambda_expr(&body);
         }
         if expr_binary_split(&body) < body.len() || expr_cast_split(&body) < body.len() {
@@ -2840,26 +2879,26 @@ pub mod syn {
                 }
             },
             Expr::Closure(_) => {
-                let fun_index = if ident_at(tokens, 0usize, "move") { 1usize } else { 0usize };
-                match tokens.as_slice().get(fun_index + 1usize) {
-                    Option::Some(TokenTree::Group(params)) => {
-                        for param in split_top_level(params.stream(), ',') {
-                            let colon = find_top_level_punct(&param, ':');
-                            if colon < param.len() {
-                                let ty = token_range(&param, colon + 1usize, param.len());
-                                visit_type_tokens(visitor, &ty);
+                let mut group_index = 0usize;
+                if ident_at(tokens, 0usize, "move") {
+                    group_index = 1usize;
+                }
+                match tokens.as_slice().get(group_index) {
+                    Option::Some(TokenTree::Group(group)) => {
+                        let stream = group.stream();
+                        let arrow = find_top_level_arrow(stream);
+                        if arrow < stream.len() {
+                            for param in split_top_level(&token_range(stream, 0usize, arrow), ',') {
+                                let colon = find_top_level_punct(&param, ':');
+                                if colon < param.len() {
+                                    let ty = token_range(&param, colon + 1usize, param.len());
+                                    visit_type_tokens(visitor, &ty);
+                                }
                             }
+                            let body = token_range(stream, arrow + 2usize, stream.len());
+                            visit_expr_tokens(visitor, &body);
                         }
                     },
-                    _ => {},
-                }
-                let brace = first_brace(tokens, fun_index + 2usize);
-                if punct_joint_at(tokens, fun_index + 2usize, '-') {
-                    let ty = token_range(tokens, fun_index + 4usize, brace);
-                    visit_type_tokens(visitor, &ty);
-                }
-                match tokens.as_slice().get(brace) {
-                    Option::Some(TokenTree::Group(body)) => visit_file_tokens(visitor, body.stream()),
                     _ => {},
                 }
             },
@@ -3497,28 +3536,30 @@ pub mod syn {
     }
 
     fun fold_closure_expr<F: Fold>(folder: &mut F, tokens: &TokenStream) -> TokenStream {
-        let fun_index = if ident_at(tokens, 0usize, "move") { 1usize } else { 0usize };
-        let params_index = fun_index + 1usize;
+        let mut group_index = 0usize;
+        if ident_at(tokens, 0usize, "move") {
+            group_index = 1usize;
+        }
         let mut output = TokenStream::new();
-        append_range(&mut output, tokens, 0usize, params_index);
-        match tokens.as_slice().get(params_index) {
+        append_range(&mut output, tokens, 0usize, group_index);
+        match tokens.as_slice().get(group_index) {
             Option::Some(TokenTree::Group(group)) => {
-                output.push(rebuilt_group(group, fold_params(folder, group.stream())));
+                let stream = group.stream();
+                let arrow = find_top_level_arrow(stream);
+                if arrow < stream.len() {
+                    let params = token_range(stream, 0usize, arrow);
+                    let body = token_range(stream, arrow + 2usize, stream.len());
+                    let mut inner = fold_params(folder, &params);
+                    append_range(&mut inner, stream, arrow, arrow + 2usize);
+                    inner.extend(fold_expr_tokens(folder, &body));
+                    output.push(rebuilt_group(group, inner));
+                } else {
+                    output.push(tokens.as_slice()[group_index].clone());
+                }
             },
             _ => {},
         }
-        let body = first_brace(tokens, params_index + 1usize);
-        if punct_joint_at(tokens, params_index + 1usize, '-') {
-            append_range(&mut output, tokens, params_index + 1usize, params_index + 3usize);
-            let ty = token_range(tokens, params_index + 3usize, body);
-            output.extend(fold_type_tokens(folder, &ty));
-        }
-        match tokens.as_slice().get(body) {
-            Option::Some(TokenTree::Group(group)) => {
-                output.push(rebuilt_group(group, fold_file_tokens(folder, group.stream())));
-            },
-            _ => {},
-        }
+        append_range(&mut output, tokens, group_index + 1usize, tokens.len());
         output
     }
 

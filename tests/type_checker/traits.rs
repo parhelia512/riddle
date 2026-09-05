@@ -106,12 +106,12 @@ fn accepts_dyn_fn_mut_and_fn_once_boundaries() {
         fun apply_once(value: dyn FnOnce() -> i32) -> i32 { value() }
         fun main() -> i32 {
             let mut total = 0;
-            let mut callback: dyn FnMut(i32) -> i32 = fun(value: i32) {
+            let mut callback: dyn FnMut(i32) -> i32 = [value: i32 -> {
                 total += value;
                 total
-            };
+            }];
             let first = apply_mut(&mut callback, 2);
-            let once: dyn FnOnce() -> i32 = fun() { first };
+            let once: dyn FnOnce() -> i32 = [ -> first];
             apply_once(once)
         }
         "#,
@@ -2650,7 +2650,7 @@ fn by_value_operator_capture_is_fn_once() {
         fun main() {
             let left = Token { value: 1 };
             let right = Token { value: 2 };
-            let add = fun() { left + right };
+            let add = [ -> left + right];
         }
         "#,
     );

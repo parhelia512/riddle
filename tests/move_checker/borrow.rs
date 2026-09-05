@@ -42,7 +42,7 @@ fn rejects_returned_closure_borrowing_a_drop_owner() {
 
         fun leak() -> impl Fn() -> () {
             let guard = Guard { value: 1 };
-            fun() { inspect(&guard); }
+            [ -> { inspect(&guard); }]
         }
         "#,
     );
@@ -916,7 +916,7 @@ fn moving_one_field_into_a_closure_leaves_the_other_field_available() {
                 left: Token { value: 1 },
                 right: Token { value: 2 },
             };
-            let take_left = fun() { consume(pair.left) };
+            let take_left = [ -> consume(pair.left)];
             consume(pair.right)
         }
         ",

@@ -842,16 +842,24 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::Param);
     }
 
-    fn lambda_expr(&mut self) -> CompletedMarker {
+    /// `fun(params) { body }` anonymous functions were removed in favor of
+    /// bracket lambdas. Consume the old shape so recovery and hovers stay
+    /// anchored, and point the user at the replacement.
+    fn removed_lambda_expr(&mut self) -> CompletedMarker {
         let m = self.start();
         if self.at(SyntaxKind::Move) {
             self.bump();
         }
-        self.expect(SyntaxKind::Fun);
+        // `error` records the diagnostic and bumps the `fun` token itself.
+        self.error(
+            "anonymous function syntax `fun(x) { ... }` has been removed; use a bracket lambda `[x -> x + 1]` instead".into(),
+        );
         if self.at(SyntaxKind::Less) {
             self.generic_params(true, false);
         }
-        self.lambda_param_list();
+        if self.at(SyntaxKind::LParen) {
+            self.lambda_param_list();
+        }
         if self.at(SyntaxKind::Arrow) {
             self.bump();
             self.ty();
@@ -859,8 +867,10 @@ impl<'s> Parser<'s> {
         if self.at(SyntaxKind::Where) {
             self.where_clause();
         }
-        self.block();
-        m.complete(self, SyntaxKind::LambdaExpr)
+        if self.at(SyntaxKind::LBrace) {
+            self.block();
+        }
+        m.complete(self, SyntaxKind::ErrorNode)
     }
 
     /// Snapshot of all parser state that speculative parsing may advance.
@@ -1666,21 +1676,25 @@ impl<'s> Parser<'s> {
 
             SyntaxKind::Unsafe => Some(self.unsafe_expr()),
 
-            SyntaxKind::Fun => Some(self.lambda_expr()),
-            SyntaxKind::Move if self.nth(1) == SyntaxKind::Fun => Some(self.lambda_expr()),
+            SyntaxKind::Fun if self.nth(1) == SyntaxKind::LParen => {
+                Some(self.removed_lambda_expr())
+            }
+            SyntaxKind::Move if self.nth(1) == SyntaxKind::Fun => {
+                Some(self.removed_lambda_expr())
+            }
             SyntaxKind::Move if self.nth(1) == SyntaxKind::LBracket => {
                 let point = self.speculation_point();
                 match self.try_bracket_lambda_expr() {
                     Some(lambda) => Some(lambda),
                     None => {
                         self.rollback_to(point);
-                        self.error("expected 'fun' after 'move'".into());
+                        self.error("expected a lambda after 'move'".into());
                         None
                     }
                 }
             }
             SyntaxKind::Move => {
-                self.error("expected 'fun' after 'move'".into());
+                self.error("expected '[' after 'move'".into());
                 None
             }
 

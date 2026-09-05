@@ -278,7 +278,6 @@ pub enum SyntaxKind {
     UnaryExpr,
     ParenExpr,
     CallExpr,
-    LambdaExpr,
     BracketLambdaExpr,
     ArgList,
     FieldExpr,

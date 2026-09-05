@@ -726,7 +726,7 @@ fn returned_closure_drops_value_captures_through_its_drop_function() {
 
         fun make() -> impl FnOnce() -> () {
             let guard = Guard {};
-            fun() { consume(guard); }
+            [ -> { consume(guard); }]
         }
 
         fun main() {
@@ -781,7 +781,7 @@ fn lambda_drops_its_by_value_parameters() {
         impl Drop for Guard { fun drop(&mut self) {} }
 
         fun main() {
-            let consume = fun(guard: Guard) {};
+            let consume = [guard: Guard -> {}];
             consume(Guard {});
         }
         "#,
@@ -2891,7 +2891,7 @@ fn lambda_return_does_not_leak_into_outer_function_summary() {
         struct Data { value: i32 }
 
         fun read_in_lambda(value: &Data) -> i32 {
-            let read = fun() -> &Data { return value; };
+            let read = [ -> { return value; }];
             (*read()).value
         }
 
@@ -2928,7 +2928,7 @@ fn reference_returned_through_local_lambda_still_escapes() {
         struct Data { value: i32 }
 
         fun relay(value: &Data) -> &Data {
-            let return_value = fun() -> &Data { value };
+            let return_value = [ -> value];
             return_value()
         }
 
@@ -3096,11 +3096,11 @@ const REFERENCE_PROMOTION_SOURCE: &str = r#"
         fun value_capture() -> impl Fn() -> i32 {
             let local = Data { value: 1 };
             let holder = Holder { value: &local };
-            fun() { read_holder(&holder) }
+            [ -> read_holder(&holder)]
         }
 
         fun lambda_param_ref() -> impl Fn(Data) -> &Data {
-            fun(value: Data) -> &Data { &value }
+            [value: Data -> &value]
         }
 
         fun read(value: &Data) -> i32 { value.value }
@@ -3632,7 +3632,7 @@ fn anonymous_function_lowers_to_function_pointer_call() {
         }
 
         fun main() -> i32 {
-            let inc = fun(x) { x + 1 };
+            let inc = [x -> x + 1];
             apply(inc, 41)
         }
         ",
@@ -3664,7 +3664,7 @@ fn non_escaping_closure_keeps_environment_and_capture_on_stack() {
         r"
         fun main() -> i32 {
             let base = 40;
-            let add = fun(value: i32) { base + value };
+            let add = [value: i32 -> base + value];
             add(2)
         }
         ",
@@ -3710,9 +3710,7 @@ fn lambda_returned_from_lambda_uses_heap_environment() {
     let module = lower(
         r"
         fun nested(base: i32) -> impl Fn(i32) -> impl Fn(i32) -> i32 {
-            fun(first: i32) {
-                fun(second: i32) { base + first + second }
-            }
+            [first: i32 -> [second: i32 -> base + first + second]]
         }
         ",
     );
@@ -3763,7 +3761,7 @@ fn closure_field_capture_clears_only_that_fields_drop_slot() {
         fun consume(value: First) {}
         fun main() {
             let pair = Pair { first: First {}, second: Second {} };
-            let take_first = fun() { consume(pair.first); };
+            let take_first = [ -> { consume(pair.first); }];
         }
         "#,
     );

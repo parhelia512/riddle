@@ -266,17 +266,35 @@ impl LowerCtx<'_> {
                 captures: Vec::new(),
                 kind: type_checker::ClosureKind::Fn,
             });
-        let (name, needs_lowering) =
+        let instance_suffix = self.current_mono_instance_suffix();
+        let (name, needs_lowering) = if instance_suffix.is_empty() {
             if let Some(name) = self.lambda_functions.get(&(body_id, expr_id)) {
                 (name.clone(), false)
             } else {
                 self.lambda_counter += 1;
-                let name =
-                    self.qualify_current_symbol(format!("__riddle_lambda_{}", self.lambda_counter));
+                let name = self
+                    .qualify_current_symbol(format!("__riddle_lambda_{}", self.lambda_counter));
                 self.lambda_functions
                     .insert((body_id, expr_id), name.clone());
                 (name, true)
-            };
+            }
+        } else {
+            // Inside a monomorphized instance the capture types depend on the
+            // substitution, so each instance needs its own lambda symbol and
+            // environment struct.
+            let key = (body_id, expr_id, instance_suffix.clone());
+            if let Some(name) = self.generic_lambda_functions.get(&key) {
+                (name.clone(), false)
+            } else {
+                self.lambda_counter += 1;
+                let name = self.qualify_current_symbol(format!(
+                    "__riddle_lambda_{}_{}",
+                    self.lambda_counter, instance_suffix
+                ));
+                self.generic_lambda_functions.insert(key, name.clone());
+                (name, true)
+            }
+        };
         let (capture_types, env_struct) = self.lambda_environment_type(&name, &info);
 
         let heap_env = !info.captures.is_empty() && self.analysis.lambda_escapes(body_id, expr_id);
@@ -318,11 +336,30 @@ impl LowerCtx<'_> {
         builder.struct_value(vec![call, env_value, drop], ty.clone())
     }
 
+    /// Stable discriminator of the monomorphized instance currently being
+    /// lowered, or empty outside generic substitution.
+    pub(super) fn current_mono_instance_suffix(&self) -> String {
+        if self.generic_subst.is_empty() && self.generic_const_subst.is_empty() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = self
+            .generic_subst
+            .iter()
+            .map(|(name, ty)| format!("{}{}", name, super::mono_type_name(ty)))
+            .collect();
+        parts.extend(
+            self.generic_const_subst
+                .iter()
+                .map(|(name, value)| format!("{}{}", name, value)),
+        );
+        parts.sort();
+        parts.join("_")
+    }
+
     pub(super) fn lambda_environment_type(
         &self,
         name: &str,
-        info: &LambdaInfo,
-    ) -> (Vec<Type>, StructType) {
+        info: &LambdaInfo,    ) -> (Vec<Type>, StructType) {
         let capture_types = info
             .captures
             .iter()

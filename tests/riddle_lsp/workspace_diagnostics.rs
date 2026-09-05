@@ -458,9 +458,23 @@ const PRODUCER_SPAN_CASES: &[DiagnosticSpanCase] = &[
     (
         "E0045",
         "parameter `x`",
-        "fun main() { let identity = fun(x) { x }; }",
+        "fun main() { let identity = [x -> x]; }",
         "x",
-        "fun(x",
+        "[x",
+    ),
+    (
+        "E0021",
+        "callable impl is missing required method",
+        "struct Adder {} impl Fn(i32) -> i32 for Adder {}",
+        "Fn(i32) -> i32",
+        "impl Fn(i32) -> i32",
+    ),
+    (
+        "E0046",
+        "dereferencing a raw pointer requires an unsafe block",
+        "fun main() { let p: *const i32 = 0usize as *const i32; let v = *p; }",
+        "*p",
+        "let v = *p",
     ),
     (
         "E0047",
@@ -591,7 +605,7 @@ const PRODUCER_SPAN_CASES: &[DiagnosticSpanCase] = &[
     (
         "E0067",
         "cannot construct an infinite type",
-        "fun main() { let id = fun(value) { value }; id(id); }",
+        "fun main() { let id = [value -> value]; id(id); }",
         "id(id)",
         "id(id)",
     ),
@@ -774,28 +788,28 @@ fn closure_diagnostic_spans_point_at_the_relevant_source() {
         (
             "E0031",
             "mutable closure",
-            "fun main() { let mut total = 0; let add = fun() { total += 1; }; add(); }",
+            "fun main() { let mut total = 0; let add = [ -> { total += 1; }]; add(); }",
             "add",
             false,
         ),
         (
             "E0100",
             "use of moved value: `once`",
-            "struct Token { value: i32 } fun take(value: Token) {} fun main() { let token = Token { value: 1 }; let once = fun() { take(token); }; once(); once(); }",
+            "struct Token { value: i32 } fun take(value: Token) {} fun main() { let token = Token { value: 1 }; let once = [ -> { take(token); }]; once(); once(); }",
             "once",
             true,
         ),
         (
             "E0303",
             "assign to `base` while borrowed",
-            "fun main() { let mut base = 1; let read = fun() { base }; base = 2; read(); }",
+            "fun main() { let mut base = 1; let read = [ -> base]; base = 2; read(); }",
             "base = 2",
             true,
         ),
         (
             "E0067",
             "infinite type",
-            "fun main() { let id = fun(value) { value }; id(id); }",
+            "fun main() { let id = [value -> value]; id(id); }",
             "id(id)",
             true,
         ),
@@ -864,7 +878,7 @@ fn closure_diagnostic_spans_point_at_the_relevant_source() {
 
 fn assert_distinct_anonymous_function_diagnostic() {
     let source =
-        "fun main() { let value = if true { fun(x: i32) { x } } else { fun(x: i32) { x } }; }";
+        "fun main() { let value = if true { [x: i32 -> x] } else { [x: i32 -> x] }; }";
     let result = riddlec::pipeline::compile_with_options(source, CompileOptions { use_std: false });
     let diagnostic = result
         .type_result

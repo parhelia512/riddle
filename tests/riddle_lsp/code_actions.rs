@@ -159,13 +159,13 @@ fn assignment_to_immutable_binding_offers_add_mut() {
 
 #[test]
 fn immutable_closure_binding_offers_the_closure_fix() {
-    let source = "fun main() {\n    let count = 0;\n    let inc = fun() {\n        count += 1;\n    };\n    inc();\n}\n";
+    let source = "fun main() {\n    let count = 0;\n    let inc = [ -> {\n        count += 1;\n    }];\n    inc();\n}\n";
     let actions = code_actions(source);
 
     let closure = action_titled(&actions, "Add `mut` to closure binding");
     let edits = action_edits(closure);
     assert_eq!(edits.len(), 1);
-    assert!(apply_edits(source, &edits).contains("let mut inc = fun() {"));
+    assert!(apply_edits(source, &edits).contains("let mut inc = [ -> {"));
 
     let binding = action_titled(&actions, "Add `mut` to binding");
     assert!(apply_edits(source, &action_edits(binding)).contains("let mut count = 0;"));
