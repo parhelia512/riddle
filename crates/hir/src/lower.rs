@@ -248,9 +248,8 @@ pub fn lower_internal_attrs(node: &SyntaxNode) -> Vec<HirInternalAttr> {
                 }
                 let target = match target.as_ref().map(rowan::SyntaxNode::kind) {
                     Some(SyntaxKind::TraitDecl) => InternalAttrTarget::Trait,
-                    Some(SyntaxKind::StructDecl | SyntaxKind::EnumDecl) => {
-                        InternalAttrTarget::FundamentalType
-                    }
+                    Some(SyntaxKind::StructDecl) => InternalAttrTarget::Struct,
+                    Some(SyntaxKind::EnumDecl) => InternalAttrTarget::Enum,
                     _ => InternalAttrTarget::Other,
                 };
                 HirInternalAttr {

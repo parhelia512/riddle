@@ -131,7 +131,7 @@ fn c_owned_dyn_trait_uses_heap_storage_and_dynamic_drop() {
     assert!(generated.contains("rgc_alloc"), "{generated}");
     assert!(generated.contains("rgc_free"), "{generated}");
     assert!(
-        generated.contains(&c_function("__riddle_dyn_drop_Speaker")),
+        generated.contains(&c_function("__riddle_dyn_drop_7:Speaker")),
         "{generated}"
     );
 
@@ -733,7 +733,7 @@ fn c_composite_comparison_dispatches_element_trait_impls() {
     let generated = CBackend::new().compile(&module).unwrap();
 
     assert!(
-        generated.matches(&c_function("eq__Point")).count() >= 3,
+        generated.matches(&c_function("eq__5:Point")).count() >= 3,
         "user-defined elements must call PartialEq::eq:\n{generated}"
     );
 }
@@ -886,7 +886,7 @@ fn c_gc_closure_environment_has_deterministic_drop_glue() {
         "{generated}"
     );
     assert!(
-        generated.contains(&c_function("drop__Guard")),
+        generated.contains(&c_function("drop__5:Guard")),
         "{generated}"
     );
     assert!(
@@ -1289,7 +1289,7 @@ fn c_static_impl_method_call_uses_mangled_name() {
     let result = backend.compile(&module).unwrap();
 
     assert!(
-        result.contains(&c_function("new__Point")),
+        result.contains(&c_function("new__5:Point")),
         "static impl method should be mangled:\n{result}"
     );
     assert!(
@@ -1740,7 +1740,10 @@ fn c_backend_wraps_string_extern_returns() {
     assert!(
         result.contains("extern const char* greeting(void);")
             && result.contains("const char* ffi_str")
-            && result.contains("(riddle_str){ ffi_str"),
+            // The C string is copied into managed memory before wrapping, so
+            // the C side freeing it later cannot dangle the Riddle value.
+            && result.contains("(char*)rgc_alloc(")
+            && result.contains("){ ffi_copy"),
         "extern string return was not wrapped:\n{result}"
     );
 }
@@ -1886,7 +1889,7 @@ fn c_backend_accepts_nested_generic_type_args_without_spaces() {
         "missing nested monomorph:\n{result}"
     );
     assert!(
-        result.contains(&c_function("get__Box_i32")),
+        result.contains(&c_function("get__7:Box_i32")),
         "missing monomorphized generic method:\n{result}"
     );
     assert!(
@@ -1948,7 +1951,7 @@ fn c_backend_monomorphizes_explicit_generic_method_arguments() {
     let result = backend.compile(&module).unwrap();
 
     assert!(
-        result.contains(&c_function("id__Helper_i32")),
+        result.contains(&c_function("id__6:Helper_i32")),
         "missing explicit generic method instance:\n{result}"
     );
 }
@@ -1977,7 +1980,7 @@ fn c_backend_separates_shadowed_impl_and_method_generics() {
     let result = backend.compile(&module).unwrap();
 
     assert!(
-        result.contains(&c_function("test__C_bool_i32")),
+        result.contains(&c_function("test__6:C_bool_i32")),
         "impl and method generic arguments were conflated:\n{result}"
     );
 }
@@ -2024,15 +2027,15 @@ fn c_backend_dispatches_trait_bound_method_in_generic_function() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains(&c_function("read__User")),
+        result.contains(&c_function("read__4:User")),
         "missing generic function monomorph:\n{result}"
     );
     assert!(
-        result.contains(&format!("{}(", c_function("name__User"))),
+        result.contains(&format!("{}(", c_function("name__4:User"))),
         "generic body should call concrete Named impl method:\n{result}"
     );
     assert!(
-        result.contains(&format!("{}(", c_function("tag__User"))),
+        result.contains(&format!("{}(", c_function("tag__4:User"))),
         "generic body should call concrete Tagged impl method:\n{result}"
     );
 }
@@ -2112,11 +2115,11 @@ fn c_backend_uses_trait_default_method_unless_overridden() {
     let generated = CBackend::new().compile(&module).unwrap();
 
     assert!(
-        generated.contains(&format!("{}(", c_function("value__Defaulted"))),
+        generated.contains(&format!("{}(", c_function("value__9:Defaulted"))),
         "{generated}"
     );
     assert!(
-        generated.contains(&format!("{}(", c_function("value__Overridden"))),
+        generated.contains(&format!("{}(", c_function("value__10:Overridden"))),
         "{generated}"
     );
 }
@@ -2186,11 +2189,11 @@ fn c_backend_lowers_non_copy_array_into_iterator() {
     let mut backend = CBackend::new();
     let result = backend.compile(&module).unwrap();
     assert!(
-        result.contains(&c_function("into_iter__arr2_Token")),
+        result.contains(&c_function("into_iter__arr2_5:Token")),
         "missing array IntoIterator monomorph:\n{result}"
     );
     assert!(
-        result.contains(&c_function("next__ArrayIter_Token_2")),
+        result.contains(&c_function("next__19:ArrayIter_5:Token_2")),
         "missing ArrayIter::next monomorph:\n{result}"
     );
     assert!(
@@ -2201,7 +2204,10 @@ fn c_backend_lowers_non_copy_array_into_iterator() {
         "array iterator construction lost its const argument:\n{result}"
     );
     assert!(
-        result.contains(&format!("{}((&", c_function("next__ArrayIter_Token_2"))),
+        result.contains(&format!(
+            "{}((&",
+            c_function("next__19:ArrayIter_5:Token_2")
+        )),
         "Iterator::next should receive the iterator slot by reference:\n{result}"
     );
     assert!(

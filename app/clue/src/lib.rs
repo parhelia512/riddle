@@ -1620,6 +1620,19 @@ fn command_bins(
             .map(|target| Some(target.name.clone()))
             .collect::<Vec<_>>();
         if manifest.binaries.len() > 1 || binaries.len() != manifest.binaries.len() {
+            // Every binary was filtered out by unsatisfied required-features:
+            // building nothing must not look like success.
+            if binaries.is_empty() {
+                let missing = manifest
+                    .binaries
+                    .iter()
+                    .flat_map(|target| target.required_features.iter().cloned())
+                    .collect::<std::collections::BTreeSet<_>>();
+                anyhow::bail!(
+                    "no binary target has its required features enabled: {}",
+                    missing.into_iter().collect::<Vec<_>>().join(", ")
+                );
+            }
             return Ok(binaries);
         }
     }

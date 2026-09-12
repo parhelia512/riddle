@@ -19,6 +19,7 @@ pub enum FsError {
     OpenFailed,
     ReadFailed,
     WriteFailed,
+    InvalidData,
 }
 
 pub struct FsFile {
@@ -96,8 +97,14 @@ impl FsFile {
                 index += 1usize;
             }
         }
-        // SAFETY: `&[u8]` and `&str` share layout; the bytes were read from
-        // the file and are reinterpreted without validation.
+        // Reject non-UTF-8 files instead of reinterpreting the bytes:
+        // `str` guarantees valid UTF-8, and skipping the check would feed
+        // invalid data into string slicing and char iteration.
+        if !crate::std::string::is_valid_utf8(bytes.as_slice()) {
+            return Result::Err(FsError::InvalidData);
+        }
+        // SAFETY: `&[u8]` and `&str` share layout; the bytes were just
+        // validated as UTF-8.
         let text: &str = unsafe { bytes.as_slice() as &str };
         Result::Ok(String::from_str(text))
     }
@@ -137,6 +144,8 @@ pub fun write(path: &str, contents: &str) -> Result<(), FsError> {
 
 unsafe extern "C" {
     safe fun riddle_fs_exists(path: &str) -> i32;
+    safe fun riddle_fs_remove(path: &str) -> i32;
+    safe fun riddle_fs_rename(from: &str, to: &str) -> i32;
     safe fun riddle_fs_size(path: &str) -> u64;
     safe fun riddle_fs_is_file(path: &str) -> i32;
     safe fun riddle_fs_is_dir(path: &str) -> i32;
@@ -158,6 +167,69 @@ pub struct FileMetadata {
 pub fun exists(path: &str) -> bool {
     let found = unsafe { riddle_fs_exists(path) };
     found != 0i32
+}
+
+/// Removes the file at `path`. Only regular files are supported; removing a
+/// directory reports `FsError::OpenFailed` (the C facade has no distinct
+/// directory-removal error).
+pub fun remove(path: &str) -> Result<(), FsError> {
+    let code = unsafe { riddle_fs_remove(path) };
+    if code == 0i32 {
+        Result::Ok(())
+    } else {
+        Result::Err(FsError::OpenFailed)
+    }
+}
+
+/// Renames (or moves) the file at `from` to `to`.
+pub fun rename(from: &str, to: &str) -> Result<(), FsError> {
+    let code = unsafe { riddle_fs_rename(from, to) };
+    if code == 0i32 {
+        Result::Ok(())
+    } else {
+        Result::Err(FsError::OpenFailed)
+    }
+}
+
+/// Copies the contents of `from` into `to` (truncating `to`), returning the
+/// number of bytes copied. The copy is chunked; nothing is buffered whole.
+pub fun copy(from: &str, to: &str) -> Result<usize, FsError> {
+    let opened_source = FsFile::open(from);
+    let mut source = match opened_source {
+        Result::Ok(value) => value,
+        Result::Err(err) => { return Result::Err(err); },
+    };
+    let opened_target = FsFile::create(to);
+    let mut target = match opened_target {
+        Result::Ok(value) => value,
+        Result::Err(err) => { return Result::Err(err); },
+    };
+    let mut total = 0usize;
+    let mut chunk = [0u8; 4096];
+    let mut window: Vector<u8> = Vector::new();
+    loop {
+        let count = match source.read(&mut chunk) {
+            Result::Ok(count) => count,
+            Result::Err(err) => { return Result::Err(err); },
+        };
+        if count == 0usize {
+            break;
+        }
+        // Build the exact-length view of the chunk. A slice range index does
+        // not exist yet, so the partial chunk is gathered into a Vector.
+        window.clear();
+        let mut index = 0usize;
+        while index < count {
+            window.push(chunk[index]);
+            index += 1usize;
+        }
+        let written = target.write(window.as_slice())?;
+        total += written;
+    }
+    match target.flush() {
+        Result::Ok(()) => Result::Ok(total),
+        Result::Err(err) => Result::Err(err),
+    }
 }
 
 pub fun metadata(path: &str) -> Option<FileMetadata> {

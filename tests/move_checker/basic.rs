@@ -2132,3 +2132,493 @@ fn let_else_binding_can_move_out_of_the_scrutinee() {
     );
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
+
+// == 循环不动点诊断（收敛后最终重放恰好上报一次） ==
+
+#[test]
+fn while_backedge_move_reported_exactly_once() {
+    // Moving `token` every iteration: iteration 2 only sees the move via the
+    // back edge, so the error depends on fixpoint convergence. It must be
+    // reported exactly once — not zero times, not once per replay iteration.
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+        fun consume(token: Token) {}
+
+        fun f(n: i32) -> i32 {
+            let token = Token { value: 1 };
+            let mut i = 0;
+            while i < n {
+                consume(token);
+                i = i + 1;
+            }
+            i
+        }
+        ",
+    );
+    let count = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0100")
+        .count();
+    assert_eq!(count, 1, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn while_body_borrow_conflict_reported_exactly_once() {
+    // A conflict that fires within every iteration must survive the fixpoint
+    // replay deduplication and be reported exactly once.
+    let result = analyze(
+        r"
+        struct Point { x: i32 }
+
+        fun f(n: i32) -> i32 {
+            let mut p = Point { x: 1 };
+            let mut i = 0;
+            while i < n {
+                let a = &mut p;
+                let b = &mut p;
+                i = i + 1;
+            }
+            i
+        }
+        ",
+    );
+    let count = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0302")
+        .count();
+    assert_eq!(count, 1, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn nested_loop_diagnostics_not_duplicated_by_outer_replay() {
+    // The inner loop's error must not be re-emitted by each outer fixpoint
+    // iteration or the outer final replay.
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+        fun consume(token: Token) {}
+
+        fun f(n: i32) -> i32 {
+            let token = Token { value: 1 };
+            let mut i = 0;
+            while i < n {
+                let mut j = 0;
+                while j < n {
+                    consume(token);
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            i
+        }
+        ",
+    );
+    let count = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0100")
+        .count();
+    assert_eq!(count, 1, "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn loop_body_move_through_break_state_reported() {
+    // `loop` (not `while`) with the move reachable only via the converged
+    // back edge must still report once.
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+        fun consume(token: Token) {}
+
+        fun f(n: i32) -> i32 {
+            let token = Token { value: 1 };
+            let mut i = 0;
+            loop {
+                if i >= n {
+                    break;
+                }
+                consume(token);
+                i = i + 1;
+            }
+            i
+        }
+        ",
+    );
+    let count = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0100")
+        .count();
+    assert_eq!(count, 1, "{:#?}", result.diagnostics);
+}
+
+// == 引用参数检查（不再整体豁免，种子 loan 除外） ==
+
+#[test]
+fn assign_through_reference_param_fields_is_allowed() {
+    // Writing through a `&mut` parameter must not conflict with the
+    // parameter's own incoming (seed) loan.
+    let result = analyze(
+        r"
+        struct Point { x: i32, y: i32 }
+
+        fun f(p: &mut Point) {
+            p.x = 1;
+            p.y = 2;
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn assign_through_reference_param_conflicts_with_local_reborrow() {
+    // A reborrow taken inside the body (not the seed loan) must conflict
+    // with a later write through the reference parameter.
+    let result = analyze(
+        r"
+        struct Point { x: i32, y: i32 }
+
+        fun f(p: &mut Point) -> i32 {
+            let b = &mut *p;
+            p.x = 1;
+            b.y
+        }
+        ",
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0303"),
+        "expected E0303 for assign through reference param while reborrowed: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn reference_field_chain_does_not_borrow_whole_param() {
+    // Reading a reference-typed field and calling a `&self` method on it
+    // borrows only that field; assigning a sibling field while the result
+    // is alive must stay legal.
+    let result = analyze(
+        r"
+        enum Cell { Ref(&i32), Empty }
+
+        struct Inner { v: i32 }
+
+        impl Inner {
+            fun peek(&self) -> Cell { Cell::Ref(&self.v) }
+        }
+
+        struct Outer { inner: Inner, index: usize }
+
+        fun take(o: &mut Outer) -> i32 {
+            match o.inner.peek() {
+                Cell::Ref(value) => {
+                    o.index += 1usize;
+                    *value
+                },
+                Cell::Empty => 0,
+            }
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn reference_field_chain_borrow_conflicts_within_field() {
+    // The precise field loan must still catch writes into the borrowed
+    // field itself while the returned reference is alive.
+    let result = analyze(
+        r"
+        enum Cell { Ref(&i32), Empty }
+
+        struct Inner { v: i32 }
+
+        impl Inner {
+            fun peek(&self) -> Cell { Cell::Ref(&self.v) }
+        }
+
+        struct Outer { inner: Inner, index: usize }
+
+        fun take(o: &mut Outer) -> i32 {
+            match o.inner.peek() {
+                Cell::Ref(value) => {
+                    o.inner.v += 1;
+                    *value
+                },
+                Cell::Empty => 0,
+            }
+        }
+        ",
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0303"),
+        "expected E0303 for write into the borrowed field: {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn wildcard_index_moves_within_one_iteration_are_rejected() {
+    // Dynamic-index moves reset at the loop head (the std array
+    // `IntoIterator` moves a different element each iteration), but two
+    // dynamic-index moves of the same array within ONE iteration body are
+    // still rejected.
+    let result = analyze(
+        r"
+        struct Token { value: i32 }
+        fun consume(t: Token) {}
+
+        fun f(n: i32) {
+            let arr = [Token { value: 1 }, Token { value: 2 }];
+            let mut i = 0;
+            while i < n {
+                consume(arr[i]);
+                consume(arr[i]);
+                i = i + 1;
+            }
+        }
+        ",
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0100" && d.message.contains("moved value")),
+        "expected E0100 for a repeated dynamic-index move in one iteration, got {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn let_destructuring_cannot_move_out_of_drop_type() {
+    // `match` arms reject moving non-Copy fields out of a Drop owner; `let`
+    // destructuring must obey the same rule (previously unenforced).
+    let result = analyze(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard { value: Inner }
+        struct Inner { count: i32 }
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun f(guard: Guard) {
+            let Guard { value } = guard;
+            let Inner { count } = value;
+        }
+        "#,
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0305"),
+        "expected E0305 for let-destructuring a non-Copy field out of a Drop owner, got {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn let_destructuring_copy_fields_out_of_drop_type_is_allowed() {
+    let result = analyze(
+        r#"
+        #[lang = "drop"]
+        trait Drop {
+            fun drop(&mut self);
+        }
+
+        struct Guard { value: i32 }
+
+        impl Drop for Guard {
+            fun drop(&mut self) {}
+        }
+
+        fun f(guard: Guard) {
+            let Guard { value } = guard;
+            let other = value + 1;
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn loop_body_use_keeps_loan_live_to_loop_end() {
+    // The borrow `r` is used inside the loop, so it may be live at any point
+    // of any iteration; assigning to `v` mid-body must conflict (Rust E0502).
+    let result = analyze(
+        r"
+        fun f(n: i32) -> i32 {
+            let mut v = 5;
+            let r = &v;
+            let mut i = 0;
+            while i < n {
+                let x = *r;
+                v = 6;
+                i = i + 1;
+            }
+            0
+        }
+        ",
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0303"),
+        "expected E0303 for assign while a loop-used borrow is live, got {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn lambda_assignment_does_not_definitely_initialize() {
+    // A lambda may run zero or more times, so an assignment inside its body
+    // never counts as a definite initialization of an outer binding.
+    let result = analyze(
+        r"
+        fun f() -> i32 {
+            let mut x: i32;
+            let mut assign = [v -> x = v];
+            assign(5);
+            x
+        }
+        ",
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0059"),
+        "expected E0059 for reading a binding only assigned inside a lambda, got {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn lambda_body_reads_respect_outer_initialization() {
+    // The lambda body is checked against the state at its definition point:
+    // reading an initialized outer binding inside the lambda is fine.
+    let result = analyze(
+        r"
+        fun f() -> i32 {
+            let x = 3;
+            let read = [v -> v + x];
+            read(1)
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn borrow_assigned_on_the_backedge_conflicts_on_the_next_iteration() {
+    let result = analyze(
+        r"
+        fun f(n: i32) {
+            let mut value = 1;
+            let other = 2;
+            let mut reference = &other;
+            let mut i = 0;
+            while i < n {
+                value = 3;
+                let previous = *reference;
+                reference = &value;
+                i += 1;
+            }
+        }
+    ",
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "E0303")
+            .count(),
+        1,
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn dead_branch_uses_do_not_keep_a_loan_live_after_the_branch() {
+    let result = analyze(
+        r"
+        fun f(flag: bool) {
+            let mut value = 1;
+            let reference = &value;
+            if flag {
+                return;
+                let dead = *reference;
+            }
+            value = 2;
+        }
+    ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn lambda_assignment_may_initialize_an_outer_immutable_binding() {
+    let result = analyze(
+        r"
+        fun f() -> i32 {
+            let value: i32;
+            let assign = [ -> { value = 1; }];
+            value = 2;
+            value
+        }
+    ",
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0031"),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn sequential_fnmut_lambdas_may_recapture_mutably() {
+    // The first closure's capture loan expires at its last use (the call),
+    // so a second closure may capture the same binding mutably afterwards.
+    let result = analyze(
+        r"
+        fun f() -> i32 {
+            let mut produced = 0i32;
+            let mut first = [ -> { produced = produced + 1i32; 1i32 }];
+            first();
+            let mut second = [ -> { produced = produced + 1i32; 2i32 }];
+            second();
+            produced
+        }
+        ",
+    );
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn overlapping_fnmut_captures_are_still_rejected() {
+    // Two live closures capturing the same binding mutably at once must
+    // still conflict.
+    let result = analyze(
+        r"
+        fun f() -> i32 {
+            let mut produced = 0i32;
+            let mut first = [ -> { produced = produced + 1i32; 1i32 }];
+            let mut second = [ -> { produced = produced + 1i32; 2i32 }];
+            first();
+            second();
+            produced
+        }
+        ",
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0302"),
+        "expected E0302 for overlapping mutable captures, got {:#?}",
+        result.diagnostics
+    );
+}

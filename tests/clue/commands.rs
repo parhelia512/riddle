@@ -1262,11 +1262,11 @@ fun main() -> i32 {
     if parse_i32("0").unwrap_or(1) == 0
         && parse_i32("2147483647").unwrap_or(0) == 2147483647i32
         && parse_i32("-2147483648").unwrap_or(0) == min
-        && parse_i32("2147483648").is_none()
-        && parse_i32("-2147483649").is_none()
-        && parse_i32("").is_none()
-        && parse_i32("-").is_none()
-        && parse_i32("12x").is_none() {
+        && parse_i32("2147483648").is_err()
+        && parse_i32("-2147483649").is_err()
+        && parse_i32("").is_err()
+        && parse_i32("-").is_err()
+        && parse_i32("12x").is_err() {
         0
     } else {
         1
@@ -2988,7 +2988,7 @@ fn vector_indexing_compiles_and_runs() {
     let mut values: Vector<i32> = Vector::new();
     values.push(10);
     values.push(20);
-    let index = 1;
+    let index: usize = 1;
 
     if values[0] != 10 { return 1; }
     values[index] = 7;

@@ -2,7 +2,11 @@ use crate::std::result::Result::{Err, Ok};
 use crate::std::string::String;
 
 unsafe extern "C" {
+    // `putchar` is the proc-macro protocol sink on the host side (clue
+    // renames it at C-compile time); stderr takes a separate shim so the
+    // protocol channel stays untouched.
     safe fun putchar(value: i32) -> i32;
+    safe fun riddle_fmt_fputc_stderr(value: i32) -> i32;
 }
 
 pub struct Error {}
@@ -12,6 +16,8 @@ pub type Result = crate::std::result::Result<(), Error>;
 pub struct Formatter {
     output: *mut String,
     writes_to_string: bool,
+    /// Writes go to stderr instead of stdout when `writes_to_string` is false.
+    to_stderr: bool,
 }
 
 impl Formatter {
@@ -19,6 +25,15 @@ impl Formatter {
         Formatter {
             output: 0usize as *mut String,
             writes_to_string: false,
+            to_stderr: false,
+        }
+    }
+
+    pub fun stderr() -> Formatter {
+        Formatter {
+            output: 0usize as *mut String,
+            writes_to_string: false,
+            to_stderr: true,
         }
     }
 
@@ -26,6 +41,7 @@ impl Formatter {
         Formatter {
             output: output as *mut String,
             writes_to_string: true,
+            to_stderr: false,
         }
     }
 
@@ -69,7 +85,12 @@ impl Formatter {
             unsafe { (*self.output).push_char(value as char); }
             return Ok(());
         }
-        if putchar(value as i32) < 0 {
+        let written = if self.to_stderr {
+            unsafe { riddle_fmt_fputc_stderr(value as i32) }
+        } else {
+            putchar(value as i32)
+        };
+        if written < 0 {
             Err(Error {})
         } else {
             Ok(())
@@ -81,6 +102,7 @@ pub trait Display {
     fun fmt(&self, formatter: &mut Formatter) -> Result;
 }
 
+#[lang = "debug"]
 pub trait Debug {
     fun fmt(&self, formatter: &mut Formatter) -> Result;
 }

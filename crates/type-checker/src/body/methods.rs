@@ -94,14 +94,35 @@ impl TypeChecker<'_> {
                 );
                 return Type::Error;
             }
-            Err(
-                MethodLookupError::Ambiguous(message) | MethodLookupError::NotObjectSafe(message),
-            ) => {
+            Err(MethodLookupError::Ambiguous(message)) => {
                 for arg in args {
                     self.check_expr(ctx, *arg);
                     self.record_value_use(ctx, *arg, ValueUse::Move);
                 }
-                self.diagnostic("E0013", message, span);
+                self.diagnostic_with_help(
+                    "E0013",
+                    message,
+                    span,
+                    Some(
+                        "use a trait-specific forwarding method or split the object bounds".into(),
+                    ),
+                );
+                return Type::Error;
+            }
+            Err(MethodLookupError::NotObjectSafe(message)) => {
+                for arg in args {
+                    self.check_expr(ctx, *arg);
+                    self.record_value_use(ctx, *arg, ValueUse::Move);
+                }
+                self.diagnostic_with_help(
+                    "E0013",
+                    message,
+                    span,
+                    Some(
+                        "use a borrowed receiver and avoid `Self`, by-value `self`, or generic methods"
+                            .into(),
+                    ),
+                );
                 return Type::Error;
             }
         };
@@ -227,6 +248,10 @@ impl TypeChecker<'_> {
                 &subst,
             )
         });
+        // Argument unification above may have solved the receiver's
+        // inference variables (impl generics); surface the solutions for
+        // callers that consume the method result immediately.
+        let return_ty = self.resolve_type(&return_ty);
         let signature_params = std::iter::once(base_ty.clone())
             .chain(
                 method
@@ -411,7 +436,17 @@ impl TypeChecker<'_> {
                 self.collect_callable_argument_subst(expected, &actual, subst);
             }
             collect_subst(&pattern, &actual, subst);
+            // Impl-level generics arrive through `method.subst` as
+            // inference variables; when the receiver could not pin them
+            // down (a bare `Enum::Variant { .. }` receiver), only the
+            // argument types can. Solve them so the assignability check
+            // and the instantiated signature see concrete types.
+            if type_has_unresolved_inference(&expected) {
+                let _ = self.unify_types(&expected, &actual);
+                self.last_occurs_error = None;
+            }
             let expected = substitute_type(&pattern, subst);
+            let expected = self.resolve_type(&expected);
             self.expect_assignable(&expected, &actual, "method argument", ctx.expr_range(*arg));
             self.record_value_use(ctx, *arg, Self::hir_parameter_value_use(&param.ty));
         }

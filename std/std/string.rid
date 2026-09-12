@@ -264,16 +264,33 @@ impl str {
         let bytes = self.as_bytes();
         let mut start = 0usize;
         let mut end = bytes.len();
-        while start < end && is_ascii_whitespace(bytes[start]) {
+        while start < end && is_ascii_whitespace_byte(bytes[start]) {
             start += 1usize;
         }
-        while end > start && is_ascii_whitespace(bytes[end - 1usize]) {
+        while end > start && is_ascii_whitespace_byte(bytes[end - 1usize]) {
             end -= 1usize;
         }
         self.slice(start, end).unwrap_or("")
     }
 
     pub fun split(&self, separator: &str) -> Vector<String> {
+        // An empty separator matches between every pair of characters
+        // (Rust semantics); the scan must always advance or it loops forever.
+        if separator.is_empty() {
+            let mut parts = Vector::new();
+            let bytes = self.as_bytes();
+            let mut start = 0usize;
+            while start < bytes.len() {
+                let mut end = start + 1usize;
+                while end < bytes.len() && (bytes[end] & 0xc0u8) == 0x80u8 {
+                    end += 1usize;
+                }
+                let piece = self.slice(start, end).unwrap_or("");
+                parts.push(String::from_str(piece));
+                start = end;
+            }
+            return parts;
+        }
         let mut parts = Vector::new();
         let separator_length = separator.len();
         let mut start = 0usize;
@@ -345,7 +362,7 @@ impl str {
     }
 }
 
-fun is_ascii_whitespace(value: u8) -> bool {
+fun is_ascii_whitespace_byte(value: u8) -> bool {
     value == 32u8 || value == 9u8 || value == 10u8 || value == 13u8
 }
 
@@ -358,7 +375,7 @@ fun is_utf8_continuation(value: u8) -> bool {
     value >= 128u8 && value <= 191u8
 }
 
-fun is_valid_utf8(value: &[u8]) -> bool {
+pub fun is_valid_utf8(value: &[u8]) -> bool {
     let mut index = 0usize;
     while index < value.len() {
         let first = value[index];

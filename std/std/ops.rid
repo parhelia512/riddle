@@ -6,52 +6,154 @@ pub trait Drop {
     fun drop(&mut self);
 }
 
-pub struct Range {
-    start: i32,
-    end: i32,
+pub trait Step: Copy + crate::std::clone::Clone + crate::std::cmp::PartialOrd {
+    fun forward_checked(self) -> Option<Self>;
+    fun take_and_advance(&mut self) -> Option<Self>;
 }
 
-impl Range {
-    pub fun new(start: i32, end: i32) -> Range {
+impl Step for i8 {
+    fun forward_checked(self) -> Option<Self> {
+        if self == 127i8 { Option::None } else { Option::Some(self + 1i8) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == 127i8 { Option::None } else { *self = value + 1i8; Option::Some(value) }
+    }
+}
+
+impl Step for i16 {
+    fun forward_checked(self) -> Option<Self> {
+        if self == 32767i16 { Option::None } else { Option::Some(self + 1i16) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == 32767i16 { Option::None } else { *self = value + 1i16; Option::Some(value) }
+    }
+}
+
+impl Step for i32 {
+    fun forward_checked(self) -> Option<Self> {
+        if self == 2147483647i32 { Option::None } else { Option::Some(self + 1i32) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == 2147483647i32 { Option::None } else { *self = value + 1i32; Option::Some(value) }
+    }
+}
+
+impl Step for i64 {
+    fun forward_checked(self) -> Option<Self> {
+        if self == 9223372036854775807i64 { Option::None } else { Option::Some(self + 1i64) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == 9223372036854775807i64 { Option::None } else { *self = value + 1i64; Option::Some(value) }
+    }
+}
+
+impl Step for isize {
+    fun forward_checked(self) -> Option<Self> {
+        if self == ((!0usize) >> 1usize) as isize { Option::None } else { Option::Some(self + 1isize) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == ((!0usize) >> 1usize) as isize { Option::None } else { *self = value + 1isize; Option::Some(value) }
+    }
+}
+
+impl Step for u8 {
+    fun forward_checked(self) -> Option<Self> {
+        if self == 255u8 { Option::None } else { Option::Some(self + 1u8) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == 255u8 { Option::None } else { *self = value + 1u8; Option::Some(value) }
+    }
+}
+
+impl Step for u16 {
+    fun forward_checked(self) -> Option<Self> {
+        if self == 65535u16 { Option::None } else { Option::Some(self + 1u16) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == 65535u16 { Option::None } else { *self = value + 1u16; Option::Some(value) }
+    }
+}
+
+impl Step for u32 {
+    fun forward_checked(self) -> Option<Self> {
+        if self == 4294967295u32 { Option::None } else { Option::Some(self + 1u32) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == 4294967295u32 { Option::None } else { *self = value + 1u32; Option::Some(value) }
+    }
+}
+
+impl Step for u64 {
+    fun forward_checked(self) -> Option<Self> {
+        if self == 18446744073709551615u64 { Option::None } else { Option::Some(self + 1u64) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == 18446744073709551615u64 { Option::None } else { *self = value + 1u64; Option::Some(value) }
+    }
+}
+
+impl Step for usize {
+    fun forward_checked(self) -> Option<Self> {
+        if self == !0usize { Option::None } else { Option::Some(self + 1usize) }
+    }
+    fun take_and_advance(&mut self) -> Option<Self> {
+        let value = *self;
+        if value == !0usize { Option::None } else { *self = value + 1usize; Option::Some(value) }
+    }
+}
+pub struct Range<T = i32> {
+    start: T,
+    end: T,
+}
+
+impl<T> Range<T> {
+    pub fun new(start: T, end: T) -> Range<T> {
         Range { start, end }
     }
 }
 
-pub fun range(start: i32, end: i32) -> Range {
+pub fun range<T: Step>(start: T, end: T) -> Range<T> {
     Range::new(start, end)
 }
 
-impl Iterator for Range {
-    type Item = i32;
+impl<T: Step + crate::std::clone::Clone> Iterator for Range<T> {
+    type Item = T;
 
     fun next(&mut self) -> Option<Self::Item> {
         if self.start < self.end {
-            let value = self.start;
-            self.start += 1;
-            Option::Some(value)
+            self.start.take_and_advance()
         } else {
             Option::None
         }
     }
 }
 
-impl IntoIterator for Range {
-    type Item = i32;
-    type IntoIter = Range;
+impl<T: Step> IntoIterator for Range<T> {
+    type Item = T;
+    type IntoIter = Range<T>;
 
     fun into_iter(self) -> Self::IntoIter {
         self
     }
 }
 
-pub struct RangeInclusive {
-    start: i32,
-    end: i32,
+pub struct RangeInclusive<T = i32> {
+    start: T,
+    end: T,
     exhausted: bool,
 }
 
-impl RangeInclusive {
-    pub fun new(start: i32, end: i32) -> RangeInclusive {
+impl<T> RangeInclusive<T> {
+    pub fun new(start: T, end: T) -> RangeInclusive<T> {
         RangeInclusive {
             start,
             end,
@@ -60,25 +162,23 @@ impl RangeInclusive {
     }
 }
 
-pub fun range_inclusive(start: i32, end: i32) -> RangeInclusive {
+pub fun range_inclusive<T: Step>(start: T, end: T) -> RangeInclusive<T> {
     RangeInclusive::new(start, end)
 }
 
-impl Iterator for RangeInclusive {
-    type Item = i32;
+impl<T: Step + crate::std::clone::Clone> Iterator for RangeInclusive<T> {
+    type Item = T;
 
     fun next(&mut self) -> Option<Self::Item> {
         if self.exhausted {
             return Option::None;
         }
         if self.start < self.end {
-            let value = self.start;
-            self.start += 1;
-            Option::Some(value)
+            self.start.take_and_advance()
         } else {
             self.exhausted = true;
             if self.start == self.end {
-                Option::Some(self.start)
+                Option::Some(self.start.clone())
             } else {
                 Option::None
             }
@@ -86,9 +186,9 @@ impl Iterator for RangeInclusive {
     }
 }
 
-impl IntoIterator for RangeInclusive {
-    type Item = i32;
-    type IntoIter = RangeInclusive;
+impl<T: Step> IntoIterator for RangeInclusive<T> {
+    type Item = T;
+    type IntoIter = RangeInclusive<T>;
 
     fun into_iter(self) -> Self::IntoIter {
         self

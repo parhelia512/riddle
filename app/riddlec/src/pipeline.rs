@@ -20,6 +20,8 @@ use type_checker::{self, IncrementalTypeChecker, TypeCheckResult, check_hir};
 
 use crate::text_range;
 
+pub use type_checker::Diagnostic;
+
 const RAW_STD_PRELUDE: &str = include_str!(concat!(env!("OUT_DIR"), "/std.rid"));
 
 fn std_prelude() -> &'static str {
@@ -37,6 +39,14 @@ fn std_prelude() -> &'static str {
         .as_str()
 }
 
+/// Test-only access to the expanded bundled std prelude, so diagnostics can
+/// slice the exact text their spans refer to.
+#[doc(hidden)]
+pub fn expanded_std_prelude() -> &'static str {
+    std_prelude()
+}
+
+#[derive(Default)]
 pub struct CompileResult {
     pub hir: Option<hir::HirFile>,
     pub scope_graph: Option<scope_graph::ScopeGraph>,
@@ -1636,7 +1646,7 @@ fn run_pipeline_with_state_cancellable_and_names(
     );
 
     // 7. Lower HIR → MIR
-    let mir_module = (success && depth == PipelineDepth::Build).then(|| {
+    let mut mir_module = (success && depth == PipelineDepth::Build).then(|| {
         mir::lower_hir(
             &hir,
             source,
@@ -1647,6 +1657,16 @@ fn run_pipeline_with_state_cancellable_and_names(
             package.names,
         )
     });
+    if let Some(module) = &mir_module {
+        analysis_diagnostics.extend(module.diagnostics.clone());
+        if module
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == type_checker::Severity::Error)
+        {
+            mir_module = None;
+        }
+    }
 
     Some(CompileResult {
         hir: Some(hir),

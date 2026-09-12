@@ -116,3 +116,252 @@ fn generic_cast_reports_e0012_not_crash() {
     let parse = parse("fun convert<T>(value: T) -> i32 { value as i32 }");
     assert!(parse.errors.is_empty());
 }
+
+#[test]
+fn nested_generics_and_shift_after_call_are_unambiguous() {
+    let parse = parse(
+        "fun f<T>(value: T) -> T { value } fun main() { let x = f::<Vec<Vec<i32>>>((1)); let y = 8i32 >> 1i32; }",
+    );
+    assert!(tree_has(&parse, SyntaxKind::TypeArgList));
+    assert!(tree_has(&parse, SyntaxKind::Shr));
+}
+
+#[test]
+fn while_comparison_chain_does_not_consume_body_tokens() {
+    let parse = parse("fun main() { let mut a = 0i32; while a < 3i32 { a = a + 1i32; } }");
+    assert!(tree_has(&parse, SyntaxKind::WhileStmt));
+}
+
+// == operator precedence (Rust/C-style bitwise ordering) ==
+
+/// Operator token of the outermost `BinaryExpr` plus its two operand kinds,
+/// used to assert how an expression groups.
+fn outermost_binary_parts(
+    parse: &frontend::tree_builder::Parse,
+) -> Option<(SyntaxKind, SyntaxKind, SyntaxKind)> {
+    let node = parse.syntax().descendants().find(|n| {
+        n.kind() == SyntaxKind::BinaryExpr
+            && !n
+                .ancestors()
+                .skip(1)
+                .any(|a| a.kind() == SyntaxKind::BinaryExpr)
+    })?;
+    let op = node.children_with_tokens().find_map(|element| {
+        element.as_token().and_then(|token| match token.kind() {
+            SyntaxKind::Pipe
+            | SyntaxKind::Caret
+            | SyntaxKind::Amp
+            | SyntaxKind::Shl
+            | SyntaxKind::Shr
+            | SyntaxKind::Plus
+            | SyntaxKind::Minus
+            | SyntaxKind::Star
+            | SyntaxKind::Slash
+            | SyntaxKind::Percent
+            | SyntaxKind::Less
+            | SyntaxKind::Greater
+            | SyntaxKind::LessEq
+            | SyntaxKind::GreaterEq
+            | SyntaxKind::EqEq
+            | SyntaxKind::BangEq
+            | SyntaxKind::AmpAmp
+            | SyntaxKind::PipePipe => Some(token.kind()),
+            _ => None,
+        })
+    })?;
+    let operands: Vec<_> = node.children().collect();
+    Some((op, operands.first()?.kind(), operands.last()?.kind()))
+}
+
+#[test]
+fn amp_binds_tighter_than_pipe() {
+    // `a | b & c` groups as `a | (b & c)` like Rust/C, not `(a | b) & c`.
+    let parse = parse("fun f(a: i32, b: i32, c: i32) -> i32 { a | b & c }");
+    assert_eq!(
+        outermost_binary_parts(&parse),
+        Some((
+            SyntaxKind::Pipe,
+            SyntaxKind::NameRef,
+            SyntaxKind::BinaryExpr
+        ))
+    );
+}
+
+#[test]
+fn caret_binds_tighter_than_pipe() {
+    // `a ^ b | c` groups as `(a ^ b) | c`.
+    let parse = parse("fun f(a: i32, b: i32, c: i32) -> i32 { a ^ b | c }");
+    assert_eq!(
+        outermost_binary_parts(&parse),
+        Some((
+            SyntaxKind::Pipe,
+            SyntaxKind::BinaryExpr,
+            SyntaxKind::NameRef
+        ))
+    );
+}
+
+#[test]
+fn amp_binds_tighter_than_caret() {
+    // `a & b ^ c` groups as `(a & b) ^ c`.
+    let parse = parse("fun f(a: i32, b: i32, c: i32) -> i32 { a & b ^ c }");
+    assert_eq!(
+        outermost_binary_parts(&parse),
+        Some((
+            SyntaxKind::Caret,
+            SyntaxKind::BinaryExpr,
+            SyntaxKind::NameRef
+        ))
+    );
+}
+
+#[test]
+fn shifts_bind_tighter_than_amp() {
+    // `a & b << 1` groups as `a & (b << 1)`.
+    let parse = parse("fun f(a: i32, b: i32) -> i32 { a & b << 1 }");
+    assert_eq!(
+        outermost_binary_parts(&parse),
+        Some((SyntaxKind::Amp, SyntaxKind::NameRef, SyntaxKind::BinaryExpr))
+    );
+}
+
+#[test]
+fn arithmetic_binds_tighter_than_shifts() {
+    // `a << b + 1` groups as `a << (b + 1)`.
+    let parse = parse("fun f(a: i32, b: i32) -> i32 { a << b + 1 }");
+    assert_eq!(
+        outermost_binary_parts(&parse),
+        Some((SyntaxKind::Shl, SyntaxKind::NameRef, SyntaxKind::BinaryExpr))
+    );
+}
+
+#[test]
+fn bitwise_binds_tighter_than_comparison() {
+    // `a & b == c` groups as `(a & b) == c` like Rust (not C, where `==`
+    // would bind tighter).
+    let parse = parse("fun f(a: i32, b: i32, c: i32) -> bool { a & b == c }");
+    assert_eq!(
+        outermost_binary_parts(&parse),
+        Some((
+            SyntaxKind::EqEq,
+            SyntaxKind::BinaryExpr,
+            SyntaxKind::NameRef
+        ))
+    );
+}
+
+#[test]
+fn arithmetic_binds_tighter_than_comparison() {
+    // `a + b < c` groups as `(a + b) < c`.
+    let parse = parse("fun f(a: i32, b: i32, c: i32) -> bool { a + b < c }");
+    assert_eq!(
+        outermost_binary_parts(&parse),
+        Some((
+            SyntaxKind::Less,
+            SyntaxKind::BinaryExpr,
+            SyntaxKind::NameRef
+        ))
+    );
+}
+
+#[test]
+fn unary_still_binds_tighter_than_multiplication() {
+    // `-a * b` groups as `(-a) * b`, not `-(a * b)`.
+    let parse1 = parse("fun f(a: i32, b: i32) -> i32 { -a * b }");
+    assert_eq!(
+        outermost_binary_parts(&parse1),
+        Some((SyntaxKind::Star, SyntaxKind::UnaryExpr, SyntaxKind::NameRef))
+    );
+    let parse2 = parse("fun f(a: bool, b: bool) -> bool { !a && b }");
+    assert_eq!(
+        outermost_binary_parts(&parse2),
+        Some((
+            SyntaxKind::AmpAmp,
+            SyntaxKind::UnaryExpr,
+            SyntaxKind::NameRef
+        ))
+    );
+}
+
+#[test]
+fn shifts_associate_left() {
+    // `a << b >> c` groups as `(a << b) >> c`.
+    let parse = parse("fun f(a: i32, b: i32, c: i32) -> i32 { a << b >> c }");
+    assert_eq!(
+        outermost_binary_parts(&parse),
+        Some((SyntaxKind::Shr, SyntaxKind::BinaryExpr, SyntaxKind::NameRef))
+    );
+}
+
+// == error recovery: context sync sets suppress cascades ==
+
+fn parse_unchecked(source: &str) -> frontend::tree_builder::Parse {
+    let mut parser = IncrementalParser::new();
+    parser.set_source(source).clone()
+}
+
+#[test]
+fn malformed_let_reports_one_error_and_keeps_later_statements() {
+    let parse = parse_unchecked("fun main() { let = 5; let y = 3; }");
+    assert_eq!(parse.errors.len(), 1, "{:?}", parse.errors);
+    // The statement after the broken one still parses as a real binding.
+    assert_eq!(
+        parse
+            .syntax()
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::VarDecl)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn missing_param_type_reports_one_error_and_closes_the_list() {
+    let parse = parse_unchecked("fun f(a: i32, b) -> i32 { 0 } fun main() { }");
+    assert_eq!(parse.errors.len(), 1, "{:?}", parse.errors);
+    assert!(tree_has(&parse, SyntaxKind::ParamList));
+}
+
+#[test]
+fn missing_struct_field_comma_reports_one_error_and_parses_both_fields() {
+    let parse = parse_unchecked("struct S { a: i32 b: i32 } fun main() { }");
+    assert_eq!(parse.errors.len(), 1, "{:?}", parse.errors);
+    assert_eq!(
+        parse
+            .syntax()
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::StructField)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn malformed_match_arm_body_reports_one_error() {
+    let parse = parse_unchecked("fun main() { match 1 { 1 => let a = ; 2 => 2 } }");
+    assert_eq!(parse.errors.len(), 1, "{:?}", parse.errors);
+    assert!(tree_has(&parse, SyntaxKind::MatchExpr));
+}
+
+#[test]
+fn missing_semi_before_next_statement_keeps_the_next_statement() {
+    // The statement keyword is a sync point: it is not swallowed by the
+    // missing-`;` error, so `fun main` parses as a real function.
+    let parse = parse_unchecked("fun f() { let a = 1 } fun main() { }");
+    assert_eq!(parse.errors.len(), 1, "{:?}", parse.errors);
+    assert_eq!(
+        parse
+            .syntax()
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FuncDecl)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn stray_closing_braces_each_report_once() {
+    let parse = parse_unchecked("fun main() { let a = 1; } } } fun other() { let b = 2; }");
+    assert_eq!(parse.errors.len(), 2, "{:?}", parse.errors);
+    assert!(tree_has(&parse, SyntaxKind::FuncDecl));
+}

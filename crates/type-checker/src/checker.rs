@@ -35,7 +35,7 @@ pub struct TypeChecker<'a> {
     pub(crate) pending_move_uses: HashSet<(BodyId, ExprId)>,
     pub(crate) pending_delayed_bindings: Vec<(BodyId, PatternBindingId, Option<TextRange>)>,
     pub(crate) pending_generic_calls: Vec<PendingGenericCall>,
-    active_trait_assumptions: Vec<TraitBound>,
+    pub(crate) active_trait_assumptions: Vec<TraitBound>,
 }
 
 struct PendingLambda {
@@ -339,12 +339,13 @@ impl<'a> TypeChecker<'a> {
                             message: String::new(),
                             style: LabelStyle::Primary,
                         }],
-                        help: Some(
-                            "recognized lang items: drop, copy, clone, partial_eq, eq, partial_ord, ord, \
-                             add, sub, mul, div, rem, neg, not, bitand, bitor, bitxor, \
-                             shl, shr, index, index_mut, and the *_assign variants"
-                                .to_string(),
-                        ),
+                    help: Some(
+                        "recognized lang items: drop, copy, clone, partial_eq, eq, partial_ord, ord, \
+                         add, sub, mul, div, rem, neg, not, bitand, bitor, bitxor, \
+                         shl, shr, index, index_mut, the *_assign variants, debug, \
+                         option, result"
+                            .to_string(),
+                    ),
                         notes: Vec::new(),
                     });
                     continue;
@@ -416,6 +417,97 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // ── Validate and register #[lang] enums ──────────────────────────────
+        for (eid, en) in self.hir.item_tree.enums.iter() {
+            for attr in &en.attrs {
+                if attr.name.0 != "lang" {
+                    continue;
+                }
+                if invalid_internal_attrs.contains(&attr.range) {
+                    continue;
+                }
+                let Some(lang) = attr.value.as_deref() else {
+                    continue;
+                };
+                // Unknown lang name.
+                let Some(item) = LangItem::from_name(lang) else {
+                    self.result.diagnostics.push(Diagnostic {
+                        code: "E0053",
+                        severity: Severity::Error,
+                        message: format!("unknown lang item `{lang}`"),
+                        labels: vec![SourceLabel {
+                            range: en.name_range,
+                            message: String::new(),
+                            style: LabelStyle::Primary,
+                        }],
+                        help: Some(
+                            "recognized lang items: drop, copy, clone, partial_eq, eq, \
+                             partial_ord, ord, add, sub, mul, div, rem, neg, not, bitand, \
+                             bitor, bitxor, shl, shr, index, index_mut, the *_assign \
+                             variants, debug, option, result"
+                                .to_string(),
+                        ),
+                        notes: Vec::new(),
+                    });
+                    continue;
+                };
+                if !item.is_enum() {
+                    self.result.diagnostics.push(Diagnostic {
+                        code: "E0053",
+                        severity: Severity::Error,
+                        message: format!(
+                            "lang item `{}` is carried by a trait, not an enum",
+                            item.as_str()
+                        ),
+                        labels: vec![SourceLabel {
+                            range: en.name_range,
+                            message: String::new(),
+                            style: LabelStyle::Primary,
+                        }],
+                        help: None,
+                        notes: Vec::new(),
+                    });
+                    continue;
+                }
+                if let Some(expected) = item.enum_generic_count()
+                    && en.generics.len() != expected
+                {
+                    self.result.diagnostics.push(Diagnostic {
+                        code: "E0053",
+                        severity: Severity::Error,
+                        message: format!(
+                            "lang item `{}` requires exactly {expected} generic parameter(s)",
+                            item.as_str()
+                        ),
+                        labels: vec![SourceLabel {
+                            range: en.name_range,
+                            message: String::new(),
+                            style: LabelStyle::Primary,
+                        }],
+                        help: None,
+                        notes: Vec::new(),
+                    });
+                    continue;
+                }
+                if self.result.trait_env.lang_items.register_enum(item, eid)
+                    == RegisterResult::DuplicateItem
+                {
+                    self.result.diagnostics.push(Diagnostic {
+                        code: "E0053",
+                        severity: Severity::Error,
+                        message: format!("lang item `{}` is defined more than once", item.as_str()),
+                        labels: vec![SourceLabel {
+                            range: en.name_range,
+                            message: "duplicate definition here".into(),
+                            style: LabelStyle::Primary,
+                        }],
+                        help: None,
+                        notes: vec!["first definition is elsewhere in the source".into()],
+                    });
+                }
+            }
+        }
+
         self.register_trait_impls();
     }
 
@@ -479,18 +571,32 @@ impl<'a> TypeChecker<'a> {
                 )
             } else {
                 match attr.name.0.as_str() {
-                    "lang" if internal.target != InternalAttrTarget::Trait => (
-                        "E0053",
-                        "`#[lang]` can only be applied to a trait".to_string(),
-                    ),
+                    "lang"
+                        if !matches!(
+                            internal.target,
+                            InternalAttrTarget::Trait | InternalAttrTarget::Enum
+                        ) =>
+                    {
+                        (
+                            "E0053",
+                            "`#[lang]` can only be applied to a trait or enum".to_string(),
+                        )
+                    }
                     "lang" if attr.value.is_none() => (
                         "E0053",
                         "`#[lang]` requires a string value: write `#[lang = \"...\"]`".to_string(),
                     ),
-                    "fundamental" if internal.target != InternalAttrTarget::FundamentalType => (
-                        "E0053",
-                        "`#[fundamental]` can only be applied to a struct or enum".to_string(),
-                    ),
+                    "fundamental"
+                        if !matches!(
+                            internal.target,
+                            InternalAttrTarget::Struct | InternalAttrTarget::Enum
+                        ) =>
+                    {
+                        (
+                            "E0053",
+                            "`#[fundamental]` can only be applied to a struct or enum".to_string(),
+                        )
+                    }
                     "fundamental" if attr.value.is_some() => (
                         "E0053",
                         "`#[fundamental]` does not accept a value".to_string(),
@@ -601,7 +707,34 @@ impl<'a> TypeChecker<'a> {
                     Some(span),
                 );
             }
+            let dep_count = deps.len();
             dependencies.insert(const_id, deps);
+            // The initializer must evaluate, and its value must fit the
+            // declared type: `const N: usize = 0 - 1` previously wrapped
+            // silently into `u64::MAX` and became a legal array length.
+            match self.const_item_value(const_id, &mut Vec::new()) {
+                Some(value) => {
+                    if !Self::const_value_fits_type(&declared, value) {
+                        self.diagnostic(
+                            "E0011",
+                            format!(
+                                "constant value `{value}` is out of range for `{}`",
+                                declared.display(self.hir)
+                            ),
+                            Some(konst.ty_range),
+                        );
+                    }
+                }
+                None if dep_count == 0 => {
+                    let span = body.source_map.expr_ranges.get(&body.root_block).copied();
+                    self.diagnostic(
+                        "E0060",
+                        "constant initializer is not a constant expression",
+                        span,
+                    );
+                }
+                None => {}
+            }
             self.finish_inference(&ctx);
         }
 
@@ -1816,15 +1949,34 @@ impl<'a> TypeChecker<'a> {
 
     /// Resolves a name used as a const-generic argument to a constant item's
     /// compile-time value.
-    pub(crate) fn const_item_value_by_name(&self, name: &str) -> Option<usize> {
-        let id = self
-            .hir
-            .item_tree
-            .consts
-            .iter()
-            .find(|(_, konst)| konst.name.0 == name)
-            .map(|(id, _)| id)?;
-        usize::try_from(self.const_item_value(id, &mut Vec::new())?).ok()
+    /// Looks up a constant item by name for a reference at `use_range`.
+    ///
+    /// Resolution rules: a non-`pub` constant only resolves for references
+    /// inside its own package; when several same-package constants share a
+    /// name (module shadowing), the declaration closest before the use wins.
+    pub(crate) fn const_item_visible_at(
+        &self,
+        name: &str,
+        use_range: rowan::TextRange,
+    ) -> Option<ConstId> {
+        let use_package = self.hir.package_for_range(use_range);
+        let mut best: Option<ConstId> = None;
+        for (id, konst) in self.hir.item_tree.consts.iter() {
+            if konst.name.0 != name {
+                continue;
+            }
+            let declared_package = self.hir.package_for_range(konst.name_range);
+            if declared_package != use_package && !konst.visibility.is_public() {
+                continue;
+            }
+            if declared_package == use_package && konst.name_range.start() <= use_range.start() {
+                best = Some(id);
+            } else if best.is_none() && declared_package != use_package {
+                // Cross-package references accept any first match.
+                best = Some(id);
+            }
+        }
+        best
     }
 
     /// Evaluates a constant item to its compile-time integer value so it can
@@ -1867,7 +2019,13 @@ impl<'a> TypeChecker<'a> {
                 let rhs_value = self.const_expr_value(body, *rhs, active)?;
                 const_value_binary(lhs_value, rhs_value, *op)
             }
-            Expr::Cast { base, .. } => self.const_expr_value(body, *base, active),
+            Expr::Cast { base, target } => {
+                let value = self.const_expr_value(body, *base, active)?;
+                Some(match const_target_int_ty(target) {
+                    Some(int_ty) => truncate_const_value(int_ty, value),
+                    None => value,
+                })
+            }
             Expr::Block { tail, .. } => {
                 tail.and_then(|tail| self.const_expr_value(body, tail, active))
             }
@@ -2186,6 +2344,18 @@ impl<'a> TypeChecker<'a> {
         message: impl Into<String>,
         span: Option<TextRange>,
     ) {
+        self.diagnostic_with_help(code, message, span, None);
+    }
+
+    /// Emits a diagnostic with an explicit help note, so call sites never
+    /// have to key extra guidance on English message substrings.
+    pub(crate) fn diagnostic_with_help(
+        &mut self,
+        code: &'static str,
+        message: impl Into<String>,
+        span: Option<TextRange>,
+        help: Option<String>,
+    ) {
         let span = span.expect("type-checker diagnostics require a source range");
         let message = message.into();
         if self.result.diagnostics.iter().any(|diagnostic| {
@@ -2198,7 +2368,10 @@ impl<'a> TypeChecker<'a> {
         }) {
             return;
         }
-        let notes = match code {
+        let notes = if let Some(help) = help {
+            vec![help]
+        } else {
+            match code {
             "E0001" => vec!["expected one type but found another; consider an explicit type annotation or cast".into()],
             "E0002" => vec!["all branches must produce values of the same type; ensure both branches return compatible types".into()],
             "E0003" => vec!["this operation requires a numeric or `char` type".into()],
@@ -2209,17 +2382,8 @@ impl<'a> TypeChecker<'a> {
             "E0008" => vec!["only references can be dereferenced, and only arrays can be indexed".into()],
             "E0009" => vec!["check that the path names a struct definition".into()],
             "E0010" => vec!["ensure tuple element counts match".into()],
-            "E0011" if message.contains("is not supported") => {
-                vec!["scalar types are limited to the C11 portable set: integers `i8`–`i64`/`u8`–`u64` (plus `isize`/`usize`) and floats `f32`/`f64`; use the closest supported type".into()]
-            }
             "E0011" => vec!["use a valid numeric suffix and keep the literal within that type's range".into()],
             "E0012" => vec!["this source and target type pair does not support `as` conversion".into()],
-            "E0013" if message.contains("ambiguous method") => {
-                vec!["use a trait-specific forwarding method or split the object bounds".into()]
-            }
-            "E0013" if message.contains("not object-safe") => {
-                vec!["use a borrowed receiver and avoid `Self`, by-value `self`, or generic methods".into()]
-            }
             "E0013" => vec!["check the impl block and receiver type".into()],
             "E0020" | "E0024" => vec!["remove the duplicate definition".into()],
             "E0031" if message == "cannot call a mutable closure through an immutable binding" => {
@@ -2259,8 +2423,10 @@ impl<'a> TypeChecker<'a> {
             "E0028" | "E0029" | "E0030" => vec!["the method signature must exactly match the trait declaration: check parameter count, types, and return type".into()],
             "E0067" => vec!["add an explicit type annotation or break the self-referential substitution cycle".into()],
             _ => Vec::new(),
+            }
         };
-        let help = (code == "E0046").then(|| "wrap this operation in `unsafe { ... }`".to_string());
+        let e0046_help =
+            (code == "E0046").then(|| "wrap this operation in `unsafe { ... }`".to_string());
         self.result.diagnostics.push(Diagnostic {
             code,
             severity: Severity::Error,
@@ -2270,7 +2436,7 @@ impl<'a> TypeChecker<'a> {
                 message: String::new(),
                 style: LabelStyle::Primary,
             }],
-            help,
+            help: e0046_help,
             notes,
         });
     }
@@ -2284,7 +2450,8 @@ impl<'a> TypeChecker<'a> {
         if let Some(suffix) = suffix {
             return IntTy::parse(suffix).map_or_else(
                 || {
-                    self.diagnostic("E0011", integer_suffix_error(suffix), span);
+                    let (message, help) = integer_suffix_error(suffix);
+                    self.diagnostic_with_help("E0011", message, span, help);
                     Type::Error
                 },
                 Type::Int,
@@ -2305,7 +2472,8 @@ impl<'a> TypeChecker<'a> {
         if let Some(suffix) = suffix {
             return FloatTy::parse(suffix).map_or_else(
                 || {
-                    self.diagnostic("E0011", float_suffix_error(suffix), span);
+                    let (message, help) = float_suffix_error(suffix);
+                    self.diagnostic_with_help("E0011", message, span, help);
                     Type::Error
                 },
                 Type::Float,
@@ -2570,21 +2738,28 @@ impl<'a> TypeChecker<'a> {
 /// integers and `f32`/`f64`.
 const RESERVED_WIDE_TYPE_HINT: &str = "scalar types are limited to the C11 portable set: integers `i8`-`i64`/`u8`-`u64` (plus `isize`/`usize`) and floats `f32`/`f64`";
 
-fn integer_suffix_error(suffix: &str) -> String {
+/// Help shown alongside reserved-wide-type suffix errors.
+const RESERVED_WIDE_TYPE_HELP: &str = "scalar types are limited to the C11 portable set: integers `i8`–`i64`/`u8`–`u64` (plus `isize`/`usize`) and floats `f32`/`f64`; use the closest supported type";
+
+fn integer_suffix_error(suffix: &str) -> (String, Option<String>) {
     match suffix {
-        "i128" | "u128" => {
-            format!("integer literal suffix `{suffix}` is not supported; {RESERVED_WIDE_TYPE_HINT}")
-        }
-        _ => format!("unknown integer literal suffix `{suffix}`"),
+        "i128" | "u128" => (
+            format!(
+                "integer literal suffix `{suffix}` is not supported; {RESERVED_WIDE_TYPE_HINT}"
+            ),
+            Some(RESERVED_WIDE_TYPE_HELP.to_string()),
+        ),
+        _ => (format!("unknown integer literal suffix `{suffix}`"), None),
     }
 }
 
-fn float_suffix_error(suffix: &str) -> String {
+fn float_suffix_error(suffix: &str) -> (String, Option<String>) {
     match suffix {
-        "f16" | "f128" => {
-            format!("float literal suffix `{suffix}` is not supported; {RESERVED_WIDE_TYPE_HINT}")
-        }
-        _ => format!("unknown float literal suffix `{suffix}`"),
+        "f16" | "f128" => (
+            format!("float literal suffix `{suffix}` is not supported; {RESERVED_WIDE_TYPE_HINT}"),
+            Some(RESERVED_WIDE_TYPE_HELP.to_string()),
+        ),
+        _ => (format!("unknown float literal suffix `{suffix}`"), None),
     }
 }
 
@@ -2655,16 +2830,19 @@ fn type_contains_infer_var(
 /// Folds a constant binary operation over evaluated integer operands.
 fn const_value_binary(lhs: u64, rhs: u64, op: HirBinOp) -> Option<u64> {
     match op {
-        HirBinOp::Add => Some(lhs.wrapping_add(rhs)),
-        HirBinOp::Sub => Some(lhs.wrapping_sub(rhs)),
-        HirBinOp::Mul => Some(lhs.wrapping_mul(rhs)),
+        // Arithmetic is checked: the evaluator models non-negative values,
+        // and an overflow (e.g. `0 - 1`) must leave the constant
+        // unevaluated instead of wrapping into a bogus array length.
+        HirBinOp::Add => lhs.checked_add(rhs),
+        HirBinOp::Sub => lhs.checked_sub(rhs),
+        HirBinOp::Mul => lhs.checked_mul(rhs),
         HirBinOp::Div if rhs != 0 => Some(lhs / rhs),
         HirBinOp::Mod if rhs != 0 => Some(lhs % rhs),
         HirBinOp::BitAnd => Some(lhs & rhs),
         HirBinOp::BitOr => Some(lhs | rhs),
         HirBinOp::BitXor => Some(lhs ^ rhs),
-        HirBinOp::Shl if rhs < u64::BITS as u64 => Some(lhs << rhs),
-        HirBinOp::Shr if rhs < u64::BITS as u64 => Some(lhs >> rhs),
+        HirBinOp::Shl if rhs < u64::BITS as u64 => lhs.checked_shl(rhs.try_into().ok()?),
+        HirBinOp::Shr if rhs < u64::BITS as u64 => lhs.checked_shr(rhs.try_into().ok()?),
         HirBinOp::Eq => Some(u64::from(lhs == rhs)),
         HirBinOp::Neq => Some(u64::from(lhs != rhs)),
         HirBinOp::Lt => Some(u64::from(lhs < rhs)),
@@ -2672,6 +2850,59 @@ fn const_value_binary(lhs: u64, rhs: u64, op: HirBinOp) -> Option<u64> {
         HirBinOp::LtEq => Some(u64::from(lhs <= rhs)),
         HirBinOp::GtEq => Some(u64::from(lhs >= rhs)),
         _ => None,
+    }
+}
+
+/// The integer type a `as` cast targets, when it is a primitive integer.
+fn const_target_int_ty(target: &HirTypeRef) -> Option<IntTy> {
+    let HirTypeRef::Named(path) = target else {
+        return None;
+    };
+    let name = path.segments.last()?.0.as_str();
+    IntTy::parse(name)
+}
+
+/// Applies `as`-cast wrapping truncation to a non-negative const value.
+fn truncate_const_value(int_ty: IntTy, value: u64) -> u64 {
+    let bits: u32 = match int_ty {
+        IntTy::I8 | IntTy::U8 => 8,
+        IntTy::I16 | IntTy::U16 => 16,
+        IntTy::I32 | IntTy::U32 => 32,
+        IntTy::I64 | IntTy::U64 | IntTy::Isize | IntTy::Usize => 64,
+    };
+    if bits == 64 {
+        value
+    } else {
+        value & ((1u64 << bits) - 1)
+    }
+}
+
+impl TypeChecker<'_> {
+    /// True when `value` (the non-negative magnitude the const evaluator
+    /// produces, with negatives reported as `None`) is representable in the
+    /// declared constant type.
+    fn const_value_fits_type(ty: &Type, value: u64) -> bool {
+        match ty {
+            Type::Int(int_ty) => Self::const_value_fits_int(*int_ty, value),
+            Type::Bool => value <= 1,
+            _ => true,
+        }
+    }
+
+    fn const_value_fits_int(int_ty: IntTy, value: u64) -> bool {
+        let max: u128 = match int_ty {
+            IntTy::I8 => i8::MAX as u128,
+            IntTy::I16 => i16::MAX as u128,
+            IntTy::I32 => i32::MAX as u128,
+            IntTy::I64 => i64::MAX as u128,
+            IntTy::Isize => isize::MAX as u128,
+            IntTy::U8 => u8::MAX as u128,
+            IntTy::U16 => u16::MAX as u128,
+            IntTy::U32 => u32::MAX as u128,
+            IntTy::U64 => u64::MAX as u128,
+            IntTy::Usize => usize::MAX as u128,
+        };
+        (value as u128) <= max
     }
 }
 
@@ -2865,6 +3096,14 @@ pub fn validate_lang_item_signature(
 
         LangItem::Index => validate_index_trait(tr, "index", false, &self_ty),
         LangItem::IndexMut => validate_index_trait(tr, "index_mut", true, &self_ty),
+
+        // Formatting — no method/assoc-type contract beyond what `fmt` uses.
+        LangItem::Debug => None,
+
+        // Enum-carried lang items never validate as traits.
+        LangItem::Option | LangItem::Result => {
+            Some("this lang item is carried by an enum, not a trait".into())
+        }
     }
 }
 

@@ -883,7 +883,7 @@ fn std_basic_value_methods_compile() {
         result.analysis_diagnostics
     );
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
-    assert!(c.contains(&c_function("is_some__Option_i32")), "{c}");
+    assert!(c.contains(&c_function("is_some__10:Option_i32")), "{c}");
 }
 
 #[test]
@@ -964,14 +964,14 @@ fn std_string_and_vector_compile_without_string_runtime_helpers() {
         result.analysis_diagnostics
     );
     let c = generate_c(result.mir_module.as_ref().unwrap()).unwrap();
-    assert!(c.contains(&c_function("new__Vector_i32")), "{c}");
+    assert!(c.contains(&c_function("new__10:Vector_i32")), "{c}");
     assert!(!c.contains("extern void* malloc(size_t)"), "{c}");
     assert!(c.contains("extern void* rgc_realloc(void*, size_t)"), "{c}");
     assert!(c.contains("extern void rgc_free(void*)"), "{c}");
     assert_eq!(c.matches("extern void abort(void);").count(), 1, "{c}");
     assert!(c.matches("abort();").count() >= 1, "{c}");
     assert!(c.contains("sizeof(int32_t)"), "{c}");
-    assert!(c.contains(&c_function("as_slice__Vector_i32")), "{c}");
+    assert!(c.contains(&c_function("as_slice__10:Vector_i32")), "{c}");
     assert!(!c.contains(&c_function("from_raw_parts")), "{c}");
     assert!(!c.contains("vector_grow"), "{c}");
     assert!(!c.contains("str_len"), "{c}");
@@ -2262,7 +2262,7 @@ fn std_modules_expose_core_items() {
 
             fun main() {
                 let value = std::option::Option::Some(1);
-                let mut iter: Range = std::ops::range(0, 3);
+                let mut iter: Range<i32> = std::ops::range(0, 3);
                 let first = iter.next();
                 let values: Vector<i32> = Vector::new();
             }
@@ -2658,5 +2658,86 @@ fn panic_locations_resolve_to_the_original_module_file() {
     assert!(
         stderr.contains("panicked at") && stderr.contains("helper.rid:2:5:"),
         "panic location should point at helper.rid:2:5, got: {stderr}"
+    );
+}
+
+#[test]
+fn user_result_enum_does_not_hijack_the_try_operator() {
+    // With std loaded, `?` must bind to the lang `Result`/`Option` enums by
+    // definition, not by name: a user enum merely named `Result` is rejected
+    // as a `?` operand while the std enum keeps working.
+    let result = compile_with_options_and_gc(
+        r#"
+        enum Result<T, E> {
+            Ok(T),
+            Err(E),
+        }
+
+        fun user_try(value: Result<i32, bool>) -> Result<i32, bool> {
+            let inner = value?;
+            Result::Ok(inner)
+        }
+
+        fun std_try(value: std::result::Result<i32, bool>) -> std::result::Result<i32, bool> {
+            let inner = value?;
+            std::result::Result::Ok(inner)
+        }
+
+        fun main() -> i32 { 0 }
+        "#,
+        CompileOptions::default(),
+        false,
+    );
+
+    let diagnostics = &result.type_result.diagnostics;
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0061"),
+        "expected E0061 for the user-defined Result used with `?`, got {:#?}",
+        diagnostics
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0062"),
+        "std Result must keep working with `?`, got {:#?}",
+        diagnostics
+    );
+}
+
+#[test]
+fn hash_map_entry_or_insert_matches_rust_idiom() {
+    let result = compile(
+        r"
+        use crate::std::collections::HashMap;
+
+        fun main() -> i32 {
+            let mut counts: HashMap<i32, i32> = HashMap::new();
+            let slot = counts.entry(7i32).or_insert(0i32);
+            *slot = *slot + 1i32;
+            let slot2 = counts.entry(7i32).or_insert(100i32);
+            if *slot2 != 1i32 { return 1; }
+            let slot3 = counts.entry(8i32).or_insert_with([ -> 40i32]);
+            *slot3 = *slot3 + 2i32;
+            if counts.len() != 2usize { return 2; }
+            let slot4 = counts.entry(7i32).or_insert(0i32);
+            if *slot4 != 1i32 { return 3; }
+            0
+        }
+        ",
+    );
+    assert!(
+        result.success(),
+        "parse: {:#?}
+type: {:#?}
+analysis: {:#?}
+hir: {:#?}
+macro: {:#?}",
+        result.parse_errors,
+        result.type_result.diagnostics,
+        result.analysis_diagnostics,
+        result.hir_diagnostics,
+        result.macro_diagnostics
     );
 }

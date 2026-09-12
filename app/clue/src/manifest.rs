@@ -299,6 +299,14 @@ fn collect_hash_files(
         if entry.file_type()?.is_dir() {
             collect_hash_files(root, &path, files)?;
         } else if entry.file_type()?.is_file() {
+            // Only hash what the build actually consumes: source files and
+            // the manifest. Editor scratch files and notes must not dirty
+            // the lock file on every save.
+            let is_source = path.extension().is_some_and(|extension| extension == "rid");
+            let is_manifest = name.to_string_lossy() == "Clue.toml";
+            if !is_source && !is_manifest {
+                continue;
+            }
             let relative = path
                 .strip_prefix(root)
                 .unwrap_or(&path)

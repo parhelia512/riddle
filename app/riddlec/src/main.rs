@@ -27,7 +27,7 @@ struct Opts {
     #[arg(long = "no-std", action = ArgAction::SetFalse, default_value_t = true)]
     use_std: bool,
 
-    /// Generate code for a target backend.
+    /// Generate code for the C backend (the only available backend).
     #[arg(short, long, value_enum)]
     backend: Option<BackendKind>,
 
@@ -47,12 +47,25 @@ struct Opts {
 }
 
 fn main() {
+    // The whole pipeline (parser, HIR lowering, move checking, MIR lowering,
+    // codegen) recurses per nesting level of the input; run on a large stack
+    // so legitimate deep inputs compile and pathological ones hit the
+    // parser's nesting diagnostic instead of a stack overflow.
+    let worker = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn compiler worker thread");
+    let code = worker.join().unwrap_or(1);
+    process::exit(code);
+}
+
+fn run() -> i32 {
     let opts = match parse_args(env::args_os()) {
         Ok(opts) => opts,
         Err(msg) => {
             let exit_code = msg.exit_code();
             let _ = msg.print();
-            process::exit(exit_code);
+            return exit_code;
         }
     };
 
@@ -62,56 +75,68 @@ fn main() {
             env!("CARGO_PKG_VERSION"),
             riddlec::GIT_HASH
         );
-        return;
+        return 0;
     }
 
     if opts.files.is_empty() {
         eprintln!("riddlec: no input files");
-        process::exit(1);
+        return 1;
     }
     let target = match selected_target(opts.target) {
         Ok(target) => target,
         Err(error) => {
             eprintln!("riddlec: {error}");
-            process::exit(1);
+            return 1;
         }
     };
 
-    if opts.backend.is_some() {
-        // The C backend compiles every input as one program: files are
-        // concatenated into a single package so they can reference each
-        // other's items, with source maps preserved for panic locations.
-        let errors = compile_program(&opts.files, &opts, target);
-        if errors > 0 {
-            process::exit(1);
-        }
-        return;
+    // Every input is one program: files are concatenated into a single
+    // package so they can reference each other's items, with source maps
+    // preserved for panic locations. This holds with and without a backend —
+    // checking and codegen must see the same program.
+    let errors = compile_program(&opts.files, &opts, target);
+    if errors > 0 {
+        return 1;
     }
+    0
+}
 
-    let mut total_errors = 0;
-    for file in &opts.files {
-        total_errors += compile_file(file, &opts, target);
-    }
-
-    if total_errors > 0 {
-        process::exit(1);
-    }
+/// A macro-expansion diagnostic report for one input file.
+///
+/// The diagnostics carry spans in the file's pre-expansion coordinates, so
+/// they are reported against a snapshot of the loaded source taken before
+/// expansion rewrote it.
+struct MacroReport {
+    loaded: pipeline::LoadedSource,
+    diagnostics: Vec<riddlec::pipeline::Diagnostic>,
+    name: String,
 }
 
 /// Loads and macro-expands every input file, merging them into one package.
 ///
 /// Returns the combined source plus per-file source maps so diagnostics and
-/// generated panic locations keep pointing at the original files.
-fn load_program_sources(files: &[PathBuf]) -> Result<pipeline::LoadedSource, PathBuf> {
+/// generated panic locations keep pointing at the original files, along with
+/// any macro-expansion diagnostics per file.
+fn load_program_sources(
+    files: &[PathBuf],
+) -> Result<(pipeline::LoadedSource, Vec<MacroReport>), PathBuf> {
     let mut combined = String::new();
     let mut files_loaded = Vec::new();
     let mut source_map = pipeline::SourceMap::default();
+    let mut macro_reports = Vec::new();
     for file in files {
         let mut loaded = pipeline::load_source_file(file).map_err(|error| {
             eprintln!("riddlec: cannot read `{}`: {error}", file.display());
             file.clone()
         })?;
         let expansion = riddlec::proc_macro::expand_standard_macros(&loaded.source);
+        if !expansion.diagnostics.is_empty() {
+            macro_reports.push(MacroReport {
+                loaded: loaded.clone(),
+                diagnostics: expansion.diagnostics,
+                name: file.display().to_string(),
+            });
+        }
         loaded.apply_expansion(expansion.source, &expansion.mappings);
         if !combined.is_empty() {
             combined.push('\n');
@@ -121,24 +146,51 @@ fn load_program_sources(files: &[PathBuf]) -> Result<pipeline::LoadedSource, Pat
         source_map.extend(loaded.source_map, offset);
         files_loaded.extend(loaded.files);
     }
-    Ok(pipeline::LoadedSource {
-        source: combined,
-        files: files_loaded,
-        source_map,
-    })
+    Ok((
+        pipeline::LoadedSource {
+            source: combined,
+            files: files_loaded,
+            source_map,
+        },
+        macro_reports,
+    ))
+}
+
+/// Prints per-file macro-expansion diagnostics and returns the error count.
+///
+/// Errors abort the program build: an unexpanded macro call lowers to a
+/// missing expression, and compiling past it would silently drop the call
+/// (and every not-yet-expanded macro after it) from the program.
+fn report_macro_reports(reports: &[MacroReport]) -> usize {
+    let mut errors = 0;
+    for report in reports {
+        let result = pipeline::CompileResult {
+            macro_diagnostics: report.diagnostics.clone(),
+            ..pipeline::CompileResult::default()
+        };
+        errors += diagnostics::report_mapped(&result, &report.loaded, &report.name);
+    }
+    errors
 }
 
 fn compile_program(files: &[PathBuf], opts: &Opts, target: TargetTriple) -> usize {
-    let loaded = match load_program_sources(files) {
+    let (loaded, macro_reports) = match load_program_sources(files) {
         Ok(loaded) => loaded,
         Err(_) => return 1,
     };
+    let macro_errors = report_macro_reports(&macro_reports);
+    if macro_errors > 0 {
+        return macro_errors;
+    }
     let options = pipeline::CompileOptions {
         use_std: opts.use_std,
     };
     let package_range = 0..loaded.source.len();
     let package_ranges = std::slice::from_ref(&package_range);
-    let result = pipeline::compile_package_with_options(&loaded.source, package_ranges, options);
+    let result = match opts.backend {
+        Some(_) => pipeline::compile_package_with_options(&loaded.source, package_ranges, options),
+        None => pipeline::check_package_with_options(&loaded.source, package_ranges, options),
+    };
 
     let entry_name = files.first().map_or_else(
         || "<unknown>".to_string(),
@@ -155,6 +207,19 @@ fn compile_program(files: &[PathBuf], opts: &Opts, target: TargetTriple) -> usiz
         && let Some(ref module) = result.mir_module
         && opts.backend.is_some()
     {
+        // A program without `main` fails only at C link time with an opaque
+        // `WinMain` error; report it here instead.
+        if !module
+            .functions
+            .values()
+            .any(|function| function.name == "main")
+        {
+            eprintln!(
+                "error[E0401]: no `main` function found in the entry package
+  = help: define `fun main() -> i32 {{ ... }}` as the program entry"
+            );
+            errors += 1;
+        }
         match pipeline::generate_c_for_package_with_source_map(
             module,
             0,
@@ -170,41 +235,6 @@ fn compile_program(files: &[PathBuf], opts: &Opts, target: TargetTriple) -> usiz
         }
     }
     errors
-}
-
-fn compile_file(file: &Path, opts: &Opts, target: TargetTriple) -> usize {
-    let mut loaded = match pipeline::load_source_file(file) {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            eprintln!("riddlec: cannot read `{}`: {error}", file.display());
-            return 1;
-        }
-    };
-    let expansion = riddlec::proc_macro::expand_standard_macros(&loaded.source);
-    loaded.apply_expansion(expansion.source, &expansion.mappings);
-    let options = pipeline::CompileOptions {
-        use_std: opts.use_std,
-    };
-    let package_range = 0..loaded.source.len();
-    let package_ranges = std::slice::from_ref(&package_range);
-    let mut result = if let Some(parse) = expansion.parse.as_ref() {
-        pipeline::check_parsed_package_with_options(&loaded.source, parse, package_ranges, options)
-    } else {
-        pipeline::check_package_with_options(&loaded.source, package_ranges, options)
-    };
-    result.macro_diagnostics = expansion.diagnostics;
-
-    let source_name = file.display().to_string();
-    if opts.verbose {
-        if opts.files.len() > 1 {
-            println!("== {} ==", file.display());
-        }
-        println!("target: {target}");
-        diagnostics::report_verbose(&result, Some(&loaded.source), &source_name);
-        println!();
-    }
-
-    diagnostics::report_mapped(&result, &loaded, &source_name)
 }
 
 fn parse_args<I, T>(args: I) -> Result<Opts, clap::Error>

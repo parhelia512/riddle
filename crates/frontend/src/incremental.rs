@@ -193,7 +193,7 @@ impl Default for IncrementalParser {
     }
 }
 
-fn parse_full(source: &str) -> Parse {
+pub(crate) fn parse_full(source: &str) -> Parse {
     let tokens = lexer::lex(source);
     let mut lex_errors = lexer_error_diagnostics(source, &tokens);
     let parser = Parser::new(source, tokens);

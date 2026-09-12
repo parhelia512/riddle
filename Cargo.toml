@@ -111,6 +111,10 @@ name = "frontend"
 path = "tests/frontend/main.rs"
 
 [[test]]
+name = "fmt"
+path = "tests/fmt/main.rs"
+
+[[test]]
 name = "riddle_lsp"
 path = "tests/riddle_lsp/unit.rs"
 

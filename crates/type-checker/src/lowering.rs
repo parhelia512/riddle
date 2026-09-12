@@ -217,10 +217,12 @@ impl TypeChecker<'_> {
                 }
                 Type::Array(
                     Box::new(self.lower_type_ref_with_params_at(inner, params, span)),
-                    self.lower_const_arg(len, params),
+                    self.lower_const_arg(len, params, span.unwrap_or_default()),
                 )
             }
-            HirTypeRef::Const(value) => Type::Const(self.lower_const_arg(value, params)),
+            HirTypeRef::Const(value) => {
+                Type::Const(self.lower_const_arg(value, params, span.unwrap_or_default()))
+            }
             HirTypeRef::ImplTrait {
                 trait_ty,
                 trait_range,
@@ -497,14 +499,24 @@ impl TypeChecker<'_> {
             .collect()
     }
 
-    fn lower_const_arg(&self, arg: &HirConstArg, params: &HashMap<String, Type>) -> ConstArg {
+    fn lower_const_arg(
+        &self,
+        arg: &HirConstArg,
+        params: &HashMap<String, Type>,
+        name_range: rowan::TextRange,
+    ) -> ConstArg {
         match arg {
             HirConstArg::Value(value) => ConstArg::Value(*value),
             HirConstArg::Param(name) => match params.get(&name.0) {
                 Some(Type::Const(value)) => value.clone(),
                 // A name that is not a generic const parameter may reference a
-                // constant item; use its evaluated value as the argument.
-                None => match self.const_item_value_by_name(&name.0) {
+                // constant item; use its evaluated value as the argument,
+                // resolved with visibility and shadowing rules.
+                None => match self
+                    .const_item_visible_at(&name.0, name_range)
+                    .and_then(|id| self.const_item_value(id, &mut Vec::new()))
+                    .and_then(|value| usize::try_from(value).ok())
+                {
                     Some(value) => ConstArg::Value(value),
                     None => ConstArg::Param(name.0.clone()),
                 },

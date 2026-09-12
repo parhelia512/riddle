@@ -570,14 +570,14 @@ const PRODUCER_SPAN_CASES: &[DiagnosticSpanCase] = &[
     (
         "E0062",
         "can only be used in a function returning Result",
-        "enum Result<T, E> { Ok(T), Err(E) } fun main() -> i32 { let value: Result<i32, i32> = Result::Ok(1); value?; 0 }",
+        "#[lang = \"result\"] enum Result<T, E> { Ok(T), Err(E) } fun main() -> i32 { let value: Result<i32, i32> = Result::Ok(1); value?; 0 }",
         "value?",
         "value?",
     ),
     (
         "E0063",
         "cannot convert",
-        "enum Result<T, E> { Ok(T), Err(E) } struct Inner {} struct Outer {} fun read() -> Result<i32, Inner> { Result::Ok(1) } fun main() -> Result<i32, Outer> { let value = read()?; Result::Ok(value) }",
+        "#[lang = \"result\"] enum Result<T, E> { Ok(T), Err(E) } struct Inner {} struct Outer {} fun read() -> Result<i32, Inner> { Result::Ok(1) } fun main() -> Result<i32, Outer> { let value = read()?; Result::Ok(value) }",
         "read()?",
         "read()?",
     ),
@@ -674,7 +674,7 @@ const PRODUCER_SPAN_CASES: &[DiagnosticSpanCase] = &[
     ),
     (
         "E0307",
-        "cannot move pattern binding `token` in a match guard",
+        "cannot move `token` in a match guard",
         "struct Token {} enum MaybeToken { Some(Token), None } fun consume(value: Token) -> bool { true } fun main(value: MaybeToken) { match value { MaybeToken::Some(token) if consume(token) => {}, MaybeToken::Some(token) => {}, MaybeToken::None => {} } }",
         "token",
         "consume(token",
@@ -877,8 +877,7 @@ fn closure_diagnostic_spans_point_at_the_relevant_source() {
 }
 
 fn assert_distinct_anonymous_function_diagnostic() {
-    let source =
-        "fun main() { let value = if true { [x: i32 -> x] } else { [x: i32 -> x] }; }";
+    let source = "fun main() { let value = if true { [x: i32 -> x] } else { [x: i32 -> x] }; }";
     let result = riddlec::pipeline::compile_with_options(source, CompileOptions { use_std: false });
     let diagnostic = result
         .type_result

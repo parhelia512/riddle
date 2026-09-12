@@ -1,4 +1,5 @@
 #[derive(Debug)]
+#[lang = "option"]
 pub enum Option<T> {
     Some(T),
     None,
@@ -6,14 +7,14 @@ pub enum Option<T> {
 
 impl<T> Option<T> {
     pub fun is_some(&self) -> bool {
-        match *self {
+        match self {
             Option::Some(_) => true,
             Option::None => false,
         }
     }
 
     pub fun is_none(&self) -> bool {
-        match *self {
+        match self {
             Option::Some(_) => false,
             Option::None => true,
         }

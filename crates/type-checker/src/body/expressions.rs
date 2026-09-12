@@ -5,6 +5,7 @@ use super::{
     struct_field_is_visible_for_owner, substitute_type, type_contains_unresolved_const_param,
     type_ref_contains_error,
 };
+use ty::types::FloatTy;
 
 impl TypeChecker<'_> {
     pub(super) fn struct_field_is_visible(
@@ -160,7 +161,17 @@ impl TypeChecker<'_> {
                     let local_ty = if explicit_error {
                         declared
                     } else {
-                        declared.or(init_ty)
+                        // An unannotated binding defaults its numeric
+                        // inference immediately (integers to `i32`, floats
+                        // to `f64`): letting `InferInt` linger on the
+                        // binding would let any later assignment through
+                        // `numeric_assignable` silently truncate the value
+                        // into a narrower integer type.
+                        match declared.or(init_ty) {
+                            Type::InferInt => Type::Int(IntTy::I32),
+                            Type::InferFloat => Type::Float(FloatTy::F64),
+                            other => other,
+                        }
                     };
                     if inferred {
                         self.expect_sized_value(&local_ty, ctx.stmt_range(stmt_id));
@@ -569,6 +580,23 @@ impl TypeChecker<'_> {
                 if is_unsafe_dst_layout_cast(&source_ty, &target_ty) {
                     self.require_unsafe(ctx, "performing a DST layout cast", span);
                 }
+                if let (
+                    Type::Ptr {
+                        mutable: source_mutable,
+                        ..
+                    },
+                    Type::Ptr {
+                        mutable: target_mutable,
+                        ..
+                    },
+                ) = (&source_ty, &target_ty)
+                    && *target_mutable
+                    && !*source_mutable
+                {
+                    // Widening `*const T` into `*mut T` grants write access;
+                    // the cast itself must sit in `unsafe`, like Rust.
+                    self.require_unsafe(ctx, "casting `*const T` to `*mut T`", span);
+                }
                 if !source_ty.is_unknown_like()
                     && !matches!(target_ty, Type::Error)
                     && !is_supported_cast(&source_ty, &target_ty)
@@ -599,15 +627,24 @@ impl TypeChecker<'_> {
         span: Option<rowan::TextRange>,
     ) -> Type {
         let return_ty = self.resolve_type(&ctx.return_ty);
+        let lang_items = &self.result.trait_env.lang_items;
+        let result_enum = lang_items.get_enum(ty::lang_items::LangItem::Result);
+        let option_enum = lang_items.get_enum(ty::lang_items::LangItem::Option);
+        // The registered lang enum decides when std is loaded (a user enum
+        // named `Result` cannot hijack `?`); without std, fall back to
+        // name-based recognition so local `Result`/`Option` still work.
+        let (ret_is_result, ret_is_option) = match &return_ty {
+            Type::Enum(enum_id, args) => (
+                args.len() == 2 && self.is_lang_enum_or_fallback(result_enum, *enum_id, "Result"),
+                args.len() == 1 && self.is_lang_enum_or_fallback(option_enum, *enum_id, "Option"),
+            ),
+            _ => (false, false),
+        };
         let operand_expected = match (expected, &return_ty) {
-            (Some(success), Type::Enum(enum_id, args))
-                if args.len() == 2 && self.hir.item_tree.enums[*enum_id].name.0 == "Result" =>
-            {
+            (Some(success), Type::Enum(enum_id, _)) if ret_is_result => {
                 Some(Type::Enum(*enum_id, vec![success.clone(), Type::Unknown]))
             }
-            (Some(success), Type::Enum(enum_id, args))
-                if args.len() == 1 && self.hir.item_tree.enums[*enum_id].name.0 == "Option" =>
-            {
+            (Some(success), Type::Enum(enum_id, _)) if ret_is_option => {
                 Some(Type::Enum(*enum_id, vec![success.clone()]))
             }
             _ => None,
@@ -620,6 +657,13 @@ impl TypeChecker<'_> {
         let operand_ty = self.resolve_type(&operand_ty);
         self.record_value_use(ctx, operand, ValueUse::Move);
 
+        let (operand_is_result, operand_is_option) = match &operand_ty {
+            Type::Enum(enum_id, _args) => (
+                self.is_lang_enum_or_fallback(result_enum, *enum_id, "Result"),
+                self.is_lang_enum_or_fallback(option_enum, *enum_id, "Option"),
+            ),
+            _ => (false, false),
+        };
         let Type::Enum(result_id, result_args) = &operand_ty else {
             self.diagnostic(
                 "E0061",
@@ -628,8 +672,15 @@ impl TypeChecker<'_> {
             );
             return Type::Error;
         };
-        let enum_name = self.hir.item_tree.enums[*result_id].name.0.clone();
-        if enum_name == "Option" && result_args.len() == 1 {
+        if !operand_is_option && !operand_is_result {
+            self.diagnostic(
+                "E0061",
+                "`?` operates on the standard `Option`/`Result` enums",
+                span,
+            );
+            return Type::Error;
+        }
+        if operand_is_option && result_args.len() == 1 {
             let Type::Enum(return_id, return_args) = &return_ty else {
                 self.diagnostic(
                     "E0062",
@@ -648,7 +699,7 @@ impl TypeChecker<'_> {
             }
             return result_args[0].clone();
         }
-        if enum_name != "Result" || result_args.len() != 2 {
+        if !operand_is_result || result_args.len() != 2 {
             self.diagnostic(
                 "E0061",
                 "`?` requires a Result or Option value as its operand",
@@ -682,6 +733,20 @@ impl TypeChecker<'_> {
         }
 
         result_args[0].clone()
+    }
+
+    /// The registered lang enum decides; when that lang item was never
+    /// registered (no std), fall back to the enum's name.
+    fn is_lang_enum_or_fallback(
+        &self,
+        registered: Option<hir::item_tree::EnumId>,
+        enum_id: hir::item_tree::EnumId,
+        name: &str,
+    ) -> bool {
+        match registered {
+            Some(registered) => registered == enum_id,
+            None => self.hir.item_tree.enums[enum_id].name.0 == name,
+        }
     }
 
     fn check_try_error_conversion(

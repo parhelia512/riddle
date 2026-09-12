@@ -519,6 +519,15 @@ impl Resolver {
             requested_features,
             true,
         )?;
+        // The lock records the default feature set: CLI feature requests
+        // (`--features`, `--all-features`, `--no-default-features`) select
+        // what this invocation builds and must not invalidate `--locked`.
+        let lock_features = enabled_features(
+            &root_manifest.features,
+            &root_manifest.dependencies,
+            &[],
+            true,
+        )?;
         let root_candidate = Candidate {
             key: root_key.clone(),
             name: root_manifest.name.clone(),
@@ -537,8 +546,8 @@ impl Resolver {
             .insert(root_key.clone(), root_candidate.clone());
         state
             .features
-            .insert(root_key.clone(), root_features.clone());
-        state.expanded.insert(root_key, root_features.clone());
+            .insert(root_key.clone(), lock_features.clone());
+        state.expanded.insert(root_key, lock_features.clone());
         let pending = self.requests_for(&root_candidate, &root_features)?;
         let state = self.solve_pending(pending, state)?;
         self.materialize(&state)?;

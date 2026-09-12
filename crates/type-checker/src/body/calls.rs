@@ -659,6 +659,40 @@ impl TypeChecker<'_> {
         }
 
         let receiver = subst.get("Self").cloned().unwrap_or(receiver);
+        let receiver = self.resolve_type(&receiver);
+        // A static `Trait::method(...)` call needs an implementer: without
+        // one, MIR resolves the call to the bodiless trait declaration and
+        // codegen emits a call through a null function pointer.
+        let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
+        let self_satisfied = match &receiver {
+            // A generic parameter relies on its bounds, checked against the
+            // enclosing function's trait assumptions.
+            Type::Param(_) => self.trait_method_self_satisfied(ctx, &receiver, trait_id),
+            Type::Unknown | Type::Error => false,
+            ty => self.result.trait_env.type_implements(ty, trait_id),
+        };
+        match &receiver {
+            Type::Unknown | Type::Error => {
+                self.diagnostic(
+                    "E0005",
+                    format!(
+                        "cannot infer the `Self` type for `{trait_name}::{method_name}`: pass a receiver or annotate the expected type"
+                    ),
+                    span,
+                );
+            }
+            ty if !self_satisfied => {
+                self.diagnostic(
+                    "E0026",
+                    format!(
+                        "no implementation of `{trait_name}` found for `{}`",
+                        ty.display(self.hir)
+                    ),
+                    span,
+                );
+            }
+            _ => {}
+        }
         self.result
             .expr_types
             .insert((ctx.body_id, callee), receiver);
@@ -680,6 +714,19 @@ impl TypeChecker<'_> {
                 &subst,
             )
         })
+    }
+
+    /// True when the enclosing function's bounds prove `ty` implements
+    /// `trait_id` (used for `Trait::method` calls with a generic `Self`).
+    fn trait_method_self_satisfied(
+        &mut self,
+        _ctx: &BodyCtx<'_>,
+        ty: &Type,
+        trait_id: TraitId,
+    ) -> bool {
+        self.active_trait_assumptions
+            .iter()
+            .any(|bound| bound.ty == *ty && bound.trait_id == trait_id)
     }
 
     pub(super) fn check_enum_variant_call(
@@ -829,11 +876,14 @@ impl TypeChecker<'_> {
         {
             args.clone()
         } else {
+            // Fresh inference variables instead of `Unknown`: a bare
+            // `Option::None` binding can later unify with a concrete
+            // `Option<T>` through inference rather than erroring.
             enum_data
                 .generics
                 .iter()
                 .chain(enum_data.const_generics.iter())
-                .map(|_| Type::Unknown)
+                .map(|_| self.fresh_infer())
                 .collect()
         };
         let enum_segment = path.segments.len().checked_sub(2);
@@ -1241,10 +1291,15 @@ impl TypeChecker<'_> {
                 subst,
             ) {
                 let trait_name = self.hir.item_tree.traits[trait_id].name.0.clone();
+                // Nicer diagnostics for `Debug` bounds — matched by lang
+                // item id, so a user trait merely named `Debug` never fires it.
                 let is_debug_bound = function.name.0 == "append_debug"
-                    && trait_name == "Debug"
-                    && self.hir.std_loaded
-                    && self.hir.package_for_range(function.name_range).is_none();
+                    && Some(trait_id)
+                        == self
+                            .result
+                            .trait_env
+                            .lang_items
+                            .get(ty::lang_items::LangItem::Debug);
                 if is_debug_bound {
                     self.report_debug_bound_failure(
                         ctx,

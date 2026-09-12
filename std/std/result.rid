@@ -1,6 +1,7 @@
 use crate::std::option::Option;
 
 #[derive(Debug)]
+#[lang = "result"]
 pub enum Result<T, E> {
     Ok(T),
     Err(E),
@@ -8,14 +9,14 @@ pub enum Result<T, E> {
 
 impl<T, E> Result<T, E> {
     pub fun is_ok(&self) -> bool {
-        match *self {
+        match self {
             Result::Ok(_) => true,
             Result::Err(_) => false,
         }
     }
 
     pub fun is_err(&self) -> bool {
-        match *self {
+        match self {
             Result::Ok(_) => false,
             Result::Err(_) => true,
         }

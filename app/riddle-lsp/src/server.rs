@@ -387,10 +387,45 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let mut docs = self.docs.lock().unwrap();
+        if !docs.contains_key(&uri) {
+            // Unknown document: recover when the batch carries full text.
+            let full_text = params
+                .content_changes
+                .iter()
+                .rev()
+                .find(|change| change.range.is_none())
+                .map(|change| change.text.clone());
+            if let Some(text) = full_text {
+                docs.insert(
+                    uri.clone(),
+                    Document {
+                        text,
+                        version: Some(params.text_document.version),
+                    },
+                );
+            } else {
+                return;
+            }
+        }
         let Some(document) = docs.get_mut(&uri) else {
             return;
         };
         if !apply_content_changes(&mut document.text, params.content_changes) {
+            // A change with an out-of-bounds or surrogate-split position is
+            // invalid; the buffered text can no longer match the editor.
+            // Drop the stale state and clear diagnostics for this document
+            // instead of analyzing content we cannot reconstruct. A full-text
+            // change (range-less) from a later batch re-registers the
+            // document through the recovery path below.
+            let related = related_document_uris(&docs, &uri);
+            docs.remove(&uri);
+            for related_uri in related {
+                self.analysis_revisions.begin(&related_uri);
+            }
+            let open_docs = docs.clone();
+            drop(docs);
+            self.completion_sessions.retain_open(&open_docs);
+            self.analysis_sessions.retain_open(&open_docs);
             return;
         }
         document.version = Some(params.text_document.version);

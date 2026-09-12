@@ -7,6 +7,43 @@ pub use parser::ParseError;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deep_nesting_does_not_overflow_the_stack() {
+        // Debug-build parser frames are tens of KB deep, so error recovery
+        // on a huge input needs more stack than the default test thread;
+        // production CLIs run their whole pipeline on a large stack.
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(deep_nesting_does_not_overflow_the_stack_inner)
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    fn deep_nesting_does_not_overflow_the_stack_inner() {
+        let n = std::env::var("RIDDLE_DEEP_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8000usize);
+        let mut source = String::new();
+        source.push_str(
+            "fun main() -> i32 {
+    let x = ",
+        );
+        source.push_str(&"(".repeat(n));
+        source.push('1');
+        source.push_str(&")".repeat(n));
+        source.push_str(
+            ";
+    0
+}
+",
+        );
+        let parse = crate::incremental::parse_full(&source);
+        assert!(!parse.errors.is_empty(), "deep nesting must be rejected");
+        // Dropping the deep green tree must not recurse either.
+        drop(parse);
+    }
+
     use crate::incremental::IncrementalParser;
 
     #[test]

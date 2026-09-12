@@ -272,8 +272,8 @@ impl LowerCtx<'_> {
                 (name.clone(), false)
             } else {
                 self.lambda_counter += 1;
-                let name = self
-                    .qualify_current_symbol(format!("__riddle_lambda_{}", self.lambda_counter));
+                let name =
+                    self.qualify_current_symbol(format!("__riddle_lambda_{}", self.lambda_counter));
                 self.lambda_functions
                     .insert((body_id, expr_id), name.clone());
                 (name, true)
@@ -359,7 +359,8 @@ impl LowerCtx<'_> {
     pub(super) fn lambda_environment_type(
         &self,
         name: &str,
-        info: &LambdaInfo,    ) -> (Vec<Type>, StructType) {
+        info: &LambdaInfo,
+    ) -> (Vec<Type>, StructType) {
         let capture_types = info
             .captures
             .iter()

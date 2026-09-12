@@ -2661,3 +2661,122 @@ fn by_value_operator_capture_is_fn_once() {
         type_checker::ClosureKind::FnOnce
     );
 }
+
+// == coherence 重叠判定的结构化（别名、统一） ==
+
+#[test]
+fn conflicting_impls_through_type_alias_are_rejected() {
+    // `type AliasPoint = Point` must not dodge the E0047 overlap check:
+    // both impls denote the same nominal type after alias resolution.
+    let result = check(
+        r#"
+        trait Greeter {
+            fun hi(&self) -> i32;
+        }
+
+        struct Point { x: i32 }
+
+        type AliasPoint = Point;
+
+        impl Greeter for Point {
+            fun hi(&self) -> i32 { 1 }
+        }
+
+        impl Greeter for AliasPoint {
+            fun hi(&self) -> i32 { 2 }
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0047"),
+        "expected E0047 for conflicting impls written through an alias, got {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn conflicting_generic_impl_unification_is_rejected() {
+    // `impl<T> Trait for Wrap<T>` overlaps `impl Trait for Wrap<u8>` by
+    // structural unification, regardless of how each header is printed.
+    let result = check(
+        r#"
+        trait Sized2 {
+            fun size(&self) -> usize;
+        }
+
+        struct Wrap<T> { inner: T }
+
+        impl<T> Sized2 for Wrap<T> {
+            fun size(&self) -> usize { 1 }
+        }
+
+        impl Sized2 for Wrap<u8> {
+            fun size(&self) -> usize { 2 }
+        }
+        "#,
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0047"),
+        "expected E0047 for overlapping generic/specific impls, got {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn distinct_generic_impls_still_coexist() {
+    // `Wrap<u8>` and `Wrap<i8>` are distinct under unification: no E0047.
+    let result = check(
+        r#"
+        trait Sized2 {
+            fun size(&self) -> usize;
+        }
+
+        struct Wrap<T> { inner: T }
+
+        impl Sized2 for Wrap<u8> {
+            fun size(&self) -> usize { 1 }
+        }
+
+        impl Sized2 for Wrap<i8> {
+            fun size(&self) -> usize { 2 }
+        }
+        "#,
+    );
+
+    assert!(
+        !result.diagnostics.iter().any(|d| d.code == "E0047"),
+        "distinct instantiations must not conflict, got {:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn fundamental_foreign_types_cover_orphan_params() {
+    // `impl<T> Foreign<FundBox<T>, Local> for Foreign2` style headers: a
+    // `#[fundamental]` foreign type covers its parameters, so the param under
+    // `FundBox` no longer triggers the uncovered-parameter orphan error.
+    let foreign = r"
+        trait Foreign2<A, B> {}
+        struct Foreign2Type {}
+        #[fundamental]
+        struct FundBox<T> { value: T }
+    ";
+    let local = r"
+        struct Local { value: i32 }
+
+        impl<T> Foreign2<FundBox<T>, Local> for Foreign2Type {}
+    ";
+    let source = format!("{foreign}{local}");
+    let result =
+        check_with_package_ranges(&source, &[0..foreign.len(), foreign.len()..source.len()]);
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0048"),
+        "fundamental foreign types must cover their params, got {:#?}",
+        result.diagnostics
+    );
+}

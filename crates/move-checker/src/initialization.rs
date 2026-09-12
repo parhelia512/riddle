@@ -184,7 +184,18 @@ impl Checker<'_> {
                 })
             }
             Expr::Lambda { body, .. } => {
-                let _ = self.analyze_expr(body, state.clone());
+                let lambda_state = self.analyze_expr(body, state.clone());
+                let mut state = state;
+                for (binding, init) in &mut state.bindings {
+                    if *init == InitState::Uninitialized
+                        && lambda_state
+                            .bindings
+                            .get(binding)
+                            .is_some_and(|after| *after != InitState::Uninitialized)
+                    {
+                        *init = InitState::MaybeInitialized;
+                    }
+                }
                 state
             }
             Expr::FieldAccess { base, .. } => self.analyze_expr(base, state),

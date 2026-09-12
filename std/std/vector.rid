@@ -88,10 +88,11 @@ impl<T> Vector<T> {
 
     pub fun push(&mut self, value: T) {
         if self.len == self.capacity {
-            let item_size = size_of::<T>();
-            if item_size == 0usize {
-                panic("Vector does not support zero-sized elements");
-            }
+            // Zero-sized elements use one-byte slots: the storage address of
+            // an element is never dereferenced (ZST reads/writes touch no
+            // memory), so only distinct slot counts matter.
+            let raw_size = size_of::<T>();
+            let item_size = if raw_size == 0usize { 1usize } else { raw_size };
             let next_capacity = if self.capacity == 0usize {
                 4usize
             } else {
@@ -149,10 +150,9 @@ impl<T> Vector<T> {
             panic("Vector insert index out of bounds");
         }
         if self.len == self.capacity {
-            let item_size = size_of::<T>();
-            if item_size == 0usize {
-                panic("Vector does not support zero-sized elements");
-            }
+            // Same zero-sized-element handling as `push`: one-byte slots.
+            let raw_size = size_of::<T>();
+            let item_size = if raw_size == 0usize { 1usize } else { raw_size };
             let next_capacity = if self.capacity == 0usize {
                 4usize
             } else {

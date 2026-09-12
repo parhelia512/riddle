@@ -1738,7 +1738,28 @@ impl LowerCtx<'_> {
             let len = builder.extract_value(base_value, 1, Type::Int(IntTy::Usize));
             builder.struct_value(vec![data, len], input.mir_type.clone())
         } else {
-            let op = determine_cast_op(&base_ty, input.mir_type);
+            let Some(op) = determine_cast_op(&base_ty, input.mir_type) else {
+                let range = input
+                    .body
+                    .source_map
+                    .expr_ranges
+                    .get(&input.expr_id)
+                    .copied()
+                    .unwrap_or_default();
+                self.module.diagnostics.push(type_checker::Diagnostic {
+                    code: "E0999",
+                    severity: type_checker::Severity::Error,
+                    message: format!("unsupported cast from {base_ty:?} to {:?}", input.mir_type),
+                    labels: vec![type_checker::SourceLabel {
+                        range,
+                        message: "this cast cannot be lowered".into(),
+                        style: type_checker::LabelStyle::Primary,
+                    }],
+                    help: None,
+                    notes: Vec::new(),
+                });
+                return builder.unit_const();
+            };
             builder.cast(op, base_value, input.mir_type.clone())
         }
     }
@@ -1817,8 +1838,23 @@ impl LowerCtx<'_> {
             return self.lower_expr(builder, param_values, body, operand);
         };
         let enum_data = &self.hir.item_tree.enums[*result_id];
-        let is_result = enum_data.name.0 == "Result";
-        let is_option = enum_data.name.0 == "Option";
+        let lang_items = &self.type_result.trait_env.lang_items;
+        // Mirror the type checker's decision: the registered lang enum when
+        // std is loaded, otherwise the name-based fallback for no-std files.
+        let is_result = lang_items
+            .get_enum(type_checker::lang_items::LangItem::Result)
+            .is_some_and(|registered| registered == *result_id)
+            || (lang_items
+                .get_enum(type_checker::lang_items::LangItem::Result)
+                .is_none()
+                && enum_data.name.0 == "Result");
+        let is_option = lang_items
+            .get_enum(type_checker::lang_items::LangItem::Option)
+            .is_some_and(|registered| registered == *result_id)
+            || (lang_items
+                .get_enum(type_checker::lang_items::LangItem::Option)
+                .is_none()
+                && enum_data.name.0 == "Option");
         let expected_args = match (is_result, is_option) {
             (true, _) => 2,
             (_, true) => 1,

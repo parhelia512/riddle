@@ -1513,3 +1513,49 @@ fn one_failed_derive_does_not_block_later_derives() {
         expanded.source
     );
 }
+
+#[test]
+fn deep_nesting_parse_stays_bounded() {
+    // Debug-build frames need a large stack for error recovery; the CLIs run
+    // their pipelines on a 256 MiB stack.
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(deep_nesting_parse_stays_bounded_inner)
+        .unwrap();
+    handle.join().unwrap();
+}
+
+fn deep_nesting_parse_stays_bounded_inner() {
+    let n = std::env::var("RIDDLE_DEEP_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8000);
+    let mut source = String::new();
+    source.push_str(
+        "fun main() -> i32 {
+    let x = ",
+    );
+    source.push_str(&"(".repeat(n));
+    source.push('1');
+    source.push_str(&")".repeat(n));
+    source.push_str(
+        ";
+    0
+}
+",
+    );
+    // The lexer-parser-tree_builder pipeline must reject the input through
+    // the nesting diagnostic, and the macro-expansion loop (which re-parses
+    // per iteration) must terminate with the same diagnostic instead of
+    // overflowing the stack.
+    let tokens = frontend::lexer::lex(&source);
+    let parse = frontend::parser::Parser::new(&source, tokens).parse();
+    let tree = frontend::tree_builder::build_tree(&parse.0, &parse.1, parse.3, parse.2);
+    assert!(!tree.errors.is_empty(), "deep nesting must be rejected");
+
+    let expansion = riddlec::proc_macro::expand_standard_macros(&source);
+    assert!(
+        !expansion.diagnostics.is_empty() || expansion.parse.is_some(),
+        "expansion must terminate on deep input"
+    );
+}

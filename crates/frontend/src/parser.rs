@@ -145,6 +145,16 @@ struct SpeculationPoint {
     errors_len: usize,
 }
 
+/// Maximum nesting depth for expressions, types, patterns, and blocks.
+///
+/// Every recursive-descent level costs a large stack frame chain across the
+/// whole pipeline (parser, HIR lowering, move checking, MIR lowering,
+/// codegen — tens of KB per level in debug builds), so deep inputs must be
+/// rejected at parse time instead of overflowing the stack — a hard crash
+/// the diagnostics layer cannot catch. 48 levels is far above anything
+/// human-written code needs.
+pub(crate) const MAX_NESTING_DEPTH: usize = 48;
+
 pub struct Parser<'s> {
     source: &'s str,
     tokens: Vec<Token>,
@@ -155,9 +165,55 @@ pub struct Parser<'s> {
     current_kind: SyntaxKind,
     current_non_trivia_pos: usize,
     pending_split_greater: usize,
+    nesting_depth: usize,
+}
+
+thread_local! {
+    /// Recursion depth of the current thread's parse — parallel parses
+    /// (language server, test threads) must not see each other's depth.
+    static RIDDLE_CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+struct RiddleDepthGuard;
+impl RiddleDepthGuard {
+    fn enter() -> Self {
+        RIDDLE_CALL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        RiddleDepthGuard
+    }
+}
+impl Drop for RiddleDepthGuard {
+    fn drop(&mut self) {
+        RIDDLE_CALL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+#[must_use]
+fn riddle_call_depth() -> usize {
+    RIDDLE_CALL_DEPTH.with(std::cell::Cell::get)
 }
 
 impl<'s> Parser<'s> {
+    /// Enters one nesting level; `false` means the limit is exhausted and an
+    /// error was already reported. Callers return early on `false`.
+    fn enter_nesting(&mut self) -> bool {
+        self.nesting_depth += 1;
+        // Postfix-call chains (`f(a)(b)`, `((((1))))`) recurse without ever
+        // nesting a syntactic block, so the call depth is the real bound.
+        if self.nesting_depth > MAX_NESTING_DEPTH || riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
+            let span = self.current_span();
+            self.errors.push(ParseError {
+                message: "expression nesting is too deep".into(),
+                span,
+            });
+            self.nesting_depth -= 1;
+            return false;
+        }
+        true
+    }
+
+    fn exit_nesting(&mut self) {
+        self.nesting_depth = self.nesting_depth.saturating_sub(1);
+    }
+
     #[must_use]
     pub fn new(source: &'s str, tokens: Vec<Token>) -> Self {
         let mut p = Self {
@@ -169,6 +225,7 @@ impl<'s> Parser<'s> {
             current_kind: SyntaxKind::Eof,
             current_non_trivia_pos: 0,
             pending_split_greater: 0,
+            nesting_depth: 0,
         };
         p.recompute_current();
         p
@@ -287,6 +344,9 @@ impl<'s> Parser<'s> {
 
         self.error_no_bump(format!("expected {:?}, found {:?}", kind, self.current()));
 
+        // Delimiters and statement-start keywords are sync points: leave
+        // them in place so the surrounding construct (statement, list) can
+        // resynchronize there instead of cascading.
         if !matches!(
             self.current(),
             SyntaxKind::RParen
@@ -294,7 +354,8 @@ impl<'s> Parser<'s> {
                 | SyntaxKind::Semi
                 | SyntaxKind::Comma
                 | SyntaxKind::Eof
-        ) {
+        ) && !self.token_starts_statement()
+        {
             let m = self.start();
             self.bump();
             m.complete(self, SyntaxKind::ErrorNode);
@@ -334,6 +395,55 @@ impl<'s> Parser<'s> {
     fn error_no_bump(&mut self, msg: String) {
         let span = self.current_span();
         self.errors.push(ParseError { message: msg, span });
+    }
+
+    /// Skip to a statement boundary after a malformed statement: consume up
+    /// to and including the next `;`, or stop before `}`/EOF/any token that
+    /// begins a new statement, so one mistake yields one diagnostic.
+    fn sync_to_statement_boundary(&mut self) {
+        while !self.at(SyntaxKind::Eof) {
+            match self.current() {
+                SyntaxKind::Semi => {
+                    self.bump();
+                    return;
+                }
+                SyntaxKind::RBrace => return,
+                _ if self.token_starts_statement() => return,
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    /// Sync-point view of "this token begins a new statement": the item and
+    /// statement keywords plus the block-like expression introducers.
+    const fn token_starts_statement(&self) -> bool {
+        matches!(
+            self.current(),
+            SyntaxKind::Hash
+                | SyntaxKind::Let
+                | SyntaxKind::Pub
+                | SyntaxKind::Fun
+                | SyntaxKind::Struct
+                | SyntaxKind::Mod
+                | SyntaxKind::Use
+                | SyntaxKind::Enum
+                | SyntaxKind::Trait
+                | SyntaxKind::Impl
+                | SyntaxKind::Const
+                | SyntaxKind::TypeKw
+                | SyntaxKind::Extern
+                | SyntaxKind::Unsafe
+                | SyntaxKind::Break
+                | SyntaxKind::Continue
+                | SyntaxKind::Return
+                | SyntaxKind::If
+                | SyntaxKind::While
+                | SyntaxKind::Loop
+                | SyntaxKind::For
+                | SyntaxKind::Match
+        )
     }
 
     #[must_use]
@@ -479,6 +589,7 @@ impl<'s> Parser<'s> {
     // == stmt ==
 
     fn statement(&mut self) {
+        let _rdg = RiddleDepthGuard::enter();
         self.attrs();
         match self.current() {
             SyntaxKind::Pub => self.pub_item(),
@@ -733,6 +844,23 @@ impl<'s> Parser<'s> {
         // `mut x`, and `let mut (a, b)` is therefore a syntax error.
         self.pattern();
 
+        // A malformed pattern leaves tokens the type/init grammar cannot
+        // consume; sync to the statement boundary so one mistake stays one
+        // diagnostic and later statements still parse.
+        if !matches!(
+            self.current(),
+            SyntaxKind::Colon
+                | SyntaxKind::Eq
+                | SyntaxKind::Else
+                | SyntaxKind::Semi
+                | SyntaxKind::RBrace
+                | SyntaxKind::Eof
+        ) {
+            self.sync_to_statement_boundary();
+            m.complete(self, SyntaxKind::VarDecl);
+            return;
+        }
+
         if self.at(SyntaxKind::Colon) {
             self.bump();
             self.ty();
@@ -836,8 +964,23 @@ impl<'s> Parser<'s> {
                 self.bump();
             }
             self.expect(SyntaxKind::Ident);
-            self.expect(SyntaxKind::Colon);
-            self.ty();
+            let has_colon = self.expect(SyntaxKind::Colon);
+            // A list delimiter here means the type slot is empty; keep the
+            // delimiters intact so `ty` cannot eat them and the rest of the
+            // parameter list still parses.
+            let at_list_delimiter = matches!(
+                self.current(),
+                SyntaxKind::Comma
+                    | SyntaxKind::RParen
+                    | SyntaxKind::Arrow
+                    | SyntaxKind::Semi
+                    | SyntaxKind::Eof
+            );
+            if has_colon && at_list_delimiter {
+                self.error_no_bump("expected parameter type".to_string());
+            } else if !at_list_delimiter {
+                self.ty();
+            }
         }
         m.complete(self, SyntaxKind::Param);
     }
@@ -983,7 +1126,9 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Struct);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params(true, false);
+            // Type declarations may provide default type arguments (for
+            // example `Range<T = i32>`), matching Rust's declaration rules.
+            self.generic_params(true, true);
         }
         if self.at(SyntaxKind::Where) {
             self.where_clause();
@@ -998,12 +1143,21 @@ impl<'s> Parser<'s> {
 
         if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
             self.struct_field();
-            while self.at(SyntaxKind::Comma) {
-                self.bump();
-                if self.at(SyntaxKind::RBrace) {
+            loop {
+                if self.at(SyntaxKind::Comma) {
+                    self.bump();
+                    if self.at(SyntaxKind::RBrace) || self.at(SyntaxKind::Eof) {
+                        break;
+                    }
+                    self.struct_field();
+                } else if self.at(SyntaxKind::Ident) {
+                    // Missing comma between fields: report once and parse the
+                    // next field instead of derailing into expression errors.
+                    self.error_no_bump("expected `,` after struct field".to_string());
+                    self.struct_field();
+                } else {
                     break;
                 }
-                self.struct_field();
             }
         }
 
@@ -1044,9 +1198,22 @@ impl<'s> Parser<'s> {
     }
 
     fn block(&mut self) -> CompletedMarker {
+        let _rdg = RiddleDepthGuard::enter();
+        let guarded = self.enter_nesting();
         let m = self.start();
         self.expect(SyntaxKind::LBrace);
+        if !guarded {
+            self.expect(SyntaxKind::RBrace);
+            let completed = m.complete(self, SyntaxKind::Block);
+            self.exit_nesting();
+            return completed;
+        }
+        let result = self.block_inner(m);
+        self.exit_nesting();
+        result
+    }
 
+    fn block_inner(&mut self, m: Marker) -> CompletedMarker {
         while !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
             if self.at_stmt_start() {
                 self.statement();
@@ -1092,7 +1259,10 @@ impl<'s> Parser<'s> {
             let stmt = expr.precede(self);
             stmt.complete(self, SyntaxKind::ExprStmt);
 
-            if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
+            if !self.at(SyntaxKind::RBrace)
+                && !self.at(SyntaxKind::Eof)
+                && !self.token_starts_statement()
+            {
                 let err = self.start();
                 self.bump();
                 err.complete(self, SyntaxKind::ErrorNode);
@@ -1126,10 +1296,19 @@ impl<'s> Parser<'s> {
             return;
         }
 
-        self.error(format!(
-            "expected ';' after expression, found {:?}",
-            self.current()
-        ));
+        // A missing `;` followed by a statement keyword keeps that keyword
+        // in place (no bump) so the next statement parses normally.
+        if self.token_starts_statement() || self.at(SyntaxKind::RBrace) {
+            self.error_no_bump(format!(
+                "expected ';' after expression, found {:?}",
+                self.current()
+            ));
+        } else {
+            self.error(format!(
+                "expected ';' after expression, found {:?}",
+                self.current()
+            ));
+        }
         m.complete(self, SyntaxKind::ExprStmt);
     }
 
@@ -1254,14 +1433,20 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::LBrace);
 
         if !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
-            let mut arm_ends_with_block = self.match_arm();
+            let mut arm_ends_with_block = self.match_arm().unwrap_or_else(|| {
+                self.sync_to_arm_boundary();
+                false
+            });
             loop {
                 if self.at(SyntaxKind::Comma) {
                     self.bump();
                     if self.at(SyntaxKind::RBrace) || self.at(SyntaxKind::Eof) {
                         break;
                     }
-                    arm_ends_with_block = self.match_arm();
+                    arm_ends_with_block = self.match_arm().unwrap_or_else(|| {
+                        self.sync_to_arm_boundary();
+                        false
+                    });
                     continue;
                 }
                 // A block-bodied arm may omit its trailing comma: the arm's
@@ -1269,7 +1454,10 @@ impl<'s> Parser<'s> {
                 // arms instead of derailing into expression-error cascades.
                 if arm_ends_with_block && !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof)
                 {
-                    arm_ends_with_block = self.match_arm();
+                    arm_ends_with_block = self.match_arm().unwrap_or_else(|| {
+                        self.sync_to_arm_boundary();
+                        false
+                    });
                     continue;
                 }
                 break;
@@ -1280,6 +1468,18 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::MatchExpr)
     }
 
+    /// Skip the remains of a malformed arm: the body's own diagnostic was
+    /// already reported, so drop tokens up to the next `,`/`}` without
+    /// adding more.
+    fn sync_to_arm_boundary(&mut self) {
+        while !matches!(
+            self.current(),
+            SyntaxKind::Comma | SyntaxKind::RBrace | SyntaxKind::Eof
+        ) {
+            self.bump();
+        }
+    }
+
     fn unsafe_expr(&mut self) -> CompletedMarker {
         let m = self.start();
         self.expect(SyntaxKind::Unsafe);
@@ -1288,10 +1488,12 @@ impl<'s> Parser<'s> {
         m.complete(self, SyntaxKind::UnsafeExpr)
     }
 
-    /// Parses one `pattern [if guard] => expr` arm. Returns whether the arm
-    /// body is an expression-with-block, whose closing `}` ends the arm and
-    /// makes the trailing comma optional.
-    fn match_arm(&mut self) -> bool {
+    /// Parses one `pattern [if guard] => expr` arm. Returns `None` when the
+    /// arm body failed to parse (the caller should resynchronize instead of
+    /// letting the stray tokens cascade), otherwise whether the arm body is
+    /// an expression-with-block, whose closing `}` ends the arm and makes
+    /// the trailing comma optional.
+    fn match_arm(&mut self) -> Option<bool> {
         self.attrs();
         let m = self.start();
 
@@ -1307,7 +1509,7 @@ impl<'s> Parser<'s> {
         let ends_with_block = body.is_some_and(|expr| is_expr_with_block(expr.kind(self)));
 
         m.complete(self, SyntaxKind::MatchArm);
-        ends_with_block
+        body.map(|_| ends_with_block)
     }
 
     fn expr_bp(&mut self, min_bp: u8) -> Option<CompletedMarker> {
@@ -1319,6 +1521,13 @@ impl<'s> Parser<'s> {
         min_bp: u8,
         restrictions: ExprRestrictions,
     ) -> Option<CompletedMarker> {
+        let _rdg = RiddleDepthGuard::enter();
+        self.attrs();
+        let _rdg = RiddleDepthGuard::enter();
+        if riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
+            self.error_no_bump("expression nesting is too deep".into());
+            return None;
+        }
         self.attrs();
         // prefix
         let mut lhs = self.lhs(restrictions)?;
@@ -1328,6 +1537,7 @@ impl<'s> Parser<'s> {
 
         loop {
             let op = self.current();
+            let pos_before_iteration = self.current_non_trivia_pos;
 
             if lhs.kind(self) == SyntaxKind::NameRef
                 && op == SyntaxKind::Less
@@ -1376,7 +1586,7 @@ impl<'s> Parser<'s> {
                 op,
                 SyntaxKind::LParen | SyntaxKind::Dot | SyntaxKind::LBracket | SyntaxKind::Question
             ) {
-                const POSTFIX_BP: u8 = 15;
+                const POSTFIX_BP: u8 = 23;
                 if POSTFIX_BP < min_bp {
                     break;
                 }
@@ -1390,7 +1600,7 @@ impl<'s> Parser<'s> {
                 && restrictions.allow_struct_expr
                 && lhs.kind(self) == SyntaxKind::NameRef
             {
-                const STRUCT_BP: u8 = 15;
+                const STRUCT_BP: u8 = 23;
                 if STRUCT_BP < min_bp {
                     break;
                 }
@@ -1403,7 +1613,7 @@ impl<'s> Parser<'s> {
 
             // cast
             if op == SyntaxKind::As {
-                const CAST_BP: u8 = 13;
+                const CAST_BP: u8 = 21;
                 if CAST_BP < min_bp {
                     break;
                 }
@@ -1445,12 +1655,31 @@ impl<'s> Parser<'s> {
             self.bump(); // operator
             self.expr_bp_restricted(r_bp, restrictions);
             lhs = m.complete(self, SyntaxKind::BinaryExpr);
+
+            if !self.iteration_made_progress(pos_before_iteration) {
+                break;
+            }
         }
 
         Some(lhs)
     }
 
+    /// True when an iteration of the Pratt loop consumed no input; continuing
+    /// would loop forever on the same token after a depth-bailout.
+    fn iteration_made_progress(&self, pos_before: usize) -> bool {
+        self.current_non_trivia_pos != pos_before
+    }
+
     fn postfix_expr(&mut self, lhs: CompletedMarker, op: SyntaxKind) -> CompletedMarker {
+        let _rdg = RiddleDepthGuard::enter();
+        if riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
+            self.error_no_bump("expression nesting is too deep".into());
+            // Consume the offending delimiter so the caller's loop makes
+            // progress instead of retrying the same token forever.
+            self.bump();
+            let m = lhs.precede(self);
+            return m.complete(self, SyntaxKind::ErrorNode);
+        }
         let m = lhs.precede(self);
         match op {
             SyntaxKind::LParen => {
@@ -1552,6 +1781,17 @@ impl<'s> Parser<'s> {
                     }
                 }
                 SyntaxKind::Eof => return false,
+                // Tokens that cannot appear inside a type-argument list end
+                // the search: without this, `while a < b.len() { .. c > (d) }`
+                // pairs the condition's `<` with an unrelated `(`-followed
+                // `>` in the loop body and misparses the condition as a
+                // generic call.
+                SyntaxKind::Dot
+                | SyntaxKind::LParen
+                | SyntaxKind::RParen
+                | SyntaxKind::LBrace
+                | SyntaxKind::RBrace
+                | SyntaxKind::Semi => return false,
                 _ => {}
             }
             i += 1;
@@ -1561,6 +1801,12 @@ impl<'s> Parser<'s> {
     }
 
     fn arg_list(&mut self) {
+        let _rdg = RiddleDepthGuard::enter();
+        if riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
+            self.error_no_bump("expression nesting is too deep".into());
+            self.error("expression nesting is too deep".into());
+            return;
+        }
         let m = self.start();
         self.bump();
 
@@ -1582,6 +1828,16 @@ impl<'s> Parser<'s> {
     // parse prefix, atom, block
     fn lhs(&mut self, restrictions: ExprRestrictions) -> Option<CompletedMarker> {
         self.attrs();
+        if !self.enter_nesting() {
+            return None;
+        }
+        let completed = self.lhs_inner(restrictions);
+        self.exit_nesting();
+        completed
+    }
+
+    fn lhs_inner(&mut self, restrictions: ExprRestrictions) -> Option<CompletedMarker> {
+        let _rdg = RiddleDepthGuard::enter();
         match self.current() {
             // unary
             SyntaxKind::Amp => {
@@ -1679,9 +1935,7 @@ impl<'s> Parser<'s> {
             SyntaxKind::Fun if self.nth(1) == SyntaxKind::LParen => {
                 Some(self.removed_lambda_expr())
             }
-            SyntaxKind::Move if self.nth(1) == SyntaxKind::Fun => {
-                Some(self.removed_lambda_expr())
-            }
+            SyntaxKind::Move if self.nth(1) == SyntaxKind::Fun => Some(self.removed_lambda_expr()),
             SyntaxKind::Move if self.nth(1) == SyntaxKind::LBracket => {
                 let point = self.speculation_point();
                 match self.try_bracket_lambda_expr() {
@@ -1734,6 +1988,13 @@ impl<'s> Parser<'s> {
     }
 
     fn paren_expr(&mut self, restrictions: ExprRestrictions) -> CompletedMarker {
+        let _rdg = RiddleDepthGuard::enter();
+        if riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
+            self.error("expression nesting is too deep".into());
+            let m = self.start();
+            let done = m.complete(self, SyntaxKind::ParenExpr);
+            return done;
+        }
         let m = self.start();
         self.bump();
         if !self.at(SyntaxKind::RParen) {
@@ -1782,7 +2043,16 @@ impl<'s> Parser<'s> {
     // == type ==
 
     fn ty(&mut self) {
+        let _rdg = RiddleDepthGuard::enter();
         self.attrs();
+        if !self.enter_nesting() {
+            return;
+        }
+        self.ty_inner();
+        self.exit_nesting();
+    }
+
+    fn ty_inner(&mut self) {
         match self.current() {
             SyntaxKind::Bang => {
                 let m = self.start();
@@ -1935,7 +2205,7 @@ impl<'s> Parser<'s> {
         self.expect(SyntaxKind::Enum);
         self.expect(SyntaxKind::Ident);
         if self.at(SyntaxKind::Less) {
-            self.generic_params(true, false);
+            self.generic_params(true, true);
         }
         if self.at(SyntaxKind::Where) {
             self.where_clause();
@@ -2394,11 +2664,20 @@ impl<'s> Parser<'s> {
     // == patterns ==
 
     fn pattern(&mut self) {
+        let _rdg = RiddleDepthGuard::enter();
         self.pattern_inner();
     }
 
     fn pattern_inner(&mut self) {
         self.attrs();
+        if !self.enter_nesting() {
+            return;
+        }
+        self.pattern_inner_guarded();
+        self.exit_nesting();
+    }
+
+    fn pattern_inner_guarded(&mut self) {
         if self.at(SyntaxKind::Mut) {
             // `mut name` — only a bare binding can be mutable.
             let m = self.start();
@@ -2558,7 +2837,7 @@ const fn prefix_binding_power(op: SyntaxKind) -> u8 {
         | SyntaxKind::Amp
         | SyntaxKind::AmpAmp
         | SyntaxKind::Star
-        | SyntaxKind::Bang => 14,
+        | SyntaxKind::Bang => 22,
         _ => 0,
     }
 }
@@ -2568,6 +2847,10 @@ const fn prefix_binding_power(op: SyntaxKind) -> u8 {
 /// left < right => left combination
 ///
 /// left > right => right combination
+///
+/// Bitwise ordering mirrors Rust (and C's ordering among the bitwise ops
+/// themselves): `<< >>` bind tightest, then `&`, then `^`, then `|`, all
+/// above the comparison operators.
 const fn infix_binding_power(op: SyntaxKind) -> Option<(u8, u8)> {
     match op {
         SyntaxKind::Eq
@@ -2587,13 +2870,12 @@ const fn infix_binding_power(op: SyntaxKind) -> Option<(u8, u8)> {
         SyntaxKind::Less | SyntaxKind::Greater | SyntaxKind::LessEq | SyntaxKind::GreaterEq => {
             Some((8, 9))
         }
-        SyntaxKind::Pipe
-        | SyntaxKind::Caret
-        | SyntaxKind::Amp
-        | SyntaxKind::Shl
-        | SyntaxKind::Shr => Some((9, 10)),
-        SyntaxKind::Plus | SyntaxKind::Minus => Some((10, 11)),
-        SyntaxKind::Star | SyntaxKind::Slash | SyntaxKind::Percent => Some((12, 13)),
+        SyntaxKind::Pipe => Some((10, 11)),
+        SyntaxKind::Caret => Some((12, 13)),
+        SyntaxKind::Amp => Some((14, 15)),
+        SyntaxKind::Shl | SyntaxKind::Shr => Some((16, 17)),
+        SyntaxKind::Plus | SyntaxKind::Minus => Some((18, 19)),
+        SyntaxKind::Star | SyntaxKind::Slash | SyntaxKind::Percent => Some((20, 21)),
         _ => None,
     }
 }

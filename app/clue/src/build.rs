@@ -941,11 +941,40 @@ impl CCompiler {
         let shared_library = matches!(mode, OutputMode::SharedLibrary);
         let compile_only = matches!(mode, OutputMode::Object { .. });
         let pic = matches!(mode, OutputMode::Object { pic: true });
+        // MSYS2 gcc's linker fails on absolute paths containing non-ASCII
+        // characters (the path reaches ld in the ANSI code page). When any
+        // tool-facing path is non-ASCII, run the compiler from a common
+        // parent with relative paths, which are encoding-agnostic. Paths
+        // that are pure ASCII keep their original absolute form.
+        let non_ascii = sources
+            .iter()
+            .copied()
+            .chain(std::iter::once(executable))
+            .chain(std::iter::once(Path::new(&self.program)))
+            .any(|path| !path.as_os_str().to_string_lossy().is_ascii());
+        let base = non_ascii
+            .then(|| {
+                common_base(
+                    sources
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(executable))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                )
+            })
+            .flatten();
         let source_args = sources
             .iter()
-            .map(|source| tool_path(source))
+            .map(|source| relative_tool_path(source, base.as_deref()))
             .collect::<Vec<_>>();
         let mut command = Command::new(&self.program);
+        if let Some(base_dir) = base.clone() {
+            let program =
+                std::path::absolute(&self.program).unwrap_or_else(|_| PathBuf::from(&self.program));
+            command = Command::new(program);
+            command.current_dir(&base_dir);
+        }
         let host = TargetTriple::host().ok();
         let cross = host.is_some_and(|host| host != self.target.triple);
         match self.flavor {
@@ -994,7 +1023,7 @@ impl CCompiler {
                     .args(&source_args)
                     .args(extra_args)
                     .arg("-o")
-                    .arg(executable);
+                    .arg(relative_tool_path(executable, base.as_deref()));
             }
             Flavor::Msvc => {
                 command.args([
@@ -1099,6 +1128,46 @@ impl CCompiler {
             paths.push(version.join("um").join(arch));
         }
         paths
+    }
+}
+
+/// The deepest common ancestor directory of the paths, when they share one.
+fn common_base(paths: &[&Path]) -> Option<std::path::PathBuf> {
+    let mut base = std::path::absolute(paths.first()?)
+        .ok()?
+        .parent()?
+        .to_path_buf();
+    for path in paths {
+        let absolute = std::path::absolute(path).ok()?;
+        let mut components = absolute.components().peekable();
+        let mut base_components = base.components().peekable();
+        let mut common = std::path::PathBuf::new();
+        loop {
+            match (base_components.next(), components.next()) {
+                (Some(a), Some(b)) if a == b => common.push(a.as_os_str()),
+                _ => break,
+            }
+        }
+        base = common;
+    }
+    if base.as_os_str().is_empty() {
+        None
+    } else {
+        Some(base)
+    }
+}
+
+/// A tool-facing path relative to `base` when one was chosen.
+fn relative_tool_path(path: &Path, base: Option<&std::path::Path>) -> String {
+    let Some(base) = base else {
+        return tool_path(path);
+    };
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    match absolute.strip_prefix(base) {
+        Ok(relative) => relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+        Err(_) => tool_path(path),
     }
 }
 

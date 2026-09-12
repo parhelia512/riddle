@@ -114,7 +114,14 @@ impl TypeChecker<'_> {
             .generics
             .iter()
             .chain(strukt.const_generics.iter())
-            .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+            .map(|name| {
+                subst.get(&name.0).cloned().unwrap_or_else(|| {
+                    // Same as the enum-variant literal above: generics not
+                    // pinned by a field stay as solvable inference
+                    // variables rather than `Unknown`.
+                    self.fresh_infer()
+                })
+            })
             .collect();
         let ty = Type::Struct(*struct_id, args);
         self.check_type_bounds(ctx, &ty, span);
@@ -246,7 +253,15 @@ impl TypeChecker<'_> {
             .generics
             .iter()
             .chain(enum_data.const_generics.iter())
-            .map(|name| subst.get(&name.0).cloned().unwrap_or(Type::Unknown))
+            .map(|name| {
+                subst.get(&name.0).cloned().unwrap_or_else(|| {
+                    // Fresh inference variables instead of `Unknown`: a
+                    // generic not referenced by any set field (e.g. the
+                    // key type of an `Entry::Vacant { index }` literal)
+                    // can still be pinned by the enclosing inference.
+                    self.fresh_infer()
+                })
+            })
             .collect();
         let ty = Type::Enum(enum_id, args);
         self.check_type_bounds(ctx, &ty, span);
@@ -560,7 +575,14 @@ impl TypeChecker<'_> {
                 }
             }
         });
-        let option_id = self.find_enum_by_name("Option");
+        // The for-loop desugaring matches the registered lang `Option` when
+        // std is loaded; without std, fall back to the name lookup.
+        let option_id = self
+            .result
+            .trait_env
+            .lang_items
+            .get_enum(ty::lang_items::LangItem::Option)
+            .or_else(|| self.find_enum_by_name("Option"));
         let some_variant = option_id.and_then(|option_id| {
             self.hir.item_tree.enums[option_id]
                 .variants

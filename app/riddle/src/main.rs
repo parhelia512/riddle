@@ -51,6 +51,20 @@ enum Emit {
 }
 
 fn main() -> ExitCode {
+    // Formatting walks deeply nested syntax trees recursively; run on a
+    // large stack so pathological inputs hit the parser's nesting
+    // diagnostic instead of a stack overflow.
+    let worker = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn formatter worker thread");
+    match worker.join() {
+        Ok(code) => code,
+        Err(_) => ExitCode::from(1),
+    }
+}
+
+fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Fmt(args) => run_fmt(args),

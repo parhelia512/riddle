@@ -931,8 +931,11 @@ impl CBackend {
         let rhs_name = self.name(rhs).to_owned();
         let lhs_type = self.ctypes.get(lhs.0 as usize).map_or("", String::as_str);
         let expr = if lhs_type == "riddle_str" && matches!(op, CmpOp::Eq | CmpOp::Neq) {
+            // A zero-length str can carry a NULL ptr (e.g. from an empty
+            // Vector's buffer); C11 requires memcmp pointers to be valid
+            // even for n == 0, so substitute an empty literal for NULL.
             let equal = format!(
-                "(({lhs_name}).len == ({rhs_name}).len && memcmp(({lhs_name}).ptr, ({rhs_name}).ptr, ({lhs_name}).len) == 0)"
+                "(({lhs_name}).len == ({rhs_name}).len && (({lhs_name}).len == 0 || memcmp(({lhs_name}).ptr != 0 ? ({lhs_name}).ptr : \"\", ({rhs_name}).ptr != 0 ? ({rhs_name}).ptr : \"\", ({lhs_name}).len) == 0))"
             );
             if matches!(op, CmpOp::Neq) {
                 format!("(!{equal})")
@@ -1141,6 +1144,33 @@ impl CBackend {
         let name = fresh_c(&mut self.counter, "tup");
         let ct = ctype_of(&inst.ty);
         self.set(value, name.clone(), ct.clone());
+        let Type::Tuple(element_types) = &inst.ty else {
+            unreachable!("TupleValue must have a tuple type");
+        };
+        // C forbids initializing an array member from an array expression
+        // inside a brace list, so tuples containing arrays take the same
+        // zero-init plus memcpy route as structs with array fields.
+        if element_types
+            .iter()
+            .any(|element_ty| matches!(element_ty, Type::Array(_, _)))
+        {
+            writeln!(out, "  {ct} {name} = {{0}};").unwrap();
+            for (index, (element, element_ty)) in
+                elements.iter().zip(element_types.iter()).enumerate()
+            {
+                let element_name = self.name(*element);
+                if matches!(element_ty, Type::Array(_, _)) {
+                    writeln!(
+                        out,
+                        "  memcpy({name}.f{index}, {element_name}, sizeof({name}.f{index}));"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(out, "  {name}.f{index} = {element_name};").unwrap();
+                }
+            }
+            return;
+        }
         let elements = elements
             .iter()
             .map(|element| self.name(*element).to_owned())
@@ -1361,13 +1391,29 @@ impl CBackend {
             }
             self.set(value, String::new(), "void".into());
         } else if is_extern && is_fat_repr(&inst.ty) {
+            // Copy the returned C string into managed memory: keeping the
+            // C pointer would leak it (never freed) and dangle the moment
+            // the C side frees or reuses it.
             let ffi_name = fresh_c(&mut self.counter, "ffi_str");
+            let ffi_copy = fresh_c(&mut self.counter, "ffi_copy");
+            let ffi_len = fresh_c(&mut self.counter, "ffi_len");
             let name = fresh_c(&mut self.counter, "call");
             self.set(value, name.clone(), ct.clone());
             writeln!(out, "  const char* {ffi_name} = {callee_name}({args});").unwrap();
             writeln!(
                 out,
-                "  {ct} {name} = (riddle_str){{ {ffi_name}, {ffi_name} ? strlen({ffi_name}) : 0 }};"
+                "  size_t {ffi_len} = {ffi_name} ? strlen({ffi_name}) : 0;"
+            )
+            .unwrap();
+            writeln!(out, "  char* {ffi_copy} = (char*)rgc_alloc({ffi_len} + 1);").unwrap();
+            writeln!(
+                out,
+                "  if ({ffi_name}) {{ memcpy({ffi_copy}, {ffi_name}, {ffi_len} + 1); }}"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  {ct} {name} = (riddle_str){{ {ffi_copy}, {ffi_len} }};"
             )
             .unwrap();
             for ffi_name in &c_string_args {

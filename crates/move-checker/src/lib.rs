@@ -115,11 +115,27 @@ impl OriginValue {
         Self { origins, fields }
     }
 
+    /// Project the value onto field `index`.
+    ///
+    /// When the per-field structure is unknown, the projected value can only
+    /// reach that field's data, so each origin's place gains a `Field(index)`
+    /// projection instead of staying at the (whole-root) base place — keeping
+    /// the loan precise for borrows taken through a reference-typed field
+    /// read (`self.source.as_bytes()` borrows `self.source`, not `self`).
     fn project(&self, index: usize) -> Self {
-        self.fields
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| self.flattened())
+        if let Some(field) = self.fields.get(index) {
+            return field.clone();
+        }
+        Self::from_origins(
+            self.origins
+                .iter()
+                .map(|origin| Origin {
+                    place: origin.place.clone().field(index),
+                    kind: origin.kind,
+                    loan: origin.loan,
+                })
+                .collect(),
+        )
     }
 
     fn iterated(&self) -> Self {
@@ -196,6 +212,7 @@ pub fn analyze(hir: &HirFile, type_result: &TypeCheckResult) -> AnalysisResult {
         result,
         loop_break_values: Vec::new(),
         loop_break_states: Vec::new(),
+        diagnostic_suppression: 0,
     };
     a.analyze_all_bodies();
     a.result
@@ -218,6 +235,11 @@ struct Analyzer<'a> {
     /// while/for 也压入空帧，保证内层 break 不会泄漏到外层 loop。
     loop_break_values: Vec<Vec<ExprId>>,
     loop_break_states: Vec<Vec<MoveStateSnapshot>>,
+    /// 循环不动点迭代（含首遍）期间抑制诊断：迭代中产生的诊断基于
+    /// 尚未收敛的 move 状态，直接上报会既重复又可能基于中间态。
+    /// 收敛后每个循环用收敛态完整重放一遍（此计数归零）再发诊断，
+    /// 保证依赖回边状态的借用/移动错误也恰好上报一次。
+    diagnostic_suppression: usize,
 }
 
 impl Analyzer<'_> {
@@ -308,6 +330,7 @@ impl Analyzer<'_> {
                 self.move_check_projection(ctx, expr_id, span);
             }
         }
+        ctx.release_expired_locals(expr_id);
     }
 
     fn move_check_path(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId, span: Option<TextRange>) {
@@ -342,13 +365,40 @@ impl Analyzer<'_> {
                     &extra,
                 );
             }
+            // A not-yet-moved parameter may still be partially moved: field
+            // moves on parameters record places without marking the name, so
+            // a whole-parameter use must check place overlap here, where the
+            // early return would otherwise skip the pattern-binding check.
+            if !*moved
+                && !matches!(resolved, Some(ResolvedName::PatternBinding(_)))
+                && let Some(place) = self.place_from_expr(ctx, expr_id)
+                && place.projections.is_empty()
+                && ctx
+                    .moved_places
+                    .iter()
+                    .any(|moved_place| place_overlaps(moved_place, &place))
+            {
+                let extra = Self::move_site_labels(ctx, &place);
+                self.diag_with_labels(
+                    format!("use of moved value: `{}`", name.0),
+                    span,
+                    "E0100",
+                    &extra,
+                );
+            }
             if let Some(ResolvedName::PatternBinding(id)) = resolved {
-                ctx.release_local_if_dead(id);
+                ctx.release_local_if_dead(id, expr_id);
             }
             return;
         }
-        if let Some(ResolvedName::PatternBinding(id)) = resolved {
-            let place = Place::root(id);
+        if let Some(place) = self.place_from_expr(ctx, expr_id)
+            && place.projections.is_empty()
+        {
+            // Whole-place use: reject when any part of it was already moved
+            // (a partially moved parameter or binding). Parameters take the
+            // same path as pattern bindings — their whole-move used to skip
+            // this check, silently re-copying a torn value whose moved field
+            // was then dropped a second time.
             if ctx
                 .moved_places
                 .iter()
@@ -363,7 +413,9 @@ impl Analyzer<'_> {
                     &extra,
                 );
             }
-            ctx.release_local_if_dead(id);
+            if let Some(ResolvedName::PatternBinding(id)) = resolved {
+                ctx.release_local_if_dead(id, expr_id);
+            }
         }
     }
 
@@ -397,20 +449,49 @@ impl Analyzer<'_> {
         let Expr::Binary { lhs, rhs, op } = ctx.body.exprs[expr_id] else {
             unreachable!("expected binary expression");
         };
-        let direct_assignment = (op == hir::body::BinaryOp::Assign)
+        let direct_binding = (op == hir::body::BinaryOp::Assign)
             .then(|| Self::local_assignment(ctx, lhs))
             .flatten()
             .filter(|(_, direct)| *direct)
             .map(|(binding, _)| binding);
-        if let Some(binding) = direct_assignment {
-            ctx.release_local_if_dead(binding);
+        let lhs_place = if let Some(binding) = direct_binding {
+            // Whole-local assignment (`x = v`): the old value is not read, and
+            // the binding is re-initialized below.
+            ctx.release_local_if_dead(binding, lhs);
+            self.place_from_expr(ctx, lhs)
+        } else if op == hir::body::BinaryOp::Assign {
+            // A plain assignment writes its left-hand side without reading
+            // it: only a move of a place *containing* the target is an error
+            // (assigning into a wholly moved value), while moved places the
+            // target covers are re-initialized below.
+            if let Some(place) = self.place_from_expr(ctx, lhs) {
+                if let Some(moved) = ctx
+                    .moved_places
+                    .iter()
+                    .find(|moved| moved.is_prefix_of(&place))
+                {
+                    let name = Self::expr_name(ctx, lhs);
+                    let extra = Self::move_site_labels(ctx, moved);
+                    self.diag_with_labels(
+                        format!("use of moved value: `{name}`"),
+                        span,
+                        "E0100",
+                        &extra,
+                    );
+                }
+                Some(place)
+            } else {
+                self.move_check_expr(ctx, lhs);
+                None
+            }
         } else {
             self.move_check_expr(ctx, lhs);
-        }
+            self.place_from_expr(ctx, lhs)
+        };
         self.move_check_expr(ctx, rhs);
         if op.is_assignment() {
-            if let Some(lhs_place) = self.place_from_expr(ctx, lhs)
-                && Self::has_any_borrow(ctx, &lhs_place)
+            if let Some(lhs_place) = lhs_place.as_ref()
+                && Self::has_conflicting_place_move_borrow(ctx, lhs_place)
             {
                 let name = Self::expr_name(ctx, lhs);
                 self.diag(
@@ -434,13 +515,22 @@ impl Analyzer<'_> {
                 ctx.bind_origin_value(binding, value);
             }
             self.apply_recorded_value_use(ctx, rhs);
-            if let Some(binding) = direct_assignment {
+            if let Some(binding) = direct_binding {
                 let place = Place::root(binding);
                 ctx.bindings.mark_available(&Self::expr_name(ctx, lhs));
                 ctx.moved_places
                     .retain(|moved| !place_overlaps(moved, &place));
                 ctx.moved_sites
                     .retain(|moved, _| !place_overlaps(moved, &place));
+            } else if let Some(lhs_place) = self.place_from_expr(ctx, lhs) {
+                // Assigning to a place re-initializes everything at or inside
+                // it, so prior moves of those places no longer apply. This
+                // covers parameter fields, whose moves were previously
+                // untracked, and partially moved locals.
+                ctx.moved_places
+                    .retain(|moved| !lhs_place.is_prefix_of(moved));
+                ctx.moved_sites
+                    .retain(|moved, _| !lhs_place.is_prefix_of(moved));
             }
         }
         let origins = if op.is_assignment() {
@@ -509,14 +599,21 @@ impl Analyzer<'_> {
         self.move_check_expr(ctx, cond);
         self.apply_recorded_value_use(ctx, cond);
         let branch_entry = ctx.move_state_snapshot();
+        let entry_origins = ctx.local_origins.clone();
         self.move_check_expr(ctx, then_branch);
         self.apply_recorded_value_use(ctx, then_branch);
         if let Some(else_branch) = else_branch {
             let then_exit = ctx.move_state_snapshot();
+            let then_origins = ctx.local_origins.clone();
             ctx.copy_move_state_snapshot(&branch_entry);
+            ctx.local_origins = entry_origins.clone();
             self.move_check_expr(ctx, else_branch);
             self.apply_recorded_value_use(ctx, else_branch);
             ctx.merge_move_state_snapshot(&then_exit);
+            // A delayed binding assigned in both branches may hold either
+            // branch's borrow afterwards: union the branch origins so the
+            // conservative loan set survives the merge.
+            BodyCtx::merge_local_origins(ctx, &entry_origins, &then_origins);
         }
         let mut value = ctx.expr_origin_value(then_branch);
         if let Some(else_branch) = else_branch {
@@ -530,9 +627,9 @@ impl Analyzer<'_> {
             unreachable!("expected while expression");
         };
         let loop_entry = ctx.clone();
+        self.diagnostic_suppression += 1;
         self.move_check_expr(ctx, condition);
         self.apply_recorded_value_use(ctx, condition);
-        let mut condition_exit = ctx.clone();
         self.push_loop_frames();
         self.move_check_expr(ctx, body);
         self.pop_loop_frames();
@@ -540,26 +637,31 @@ impl Analyzer<'_> {
         let mut loop_head = loop_entry.clone();
         let mut loop_exit = ctx.clone();
         loop {
-            let mut next_head = loop_entry.clone();
-            next_head.merge_move_state_from(&loop_exit);
+            let mut next_head = loop_head.clone();
+            next_head.merge_loop_head_move_state_from(&loop_exit);
             if next_head.same_move_state(&loop_head) {
                 break;
             }
             loop_head = next_head;
-            let mut iteration = loop_entry.clone();
-            iteration.copy_move_state_from(&loop_head);
-            let diagnostic_count = self.result.diagnostics.len();
+            let mut iteration = loop_head.clone();
             self.move_check_expr(&mut iteration, condition);
             self.apply_recorded_value_use(&mut iteration, condition);
-            condition_exit = iteration.clone();
             self.push_loop_frames();
             self.move_check_expr(&mut iteration, body);
             self.pop_loop_frames();
             self.apply_recorded_value_use(&mut iteration, body);
-            self.retain_new_loop_move_diagnostics(diagnostic_count);
             loop_exit = iteration;
         }
-        ctx.copy_move_state_from(&condition_exit);
+        // 不动点已收敛：用收敛后的回边状态完整重放一遍并发诊断。
+        self.diagnostic_suppression -= 1;
+        let mut final_iteration = loop_head.clone();
+        self.move_check_expr(&mut final_iteration, condition);
+        self.apply_recorded_value_use(&mut final_iteration, condition);
+        self.push_loop_frames();
+        self.move_check_expr(&mut final_iteration, body);
+        self.pop_loop_frames();
+        self.apply_recorded_value_use(&mut final_iteration, body);
+        *ctx = final_iteration;
     }
 
     fn move_check_loop(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
@@ -568,6 +670,7 @@ impl Analyzer<'_> {
         };
         // 与 while 相同的不动点迭代；循环体至少执行一次，出口只经由 break
         let loop_entry = ctx.clone();
+        self.diagnostic_suppression += 1;
         self.push_loop_frames();
         self.move_check_expr(ctx, body);
         self.apply_recorded_value_use(ctx, body);
@@ -575,24 +678,31 @@ impl Analyzer<'_> {
         let mut loop_head = loop_entry.clone();
         let mut loop_exit = ctx.clone();
         loop {
-            let mut next_head = loop_entry.clone();
-            next_head.merge_move_state_from(&loop_exit);
+            let mut next_head = loop_head.clone();
+            next_head.merge_loop_head_move_state_from(&loop_exit);
             if next_head.same_move_state(&loop_head) {
                 break;
             }
             loop_head = next_head;
-            let mut iteration = loop_entry.clone();
-            iteration.copy_move_state_from(&loop_head);
-            let diagnostic_count = self.result.diagnostics.len();
+            let mut iteration = loop_head.clone();
             self.push_loop_frames();
             self.move_check_expr(&mut iteration, body);
             self.apply_recorded_value_use(&mut iteration, body);
             let (values, states) = self.pop_loop_frames();
             break_values.extend(values);
             break_states.extend(states);
-            self.retain_new_loop_move_diagnostics(diagnostic_count);
             loop_exit = iteration;
         }
+        // 不动点已收敛：用收敛后的回边状态完整重放一遍并发诊断。
+        self.diagnostic_suppression -= 1;
+        let mut final_iteration = loop_head.clone();
+        self.push_loop_frames();
+        self.move_check_expr(&mut final_iteration, body);
+        self.apply_recorded_value_use(&mut final_iteration, body);
+        let (values, states) = self.pop_loop_frames();
+        break_values.extend(values);
+        break_states.extend(states);
+        *ctx = final_iteration;
         if let Some(first) = break_states.first() {
             ctx.copy_move_state_snapshot(first);
             for state in &break_states[1..] {
@@ -658,6 +768,7 @@ impl Analyzer<'_> {
         ctx.push_scope();
         Self::bind_pattern_names(ctx, pat);
         self.bind_pattern_origins(ctx, pat, &item_value);
+        self.diagnostic_suppression += 1;
         self.push_loop_frames();
         self.move_check_expr(ctx, body);
         self.pop_loop_frames();
@@ -665,25 +776,33 @@ impl Analyzer<'_> {
         let mut loop_head = loop_entry.clone();
         let mut loop_exit = ctx.clone();
         loop {
-            let mut next_head = loop_entry.clone();
-            next_head.merge_move_state_from(&loop_exit);
+            let mut next_head = loop_head.clone();
+            next_head.merge_loop_head_move_state_from(&loop_exit);
             if next_head.same_move_state(&loop_head) {
                 break;
             }
             loop_head = next_head;
-            let mut iteration = loop_entry.clone();
-            iteration.copy_move_state_from(&loop_head);
-            let diagnostic_count = self.result.diagnostics.len();
+            let mut iteration = loop_head.clone();
             iteration.push_scope();
             Self::bind_pattern_names(&mut iteration, pat);
             self.bind_pattern_origins(&mut iteration, pat, &item_value);
             self.push_loop_frames();
             self.move_check_expr(&mut iteration, body);
             self.pop_loop_frames();
-            self.retain_new_loop_move_diagnostics(diagnostic_count);
             iteration.pop_scope();
             loop_exit = iteration;
         }
+        // 不动点已收敛：用收敛后的回边状态完整重放一遍并发诊断。
+        self.diagnostic_suppression -= 1;
+        let mut final_iteration = loop_head.clone();
+        final_iteration.push_scope();
+        Self::bind_pattern_names(&mut final_iteration, pat);
+        self.bind_pattern_origins(&mut final_iteration, pat, &item_value);
+        self.push_loop_frames();
+        self.move_check_expr(&mut final_iteration, body);
+        self.pop_loop_frames();
+        final_iteration.pop_scope();
+        *ctx = final_iteration;
         ctx.copy_move_state_from(&loop_head);
         ctx.pop_scope();
     }
@@ -701,6 +820,13 @@ impl Analyzer<'_> {
             .cloned()
             .unwrap_or(Type::Unknown);
         let scrutinee_place = self.place_from_expr(ctx, scrutinee);
+        if scrutinee_place.is_none() {
+            // The scrutinee is not a trackable place (e.g. `match *r` behind a
+            // reference, or a temporary). Route the recorded value use through
+            // the normal consume path so moving out of a dereference of a
+            // non-Copy value is still rejected.
+            self.apply_recorded_value_use(ctx, scrutinee);
+        }
         let base_bindings = ctx.bindings.clone();
         let base_moved_places = ctx.moved_places.clone();
         let base_moved_sites = ctx.moved_sites.clone();
@@ -718,7 +844,18 @@ impl Analyzer<'_> {
             self.bind_pattern_origins(ctx, arm.pat, &scrutinee_value);
             if let Some(guard) = arm.guard {
                 let old_guard = std::mem::replace(&mut ctx.in_match_guard, true);
+                let old_scrutinee = std::mem::take(&mut ctx.guard_scrutinee);
+                ctx.guard_scrutinee = scrutinee_place.iter().cloned().collect();
+                let mut arm_bindings = Vec::new();
+                initialization::collect_pattern_bindings(ctx.body, arm.pat, &mut arm_bindings);
+                for (binding, _) in arm_bindings {
+                    // A whole-value binding aliases the scrutinee place; a
+                    // field binding aliases that field, and its root still
+                    // covers the moved-out part.
+                    ctx.guard_scrutinee.push(Place::root(binding));
+                }
                 self.move_check_expr(ctx, guard);
+                ctx.guard_scrutinee = old_scrutinee;
                 ctx.in_match_guard = old_guard;
             }
             if let Some(root) = &scrutinee_place {
@@ -804,11 +941,62 @@ impl Analyzer<'_> {
             );
         }
         self.move_check_expr(ctx, callee);
+        // A value-passed argument that itself holds borrows (e.g. a `&mut`
+        // binding moved into the call) keeps them live for the duration of
+        // the call: later argument expressions and reference parameters of
+        // the same call must still conflict with them, exactly as if the
+        // borrows had been written inline.
+        let mut transferred_loans = Vec::new();
         for arg in &args {
             self.move_check_expr(ctx, *arg);
+            if let Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(binding)),
+                ..
+            } = &ctx.body.exprs[*arg]
+            {
+                for origin in ctx.local_origins.get(binding).into_iter().flatten() {
+                    if let Some(record) = ctx.loans.get_mut(&origin.loan)
+                        && !record.active
+                        && !record.permanent
+                    {
+                        record.active = true;
+                        transferred_loans.push(origin.loan);
+                    }
+                }
+            }
         }
         let (inputs, modes, fid) = self.call_signature(ctx, callee, &args);
         let value = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, span);
+        if fid.is_none()
+            && self
+                .type_result
+                .trait_method_calls
+                .contains_key(&(ctx.body_id, callee))
+            && self
+                .type_result
+                .expr_types
+                .get(&(ctx.body_id, expr_id))
+                .is_some_and(contains_opaque_owned_result)
+        {
+            // ponytail: an opaque associated item cannot yet distinguish an
+            // iterator's stored references from borrowing the iterator itself.
+            // Reset only these implicit receiver loans on backedges until
+            // associated-return provenance is available; explicit borrows stay.
+            for origin in &value.origins {
+                if ctx
+                    .loans
+                    .get(&origin.loan)
+                    .is_some_and(|loan| loan.issued_at == span)
+                {
+                    ctx.backedge_reset_loans.insert(origin.loan);
+                }
+            }
+        }
+        for loan in transferred_loans {
+            if let Some(record) = ctx.loans.get_mut(&loan) {
+                record.active = false;
+            }
+        }
         ctx.set_expr_origin_value(expr_id, value);
         for input in &inputs {
             self.apply_recorded_value_use(ctx, *input);
@@ -934,6 +1122,16 @@ impl Analyzer<'_> {
                     self.bind_pattern_origins(ctx, pat, &value);
                     Self::deactivate_unretained(ctx, init, &HashSet::new());
                     self.check_explicit_reference_pattern_move(ctx, pat);
+                    if let Some(init_ty) = self
+                        .type_result
+                        .expr_types
+                        .get(&(ctx.body_id, init))
+                        .cloned()
+                    {
+                        // `let` destructuring must obey the same
+                        // move-out-of-Drop-owner rule as `match` arms.
+                        self.check_pattern_move_from_drop(ctx, pat, &init_ty);
+                    }
                     self.apply_recorded_value_use(ctx, init);
                 }
                 if let Some(else_) = else_ {
@@ -946,6 +1144,14 @@ impl Analyzer<'_> {
                     ctx.bindings = bindings;
                     ctx.moved_places = moved_places;
                     ctx.moved_sites = moved_sites;
+                }
+                // Record the declaration scope of every binding the pattern
+                // introduces, so deferred assignments inside nested blocks
+                // clamp their loans to this depth (see `bind_origins`).
+                let mut declared = Vec::new();
+                initialization::collect_pattern_bindings(ctx.body, pat, &mut declared);
+                for (id, _) in declared {
+                    ctx.binding_scopes.entry(id).or_insert(ctx.scope_depth);
                 }
                 Self::reset_pattern_moves(ctx, pat);
             }
@@ -985,9 +1191,27 @@ impl Analyzer<'_> {
             if !self.trait_env.type_is_copy(&ty)
                 || matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
             {
-                if ctx.in_match_guard && matches!(resolved, Some(ResolvedName::PatternBinding(_))) {
+                if ctx.in_match_guard
+                    && self
+                        .place_from_expr(ctx, expr_id)
+                        .or_else(|| {
+                            resolved.as_ref().and_then(|resolved| match resolved {
+                                ResolvedName::PatternBinding(id) => Some(Place::root(*id)),
+                                ResolvedName::Param(index) => Some(Place::param(*index)),
+                                ResolvedName::LambdaParam { lambda, index } => {
+                                    Some(Place::lambda_param(*lambda, *index))
+                                }
+                                _ => None,
+                            })
+                        })
+                        .is_some_and(|place| {
+                            ctx.guard_scrutinee
+                                .iter()
+                                .any(|scrutinee| place_overlaps(&place, scrutinee))
+                        })
+                {
                     self.diag(
-                        format!("cannot move pattern binding `{}` in a match guard", name.0),
+                        format!("cannot move `{}` in a match guard", name.0),
                         ctx.expr_range(expr_id),
                         "E0307",
                     );
@@ -1006,12 +1230,27 @@ impl Analyzer<'_> {
                 }
                 ctx.bindings.mark_moved(&name.0);
                 self.result.moved_exprs.insert((ctx.body_id, expr_id));
-                // Record move site for secondary label.
+                // Record move site for secondary label. Parameters and lambda
+                // parameters record their whole place too, so later field
+                // uses see the move (pattern bindings already do).
                 let span = ctx.expr_range(expr_id);
-                if let Some(ResolvedName::PatternBinding(id)) = resolved {
-                    let p = Place::root(*id);
-                    ctx.moved_places.insert(p.clone());
-                    ctx.moved_sites.insert(p, (span, "value moved here".into()));
+                match resolved {
+                    Some(ResolvedName::PatternBinding(id)) => {
+                        let p = Place::root(*id);
+                        ctx.moved_places.insert(p.clone());
+                        ctx.moved_sites.insert(p, (span, "value moved here".into()));
+                    }
+                    Some(ResolvedName::Param(index)) => {
+                        let p = Place::param(*index);
+                        ctx.moved_places.insert(p.clone());
+                        ctx.moved_sites.insert(p, (span, "value moved here".into()));
+                    }
+                    Some(ResolvedName::LambdaParam { lambda, index }) => {
+                        let p = Place::lambda_param(*lambda, *index);
+                        ctx.moved_places.insert(p.clone());
+                        ctx.moved_sites.insert(p, (span, "value moved here".into()));
+                    }
+                    _ => {}
                 }
             }
             return;
@@ -1024,6 +1263,12 @@ impl Analyzer<'_> {
             return;
         }
         if self.place_has_explicit_reference_deref(ctx, expr_id) {
+            if std::env::var_os("RIDDLE_MC_DEBUG").is_some() {
+                eprintln!(
+                    "mc-debug: E0308 expr {expr_id:?} = {:#?}",
+                    ctx.body.exprs[expr_id]
+                );
+            }
             self.diag(
                 "cannot move out of dereference of a non-Copy value".into(),
                 ctx.expr_range(expr_id),
@@ -1034,6 +1279,20 @@ impl Analyzer<'_> {
         let Some(place) = self.place_from_expr(ctx, expr_id) else {
             return;
         };
+        if ctx.in_match_guard
+            && ctx
+                .guard_scrutinee
+                .iter()
+                .any(|scrutinee| place_overlaps(&place, scrutinee))
+        {
+            let name = Self::expr_name(ctx, expr_id);
+            self.diag(
+                format!("cannot move `{name}` in a match guard",),
+                ctx.expr_range(expr_id),
+                "E0307",
+            );
+            return;
+        }
         if !place.projections.is_empty()
             && self
                 .root_type_from_expr(ctx, expr_id)
@@ -1046,7 +1305,7 @@ impl Analyzer<'_> {
             );
             return;
         }
-        if Self::has_any_borrow(ctx, &place) {
+        if Self::has_conflicting_place_move_borrow(ctx, &place) {
             let name = Self::expr_name(ctx, expr_id);
             self.diag(
                 format!("cannot move `{name}` while borrowed"),
@@ -1055,11 +1314,20 @@ impl Analyzer<'_> {
             );
             return;
         }
-        ctx.moved_places.insert(place.clone());
+        // Record the expression move unconditionally so MIR clears the
+        // element's drop flag, but only track the place statically for
+        // pattern-rooted locals: a runtime index on a parameter cannot be
+        // told apart from a different index, and standard-library shift
+        // loops move and re-read neighbouring elements in one pass.
+        if matches!(place.root, hir::place::PlaceRoot::Pattern(_))
+            || !place_has_wildcard_index(&place)
+        {
+            ctx.moved_places.insert(place.clone());
+            let span = ctx.expr_range(expr_id);
+            let desc = "value moved here".to_string();
+            ctx.moved_sites.insert(place, (span, desc));
+        }
         self.result.moved_exprs.insert((ctx.body_id, expr_id));
-        let span = ctx.expr_range(expr_id);
-        let desc = "value moved here".to_string();
-        ctx.moved_sites.insert(place, (span, desc));
     }
 
     fn expr_move_properties(
@@ -1182,6 +1450,7 @@ impl Analyzer<'_> {
 
     fn apply_capture_effects(&mut self, ctx: &mut BodyCtx<'_>, lambda: ExprId, info: &LambdaInfo) {
         let span = ctx.expr_range(lambda);
+        let mut capture_origins = Origins::new();
         for capture in &info.captures {
             if ctx.bindings.get(&capture.name).copied() == Some(true) {
                 self.diag(
@@ -1209,7 +1478,20 @@ impl Analyzer<'_> {
                 continue;
             }
 
-            self.apply_capture_mode(ctx, capture, move_place, &access_place, span);
+            if let Some(origin) =
+                self.apply_capture_mode(ctx, capture, move_place, &access_place, span)
+            {
+                capture_origins.insert(origin);
+            }
+        }
+        if !capture_origins.is_empty() {
+            // The lambda's value carries its captured references: attach the
+            // capture loans as the expression's origins so they flow into the
+            // binding that owns the lambda and expire at its last use, not at
+            // the enclosing scope's exit.
+            let mut value = ctx.expr_origin_value(lambda);
+            value.origins.extend(capture_origins);
+            ctx.set_expr_origin_value(lambda, value);
         }
     }
 
@@ -1220,7 +1502,7 @@ impl Analyzer<'_> {
         move_place: Option<Place>,
         access_place: &AccessPlace,
         span: Option<TextRange>,
-    ) {
+    ) -> Option<Origin> {
         match capture.mode {
             CaptureMode::Shared => {
                 if Self::has_mut_access_borrow(ctx, access_place) {
@@ -1232,8 +1514,14 @@ impl Analyzer<'_> {
                         span,
                         "E0301",
                     );
+                    None
                 } else {
-                    ctx.new_loan(access_place.clone(), BorrowKind::Shared, span, false);
+                    let loan = ctx.new_loan(access_place.clone(), BorrowKind::Shared, span, false);
+                    Some(Origin {
+                        place: access_place.clone(),
+                        kind: BorrowKind::Shared,
+                        loan,
+                    })
                 }
             }
             CaptureMode::Mutable => {
@@ -1246,48 +1534,53 @@ impl Analyzer<'_> {
                         span,
                         "E0300",
                     );
+                    None
                 } else if Self::has_mut_access_borrow(ctx, access_place) {
                     self.diag(
                         format!("cannot capture `{}` mutably more than once", capture.name),
                         span,
                         "E0302",
                     );
+                    None
                 } else {
-                    ctx.new_loan(access_place.clone(), BorrowKind::Mutable, span, false);
+                    let loan = ctx.new_loan(access_place.clone(), BorrowKind::Mutable, span, false);
+                    Some(Origin {
+                        place: access_place.clone(),
+                        kind: BorrowKind::Mutable,
+                        loan,
+                    })
                 }
             }
             CaptureMode::Value => {
                 if self.trait_env.type_is_copy(&capture.ty) {
-                    return;
+                    return None;
                 }
-                if ctx.in_match_guard && matches!(&capture.place.source, CaptureSource::Pattern(_))
+                if ctx.in_match_guard
+                    && move_place.as_ref().is_some_and(|place| {
+                        ctx.guard_scrutinee
+                            .iter()
+                            .any(|scrutinee| place_overlaps(place, scrutinee))
+                    })
                 {
                     self.diag(
                         format!(
-                            "cannot move pattern binding `{}` in a match guard",
+                            "cannot move `{}` into a closure in a match guard",
                             capture.name
                         ),
                         span,
                         "E0307",
                     );
-                    return;
+                    return None;
                 }
                 if !capture.place.projections.is_empty()
-                    && match &capture.place.source {
-                        CaptureSource::Pattern(id) => self
-                            .type_result
-                            .pattern_binding_types
-                            .get(&(ctx.body_id, *id))
-                            .is_some_and(|ty| self.trait_env.type_has_explicit_drop(ty)),
-                        CaptureSource::Param(_) | CaptureSource::LambdaParam { .. } => false,
-                    }
+                    && self.root_has_explicit_drop(ctx, access_place.root)
                 {
                     self.diag(
                         "cannot move out of a field of a type that implements `Drop`".into(),
                         span,
                         "E0305",
                     );
-                    return;
+                    return None;
                 }
                 if Self::has_any_access_borrow(ctx, access_place) {
                     self.diag(
@@ -1295,7 +1588,7 @@ impl Analyzer<'_> {
                         span,
                         "E0304",
                     );
-                    return;
+                    return None;
                 }
                 if let Some(place) = move_place {
                     ctx.moved_places.insert(place.clone());
@@ -1305,6 +1598,7 @@ impl Analyzer<'_> {
                 if capture.place.projections.is_empty() {
                     ctx.bindings.mark_moved(&capture.name);
                 }
+                None
             }
         }
     }
@@ -1334,10 +1628,14 @@ impl Analyzer<'_> {
 
     fn place_from_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<Place> {
         match &ctx.body.exprs[expr_id] {
-            Expr::Path {
-                resolved: Some(ResolvedName::PatternBinding(id)),
-                ..
-            } => Some(Place::root(*id)),
+            Expr::Path { resolved, .. } => match resolved.as_ref()? {
+                ResolvedName::PatternBinding(id) => Some(Place::root(*id)),
+                ResolvedName::Param(index) => Some(Place::param(*index)),
+                ResolvedName::LambdaParam { lambda, index } => {
+                    Some(Place::lambda_param(*lambda, *index))
+                }
+                _ => None,
+            },
             Expr::FieldAccess { base, field } => {
                 let base_place = self.place_from_expr(ctx, *base)?;
                 let idx = self.resolve_field_index(ctx.body_id, *base, field)?;
@@ -1413,6 +1711,27 @@ impl Analyzer<'_> {
     fn has_any_borrow(ctx: &BodyCtx<'_>, place: &Place) -> bool {
         let place = access_place_from_move_place(place);
         Self::has_any_access_borrow(ctx, &place)
+    }
+
+    /// True when moving `place` conflicts with an active loan, ignoring the
+    /// seed loan a reference parameter carries into the function.
+    ///
+    /// A `&T`/`&mut T` parameter's seed loan represents the incoming borrow;
+    /// moving the reference itself (forwarding it) or moving through its raw
+    /// pointers inside `unsafe` blocks is how the standard library uses its
+    /// parameters. Loans created inside the body still conflict as usual.
+    fn has_conflicting_place_move_borrow(ctx: &BodyCtx<'_>, place: &Place) -> bool {
+        let access = access_place_from_move_place(place);
+        let seed_loans = match place.root {
+            hir::place::PlaceRoot::Param(index) => ctx.param_origins.get(&index),
+            hir::place::PlaceRoot::LambdaParam { .. } | hir::place::PlaceRoot::Pattern(_) => None,
+        };
+        ctx.loans.iter().any(|(id, loan)| {
+            loan.active
+                && access_places_overlap(&loan.place, &access)
+                && !seed_loans
+                    .is_some_and(|origins| origins.iter().any(|origin| origin.loan == *id))
+        })
     }
 
     fn check_trait_index_receiver_borrow(
@@ -1997,6 +2316,7 @@ impl Analyzer<'_> {
 
     fn bind_pattern_name(ctx: &mut BodyCtx<'_>, id: PatternBindingId, name: &str) {
         ctx.bindings.insert_available(name.to_string());
+        ctx.binding_scopes.insert(id, ctx.scope_depth);
         Self::reset_binding_move(ctx, id);
     }
 
@@ -2419,6 +2739,11 @@ impl Analyzer<'_> {
         code: &'static str,
         extra_labels: &[(TextRange, String, LabelStyle)],
     ) {
+        if self.diagnostic_suppression > 0 {
+            // 循环不动点尚未收敛（或处于外层未收敛循环的重放中），
+            // 诊断由收敛后的最终重放统一上报。
+            return;
+        }
         let span = span.expect("move-checker diagnostics require a source range");
         let notes = match code {
             "E0059" => vec!["assign the binding on every path before reading it".into()],
@@ -2459,21 +2784,6 @@ impl Analyzer<'_> {
             notes,
         });
     }
-
-    fn retain_new_loop_move_diagnostics(&mut self, start: usize) {
-        let replayed = self.result.diagnostics.split_off(start);
-        for diagnostic in replayed {
-            let primary = diagnostic.labels.first().map(|label| label.range);
-            let duplicate = self.result.diagnostics.iter().any(|existing| {
-                existing.code == diagnostic.code
-                    && existing.message == diagnostic.message
-                    && existing.labels.first().map(|label| label.range) == primary
-            });
-            if diagnostic.code == "E0100" && !duplicate {
-                self.result.diagnostics.push(diagnostic);
-            }
-        }
-    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2507,15 +2817,25 @@ struct BodyCtx<'a> {
 
     // Borrow and reference provenance tracking
     loans: HashMap<LoanId, BorrowRecord>,
+    backedge_reset_loans: HashSet<LoanId>,
     next_loan: LoanId,
     expr_origins: HashMap<ExprId, Origins>,
     local_origins: HashMap<PatternBindingId, Origins>,
     expr_origin_fields: HashMap<ExprId, Vec<OriginValue>>,
     local_origin_fields: HashMap<PatternBindingId, Vec<OriginValue>>,
     param_origins: HashMap<usize, Origins>,
-    remaining_uses: HashMap<PatternBindingId, usize>,
+    last_uses: HashMap<PatternBindingId, usize>,
+    /// Scope depth at each enclosing loop's entry.
+    /// Declaration scope depth of each pattern binding, so loans assigned to
+    /// a deferred binding keep living until the binding's own scope ends.
+    binding_scopes: HashMap<PatternBindingId, usize>,
     scope_depth: usize,
     in_match_guard: bool,
+    /// Places that a match guard must leave intact: the scrutinee place plus
+    /// the roots of the arm's whole-value pattern bindings (they alias the
+    /// scrutinee). Moves out of them must be rejected in guards: the guard
+    /// may fail and the next arm still needs the value.
+    guard_scrutinee: Vec<Place>,
 }
 
 impl<'a> BodyCtx<'a> {
@@ -2529,15 +2849,18 @@ impl<'a> BodyCtx<'a> {
             moved_places: HashSet::new(),
             moved_sites: HashMap::new(),
             loans: HashMap::new(),
+            backedge_reset_loans: HashSet::new(),
             next_loan: 0,
             expr_origins: HashMap::new(),
             local_origins: HashMap::new(),
             expr_origin_fields: HashMap::new(),
             local_origin_fields: HashMap::new(),
             param_origins: HashMap::new(),
-            remaining_uses: collect_local_uses(body),
+            last_uses: collect_local_uses(body),
+            binding_scopes: HashMap::new(),
             scope_depth: 0,
             in_match_guard: false,
+            guard_scrutinee: Vec::new(),
         }
     }
 
@@ -2591,14 +2914,115 @@ impl<'a> BodyCtx<'a> {
         self.moved_sites.extend(snapshot.moved_sites.clone());
     }
 
-    fn merge_move_state_from(&mut self, other: &Self) {
+    /// Merges two branch exits' `local_origins`: for every binding whose
+    /// origins differ from the branch entry, keep the union of both branches
+    /// and re-activate the unioned loans. A binding assigned a borrow in
+    /// either branch may hold that borrow after the `if`, so loans from both
+    /// branches must stay live and conflicting.
+    fn merge_local_origins(
+        ctx: &mut BodyCtx<'_>,
+        entry: &HashMap<PatternBindingId, Origins>,
+        other: &HashMap<PatternBindingId, Origins>,
+    ) {
+        let current = ctx.local_origins.clone();
+        let mut merged: HashMap<PatternBindingId, Origins> = HashMap::new();
+        let mut bindings = current
+            .keys()
+            .chain(other.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        bindings.sort_unstable_by_key(|id| id.field.map_or(0, |index| index + 1));
+        bindings.dedup_by(|a, b| a.pattern == b.pattern && a.field == b.field);
+        bindings.dedup();
+        for binding in bindings {
+            let entry_origins = entry.get(&binding);
+            let mut origins = current.get(&binding).cloned().unwrap_or_default();
+            let other_origins = other.get(&binding).cloned().unwrap_or_default();
+            if entry_origins == Some(&origins) && entry_origins == Some(&other_origins) {
+                continue;
+            }
+            origins.extend(other_origins);
+            if origins.is_empty() {
+                continue;
+            }
+            let declared = ctx
+                .binding_scopes
+                .get(&binding)
+                .copied()
+                .unwrap_or(ctx.scope_depth);
+            for origin in &origins {
+                if let Some(record) = ctx.loans.get_mut(&origin.loan) {
+                    record.holders.insert(binding);
+                    record.scope_depth = record.scope_depth.min(declared);
+                    // Re-activate only loans whose scope still covers the
+                    // current depth; a loan from a deeper, already-popped
+                    // scope (e.g. a match arm binding) stays deactivated.
+                    if record.scope_depth <= ctx.scope_depth {
+                        record.active = true;
+                    }
+                }
+            }
+            merged.insert(binding, origins);
+        }
+        for (binding, origins) in merged {
+            ctx.local_origins.insert(binding, origins);
+        }
+    }
+
+    // ponytail: wildcard moves are checked within an iteration and reset on
+    // backedges for array IntoIterator; per-slot initialization would allow
+    // rejecting repeated dynamic-index moves across iterations as well.
+    fn merge_loop_head_move_state_from(&mut self, other: &Self) {
         self.bindings.merge_moved_from(&other.bindings);
-        self.moved_places.extend(other.moved_places.iter().cloned());
-        self.moved_sites.extend(other.moved_sites.clone());
+        self.moved_places.extend(
+            other
+                .moved_places
+                .iter()
+                .filter(|place| !place_has_wildcard_index(place))
+                .cloned(),
+        );
+        let filtered = other
+            .moved_sites
+            .iter()
+            .filter(|(place, _)| !place_has_wildcard_index(place));
+        self.moved_sites
+            .extend(filtered.map(|(place, site)| (place.clone(), site.clone())));
+        self.next_loan = other.next_loan;
+        self.backedge_reset_loans
+            .extend(&other.backedge_reset_loans);
+        for (id, record) in &other.loans {
+            let entry = self.loans.entry(*id).or_insert_with(|| record.clone());
+            entry.active |= record.active;
+            entry.holders.extend(&record.holders);
+            entry.parents.extend(&record.parents);
+            entry.scope_depth = entry.scope_depth.min(record.scope_depth);
+            if self.backedge_reset_loans.contains(id) {
+                entry.active = false;
+                entry.holders.clear();
+            }
+        }
+        for binding in self.binding_scopes.keys().copied().collect::<Vec<_>>() {
+            let mut value = self.local_origin_value(binding);
+            value.merge(other.local_origin_value(binding));
+            discard_reset_origins(&mut value, &self.backedge_reset_loans);
+            self.bind_origin_value(binding, value);
+        }
     }
 
     fn same_move_state(&self, other: &Self) -> bool {
-        self.bindings == other.bindings && self.moved_places == other.moved_places
+        self.bindings == other.bindings
+            && self.moved_places == other.moved_places
+            && self.local_origins == other.local_origins
+            && self
+                .loans
+                .iter()
+                .filter(|(_, loan)| loan.active)
+                .all(|(id, _)| other.loans.get(id).is_some_and(|loan| loan.active))
+            && other
+                .loans
+                .iter()
+                .filter(|(_, loan)| loan.active)
+                .all(|(id, _)| self.loans.get(id).is_some_and(|loan| loan.active))
     }
 
     fn seed_reference_params<'b>(
@@ -2641,6 +3065,17 @@ impl<'a> BodyCtx<'a> {
         permanent: bool,
         parents: HashSet<LoanId>,
     ) -> LoanId {
+        if let Some((id, record)) = self.loans.iter_mut().find(|(_, record)| {
+            record.place == place
+                && record.kind == kind
+                && record.issued_at == issued_at
+                && record.permanent == permanent
+        }) {
+            record.active = true;
+            record.scope_depth = self.scope_depth;
+            record.parents.extend(parents);
+            return *id;
+        }
         let id = self.next_loan;
         self.next_loan += 1;
         self.loans.insert(
@@ -2691,7 +3126,15 @@ impl<'a> BodyCtx<'a> {
         for origin in origins {
             if let Some(loan) = self.loans.get_mut(&origin.loan) {
                 loan.holders.insert(binding);
-                loan.scope_depth = loan.scope_depth.min(self.scope_depth);
+                // A loan assigned inside a nested block to a binding declared
+                // in an outer scope must outlive that block: clamp to the
+                // binding's declaration depth, not the assignment site.
+                let declared = self
+                    .binding_scopes
+                    .get(&binding)
+                    .copied()
+                    .unwrap_or(self.scope_depth);
+                loan.scope_depth = loan.scope_depth.min(declared);
                 loan.active = true;
             }
         }
@@ -2741,14 +3184,37 @@ impl<'a> BodyCtx<'a> {
         }
     }
 
-    fn release_local_if_dead(&mut self, binding: PatternBindingId) {
-        let Some(remaining) = self.remaining_uses.get_mut(&binding) else {
+    fn release_local_if_dead(&mut self, binding: PatternBindingId, expr: ExprId) {
+        if let Some(range) = self.expr_range(expr)
+            && self
+                .last_uses
+                .get(&binding)
+                .is_some_and(|last| *last <= usize::from(range.end()))
+        {
+            self.release_local_origins(binding);
+        }
+    }
+
+    fn release_expired_locals(&mut self, expr: ExprId) {
+        let Some(range) = self.expr_range(expr) else {
             return;
         };
-        *remaining = remaining.saturating_sub(1);
-        if *remaining != 0 {
-            return;
+        let expired = self
+            .local_origins
+            .keys()
+            .copied()
+            .filter(|binding| {
+                self.last_uses
+                    .get(binding)
+                    .is_some_and(|last| *last <= usize::from(range.end()))
+            })
+            .collect::<Vec<_>>();
+        for binding in expired {
+            self.release_local_origins(binding);
         }
+    }
+
+    fn release_local_origins(&mut self, binding: PatternBindingId) {
         let Some(origins) = self.local_origins.get(&binding) else {
             return;
         };
@@ -2846,6 +3312,32 @@ fn place_overlaps(a: &Place, b: &Place) -> bool {
     a.is_prefix_of(b) || b.is_prefix_of(a)
 }
 
+fn contains_opaque_owned_result(ty: &Type) -> bool {
+    match ty {
+        Type::Param(_) => true,
+        Type::Enum(_, args) | Type::Struct(_, args) | Type::Tuple(args) => {
+            args.iter().any(contains_opaque_owned_result)
+        }
+        Type::Array(inner, _) => contains_opaque_owned_result(inner),
+        _ => false,
+    }
+}
+
+fn discard_reset_origins(value: &mut OriginValue, reset: &HashSet<LoanId>) {
+    value.origins.retain(|origin| !reset.contains(&origin.loan));
+    for field in &mut value.fields {
+        discard_reset_origins(field, reset);
+    }
+}
+
+/// True when the place contains a runtime (wildcard) array index projection.
+fn place_has_wildcard_index(place: &Place) -> bool {
+    place
+        .projections
+        .iter()
+        .any(|projection| matches!(projection, hir::place::Projection::Index(None)))
+}
+
 fn access_places_overlap(a: &AccessPlace, b: &AccessPlace) -> bool {
     if a.root != b.root {
         return false;
@@ -2869,7 +3361,14 @@ fn access_places_overlap(a: &AccessPlace, b: &AccessPlace) -> bool {
 }
 
 fn access_place_from_move_place(place: &Place) -> AccessPlace {
-    let mut result = AccessPlace::new(AccessRoot::Pattern(place.local));
+    let root = match place.root {
+        hir::place::PlaceRoot::Pattern(id) => AccessRoot::Pattern(id),
+        hir::place::PlaceRoot::Param(index) => AccessRoot::Param(index),
+        hir::place::PlaceRoot::LambdaParam { lambda, index } => {
+            AccessRoot::LambdaParam { lambda, index }
+        }
+    };
+    let mut result = AccessPlace::new(root);
     for projection in &place.projections {
         result = match projection {
             hir::place::Projection::Field(index) => result.field(*index),
@@ -2912,10 +3411,11 @@ fn access_place_from_capture(place: &CapturePlace) -> AccessPlace {
 }
 
 fn move_place_from_capture(capture: &CapturePlace) -> Option<Place> {
-    let CaptureSource::Pattern(id) = &capture.source else {
-        return None;
+    let mut place = match &capture.source {
+        CaptureSource::Pattern(id) => Place::root(*id),
+        CaptureSource::Param(index) => Place::param(*index),
+        CaptureSource::LambdaParam { lambda, index } => Place::lambda_param(*lambda, *index),
     };
-    let mut place = Place::root(*id);
     for projection in &capture.projections {
         place = match projection {
             hir::place::Projection::Field(index) => place.field(*index),
@@ -2964,7 +3464,12 @@ fn collect_expr_local_uses(body: &Body, id: ExprId, uses: &mut HashMap<PatternBi
         Expr::Path {
             resolved: Some(ResolvedName::PatternBinding(binding)),
             ..
-        } => *uses.entry(*binding).or_default() += 1,
+        } => {
+            if let Some(range) = body.source_map.expr_ranges.get(&id) {
+                let last = uses.entry(*binding).or_default();
+                *last = (*last).max(usize::from(range.end()));
+            }
+        }
         Expr::Binary { lhs, rhs, .. } => {
             collect_expr_local_uses(body, *lhs, uses);
             collect_expr_local_uses(body, *rhs, uses);
@@ -3047,6 +3552,24 @@ fn collect_expr_local_uses(body: &Body, id: ExprId, uses: &mut HashMap<PatternBi
         | Expr::CharLiteral { .. }
         | Expr::BoolLiteral { .. }
         | Expr::Path { .. } => {}
+    }
+    if matches!(
+        body.exprs[id],
+        Expr::While { .. } | Expr::Loop { .. } | Expr::For { .. } | Expr::Lambda { .. }
+    ) && let Some(range) = body.source_map.expr_ranges.get(&id)
+    {
+        for (binding, last) in uses.iter_mut() {
+            if *last >= usize::from(range.start())
+                && *last <= usize::from(range.end())
+                && body
+                    .source_map
+                    .pat_ranges
+                    .get(&binding.pattern)
+                    .is_some_and(|declaration| declaration.start() < range.start())
+            {
+                *last = usize::from(range.end());
+            }
+        }
     }
 }
 

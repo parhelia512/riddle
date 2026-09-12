@@ -126,6 +126,16 @@ impl LowerCtx<'_> {
                 builder.store(source, destination);
                 Some(previous)
             }
+            "swap" => {
+                let element_ty = self.convert_type(generic_call.as_ref()?.args.first()?);
+                let a = self.lower_expr(builder, param_values, body, *args.first()?);
+                let b = self.lower_expr(builder, param_values, body, *args.get(1)?);
+                let left = builder.load(a, element_ty.clone());
+                let right = builder.load(b, element_ty);
+                builder.store(right, a);
+                builder.store(left, b);
+                Some(builder.unit_const())
+            }
             _ => None,
         }
     }

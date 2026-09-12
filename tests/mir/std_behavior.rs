@@ -13,8 +13,16 @@ fn compile_and_run(source: &str, gc: bool) -> (i32, String) {
     let result = pipeline::compile(source);
     assert!(
         result.success(),
-        "riddle diagnostics: {:#?}",
-        result.type_result.diagnostics
+        "riddle diagnostics: {:#?}
+hir: {:#?}
+macro: {:#?}
+parse: {:#?}
+analysis: {:#?}",
+        result.type_result.diagnostics,
+        result.hir_diagnostics,
+        result.macro_diagnostics,
+        result.parse_errors,
+        result.analysis_diagnostics
     );
     let generated = pipeline::generate_c_with_gc_and_source(
         result.mir_module.as_ref().unwrap(),
@@ -631,41 +639,68 @@ fn hash_map_get_or_insert_counts_once() {
 #[test]
 fn parse_wide_integers_and_radix_roundtrip() {
     let source = r#"
-        use crate::std::parse::{parse_i64, parse_u64, parse_usize, parse_with_radix};
-        use crate::std::option::Option;
+        use crate::std::parse::{ParseIntErrorKind, parse_i64, parse_u64, parse_usize, parse_with_radix};
+        use crate::std::result::Result;
 
         fun main() -> i32 {
             match parse_i64("-9223372036854775808") {
-                Option::Some(v) => { if v != -9223372036854775807i64 - 1i64 { return 1; } },
-                Option::None => { return 2; },
+                Result::Ok(v) => { if v != -9223372036854775807i64 - 1i64 { return 1; } },
+                Result::Err(_) => { return 2; },
             }
             match parse_i64("9223372036854775808") {
-                Option::None => {},
-                Option::Some(_) => { return 3; },
+                Result::Err(error) => match *error.kind() {
+                    ParseIntErrorKind::PosOverflow => {},
+                    _ => { return 3; },
+                },
+                Result::Ok(_) => { return 3; },
             }
             match parse_u64("18446744073709551615") {
-                Option::Some(v) => { if v != 18446744073709551615u64 { return 4; } },
-                Option::None => { return 5; },
+                Result::Ok(v) => { if v != 18446744073709551615u64 { return 4; } },
+                Result::Err(_) => { return 5; },
             }
             match parse_with_radix("ff", 16) {
-                Option::Some(v) => { if v != 255i64 { return 6; } },
-                Option::None => { return 7; },
+                Result::Ok(v) => { if v != 255i64 { return 6; } },
+                Result::Err(_) => { return 7; },
             }
             match parse_with_radix("-2a", 16) {
-                Option::Some(v) => { if v != -42i64 { return 8; } },
-                Option::None => { return 9; },
+                Result::Ok(v) => { if v != -42i64 { return 8; } },
+                Result::Err(_) => { return 9; },
             }
             match parse_with_radix("1010", 2) {
-                Option::Some(v) => { if v != 10i64 { return 10; } },
-                Option::None => { return 11; },
+                Result::Ok(v) => { if v != 10i64 { return 10; } },
+                Result::Err(_) => { return 11; },
             }
             match parse_with_radix("1", 37) {
-                Option::None => {},
-                Option::Some(_) => { return 12; },
+                Result::Err(error) => match *error.kind() {
+                    ParseIntErrorKind::InvalidDigit => {},
+                    _ => { return 12; },
+                },
+                Result::Ok(_) => { return 12; },
             }
             match parse_usize("12345") {
-                Option::Some(v) => { if v != 12345usize { return 13; } },
-                Option::None => { return 14; },
+                Result::Ok(v) => { if v != 12345usize { return 13; } },
+                Result::Err(_) => { return 14; },
+            }
+            match parse_i64("") {
+                Result::Err(error) => match *error.kind() {
+                    ParseIntErrorKind::Empty => {},
+                    _ => { return 15; },
+                },
+                Result::Ok(_) => { return 15; },
+            }
+            match parse_i64("12x") {
+                Result::Err(error) => match *error.kind() {
+                    ParseIntErrorKind::InvalidDigit => {},
+                    _ => { return 16; },
+                },
+                Result::Ok(_) => { return 16; },
+            }
+            match parse_i64("-9223372036854775809") {
+                Result::Err(error) => match *error.kind() {
+                    ParseIntErrorKind::NegOverflow => {},
+                    _ => { return 17; },
+                },
+                Result::Ok(_) => { return 17; },
             }
             0
         }
@@ -804,6 +839,229 @@ fn vec_macro_builds_lists_repeats_and_empty_vectors() {
             }
             if nested_total != 6i32 { return 5; }
             if vec![9; 0usize].len() != 0usize { return 6; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn random_values_stay_in_requested_bounds() {
+    let source = r#"
+        use crate::std::random::{random_u32, random_bool, random_below};
+
+        fun main() -> i32 {
+            // random_below(1) must collapse to the only in-range value.
+            let mut index = 0usize;
+            while index < 64usize {
+                if random_below(1u32) != 0u32 { return 1; }
+                if random_below(0u32) != 0u32 { return 2; }
+                let value = random_below(7u32);
+                if value >= 7u32 { return 3; }
+                index += 1usize;
+            }
+            // Bounded by the full range: any result is representable; just
+            // exercise both generators so a broken binding shows up.
+            let _ = random_u32();
+            let coin = random_bool();
+            if coin != true && coin != false { return 4; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn time_now_is_monotonic_across_reads() {
+    let source = r#"
+        use crate::std::time::time_now;
+
+        fun main() -> i32 {
+            let first = time_now();
+            let mut second = time_now();
+            // Adjacent reads never go backwards; retry a few times so a
+            // coarse clock still produces an advancing pair.
+            let mut tries = 0;
+            while second == first && tries < 1000 {
+                second = time_now();
+                tries += 1;
+            }
+            if second < first { return 1; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn osstring_roundtrips_and_args_stay_consistent() {
+    let source = r#"
+        use crate::std::ffi::OsString;
+        use crate::std::env;
+        use crate::std::result::Result;
+        use crate::std::option::Option;
+
+        fun main() -> i32 {
+            // str -> OsString -> str roundtrip preserves bytes.
+            let original = OsString::from_str("hello world");
+            match original.clone().into_string() {
+                Result::Ok(text) => { if text.as_str() != "hello world" { return 1; } },
+                Result::Err(_) => { return 2; },
+            }
+            if original.len() != 11usize || original.is_empty() { return 3; }
+
+            // Encoded bytes survive the unsafe copy constructor.
+            let copy = original.clone();
+            let left = original.as_encoded_bytes();
+            let right = copy.as_encoded_bytes();
+            if left.len() != right.len() { return 4; }
+            let mut index = 0usize;
+            while index < left.len() {
+                if left[index] != right[index] { return 5; }
+                index += 1usize;
+            }
+
+            // The process always has at least its own executable name, and
+            // args_os/args agree on the count.
+            let wide = env::args_os();
+            if wide.is_empty() { return 6; }
+            let narrow = env::args();
+            if narrow.len() != wide.len() { return 7; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn tree_map_iterates_sorted_with_boundary_keys() {
+    let source = r#"
+        use crate::std::collections::TreeMap;
+        use crate::std::option::Option;
+        use crate::std::iter::Iterator;
+
+        fun main() -> i32 {
+            let mut tree: TreeMap<i32, i32> = TreeMap::new();
+            // Insert in scrambled order including both i32 extremes.
+            tree.insert(0i32, 0i32);
+            tree.insert(-2147483648i32, 1i32);
+            tree.insert(2147483647i32, 2i32);
+            tree.insert(5i32, 3i32);
+            tree.insert(-5i32, 4i32);
+            if tree.len() != 5usize { return 1; }
+
+            // In-order walk: strictly ascending, extremes first and last.
+            let mut iter = tree.iter();
+            let mut previous: Option<i32> = Option::None;
+            let mut count = 0usize;
+            let mut first_key = 0i32;
+            let mut last_key = 0i32;
+            loop {
+                match iter.next() {
+                    Option::Some((key, _value)) => {
+                        if count == 0usize { first_key = *key; }
+                        last_key = *key;
+                        match previous {
+                            Option::Some(p) => { if *key <= p { return 2; } },
+                            Option::None => {},
+                        }
+                        previous = Option::Some(*key);
+                        count += 1usize;
+                    },
+                    Option::None => { break; },
+                }
+            }
+            if count != 5usize { return 3; }
+            if first_key != -2147483648i32 || last_key != 2147483647i32 { return 4; }
+
+            // Removing either extreme keeps the middle ordered and lookupable.
+            match tree.remove(&-2147483648i32) {
+                Option::Some(value) => { if value != 1i32 { return 5; } },
+                Option::None => { return 6; },
+            }
+            match tree.remove(&2147483647i32) {
+                Option::Some(value) => { if value != 2i32 { return 7; } },
+                Option::None => { return 8; },
+            }
+            if tree.len() != 3usize || !tree.contains_key(&0i32) { return 9; }
+
+            // A missing lookup and reinsert after boundary removals.
+            if tree.get(&-2147483648i32).is_some() { return 10; }
+            tree.insert(-2147483648i32, 9i32);
+            if tree.get(&-2147483648i32).is_none() { return 11; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn tree_set_orders_and_removes_boundary_values() {
+    let source = r#"
+        use crate::std::collections::TreeSet;
+
+        fun main() -> i32 {
+            let mut set: TreeSet<i32> = TreeSet::new();
+            set.insert(10i32);
+            set.insert(-10i32);
+            set.insert(-2147483648i32);
+            set.insert(2147483647i32);
+            set.insert(0i32);
+            if set.len() != 5usize { return 1; }
+
+            // Re-inserting an existing value is a no-op.
+            set.insert(0i32);
+            if set.len() != 5usize { return 2; }
+
+            if !set.contains(&-2147483648i32) || !set.contains(&2147483647i32) { return 3; }
+            if !set.remove(&-2147483648i32) { return 4; }
+            if set.contains(&-2147483648i32) || set.len() != 4usize { return 5; }
+            if set.remove(&-2147483648i32) { return 6; }
+
+            // Boundary removal keeps the rest addressable.
+            if !set.contains(&0i32) || !set.contains(&10i32) { return 7; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn hash_map_entry_runs_the_rust_idiom_end_to_end() {
+    let source = r#"
+        use crate::std::collections::HashMap;
+
+        fun main() -> i32 {
+            let mut counts: HashMap<i32, i32> = HashMap::new();
+
+            // Vacant path: inserts 0, then the slot is writable.
+            let slot = counts.entry(7i32).or_insert(0i32);
+            *slot = *slot + 1i32;
+            let observed = match counts.get(&7i32) { Option::Some(v) => *v, Option::None => -1i32 };
+            if observed != 1i32 { return 1; }
+
+            // Occupied path: the default is dropped, the stored value stays.
+            let again = counts.entry(7i32).or_insert(100i32);
+            if *again != 1i32 { return 2; }
+            *again = *again + 1i32;
+
+            // Lazy default: the lambda must not run for occupied entries.
+            let mut produced = 0i32;
+            let third = counts.entry(7i32).or_insert_with([ -> { produced = produced + 1i32; 5i32 }]);
+            if *third != 2i32 { return 3; }
+            if produced != 0i32 { return 4; }
+
+            // A vacant entry runs the default exactly once.
+            let fourth = counts.entry(9i32).or_insert_with([ -> { produced = produced + 1i32; 5i32 }]);
+            if *fourth != 5i32 || produced != 1i32 { return 5; }
+
+            if counts.len() != 2usize { return 6; }
             0
         }
     "#;

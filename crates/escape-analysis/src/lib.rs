@@ -401,9 +401,17 @@ impl EscapeAnalyzer<'_> {
             .iter()
             .map(|field| Self::summarize_return_value(&ctx, field))
             .collect();
+        // A reference parameter whose place escapes (stored into an escaping
+        // lambda, forwarded out, recorded as a lifetime sink) forces the
+        // caller to promote the referent: the callee's borrowed-from value
+        // outlives the call.
+        let mut escaping = ctx.escaping_params;
+        escaping.extend(ctx.escaping_param_places.iter().copied());
+        let mut lifetime_escaping = ctx.lifetime_escaping_param_values;
+        lifetime_escaping.extend(ctx.lifetime_escaping_params.iter().copied());
         FnSummary {
-            escaping: ctx.escaping_params,
-            lifetime_escaping: ctx.lifetime_escaping_param_values,
+            escaping,
+            lifetime_escaping,
             returned: ctx.returned_params,
             returned_fields,
         }
@@ -495,14 +503,136 @@ impl EscapeAnalyzer<'_> {
             }
             self.escape_check_stmt(ctx, stmt);
         }
+        // Provenance that outlives the block cannot rest on block-local
+        // storage. Two paths carry it out: an assignment to a binding
+        // declared outside the block, and the block's tail value. Promote
+        // every block local that either path borrowed.
+        let mut outer_bindings = HashSet::new();
+        for binding in ctx.binding_sources.keys() {
+            if !locals.contains(binding) {
+                outer_bindings.insert(*binding);
+            }
+        }
+        let mut outflow = RefSources::new();
+        for binding in &outer_bindings {
+            outflow.extend(
+                ctx.binding_sources
+                    .get(binding)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+        Self::promote_escaping_block_locals(ctx, &locals, &outflow);
         let Some(tail) = tail else {
             return false;
         };
         self.mark_escaping_exprs(ctx, tail);
         let value = ctx.expr_source_value(tail);
         Self::mark_scoped_lifetime_sources(ctx, &value.sources, &locals);
+        Self::promote_scope_sources(ctx, &value.sources, &locals);
         ctx.set_expr_source_value(expr_id, value);
         ctx.escaping_exprs.contains(&tail)
+    }
+
+    /// Promotes every block-local binding whose provenance reached one of
+    /// `sinks`: the recorded out-of-block sources, or any earlier
+    /// `mark_source_sink` target.
+    fn promote_escaping_block_locals(
+        ctx: &mut EscapeCtx<'_>,
+        locals: &HashSet<PatternBindingId>,
+        extra_sinks: &RefSources,
+    ) {
+        if locals.is_empty() {
+            return;
+        }
+        let mut sinks = ctx.escaping_sources.clone();
+        sinks.extend(extra_sinks.iter().copied());
+        if sinks.is_empty() {
+            return;
+        }
+        for binding in locals {
+            let local_source = RefSource::Local(*binding);
+            let local_value_source = RefSource::LocalValue(*binding);
+            let mut escapes = sinks.contains(&local_source) || sinks.contains(&local_value_source);
+            if !escapes {
+                // Also chase the local's own stored provenance to any sink.
+                let mut pending: Vec<RefSource> = ctx
+                    .binding_sources
+                    .get(binding)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let mut seen = HashSet::new();
+                while let Some(source) = pending.pop() {
+                    if !seen.insert(source) {
+                        continue;
+                    }
+                    if sinks.contains(&source) {
+                        escapes = true;
+                        break;
+                    }
+                    match source {
+                        RefSource::LocalValue(nested) => pending.extend(
+                            ctx.binding_sources
+                                .get(&nested)
+                                .into_iter()
+                                .flatten()
+                                .copied(),
+                        ),
+                        RefSource::Temporary(expr) => pending
+                            .extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied()),
+                        _ => {}
+                    }
+                }
+            }
+            if escapes {
+                ctx.escaping_locals.insert(*binding);
+            }
+        }
+    }
+
+    /// GC-mode twin of `mark_scoped_lifetime_sources`: tail-expression
+    /// provenance that names a block local promotes it, because the block
+    /// value carries the reference out of the local's scope.
+    fn promote_scope_sources(
+        ctx: &mut EscapeCtx<'_>,
+        sources: &RefSources,
+        locals: &HashSet<PatternBindingId>,
+    ) {
+        let mut pending: Vec<RefSource> = sources.iter().copied().collect();
+        let mut seen = HashSet::new();
+        while let Some(source) = pending.pop() {
+            if !seen.insert(source) {
+                continue;
+            }
+            match source {
+                RefSource::Local(binding) if locals.contains(&binding) => {
+                    ctx.escaping_locals.insert(binding);
+                }
+                RefSource::LocalValue(binding) => {
+                    if !locals.contains(&binding) {
+                        pending.extend(
+                            ctx.binding_sources
+                                .get(&binding)
+                                .into_iter()
+                                .flatten()
+                                .copied(),
+                        );
+                    }
+                }
+                RefSource::Temporary(expr) => {
+                    pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied());
+                }
+                RefSource::Local(_)
+                | RefSource::ParamPlace(_)
+                | RefSource::ParamValue(_)
+                | RefSource::LambdaParamPlace(..)
+                | RefSource::LambdaParamValue(..)
+                | RefSource::Lambda(_) => {}
+            }
+        }
     }
 
     fn mark_unary_expr(&mut self, ctx: &mut EscapeCtx<'_>, expr_id: ExprId) -> bool {
@@ -830,18 +960,23 @@ impl EscapeAnalyzer<'_> {
             .copied()
             .collect::<Vec<_>>();
         let mut seen = RefSources::new();
+        let mut callee_lambdas = Vec::new();
+        let mut unknown_callee_source = false;
         while let Some(source) = pending.pop() {
             if !seen.insert(source) {
                 continue;
             }
             match source {
-                RefSource::Lambda(lambda) => returned.sources.extend(
-                    ctx.lambda_return_sources
-                        .get(&lambda)
-                        .into_iter()
-                        .flatten()
-                        .copied(),
-                ),
+                RefSource::Lambda(lambda) => {
+                    callee_lambdas.push(lambda);
+                    returned.sources.extend(
+                        ctx.lambda_return_sources
+                            .get(&lambda)
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                }
                 RefSource::LocalValue(binding) => pending.extend(
                     ctx.binding_sources
                         .get(&binding)
@@ -852,9 +987,18 @@ impl EscapeAnalyzer<'_> {
                 RefSource::Temporary(expr) => {
                     pending.extend(ctx.expr_sources.get(&expr).into_iter().flatten().copied());
                 }
+                RefSource::ParamValue(_) | RefSource::LambdaParamValue(..) => {
+                    unknown_callee_source = true;
+                }
                 _ => {}
             }
         }
+        // A callee whose sources all resolve to lambda literals defined in
+        // this body has precise per-param summaries (`lambda_return_sources`,
+        // `lambda_param_sinks`); only genuinely opaque callees (params, FFI,
+        // function values from other frames) fall back to blanket retention.
+        let known_lambda_callee =
+            callee_fid.is_none() && !callee_lambdas.is_empty() && !unknown_callee_source;
         let receiver = callee_fid.and_then(|fid| {
             let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee] else {
                 return None;
@@ -863,17 +1007,43 @@ impl EscapeAnalyzer<'_> {
             Some((*base, matches!(param.ty, HirTypeRef::Ref(..))))
         });
         // Bound-dispatch method calls (`value.lt(...)` resolved through
-        // `T: PartialOrd`) record no `FunctionItem` for the callee, so the
-        // receiver's by-ref `self` cannot be confirmed. Conservatively treat
-        // the receiver as borrowed: an address-taken receiver gets its place
-        // materialized at the binding site, which dominates every later use.
+        // `T: PartialOrd`) record no `FunctionItem` for the callee. When impl
+        // methods are discoverable, union their summaries through the normal
+        // per-function path; only when none exist (fully opaque dispatch) fall
+        // back to treating the receiver as merely borrowed.
         let conservative_receiver =
             receiver.is_none() && matches!(ctx.body.exprs[callee], Expr::FieldAccess { .. });
+        let callee_receiver = match &ctx.body.exprs[callee] {
+            Expr::FieldAccess { base, .. } => Some(*base),
+            _ => None,
+        };
+        let bound_impl_candidates = if conservative_receiver {
+            self.type_result
+                .trait_method_calls
+                .get(&(ctx.body_id, callee))
+                .map(|call| self.trait_method_impl_candidates(call.trait_id, &call.method))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         if let Some((receiver, by_ref)) = receiver {
             let value = self.handle_call_operand(ctx, callee_fid, 0, receiver, by_ref);
             returned.merge(value.clone());
             inputs.push(value);
+        } else if let (Some(receiver), false) = (callee_receiver, bound_impl_candidates.is_empty())
+        {
+            self.mark_escaping_exprs(ctx, receiver);
+            for fid in &bound_impl_candidates {
+                let fid = *fid;
+                let by_ref = self.hir.item_tree.functions[fid]
+                    .params
+                    .first()
+                    .is_some_and(|param| matches!(param.ty, HirTypeRef::Ref(..)));
+                let value = self.handle_call_operand(ctx, Some(fid), 0, receiver, by_ref);
+                returned.merge(value.clone());
+                inputs.push(value);
+            }
         } else if conservative_receiver {
             let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee] else {
                 unreachable!("callee shape checked above");
@@ -888,14 +1058,13 @@ impl EscapeAnalyzer<'_> {
                 .get(&(ctx.body_id, receiver))
                 .is_some_and(|ty| matches!(ty, Type::Ref(..)));
             let sources = if receiver_is_reference {
-                RefSources::new()
+                ctx.expr_source_value(receiver).sources
             } else {
                 self.place_sources(ctx, receiver)
             };
             Self::mark_address_taken(ctx, &sources);
+            Self::mark_source_sink(ctx, &sources);
             let value = SourceValue::from_sources(sources);
-            // No callee summary is available, so — unlike the resolved path —
-            // the receiver is only borrowed, never treated as escaping.
             returned.merge(value.clone());
             inputs.push(value);
         }
@@ -905,7 +1074,52 @@ impl EscapeAnalyzer<'_> {
         for (i, arg) in args.iter().enumerate() {
             self.mark_escaping_exprs(ctx, *arg);
             let source = ctx.expr_source_value(*arg);
-            let value = self.handle_call_operand(ctx, callee_fid, i + param_offset, *arg, false);
+            if known_lambda_callee {
+                // The lambda's body was analyzed before this flow-later call
+                // site, so its recorded param summaries decide exactly which
+                // arguments sink (stored past the call) or flow into the
+                // result — instead of sinking every argument.
+                if callee_lambdas
+                    .iter()
+                    .any(|lambda| ctx.lambda_param_sinks.contains(&(*lambda, i)))
+                {
+                    Self::mark_source_sink(ctx, &source.sources);
+                }
+                if callable_returns_reference
+                    && callee_lambdas.iter().any(|lambda| {
+                        ctx.lambda_return_sources
+                            .get(lambda)
+                            .is_some_and(|sources| {
+                                sources.contains(&RefSource::LambdaParamValue(*lambda, i))
+                                    || sources.contains(&RefSource::LambdaParamPlace(*lambda, i))
+                            })
+                    })
+                {
+                    returned.merge(source.clone());
+                }
+                inputs.push(SourceValue::default());
+                let carries_reference = callable_signature
+                    .as_ref()
+                    .and_then(|signature| signature.params.get(i))
+                    .is_some_and(type_may_carry_reference);
+                callable_inputs.push((source, carries_reference));
+                continue;
+            }
+            let value = if bound_impl_candidates.is_empty() {
+                self.handle_call_operand(ctx, callee_fid, i + param_offset, *arg, false)
+            } else {
+                let mut value = SourceValue::default();
+                for fid in &bound_impl_candidates {
+                    value.merge(self.handle_call_operand(
+                        ctx,
+                        Some(*fid),
+                        i + param_offset,
+                        *arg,
+                        false,
+                    ));
+                }
+                value
+            };
             returned.merge(value.clone());
             inputs.push(value);
             let carries_reference = callable_signature
@@ -914,9 +1128,10 @@ impl EscapeAnalyzer<'_> {
                 .is_some_and(type_may_carry_reference);
             callable_inputs.push((source, carries_reference));
         }
-        // ponytail: dynamic callable summaries are unavailable, so a reference-returning
-        // callback conservatively keeps its callee and every argument alive.
-        if callee_fid.is_none() && callable_returns_reference {
+        // Opaque dynamic callees have no per-arg summaries, so a
+        // reference-returning callback conservatively keeps its callee and
+        // every reference-carrying argument alive.
+        if callee_fid.is_none() && !known_lambda_callee && callable_returns_reference {
             returned.merge(ctx.expr_source_value(callee));
             for (input, carries_reference) in callable_inputs {
                 if carries_reference {
@@ -1045,6 +1260,39 @@ impl EscapeAnalyzer<'_> {
             } => Some(*fid),
             _ => None,
         }
+    }
+
+    /// All implementations of this trait method, including default bodies.
+    fn trait_method_impl_candidates(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        method: &str,
+    ) -> Vec<FunctionId> {
+        self.hir
+            .item_tree
+            .impls
+            .iter()
+            .filter(|(_, imp)| {
+                imp.trait_ty.as_ref().is_some_and(|ty| {
+                    matches!(ty, hir::item_tree::HirTypeRef::Named(path)
+                        if matches!(self.hir.type_resolutions.get(&path.range),
+                            Some(ResolvedName::Trait(id)) if *id == trait_id))
+                })
+            })
+            .filter_map(|(_, imp)| {
+                imp.methods
+                    .iter()
+                    .copied()
+                    .find(|fid| self.hir.item_tree.functions[*fid].name.0 == method)
+                    .or_else(|| {
+                        self.hir.item_tree.traits[trait_id]
+                            .default_methods
+                            .iter()
+                            .copied()
+                            .find(|fid| self.hir.item_tree.functions[*fid].name.0 == method)
+                    })
+            })
+            .collect()
     }
 
     fn escape_check_stmt(&mut self, ctx: &mut EscapeCtx<'_>, stmt_id: StmtId) {
@@ -1219,8 +1467,16 @@ impl EscapeAnalyzer<'_> {
                 RefSource::LambdaParamPlace(owner, index) if owner == lambda => {
                     ctx.escaping_lambda_param_places.insert((owner, index));
                     ctx.lifetime_escaping_lambda_params.insert((owner, index));
+                    // The result references this param's place, i.e. the
+                    // matching call-site argument.
+                    returned.insert(source);
                 }
-                RefSource::LambdaParamValue(owner, _) if owner == lambda => {}
+                RefSource::LambdaParamValue(owner, _) if owner == lambda => {
+                    // Record which of the lambda's params the return value
+                    // references so call sites through this lambda can keep
+                    // exactly those arguments alive instead of all of them.
+                    returned.insert(source);
+                }
                 RefSource::Lambda(inner) => {
                     ctx.escaping_lambdas.insert(inner);
                     returned.insert(source);
@@ -1271,6 +1527,7 @@ impl EscapeAnalyzer<'_> {
                 RefSource::ParamValue(index) if include_param_values => {
                     ctx.lifetime_escaping_param_values.insert(index);
                 }
+
                 RefSource::ParamValue(_)
                 | RefSource::LambdaParamValue(..)
                 | RefSource::Lambda(_) => {}
@@ -1354,7 +1611,12 @@ impl EscapeAnalyzer<'_> {
                 RefSource::LambdaParamPlace(lambda, index) => {
                     changed |= ctx.escaping_lambda_param_places.insert((lambda, index));
                 }
-                RefSource::LambdaParamValue(..) => {}
+                RefSource::LambdaParamValue(lambda, index) => {
+                    // The lambda stored this param's value past the call;
+                    // remember it so call sites through the lambda sink the
+                    // matching argument instead of every argument.
+                    changed |= ctx.lambda_param_sinks.insert((lambda, index));
+                }
                 RefSource::Lambda(lambda) => {
                     changed |= ctx.escaping_lambdas.insert(lambda);
                 }
@@ -1707,6 +1969,10 @@ struct EscapeCtx<'a> {
     loop_break_stack: Vec<Vec<ExprId>>,
     lambda_locals: HashMap<ExprId, HashSet<PatternBindingId>>,
     lambda_return_sources: HashMap<ExprId, RefSources>,
+    /// Lambda parameters whose VALUE reached an escape sink inside the lambda
+    /// body (stored past the call). Filled while the lambda body is analyzed,
+    /// before flow-later call sites consult it.
+    lambda_param_sinks: HashSet<(ExprId, usize)>,
     escaping_sources: RefSources,
     expr_sources: HashMap<ExprId, RefSources>,
     expr_source_fields: HashMap<ExprId, Vec<SourceValue>>,
@@ -1742,6 +2008,7 @@ impl<'a> EscapeCtx<'a> {
             loop_break_stack: Vec::new(),
             lambda_locals: HashMap::new(),
             lambda_return_sources: HashMap::new(),
+            lambda_param_sinks: HashSet::new(),
             escaping_sources: RefSources::new(),
             expr_sources: HashMap::new(),
             expr_source_fields: HashMap::new(),

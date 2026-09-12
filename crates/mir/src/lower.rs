@@ -477,6 +477,11 @@ const fn tc_const_arg_to_usize(ty: &type_checker::Type) -> Option<usize> {
     }
 }
 
+/// Encodes a name with its byte length so `_`-joined suffixes stay unique.
+fn encode_mono_name(name: &str) -> String {
+    format!("{}:{}", name.len(), name)
+}
+
 fn mono_type_name(ty: &Type) -> String {
     match ty {
         Type::Int(i) => format!("{i:?}").to_ascii_lowercase(),
@@ -502,8 +507,11 @@ fn mono_type_name(ty: &Type) -> String {
         ),
         Type::Slice(inner) => format!("slice_{}", mono_type_name(inner)),
         Type::Array(inner, len) => format!("arr{len}_{}", mono_type_name(inner)),
-        Type::Struct(st) => st.name.clone(),
-        Type::Enum(e) => e.name.clone(),
+        // Length-prefix user type names so differently-named type
+        // arguments cannot collide when suffixes join on `_`:
+        // `<A_B, C>` and `<A, B_C>` encode as `4:A_B_1:C` vs `1:A_3:B_C`.
+        Type::Struct(st) => encode_mono_name(&st.name),
+        Type::Enum(e) => encode_mono_name(&e.name),
         Type::FnPtr(_) => "fn".into(),
         Type::Void => "void".into(),
     }
@@ -1022,15 +1030,7 @@ fn resolve_field_index(
     }
 }
 
-fn determine_cast_op(source: &Type, target: &Type) -> CastOp {
-    try_cast_op(source, target).unwrap_or_else(|| {
-        unreachable!("unsupported cast reached MIR lowering: {source:?} as {target:?}")
-    })
-}
-
-/// The cast matrix the type checker's E0012 rule admits. `cast_matrix_tests`
-/// pins every documented pair so a checker-side extension cannot silently
-/// reach the unsupported-cast ICE in [`determine_cast_op`].
+/// The cast matrix the type checker's E0012 rule admits.
 fn try_cast_op(source: &Type, target: &Type) -> Option<CastOp> {
     match (source, target) {
         (Type::Int(IntTy::U8), Type::Char) => Some(CastOp::IntToChar),
@@ -1045,6 +1045,10 @@ fn try_cast_op(source: &Type, target: &Type) -> Option<CastOp> {
         (Type::Ptr(_), Type::Ptr(_)) => Some(CastOp::PtrToPtr),
         _ => None,
     }
+}
+
+fn determine_cast_op(source: &Type, target: &Type) -> Option<CastOp> {
+    try_cast_op(source, target)
 }
 
 fn is_raw_parts_to_slice_cast(source: &Type, target: &Type) -> bool {

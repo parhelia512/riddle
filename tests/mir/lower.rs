@@ -120,7 +120,7 @@ fn discarded_temporaries_drop_moved_and_remaining_fields() {
             matches!(
                 &inst.kind,
                 mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                    if name == "drop__Guard"
+                    if name == "drop__5:Guard"
             )
         })
         .count();
@@ -244,7 +244,7 @@ fn drop_glue_runs_user_drop_before_fields_in_declaration_order() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(calls, ["drop__Owner", "drop__First", "drop__Second"]);
+    assert_eq!(calls, ["drop__5:Owner", "drop__5:First", "drop__6:Second"]);
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn aggregate_without_user_drop_still_drops_its_fields() {
                 matches!(
                     &inst.kind,
                     mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                        if name == "drop__Guard"
+                        if name == "drop__5:Guard"
                 )
             })),
         "field drop glue is missing: {main:#?}"
@@ -685,7 +685,7 @@ fn assignment_drops_old_value_and_rearms_drop_flag() {
             matches!(
                 &inst.kind,
                 mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                    if name == "drop__Guard"
+                    if name == "drop__5:Guard"
             )
         })
         .count();
@@ -748,7 +748,7 @@ fn returned_closure_drops_value_captures_through_its_drop_function() {
                 matches!(
                     &inst.kind,
                     mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                        if name == "drop__Guard"
+                        if name == "drop__5:Guard"
                 )
             })),
         "closure drop function must drop its value captures: {closure_drop:#?}"
@@ -800,7 +800,7 @@ fn lambda_drops_its_by_value_parameters() {
                 matches!(
                     &inst.kind,
                     mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                        if name == "drop__Guard"
+                        if name == "drop__5:Guard"
                 )
             })),
         "lambda parameter must be dropped by the lambda body: {lambda:#?}"
@@ -840,7 +840,7 @@ fn monomorphized_generic_parameter_runs_drop() {
                 matches!(
                     &inst.kind,
                     mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                        if name == "drop__Guard"
+                        if name == "drop__5:Guard"
                 )
             })),
         "generic by-value parameter must be dropped after monomorphization: {drop_value:#?}"
@@ -884,7 +884,7 @@ fn monomorphized_generic_assignment_and_local_run_drop() {
             matches!(
                 &inst.kind,
                 mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                    if name == "drop__Guard"
+                    if name == "drop__5:Guard"
             )
         })
         .count();
@@ -925,7 +925,7 @@ fn monomorphization_preserves_callers_drop_scope() {
                 matches!(
                     &inst.kind,
                     mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                        if name == "drop__Guard"
+                        if name == "drop__5:Guard"
                 )
             })),
         "generic lowering must restore the caller's drop scope: {main:#?}"
@@ -1294,7 +1294,7 @@ fn generic_function_for_loop_uses_concrete_iterator_impl_and_enum_layout() {
         .function_order
         .iter()
         .map(|fid| &module.functions[*fid])
-        .find(|func| func.name == "consume__Counter_i32")
+        .find(|func| func.name == "consume__11:Counter_i32")
         .unwrap();
     let insts = func
         .blocks
@@ -1817,12 +1817,12 @@ fn generic_bound_operator_dispatches_after_monomorphization() {
         .function_order
         .iter()
         .map(|fid| &module.functions[*fid])
-        .find(|function| function.name == "sum__Number")
+        .find(|function| function.name == "sum__6:Number")
         .unwrap();
     assert!(sum.blocks.iter().any(|(_, block)| {
         block.insts.iter().any(|instruction| matches!(
             &instruction.kind,
-            mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name.starts_with("add__Number")
+            mir::instr::InstKind::Call(mir::FuncRef::Local(name), _) if name.starts_with("add__6:Number")
         ))
     }), "{sum:#?}");
     assert!(
@@ -1885,7 +1885,7 @@ fn heterogeneous_generic_operator_selects_rhs_impl() {
         .function_order
         .iter()
         .map(|fid| &module.functions[*fid])
-        .find(|function| function.name == "sum__Number_Delta")
+        .find(|function| function.name == "sum__6:Number_5:Delta")
         .unwrap();
     assert!(
         sum.blocks.iter().any(|(_, block)| {
@@ -1893,7 +1893,7 @@ fn heterogeneous_generic_operator_selects_rhs_impl() {
                 matches!(
                     &instruction.kind,
                     mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
-                        if name == "add__Number_Delta"
+                        if name == "add__6:Number_5:Delta"
                 )
             })
         }),
@@ -1944,7 +1944,7 @@ fn heterogeneous_operator_selects_rhs_impl_for_primitive_lhs() {
                 matches!(
                     &instruction.kind,
                     mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
-                        if name == "add__i32_Delta"
+                        if name == "add__i32_5:Delta"
                 )
             })
         }),
@@ -1993,7 +1993,7 @@ fn heterogeneous_comparison_selects_rhs_impl_for_primitive_lhs() {
                 matches!(
                     &instruction.kind,
                     mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
-                        if name == "eq__i32_Delta"
+                        if name == "eq__i32_5:Delta"
                 )
             })
         }),
@@ -2043,7 +2043,7 @@ fn heterogeneous_compound_assignment_selects_rhs_impl_for_primitive_lhs() {
                 matches!(
                     &instruction.kind,
                     mir::instr::InstKind::Call(mir::FuncRef::Local(name), _)
-                        if name == "add_assign__i32_Delta"
+                        if name == "add_assign__i32_5:Delta"
                 )
             })
         }),
@@ -3781,7 +3781,7 @@ fn closure_field_capture_clears_only_that_fields_drop_slot() {
                 matches!(
                     &inst.kind,
                     mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                        if name == "drop__First"
+                        if name == "drop__5:First"
                 )
             }))
     );
@@ -3798,7 +3798,7 @@ fn closure_field_capture_clears_only_that_fields_drop_slot() {
                 matches!(
                     &inst.kind,
                     mir::instr::InstKind::Call(mir::value::FuncRef::Local(name), _)
-                        if name == "drop__Second"
+                        if name == "drop__6:Second"
                 )
             }))
     );
@@ -4542,5 +4542,71 @@ fn let_else_with_an_irrefutable_pattern_binds_unconditionally() {
             .count()
             >= 2,
         "both tuple elements should be extracted into bindings: {main:#?}"
+    );
+}
+
+#[test]
+fn known_lambda_callback_does_not_retain_unreferenced_arguments() {
+    // Calling a lambda literal through a binding must not blanket-promote
+    // every reference argument: the lambda `[p -> &p.value]` references only
+    // its parameter, so the unrelated `other` local stays on the stack.
+    let module = lower(
+        r"
+        struct Data { value: i32 }
+
+        fun pick(data: &Data) -> &i32 {
+            let selector = [p -> &p.value];
+            selector(data)
+        }
+
+        fun unrelated_heap_use_is_not_forced() -> i32 {
+            let data = Data { value: 1 };
+            let other = Data { value: 2 };
+            let selector = [p -> p.value];
+            let picked = selector(&data);
+            picked + other.value
+        }
+        ",
+    );
+    for function in module.functions.values() {
+        if function.name.contains("unrelated") {
+            assert!(
+                !function
+                    .blocks
+                    .values()
+                    .flat_map(|block| &block.insts)
+                    .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_))),
+                "a callback that never references its argument must not force heap promotion: {function:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lambda_returning_argument_reference_promotes_it() {
+    // `[p -> &p.value]` does reference its parameter, so the argument's
+    // storage must still be heap-promoted.
+    let module = lower(
+        r"
+        struct Data { value: i32 }
+
+        fun pick() -> &i32 {
+            let local = Data { value: 1 };
+            let selector = [p -> &p.value];
+            selector(&local)
+        }
+        ",
+    );
+    let func = module
+        .functions
+        .values()
+        .find(|function| function.name == "pick")
+        .expect("pick function should exist");
+    assert!(
+        func.blocks
+            .values()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, mir::instr::InstKind::HeapAlloc(_))),
+        "a callback that returns a reference to its argument must promote it: {func:#?}"
     );
 }

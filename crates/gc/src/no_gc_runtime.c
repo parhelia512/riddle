@@ -159,36 +159,48 @@ size_t riddle_fs_read_dir(
     size_t count = 0;
     size_t seen = 0;
 #if defined(_WIN32)
-    WIN32_FIND_DATAA entry;
-    char pattern[4096];
-    size_t path_len = strlen(path);
-    if (path_len + 3 >= sizeof(pattern)) {
-        return 0;
+    /* Use the wide API: FindFirstFileA returns names in the legacy ANSI
+     * code page, so non-ASCII file names would be mangled or rejected by
+     * the UTF-8 conversion in std. */
+    WIN32_FIND_DATAW entry;
+    wchar_t pattern_w[4096];
+    {
+        size_t path_len = strlen(path);
+        int wide_len = MultiByteToWideChar(CP_UTF8, 0, path, (int)path_len, NULL, 0);
+        if (wide_len <= 0 || (size_t)wide_len + 2 >= sizeof(pattern_w) / sizeof(pattern_w[0])) {
+            return 0;
+        }
+        MultiByteToWideChar(CP_UTF8, 0, path, (int)path_len, pattern_w, wide_len);
+        pattern_w[wide_len] = L'\\';
+        pattern_w[wide_len + 1] = L'*';
+        pattern_w[wide_len + 2] = L'\0';
     }
-    memcpy(pattern, path, path_len);
-    pattern[path_len] = '\\'; /* backslash */
-    pattern[path_len + 1] = '*';
-    pattern[path_len + 2] = '\0';
-    HANDLE handle = FindFirstFileA(pattern, &entry);
+    HANDLE handle = FindFirstFileW(pattern_w, &entry);
     if (handle == INVALID_HANDLE_VALUE) {
         return 0;
     }
     do {
-        const char *name = entry.cFileName;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        const wchar_t *name = entry.cFileName;
+        if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0) {
             continue;
         }
         seen += 1;
         if (count >= capacity) {
             continue;
         }
-        size_t len = strlen(name);
-        uint8_t *buffer = (uint8_t *)riddle_alloc(len + 1);
-        memcpy(buffer, name, len + 1);
+        int utf8_len = WideCharToMultiByte(CP_UTF8, 0, name, -1, NULL, 0, NULL, NULL);
+        if (utf8_len <= 0) {
+            continue;
+        }
+        uint8_t *buffer = (uint8_t *)riddle_alloc((size_t)utf8_len);
+        if (WideCharToMultiByte(CP_UTF8, 0, name, -1, (char *)buffer, utf8_len, NULL, NULL) == 0) {
+            riddle_free(buffer);
+            continue;
+        }
         names_out[count] = buffer;
-        lens_out[count] = len;
+        lens_out[count] = (size_t)utf8_len - 1; /* exclude the NUL */
         count += 1;
-    } while (FindNextFileA(handle, &entry));
+    } while (FindNextFileW(handle, &entry));
     FindClose(handle);
 #else
 #include <dirent.h>
@@ -216,4 +228,56 @@ size_t riddle_fs_read_dir(
     closedir(dir);
 #endif
     return seen > count ? seen : count;
+}
+
+/* ---- std::process / std::io / std::fs additions ---- */
+void riddle_process_exit(int32_t code) {
+    exit((int)code);
+}
+
+FILE *riddle_io_stderr(void) {
+    return stderr;
+}
+
+size_t riddle_io_stdin(void) {
+    return (size_t)(uintptr_t)stdin;
+}
+
+int riddle_fmt_fputc_stderr(int32_t value) {
+    return fputc((int)value, stderr);
+}
+
+int riddle_fs_remove(const char *path) {
+    return remove(path);
+}
+
+int riddle_fs_rename(const char *from, const char *to) {
+    return rename(from, to);
+}
+
+void riddle_mem_swap(uint8_t *a, uint8_t *b, size_t size) {
+    if (a == b || size == 0u) {
+        return;
+    }
+    while (size >= 8u) {
+        uint64_t temp8;
+        memcpy(&temp8, a, 8u);
+        memcpy(a, b, 8u);
+        memcpy(b, &temp8, 8u);
+        a += 8u;
+        b += 8u;
+        size -= 8u;
+    }
+    while (size > 0u) {
+        uint8_t temp = *a;
+        *a = *b;
+        *b = temp;
+        a += 1u;
+        b += 1u;
+        size -= 1u;
+    }
+}
+
+int32_t riddle_fs_fgetc(size_t stream) {
+    return (int32_t)fgetc((FILE *)(uintptr_t)stream);
 }

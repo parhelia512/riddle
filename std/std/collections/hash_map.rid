@@ -277,10 +277,26 @@ impl<K, V> HashMap<K, V> {
         }
     }
 
+    /// Iterates the keys in insertion order (probe-table order is an
+    /// implementation detail and must not be relied upon).
+    pub fun keys(&self) -> HashMapKeys<K, V> {
+        HashMapKeys {
+            inner: self.iter(),
+        }
+    }
+
+    /// Iterates the values in the same order as [`HashMap::keys`].
+    pub fun values(&self) -> HashMapValues<K, V> {
+        HashMapValues {
+            inner: self.iter(),
+        }
+    }
+
     pub fun contains_key(&self, key: &K) -> bool
     where K: Hash + Eq {
         self.find_entry(key).is_some()
     }
+
 
     /// Returns the stored value for `key`, inserting `default` first when the
     /// key is absent. The key is consumed because `insert` stores it by value.
@@ -297,6 +313,20 @@ impl<K, V> HashMap<K, V> {
         match self.values.get_mut(last) {
             Option::Some(value) => value,
             Option::None => { crate::std::panic::panic("get_or_insert: entry missing after insert") },
+        }
+    }
+
+    /// Gets the given key's corresponding entry for in-place manipulation,
+    /// mirroring Rust's `HashMap::entry`: `map.entry(key).or_insert(0)`
+    /// inserts only when the key is absent and returns the slot either way.
+    pub fun entry(&mut self, key: K) -> Entry<K, V>
+    where K: Hash + Eq {
+        match self.find_entry(&key) {
+            Option::Some(entry_index) => match self.values.get_mut(entry_index) {
+                Option::Some(value) => Entry::Occupied { value },
+                Option::None => { crate::std::panic::panic("entry: index out of sync") },
+            },
+            Option::None => Entry::Vacant { key, map: self },
         }
     }
 
@@ -412,5 +442,84 @@ impl<K, V> crate::std::iter::IntoIterator for &HashMap<K, V> {
 
     fun into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+pub struct HashMapKeys<K, V> {
+    inner: HashMapIter<K, V>,
+}
+
+impl<K, V> crate::std::iter::Iterator for HashMapKeys<K, V> {
+    type Item = &K;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Option::Some((key, _)) => Option::Some(key),
+            Option::None => Option::None,
+        }
+    }
+}
+
+pub struct HashMapValues<K, V> {
+    inner: HashMapIter<K, V>,
+}
+
+impl<K, V> crate::std::iter::Iterator for HashMapValues<K, V> {
+    type Item = &V;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Option::Some((_, value)) => Option::Some(value),
+            Option::None => Option::None,
+        }
+    }
+}
+
+/// A view into a single map slot, mirroring Rust's `hash_map::Entry`.
+/// Constructed through [`HashMap::entry`]; the `or_insert*` methods insert
+/// on the vacant variant only and return the slot either way.
+pub enum Entry<K, V> {
+    Occupied { value: &mut V },
+    Vacant { key: K, map: &mut HashMap<K, V> },
+}
+
+impl<K, V> Entry<K, V>
+where K: Hash + Eq {
+    /// Inserts `default` when the entry is vacant, then returns the slot.
+    pub fun or_insert(self, default: V) -> &mut V {
+        match self {
+            Entry::Occupied { value } => value,
+            Entry::Vacant { key, map: mut map } => {
+                map.insert(key, default);
+                let last = map.values.len() - 1usize;
+                match map.values.get_mut(last) {
+                    Option::Some(value) => value,
+                    Option::None => { crate::std::panic::panic("entry: missing slot after insert") },
+                }
+            },
+        }
+    }
+
+    /// Like [`Entry::or_insert`], but the default is produced by
+    /// `make_default` only when the entry is vacant.
+    pub fun or_insert_with(self, mut make_default: impl FnOnce() -> V) -> &mut V {
+        match self {
+            Entry::Occupied { value } => value,
+            Entry::Vacant { key, map: mut map } => {
+                map.insert(key, make_default());
+                let last = map.values.len() - 1usize;
+                match map.values.get_mut(last) {
+                    Option::Some(value) => value,
+                    Option::None => { crate::std::panic::panic("entry: missing slot after insert") },
+                }
+            },
+        }
+    }
+
+    /// Like [`Entry::or_insert`], using `Default::default()`.
+    pub fun or_default(self) -> &mut V
+    where V: crate::std::default::Default {
+        let produced: V = crate::std::default::Default::default();
+        self.or_insert(produced)
     }
 }

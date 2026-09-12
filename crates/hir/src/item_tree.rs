@@ -71,7 +71,8 @@ pub struct HirAttr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InternalAttrTarget {
     Trait,
-    FundamentalType,
+    Struct,
+    Enum,
     Other,
 }
 

@@ -15,6 +15,9 @@ pub struct Module {
 
     /// Externally-linked function signatures.
     pub externs: Vec<ExternFunc>,
+
+    /// Errors discovered while lowering type-checked HIR.
+    pub diagnostics: Vec<type_checker::Diagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,7 @@ impl Module {
             functions: Arena::new(),
             function_order: Vec::new(),
             externs: Vec::new(),
+            diagnostics: Vec::new(),
         }
     }
 

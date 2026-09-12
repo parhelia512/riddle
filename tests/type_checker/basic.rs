@@ -470,6 +470,7 @@ fn try_expression_expected_success_type_infers_its_operand() {
             safe fun fail() -> !;
         }
 
+        #[lang = "result"]
         enum Result<T, E> {
             Ok(T),
             Err(E),
@@ -595,10 +596,12 @@ fn method_generic_can_shadow_impl_generic() {
 
     assert_eq!(result.diagnostics, vec![]);
     assert!(
-        result
-            .generic_calls
-            .values()
-            .any(|call| { call.args == [Type::Unknown, Type::Ref(Box::new(Type::Str), false)] }),
+        result.generic_calls.values().any(|call| {
+            matches!(
+                call.args.as_slice(),
+                [Type::InferVar(_), Type::Ref(inner, false)] if matches!(**inner, Type::Str)
+            )
+        }),
         "{:#?}",
         result.generic_calls
     );
@@ -1896,5 +1899,45 @@ fn for_loop_shape_mismatch_reports_only_the_shape_error() {
             .all(|diagnostic| diagnostic.code != "E0057"),
         "{:#?}",
         result.diagnostics
+    );
+}
+
+#[test]
+fn impl_generics_infer_from_method_arguments_on_bare_receiver() {
+    let result = check(
+        r"
+        struct Table<K, V> {
+            first: K,
+            second: V,
+        }
+
+        enum Entry<K, V> {
+            Occupied { index: i32 },
+            Vacant { key: K },
+        }
+
+        impl<K, V> Entry<K, V> {
+            pub fun or_insert(self, table: &mut Table<K, V>, default: V) -> V {
+                match self {
+                    Entry::Occupied { index } => default,
+                    Entry::Vacant { key } => default,
+                }
+            }
+        }
+
+        fun main() -> i32 {
+            let mut b: Table<i32, bool> = Table { first: 2, second: false };
+            let out = Entry::Occupied { index: 3 }.or_insert(&mut b, true);
+            if out { 1 } else { 0 }
+        }
+        ",
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.clone()))
+            .collect::<Vec<_>>(),
+        vec![]
     );
 }

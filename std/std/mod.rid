@@ -1,4 +1,6 @@
 pub mod array;
+pub mod char;
+pub use crate::std::char as chars;
 pub mod clone;
 pub mod cmp;
 pub mod collections;
@@ -19,6 +21,8 @@ pub mod option;
 pub mod panic;
 pub mod parse;
 pub mod prelude;
+pub mod process;
+
 pub mod random;
 pub mod result;
 pub mod slice;

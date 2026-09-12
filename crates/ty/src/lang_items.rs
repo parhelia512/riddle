@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hir::item_tree::TraitId;
+use hir::item_tree::{EnumId, TraitId};
 
 /// Every recognized `#[lang = "..."]` name.
 ///
@@ -59,6 +59,13 @@ pub enum LangItem {
     // Indexing
     Index,
     IndexMut,
+
+    // Formatting
+    Debug,
+
+    // Error handling / optionality (`?` operator, for-loop desugaring)
+    Option,
+    Result,
 }
 
 impl LangItem {
@@ -97,6 +104,9 @@ impl LangItem {
             "shr_assign" => Self::ShrAssign,
             "index" => Self::Index,
             "index_mut" => Self::IndexMut,
+            "debug" => Self::Debug,
+            "option" => Self::Option,
+            "result" => Self::Result,
             _ => return None,
         })
     }
@@ -136,6 +146,9 @@ impl LangItem {
             Self::ShrAssign => "shr_assign",
             Self::Index => "index",
             Self::IndexMut => "index_mut",
+            Self::Debug => "debug",
+            Self::Option => "option",
+            Self::Result => "result",
         }
     }
 
@@ -145,6 +158,22 @@ impl LangItem {
         Some(match self {
             Self::Copy | Self::Eq | Self::Ord => CompositeKind::Same,
             Self::PartialEq | Self::PartialOrd => CompositeKind::Binary,
+            _ => return None,
+        })
+    }
+
+    /// Whether this lang item is carried by an enum (as opposed to a trait).
+    #[must_use]
+    pub const fn is_enum(self) -> bool {
+        matches!(self, Self::Option | Self::Result)
+    }
+
+    /// Required generic arity for enum lang items.
+    #[must_use]
+    pub const fn enum_generic_count(self) -> Option<usize> {
+        Some(match self {
+            Self::Option => 1,
+            Self::Result => 2,
             _ => return None,
         })
     }
@@ -168,6 +197,8 @@ pub struct LangItemRegistry {
     items: HashMap<LangItem, TraitId>,
     /// Reverse map: `TraitId` → `LangItem`, populated in lock-step.
     by_trait: HashMap<TraitId, LangItem>,
+    /// Enum lang items (`option`, `result`) keyed to their `EnumId`.
+    enums: HashMap<LangItem, EnumId>,
 }
 
 /// Result of a registry insertion.
@@ -200,6 +231,20 @@ impl LangItemRegistry {
         self.by_trait.get(&id).copied()
     }
 
+    /// Looks up the `EnumId` for an enum lang item (`option`, `result`).
+    #[must_use]
+    pub fn get_enum(&self, item: LangItem) -> Option<EnumId> {
+        self.enums.get(&item).copied()
+    }
+
+    /// True when `id` is the enum registered for this lang item.
+    #[must_use]
+    pub fn is_enum(&self, item: LangItem, id: EnumId) -> bool {
+        self.enums
+            .get(&item)
+            .is_some_and(|registered| *registered == id)
+    }
+
     /// Registers a lang item.
     ///
     /// Returns `DuplicateItem` when the same `LangItem` was already registered
@@ -215,6 +260,15 @@ impl LangItemRegistry {
         }
         self.items.insert(item, id);
         self.by_trait.insert(id, item);
+        RegisterResult::Ok
+    }
+
+    /// Registers an enum lang item. First definition wins.
+    pub fn register_enum(&mut self, item: LangItem, id: EnumId) -> RegisterResult {
+        if self.enums.contains_key(&item) {
+            return RegisterResult::DuplicateItem;
+        }
+        self.enums.insert(item, id);
         RegisterResult::Ok
     }
 }

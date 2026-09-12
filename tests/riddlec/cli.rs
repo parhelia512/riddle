@@ -128,6 +128,54 @@ fn c_backend_combines_multiple_inputs_into_one_program() {
 }
 
 #[test]
+fn c_backend_reports_macro_expansion_errors_instead_of_dropping_calls() {
+    let root = temp_root("macro-error-backend");
+    fs::create_dir_all(&root).unwrap();
+    // The format string has two placeholders but only one argument, so
+    // `println!` fails to expand. The C-backend path previously discarded the
+    // expansion diagnostic, lowered the unexpanded call (and every macro
+    // after it) to nothing, and emitted a program that silently skipped the
+    // remaining statements of the block.
+    let input = root.join("main.rid");
+    fs::write(
+        &input,
+        concat!(
+            "fun main() -> i32 {\n",
+            "    let s = 3;\n",
+            "    let t = 4;\n",
+            "    println!(\"s={} t={}\", [s, t]);\n",
+            "    0\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let generated = root.join("out.c");
+
+    let output = run(&[
+        Path::new("--backend"),
+        Path::new("c"),
+        Path::new("--output"),
+        &generated,
+        &input,
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "macro expansion errors must fail the C-backend build"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("E0400"),
+        "the expansion diagnostic is reported, got: {stderr}"
+    );
+    assert!(
+        !generated.exists(),
+        "no C file is emitted for a failed expansion"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn diagnostics_keep_rust_style_hierarchy() {
     let root = temp_root("diagnostics");
     fs::create_dir_all(&root).unwrap();

@@ -130,12 +130,9 @@ impl TypeChecker<'_> {
                 self.trait_ref_args(trait_id, trait_ty, &self_ty, &params, imp.trait_ty_range);
             self.result.diagnostics.truncate(diagnostics_start);
 
-            if !coherence_type_is_valid(&self_ty)
-                || trait_args.iter().any(|ty| !coherence_type_is_valid(ty))
-            {
-                continue;
+            if coherence_type_is_valid(&self_ty) && trait_args.iter().all(coherence_type_is_valid) {
+                self.check_impl_orphan_rule(imp, trait_id, &self_ty, &trait_args, &param_prefix);
             }
-            self.check_impl_orphan_rule(imp, trait_id, &self_ty, &trait_args, &param_prefix);
             headers.push(CoherenceHeader {
                 trait_id,
                 self_ty,
@@ -206,7 +203,7 @@ impl TypeChecker<'_> {
 
         if let Some(param) = types
             .take(first_local)
-            .find_map(|ty| uncovered_orphan_param(ty, param_prefix))
+            .find_map(|ty| uncovered_orphan_param(self.hir, ty, param_prefix))
         {
             self.diagnostic(
                 "E0048",
@@ -800,6 +797,20 @@ impl TypeChecker<'_> {
         );
         let trait_name = tr.name.0.as_str();
 
+        // The method's own generics are universally quantified at each call:
+        // resolve them symbolically on both sides. Impl declarations may
+        // rename them, so map the impl's names onto the trait's positionally.
+        for name in &expected.generics {
+            params.insert(name.0.clone(), Type::Param(name.0.clone()));
+        }
+        for (index, generic) in actual.generics.iter().enumerate() {
+            let mapped = expected
+                .generics
+                .get(index)
+                .map_or_else(|| generic.0.clone(), |expected| expected.0.clone());
+            params.insert(generic.0.clone(), Type::Param(mapped));
+        }
+
         if expected.is_unsafe != actual.is_unsafe {
             self.diagnostic(
                 "E0028",
@@ -823,6 +834,19 @@ impl TypeChecker<'_> {
                     trait_name,
                     expected.params.len(),
                     actual.params.len()
+                ),
+                Some(actual.name_range),
+            );
+        }
+        if expected.generics.len() != actual.generics.len() {
+            self.diagnostic(
+                "E0028",
+                format!(
+                    "impl method `{}` for trait `{}` generic parameter count mismatch: expected {}, got {}",
+                    expected.name.0,
+                    trait_name,
+                    expected.generics.len(),
+                    actual.generics.len()
                 ),
                 Some(actual.name_range),
             );
@@ -962,41 +986,55 @@ fn is_fundamental(attrs: &[HirAttr]) -> bool {
 ///
 /// Called only on types that appear *before* the first local type, so nothing
 /// nested here can be covered by a local constructor — any parameter reachable
-/// through any constructor is uncovered.
-///
-// ponytail: does not treat `#[fundamental]` foreign types as covering their
-// params, so an exotic impl like `impl<T> Foreign<Box<T>, Local> for Foreign2`
-// is rejected though Rust accepts it. Thread `hir` through here to lift that.
-fn uncovered_orphan_param(ty: &Type, prefix: &str) -> Option<String> {
+/// through any constructor is uncovered. `#[fundamental]` foreign types cover
+/// their parameters (mirroring `Box<T>` in Rust).
+fn uncovered_orphan_param(hir: &hir::HirFile, ty: &Type, prefix: &str) -> Option<String> {
     match ty {
         Type::Param(name) | Type::Const(ConstArg::Param(name)) => {
             name.strip_prefix(prefix).map(str::to_string)
         }
         Type::Ref(inner, _) | Type::Ptr { inner, .. } | Type::Slice(inner) => {
-            uncovered_orphan_param(inner, prefix)
+            uncovered_orphan_param(hir, inner, prefix)
         }
-        Type::Array(inner, len) => uncovered_orphan_param(inner, prefix).or_else(|| {
+        Type::Array(inner, len) => uncovered_orphan_param(hir, inner, prefix).or_else(|| {
             let ConstArg::Param(name) = len else {
                 return None;
             };
             name.strip_prefix(prefix).map(str::to_string)
         }),
-        Type::Tuple(elements)
-        | Type::Struct(_, elements)
-        | Type::Enum(_, elements)
-        | Type::OpaqueTrait { args: elements, .. } => elements
+        Type::Struct(struct_id, elements) => {
+            let fundamental = is_fundamental(&hir.item_tree.structs[*struct_id].attrs);
+            (!fundamental)
+                .then(|| {
+                    elements
+                        .iter()
+                        .find_map(|ty| uncovered_orphan_param(hir, ty, prefix))
+                })
+                .flatten()
+        }
+        Type::Enum(enum_id, elements) => {
+            let fundamental = is_fundamental(&hir.item_tree.enums[*enum_id].attrs);
+            (!fundamental)
+                .then(|| {
+                    elements
+                        .iter()
+                        .find_map(|ty| uncovered_orphan_param(hir, ty, prefix))
+                })
+                .flatten()
+        }
+        Type::Tuple(elements) | Type::OpaqueTrait { args: elements, .. } => elements
             .iter()
-            .find_map(|ty| uncovered_orphan_param(ty, prefix)),
+            .find_map(|ty| uncovered_orphan_param(hir, ty, prefix)),
         Type::FunctionItem { args, .. } => args
             .iter()
-            .find_map(|ty| uncovered_orphan_param(ty, prefix)),
+            .find_map(|ty| uncovered_orphan_param(hir, ty, prefix)),
         Type::CallableConstraint(signature)
         | Type::Closure { signature, .. }
         | Type::OpaqueCallable { signature, .. } => signature
             .params
             .iter()
             .chain(std::iter::once(signature.ret.as_ref()))
-            .find_map(|ty| uncovered_orphan_param(ty, prefix)),
+            .find_map(|ty| uncovered_orphan_param(hir, ty, prefix)),
         _ => None,
     }
 }
@@ -1029,6 +1067,14 @@ const fn coherence_const_is_valid(value: &ConstArg) -> bool {
 }
 
 fn coherence_headers_overlap(lhs: &CoherenceHeader, rhs: &CoherenceHeader) -> bool {
+    if [&lhs.self_ty, &rhs.self_ty]
+        .into_iter()
+        .chain(&lhs.trait_args)
+        .chain(&rhs.trait_args)
+        .any(|ty| !coherence_type_is_valid(ty))
+    {
+        return true;
+    }
     let mut type_subst = HashMap::new();
     let mut const_subst = HashMap::new();
     unify_coherence_type(
