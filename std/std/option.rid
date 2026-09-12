@@ -27,6 +27,7 @@ impl<T> Option<T> {
         }
     }
 
+    /// Returns the contained value, or panics when this is `None`.
     pub fun unwrap(self) -> T {
         match self {
             Option::Some(value) => value,
@@ -34,6 +35,7 @@ impl<T> Option<T> {
         }
     }
 
+    /// Applies `function` to the contained value, keeping `None` as `None`.
     pub fun map<U>(self, function: impl FnOnce(T) -> U) -> Option<U> {
         match self {
             Option::Some(value) => Option::Some(function(value)),

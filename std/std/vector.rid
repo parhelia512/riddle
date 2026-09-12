@@ -86,6 +86,7 @@ impl<T> Vector<T> {
         self.len == 0usize
     }
 
+    /// Appends `value` to the end, growing the buffer if needed.
     pub fun push(&mut self, value: T) {
         if self.len == self.capacity {
             // Zero-sized elements use one-byte slots: the storage address of

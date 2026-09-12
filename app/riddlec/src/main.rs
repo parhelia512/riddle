@@ -12,6 +12,14 @@ enum BackendKind {
     C,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum EmitKind {
+    /// Generated C source (default with `--backend c`).
+    C,
+    /// Pretty-printed MIR of the whole program.
+    Mir,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "riddlec",
@@ -30,6 +38,10 @@ struct Opts {
     /// Generate code for the C backend (the only available backend).
     #[arg(short, long, value_enum)]
     backend: Option<BackendKind>,
+
+    /// What to emit: `c` (generated C) or `mir` (pretty-printed MIR).
+    #[arg(long, value_enum, conflicts_with = "backend")]
+    emit: Option<EmitKind>,
 
     /// Select the target platform triple.
     #[arg(long, value_name = "TRIPLE")]
@@ -187,9 +199,13 @@ fn compile_program(files: &[PathBuf], opts: &Opts, target: TargetTriple) -> usiz
     };
     let package_range = 0..loaded.source.len();
     let package_ranges = std::slice::from_ref(&package_range);
-    let result = match opts.backend {
-        Some(_) => pipeline::compile_package_with_options(&loaded.source, package_ranges, options),
-        None => pipeline::check_package_with_options(&loaded.source, package_ranges, options),
+    // Both C codegen and MIR emission need the lowered module; plain check
+    // stops before MIR.
+    let needs_mir = opts.backend.is_some() || opts.emit.is_some();
+    let result = if needs_mir {
+        pipeline::compile_package_with_options(&loaded.source, package_ranges, options)
+    } else {
+        pipeline::check_package_with_options(&loaded.source, package_ranges, options)
     };
 
     let entry_name = files.first().map_or_else(
@@ -205,32 +221,37 @@ fn compile_program(files: &[PathBuf], opts: &Opts, target: TargetTriple) -> usiz
     let mut errors = diagnostics::report_mapped(&result, &loaded, &entry_name);
     if result.success()
         && let Some(ref module) = result.mir_module
-        && opts.backend.is_some()
     {
-        // A program without `main` fails only at C link time with an opaque
-        // `WinMain` error; report it here instead.
-        if !module
-            .functions
-            .values()
-            .any(|function| function.name == "main")
-        {
-            eprintln!(
-                "error[E0401]: no `main` function found in the entry package
-  = help: define `fun main() -> i32 {{ ... }}` as the program entry"
-            );
-            errors += 1;
+        if opts.emit == Some(EmitKind::Mir) {
+            print!("{module}");
+            return errors;
         }
-        match pipeline::generate_c_for_package_with_source_map(
-            module,
-            0,
-            true,
-            &loaded.source_map,
-            &entry_name,
-        ) {
-            Ok(code) => errors += write_c(&code, opts.output.as_deref(), files),
-            Err(error) => {
-                eprintln!("riddlec: code generation error: {error:?}");
+        if opts.backend.is_some() {
+            // A program without `main` fails only at C link time with an opaque
+            // `WinMain` error; report it here instead.
+            if !module
+                .functions
+                .values()
+                .any(|function| function.name == "main")
+            {
+                eprintln!(
+                    "error[E0401]: no `main` function found in the entry package
+  = help: define `fun main() -> i32 {{ ... }}` as the program entry"
+                );
                 errors += 1;
+            }
+            match pipeline::generate_c_for_package_with_source_map(
+                module,
+                0,
+                true,
+                &loaded.source_map,
+                &entry_name,
+            ) {
+                Ok(code) => errors += write_c(&code, opts.output.as_deref(), files),
+                Err(error) => {
+                    eprintln!("riddlec: code generation error: {error:?}");
+                    errors += 1;
+                }
             }
         }
     }

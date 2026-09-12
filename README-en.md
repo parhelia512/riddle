@@ -5,8 +5,9 @@
 </div>
 
 This is the main source code repository for [Riddle][github]. It contains the
-compiler (`riddlec`), project tooling (`clue`), and a language server
-(`riddle-lsp`), together with the `riddle fmt` formatter.
+compiler (`riddlec`), the interpreter driver (`riddle run` / `riddle repl`),
+project tooling (`clue`), a language server (`riddle-lsp`), and the
+`riddle fmt` formatter.
 
 Riddle is an experimental programming language inspired by Rust and Go. As of
 `v0.2.3`, it provides type checking, a move checker, borrow and escape
@@ -33,9 +34,11 @@ may still change without compatibility guarantees.
 
 ## Tools
 
-- `riddlec`: checks Riddle source and generates C;
+- `riddlec`: checks Riddle source and generates C (`--emit mir` prints MIR);
+- `riddle run`: runs a single `.rid` file through the built-in MIR interpreter — no C toolchain needed;
+- `riddle repl`: an interactive session with accumulating definitions and immediate expression evaluation (`:help` lists commands);
 - `riddle fmt`: formats Riddle source or checks it with `--check`;
-- `clue`: manages Riddle packages, dependencies, workspaces, build targets, and installed artifacts;
+- `clue`: manages Riddle packages, dependencies, workspaces, build targets, and installed artifacts (`clue doc` generates HTML API docs; library builds populate the `$CLUE_HOME` global cache and sibling dependencies build in parallel under `-j`);
 - `riddle-lsp`: provides editor diagnostics, completion, formatting, and semantic highlighting.
 
 The [`editors`](./editors) directory contains `riddle-lsp` integrations for

@@ -1,0 +1,7 @@
+[package]
+name = "std"
+version = "0.2.3"
+description = "The Riddle standard library"
+
+[lib]
+path = "lib.rid"

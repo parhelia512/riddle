@@ -20,6 +20,7 @@ pub mod body_lower;
 pub mod item_tree;
 pub mod lower;
 pub mod place;
+pub mod render;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Name(pub String);

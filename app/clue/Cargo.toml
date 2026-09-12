@@ -6,6 +6,7 @@ publish = false
 autotests = false
 
 [dependencies]
+hir = { path = "../../crates/hir" }
 anyhow = "1.0"
 ast = { path = "../../crates/ast" }
 clap = { version = "=4.5.61", features = ["derive"] }

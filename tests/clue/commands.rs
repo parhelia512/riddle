@@ -5427,3 +5427,319 @@ fn check_all_targets_checks_automatic_test_targets() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("check failed"));
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn doc_generates_html_with_signatures_and_docs() {
+    let root = temp_root("doc");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"docdemo\"\nversion = \"0.1.0\"\ndescription = \"Doc demo\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.rid"),
+        r#"
+/// Adds two numbers together.
+///
+/// - first: a number
+/// - second: another number
+pub fun add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub mod math {
+    /// Doubles the value.
+    pub fun double(n: i32) -> i32 {
+        n * 2
+    }
+
+    fun triple(n: i32) -> i32 {
+        n * 3
+    }
+}
+
+pub struct Counter {
+    pub value: i32,
+    hidden: i32,
+}
+
+/// Bumps the count and returns the new value.
+impl Counter {
+    /// Increments the counter by one.
+    pub fun bump(&mut self) -> i32 {
+        self.value += 1;
+        self.value
+    }
+}
+
+fun main() -> i32 {
+    let mut counter = Counter { value: 0, hidden: 0 };
+    counter.bump();
+    0
+}
+"#,
+    )
+    .unwrap();
+
+    let output = clue(&["doc"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let index = fs::read_to_string(root.join(".clue/doc/index.html")).unwrap();
+    assert!(
+        index.contains("pub fun add(a: i32, b: i32) -&gt; i32"),
+        "signature missing: {index}"
+    );
+    assert!(index.contains("Adds two numbers together."), "docs missing");
+    assert!(
+        !index.contains("<h3>Examples</h3>"),
+        "no Examples heading here"
+    );
+    assert!(index.contains("<li>first: a number</li>"), "list rendering");
+    assert!(index.contains("pub struct Counter"), "struct missing");
+    assert!(
+        index.contains("pub fun bump(&amp;mut self) -&gt; i32"),
+        "impl methods missing"
+    );
+    assert!(index.contains("class=\"impl\""), "impl section class");
+    assert!(
+        index.contains("Bumps the count and returns the new value."),
+        "impl docs missing"
+    );
+    assert!(
+        index.contains("Increments the counter by one."),
+        "method docs missing"
+    );
+    assert!(!index.contains("triple"), "private sibling item leaked");
+
+    let math = fs::read_to_string(root.join(".clue/doc/math.html")).unwrap();
+    assert!(math.contains("pub fun double(n: i32) -&gt; i32"));
+    assert!(!math.contains("triple"), "private item leaked: {math}");
+
+    let output = clue(&["doc", "--document-private-items"], &root);
+    assert!(output.status.success());
+    let math = fs::read_to_string(root.join(".clue/doc/math.html")).unwrap();
+    assert!(
+        math.contains("fun triple(n: i32) -&gt; i32"),
+        "private item still hidden"
+    );
+
+    let metadata = clue(&["metadata"], &root);
+    assert!(String::from_utf8_lossy(&metadata.stdout).contains("\"description\": \"Doc demo\""));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn doc_fails_on_broken_project() {
+    let root = temp_root("doc-broken");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]\nname = \"broken\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.rid"),
+        "fun main() -> i32 { undefined_name() }",
+    )
+    .unwrap();
+
+    let output = clue(&["doc"], &root);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unresolved name"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn library_rebuild_restores_missing_dependency_artifacts() {
+    // A binary whose `.hash` says fresh but whose dependency `.rlib` was
+    // removed must rebuild instead of linking against nothing.
+    let root = temp_root("cache-fresh-deps");
+    write_workspace_fixture(&root);
+    let output = clue(&["build"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let rlib = root.join("math/.clue/build/math.rlib");
+    assert!(rlib.is_file());
+    fs::remove_file(&rlib).unwrap();
+
+    let output = clue(&["build"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(rlib.is_file(), "dependency rlib was not rebuilt");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn global_cache_serves_identical_dependency_copies_across_projects() {
+    // Two independent projects each vendor their own copy of the same
+    // library. The first build compiles the copy and publishes it to the
+    // global cache; the second project's copy has a different root (so its
+    // per-project build dir is empty) but an identical fingerprint, and
+    // must be served from the cache.
+    let compiler = c_compiler();
+    if compiler.is_none() {
+        eprintln!("skipping global cache test: no C compiler");
+        return;
+    }
+    let home = temp_root("cache-home");
+    fs::create_dir_all(&home).unwrap();
+
+    let write_project = |root: &Path| {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("vendor/libmath/src")).unwrap();
+        fs::write(
+            root.join("Clue.toml"),
+            "[package]
+name = \"app\"
+version = \"0.1.0\"
+
+[[bin]]
+path = \"src/main.rid\"
+
+[dependencies]
+libmath = { path = \"vendor/libmath\" }
+",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.rid"),
+            "fun main() -> i32 { libmath::value() }
+",
+        )
+        .unwrap();
+        fs::write(
+            root.join("vendor/libmath/Clue.toml"),
+            "[package]
+name = \"libmath\"
+version = \"1.0.0\"
+
+[lib]
+path = \"src/lib.rid\"
+",
+        )
+        .unwrap();
+        fs::write(
+            root.join("vendor/libmath/src/lib.rid"),
+            "pub fun value() -> i32 { 7 }
+",
+        )
+        .unwrap();
+    };
+
+    let first = temp_root("cache-first");
+    write_project(&first);
+    let output = clue_with_home(&["build"], &first, &home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("built library"),
+        "first build should compile: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let second = temp_root("cache-second");
+    write_project(&second);
+    let output = clue_with_home(&["build"], &second, &home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("cached library"),
+        "second project should hit the global cache: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(first);
+    let _ = fs::remove_dir_all(second);
+}
+
+#[test]
+fn parallel_dependency_builds_match_serial_output() {
+    let compiler = c_compiler();
+    if compiler.is_none() {
+        eprintln!("skipping parallel build test: no C compiler");
+        return;
+    }
+    // A project with three independent path dependencies.
+    let root = temp_root("cache-parallel");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Clue.toml"),
+        "[package]
+name = \"app\"
+version = \"0.1.0\"
+
+[[bin]]
+path = \"src/main.rid\"
+
+[dependencies]
+one = { path = \"one\" }
+two = { path = \"two\" }
+three = { path = \"three\" }
+",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.rid"),
+        "fun main() -> i32 { one::v() + two::v() + three::v() }
+",
+    )
+    .unwrap();
+    for (name, value) in [("one", 1), ("two", 2), ("three", 3)] {
+        fs::create_dir_all(root.join(format!("{name}/src"))).unwrap();
+        fs::write(
+            root.join(format!("{name}/Clue.toml")),
+            format!(
+                "[package]
+name = \"{name}\"
+version = \"0.1.0\"
+
+[lib]
+path = \"src/lib.rid\"
+"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join(format!("{name}/src/lib.rid")),
+            format!(
+                "pub fun v() -> i32 {{ {value} }}
+"
+            ),
+        )
+        .unwrap();
+    }
+
+    let output = clue(&["-j", "4", "build"], &root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for name in ["one", "two", "three"] {
+        assert!(
+            root.join(format!("{name}/.clue/build/{name}.rlib"))
+                .is_file()
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}

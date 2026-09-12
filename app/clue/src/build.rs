@@ -137,7 +137,10 @@ fn build_dependencies(
         !options.no_default_features,
     )
     .map_err(anyhow::Error::msg)?;
-    let mut artifacts = Vec::new();
+
+    // Select the dependencies this build actually needs, keeping manifest
+    // order so link arguments stay deterministic.
+    let mut wanted: Vec<(PathBuf, crate::project::LoadOptions)> = Vec::new();
     for dependency in &manifest.dependencies {
         if dependency.kind == DependencyKind::Development && !options.include_dev {
             continue;
@@ -160,20 +163,88 @@ fn build_dependencies(
         }
         features.sort();
         features.dedup();
-        artifacts.push(build_library_dependency(
-            &dependency_root,
-            triple,
-            target,
-            profile,
-            &crate::project::LoadOptions {
+        wanted.push((
+            dependency_root,
+            crate::project::LoadOptions {
                 features,
                 no_default_features: !dependency.default_features,
                 ..crate::project::LoadOptions::default()
             },
-            state,
-        )?);
+        ));
     }
-    Ok(artifacts)
+
+    if wanted.len() <= 1 {
+        return wanted
+            .iter()
+            .map(|(dependency_root, load_options)| {
+                build_library_dependency(
+                    dependency_root,
+                    triple,
+                    target,
+                    profile,
+                    load_options,
+                    state,
+                )
+            })
+            .collect();
+    }
+
+    // Sibling dependencies build in parallel across `jobs` workers. Each
+    // worker owns its recursion stack, so package cycles are still caught
+    // inside a worker; concurrent builds of the same package serialize on
+    // that package's `.build-lock` instead.
+    let jobs = crate::package::configured_jobs(root)
+        .unwrap_or_else(|_| {
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        })
+        .clamp(1, wanted.len());
+    let outcomes: std::sync::Mutex<Vec<Option<anyhow::Result<BuildArtifact>>>> =
+        std::sync::Mutex::new((0..wanted.len()).map(|_| None).collect());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            let next = &next;
+            let outcomes = &outcomes;
+            let wanted = &wanted;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((dependency_root, load_options)) = wanted.get(index) else {
+                        break;
+                    };
+                    let mut worker_state = BuildState::default();
+                    let outcome = build_library_dependency(
+                        dependency_root,
+                        triple,
+                        target,
+                        profile,
+                        load_options,
+                        &mut worker_state,
+                    );
+                    outcomes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(outcome);
+                }
+            });
+        }
+    });
+    // Slots are indexed by manifest position, so the collected artifacts —
+    // and the link arguments built from them — stay deterministic no matter
+    // which worker finishes first.
+    let slots = outcomes
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut collected = Vec::with_capacity(wanted.len());
+    for slot in slots {
+        match slot {
+            Some(Ok(artifact)) => collected.push(artifact),
+            Some(Err(error)) => bail!("dependency build failed: {error:#}"),
+            None => bail!("dependency build did not produce every artifact"),
+        }
+    }
+    Ok(collected)
 }
 
 fn build_library_dependency(
@@ -327,16 +398,43 @@ fn build_analysis(
             if triple.is_windows() { "obj" } else { "o" }
         ));
         let archive = build_dir.join(format!("{target_name}.rlib"));
+        let dependencies_present = || {
+            dependencies.iter().all(|dependency| match dependency {
+                BuildArtifact::Library { links, .. } => links
+                    .iter()
+                    .all(|link| link.archive.is_file() && link.object.is_file()),
+                BuildArtifact::Executable { .. } => true,
+            })
+        };
         if source_is_fresh
             && object.is_file()
             && archive.is_file()
             && library_outputs_exist(&analysis.library_types, &build_dir, target_name, triple)
+            && dependencies_present()
         {
             println!("clue: fresh library `{target_name}`");
             return Ok(BuildArtifact::Library {
                 links: library_links(&archive, &object, dependencies),
             });
         }
+
+        // Global build cache: restore a previously built copy of this
+        // library when its fingerprint matches, or publish the fresh build
+        // so other projects can reuse it.
+        let cache_entry = build_cache_entry(root, triple, profile).map(|dir| dir.join(&hash));
+        let restored = cache_entry.as_ref().is_some_and(|entry| {
+            restore_cached_library(entry, &build_dir, target_name)
+                && library_outputs_exist(&analysis.library_types, &build_dir, target_name, triple)
+                && dependencies_present()
+        });
+        if restored {
+            atomic_write(&hash_path, hash.as_bytes())?;
+            println!("clue: cached library `{target_name}`");
+            return Ok(BuildArtifact::Library {
+                links: library_links(&archive, &object, dependencies),
+            });
+        }
+
         build_library_artifacts(
             analysis,
             &compiler,
@@ -352,6 +450,9 @@ fn build_analysis(
             dependencies,
         )?;
         atomic_write(&hash_path, hash.as_bytes())?;
+        if let Some(entry) = &cache_entry {
+            publish_cached_library(entry, &build_dir, target_name);
+        }
         println!("clue: built library `{target_name}`");
         return Ok(BuildArtifact::Library {
             links: library_links(&archive, &object, dependencies),
@@ -359,7 +460,15 @@ fn build_analysis(
     }
 
     let executable = executable_path(&c_path, triple);
-    if source_is_fresh && executable.is_file() {
+    if source_is_fresh
+        && executable.is_file()
+        && dependencies.iter().all(|dependency| match dependency {
+            BuildArtifact::Library { links, .. } => links
+                .iter()
+                .all(|link| link.archive.is_file() && link.object.is_file()),
+            BuildArtifact::Executable { .. } => true,
+        })
+    {
         println!("clue: fresh {}", executable.display());
         return Ok(BuildArtifact::Executable {
             path: executable,
@@ -1286,6 +1395,82 @@ fn program_name(program: &OsStr) -> String {
         .unwrap_or_default()
         .to_ascii_lowercase();
     name.strip_suffix(".exe").unwrap_or(&name).to_owned()
+}
+
+/// Directory of the global build cache for one target/profile, or `None`
+/// when the cache is disabled via `[build] cache = false` in `Clue.toml`
+/// or `CLUE_BUILD_CACHE=0`.
+fn build_cache_entry(root: &Path, triple: TargetTriple, profile: BuildProfile) -> Option<PathBuf> {
+    if env::var("CLUE_BUILD_CACHE").is_ok_and(|value| value == "0") {
+        return None;
+    }
+    let manifest = crate::manifest::read(root, ProjectKind::Binary).ok()?;
+    if manifest.build_cache == Some(false) {
+        return None;
+    }
+    let profile_name = match profile {
+        BuildProfile::Debug => "debug",
+        BuildProfile::Release => "release",
+    };
+    crate::package::clue_home().ok().map(|home| {
+        home.join("cache")
+            .join("build")
+            .join(triple.as_str())
+            .join(profile_name)
+    })
+}
+
+/// Copies every `{name}.*` build artifact (excluding fingerprints) from a
+/// cache entry into the project's build directory.
+fn restore_cached_library(entry: &Path, build_dir: &Path, name: &str) -> bool {
+    let Ok(entries) = fs::read_dir(entry) else {
+        return false;
+    };
+    let mut restored = false;
+    for file in entries.flatten() {
+        let owned_name = file.file_name().to_string_lossy().into_owned();
+        let file_name = owned_name.as_str();
+        if !file_name.starts_with(&format!("{name}.")) || file_name.ends_with(".hash") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(file.path()) else {
+            return false;
+        };
+        if atomic_write(&build_dir.join(file_name), &bytes).is_err() {
+            return false;
+        }
+        restored = true;
+    }
+    restored
+}
+
+/// Publishes a freshly built library's artifacts into the global cache.
+/// Cache failures are non-fatal: the build itself already succeeded.
+fn publish_cached_library(entry: &Path, build_dir: &Path, name: &str) {
+    let Ok(entries) = fs::read_dir(build_dir) else {
+        return;
+    };
+    let Ok(_) = fs::create_dir_all(entry) else {
+        return;
+    };
+    for file in entries.flatten() {
+        let owned_name = file.file_name().to_string_lossy().into_owned();
+        let file_name = owned_name.as_str();
+        if !file_name.starts_with(&format!("{name}."))
+            || file_name.ends_with(".hash")
+            || file_name.starts_with(".tmp-")
+        {
+            continue;
+        }
+        let Ok(bytes) = fs::read(file.path()) else {
+            continue;
+        };
+        let target = entry.join(file_name);
+        let temp = entry.join(format!(".{file_name}.tmp-{}", std::process::id()));
+        if fs::write(&temp, &bytes).is_ok() {
+            let _ = crate::lock::replace_file(&temp, &target);
+        }
+    }
 }
 
 #[cfg(test)]

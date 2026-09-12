@@ -9,6 +9,7 @@ members = [
     "crates/frontend",
     "crates/gc",
     "crates/hir",
+    "crates/interpreter",
     "crates/mir",
     "crates/move-checker",
     "crates/scope-graph",
@@ -26,6 +27,7 @@ default-members = [
     "crates/frontend",
     "crates/gc",
     "crates/hir",
+    "crates/interpreter",
     "crates/mir",
     "crates/move-checker",
     "crates/scope-graph",
@@ -46,13 +48,20 @@ publish = false
 autotests = false
 default-run = "riddle"
 
+[lib]
+name = "riddle"
+path = "app/riddle/src/lib.rs"
+
 [dependencies]
 clap = { version = "=4.5.61", features = ["derive", "string"] }
 clue = { path = "app/clue" }
 ctrlc = "3.4"
+interpreter = { path = "crates/interpreter" }
 mir = { path = "crates/mir" }
 riddlec = { path = "app/riddlec" }
 riddle-lsp = { path = "app/riddle-lsp" }
+rustyline = "17"
+type-checker = { path = "crates/type-checker" }
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sync", "time"] }
 
 [features]

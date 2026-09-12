@@ -18,8 +18,17 @@
     "comments": {
       "patterns": [
         {
+          "name": "comment.line.documentation.riddle",
+          "match": "//[!/<].*$"
+        },
+        {
           "name": "comment.line.double-slash.riddle",
           "match": "//.*$"
+        },
+        {
+          "name": "comment.block.riddle",
+          "begin": "/\\*",
+          "end": "\\*/"
         }
       ]
     },
@@ -100,7 +109,7 @@
         },
         {
           "name": "keyword.other.riddle",
-          "match": "\\b(?:as|const|crate|extern|impl|move|mut|pub|safe|self|super|unsafe|use|where)\\b"
+          "match": "\\b(?:as|const|crate|dyn|extern|impl|move|mut|pub|safe|self|super|unsafe|use|where)\\b"
         },
         {
           "name": "constant.language.boolean.riddle",
@@ -112,7 +121,7 @@
       "patterns": [
         {
           "name": "support.type.primitive.riddle",
-          "match": "\\b(?:i8|i16|i32|i64|isize|u8|u16|u32|u64|usize|f32|f64|bool|str|char)\\b"
+          "match": "\\b(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|f16|f32|f64|f128|bool|str|char)\\b"
         },
         {
           "name": "entity.name.type.riddle",
@@ -124,12 +133,16 @@
       "patterns": [
         {
           "name": "constant.numeric.riddle",
-          "match": "\\b(?:[0-9]+\\.[0-9]*(?:[eE][+-]?[0-9]+)?(?:f32|f64)?|[0-9]+[eE][+-]?[0-9]+(?:f32|f64)?|[0-9]+(?:i8|i16|i32|i64|isize|u8|u16|u32|u64|usize)?)(?![A-Za-z0-9_])"
+          "match": "\\b(?:0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9]+)?(?:f16|f32|f64|f128)?|[0-9][0-9_]*[eE][+-]?[0-9]+(?:f16|f32|f64|f128)?|[0-9][0-9_]*(?:f16|f32|f64|f128))(?![A-Za-z0-9_])(?!\\.[0-9])|\\b[0-9][0-9_]*(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)?(?![A-Za-z0-9_])"
         }
       ]
     },
     "calls": {
       "patterns": [
+        {
+          "name": "entity.name.function.macro.riddle",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=!\\s*[(\\[{])"
+        },
         {
           "name": "entity.name.function.call.riddle",
           "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
@@ -140,7 +153,7 @@
       "patterns": [
         {
           "name": "keyword.operator.riddle",
-          "match": "(?:<<=|>>=|->|=>|==|!=|<=|>=|&&|\\|\\||\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|[+\\-*/%&|^!<>=])"
+          "match": "(?:<<=|>>=|->|=>|==|!=|<=|>=|&&|\\|\\||\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|\\.\\.\\.=|\\.\\.|::|\\?|[+\\-*/%&|^!<>=])"
         }
       ]
     }

@@ -197,6 +197,21 @@ enum Commands {
     Clean {
         path: Option<PathBuf>,
     },
+    /// Generate HTML API documentation.
+    Doc {
+        path: Option<PathBuf>,
+        #[arg(short = 'p', long)]
+        package: Option<String>,
+        #[arg(long)]
+        open: bool,
+        /// Document private items too.
+        #[arg(long = "document-private-items")]
+        document_private_items: bool,
+        /// Compile without the bundled standard library (for documenting
+        /// `std` itself).
+        #[arg(long = "no-std")]
+        no_std: bool,
+    },
     Test {
         path: Option<PathBuf>,
         #[arg(short = 'p', long)]
@@ -553,6 +568,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = path.as_deref().unwrap_or_else(|| std::path::Path::new("."));
             clean(path)?;
             println!("clue: cleaned {}", path.display());
+        }
+        Commands::Doc {
+            path,
+            package: _,
+            open,
+            document_private_items,
+            no_std,
+        } => {
+            let path = path.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+            clue::generate_doc(path, open, document_private_items, no_std)?;
         }
         Commands::Test {
             path,

@@ -1,4 +1,5 @@
 mod build;
+mod doc;
 mod lock;
 mod manifest;
 mod model;
@@ -1904,4 +1905,18 @@ where
         parallel_packages(&batch, jobs, &operation)?;
     }
     Ok(())
+}
+
+/// Generates HTML API documentation for the current package (`clue doc`).
+///
+/// # Errors
+///
+/// Returns an error when the project cannot be loaded or fails to check.
+pub fn generate_doc(
+    path: &Path,
+    open: bool,
+    document_private_items: bool,
+    no_std: bool,
+) -> anyhow::Result<()> {
+    doc::generate(path, document_private_items, open, no_std).map(|_| ())
 }

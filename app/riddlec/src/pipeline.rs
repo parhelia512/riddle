@@ -46,6 +46,12 @@ pub fn expanded_std_prelude() -> &'static str {
     std_prelude()
 }
 
+/// Placeholder path for the user region of [`CompileResult::source_files`];
+/// [`compile_for_interpretation`] renames it to the caller's file name.
+const USER_SOURCE_PATH: &str = "source";
+/// Path reported for panics inside the appended bundled-std region.
+const STD_SOURCE_PATH: &str = "std";
+
 #[derive(Default)]
 pub struct CompileResult {
     pub hir: Option<hir::HirFile>,
@@ -57,6 +63,10 @@ pub struct CompileResult {
     pub analysis: move_checker::AnalysisResult,
     pub mir_module: Option<Module>,
     pub parse_errors: Vec<ParseError>,
+    /// Panic-site origin map for interpreted runs: the user region
+    /// (rewritten through standard-macro expansion) plus the appended std
+    /// region. Empty unless a standalone compile produced a MIR module.
+    pub source_files: Vec<mir::SourceFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -1105,6 +1115,20 @@ pub fn compile(source: &str) -> CompileResult {
     compile_with_options(source, CompileOptions::default())
 }
 
+/// Compiles like [`compile`] and, when a MIR module is produced, maps panic
+/// sites back to `user_path` (rewritten through standard-macro expansion)
+/// and the appended std region — the source files the interpreter needs to
+/// render panic locations for `riddle run` and `riddle repl`.
+pub fn compile_for_interpretation(source: &str, user_path: &str) -> CompileResult {
+    let mut result = compile(source);
+    for file in &mut result.source_files {
+        if file.path == USER_SOURCE_PATH {
+            file.path = user_path.to_string();
+        }
+    }
+    result
+}
+
 #[must_use]
 pub fn compile_with_options(source: &str, options: CompileOptions) -> CompileResult {
     compile_with_options_and_gc(source, options, true)
@@ -1359,7 +1383,45 @@ fn run_standalone_pipeline_with_state_cancellable(
         cancelled,
     )?;
     result.macro_diagnostics = expansion.diagnostics;
+    if result.mir_module.is_some() {
+        result.source_files = mir_source_files(
+            source,
+            &expansion.mappings,
+            expansion.source.len(),
+            options.use_std,
+        );
+    }
     Some(result)
+}
+
+/// Builds the panic-location map for interpreted runs. The user region's
+/// offsets refer to the standard-macro-expanded text, so sites map back
+/// through the expansion; the std region is appended verbatim after two
+/// separator bytes (matching the deep pipeline's `format!("{source}\n\n{}")`).
+fn mir_source_files(
+    source: &str,
+    mappings: &[crate::proc_macro::ExpandedTokenMapping],
+    expanded_len: usize,
+    use_std: bool,
+) -> Vec<mir::SourceFile> {
+    let mut map = SourceMap::default();
+    map.push(
+        0..source.len(),
+        Path::new(USER_SOURCE_PATH),
+        Arc::from(source),
+        0,
+    );
+    map.apply_expansion(mappings);
+    if use_std {
+        let std_start = expanded_len + 2;
+        map.push(
+            std_start..std_start + std_prelude().len(),
+            Path::new(STD_SOURCE_PATH),
+            Arc::from(std_prelude()),
+            0,
+        );
+    }
+    map.to_mir_files()
 }
 
 fn run_pipeline_with_state(
@@ -1493,6 +1555,7 @@ fn resolve_result(
         analysis: move_checker::AnalysisResult::default(),
         mir_module: None,
         parse_errors,
+        source_files: Vec::new(),
     }
 }
 
@@ -1617,6 +1680,7 @@ fn run_pipeline_with_state_cancellable_and_names(
             analysis: move_checker::AnalysisResult::default(),
             mir_module: None,
             parse_errors,
+            source_files: Vec::new(),
         });
     }
 
@@ -1678,6 +1742,7 @@ fn run_pipeline_with_state_cancellable_and_names(
         analysis,
         mir_module,
         parse_errors,
+        source_files: Vec::new(),
     })
 }
 
@@ -1735,6 +1800,7 @@ fn parse_failure(parse_errors: Vec<ParseError>) -> CompileResult {
         analysis: move_checker::AnalysisResult::default(),
         mir_module: None,
         parse_errors,
+        source_files: Vec::new(),
     }
 }
 

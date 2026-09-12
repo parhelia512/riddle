@@ -1,4 +1,5 @@
 use clap::{Args, Parser, ValueEnum};
+use riddle::repl::{self, Session};
 use riddlec::fmt::{self, FormatOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -19,7 +20,28 @@ struct Cli {
 enum Command {
     /// Format Riddle source files.
     Fmt(FmtArgs),
+    /// Compile a file and interpret it (no C toolchain needed).
+    Run(RunArgs),
+    /// Start an interactive session backed by the MIR interpreter.
+    Repl(ReplArgs),
 }
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    /// Source file to run.
+    file: PathBuf,
+
+    /// Program arguments passed to `std::env::args`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    program_args: Vec<String>,
+
+    /// Seed for `std::random` (0 = seed from the clock).
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
+#[derive(Debug, Args)]
+struct ReplArgs {}
 
 #[derive(Debug, Args)]
 struct FmtArgs {
@@ -68,6 +90,145 @@ fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Fmt(args) => run_fmt(args),
+        Command::Run(args) => run_file(args),
+        Command::Repl(args) => run_repl(args),
+    }
+}
+
+fn run_file(args: RunArgs) -> ExitCode {
+    let source = match std::fs::read_to_string(&args.file) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("riddle run: cannot read `{}`: {error}", args.file.display());
+            return ExitCode::from(2);
+        }
+    };
+    let result = riddlec::pipeline::compile_for_interpretation(
+        &source,
+        &args.file.display().to_string(),
+    );
+    if !result.success() {
+        let errors =
+            riddlec::diagnostics::report(&result, Some(&source), &args.file.display().to_string());
+        if errors == 0 {
+            eprintln!("riddle run: compilation failed");
+        }
+        return ExitCode::from(1);
+    }
+    let module = result.mir_module.expect("successful compile produced MIR");
+    // A program without `main` would otherwise die inside the interpreter
+    // with a bare internal error; report it like the C backend does.
+    if !module
+        .functions
+        .values()
+        .any(|function| function.name == "main")
+    {
+        eprintln!(
+            "error[E0401]: no `main` function found in the entry package
+  = help: define `fun main() -> i32 {{ ... }}` as the program entry"
+        );
+        return ExitCode::from(1);
+    }
+    // Panic sites map back to the source file (through standard-macro
+    // expansion) and into the bundled std region.
+    let source_files = result.source_files;
+    let config = interpreter::Config {
+        args: {
+            let mut all = vec![args.file.display().to_string()];
+            all.extend(args.program_args);
+            all
+        },
+        rng_seed: args.seed,
+        ..interpreter::Config::default()
+    };
+    let outcome = interpreter::run_with(&module, source_files, config);
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(&outcome.stdout);
+    let _ = stdout.flush();
+    let mut stderr = io::stderr();
+    let _ = stderr.write_all(&outcome.stderr);
+    match &outcome.result {
+        Ok(code) => ExitCode::from((*code).max(0) as u8),
+        Err(trap) => {
+            let mut rendered = Vec::new();
+            trap.render(&mut rendered);
+            let _ = stderr.write_all(&rendered);
+            let _ = stderr.flush();
+            ExitCode::from(repl::trap_exit_code(trap))
+        }
+    }
+}
+
+fn run_repl(_args: ReplArgs) -> ExitCode {
+    let mut editor = match rustyline::DefaultEditor::new() {
+        Ok(editor) => editor,
+        Err(error) => {
+            eprintln!("riddle repl: cannot initialize line editor: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut session = Session::new();
+    println!("Riddle REPL — type :help for commands, :quit to exit");
+    match read_and_eval(&mut editor, &mut session) {
+        Flow::Quit | Flow::Eof => ExitCode::SUCCESS,
+    }
+}
+
+enum Flow {
+    Quit,
+    Eof,
+}
+
+/// Reads one logical input (following `|` continuation lines) and evaluates
+/// it.
+fn read_and_eval(editor: &mut rustyline::DefaultEditor, session: &mut Session) -> Flow {
+    let mut pending: Option<String> = None;
+    loop {
+        let prompt = if pending.is_some() { "  | " } else { ">>> " };
+        match editor.readline(prompt) {
+            Ok(line) => {
+                let _ = editor.add_history_entry(line.trim_end());
+                let input = match pending.take() {
+                    Some(text) => Session::combine(&text, &line),
+                    None => line,
+                };
+                if Session::needs_continuation(&input) {
+                    pending = Some(input);
+                    continue;
+                }
+                if input.trim().is_empty() {
+                    continue;
+                }
+                match session.eval(&input) {
+                    Ok(repl::Outcome::Quit) => return Flow::Quit,
+                    Ok(repl::Outcome::Notice(notice)) if !notice.is_empty() => {
+                        println!("{notice}");
+                    }
+                    Ok(repl::Outcome::Evaluated(value)) if !value.is_empty() => {
+                        if value.ends_with('\n') {
+                            print!("{value}");
+                        } else {
+                            println!("{value}");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(reject) => {
+                        let text = match reject {
+                            repl::Reject::Diagnostics(text)
+                            | repl::Reject::Runtime(text)
+                            | repl::Reject::Internal(text) => text,
+                        };
+                        print!("{text}");
+                        let _ = io::stdout().flush();
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("(use :quit to exit)");
+                pending = None;
+            }
+            Err(_) => return Flow::Eof,
+        }
     }
 }
 
@@ -191,8 +352,25 @@ mod tests {
     fn parses_fmt_modes() {
         let cli = Cli::try_parse_from(["riddle", "fmt", "--emit", "stdout", "main.rid"])
             .expect("fmt arguments should parse");
-        let Command::Fmt(args) = cli.command;
+        let Command::Fmt(args) = cli.command else {
+            panic!("expected the fmt subcommand");
+        };
         assert!(matches!(args.emit, Emit::Stdout));
         assert_eq!(args.files, [PathBuf::from("main.rid")]);
+    }
+
+    #[test]
+    fn parses_run_and_repl() {
+        let cli = Cli::try_parse_from(["riddle", "run", "--seed", "7", "app.rid", "--flag"])
+            .expect("run arguments should parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.file, PathBuf::from("app.rid"));
+        assert_eq!(args.seed, 7);
+        assert_eq!(args.program_args, ["--flag"]);
+
+        let cli = Cli::try_parse_from(["riddle", "repl"]).expect("repl parses");
+        assert!(matches!(cli.command, Command::Repl(_)));
     }
 }

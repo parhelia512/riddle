@@ -3015,50 +3015,10 @@ fn receiver_struct_id(ty: &Type) -> Option<hir::item_tree::StructId> {
     }
 }
 
+// Signature rendering moved to `hir::render` so `clue doc` shares it;
+// hover keeps the compact 5-item truncation.
 fn format_function(function: &HirFunction) -> String {
-    let visibility = if function.visibility.is_public() {
-        "pub "
-    } else {
-        ""
-    };
-    let safety = if function.is_unsafe { "unsafe " } else { "" };
-    let generics = if function.generics.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<{}>",
-            function
-                .generics
-                .iter()
-                .map(|name| name.0.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    let params = function
-        .params
-        .iter()
-        .map(|parameter| {
-            if parameter.name.0 == "self" {
-                match &parameter.ty {
-                    HirTypeRef::Ref(_, true) => "&mut self".into(),
-                    HirTypeRef::Ref(_, false) => "&self".into(),
-                    _ => "self".into(),
-                }
-            } else {
-                format!("{}: {}", parameter.name.0, parameter.ty.display())
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let ret = function
-        .ret_type
-        .as_ref()
-        .map_or_else(|| "()".into(), HirTypeRef::display);
-    format!(
-        "{visibility}{safety}fun {}{generics}({params}) -> {ret}",
-        function.name.0
-    )
+    hir::render::format_function(function)
 }
 
 fn format_nominal(kind: &str, name: &Name, generics: &[Name]) -> String {
@@ -3077,94 +3037,13 @@ fn format_nominal(kind: &str, name: &Name, generics: &[Name]) -> String {
 }
 
 fn format_struct(strukt: &HirStruct) -> String {
-    let visibility = if strukt.visibility.is_public() {
-        "pub "
-    } else {
-        ""
-    };
-    let mut detail = format!(
-        "{visibility}{}",
-        format_nominal("struct", &strukt.name, &strukt.generics)
-    );
-    if strukt.fields.is_empty() {
-        detail.push_str(" {}");
-        return detail;
-    }
-
-    detail.push_str(" {\n");
-    for field in strukt.fields.iter().take(HOVER_DECLARATION_ITEM_LIMIT) {
-        detail.push_str("    ");
-        detail.push_str(&format_struct_field(field));
-        detail.push_str(",\n");
-    }
-    if strukt.fields.len() > HOVER_DECLARATION_ITEM_LIMIT {
-        detail.push_str("    /* ... */\n");
-    }
-    detail.push('}');
-    detail
+    hir::render::format_struct_limited(strukt, HOVER_DECLARATION_ITEM_LIMIT)
 }
 
 fn format_enum(enumeration: &HirEnum) -> String {
-    let visibility = if enumeration.visibility.is_public() {
-        "pub "
-    } else {
-        ""
-    };
-    let mut detail = format!(
-        "{visibility}{}",
-        format_nominal("enum", &enumeration.name, &enumeration.generics)
-    );
-    if enumeration.variants.is_empty() {
-        detail.push_str(" {}");
-        return detail;
-    }
-
-    detail.push_str(" {\n");
-    for variant in enumeration
-        .variants
-        .iter()
-        .take(HOVER_DECLARATION_ITEM_LIMIT)
-    {
-        detail.push_str("    ");
-        detail.push_str(&format_enum_variant(variant));
-        detail.push_str(",\n");
-    }
-    if enumeration.variants.len() > HOVER_DECLARATION_ITEM_LIMIT {
-        detail.push_str("    /* ... */\n");
-    }
-    detail.push('}');
-    detail
+    hir::render::format_enum_limited(enumeration, HOVER_DECLARATION_ITEM_LIMIT)
 }
 
 fn format_enum_variant(variant: &HirEnumVariant) -> String {
-    match &variant.kind {
-        HirVariantKind::Unit => variant.name.0.clone(),
-        HirVariantKind::Tuple(fields) => format!(
-            "{}({})",
-            variant.name.0,
-            fields
-                .iter()
-                .map(HirTypeRef::display)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        HirVariantKind::Struct(fields) => format!(
-            "{} {{ {} }}",
-            variant.name.0,
-            fields
-                .iter()
-                .map(format_struct_field)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
-}
-
-fn format_struct_field(field: &HirStructField) -> String {
-    let visibility = if field.visibility.is_public() {
-        "pub "
-    } else {
-        ""
-    };
-    format!("{visibility}{}: {}", field.name.0, field.ty.display())
+    hir::render::format_enum_variant(variant)
 }

@@ -13,7 +13,7 @@ pub type BlockId = Idx<Block>;
 pub struct Value(pub u32);
 
 /// Reference to a callable function.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FuncRef {
     /// A function defined in the same module.
     Local(String),

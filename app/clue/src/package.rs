@@ -173,7 +173,7 @@ impl Config {
     }
 }
 
-fn clue_home() -> anyhow::Result<PathBuf> {
+pub(crate) fn clue_home() -> anyhow::Result<PathBuf> {
     if let Some(path) = std::env::var_os("CLUE_HOME") {
         return Ok(PathBuf::from(path));
     }
@@ -1585,6 +1585,9 @@ pub(crate) fn metadata(root: &Path) -> anyhow::Result<String> {
         "manifest": {
             "name": manifest.name,
             "version": manifest.version,
+            "description": manifest.description,
+            "authors": manifest.authors,
+            "repository": manifest.repository,
             "license": manifest.license,
             "publish": manifest.publish,
         },

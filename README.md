@@ -4,7 +4,7 @@
   [GitHub][github] | [文档][docs] | [更新日志][changelog] | [English](README-en.md)
 </div>
 
-这是 [Riddle][github] 的主源码仓库，包含格式化工具（`riddle fmt`）、编译器（`riddlec`）、项目工具（`clue`）和语言服务器（`riddle-lsp`）。
+这是 [Riddle][github] 的主源码仓库，包含格式化工具（`riddle fmt`）、解释器驱动（`riddle run` / `riddle repl`）、编译器（`riddlec`）、项目工具（`clue`）和语言服务器（`riddle-lsp`）。
 
 Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.3` 提供类型检查、move checker、借用与逃逸分析、unsafe 语义、内置标准库、C 后端、项目工具和 LSP。当前版本仍处于技术预览阶段：语言和工具链仍可能发生不兼容变化。
 
@@ -18,9 +18,11 @@ Riddle 是一门受 Rust 和 Go 启发的实验性编程语言。`v0.2.3` 提供
 
 ## 工具
 
-- `riddlec`：检查 Riddle 源码并生成 C；
+- `riddlec`：检查 Riddle 源码并生成 C（`--emit mir` 可打印 MIR）；
+- `riddle run`：无需 C 工具链，直接用内置 MIR 解释器运行单个 `.rid` 文件；
+- `riddle repl`：交互式会话，定义持续累积、表达式即时求值（`:help` 查看命令）；
 - `riddle fmt`：按统一风格格式化 Riddle 源码，也可用 `--check` 检查格式；
-- `clue`：管理 Riddle 包、依赖、工作区、构建目标与安装产物；
+- `clue`：管理 Riddle 包、依赖、工作区、构建目标与安装产物（`clue doc` 生成 HTML API 文档，库构建产物进入 `$CLUE_HOME` 全局缓存，兄弟依赖按 `-j` 并行构建）；
 - `riddle-lsp`：为编辑器提供诊断、工作区索引、自动导入补全、高级导航、重命名、格式化和语义高亮。
 
 仓库中的 [`editors`](./editors) 目录为 Helix、VS Code、Zed 和 IntelliJ IDEA 2026.1+ 提供 `riddle-lsp` 适配。

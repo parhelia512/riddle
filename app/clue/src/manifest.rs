@@ -54,11 +54,15 @@ fn document(name: &str, value: Value) -> String {
 pub struct Manifest {
     pub name: String,
     pub version: Version,
+    pub description: Option<String>,
+    pub authors: Vec<String>,
+    pub repository: Option<String>,
     pub license: Option<String>,
     pub publish: Option<Vec<String>>,
     pub entry: PathBuf,
     pub kind: ProjectKind,
     pub build_target: Option<String>,
+    pub build_cache: Option<bool>,
     pub runtime_source: Option<PathBuf>,
     pub gc_enabled: bool,
     pub fingerprint: String,
@@ -138,6 +142,19 @@ pub fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
         )
     })?;
     let license = optional_string_field(package, "license", "package")?;
+    let description = optional_string_field(package, "description", "package")?;
+    let repository = optional_string_field(package, "repository", "package")?;
+    let authors = package
+        .get("authors")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let publish = publish_registries(package)?;
     validate_package_name(&name).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
     let binaries = binary_targets(root, &value, &name)?;
@@ -165,6 +182,8 @@ pub fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
         .map(|build| optional_string_field(build, "target", "build"))
         .transpose()?
         .flatten();
+    let build_cache =
+        table(&value, "build").and_then(|build| build.get("cache").and_then(Value::as_bool));
 
     let dependencies = dependencies(&value)?;
     let mut features = feature_names(&value)?;
@@ -175,11 +194,15 @@ pub fn read(root: &Path, kind: ProjectKind) -> io::Result<Manifest> {
     Ok(Manifest {
         name,
         version,
+        description,
+        authors,
+        repository,
         license,
         publish,
         entry,
         kind,
         build_target,
+        build_cache,
         runtime_source,
         gc_enabled,
         fingerprint: value.to_string(),
