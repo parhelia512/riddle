@@ -1362,11 +1362,28 @@ where
     if let Some(directory) = directory {
         command.current_dir(directory);
     }
-    let status = command.args(arguments).status()?;
-    if !status.success() {
-        bail!("git command failed with {status}");
+    let output = command.args(arguments).output()?;
+    if !output.status.success() {
+        bail!(
+            "git command failed with {}: {}",
+            output.status,
+            git_failure(&output.stderr)
+        );
     }
     Ok(())
+}
+
+/// git's own explanation of a failure. The exit code alone hides the cause
+/// (missing revision, unreachable remote, unusable local transport), so the
+/// captured stderr is what makes the error actionable.
+fn git_failure(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr);
+    let message = message.trim();
+    if message.is_empty() {
+        "no diagnostic output".to_owned()
+    } else {
+        message.to_owned()
+    }
 }
 
 fn git_output<I, S>(directory: &Path, arguments: I) -> anyhow::Result<String>
@@ -1379,7 +1396,11 @@ where
         .args(arguments)
         .output()?;
     if !output.status.success() {
-        bail!("git command failed with {}", output.status);
+        bail!(
+            "git command failed with {}: {}",
+            output.status,
+            git_failure(&output.stderr)
+        );
     }
     String::from_utf8(output.stdout).context("git output was not UTF-8")
 }

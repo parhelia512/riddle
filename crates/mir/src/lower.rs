@@ -94,6 +94,7 @@ pub fn lower_hir<S: BuildHasher>(
         generic_const_subst: HashMap::new(),
         mono_functions: HashMap::new(),
         mono_methods: HashMap::new(),
+        mono_generated_symbols: std::collections::HashSet::new(),
         loop_targets: Vec::new(),
         lambda_functions: HashMap::new(),
         generic_lambda_functions: HashMap::new(),
@@ -104,7 +105,25 @@ pub fn lower_hir<S: BuildHasher>(
         lambda_counter: 0,
         active_consts: HashSet::new(),
         package_names,
+        free_symbol_counts: HashMap::new(),
     };
+    let free_symbol_counts = hir
+        .item_tree
+        .functions
+        .iter()
+        .filter(|(fid, function)| {
+            !ctx.method_impls.contains_key(fid)
+                && !ctx.default_methods.contains_key(fid)
+                // Extern and `c_export` names are ABI, not internal symbols.
+                && !hir.item_tree.extern_function_ids.contains(fid)
+                && !function.attrs.iter().any(|attr| attr.name.0 == "c_export")
+        })
+        .map(|(fid, function)| ctx.package_qualified_symbol(fid, function.name.0.clone()))
+        .fold(HashMap::new(), |mut counts, symbol| {
+            *counts.entry(symbol).or_insert(0) += 1;
+            counts
+        });
+    ctx.free_symbol_counts = free_symbol_counts;
 
     // 遍历所有有函数体的函数
     for (fid, func) in hir.item_tree.functions.iter() {
@@ -186,6 +205,12 @@ struct LowerCtx<'a> {
     generic_const_subst: HashMap<String, usize>,
     mono_functions: HashMap<(hir::item_tree::FunctionId, String), String>,
     mono_methods: HashMap<(hir::item_tree::FunctionId, String), String>,
+    /// Final symbols of already-generated monomorphizations. The two keyed
+    /// caches above can independently derive the same symbol (an impl
+    /// method reached both as a method call and as a generic call); without
+    /// this registry both would emit a body and the C build would fail on
+    /// the redefinition.
+    mono_generated_symbols: std::collections::HashSet<String>,
     loop_targets: Vec<LoopTargets>,
     lambda_functions: HashMap<(BodyId, ExprId), String>,
     generic_lambda_functions: HashMap<(BodyId, ExprId, String), String>,
@@ -196,6 +221,10 @@ struct LowerCtx<'a> {
     lambda_counter: u32,
     active_consts: HashSet<hir::item_tree::ConstId>,
     package_names: &'a [String],
+    /// Final (pre-disambiguation) symbols of free functions, counted so
+    /// same-named privates can be renamed before they emit duplicate C
+    /// symbols or shadow each other in the interpreter's name table.
+    free_symbol_counts: HashMap<String, usize>,
 }
 
 #[derive(Clone)]
@@ -995,7 +1024,7 @@ fn collect_let_pattern_bindings(
                 }
             }
         }
-        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {}
     }
 }
 

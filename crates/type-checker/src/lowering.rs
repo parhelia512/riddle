@@ -381,6 +381,20 @@ impl TypeChecker<'_> {
         let tr = self.hir.item_tree.traits[trait_id].clone();
         let mut subst = params.clone();
         subst.insert("Self".into(), self_ty.clone());
+        // Seed trait generics with their defaults first: an implicit
+        // self-bound is spelled with the trait's own generic names
+        // (`Self: PartialOrd<Rhs>`), and at a call site those names are not
+        // in scope — without the seeding the explicit-arg lowering below
+        // reports them as unknown types.
+        for (index, name) in tr.generics.iter().enumerate() {
+            if subst.contains_key(&name.0) {
+                continue;
+            }
+            if let Some(Some(default)) = tr.generic_defaults.get(index) {
+                let ty = self.lower_type_ref_with_params_at(default, &subst, span);
+                subst.insert(name.0.clone(), ty);
+            }
+        }
         for (index, name) in tr.generics.iter().enumerate() {
             let ty = explicit
                 .get(index)
@@ -616,6 +630,29 @@ impl TypeChecker<'_> {
             .structs
             .iter()
             .find_map(|(id, strukt)| (strukt.name.0 == name).then_some(id))
+    }
+
+    /// Seeds `subst` with the trait's generic parameters resolved through
+    /// their defaults. Method signatures spell trait generics directly
+    /// (`fun eq(&self, other: &Rhs)`), and a method resolved through an impl
+    /// carries only the impl's generics — without the seeded `Rhs`, lowering
+    /// the signature at the call site reports it as an unknown type.
+    pub(crate) fn seed_trait_generic_defaults(
+        &mut self,
+        trait_id: TraitId,
+        subst: &mut HashMap<String, Type>,
+    ) {
+        let tr = self.hir.item_tree.traits[trait_id].clone();
+        let span = Some(tr.name_range);
+        for (index, name) in tr.generics.iter().enumerate() {
+            if subst.contains_key(&name.0) {
+                continue;
+            }
+            if let Some(Some(default)) = tr.generic_defaults.get(index) {
+                let ty = self.lower_type_ref_with_params_at(default, subst, span);
+                subst.insert(name.0.clone(), ty);
+            }
+        }
     }
 
     pub(crate) fn find_enum_by_name(&self, name: &str) -> Option<EnumId> {

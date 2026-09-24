@@ -37,7 +37,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 
 [package]
@@ -88,10 +88,12 @@ path = "app/riddle/src/main.rs"
 
 [dev-dependencies]
 ast = { path = "crates/ast" }
+criterion = "0.8.2"
 escape-analysis = { path = "crates/escape-analysis" }
 frontend = { path = "crates/frontend" }
 gc = { path = "crates/gc" }
 hir = { path = "crates/hir" }
+la-arena = "0.3"
 lsp-types = "0.94.1"
 mir = { path = "crates/mir" }
 move-checker = { path = "crates/move-checker" }
@@ -120,6 +122,10 @@ name = "frontend"
 path = "tests/frontend/main.rs"
 
 [[test]]
+name = "ast_hir"
+path = "tests/ast_hir/main.rs"
+
+[[test]]
 name = "fmt"
 path = "tests/fmt/main.rs"
 
@@ -134,3 +140,8 @@ path = "tests/scope_graph/main.rs"
 [[test]]
 name = "type_checker"
 path = "tests/type_checker/main.rs"
+
+[[bench]]
+name = "interpreter"
+path = "benches/interpreter.rs"
+harness = false

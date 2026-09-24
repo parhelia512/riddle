@@ -310,6 +310,8 @@ pub enum SyntaxKind {
     StructPattern,
     EnumPattern,
     ReferencePattern,
+    /// `A | B | C` — top-level or-pattern in a match arm.
+    OrPattern,
     /// `mut name` — a binding that is explicitly mutable.
     BindingPattern,
     WildcardPattern,

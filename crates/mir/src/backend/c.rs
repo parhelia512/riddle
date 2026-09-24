@@ -739,7 +739,7 @@ impl CBackend {
         let expr = match constant {
             ConstValue::Int(value, _) => c_int_literal(*value, &inst.ty),
             ConstValue::NegativeInt(value, _) => c_negative_int_literal(*value, &inst.ty),
-            ConstValue::Float(value, _) => format!("(({ct}){value})"),
+            ConstValue::Float(value, _) => format!("(({ct}){})", c_float_literal(*value)),
             ConstValue::Bool(value) => value.to_string(),
             ConstValue::String(value) => {
                 let (inner, len) = c_string_parts(value);
@@ -1863,6 +1863,24 @@ fn c_int_literal(value: u64, ty: &Type) -> String {
             format!("(({ctype})UINT64_C({value}))")
         }
         _ => format!("(({ctype}){value})"),
+    }
+}
+
+/// Floats must be emitted in scientific notation: `Display` renders large
+/// values as plain digit runs, and an unsuffixed C integer constant that
+/// exceeds `long long` is undefined behavior, so `((double)179769...0)` used
+/// to truncate before the cast ever widened it.
+fn c_float_literal(value: f64) -> String {
+    if value.is_nan() {
+        "(double)NAN".into()
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            "(-(double)INFINITY)".into()
+        } else {
+            "(double)INFINITY".into()
+        }
+    } else {
+        format!("{value:e}")
     }
 }
 

@@ -624,7 +624,9 @@ impl TypeChecker<'_> {
                     ValueUse::Shared
                 })
             }
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => ValueUse::Shared,
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {
+                ValueUse::Shared
+            }
         }
     }
 

@@ -4,11 +4,15 @@ unsafe extern "C" {
 }
 
 pub fun random_u32() -> u32 {
-    unsafe { riddle_random_u32() }
+    unsafe {
+        riddle_random_u32()
+    }
 }
 
 pub fun random_u64() -> u64 {
-    unsafe { riddle_random_u64() }
+    unsafe {
+        riddle_random_u64()
+    }
 }
 
 pub fun random_bool() -> bool {

@@ -959,6 +959,10 @@ impl<'a> BodyLower<'a> {
                 self.alloc_pat(Pattern::Reference { mutable, pattern }, range)
             }
             ast::Pattern::Literal(literal) => self.lower_literal_pattern(&literal, range),
+            ast::Pattern::Or(or) => {
+                let alternatives = or.alternatives().map(|p| self.lower_pattern(p)).collect();
+                self.alloc_pat(Pattern::Or { alternatives }, range)
+            }
             ast::Pattern::Tuple(tp) => {
                 let elements = tp.elements().map(|p| self.lower_pattern(p)).collect();
                 self.alloc_pat(Pattern::Tuple { elements }, range)

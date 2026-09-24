@@ -102,6 +102,66 @@ impl TypeChecker<'_> {
                     allow_reference_deref,
                 );
             }
+            Pattern::Or { alternatives } => {
+                self.bind_or_pattern(
+                    ctx,
+                    &alternatives,
+                    &effective,
+                    mode,
+                    allow_reference_deref,
+                    span,
+                );
+            }
+        }
+    }
+
+    /// Binds a match-arm or-pattern `A | B | C`. Every alternative is checked
+    /// against the same scrutinee type, but the arm body sees no bindings —
+    /// an alternative that introduces one is rejected (matching Rust's rule
+    /// that or-patterns may not bind, which would require all sides to bind
+    /// the same names).
+    fn bind_or_pattern(
+        &mut self,
+        ctx: &mut BodyCtx<'_>,
+        alternatives: &[PatId],
+        effective: &Type,
+        mode: PatternBindingMode,
+        allow_reference_deref: bool,
+        span: Option<rowan::TextRange>,
+    ) {
+        for &alternative in alternatives {
+            if Self::pattern_contains_binding(ctx.body, alternative) {
+                self.diagnostic_with_help(
+                    "E0010",
+                    "or-pattern alternatives cannot bind variables",
+                    ctx.pat_range(alternative).or(span),
+                    Some(
+                        "bind in the arm body instead, or give each alternative its own arm".into(),
+                    ),
+                );
+            }
+            self.bind_pattern_with_mode(ctx, alternative, effective, mode, allow_reference_deref);
+        }
+    }
+
+    fn pattern_contains_binding(body: &hir::body::Body, pat: PatId) -> bool {
+        match &body.pats[pat] {
+            Pattern::Binding { .. } => true,
+            Pattern::Reference { pattern, .. } => Self::pattern_contains_binding(body, *pattern),
+            Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => elements
+                .iter()
+                .any(|element| Self::pattern_contains_binding(body, *element)),
+            Pattern::Struct { fields, .. } => fields.iter().any(|field| {
+                // A shorthand field (`Foo { a }`) binds `a` implicitly.
+                field.pat.is_none()
+                    || field
+                        .pat
+                        .is_some_and(|sub| Self::pattern_contains_binding(body, sub))
+            }),
+            Pattern::Or { alternatives } => alternatives
+                .iter()
+                .any(|alternative| Self::pattern_contains_binding(body, *alternative)),
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => false,
         }
     }
 
@@ -286,7 +346,8 @@ impl TypeChecker<'_> {
             | Pattern::Path { .. }
             | Pattern::Tuple { .. }
             | Pattern::TupleStruct { .. }
-            | Pattern::Struct { .. } => true,
+            | Pattern::Struct { .. }
+            | Pattern::Or { .. } => true,
             Pattern::Binding { name, .. } => self
                 .enum_variant_is_unit_through_refs(expected, &name.0)
                 .is_some(),
@@ -684,7 +745,10 @@ impl TypeChecker<'_> {
                         }
                     }
                 }
-                Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+                Pattern::Wildcard
+                | Pattern::Literal(_)
+                | Pattern::Path { .. }
+                | Pattern::Or { .. } => {}
             }
         }
 
@@ -773,7 +837,10 @@ impl TypeChecker<'_> {
                         }
                     }
                 }
-                Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+                Pattern::Wildcard
+                | Pattern::Literal(_)
+                | Pattern::Path { .. }
+                | Pattern::Or { .. } => {}
             }
         }
 

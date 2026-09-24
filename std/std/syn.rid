@@ -3,7 +3,17 @@ pub mod syn {
     use crate::std::result::Result;
     use crate::std::string::String;
     use crate::std::vector::Vector;
-    use crate::{Delimiter, Diagnostic, Group, Ident, Punct, Span, Spacing, TokenStream, TokenTree};
+    use crate::{
+        Delimiter,
+        Diagnostic,
+        Group,
+        Ident,
+        Punct,
+        Span,
+        Spacing,
+        TokenStream,
+        TokenTree
+    };
 
     pub use crate::ToTokens;
 
@@ -22,24 +32,48 @@ pub mod syn {
     }
 
     pub trait Visit {
-        fun visit_file(&mut self, node: &File) { walk_file(self, node); }
-        fun visit_item(&mut self, node: &Item) { walk_item(self, node); }
-        fun visit_stmt(&mut self, node: &Stmt) { walk_stmt(self, node); }
-        fun visit_expr(&mut self, node: &Expr) { walk_expr(self, node); }
-        fun visit_type(&mut self, node: &Type) { walk_type(self, node); }
-        fun visit_pat(&mut self, node: &Pat) { walk_pat(self, node); }
+        fun visit_file(&mut self, node: &File) {
+            walk_file(self, node);
+        }
+        fun visit_item(&mut self, node: &Item) {
+            walk_item(self, node);
+        }
+        fun visit_stmt(&mut self, node: &Stmt) {
+            walk_stmt(self, node);
+        }
+        fun visit_expr(&mut self, node: &Expr) {
+            walk_expr(self, node);
+        }
+        fun visit_type(&mut self, node: &Type) {
+            walk_type(self, node);
+        }
+        fun visit_pat(&mut self, node: &Pat) {
+            walk_pat(self, node);
+        }
         fun visit_derive_input(&mut self, node: &DeriveInput) {
             walk_derive_input(self, node);
         }
     }
 
     pub trait Fold {
-        fun fold_file(&mut self, node: File) -> File { fold_file_default(self, node) }
-        fun fold_item(&mut self, node: Item) -> Item { fold_item_default(self, node) }
-        fun fold_stmt(&mut self, node: Stmt) -> Stmt { fold_stmt_default(self, node) }
-        fun fold_expr(&mut self, node: Expr) -> Expr { fold_expr_default(self, node) }
-        fun fold_type(&mut self, node: Type) -> Type { fold_type_default(self, node) }
-        fun fold_pat(&mut self, node: Pat) -> Pat { fold_pat_default(self, node) }
+        fun fold_file(&mut self, node: File) -> File {
+            fold_file_default(self, node)
+        }
+        fun fold_item(&mut self, node: Item) -> Item {
+            fold_item_default(self, node)
+        }
+        fun fold_stmt(&mut self, node: Stmt) -> Stmt {
+            fold_stmt_default(self, node)
+        }
+        fun fold_expr(&mut self, node: Expr) -> Expr {
+            fold_expr_default(self, node)
+        }
+        fun fold_type(&mut self, node: Type) -> Type {
+            fold_type_default(self, node)
+        }
+        fun fold_pat(&mut self, node: Pat) -> Pat {
+            fold_pat_default(self, node)
+        }
         fun fold_derive_input(&mut self, node: DeriveInput) -> DeriveInput {
             fold_derive_input_default(self, node)
         }
@@ -217,7 +251,10 @@ pub mod syn {
 
     impl ParseStream {
         pub fun new(tokens: TokenStream) -> ParseStream {
-            ParseStream { tokens, index: 0usize }
+            ParseStream {
+                tokens,
+                index: 0usize
+            }
         }
 
         pub fun is_empty(&self) -> bool {
@@ -381,10 +418,7 @@ pub mod syn {
 
     fun item_keyword_index(tokens: &TokenStream) -> usize {
         let mut index = 0usize;
-        while index + 1usize < tokens.len()
-            && punct_at(tokens, index, '#')
-            && bracket_at(tokens, index + 1usize)
-        {
+        while index + 1usize < tokens.len() && punct_at(tokens, index, '#') && bracket_at(tokens, index + 1usize) {
             index += 2usize;
         }
         if ident_at(tokens, index, "pub") {
@@ -398,10 +432,7 @@ pub mod syn {
 
     fun attribute_end_index(tokens: &TokenStream) -> usize {
         let mut index = 0usize;
-        while index + 1usize < tokens.len()
-            && punct_at(tokens, index, '#')
-            && bracket_at(tokens, index + 1usize)
-        {
+        while index + 1usize < tokens.len() && punct_at(tokens, index, '#') && bracket_at(tokens, index + 1usize) {
             index += 2usize;
         }
         index
@@ -429,29 +460,14 @@ pub mod syn {
                 _ => false,
             };
         }
-        if ident_at(&current, item_index, "struct")
-            || ident_at(&current, item_index, "enum")
-            || ident_at(&current, item_index, "trait")
-            || ident_at(&current, item_index, "impl")
-            || ident_at(&current, item_index, "mod")
-            || ident_at(&current, item_index, "extern")
-        {
+        if ident_at(&current, item_index, "struct") || ident_at(&current, item_index, "enum") || ident_at(&current, item_index, "trait") || ident_at(&current, item_index, "impl") || ident_at(&current, item_index, "mod") || ident_at(&current, item_index, "extern") {
             return true;
         }
         let expr_index = attribute_end_index(&current);
-        ident_at(&current, expr_index, "if")
-            || ident_at(&current, expr_index, "while")
-            || ident_at(&current, expr_index, "for")
-            || ident_at(&current, expr_index, "match")
-            || ident_at(&current, expr_index, "unsafe")
+        ident_at(&current, expr_index, "if") || ident_at(&current, expr_index, "while") || ident_at(&current, expr_index, "for") || ident_at(&current, expr_index, "match") || ident_at(&current, expr_index, "unsafe")
     }
 
-    fun push_statement(
-        stmts: &mut Vector<Stmt>,
-        tokens: &TokenStream,
-        start: usize,
-        end: usize
-    ) -> Result<(), Error> {
+    fun push_statement(stmts: &mut Vector<Stmt>, tokens: &TokenStream, start: usize, end: usize) -> Result<(), Error> {
         let current = token_range(tokens, start, end);
         match classify_stmt(&current) {
             Result::Ok(stmt) => {
@@ -486,7 +502,9 @@ pub mod syn {
                 }
                 match param.as_slice().get(index) {
                     Option::Some(TokenTree::Ident(_)) => index += 1usize,
-                    _ => { return false; },
+                    _ => {
+                        return false;
+                    },
                 }
                 if !punct_at(&param, index, ':') {
                     return false;
@@ -504,7 +522,9 @@ pub mod syn {
         let mut index = keyword + 1usize;
         match tokens.as_slice().get(index) {
             Option::Some(TokenTree::Ident(_)) => index += 1usize,
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         }
         if punct_at(tokens, index, '<') {
             let close = matching_angle_end(tokens, index, tokens.len());
@@ -514,7 +534,9 @@ pub mod syn {
             let generics = token_range(tokens, index, close);
             match parse_generic_params(&generics) {
                 Result::Ok(_) => {},
-                Result::Err(_) => { return false; },
+                Result::Err(_) => {
+                    return false;
+                },
             }
             index = close;
         }
@@ -522,10 +544,14 @@ pub mod syn {
             Option::Some(TokenTree::Group(group)) => {
                 match group.delimiter() {
                     Delimiter::Parenthesis => group,
-                    _ => { return false; },
+                    _ => {
+                        return false;
+                    },
                 }
             },
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         };
         if !valid_params(params.stream()) {
             return false;
@@ -533,11 +559,7 @@ pub mod syn {
         index += 1usize;
         if punct_joint_at(tokens, index, '-') && punct_at(tokens, index + 1usize, '>') {
             let mut end = index + 2usize;
-            while end < tokens.len()
-                && !ident_at(tokens, end, "where")
-                && !brace_at(tokens, end)
-                && !punct_at(tokens, end, ';')
-            {
+            while end < tokens.len() && !ident_at(tokens, end, "where") && !brace_at(tokens, end) && !punct_at(tokens, end, ';') {
                 end += 1usize;
             }
             let ty = token_range(tokens, index + 2usize, end);
@@ -554,7 +576,9 @@ pub mod syn {
             let clause = token_range(tokens, index, end);
             match parse_where_predicates(&clause) {
                 Result::Ok(_) => {},
-                Result::Err(_) => { return false; },
+                Result::Err(_) => {
+                    return false;
+                },
             }
             index = end;
         }
@@ -577,7 +601,9 @@ pub mod syn {
         }
         match tokens.as_slice().get(keyword + 1usize) {
             Option::Some(TokenTree::Ident(_)) => {},
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         }
         let rest = token_range(tokens, keyword + 2usize, tokens.len() - 1usize);
         let colon = find_top_level_punct(&rest, ':');
@@ -596,18 +622,24 @@ pub mod syn {
         }
         match tokens.as_slice().get(keyword + 1usize) {
             Option::Some(TokenTree::Ident(_)) => {},
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         }
         if keyword + 3usize == tokens.len() {
             return true;
         }
-        if !punct_at(tokens, keyword + 2usize, '=') { return false; }
+        if !punct_at(tokens, keyword + 2usize, '=') {
+            return false;
+        }
         let ty = token_range(tokens, keyword + 3usize, tokens.len() - 1usize);
         !ty.is_empty() && valid_type(&ty)
     }
 
     fun valid_item_body(tokens: &TokenStream) -> bool {
-        if !matches_group_at_end(tokens, Delimiter::Brace) { return false; }
+        if !matches_group_at_end(tokens, Delimiter::Brace) {
+            return false;
+        }
         match tokens.as_slice().get(tokens.len() - 1usize) {
             Option::Some(TokenTree::Group(group)) => {
                 match parse::<File>(group.stream().cloned()) {
@@ -622,38 +654,54 @@ pub mod syn {
     fun valid_trait_item(tokens: &TokenStream, keyword: usize) -> bool {
         match tokens.as_slice().get(keyword + 1usize) {
             Option::Some(TokenTree::Ident(_)) => {},
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         }
         let body = tokens.len() - 1usize;
         let mut index = keyword + 2usize;
         if punct_at(tokens, index, '<') {
             let close = matching_angle_end(tokens, index, body);
-            if close == index { return false; }
+            if close == index {
+                return false;
+            }
             match parse_generic_params(&token_range(tokens, index, close)) {
                 Result::Ok(_) => {},
-                Result::Err(_) => { return false; },
+                Result::Err(_) => {
+                    return false;
+                },
             }
             index = close;
         }
         if punct_at(tokens, index, ':') {
             let bounds = token_range(tokens, index + 1usize, body);
-            if bounds.is_empty() || !valid_bounds(&bounds) { return false; }
+            if bounds.is_empty() || !valid_bounds(&bounds) {
+                return false;
+            }
             index = body;
         }
         index == body && valid_item_body(tokens)
     }
 
     fun valid_impl_item(tokens: &TokenStream, keyword: usize) -> bool {
-        if ident_at(tokens, attribute_end_index(tokens), "pub") { return false; }
-        if !matches_group_at_end(tokens, Delimiter::Brace) { return false; }
+        if ident_at(tokens, attribute_end_index(tokens), "pub") {
+            return false;
+        }
+        if !matches_group_at_end(tokens, Delimiter::Brace) {
+            return false;
+        }
         let body = tokens.len() - 1usize;
         let mut index = keyword + 1usize;
         if punct_at(tokens, index, '<') {
             let close = matching_angle_end(tokens, index, body);
-            if close == index { return false; }
+            if close == index {
+                return false;
+            }
             match parse_generic_params(&token_range(tokens, index, close)) {
                 Result::Ok(_) => {},
-                Result::Err(_) => { return false; },
+                Result::Err(_) => {
+                    return false;
+                },
             }
             index = close;
         }
@@ -661,27 +709,37 @@ pub mod syn {
         let mut for_index = body;
         let mut scan = index;
         while scan < body {
-            if ident_at(tokens, scan, "where") && where_index == body { where_index = scan; }
-            if ident_at(tokens, scan, "for") && for_index == body { for_index = scan; }
+            if ident_at(tokens, scan, "where") && where_index == body {
+                where_index = scan;
+            }
+            if ident_at(tokens, scan, "for") && for_index == body {
+                for_index = scan;
+            }
             scan += 1usize;
         }
-        let head_end = if where_index < body { where_index } else { body };
+        let head_end = if where_index < body {
+            where_index
+        } else {
+            body
+        };
         if for_index < head_end {
             let trait_ty = token_range(tokens, index, for_index);
             let self_ty = token_range(tokens, for_index + 1usize, head_end);
-            if trait_ty.is_empty() || self_ty.is_empty()
-                || !valid_type(&trait_ty) || !valid_type(&self_ty)
-            {
+            if trait_ty.is_empty() || self_ty.is_empty() || !valid_type(&trait_ty) || !valid_type(&self_ty) {
                 return false;
             }
         } else {
             let self_ty = token_range(tokens, index, head_end);
-            if self_ty.is_empty() || !valid_type(&self_ty) { return false; }
+            if self_ty.is_empty() || !valid_type(&self_ty) {
+                return false;
+            }
         }
         if where_index < body {
             match parse_where_predicates(&token_range(tokens, where_index, body)) {
                 Result::Ok(_) => {},
-                Result::Err(_) => { return false; },
+                Result::Err(_) => {
+                    return false;
+                },
             }
         }
         valid_item_body(tokens)
@@ -694,14 +752,13 @@ pub mod syn {
             if punct_at(tokens, index, ';') {
                 let member = token_range(tokens, start, index + 1usize);
                 let mut keyword = attribute_end_index(&member);
-                if ident_at(&member, keyword, "pub") { keyword += 1usize; }
+                if ident_at(&member, keyword, "pub") {
+                    keyword += 1usize;
+                }
                 if ident_at(&member, keyword, "safe") || ident_at(&member, keyword, "unsafe") {
                     keyword += 1usize;
                 }
-                if !ident_at(&member, keyword, "fun")
-                    || punct_at(&member, keyword + 2usize, '<')
-                    || !valid_function_item(&member, keyword)
-                {
+                if !ident_at(&member, keyword, "fun") || punct_at(&member, keyword + 2usize, '<') || !valid_function_item(&member, keyword) {
                     return false;
                 }
                 start = index + 1usize;
@@ -714,18 +771,25 @@ pub mod syn {
     fun valid_extern_item(tokens: &TokenStream, keyword: usize) -> bool {
         match tokens.as_slice().get(keyword + 1usize) {
             Option::Some(TokenTree::Literal(_)) => {},
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         }
         if ident_at(tokens, keyword + 2usize, "fun") {
-            return matches_group_at_end(tokens, Delimiter::Brace)
-                && valid_function_item(tokens, keyword + 2usize);
+            return matches_group_at_end(tokens, Delimiter::Brace) && valid_function_item(tokens, keyword + 2usize);
         }
         if keyword + 3usize != tokens.len() || !brace_at(tokens, keyword + 2usize) {
             return false;
         }
         let prefix = attribute_end_index(tokens);
-        let unsafe_index = if ident_at(tokens, prefix, "pub") { prefix + 1usize } else { prefix };
-        if !ident_at(tokens, unsafe_index, "unsafe") { return false; }
+        let unsafe_index = if ident_at(tokens, prefix, "pub") {
+            prefix + 1usize
+        } else {
+            prefix
+        };
+        if !ident_at(tokens, unsafe_index, "unsafe") {
+            return false;
+        }
         match tokens.as_slice().get(keyword + 2usize) {
             Option::Some(TokenTree::Group(group)) => valid_extern_members(group.stream()),
             _ => false,
@@ -749,7 +813,9 @@ pub mod syn {
         if ident_at(tokens, index, "mod") {
             match tokens.as_slice().get(index + 1usize) {
                 Option::Some(TokenTree::Ident(_)) => {},
-                _ => { return false; },
+                _ => {
+                    return false;
+                },
             }
             if index + 3usize != tokens.len() {
                 return false;
@@ -763,8 +829,7 @@ pub mod syn {
             };
         }
         if ident_at(tokens, index, "use") {
-            return index + 2usize < tokens.len()
-                && punct_at(tokens, tokens.len() - 1usize, ';');
+            return index + 2usize < tokens.len() && punct_at(tokens, tokens.len() - 1usize, ';');
         }
         if ident_at(tokens, index, "const") {
             return valid_const_item(tokens, index);
@@ -805,10 +870,7 @@ pub mod syn {
     fun classify_item(tokens: &TokenStream) -> Result<Item, Error> {
         let keyword = item_keyword_index(tokens);
         if ident_at(tokens, keyword, "fun") && keyword + 2usize == tokens.len() {
-            return Result::Err(Error::new(
-                tokens_span(tokens),
-                "expected function parameter list"
-            ));
+            return Result::Err(Error::new(tokens_span(tokens), "expected function parameter list"));
         }
         if !valid_item(tokens) {
             return Result::Err(Error::new(tokens_span(tokens), "invalid item syntax"));
@@ -841,16 +903,7 @@ pub mod syn {
 
     fun is_item(tokens: &TokenStream) -> bool {
         let index = item_keyword_index(tokens);
-        ident_at(tokens, index, "mod")
-            || ident_at(tokens, index, "use")
-            || ident_at(tokens, index, "fun")
-            || ident_at(tokens, index, "struct")
-            || ident_at(tokens, index, "enum")
-            || ident_at(tokens, index, "trait")
-            || ident_at(tokens, index, "impl")
-            || ident_at(tokens, index, "const")
-            || ident_at(tokens, index, "type")
-            || ident_at(tokens, index, "extern")
+        ident_at(tokens, index, "mod") || ident_at(tokens, index, "use") || ident_at(tokens, index, "fun") || ident_at(tokens, index, "struct") || ident_at(tokens, index, "enum") || ident_at(tokens, index, "trait") || ident_at(tokens, index, "impl") || ident_at(tokens, index, "const") || ident_at(tokens, index, "type") || ident_at(tokens, index, "extern")
     }
 
     fun classify_stmt(tokens: &TokenStream) -> Result<Stmt, Error> {
@@ -919,15 +972,27 @@ pub mod syn {
         if equals == 0usize || equals + 1usize == body.len() {
             return false;
         }
-        let left_end = if equals < body.len() { equals } else { body.len() };
+        let left_end = if equals < body.len() {
+            equals
+        } else {
+            body.len()
+        };
         let left = token_range(&body, 0usize, left_end);
         let colon = find_top_level_punct(&left, ':');
-        let pat_end = if colon < left.len() { colon } else { left.len() };
+        let pat_end = if colon < left.len() {
+            colon
+        } else {
+            left.len()
+        };
         let pat = token_range(&left, 0usize, pat_end);
-        if !valid_pat(&pat) { return false; }
+        if !valid_pat(&pat) {
+            return false;
+        }
         if colon < left.len() {
             let ty = token_range(&left, colon + 1usize, left.len());
-            if ty.is_empty() || !valid_type(&ty) { return false; }
+            if ty.is_empty() || !valid_type(&ty) {
+                return false;
+            }
         }
         if equals < body.len() {
             let value = token_range(&body, equals + 1usize, body.len());
@@ -971,11 +1036,7 @@ pub mod syn {
             return Result::Ok(Expr::Try(tokens.cloned()));
         }
         let path_end = consume_path(tokens, start, tokens.len());
-        if path_end > start
-            && punct_at(tokens, path_end, '!')
-            && group_at(tokens, path_end + 1usize)
-            && path_end + 2usize == tokens.len()
-        {
+        if path_end > start && punct_at(tokens, path_end, '!') && group_at(tokens, path_end + 1usize) && path_end + 2usize == tokens.len() {
             return Result::Ok(Expr::Macro(tokens.cloned()));
         }
         if brace_at(tokens, last) {
@@ -999,12 +1060,7 @@ pub mod syn {
         if has_punct(tokens, '.') {
             return Result::Ok(Expr::Field(tokens.cloned()));
         }
-        if punct_at(tokens, start, '+')
-            || punct_at(tokens, start, '-')
-            || punct_at(tokens, start, '&')
-            || punct_at(tokens, start, '*')
-            || punct_at(tokens, start, '!')
-        {
+        if punct_at(tokens, start, '+') || punct_at(tokens, start, '-') || punct_at(tokens, start, '&') || punct_at(tokens, start, '*') || punct_at(tokens, start, '!') {
             return Result::Ok(Expr::Unary(tokens.cloned()));
         }
         match tokens.as_slice().get(start) {
@@ -1073,8 +1129,7 @@ pub mod syn {
                 } else if parts.len() == 1usize {
                     valid_expr_list(&parts.as_slice()[0usize])
                 } else if parts.len() == 2usize {
-                    valid_expr(&parts.as_slice()[0usize])
-                        && valid_expr(&parts.as_slice()[1usize])
+                    valid_expr(&parts.as_slice()[0usize]) && valid_expr(&parts.as_slice()[1usize])
                 } else {
                     false
                 }
@@ -1091,7 +1146,9 @@ pub mod syn {
         for field in split_top_level(tokens, ',') {
             match field.as_slice().get(0usize) {
                 Option::Some(TokenTree::Ident(_)) => {},
-                _ => { return false; },
+                _ => {
+                    return false;
+                },
             }
             if field.len() > 1usize {
                 if !punct_at(&field, 1usize, ':') || punct_at(&field, 2usize, ':') {
@@ -1109,7 +1166,9 @@ pub mod syn {
     fun binary_operator_end(tokens: &TokenStream, index: usize) -> usize {
         let value = match tokens.as_slice().get(index) {
             Option::Some(TokenTree::Punct(value)) => value.as_char(),
-            _ => { return index; },
+            _ => {
+                return index;
+            },
         };
         if value == '!' {
             if punct_joint_at(tokens, index, '!') && punct_at(tokens, index + 1usize, '=') {
@@ -1117,33 +1176,17 @@ pub mod syn {
             }
             return index;
         }
-        if value != '='
-            && value != '+'
-            && value != '-'
-            && value != '*'
-            && value != '/'
-            && value != '%'
-            && value != '&'
-            && value != '|'
-            && value != '^'
-            && value != '<'
-            && value != '>'
-        {
+        if value != '=' && value != '+' && value != '-' && value != '*' && value != '/' && value != '%' && value != '&' && value != '|' && value != '^' && value != '<' && value != '>' {
             return index;
         }
         let mut end = index + 1usize;
-        if punct_joint_at(tokens, index, value)
-            && punct_at(tokens, end, value)
-            && (value == '&' || value == '|' || value == '<' || value == '>')
-        {
+        if punct_joint_at(tokens, index, value) && punct_at(tokens, end, value) && (value == '&' || value == '|' || value == '<' || value == '>') {
             end += 1usize;
         }
-        if punct_at(tokens, end, '=')
-            && punct_joint_at(tokens, end - 1usize, match tokens.as_slice().get(end - 1usize) {
-                Option::Some(TokenTree::Punct(punct)) => punct.as_char(),
-                _ => value,
-            })
-        {
+        if punct_at(tokens, end, '=') && punct_joint_at(tokens, end - 1usize, match tokens.as_slice().get(end - 1usize) {
+            Option::Some(TokenTree::Punct(punct)) => punct.as_char(),
+            _ => value,
+        }) {
             end += 1usize;
         }
         end
@@ -1152,11 +1195,7 @@ pub mod syn {
     fun expr_binary_split(tokens: &TokenStream) -> usize {
         let mut index = attribute_end_index(tokens) + 1usize;
         while index < tokens.len() {
-            if punct_at(tokens, index, '<')
-                && index >= 2usize
-                && punct_at(tokens, index - 1usize, ':')
-                && punct_at(tokens, index - 2usize, ':')
-            {
+            if punct_at(tokens, index, '<') && index >= 2usize && punct_at(tokens, index - 1usize, ':') && punct_at(tokens, index - 2usize, ':') {
                 let close = matching_angle_end(tokens, index, tokens.len());
                 if close > index {
                     index = close;
@@ -1210,7 +1249,9 @@ pub mod syn {
         let condition = token_range(tokens, 1usize, brace);
         let group = match tokens.as_slice().get(brace) {
             Option::Some(TokenTree::Group(group)) => group,
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         };
         if condition.is_empty() || !valid_expr(&condition) || !valid_block(group) {
             return false;
@@ -1246,7 +1287,9 @@ pub mod syn {
         }
         let group = match tokens.as_slice().get(brace) {
             Option::Some(TokenTree::Group(group)) => group,
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         };
         if !valid_block(group) {
             return false;
@@ -1273,9 +1316,7 @@ pub mod syn {
         }
         for arm in split_top_level(tokens, ',') {
             let mut arrow = 0usize;
-            while arrow + 1usize < arm.len()
-                && !(punct_joint_at(&arm, arrow, '=') && punct_at(&arm, arrow + 1usize, '>'))
-            {
+            while arrow + 1usize < arm.len() && !(punct_joint_at(&arm, arrow, '=') && punct_at(&arm, arrow + 1usize, '>')) {
                 arrow += 1usize;
             }
             if arrow + 1usize >= arm.len() {
@@ -1337,10 +1378,14 @@ pub mod syn {
                 Option::Some(TokenTree::Group(group)) => {
                     match group.delimiter() {
                         Delimiter::Parenthesis => index += 1usize,
-                        _ => { return false; },
+                        _ => {
+                            return false;
+                        },
                     }
                 },
-                _ => { return false; },
+                _ => {
+                    return false;
+                },
             }
             if index < param.len() {
                 if !punct_at(&param, index, ':') {
@@ -1367,7 +1412,9 @@ pub mod syn {
                 }
                 match group.delimiter() {
                     Delimiter::Bracket => {},
-                    _ => { return false; },
+                    _ => {
+                        return false;
+                    },
                 }
                 let stream = group.stream();
                 let arrow = find_top_level_arrow(stream);
@@ -1420,7 +1467,9 @@ pub mod syn {
             Option::Some(TokenTree::Group(group)) => {
                 match group.delimiter() {
                     Delimiter::Bracket => {},
-                    _ => { return false; },
+                    _ => {
+                        return false;
+                    },
                 }
                 find_top_level_arrow(group.stream()) < group.stream().len()
             },
@@ -1467,12 +1516,7 @@ pub mod syn {
         }
         let end = body.len();
         let mut index = 0usize;
-        if punct_at(&body, index, '+')
-            || punct_at(&body, index, '-')
-            || punct_at(&body, index, '*')
-            || punct_at(&body, index, '!')
-            || punct_at(&body, index, '&')
-        {
+        if punct_at(&body, index, '+') || punct_at(&body, index, '-') || punct_at(&body, index, '*') || punct_at(&body, index, '!') || punct_at(&body, index, '&') {
             index += 1usize;
             if punct_at(&body, 0usize, '&') && ident_at(&body, index, "mut") {
                 index += 1usize;
@@ -1530,13 +1574,12 @@ pub mod syn {
                     can_struct = false;
                 }
             },
-            _ => { return false; },
+            _ => {
+                return false;
+            },
         }
         while index < end {
-            if punct_at(&body, index, ':')
-                && punct_at(&body, index + 1usize, ':')
-                && punct_at(&body, index + 2usize, '<')
-            {
+            if punct_at(&body, index, ':') && punct_at(&body, index + 1usize, ':') && punct_at(&body, index + 2usize, '<') {
                 let close = matching_angle_end(&body, index + 2usize, end);
                 if close == index + 2usize {
                     return false;
@@ -1552,16 +1595,24 @@ pub mod syn {
                 Option::Some(TokenTree::Group(group)) => {
                     match group.delimiter() {
                         Delimiter::Parenthesis => {
-                            if !valid_expr_list(group.stream()) { return false; }
+                            if !valid_expr_list(group.stream()) {
+                                return false;
+                            }
                         },
                         Delimiter::Bracket => {
-                            if group.stream().is_empty() || !valid_expr(group.stream()) { return false; }
+                            if group.stream().is_empty() || !valid_expr(group.stream()) {
+                                return false;
+                            }
                         },
                         Delimiter::Brace => {
-                            if !can_struct || !valid_struct_expr_fields(group.stream()) { return false; }
+                            if !can_struct || !valid_struct_expr_fields(group.stream()) {
+                                return false;
+                            }
                         },
                         Delimiter::None => {
-                            if !valid_expr(group.stream()) { return false; }
+                            if !valid_expr(group.stream()) {
+                                return false;
+                            }
                         },
                     }
                     index += 1usize;
@@ -1577,49 +1628,25 @@ pub mod syn {
                             index += 2usize;
                             can_struct = false;
                         },
-                        _ => { return false; },
+                        _ => {
+                            return false;
+                        },
                     }
                 },
                 Option::Some(TokenTree::Punct(punct)) if punct.as_char() == '?' => {
                     index += 1usize;
                     can_struct = false;
                 },
-                _ => { return false; },
+                _ => {
+                    return false;
+                },
             }
         }
         true
     }
 
     fun reserved_ident_at(tokens: &TokenStream, index: usize) -> bool {
-        ident_at(tokens, index, "as")
-            || ident_at(tokens, index, "break")
-            || ident_at(tokens, index, "const")
-            || ident_at(tokens, index, "continue")
-            || ident_at(tokens, index, "else")
-            || ident_at(tokens, index, "enum")
-            || ident_at(tokens, index, "extern")
-            || ident_at(tokens, index, "false")
-            || ident_at(tokens, index, "for")
-            || ident_at(tokens, index, "fun")
-            || ident_at(tokens, index, "if")
-            || ident_at(tokens, index, "impl")
-            || ident_at(tokens, index, "in")
-            || ident_at(tokens, index, "let")
-            || ident_at(tokens, index, "match")
-            || ident_at(tokens, index, "mod")
-            || ident_at(tokens, index, "move")
-            || ident_at(tokens, index, "mut")
-            || ident_at(tokens, index, "pub")
-            || ident_at(tokens, index, "return")
-            || ident_at(tokens, index, "safe")
-            || ident_at(tokens, index, "struct")
-            || ident_at(tokens, index, "trait")
-            || ident_at(tokens, index, "true")
-            || ident_at(tokens, index, "type")
-            || ident_at(tokens, index, "unsafe")
-            || ident_at(tokens, index, "use")
-            || ident_at(tokens, index, "where")
-            || ident_at(tokens, index, "while")
+        ident_at(tokens, index, "as") || ident_at(tokens, index, "break") || ident_at(tokens, index, "const") || ident_at(tokens, index, "continue") || ident_at(tokens, index, "else") || ident_at(tokens, index, "enum") || ident_at(tokens, index, "extern") || ident_at(tokens, index, "false") || ident_at(tokens, index, "for") || ident_at(tokens, index, "fun") || ident_at(tokens, index, "if") || ident_at(tokens, index, "impl") || ident_at(tokens, index, "in") || ident_at(tokens, index, "let") || ident_at(tokens, index, "match") || ident_at(tokens, index, "mod") || ident_at(tokens, index, "move") || ident_at(tokens, index, "mut") || ident_at(tokens, index, "pub") || ident_at(tokens, index, "return") || ident_at(tokens, index, "safe") || ident_at(tokens, index, "struct") || ident_at(tokens, index, "trait") || ident_at(tokens, index, "true") || ident_at(tokens, index, "type") || ident_at(tokens, index, "unsafe") || ident_at(tokens, index, "use") || ident_at(tokens, index, "where") || ident_at(tokens, index, "while")
     }
 
     fun consume_path(tokens: &TokenStream, start: usize, end: usize) -> usize {
@@ -1627,19 +1654,24 @@ pub mod syn {
         if punct_at(tokens, index, ':') && punct_at(tokens, index + 1usize, ':') {
             index += 2usize;
         }
-        if reserved_ident_at(tokens, index) { return start; }
+        if reserved_ident_at(tokens, index) {
+            return start;
+        }
         match tokens.as_slice().get(index) {
             Option::Some(TokenTree::Ident(_)) => index += 1usize,
-            _ => { return start; },
+            _ => {
+                return start;
+            },
         }
-        while index + 2usize < end
-            && punct_at(tokens, index, ':')
-            && punct_at(tokens, index + 1usize, ':')
-        {
-            if reserved_ident_at(tokens, index + 2usize) { return start; }
+        while index + 2usize < end && punct_at(tokens, index, ':') && punct_at(tokens, index + 1usize, ':') {
+            if reserved_ident_at(tokens, index + 2usize) {
+                return start;
+            }
             match tokens.as_slice().get(index + 2usize) {
                 Option::Some(TokenTree::Ident(_)) => index += 3usize,
-                _ => { return start; },
+                _ => {
+                    return start;
+                },
             }
         }
         index
@@ -1681,7 +1713,9 @@ pub mod syn {
     }
 
     fun valid_bound_arguments(tokens: &TokenStream) -> bool {
-        if tokens.is_empty() { return true; }
+        if tokens.is_empty() {
+            return true;
+        }
         for argument in split_top_level(tokens, ',') {
             let equals = find_top_level_punct(&argument, '=');
             if equals < argument.len() {
@@ -1690,10 +1724,14 @@ pub mod syn {
                 }
                 match argument.as_slice().get(0usize) {
                     Option::Some(TokenTree::Ident(_)) => {},
-                    _ => { return false; },
+                    _ => {
+                        return false;
+                    },
                 }
                 let value = token_range(&argument, equals + 1usize, argument.len());
-                if value.is_empty() || !valid_type(&value) { return false; }
+                if value.is_empty() || !valid_type(&value) {
+                    return false;
+                }
             } else if !valid_type(&argument) {
                 return false;
             }
@@ -1709,8 +1747,7 @@ pub mod syn {
                 if parts.len() == 1usize {
                     valid_type(&parts.as_slice()[0usize])
                 } else if parts.len() == 2usize {
-                    valid_type(&parts.as_slice()[0usize])
-                        && valid_expr(&parts.as_slice()[1usize])
+                    valid_type(&parts.as_slice()[0usize]) && valid_expr(&parts.as_slice()[1usize])
                 } else {
                     false
                 }
@@ -1811,10 +1848,7 @@ pub mod syn {
             },
             Option::Some(TokenTree::Literal(literal)) => {
                 let text = literal.as_str().as_bytes();
-                return end == 1usize
-                    && !text.is_empty()
-                    && text[0usize] >= 48u8
-                    && text[0usize] <= 57u8;
+                return end == 1usize && !text.is_empty() && text[0usize] >= 48u8 && text[0usize] <= 57u8;
             },
             _ => {},
         }
@@ -1841,9 +1875,7 @@ pub mod syn {
 
     fun classify_type(tokens: &TokenStream) -> Result<Type, Error> {
         let start = attribute_end_index(tokens);
-        if start + 1usize == tokens.len()
-            && (punct_at(tokens, start, '&') || punct_at(tokens, start, '*'))
-        {
+        if start + 1usize == tokens.len() && (punct_at(tokens, start, '&') || punct_at(tokens, start, '*')) {
             return Result::Err(Error::new(tokens_span(tokens), "incomplete type syntax"));
         }
         if !valid_type(tokens) {
@@ -1882,7 +1914,9 @@ pub mod syn {
             let mut index = attribute_end_index(&field);
             match field.as_slice().get(index) {
                 Option::Some(TokenTree::Ident(_)) => index += 1usize,
-                _ => { return false; },
+                _ => {
+                    return false;
+                },
             }
             if index < field.len() {
                 if !punct_at(&field, index, ':') || punct_at(&field, index + 1usize, ':') {
@@ -1926,7 +1960,9 @@ pub mod syn {
             return valid_pat(&inner);
         }
         match body.as_slice().get(0usize) {
-            Option::Some(TokenTree::Literal(_)) => { return end == 1usize; },
+            Option::Some(TokenTree::Literal(_)) => {
+                return end == 1usize;
+            },
             Option::Some(TokenTree::Group(group)) => {
                 if end != 1usize {
                     return false;
@@ -1940,7 +1976,9 @@ pub mod syn {
                         }
                         return true;
                     },
-                    _ => { return false; },
+                    _ => {
+                        return false;
+                    },
                 }
             },
             _ => {},
@@ -2060,10 +2098,7 @@ pub mod syn {
             } else if punct_at(tokens, index, '>') && angle_depth > 0usize {
                 angle_depth -= 1usize;
             } else if punct_at(tokens, index, expected) && angle_depth == 0usize {
-                if expected != ':'
-                    || (!punct_at(tokens, index + 1usize, ':')
-                        && (index == 0usize || !punct_at(tokens, index - 1usize, ':')))
-                {
+                if expected != ':' || (!punct_at(tokens, index + 1usize, ':') && (index == 0usize || !punct_at(tokens, index - 1usize, ':'))) {
                     return index;
                 }
             }
@@ -2074,10 +2109,7 @@ pub mod syn {
 
     fun parse_attributes(tokens: &TokenStream, index: &mut usize) -> Vector<Attribute> {
         let mut attrs = Vector::new();
-        while *index + 1usize < tokens.len()
-            && punct_at(tokens, *index, '#')
-            && bracket_at(tokens, *index + 1usize)
-        {
+        while *index + 1usize < tokens.len() && punct_at(tokens, *index, '#') && bracket_at(tokens, *index + 1usize) {
             attrs.push(Attribute {
                 tokens: token_range(tokens, *index, *index + 2usize),
             });
@@ -2108,7 +2140,9 @@ pub mod syn {
         let vis = parse_visibility(tokens, &mut index);
         let ident = match parse_ident_at(tokens, index, "expected field name") {
             Result::Ok(value) => value,
-            Result::Err(error) => { return Result::Err(error); },
+            Result::Err(error) => {
+                return Result::Err(error);
+            },
         };
         index += 1usize;
         if !punct_at(tokens, index, ':') || punct_at(tokens, index + 1usize, ':') {
@@ -2121,7 +2155,9 @@ pub mod syn {
         let ty_tokens = token_range(tokens, index, tokens.len());
         let ty = match classify_type(&ty_tokens) {
             Result::Ok(value) => value,
-            Result::Err(error) => { return Result::Err(error); },
+            Result::Err(error) => {
+                return Result::Err(error);
+            },
         };
         Result::Ok(Field {
             attrs,
@@ -2137,7 +2173,9 @@ pub mod syn {
         for field_tokens in split_top_level(tokens, ',') {
             match parse_field(&field_tokens) {
                 Result::Ok(field) => fields.push(field),
-                Result::Err(error) => { return Result::Err(error); },
+                Result::Err(error) => {
+                    return Result::Err(error);
+                },
             }
         }
         Result::Ok(fields)
@@ -2148,7 +2186,9 @@ pub mod syn {
         for field_tokens in split_top_level(tokens, ',') {
             match classify_type(&field_tokens) {
                 Result::Ok(field) => fields.push(field),
-                Result::Err(error) => { return Result::Err(error); },
+                Result::Err(error) => {
+                    return Result::Err(error);
+                },
             }
         }
         Result::Ok(fields)
@@ -2159,7 +2199,9 @@ pub mod syn {
         let attrs = parse_attributes(tokens, &mut index);
         let ident = match parse_ident_at(tokens, index, "expected variant name") {
             Result::Ok(value) => value,
-            Result::Err(error) => { return Result::Err(error); },
+            Result::Err(error) => {
+                return Result::Err(error);
+            },
         };
         index += 1usize;
         let fields = if index == tokens.len() {
@@ -2168,33 +2210,28 @@ pub mod syn {
             match tokens.as_slice().get(index) {
                 Option::Some(TokenTree::Group(group)) => {
                     if index + 1usize != tokens.len() {
-                        return Result::Err(Error::new(
-                            tokens_span(tokens),
-                            "unexpected tokens after enum variant"
-                        ));
+                        return Result::Err(Error::new(tokens_span(tokens), "unexpected tokens after enum variant"));
                     }
                     match group.delimiter() {
                         Delimiter::Parenthesis => match parse_unnamed_fields(group.stream()) {
                             Result::Ok(values) => Fields::Unnamed(values),
-                            Result::Err(error) => { return Result::Err(error); },
+                            Result::Err(error) => {
+                                return Result::Err(error);
+                            },
                         },
                         Delimiter::Brace => match parse_named_fields(group.stream()) {
                             Result::Ok(values) => Fields::Named(values),
-                            Result::Err(error) => { return Result::Err(error); },
+                            Result::Err(error) => {
+                                return Result::Err(error);
+                            },
                         },
                         _ => {
-                            return Result::Err(Error::new(
-                                group.span(),
-                                "expected tuple or named variant fields"
-                            ));
+                            return Result::Err(Error::new(group.span(), "expected tuple or named variant fields"));
                         },
                     }
                 },
                 _ => {
-                    return Result::Err(Error::new(
-                        tokens_span(tokens),
-                        "expected enum variant fields"
-                    ));
+                    return Result::Err(Error::new(tokens_span(tokens), "expected enum variant fields"));
                 },
             }
         };
@@ -2211,7 +2248,9 @@ pub mod syn {
         for variant_tokens in split_top_level(tokens, ',') {
             match parse_variant(&variant_tokens) {
                 Result::Ok(variant) => variants.push(variant),
-                Result::Err(error) => { return Result::Err(error); },
+                Result::Err(error) => {
+                    return Result::Err(error);
+                },
             }
         }
         Result::Ok(variants)
@@ -2222,26 +2261,26 @@ pub mod syn {
         if tokens.is_empty() {
             return Result::Ok(Vector::new());
         }
-        if tokens.len() < 3usize
-            || !punct_at(tokens, 0usize, '<')
-            || !punct_at(tokens, tokens.len() - 1usize, '>')
-        {
+        if tokens.len() < 3usize || !punct_at(tokens, 0usize, '<') || !punct_at(tokens, tokens.len() - 1usize, '>') {
             return Result::Err(Error::new(tokens_span(tokens), "invalid generic parameters"));
         }
         let inner = token_range(tokens, 1usize, tokens.len() - 1usize);
         for param_tokens in split_top_level(&inner, ',') {
             let is_const = ident_at(&param_tokens, 0usize, "const");
-            let name_index = if is_const { 1usize } else { 0usize };
+            let name_index = if is_const {
+                1usize
+            } else {
+                0usize
+            };
             let ident = match parse_ident_at(&param_tokens, name_index, "expected generic parameter") {
                 Result::Ok(value) => value,
-                Result::Err(error) => { return Result::Err(error); },
+                Result::Err(error) => {
+                    return Result::Err(error);
+                },
             };
             if is_const {
                 if !punct_at(&param_tokens, name_index + 1usize, ':') {
-                    return Result::Err(Error::new(
-                        tokens_span(&param_tokens),
-                        "expected `:` in const generic parameter"
-                    ));
+                    return Result::Err(Error::new(tokens_span(&param_tokens), "expected `:` in const generic parameter"));
                 }
                 let ty_tokens = token_range(&param_tokens, name_index + 2usize, param_tokens.len());
                 if ty_tokens.is_empty() || !valid_type(&ty_tokens) {
@@ -2249,7 +2288,9 @@ pub mod syn {
                 }
                 let ty = match classify_type(&ty_tokens) {
                     Result::Ok(value) => value,
-                    Result::Err(error) => { return Result::Err(error); },
+                    Result::Err(error) => {
+                        return Result::Err(error);
+                    },
                 };
                 params.push(GenericParam::Const(ConstParam {
                     ident: ident.clone(),
@@ -2259,7 +2300,11 @@ pub mod syn {
             } else {
                 let colon = find_top_level_punct(&param_tokens, ':');
                 let equals = find_top_level_punct(&param_tokens, '=');
-                let bounds_end = if equals < param_tokens.len() { equals } else { param_tokens.len() };
+                let bounds_end = if equals < param_tokens.len() {
+                    equals
+                } else {
+                    param_tokens.len()
+                };
                 let bounds = if colon < bounds_end {
                     token_range(&param_tokens, colon + 1usize, bounds_end)
                 } else {
@@ -2270,16 +2315,13 @@ pub mod syn {
                 } else {
                     TokenStream::new()
                 };
-                let name_end = if colon < bounds_end { colon } else { bounds_end };
-                if name_end != 1usize
-                    || (colon < bounds_end && (bounds.is_empty() || !valid_bounds(&bounds)))
-                    || (equals < param_tokens.len()
-                        && (default.is_empty() || !valid_type(&default)))
-                {
-                    return Result::Err(Error::new(
-                        tokens_span(&param_tokens),
-                        "invalid type generic parameter"
-                    ));
+                let name_end = if colon < bounds_end {
+                    colon
+                } else {
+                    bounds_end
+                };
+                if name_end != 1usize || (colon < bounds_end && (bounds.is_empty() || !valid_bounds(&bounds))) || (equals < param_tokens.len() && (default.is_empty() || !valid_type(&default))) {
+                    return Result::Err(Error::new(tokens_span(&param_tokens), "invalid type generic parameter"));
                 }
                 params.push(GenericParam::Type(TypeParam {
                     ident,
@@ -2297,33 +2339,30 @@ pub mod syn {
         if tokens.is_empty() {
             return Result::Ok(Vector::new());
         }
-        let start = if ident_at(tokens, 0usize, "where") { 1usize } else { 0usize };
+        let start = if ident_at(tokens, 0usize, "where") {
+            1usize
+        } else {
+            0usize
+        };
         let body = token_range(tokens, start, tokens.len());
         for predicate_tokens in split_top_level(&body, ',') {
             let colon = find_top_level_punct(&predicate_tokens, ':');
             if colon == predicate_tokens.len() {
-                return Result::Err(Error::new(
-                    tokens_span(&predicate_tokens),
-                    "expected `:` in where predicate"
-                ));
+                return Result::Err(Error::new(tokens_span(&predicate_tokens), "expected `:` in where predicate"));
             }
             let ty_tokens = token_range(&predicate_tokens, 0usize, colon);
             let bounds = token_range(&predicate_tokens, colon + 1usize, predicate_tokens.len());
             if ty_tokens.is_empty() || bounds.is_empty() {
-                return Result::Err(Error::new(
-                    tokens_span(&predicate_tokens),
-                    "incomplete where predicate"
-                ));
+                return Result::Err(Error::new(tokens_span(&predicate_tokens), "incomplete where predicate"));
             }
             let ty = match classify_type(&ty_tokens) {
                 Result::Ok(value) => value,
-                Result::Err(error) => { return Result::Err(error); },
+                Result::Err(error) => {
+                    return Result::Err(error);
+                },
             };
             if !valid_bounds(&bounds) {
-                return Result::Err(Error::new(
-                    tokens_span(&predicate_tokens),
-                    "invalid where predicate bounds"
-                ));
+                return Result::Err(Error::new(tokens_span(&predicate_tokens), "invalid where predicate bounds"));
             }
             predicates.push(WherePredicate {
                 ty,
@@ -2356,10 +2395,18 @@ pub mod syn {
                 let keyword = item_keyword_index(tokens);
                 let body = token_range(tokens, keyword + 1usize, tokens.len() - 1usize);
                 let equals = find_top_level_punct(&body, '=');
-                let left_end = if equals < body.len() { equals } else { body.len() };
+                let left_end = if equals < body.len() {
+                    equals
+                } else {
+                    body.len()
+                };
                 let left = token_range(&body, 0usize, left_end);
                 let colon = find_top_level_punct(&left, ':');
-                let pat_end = if colon < left.len() { colon } else { left.len() };
+                let pat_end = if colon < left.len() {
+                    colon
+                } else {
+                    left.len()
+                };
                 let pat = token_range(&left, 0usize, pat_end);
                 visit_pat_tokens(visitor, &pat);
                 if colon < left.len() {
@@ -2451,9 +2498,7 @@ pub mod syn {
             match tokens.as_slice().get(path_end) {
                 Option::Some(TokenTree::Group(group)) => {
                     visit_type_list(visitor, group.stream());
-                    if punct_joint_at(tokens, path_end + 1usize, '-')
-                        && punct_at(tokens, path_end + 2usize, '>')
-                    {
+                    if punct_joint_at(tokens, path_end + 1usize, '-') && punct_at(tokens, path_end + 2usize, '>') {
                         let output = token_range(tokens, path_end + 3usize, tokens.len());
                         visit_type_tokens(visitor, &output);
                     }
@@ -2475,8 +2520,12 @@ pub mod syn {
                 for param in params.as_slice() {
                     match param {
                         GenericParam::Type(param) => {
-                            if !param.bounds.is_empty() { visit_bounds(visitor, &param.bounds); }
-                            if !param.default.is_empty() { visit_type_tokens(visitor, &param.default); }
+                            if !param.bounds.is_empty() {
+                                visit_bounds(visitor, &param.bounds);
+                            }
+                            if !param.default.is_empty() {
+                                visit_type_tokens(visitor, &param.default);
+                            }
                         },
                         GenericParam::Const(param) => visitor.visit_type(&param.ty),
                     }
@@ -2580,11 +2629,19 @@ pub mod syn {
         let mut for_index = body;
         let mut scan = index;
         while scan < body {
-            if ident_at(tokens, scan, "where") && where_index == body { where_index = scan; }
-            if ident_at(tokens, scan, "for") && for_index == body { for_index = scan; }
+            if ident_at(tokens, scan, "where") && where_index == body {
+                where_index = scan;
+            }
+            if ident_at(tokens, scan, "for") && for_index == body {
+                for_index = scan;
+            }
             scan += 1usize;
         }
-        let head_end = if where_index < body { where_index } else { body };
+        let head_end = if where_index < body {
+            where_index
+        } else {
+            body
+        };
         if for_index < head_end {
             visit_type_tokens(visitor, &token_range(tokens, index, for_index));
             visit_type_tokens(visitor, &token_range(tokens, for_index + 1usize, head_end));
@@ -2602,7 +2659,10 @@ pub mod syn {
             let mut fun_index = member.len();
             let mut index = 0usize;
             while index < member.len() {
-                if ident_at(&member, index, "fun") { fun_index = index; break; }
+                if ident_at(&member, index, "fun") {
+                    fun_index = index;
+                    break;
+                }
                 index += 1usize;
             }
             if fun_index < member.len() {
@@ -2688,9 +2748,7 @@ pub mod syn {
     fun visit_match_arms<V: Visit>(visitor: &mut V, tokens: &TokenStream) {
         for arm in split_top_level(tokens, ',') {
             let mut arrow = 0usize;
-            while arrow + 1usize < arm.len()
-                && !(punct_joint_at(&arm, arrow, '=') && punct_at(&arm, arrow + 1usize, '>'))
-            {
+            while arrow + 1usize < arm.len() && !(punct_joint_at(&arm, arrow, '=') && punct_at(&arm, arrow + 1usize, '>')) {
                 arrow += 1usize;
             }
             let mut guard = arrow;
@@ -2757,9 +2815,7 @@ pub mod syn {
             },
             Expr::Unary(_) => {
                 let mut start = attribute_end_index(tokens) + 1usize;
-                if punct_at(tokens, attribute_end_index(tokens), '&')
-                    && (ident_at(tokens, start, "mut") || punct_at(tokens, start, '&'))
-                {
+                if punct_at(tokens, attribute_end_index(tokens), '&') && (ident_at(tokens, start, "mut") || punct_at(tokens, start, '&')) {
                     start += 1usize;
                 }
                 let value = token_range(tokens, start, tokens.len());
@@ -3130,11 +3186,7 @@ pub mod syn {
         }
     }
 
-    fun fold_expr_separated<F: Fold>(
-        folder: &mut F,
-        tokens: &TokenStream,
-        separator: char
-    ) -> TokenStream {
+    fun fold_expr_separated<F: Fold>(folder: &mut F, tokens: &TokenStream, separator: char) -> TokenStream {
         let mut output = TokenStream::new();
         let mut start = 0usize;
         let mut angle_depth = 0usize;
@@ -3161,11 +3213,7 @@ pub mod syn {
         output
     }
 
-    fun fold_type_separated<F: Fold>(
-        folder: &mut F,
-        tokens: &TokenStream,
-        separator: char
-    ) -> TokenStream {
+    fun fold_type_separated<F: Fold>(folder: &mut F, tokens: &TokenStream, separator: char) -> TokenStream {
         let mut output = TokenStream::new();
         let mut start = 0usize;
         let mut angle_depth = 0usize;
@@ -3192,11 +3240,7 @@ pub mod syn {
         output
     }
 
-    fun fold_pat_separated<F: Fold>(
-        folder: &mut F,
-        tokens: &TokenStream,
-        separator: char
-    ) -> TokenStream {
+    fun fold_pat_separated<F: Fold>(folder: &mut F, tokens: &TokenStream, separator: char) -> TokenStream {
         let mut output = TokenStream::new();
         let mut start = 0usize;
         let mut index = 0usize;
@@ -3275,9 +3319,7 @@ pub mod syn {
                 let arm = token_range(tokens, start, end);
                 if !arm.is_empty() {
                     let mut arrow = 0usize;
-                    while arrow + 1usize < arm.len()
-                        && !(punct_joint_at(&arm, arrow, '=') && punct_at(&arm, arrow + 1usize, '>'))
-                    {
+                    while arrow + 1usize < arm.len() && !(punct_joint_at(&arm, arrow, '=') && punct_at(&arm, arrow + 1usize, '>')) {
                         arrow += 1usize;
                     }
                     let mut guard = arrow;
@@ -3370,7 +3412,9 @@ pub mod syn {
         for stmt in node.stmts {
             stmts.push(folder.fold_stmt(stmt));
         }
-        File { stmts }
+        File {
+            stmts
+        }
     }
 
     fun fold_stmt_default<F: Fold>(folder: &mut F, node: Stmt) -> Stmt {
@@ -3419,10 +3463,18 @@ pub mod syn {
         let keyword = item_keyword_index(tokens);
         let body = token_range(tokens, keyword + 1usize, tokens.len() - 1usize);
         let equals = find_top_level_punct(&body, '=');
-        let left_end = if equals < body.len() { equals } else { body.len() };
+        let left_end = if equals < body.len() {
+            equals
+        } else {
+            body.len()
+        };
         let left = token_range(&body, 0usize, left_end);
         let colon = find_top_level_punct(&left, ':');
-        let pat_end = if colon < left.len() { colon } else { left.len() };
+        let pat_end = if colon < left.len() {
+            colon
+        } else {
+            left.len()
+        };
         let pat = token_range(&left, 0usize, pat_end);
         let mut output = TokenStream::new();
         append_range(&mut output, tokens, 0usize, keyword + 1usize);
@@ -3480,11 +3532,7 @@ pub mod syn {
         output
     }
 
-    fun fold_control_tokens<F: Fold>(
-        folder: &mut F,
-        tokens: &TokenStream,
-        value_start: usize
-    ) -> TokenStream {
+    fun fold_control_tokens<F: Fold>(folder: &mut F, tokens: &TokenStream, value_start: usize) -> TokenStream {
         let brace = first_brace(tokens, value_start);
         let value = token_range(tokens, value_start, brace);
         let mut output = TokenStream::new();
@@ -3573,9 +3621,7 @@ pub mod syn {
             Expr::Unary(tokens) => {
                 let prefix = attribute_end_index(&tokens);
                 let mut start = prefix + 1usize;
-                if punct_at(&tokens, prefix, '&')
-                    && (punct_at(&tokens, start, '&') || ident_at(&tokens, start, "mut"))
-                {
+                if punct_at(&tokens, prefix, '&') && (punct_at(&tokens, start, '&') || ident_at(&tokens, start, "mut")) {
                     start += 1usize;
                 }
                 let value = token_range(&tokens, start, tokens.len());
@@ -3715,10 +3761,7 @@ pub mod syn {
         } else {
             match tokens.as_slice().get(path_end) {
                 Option::Some(TokenTree::Group(group)) => {
-                    output.push(rebuilt_group(
-                        group,
-                        fold_type_separated(folder, group.stream(), ',')
-                    ));
+                    output.push(rebuilt_group(group, fold_type_separated(folder, group.stream(), ',')));
                     let arrow = path_end + 1usize;
                     if punct_joint_at(tokens, arrow, '-') && punct_at(tokens, arrow + 1usize, '>') {
                         append_range(&mut output, tokens, arrow, arrow + 2usize);
@@ -3900,7 +3943,11 @@ pub mod syn {
     }
 
     fun fold_where_clause<F: Fold>(folder: &mut F, tokens: &TokenStream) -> TokenStream {
-        let start = if ident_at(tokens, 0usize, "where") { 1usize } else { 0usize };
+        let start = if ident_at(tokens, 0usize, "where") {
+            1usize
+        } else {
+            0usize
+        };
         let mut output = TokenStream::new();
         append_range(&mut output, tokens, 0usize, start);
         let body = token_range(tokens, start, tokens.len());
@@ -3948,14 +3995,22 @@ pub mod syn {
                     let equals = find_top_level_punct(&param, '=');
                     if ident_at(&param, 0usize, "const") && colon < param.len() {
                         append_range(&mut output, &param, 0usize, colon + 1usize);
-                        let ty_end = if equals < param.len() { equals } else { param.len() };
+                        let ty_end = if equals < param.len() {
+                            equals
+                        } else {
+                            param.len()
+                        };
                         let ty = token_range(&param, colon + 1usize, ty_end);
                         output.extend(fold_type_tokens(folder, &ty));
                         if equals < param.len() {
                             append_range(&mut output, &param, equals, param.len());
                         }
                     } else {
-                        let bounds_end = if equals < param.len() { equals } else { param.len() };
+                        let bounds_end = if equals < param.len() {
+                            equals
+                        } else {
+                            param.len()
+                        };
                         if colon < bounds_end {
                             append_range(&mut output, &param, 0usize, colon + 1usize);
                             let bounds = token_range(&param, colon + 1usize, bounds_end);
@@ -4095,9 +4150,7 @@ pub mod syn {
             output.push(tokens.as_slice()[index].clone());
             output.push(tokens.as_slice()[index + 1usize].clone());
             let mut end = index + 2usize;
-            while end < tokens.len() && !ident_at(tokens, end, "where") && !brace_at(tokens, end)
-                && !punct_at(tokens, end, ';')
-            {
+            while end < tokens.len() && !ident_at(tokens, end, "where") && !brace_at(tokens, end) && !punct_at(tokens, end, ';') {
                 end += 1usize;
             }
             let ty = token_range(tokens, index + 2usize, end);
@@ -4180,11 +4233,19 @@ pub mod syn {
         let mut for_index = body;
         let mut scan = index;
         while scan < body {
-            if ident_at(tokens, scan, "where") && where_index == body { where_index = scan; }
-            if ident_at(tokens, scan, "for") && for_index == body { for_index = scan; }
+            if ident_at(tokens, scan, "where") && where_index == body {
+                where_index = scan;
+            }
+            if ident_at(tokens, scan, "for") && for_index == body {
+                for_index = scan;
+            }
             scan += 1usize;
         }
-        let head_end = if where_index < body { where_index } else { body };
+        let head_end = if where_index < body {
+            where_index
+        } else {
+            body
+        };
         if for_index < head_end {
             output.extend(fold_type_tokens(folder, &token_range(tokens, index, for_index)));
             output.push(tokens.as_slice()[for_index].clone());
@@ -4214,15 +4275,15 @@ pub mod syn {
                 let mut fun_index = member.len();
                 let mut scan = 0usize;
                 while scan < member.len() {
-                    if ident_at(&member, scan, "fun") { fun_index = scan; break; }
+                    if ident_at(&member, scan, "fun") {
+                        fun_index = scan;
+                        break;
+                    }
                     scan += 1usize;
                 }
                 if fun_index < member.len() {
                     append_range(&mut output, &member, 0usize, fun_index);
-                    output.extend(fold_function_item(
-                        folder,
-                        &token_range(&member, fun_index, member.len())
-                    ));
+                    output.extend(fold_function_item(folder, &token_range(&member, fun_index, member.len())));
                 } else {
                     output.extend(member);
                 }
@@ -4243,10 +4304,7 @@ pub mod syn {
         if fun_index < tokens.len() {
             let mut output = TokenStream::new();
             append_range(&mut output, tokens, 0usize, fun_index);
-            output.extend(fold_function_item(
-                folder,
-                &token_range(tokens, fun_index, tokens.len())
-            ));
+            output.extend(fold_function_item(folder, &token_range(tokens, fun_index, tokens.len())));
             return output;
         }
         let body = tokens.len() - 1usize;
@@ -4321,13 +4379,13 @@ pub mod syn {
             let mut start = 0usize;
             let mut index = 0usize;
             while index < tokens.len() {
-                let at_end = punct_at(&tokens, index, ';')
-                    || (brace_at(&tokens, index)
-                        && brace_terminates_statement(&tokens, index, start));
+                let at_end = punct_at(&tokens, index, ';') || (brace_at(&tokens, index) && brace_terminates_statement(&tokens, index, start));
                 if at_end {
                     match push_statement(&mut stmts, &tokens, start, index + 1usize) {
                         Result::Ok(()) => {},
-                        Result::Err(error) => { return Result::Err(error); },
+                        Result::Err(error) => {
+                            return Result::Err(error);
+                        },
                     }
                     start = index + 1usize;
                 }
@@ -4336,10 +4394,14 @@ pub mod syn {
             if start < tokens.len() {
                 match push_statement(&mut stmts, &tokens, start, tokens.len()) {
                     Result::Ok(()) => {},
-                    Result::Err(error) => { return Result::Err(error); },
+                    Result::Err(error) => {
+                        return Result::Err(error);
+                    },
                 }
             }
-            Result::Ok(File { stmts })
+            Result::Ok(File {
+                stmts
+            })
         }
     }
 
@@ -4627,7 +4689,9 @@ pub mod syn {
                         return Result::Err(Error::new(input.span(), "expected attribute brackets"));
                     },
                 }
-                attrs.push(Attribute { tokens: attribute });
+                attrs.push(Attribute {
+                    tokens: attribute
+                });
             }
 
             let vis = if input.peek_ident("pub") {
@@ -4727,16 +4791,22 @@ pub mod syn {
             }
             let params = match parse_generic_params(&generic_tokens) {
                 Result::Ok(value) => value,
-                Result::Err(error) => { return Result::Err(error); },
+                Result::Err(error) => {
+                    return Result::Err(error);
+                },
             };
             let predicates = match parse_where_predicates(&where_clause) {
                 Result::Ok(value) => value,
-                Result::Err(error) => { return Result::Err(error); },
+                Result::Err(error) => {
+                    return Result::Err(error);
+                },
             };
             let data = if is_struct {
                 let named = match parse_named_fields(&body) {
                     Result::Ok(value) => value,
-                    Result::Err(error) => { return Result::Err(error); },
+                    Result::Err(error) => {
+                        return Result::Err(error);
+                    },
                 };
                 Data::Struct(DataStruct {
                     fields: body.cloned(),
@@ -4745,7 +4815,9 @@ pub mod syn {
             } else {
                 let items = match parse_variants(&body) {
                     Result::Ok(value) => value,
-                    Result::Err(error) => { return Result::Err(error); },
+                    Result::Err(error) => {
+                        return Result::Err(error);
+                    },
                 };
                 Data::Enum(DataEnum {
                     variants: body.cloned(),

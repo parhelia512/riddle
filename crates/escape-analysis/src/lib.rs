@@ -1711,7 +1711,8 @@ impl EscapeAnalyzer<'_> {
                     self.bind_pattern_source(ctx, binding, &value.flattened());
                 }
             }
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {
+            }
         }
     }
 
@@ -1774,7 +1775,8 @@ impl EscapeAnalyzer<'_> {
                     }
                 }
             }
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {
+            }
         }
     }
 

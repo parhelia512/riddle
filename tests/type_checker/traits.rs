@@ -2780,3 +2780,126 @@ fn fundamental_foreign_types_cover_orphan_params() {
         result.diagnostics
     );
 }
+
+#[test]
+fn accepts_structured_associated_type_bindings() {
+    // The bound value is a pattern over the callee's generics, so it must be
+    // matched against the impl's associated type at the parameter's own
+    // position. Binding the whole associated type to every parameter the
+    // pattern mentions rejected every reference, tuple, and generic-struct
+    // constraint with a spurious E0035.
+    let reference_case = check(
+        r"
+        trait Source {
+            type Out;
+            fun get(&self) -> Self::Out;
+        }
+
+        struct Holder {
+            value: i32,
+        }
+
+        impl Source for Holder {
+            type Out = &i32;
+            fun get(&self) -> &i32 { &self.value }
+        }
+
+        fun read<S, T>(source: &S) -> bool
+        where S: Source<Out = &T> {
+            let held = source.get();
+            true
+        }
+
+        fun main() -> bool {
+            let holder = Holder { value: 7 };
+            read(&holder)
+        }
+        ",
+    );
+    assert_eq!(reference_case.diagnostics, vec![]);
+
+    let tuple_case = check(
+        r"
+        trait Pairing {
+            type Out;
+            fun get(&self) -> Self::Out;
+        }
+
+        struct Holder {
+            value: (i32, bool),
+        }
+
+        impl Pairing for Holder {
+            type Out = (i32, bool);
+            fun get(&self) -> (i32, bool) { self.value }
+        }
+
+        fun read<S, T>(source: &S) -> bool
+        where S: Pairing<Out = (T, bool)> {
+            let held = source.get();
+            true
+        }
+
+        fun main() -> bool {
+            let holder = Holder { value: (1, true) };
+            read(&holder)
+        }
+        ",
+    );
+    assert_eq!(tuple_case.diagnostics, vec![]);
+
+    let loop_case = check(
+        r"
+        enum Option<T> {
+            Some(T),
+            None,
+        }
+
+        trait Iterator {
+            type Item;
+            fun next(&mut self) -> Option<Self::Item>;
+        }
+
+        trait IntoIterator {
+            type Item;
+            type IntoIter;
+            fun into_iter(self) -> Self::IntoIter;
+        }
+
+        struct Items {
+            value: i32,
+        }
+
+        impl Iterator for Items {
+            type Item = &i32;
+
+            fun next(&mut self) -> Option<Self::Item> {
+                Option::None
+            }
+        }
+
+        impl IntoIterator for Items {
+            type Item = &i32;
+            type IntoIter = Items;
+
+            fun into_iter(self) -> Self::IntoIter {
+                self
+            }
+        }
+
+        fun count<I, J, T>(source: I) -> bool
+        where I: IntoIterator<Item = &T, IntoIter = J>,
+              J: Iterator<Item = &T> {
+            for item in source {
+                let held = item;
+            }
+            true
+        }
+
+        fun main() -> bool {
+            count(Items { value: 1 })
+        }
+        ",
+    );
+    assert_eq!(loop_case.diagnostics, vec![]);
+}

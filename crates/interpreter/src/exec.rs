@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use la_arena::{Arena, Idx};
+use la_arena::{Idx, RawIdx};
 use mir::func::Function;
 use mir::instr::{BinOp, CastOp, CmpOp, ConstValue, Inst, InstKind, Terminator, UnOp};
 use mir::module::Module;
@@ -98,7 +98,10 @@ impl Trap {
 }
 
 pub(crate) struct Interpreter {
-    functions: Arena<Function>,
+    /// Functions keyed by `Idx<Function>` (assigned in load order). `Rc` slots
+    /// let each activation hold an owned handle and borrow its instruction
+    /// stream instead of cloning blocks on every basic-block step.
+    functions: Vec<Rc<Function>>,
     /// Function name → arena index.
     index: HashMap<String, Idx<Function>>,
     /// Static type of every `Value` per function.
@@ -133,13 +136,14 @@ impl Interpreter {
         rng_seed: u64,
         max_depth: usize,
     ) -> Self {
-        let mut functions = Arena::new();
+        let mut functions = Vec::with_capacity(module.function_order.len());
         let mut index = HashMap::new();
         let mut types = HashMap::new();
         for fid in &module.function_order {
-            let function = module.functions[*fid].clone();
+            let function = Rc::new(module.functions[*fid].clone());
             let function_types = Rc::new(value_types(&function));
-            let new_id = functions.alloc(function);
+            let new_id = Idx::from_raw(RawIdx::from_u32(functions.len() as u32));
+            functions.push(function);
             index.insert(module.functions[*fid].name.clone(), new_id);
             types.insert(new_id, function_types);
         }
@@ -188,17 +192,22 @@ impl Interpreter {
         self.call_idx(fid, args)
     }
 
+    /// Shared handle to a function by arena-style index.
+    fn function(&self, fid: Idx<Function>) -> &Rc<Function> {
+        &self.functions[u32::from(fid.into_raw()) as usize]
+    }
+
     /// Return type of a function, if present.
     #[must_use]
     pub fn return_type(&self, name: &str) -> Option<Type> {
         self.index
             .get(name)
-            .map(|fid| self.functions[*fid].ret_type.clone())
+            .map(|fid| self.function(*fid).ret_type.clone())
     }
 
     fn call_idx(&mut self, fid: Idx<Function>, args: Vec<Val>) -> Result<Val, Trap> {
         if self.depth >= self.max_depth {
-            let name = self.functions[fid].name.clone();
+            let name = self.function(fid).name.clone();
             return Err(Trap::StackOverflow { function: name });
         }
         self.depth += 1;
@@ -209,47 +218,52 @@ impl Interpreter {
 
     fn execute(&mut self, fid: Idx<Function>, args: Vec<Val>) -> Result<Val, Trap> {
         let types = self.types[&fid].clone();
-        let next_value = self.functions[fid].next_value as usize;
+        // An owned handle per activation: blocks and instructions are then
+        // borrowed from `function` (not `self`), so evaluating an instruction
+        // — which needs `&mut self` for memory — never clones the instruction
+        // stream the way a direct `self.functions[fid]` borrow would force.
+        let function = self.function(fid).clone();
+        let next_value = function.next_value as usize;
         let mut frame = Frame {
             regs: vec![Val::Unit; next_value],
             homes: HashMap::new(),
         };
-        let params = self.functions[fid].params.clone();
-        for (param, arg) in params.iter().zip(args) {
+        for (param, arg) in function.params.iter().zip(args) {
             frame.regs[param.value.0 as usize] = arg;
         }
 
-        let mut block = self.functions[fid].entry;
+        let mut block = function.entry;
         loop {
             let (insts, terminator, start_value) = {
-                let b = &self.functions[fid].blocks[block];
-                (b.insts.clone(), b.terminator.clone(), b.start_value)
+                let b = &function.blocks[block];
+                (&b.insts, &b.terminator, b.start_value)
             };
             for (offset, inst) in insts.iter().enumerate() {
                 if matches!(inst.kind, InstKind::Phi(_)) {
                     continue;
                 }
                 let value = Value(start_value + offset as u32);
-                let val =
-                    self.eval_inst(&types, &mut frame, value, inst)
-                        .map_err(|trap| match trap {
-                            Trap::Internal(message) => Trap::Internal(format!(
-                                "`{}` executing {} ({message})",
-                                self.functions[fid].name,
-                                display_inst(inst)
-                            )),
-                            other => other,
-                        })?;
+                let val = self
+                    .eval_inst(&types, &mut frame, inst)
+                    .map_err(|trap| match trap {
+                        Trap::Internal(message) => Trap::Internal(format!(
+                            "`{}` executing {} ({message})",
+                            function.name,
+                            display_inst(inst)
+                        )),
+                        other => other,
+                    })?;
                 frame.regs[value.0 as usize] = val;
             }
             match terminator {
                 Terminator::Pending => {
                     return Err(Trap::Internal(format!(
                         "block in `{}` left a pending terminator",
-                        self.functions[fid].name
+                        function.name
                     )));
                 }
                 Terminator::Branch(target) => {
+                    let target = *target;
                     self.transfer_phis(&mut frame, fid, block, target);
                     block = target;
                 }
@@ -261,16 +275,18 @@ impl Interpreter {
                             return Err(Trap::Internal(format!("condition branched on {other:?}")));
                         }
                     };
-                    let target = if decided { then_block } else { else_block };
+                    let target = if decided { *then_block } else { *else_block };
                     self.transfer_phis(&mut frame, fid, block, target);
                     block = target;
                 }
                 Terminator::Return(value) => {
-                    return Ok(value.map_or(Val::Unit, |v| frame.regs[v.0 as usize].clone()));
+                    return Ok(value
+                        .as_ref()
+                        .map_or(Val::Unit, |v| frame.regs[v.0 as usize].clone()));
                 }
                 Terminator::Unreachable => {
                     return Err(Trap::Unreachable {
-                        function: self.functions[fid].name.clone(),
+                        function: function.name.clone(),
                     });
                 }
             }
@@ -280,7 +296,7 @@ impl Interpreter {
     /// Copies phi inputs across the edge `from → target`, matching the C
     /// backend's per-edge phi assignments.
     fn transfer_phis(&self, frame: &mut Frame, fid: Idx<Function>, from: BlockId, target: BlockId) {
-        let block = &self.functions[fid].blocks[target];
+        let block = &self.function(fid).blocks[target];
         let start = block.start_value;
         for (offset, inst) in block.insts.iter().enumerate() {
             let InstKind::Phi(entries) = &inst.kind else {
@@ -312,13 +328,7 @@ impl Interpreter {
         Ok(ptr)
     }
 
-    fn eval_inst(
-        &mut self,
-        types: &[Type],
-        frame: &mut Frame,
-        value: Value,
-        inst: &Inst,
-    ) -> Result<Val, Trap> {
+    fn eval_inst(&mut self, types: &[Type], frame: &mut Frame, inst: &Inst) -> Result<Val, Trap> {
         match &inst.kind {
             InstKind::Const(constant) => Ok(self.const_val(&inst.ty, constant)),
             InstKind::BinOp(op, lhs, rhs) => {
@@ -329,7 +339,17 @@ impl Interpreter {
             }
             InstKind::UnOp(op, operand) => {
                 let a = frame.regs[operand.0 as usize].clone();
-                self.unop(*op, &inst.ty, &self.ty_of(types, *operand), a, frame, value)
+                // `Ref` on a register aggregate materializes the OPERAND's
+                // home — passing the result number would read the not-yet-
+                // written destination register (Unit) instead.
+                self.unop(
+                    *op,
+                    &inst.ty,
+                    &self.ty_of(types, *operand),
+                    a,
+                    frame,
+                    *operand,
+                )
             }
             InstKind::Cmp(op, lhs, rhs) => {
                 let a = frame.regs[lhs.0 as usize].clone();
@@ -519,6 +539,9 @@ impl Interpreter {
                 })?;
                 let stride = match pointee {
                     Type::Slice(element) => size_of(element),
+                    // Indexing through a pointer to an array (`&[T; N]`) steps
+                    // by the element, not by the whole array's size.
+                    Type::Array(element, _) => size_of(element),
                     Type::Str => 1,
                     other => size_of(other),
                 };
@@ -652,6 +675,23 @@ impl Interpreter {
                 let lhs = self.expect_int(a)?;
                 let rhs = self.expect_int(b)?;
                 integer_binop(op, *int_ty, width, lhs, rhs).map(Val::Int)
+            }
+            // Eager bitwise operators on `bool`, which `match` lowering uses to
+            // fold pattern tests and arm guards together; `&&`/`||` reach the
+            // executor as short-circuit control flow instead.
+            Type::Bool => {
+                let Val::Bool(lhs) = a else {
+                    return Err(Trap::Internal(format!("bool op on {a:?}")));
+                };
+                let Val::Bool(rhs) = b else {
+                    return Err(Trap::Internal(format!("bool op on {b:?}")));
+                };
+                match op {
+                    BinOp::BitAnd => Ok(Val::Bool(lhs & rhs)),
+                    BinOp::BitOr => Ok(Val::Bool(lhs | rhs)),
+                    BinOp::BitXor => Ok(Val::Bool(lhs ^ rhs)),
+                    _ => Err(Trap::Internal(format!("binary op `{op:?}` on bool"))),
+                }
             }
             Type::Float(float_ty) => {
                 let Val::Float(lhs) = a else {

@@ -32,6 +32,19 @@ impl LowerCtx<'_> {
         if imp.generics.is_empty() && imp.const_generics.is_empty() {
             return None;
         }
+        // An impl method reached through a reference receiver (the implicit
+        // `self` of a default trait method, say) keys its instance by the
+        // type the impl actually unifies with — the dereferenced self — so
+        // direct calls and reentrant default-method calls share one instance
+        // instead of spawning a `ref_`-suffixed twin with drifted arity.
+        let receiver_ty = match &receiver_ty {
+            type_checker::Type::Ref(inner, _)
+                if self.impl_mir_subst(&imp, &receiver_ty).is_none() =>
+            {
+                (**inner).clone()
+            }
+            _ => receiver_ty,
+        };
         let receiver_mir_ty = self.convert_type(&receiver_ty);
         let subst = self
             .impl_mir_subst(&imp, &receiver_ty)
@@ -73,9 +86,42 @@ impl LowerCtx<'_> {
         }
         let original_name = self.method_symbol_base(fid);
         let mono_name = format!("{original_name}__{suffix}");
+        if !self.mono_generated_symbols.insert(mono_name.clone()) {
+            self.mono_methods.insert(key, mono_name.clone());
+            return Some(mono_name);
+        }
         self.mono_methods.insert(key, mono_name.clone());
-        let old_subst = std::mem::replace(&mut self.generic_subst, subst.types);
-        let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, subst.tc_types);
+        // Seed the impl's own associated type aliases (`type Item = &T`)
+        // under both `Self::Name` and `Name`, resolved with the instance's
+        // generic substitution — the body's `Self::Item` otherwise lowers to
+        // a placeholder when an impl method is instantiated out of a generic
+        // caller. Mirrors what `mono_default_method_name` does for defaults.
+        let mut mir_subst = subst.types;
+        let mut tc_subst = subst.tc_types;
+        let const_view: HashMap<&str, usize> = subst
+            .consts
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect();
+        for alias_id in &imp.type_aliases {
+            let alias = &self.hir.item_tree.type_aliases[*alias_id];
+            let Some(alias_ty) = alias.ty.as_ref() else {
+                continue;
+            };
+            let type_view: HashMap<&str, &Type> = mir_subst
+                .iter()
+                .map(|(name, ty)| (name.as_str(), ty))
+                .collect();
+            let resolved_mir = self.convert_hir_type_with_substs(alias_ty, &type_view, &const_view);
+            let resolved_tc = self.lower_hir_type_for_pattern(alias_ty, &tc_subst);
+            let self_key = format!("Self::{}", alias.name.0);
+            tc_subst.insert(self_key.clone(), resolved_tc.clone());
+            tc_subst.insert(alias.name.0.clone(), resolved_tc);
+            mir_subst.insert(self_key.clone(), resolved_mir.clone());
+            mir_subst.insert(alias.name.0.clone(), resolved_mir);
+        }
+        let old_subst = std::mem::replace(&mut self.generic_subst, mir_subst);
+        let old_tc_subst = std::mem::replace(&mut self.generic_tc_subst, tc_subst);
         let old_const_subst = std::mem::replace(&mut self.generic_const_subst, subst.consts);
         let old_state = self.take_lowering_state();
         let body_id = *self.hir.function_bodies.get(&fid)?;
@@ -101,7 +147,16 @@ impl LowerCtx<'_> {
         let receiver_mir_ty = self.convert_type(receiver_ty);
         let trait_id = self.default_methods[&fid];
         let trait_generics = self.hir.item_tree.traits[trait_id].generics.clone();
-        let rhs_ty = rhs_ty.map(|ty| self.substitute_tc_type(ty));
+        // The first trait generic (e.g. `Rhs`) is derived from the rhs
+        // operand's expression type — but the argument convention passes it
+        // by reference (`fun lt(&self, other: &Rhs)`), so a ref-typed rhs
+        // names the pointee, not the reference.
+        let rhs_ty = rhs_ty
+            .map(|ty| self.substitute_tc_type(ty))
+            .map(|ty| match &ty {
+                type_checker::Type::Ref(inner, _) => (**inner).clone(),
+                _ => ty,
+            });
         let trait_args = trait_generics
             .iter()
             .enumerate()
@@ -127,6 +182,10 @@ impl LowerCtx<'_> {
         }
 
         let mono_name = format!("{}__{}", self.method_symbol_base(fid), suffix);
+        if !self.mono_generated_symbols.insert(mono_name.clone()) {
+            self.mono_methods.insert(key, mono_name.clone());
+            return Some(mono_name);
+        }
         self.mono_methods.insert(key, mono_name.clone());
         let mut tc_subst = HashMap::from([("Self".into(), receiver_ty.clone())]);
         tc_subst.extend(
@@ -349,7 +408,92 @@ impl LowerCtx<'_> {
             let receiver = self.substitute_tc_type(&receiver);
             self.insert_impl_assoc_types(*trait_id, &receiver, &mut tc_subst, Some(&mut subst));
         }
+        // Implicit generic slots introduced by associated-type bounds
+        // (`fun f<I: Iterator<Item = T>>(...)` gets an implicit `T`) arrive
+        // as Unit placeholders when the checker could not infer them in the
+        // generic body; resolve them now from the bound's trait impl for
+        // the substituted parameter type.
+        for bound in &function.generic_bounds {
+            let Some(param_ty) = tc_subst.get(&bound.param.0).cloned() else {
+                continue;
+            };
+            let Some(trait_id) = self.resolve_trait_ref(&bound.trait_ty) else {
+                continue;
+            };
+            let constraint_names = bound
+                .assoc_constraints
+                .iter()
+                .map(|constraint| {
+                    let name = match &constraint.ty {
+                        hir::item_tree::HirTypeRef::Named(path) => {
+                            path.as_single_name().map(|name| name.0.clone())
+                        }
+                        _ => None,
+                    };
+                    (constraint.name.0.clone(), name)
+                })
+                .collect::<Vec<_>>();
+            for (assoc_name, slot_name) in constraint_names {
+                let Some(slot) = slot_name else { continue };
+                let unresolved = !tc_subst.contains_key(&slot)
+                    || matches!(tc_subst.get(&slot), Some(type_checker::Type::Unit));
+                if !unresolved {
+                    continue;
+                }
+                for candidate in self.hir.item_tree.impls.values() {
+                    let Some(candidate_trait) = candidate.trait_ty.as_ref() else {
+                        continue;
+                    };
+                    let Some(candidate_id) = self.resolve_trait_ref(candidate_trait) else {
+                        continue;
+                    };
+                    if candidate_id != trait_id || !self.impl_type_matches(candidate, &param_ty) {
+                        continue;
+                    }
+                    let Some(alias_id) = candidate.type_aliases.iter().find(|alias_id| {
+                        self.hir.item_tree.type_aliases[**alias_id].name.0 == assoc_name
+                    }) else {
+                        continue;
+                    };
+                    let alias = &self.hir.item_tree.type_aliases[*alias_id];
+                    let Some(alias_ty) = alias.ty.as_ref() else {
+                        continue;
+                    };
+                    let Some(impl_subst) = self.impl_mir_subst(candidate, &param_ty) else {
+                        continue;
+                    };
+                    let resolved_tc =
+                        self.lower_hir_type_for_pattern(alias_ty, &impl_subst.tc_types);
+                    let resolved_mir = self.convert_type(&resolved_tc);
+                    tc_subst.insert(slot.clone(), resolved_tc);
+                    subst.insert(slot.clone(), resolved_mir);
+                }
+            }
+        }
+        // An impl method's own associated type aliases (`type Item = &T`)
+        // resolve through the impl's generics; seed them under `Self::Name`
+        // and `Name` so the body's `Self::Item` substitutes concretely —
+        // same treatment `mono_method_name_for_receiver` gives its instances.
+        if let Some(imp) = &imp {
+            for alias_id in imp.type_aliases.clone() {
+                let alias = &self.hir.item_tree.type_aliases[alias_id];
+                let Some(alias_ty) = alias.ty.as_ref() else {
+                    continue;
+                };
+                let resolved_tc = self.lower_hir_type_for_pattern(alias_ty, &tc_subst);
+                let resolved_mir = self.convert_type(&resolved_tc);
+                let self_key = format!("Self::{}", alias.name.0);
+                tc_subst.insert(self_key.clone(), resolved_tc.clone());
+                tc_subst.insert(alias.name.0.clone(), resolved_tc);
+                subst.insert(self_key.clone(), resolved_mir.clone());
+                subst.insert(alias.name.0.clone(), resolved_mir);
+            }
+        }
         let mono_name = format!("{}__{}", self.method_symbol_base(fid), suffix);
+        if !self.mono_generated_symbols.insert(mono_name.clone()) {
+            self.mono_functions.insert(key, mono_name.clone());
+            return Some(mono_name);
+        }
         self.mono_functions.insert(key, mono_name.clone());
 
         let old_subst = std::mem::replace(&mut self.generic_subst, subst);
@@ -498,6 +642,18 @@ impl LowerCtx<'_> {
     }
 
     fn qualify_symbol(&self, fid: hir::item_tree::FunctionId, base: String) -> String {
+        let candidate = self.package_qualified_symbol(fid, base);
+        self.disambiguate_free_symbol(fid, candidate)
+    }
+
+    /// Package qualification only: extern/C-export symbols keep their bare
+    /// names, and so do package-less functions (std, synthesized helpers)
+    /// and every function in single-file builds.
+    pub(super) fn package_qualified_symbol(
+        &self,
+        fid: hir::item_tree::FunctionId,
+        base: String,
+    ) -> String {
         let function = &self.hir.item_tree.functions[fid];
         if self.hir.item_tree.extern_function_ids.contains(&fid)
             || function.attrs.iter().any(|attr| attr.name.0 == "c_export")
@@ -518,6 +674,42 @@ impl LowerCtx<'_> {
             .get(package)
             .map_or_else(|| format!("package_{package}"), Clone::clone);
         format!("package::{name}::{base}")
+    }
+
+    /// Free functions that end up with the same final symbol — a private std
+    /// helper colliding with a user function in single-file builds, or
+    /// same-named privates in different modules of one package — would emit
+    /// duplicate C symbols and shadow each other in the interpreter's name
+    /// table. Rename every colliding party by fid, mirroring
+    /// `method_symbol_base`'s `method::<fid>::` fallback. Extern and
+    /// `c_export` functions never participate: their names are ABI (runtime
+    /// symbols like `rgc_free`, or the user's chosen C identifier).
+    fn disambiguate_free_symbol(
+        &self,
+        fid: hir::item_tree::FunctionId,
+        candidate: String,
+    ) -> String {
+        if self.method_impls.contains_key(&fid)
+            || self.default_methods.contains_key(&fid)
+            || self.hir.item_tree.extern_function_ids.contains(&fid)
+            || self.hir.item_tree.functions[fid]
+                .attrs
+                .iter()
+                .any(|attr| attr.name.0 == "c_export")
+            || self.hir.item_tree.functions[fid].name.0 == "main"
+        {
+            return candidate;
+        }
+        if self
+            .free_symbol_counts
+            .get(&candidate)
+            .copied()
+            .unwrap_or(0)
+            > 1
+        {
+            return format!("fun::{}::{candidate}", fid.into_raw().into_u32());
+        }
+        candidate
     }
 
     pub(super) fn qualify_current_symbol(&self, base: String) -> String {
@@ -549,6 +741,103 @@ impl LowerCtx<'_> {
     pub(super) fn impl_self_mir_type(&self, fid: hir::item_tree::FunctionId) -> Option<Type> {
         self.impl_for_method(fid)
             .map(|imp| self.convert_hir_type(&imp.self_ty))
+    }
+
+    /// Substituted MIR type of a method's declared parameter in the instance
+    /// `mono_method_name_for_receiver`/`mono_default_method_name` selects for
+    /// `receiver_ty` — what the callee's parameter actually holds once the
+    /// instance's generics, `Self`, and trait generics (`Rhs` for the
+    /// comparison traits) are applied. Pure lookup: never generates an
+    /// instance. Callers use it to decide whether an operand needs the extra
+    /// reference level for an impl whose self type is itself a reference.
+    pub(super) fn mono_method_param_type(
+        &self,
+        fid: hir::item_tree::FunctionId,
+        param_index: usize,
+        receiver_ty: &type_checker::Type,
+        rhs_ty: Option<&type_checker::Type>,
+    ) -> Option<Type> {
+        let receiver_ty = self.substitute_tc_type(receiver_ty);
+        let param = self.hir.item_tree.functions[fid].params.get(param_index)?;
+        if let Some(&trait_id) = self.default_methods.get(&fid) {
+            // Default-method instances instantiate with the dereferenced
+            // receiver as `Self`, and the first trait generic (e.g. `Rhs`)
+            // with the rhs operand, dereferenced to match the
+            // by-reference argument convention.
+            let self_ty = match &receiver_ty {
+                type_checker::Type::Ref(inner, _) => (**inner).clone(),
+                other => other.clone(),
+            };
+            let rhs_ty = rhs_ty
+                .map(|ty| self.substitute_tc_type(ty))
+                .map(|ty| match &ty {
+                    type_checker::Type::Ref(inner, _) => (**inner).clone(),
+                    _ => ty,
+                });
+            let mut tc_subst: HashMap<String, type_checker::Type> =
+                HashMap::from([("Self".to_string(), self_ty.clone())]);
+            for (index, name) in self.hir.item_tree.traits[trait_id]
+                .generics
+                .iter()
+                .enumerate()
+            {
+                let arg = if index == 0 {
+                    rhs_ty.clone().unwrap_or_else(|| self_ty.clone())
+                } else {
+                    self_ty.clone()
+                };
+                tc_subst.insert(name.0.clone(), arg);
+            }
+            let owned: HashMap<String, Type> = tc_subst
+                .iter()
+                .map(|(name, ty)| (name.clone(), self.convert_type(ty)))
+                .collect();
+            let type_subst: HashMap<&str, &Type> =
+                owned.iter().map(|(name, ty)| (name.as_str(), ty)).collect();
+            return Some(self.convert_hir_type_with_substs(
+                &param.ty,
+                &type_subst,
+                &HashMap::new(),
+            ));
+        }
+        let imp = self.impl_for_method(fid)?;
+        let receiver_ty = match &receiver_ty {
+            type_checker::Type::Ref(inner, _)
+                if self.impl_mir_subst(imp, &receiver_ty).is_none() =>
+            {
+                (**inner).clone()
+            }
+            other => other.clone(),
+        };
+        let mut owned: HashMap<String, Type> = HashMap::new();
+        let mut const_subst: HashMap<String, usize> = HashMap::new();
+        if !imp.generics.is_empty() || !imp.const_generics.is_empty() {
+            let subst = self
+                .impl_mir_subst(imp, &receiver_ty)
+                .or_else(|| match &receiver_ty {
+                    type_checker::Type::Ref(inner, _) => self.impl_mir_subst(imp, inner),
+                    _ => None,
+                })?;
+            owned = subst.types.clone();
+            const_subst = subst.consts.clone();
+        }
+        if !owned.contains_key("Self") {
+            let type_subst: HashMap<&str, &Type> =
+                owned.iter().map(|(name, ty)| (name.as_str(), ty)).collect();
+            let const_view: HashMap<&str, usize> = const_subst
+                .iter()
+                .map(|(name, value)| (name.as_str(), *value))
+                .collect();
+            let self_ty = self.convert_hir_type_with_substs(&imp.self_ty, &type_subst, &const_view);
+            owned.insert("Self".to_string(), self_ty);
+        }
+        let type_subst: HashMap<&str, &Type> =
+            owned.iter().map(|(name, ty)| (name.as_str(), ty)).collect();
+        let const_view: HashMap<&str, usize> = const_subst
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect();
+        Some(self.convert_hir_type_with_substs(&param.ty, &type_subst, &const_view))
     }
 
     pub(super) fn impl_type_matches(
@@ -705,8 +994,41 @@ impl LowerCtx<'_> {
             type_checker::Type::Slice(..) => self.slice_impl_subst(imp, receiver_ty),
             type_checker::Type::Ref(..) => self.reference_impl_subst(imp, receiver_ty),
             type_checker::Type::Ptr { .. } => self.pointer_impl_subst(imp, receiver_ty),
+            type_checker::Type::Tuple(..) => self.tuple_impl_subst(imp, receiver_ty),
             _ => None,
         }
+    }
+
+    /// Unifies a generic tuple self type like `(A, B)` with a concrete tuple
+    /// receiver, collecting the element substitutions.
+    fn tuple_impl_subst(
+        &self,
+        imp: &hir::item_tree::HirImpl,
+        receiver_ty: &type_checker::Type,
+    ) -> Option<MirSubst> {
+        let type_checker::Type::Tuple(elements) = receiver_ty else {
+            return None;
+        };
+        let hir::item_tree::HirTypeRef::Tuple(pattern_elements) = &imp.self_ty else {
+            return None;
+        };
+        if pattern_elements.len() != elements.len() {
+            return None;
+        }
+        let mut subst = MirSubst::default();
+        let generics = Self::impl_generic_names(imp);
+        for (pattern, actual) in pattern_elements.iter().zip(elements) {
+            if !self.collect_hir_type_subst(
+                pattern,
+                actual,
+                &generics,
+                &mut subst.types,
+                &mut subst.tc_types,
+            ) {
+                return None;
+            }
+        }
+        Some(subst)
     }
 
     fn nominal_impl_subst(
@@ -937,6 +1259,19 @@ impl LowerCtx<'_> {
             hir::item_tree::HirTypeRef::Slice(inner) => match actual {
                 type_checker::Type::Slice(actual_inner) => {
                     self.collect_hir_type_subst(inner, actual_inner, generics, subst, tc_subst)
+                }
+                _ => false,
+            },
+            hir::item_tree::HirTypeRef::Tuple(elements) => match actual {
+                type_checker::Type::Tuple(actual_elements)
+                    if elements.len() == actual_elements.len() =>
+                {
+                    elements
+                        .iter()
+                        .zip(actual_elements)
+                        .all(|(pattern, actual)| {
+                            self.collect_hir_type_subst(pattern, actual, generics, subst, tc_subst)
+                        })
                 }
                 _ => false,
             },

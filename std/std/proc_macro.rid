@@ -3,7 +3,10 @@ use crate::std::mem::size_of;
 use crate::std::panic::panic;
 use crate::std::result::Result;
 use crate::std::slice::SliceIter;
-use crate::std::vector::{Vector, VectorIntoIter};
+use crate::std::vector::{
+    Vector,
+    VectorIntoIter
+};
 
 pub enum Delimiter {
     Parenthesis,
@@ -99,13 +102,7 @@ unsafe extern "C" {
     safe fun rgc_free(data: *mut u8);
     safe fun riddle_proc_call_site_start() -> usize;
     safe fun riddle_proc_call_site_end() -> usize;
-    safe fun riddle_proc_emit_diagnostic(
-        level: u8,
-        start: usize,
-        end: usize,
-        message: *const u8,
-        len: usize
-    );
+    safe fun riddle_proc_emit_diagnostic(level: u8, start: usize, end: usize, message: *const u8, len: usize);
     safe fun riddle_proc_set_output(value: *const u8, len: usize);
 }
 
@@ -156,14 +153,21 @@ impl crate::std::clone::Clone for TokenTree {
 
 impl crate::std::clone::Clone for TokenStream {
     fun clone(&self) -> TokenStream {
-        unsafe { self.data[0usize].references += 1usize; }
-        TokenStream { data: self.data }
+        unsafe {
+            self.data[0usize].references += 1usize;
+        }
+        TokenStream {
+            data: self.data
+        }
     }
 }
 
 impl Span {
     fun new(start: usize, end: usize) -> Span {
-        Span { start, end }
+        Span {
+            start,
+            end
+        }
     }
 
     pub fun call_site() -> Span {
@@ -175,8 +179,16 @@ impl Span {
     }
 
     pub fun join(&self, other: Span) -> Option<Span> {
-        let start = if self.start < other.start { self.start } else { other.start };
-        let end = if self.end > other.end { self.end } else { other.end };
+        let start = if self.start < other.start {
+            self.start
+        } else {
+            other.start
+        };
+        let end = if self.end > other.end {
+            self.end
+        } else {
+            other.end
+        };
         Option::Some(Span::new(start, end))
     }
 
@@ -200,7 +212,9 @@ impl Span {
 impl Group {
     pub fun new(delimiter: Delimiter, stream: TokenStream) -> Group {
         let mut storage = rgc_alloc(size_of::<TokenStream>()) as *mut TokenStream;
-        unsafe { storage[0usize] = stream; }
+        unsafe {
+            storage[0usize] = stream;
+        }
         Group {
             delimiter,
             stream: storage as *mut u8,
@@ -213,7 +227,9 @@ impl Group {
     }
 
     pub fun stream(&self) -> &TokenStream {
-        unsafe { &(self.stream as *const TokenStream)[0usize] }
+        unsafe {
+            &(self.stream as *const TokenStream)[0usize]
+        }
     }
 
     pub fun span(&self) -> Span {
@@ -227,7 +243,9 @@ impl Group {
 
 impl crate::std::ops::Drop for Group {
     fun drop(&mut self) {
-        let stream = unsafe { (self.stream as *mut TokenStream)[0usize] };
+        let stream = unsafe {
+            (self.stream as *mut TokenStream)[0usize]
+        };
         rgc_free(self.stream);
     }
 }
@@ -298,19 +316,15 @@ impl Literal {
         match TokenStream::from_str(value) {
             Result::Ok(stream) => {
                 if stream.len() != 1usize {
-                    return Result::Err(LexError::new(
-                        "expected exactly one literal",
-                        Span::call_site()
-                    ));
+                    return Result::Err(LexError::new("expected exactly one literal", Span::call_site()));
                 }
                 for tree in stream {
                     match tree {
-                        TokenTree::Literal(literal) => { return Result::Ok(literal); },
+                        TokenTree::Literal(literal) => {
+                            return Result::Ok(literal);
+                        },
                         _ => {
-                            return Result::Err(LexError::new(
-                                "expected a literal",
-                                Span::call_site()
-                            ));
+                            return Result::Err(LexError::new("expected a literal", Span::call_site()));
                         },
                     }
                 }
@@ -487,7 +501,9 @@ impl TokenStream {
     }
 
     pub fun len(&self) -> usize {
-        unsafe { self.data[0usize].trees.len() }
+        unsafe {
+            self.data[0usize].trees.len()
+        }
     }
 
     pub fun is_empty(&self) -> bool {
@@ -496,7 +512,9 @@ impl TokenStream {
 
     pub fun push(&mut self, tree: TokenTree) {
         self.make_unique();
-        unsafe { self.data[0usize].trees.push(tree); }
+        unsafe {
+            self.data[0usize].trees.push(tree);
+        }
     }
 
     pub fun extend(&mut self, stream: TokenStream) {
@@ -506,7 +524,9 @@ impl TokenStream {
     }
 
     pub fun as_slice(&self) -> &[TokenTree] {
-        unsafe { self.data[0usize].trees.as_slice() }
+        unsafe {
+            self.data[0usize].trees.as_slice()
+        }
     }
 
     pub fun to_string(&self) -> String {
@@ -516,7 +536,9 @@ impl TokenStream {
     }
 
     fun make_unique(&mut self) {
-        let references = unsafe { self.data[0usize].references };
+        let references = unsafe {
+            self.data[0usize].references
+        };
         if references == 1usize {
             return;
         }
@@ -524,19 +546,27 @@ impl TokenStream {
         for tree in self.as_slice() {
             trees.push(tree.clone());
         }
-        unsafe { self.data[0usize].references -= 1usize; }
+        unsafe {
+            self.data[0usize].references -= 1usize;
+        }
         self.data = TokenStream::allocate(trees);
     }
 }
 
 impl crate::std::ops::Drop for TokenStream {
     fun drop(&mut self) {
-        let references = unsafe { self.data[0usize].references };
+        let references = unsafe {
+            self.data[0usize].references
+        };
         if references > 1usize {
-            unsafe { self.data[0usize].references -= 1usize; }
+            unsafe {
+                self.data[0usize].references -= 1usize;
+            }
         } else {
             let allocation = self.data as *mut u8;
-            let _owned = unsafe { self.data[0usize] };
+            let _owned = unsafe {
+                self.data[0usize]
+            };
             self.data = 0usize as *mut TokenStreamData;
             rgc_free(allocation);
         }
@@ -600,13 +630,7 @@ impl Diagnostic {
 
     pub fun emit(&self) {
         let message = self.message.as_str().as_bytes();
-        riddle_proc_emit_diagnostic(
-            self.level,
-            self.span.start(),
-            self.span.end(),
-            message.as_ptr(),
-            message.len()
-        );
+        riddle_proc_emit_diagnostic(self.level, self.span.start(), self.span.end(), message.as_ptr(), message.len());
     }
 }
 
@@ -619,10 +643,7 @@ fun riddle_proc_decode_token_stream(input: &str) -> TokenStream {
     parser.expect(59u8);
     let stream = parser.parse_stream();
     if parser.failed || parser.index != input.len() {
-        Diagnostic::error(
-            Span::call_site(),
-            "invalid structured proc-macro token stream"
-        ).emit();
+        Diagnostic::error(Span::call_site(), "invalid structured proc-macro token stream").emit();
         TokenStream::new()
     } else {
         stream
@@ -676,12 +697,18 @@ impl ProcWireParser {
         if tag == 73u8 {
             let span = self.read_span();
             let text = self.read_text();
-            return TokenTree::Ident(Ident { text, span });
+            return TokenTree::Ident(Ident {
+                text,
+                span
+            });
         }
         if tag == 76u8 {
             let span = self.read_span();
             let text = self.read_text();
-            return TokenTree::Literal(Literal { text, span });
+            return TokenTree::Literal(Literal {
+                text,
+                span
+            });
         }
         if tag == 80u8 {
             let span = self.read_span();
@@ -768,9 +795,7 @@ impl ProcWireParser {
             }
             saw_digit = true;
             let digit = (byte - 48u8) as usize;
-            if value > 429496729usize
-                || (value == 429496729usize && digit > 5usize)
-            {
+            if value > 429496729usize || (value == 429496729usize && digit > 5usize) {
                 self.failed = true;
                 return 0usize;
             }
@@ -888,23 +913,25 @@ impl TokenParser {
         }
     }
 
-    fun parse_group(
-        &mut self,
-        output: &mut TokenStream,
-        delimiter: Delimiter,
-        closing: u8,
-        opening: u8
-    ) {
+    fun parse_group(&mut self, output: &mut TokenStream, delimiter: Delimiter, closing: u8, opening: u8) {
         let start = self.index;
         self.index += 1usize;
         let parsed = self.parse_until(closing);
         match parsed {
-            ParsedTokenStream { stream: inner, closed: true } => {
+            ParsedTokenStream {
+                stream: inner,
+                closed: true
+            }
+            => {
                 let mut group = Group::new(delimiter, inner);
                 group.set_span(self.span);
                 output.push(TokenTree::Group(group));
             },
-            ParsedTokenStream { stream: inner, closed: false } => {
+            ParsedTokenStream {
+                stream: inner,
+                closed: false
+            }
+            => {
                 let _opening = opening;
                 let _inner = inner;
                 self.fail("unclosed delimiter");
@@ -962,10 +989,7 @@ impl TokenParser {
             if self.byte_at(cursor) == 34u8 {
                 let mut tail = cursor + 1usize;
                 let mut matched = 0usize;
-                while matched < hashes
-                    && tail < self.source.len()
-                    && self.byte_at(tail) == 35u8
-                {
+                while matched < hashes && tail < self.source.len() && self.byte_at(tail) == 35u8 {
                     matched += 1usize;
                     tail += 1usize;
                 }
@@ -1015,13 +1039,9 @@ impl TokenParser {
                 self.index += 1usize;
             }
         }
-        if self.index < self.source.len()
-            && (self.byte_at(self.index) == 101u8 || self.byte_at(self.index) == 69u8)
-        {
+        if self.index < self.source.len() && (self.byte_at(self.index) == 101u8 || self.byte_at(self.index) == 69u8) {
             let mut cursor = self.index + 1usize;
-            if cursor < self.source.len()
-                && (self.byte_at(cursor) == 43u8 || self.byte_at(cursor) == 45u8)
-            {
+            if cursor < self.source.len() && (self.byte_at(cursor) == 43u8 || self.byte_at(cursor) == 45u8) {
                 cursor += 1usize;
             }
             let digits = cursor;
@@ -1032,9 +1052,7 @@ impl TokenParser {
                 self.index = cursor;
             }
         }
-        while self.index < self.source.len()
-            && (is_ident_continue(self.byte_at(self.index)))
-        {
+        while self.index < self.source.len() && (is_ident_continue(self.byte_at(self.index))) {
             self.index += 1usize;
         }
         self.literal_between(start, self.index)
@@ -1097,7 +1115,9 @@ impl TokenParser {
     }
 
     fun byte_at(&self, index: usize) -> u8 {
-        unsafe { self.source.as_bytes().as_ptr()[index] }
+        unsafe {
+            self.source.as_bytes().as_ptr()[index]
+        }
     }
 
     fun fail(&mut self, message: &str) {
@@ -1117,9 +1137,7 @@ fun is_digit(value: u8) -> bool {
 }
 
 fun is_ident_start(value: u8) -> bool {
-    (value >= 65u8 && value <= 90u8)
-        || (value >= 97u8 && value <= 122u8)
-        || value == 95u8
+    (value >= 65u8 && value <= 90u8) || (value >= 97u8 && value <= 122u8) || value == 95u8
 }
 
 fun is_ident_continue(value: u8) -> bool {
@@ -1127,24 +1145,7 @@ fun is_ident_continue(value: u8) -> bool {
 }
 
 fun is_punctuation(value: u8) -> bool {
-    value == 43u8
-        || value == 45u8
-        || value == 42u8
-        || value == 47u8
-        || value == 37u8
-        || value == 38u8
-        || value == 124u8
-        || value == 94u8
-        || value == 60u8
-        || value == 62u8
-        || value == 33u8
-        || value == 63u8
-        || value == 35u8
-        || value == 46u8
-        || value == 58u8
-        || value == 59u8
-        || value == 44u8
-        || value == 61u8
+    value == 43u8 || value == 45u8 || value == 42u8 || value == 47u8 || value == 37u8 || value == 38u8 || value == 124u8 || value == 94u8 || value == 60u8 || value == 62u8 || value == 33u8 || value == 63u8 || value == 35u8 || value == 46u8 || value == 58u8 || value == 59u8 || value == 44u8 || value == 61u8
 }
 
 fun is_closing_delimiter(value: u8) -> bool {
@@ -1174,7 +1175,9 @@ fun copy_text(value: &str) -> Vector<u8> {
 }
 
 fun text_as_str(value: &[u8]) -> &str {
-    unsafe { value as &str }
+    unsafe {
+        value as &str
+    }
 }
 
 fun riddle_proc_literal_hashes(value: &str) -> usize {
@@ -1244,7 +1247,9 @@ fun write_token_tree(tree: &TokenTree, output: &mut String) {
 fun push_ascii(output: &mut String, value: u8) {
     let bytes = [value];
     let slice: &[u8] = &bytes;
-    let text = unsafe { slice as &str };
+    let text = unsafe {
+        slice as &str
+    };
     output.push_str(text);
 }
 

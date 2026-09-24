@@ -109,7 +109,8 @@ impl TypeChecker<'_> {
         let matrix = arms
             .iter()
             .filter(|arm| arm.guard.is_none())
-            .map(|arm| vec![self.lower_matrix_pattern(ctx, arm.pat, &coverage_ty)])
+            .flat_map(|arm| self.lower_matrix_rows(ctx, arm.pat, &coverage_ty))
+            .map(|row| vec![row])
             .collect::<Vec<_>>();
         let witness = self.useful(
             &matrix,
@@ -258,6 +259,25 @@ impl TypeChecker<'_> {
         }
     }
 
+    /// Expands an arm pattern into the coverage matrix rows it contributes.
+    /// A top-level or-pattern `A | B` is a disjunction, so it contributes one
+    /// row per alternative; every other shape is a single row.
+    fn lower_matrix_rows(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        pat: PatId,
+        expected: &Type,
+    ) -> Vec<MatrixPat> {
+        if let Pattern::Or { alternatives } = ctx.body.pats[pat].clone() {
+            alternatives
+                .into_iter()
+                .map(|alternative| self.lower_matrix_pattern(ctx, alternative, expected))
+                .collect()
+        } else {
+            vec![self.lower_matrix_pattern(ctx, pat, expected)]
+        }
+    }
+
     fn lower_matrix_pattern(
         &mut self,
         ctx: &BodyCtx<'_>,
@@ -325,6 +345,12 @@ impl TypeChecker<'_> {
             Pattern::Struct { path, fields } => {
                 self.lower_struct_pattern(ctx, expected, &path, &fields)
             }
+            // The parser only accepts `A | B` at the top of an arm, and
+            // `lower_matrix_rows` expands those into one row per alternative
+            // before this runs. A nested or-pattern reaching here would be a
+            // bug, so refuse to reason about it rather than under-approximate
+            // coverage with just the first alternative.
+            Pattern::Or { .. } => MatrixPat::Invalid,
         }
     }
 

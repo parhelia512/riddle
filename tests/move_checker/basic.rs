@@ -1253,15 +1253,18 @@ fn mutable_borrows_of_disjoint_fields_can_coexist() {
 
 #[test]
 fn move_while_borrowed_is_error() {
-    // Moving p while a shared borrow exists is E0304.
+    // Moving p while a shared borrow exists is E0304. `r` is used after the
+    // move site; a borrow whose binding is never used dies at its binding
+    // (NLL) and no longer conflicts.
     let result = analyze(
         r"
         struct Point { x: i32 }
 
-        fun f() {
+        fun f() -> i32 {
             let p = Point{x: 1};
             let r = &p;
             let q = p;
+            r.x
         }
         ",
     );
@@ -1372,6 +1375,58 @@ fn generic_copy_impl_makes_instantiations_copyable() {
         "#,
     );
     assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn generic_copy_bound_allows_deref_move_and_reuse() {
+    // A `T: Copy` bound makes the parameter copyable even though the global
+    // environment holds no impl for the bare parameter: moving out of `&T`
+    // and using the value twice are both allowed.
+    let result = analyze(
+        r#"
+        #[lang = "copy"]
+        trait Copy {}
+
+        fun duplicate<T: Copy>(value: &T) -> T {
+            *value
+        }
+
+        fun reuse<T: Copy>(value: T) -> T {
+            let first = value;
+            let second = value;
+            second
+        }
+
+        fun main() {
+            let number = 1i32;
+            let copy = duplicate(&number);
+            let again = reuse(copy);
+        }
+        "#,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn unbound_parameter_still_cannot_move_out_of_reference() {
+    let result = analyze(
+        r#"
+        fun take<T>(value: &T) -> T {
+            *value
+        }
+        "#,
+    );
+    // The root block's tail is visited by both the body walk and the block
+    // walk; the repeat used to be reported as a second identical E0308.
+    assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+    assert_eq!(result.diagnostics[0].code, "E0308");
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("cannot move out of dereference"),
+        "{:?}",
+        result.diagnostics
+    );
 }
 
 #[test]
@@ -2178,6 +2233,7 @@ fn while_body_borrow_conflict_reported_exactly_once() {
             while i < n {
                 let a = &mut p;
                 let b = &mut p;
+                i = i + a.x;
                 i = i + 1;
             }
             i

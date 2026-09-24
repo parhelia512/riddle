@@ -4,12 +4,20 @@
 //! the runtime, runs it, and asserts on the exit code and output.
 
 use riddlec::pipeline;
+use std::io::Write;
+use std::process::Stdio;
 use std::{fs, path::Path, process::Command};
 
 /// Compiles `source` with the full pipeline, emits C, builds it with the
-/// system C compiler plus the selected runtime, and runs it. Returns the
-/// exit code and captured stdout.
+/// system C compiler plus the selected runtime, and runs it with empty
+/// standard input. Returns the exit code and captured stdout.
 fn compile_and_run(source: &str, gc: bool) -> (i32, String) {
+    compile_and_run_with_stdin(source, gc, &[])
+}
+
+/// Same as `compile_and_run`, but feeds `stdin` bytes to the program and
+/// closes the pipe so standard input reads observe end of stream.
+fn compile_and_run_with_stdin(source: &str, gc: bool, stdin: &[u8]) -> (i32, String) {
     let result = pipeline::compile(source);
     assert!(
         result.success(),
@@ -90,10 +98,21 @@ analysis: {:#?}",
         String::from_utf8_lossy(&compile_output.stderr)
     );
 
-    let run = Command::new(&executable)
+    let mut child = Command::new(&executable)
         .current_dir(&dir)
-        .output()
-        .unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to launch {executable:?}: {error}"));
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin)
+        .unwrap_or_else(|error| panic!("failed to feed stdin: {error}"));
+    // `wait_with_output` closes stdin first, so reads observe end of stream.
+    let run = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
     let _ = fs::remove_dir_all(&dir);
     (run.status.code().unwrap_or(-1), stdout)
@@ -1063,6 +1082,736 @@ fn hash_map_entry_runs_the_rust_idiom_end_to_end() {
 
             if counts.len() != 2usize { return 6; }
             0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn slice_iter_next_back_walks_both_directions() {
+    // Regression: `next_back` used to return the final element without a
+    // back cursor, so a backward walk looped on the last value forever.
+    let source = r#"
+        use crate::std::iter::{DoubleEndedIterator, Iterator};
+
+        fun main() -> i32 {
+            let values = [3i32, 7i32, 4i32, 9i32, 5i32];
+            let slice: &[i32] = &values;
+
+            // A pure backward walk visits every element exactly once, last
+            // to first.
+            let mut iter = slice.iter();
+            let mut count = 0usize;
+            let mut first_seen = 0i32;
+            let mut last_seen = 0i32;
+            loop {
+                match iter.next_back() {
+                    Option::Some(value) => {
+                        if count == 0usize { last_seen = *value; }
+                        first_seen = *value;
+                        count += 1usize;
+                    },
+                    Option::None => { break; },
+                }
+            }
+            if count != 5usize || last_seen != 5i32 || first_seen != 3i32 { return 1; }
+
+            // The exhausted iterator stays exhausted from both ends.
+            if iter.next().is_some() || iter.next_back().is_some() { return 2; }
+
+            // Interleaved ends never overlap or repeat.
+            let mut mixed = slice.iter();
+            if *mixed.next().unwrap_or(&0i32) != 3i32 { return 3; }
+            if *mixed.next_back().unwrap_or(&0i32) != 5i32 { return 4; }
+            if *mixed.next().unwrap_or(&0i32) != 7i32 { return 5; }
+            if *mixed.next_back().unwrap_or(&0i32) != 9i32 { return 6; }
+            if *mixed.next().unwrap_or(&0i32) != 4i32 { return 7; }
+            if mixed.next().is_some() || mixed.next_back().is_some() { return 8; }
+
+            // Empty and single-element slices terminate immediately.
+            let empty = [0i32; 0usize];
+            let empty_slice: &[i32] = &empty;
+            if empty_slice.iter().next_back().is_some() { return 9; }
+            let single = [42i32];
+            let single_slice: &[i32] = &single;
+            let mut single_iter = single_slice.iter();
+            if *single_iter.next_back().unwrap_or(&0i32) != 42i32 { return 10; }
+            if single_iter.next_back().is_some() { return 11; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn float_hashes_distinguish_values_by_bit_pattern() {
+    // Regression: `Hash for f32/f64` used to cast the value to `usize`,
+    // truncating every fraction below 1.0 onto the same hash.
+    let source = r#"
+        use crate::std::hash::Hash;
+
+        fun main() -> i32 {
+            let small = 0.1f64;
+            let large = 0.9f64;
+            let half = 0.5f64;
+            if small.hash() == large.hash() { return 1; }
+            if half.hash() == small.hash() { return 2; }
+            let one = 1.5f64;
+            let two = 2.5f64;
+            if one.hash() == two.hash() { return 3; }
+            let quarter = 0.25f64;
+            let quarter_again = 0.25f64;
+            if quarter.hash() != quarter_again.hash() { return 4; }
+            let fsmall = 0.1f32;
+            let flarge = 0.9f32;
+            if fsmall.hash() == flarge.hash() { return 5; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn float_hashes_fold_the_exact_bit_pattern() {
+    // `f64_bits` reads the value's bytes through a `&[u8]` view, so a wrong byte
+    // order or a short fold still leaves "these two hashes differ" true for most
+    // pairs. Pinning the exact hash of `1.5` / `2.25` (fmix64 of
+    // 0x3FF8000000000000 / 0x4002000000000000) catches that. The last pair
+    // records the documented `-0.0` / `0.0` split: they compare equal yet hash
+    // apart, which is safe only while floats implement `PartialEq` but not `Eq`.
+    let source = r#"
+        use crate::std::hash::Hash;
+
+        fun main() -> i32 {
+            let one = 1.5f64;
+            let two = 2.25f64;
+            if one.hash() != 9826234843501278960usize { return 1; }
+            if two.hash() != 2653818900198545032usize { return 2; }
+            let zero = 0.0f64;
+            let neg_zero = -0.0f64;
+            if zero != neg_zero { return 3; }
+            if zero.hash() == neg_zero.hash() { return 4; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn float_display_handles_nan_infinity_and_negative_zero() {
+    // Regression: `write_float` used to print NaN as `0.000000` and the
+    // infinities as `±18446744073709551615.000000`, dropped the sign of
+    // negative zero, and mangled any finite value at or above 2^64.
+    let source = r#"
+        fun main() -> i32 {
+            let nan = 0.0f64 / 0.0f64;
+            let positive_infinity = 1.0f64 / 0.0f64;
+            let negative_infinity = -1.0f64 / 0.0f64;
+            let negative_zero = -0.0f64;
+            let quarter = 0.25f32;
+            let big = 1.0e20f64;
+            let dmax = 1.7976931348623157e308f64;
+            println!("nan={nan} dbg={nan:?} pos={positive_infinity} neg={negative_infinity}");
+            println!("zero={negative_zero} f32={quarter}");
+            println!("big={big}");
+            println!("dmax={dmax}");
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(stdout.contains("nan=NaN"), "stdout: {stdout}");
+    assert!(stdout.contains("dbg=NaN"), "stdout: {stdout}");
+    assert!(stdout.contains("pos=inf"), "stdout: {stdout}");
+    assert!(stdout.contains("neg=-inf"), "stdout: {stdout}");
+    assert!(stdout.contains("zero=-0.000000"), "stdout: {stdout}");
+    assert!(stdout.contains("f32=0.250000"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("big=100000000000000000000.000000"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        // The exact decimal expansion (`{:.0}`), not the shortest round-trip
+        // form `Display` picks; the Riddle formatter prints exact digits.
+        stdout.contains(&format!("dmax={:.0}.000000", f64::MAX)),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn stdin_read_line_decodes_utf8_and_rejects_invalid_bytes() {
+    let source = r#"
+        use crate::std::io;
+        use crate::std::result::Result;
+        use crate::std::string::String;
+
+        fun main() -> i32 {
+            let mut line = String::new();
+            match io::read_line(&mut line) {
+                Result::Ok(()) => {},
+                Result::Err(_) => { return 2; },
+            }
+            println!("got={line}");
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run_with_stdin(source, true, "你好，riddle\n".as_bytes());
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(stdout.contains("got=你好，riddle"), "stdout: {stdout}");
+
+    let invalid = r#"
+        use crate::std::io;
+        use crate::std::io::ReadError;
+        use crate::std::result::Result;
+        use crate::std::string::String;
+
+        fun main() -> i32 {
+            let mut line = String::new();
+            match io::read_line(&mut line) {
+                Result::Ok(()) => { return 3; },
+                Result::Err(error) => {
+                    match error {
+                        ReadError::InvalidUtf8 => {},
+                        ReadError::EndOfFile => { return 4; },
+                    }
+                },
+            }
+            if !line.is_empty() { return 5; }
+            println!("rejected");
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run_with_stdin(invalid, true, b"\xff\xfe bad \xff\n");
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(stdout.contains("rejected"), "stdout: {stdout}");
+}
+
+#[test]
+fn buf_reader_read_line_decodes_utf8_across_lines() {
+    let source = r#"
+        use crate::std::fs::write;
+        use crate::std::io::{BufReader, ReadError};
+        use crate::std::result::Result;
+        use crate::std::string::String;
+
+        fun main() -> i32 {
+            match write("riddle_utf8_lines.tmp", "héllo wörld 你好\nsecond line") {
+                Result::Ok(()) => {},
+                Result::Err(_) => { return 1; },
+            }
+            let mut reader = match BufReader::open("riddle_utf8_lines.tmp") {
+                Result::Ok(reader) => reader,
+                Result::Err(_) => { return 2; },
+            };
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Result::Ok(()) => {},
+                Result::Err(_) => { return 3; },
+            }
+            println!("first={line}");
+            match reader.read_line(&mut line) {
+                Result::Ok(()) => {},
+                Result::Err(_) => { return 4; },
+            }
+            println!("second={line}");
+            match reader.read_line(&mut line) {
+                Result::Err(ReadError::EndOfFile) => {},
+                _ => { return 5; },
+            }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(
+        stdout.contains("first=héllo wörld 你好"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("second=second line"), "stdout: {stdout}");
+}
+
+#[test]
+fn collections_sets_and_map_views_iterate() {
+    let source = r#"
+        use crate::std::collections::{HashMap, HashSet, TreeMap, TreeSet};
+
+        fun main() -> i32 {
+            let mut hash: HashSet<i32> = HashSet::new();
+            hash.insert(3);
+            hash.insert(1);
+            hash.insert(4);
+            hash.insert(1);
+            if hash.len() != 3usize { return 1; }
+
+            let mut hash_out = 0usize;
+            for value in &hash {
+                hash_out = hash_out * 10usize + (*value as usize);
+            }
+            if hash_out != 314usize { return 2; }
+
+            let mut tree: TreeSet<i32> = TreeSet::new();
+            tree.insert(5);
+            tree.insert(1);
+            tree.insert(9);
+            tree.insert(3);
+            let mut tree_out = 0usize;
+            for value in &tree {
+                tree_out = tree_out * 10usize + (*value as usize);
+            }
+            if tree_out != 1359usize { return 3; }
+
+            let mut map: TreeMap<i32, i32> = TreeMap::new();
+            map.insert(10, 1);
+            map.insert(20, 2);
+            map.insert(30, 3);
+            map.insert(40, 4);
+            map.insert(50, 5);
+
+            let mut keys = 0usize;
+            for key in map.keys() {
+                keys = keys * 100usize + (*key as usize);
+            }
+            if keys != 1020304050usize { return 4; }
+
+            let mut values = 0usize;
+            for value in map.values() {
+                values = values * 10usize + (*value as usize);
+            }
+            if values != 12345usize { return 5; }
+
+            let mut range_out = 0usize;
+            for (key, value) in map.range(&20, &50) {
+                range_out = range_out * 100usize + (*key as usize);
+                if *value != *key / 10 { return 6; }
+            }
+            if range_out != 203040usize { return 7; }
+
+            let mut none = 0usize;
+            for (key, _) in map.range(&35, &40) {
+                none = none * 100usize + (*key as usize);
+            }
+            if none != 0usize { return 8; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn vector_sorts_large_inputs_in_n_log_n_moves() {
+    let source = r#"
+        use crate::std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
+        use crate::std::option::Option;
+
+        struct Pair { key: i32, tag: i32 }
+
+        impl PartialEq for Pair {
+            fun eq(&self, other: &Self) -> bool {
+                self.key == other.key && self.tag == other.tag
+            }
+        }
+
+        impl PartialOrd for Pair {
+            fun partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                if self.key < other.key {
+                    Option::Some(Ordering::Less)
+                } else if self.key > other.key {
+                    Option::Some(Ordering::Greater)
+                } else {
+                    Option::Some(Ordering::Equal)
+                }
+            }
+        }
+
+        fun main() -> i32 {
+            let mut v: Vector<i32> = Vector::new();
+            let mut seed = 7i32;
+            let mut i = 0usize;
+            while i < 500usize {
+                seed = seed * 1103515245i32 + 12345i32;
+                v.push(seed / 65536i32);
+                i += 1usize;
+            }
+            v.sort();
+            let mut j: usize = 1usize;
+            while j < v.len() {
+                if v[j - 1usize] > v[j] { return 1; }
+                j += 1usize;
+            }
+
+            // Stability: equal keys keep push order (tag ascending within
+            // equal keys exactly as inserted).
+            let mut pairs: Vector<Pair> = Vector::new();
+            let mut k = 0usize;
+            while k < 64usize {
+                pairs.push(Pair { key: (k % 4usize) as i32, tag: k as i32 });
+                k += 1usize;
+            }
+            pairs.sort();
+            let mut m: usize = 1usize;
+            while m < pairs.len() {
+                if pairs[m - 1usize].key > pairs[m].key { return 2; }
+                if pairs[m - 1usize].key == pairs[m].key
+                    && pairs[m - 1usize].tag > pairs[m].tag { return 3; }
+                m += 1usize;
+            }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn tuple_trait_methods_dispatch_through_std_impls() {
+    let source = r#"
+        use crate::std::collections::{HashMap, TreeMap};
+
+        fun main() -> i32 {
+            let a = (1, 2);
+            let b = (0, 9);
+            if !b.lt(&a) { return 1; }
+            if a.eq(&b) { return 2; }
+            match a.cmp(&a) {
+                crate::std::cmp::Ordering::Equal => {},
+                _ => { return 3; },
+            }
+            let same = (1, 2);
+            if !(a == same && a != b && a > b) { return 4; }
+
+            // Generic dispatch through tuple impls: sort and ordered maps.
+            let mut v: Vector<(i32, i32)> = Vector::new();
+            v.push((3, 1));
+            v.push((1, 2));
+            v.push((1, 1));
+            v.sort();
+            if v[0].0 != 1 || v[0].1 != 1 { return 5; }
+            if v[1].0 != 1 || v[1].1 != 2 { return 6; }
+            if v[2].0 != 3 { return 7; }
+
+            // Nested tuples: the outer impl dispatches `.lt` into the inner
+            // tuple impl, recursing through the same generic machinery.
+            let mut nested: Vector<((i32, i32), i32)> = Vector::new();
+            nested.push(((1, 0), 5));
+            nested.push(((0, 9), 5));
+            nested.push(((1, 0), 2));
+            nested.sort();
+            if (nested[0].0).0 != 0 { return 20; }
+            if nested[1].1 != 2 { return 21; }
+            if nested[2].1 != 5 { return 22; }
+
+            let mut counts: HashMap<(i32, i32), i32> = HashMap::new();
+            counts.insert((1, 2), 10);
+            counts.insert((1, 2), 20);
+            counts.insert((2, 1), 30);
+            match counts.get(&(1, 2)) {
+                crate::std::option::Option::Some(value) => { if *value != 20 { return 8; } },
+                crate::std::option::Option::None => { return 9; },
+            }
+
+            let mut ordered: TreeMap<(i32, i32), i32> = TreeMap::new();
+            ordered.insert((2, 0), 1);
+            ordered.insert((1, 9), 2);
+            let mut first: (i32, i32) = (9, 9);
+            let low = (0, 0);
+            let high = (2, 0);
+            for (key, _) in ordered.range(&low, &high) {
+                first = *key;
+                break;
+            }
+            if first.0 != 1 || first.1 != 9 { return 10; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn match_or_patterns_dispatch_through_c() {
+    let source = r#"
+        enum Color { Red, Green, Blue, Custom(i32) }
+
+        fun band(x: i32) -> i32 {
+            match x {
+                1 | 2 | 3 => 10,
+                10 => 20,
+                _ => 30,
+            }
+        }
+
+        fun name(color: Color) -> i32 {
+            match color {
+                Color::Red | Color::Green => 1,
+                Color::Custom(_) | Color::Blue => 2,
+            }
+        }
+
+        fun guarded(x: i32) -> i32 {
+            match x {
+                1 | 2 | 3 if x > 2 => 1,
+                1 | 2 | 3 => 2,
+                y if y > 100 => 3,
+                _ => 4,
+            }
+        }
+
+        fun main() -> i32 {
+            if band(2) != 10 { return 1; }
+            if band(10) != 20 { return 2; }
+            if band(99) != 30 { return 3; }
+            if name(Color::Red) != 1 { return 4; }
+            if name(Color::Blue) != 2 { return 5; }
+            if name(Color::Custom(7)) != 2 { return 6; }
+            if name(Color::Green) != 1 { return 7; }
+            if guarded(3) != 1 { return 8; }
+            if guarded(1) != 2 { return 9; }
+            if guarded(200) != 3 { return 10; }
+            if guarded(50) != 4 { return 11; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn bool_bitwise_ops_are_eager_through_c() {
+    // The interpreter must agree with the C backend here: `&`/`|`/`^` on
+    // `bool` are eager operators, while `&&`/`||` short-circuit.
+    let source = r#"
+        fun main() -> i32 {
+            let mut calls = 0i32;
+            let mut bump = [ -> { calls += 1i32; true }];
+            let t = true;
+            let f = false;
+
+            if t & f { return 1; }
+            if !(t | f) { return 2; }
+            if !(t ^ f) { return 3; }
+            if t && f { return 4; }
+            if !(t || f) { return 5; }
+
+            if f && bump() { return 6; }
+            if calls != 0i32 { return 7; }
+
+            if f & bump() { return 8; }
+            if calls != 1i32 { return 9; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn indexing_through_array_references_through_c() {
+    let source = r#"
+        struct Pair { a: [i32; 2] }
+
+        fun main() -> i32 {
+            let values = [5i32, 6i32, 7i32];
+            let view = &values;
+            let mut total = 0i32;
+            let mut index = 0usize;
+            while index < 3usize {
+                total += view[index];
+                index += 1usize;
+            }
+            if total != 18i32 { return 1; }
+            if view[2usize] != 7i32 { return 2; }
+
+            let pair = Pair { a: [1i32, 2i32] };
+            let inner = &pair.a;
+            if inner[0usize] + inner[1usize] != 3i32 { return 3; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn ordering_values_compare_through_c() {
+    let source = r#"
+        use crate::std::cmp::Ordering;
+
+        fun main() -> i32 {
+            let a = 1i32;
+            let b = 2i32;
+            if a.cmp(&a) != Ordering::Equal { return 1; }
+            if a.cmp(&b) != Ordering::Less { return 2; }
+            if b.cmp(&a) != Ordering::Greater { return 3; }
+            if a.cmp(&b) == Ordering::Equal { return 4; }
+            if !(Ordering::Less < Ordering::Equal) { return 5; }
+            if !(Ordering::Equal < Ordering::Greater) { return 6; }
+            if !(Ordering::Greater > Ordering::Less) { return 7; }
+            let mut results = vec![Ordering::Greater, Ordering::Less, Ordering::Equal];
+            results.sort();
+            if results[0] != Ordering::Less { return 8; }
+            if results[1] != Ordering::Equal { return 9; }
+            if results[2] != Ordering::Greater { return 10; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn references_compare_through_blanket_impls() {
+    let source = r#"
+        use crate::std::cmp::Ordering;
+
+        fun ref_eq<T: crate::std::cmp::PartialEq>(a: &T, b: &T) -> bool {
+            a == b
+        }
+
+        fun main() -> i32 {
+            let p = 10;
+            let q = 10;
+            let a = &p;
+            let b = &q;
+            // Value equality through distinct addresses.
+            if !(a == b) { return 1; }
+            if a != b { return 2; }
+            // Ordering operators on references.
+            let small = 3;
+            let big = 9;
+            if !(&small < &big) { return 3; }
+            if !(&big > &small) { return 4; }
+            if &small >= &big { return 5; }
+            // Method syntax resolves through the pointee impl.
+            if !a.eq(b) { return 6; }
+            // cmp on references and on the comparison result.
+            if a.cmp(b) != Ordering::Equal { return 7; }
+            if small.cmp(&big) != Ordering::Less { return 8; }
+            // Generic context goes through the trait bound.
+            if !ref_eq(&p, &q) { return 9; }
+            if ref_eq(&small, &big) { return 10; }
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn debug_formats_std_sum_types() {
+    let source = r#"
+        use crate::std::cmp::Ordering;
+        use crate::std::option::Option;
+        use crate::std::string::String;
+        use crate::std::vector::Vector;
+
+        fun main() -> i32 {
+            let some = Option::Some(42);
+            let none: Option<i32> = Option::None;
+            let ok: crate::std::result::Result<i32, String> = crate::std::result::Result::Ok(7);
+            let err: crate::std::result::Result<i32, String> =
+                crate::std::result::Result::Err(String::from("boom"));
+            let mut v: Vector<i32> = Vector::new();
+            v.push(1);
+            v.push(2);
+            println!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                some, none, ok, err, Ordering::Less, Ordering::Equal, Option::Some(v),
+            );
+            0
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert_eq!(
+        stdout.trim(),
+        r#"Some(42)|None|Ok(7)|Err("boom")|Less|Equal|Some([1, 2])"#,
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn private_helper_with_std_name_compiles() {
+    let source = r#"
+        use crate::std::collections::hash_map::HashMap;
+
+        fun mix64(value: u64) -> u64 {
+            value ^ 0xdead_beef_dead_beefu64
+        }
+
+        fun main() -> i32 {
+            // std's own private `mix64` (hash.rid) must not collide with the
+            // user's same-named helper in the generated C symbols.
+            let mut map: HashMap<i32, i32> = HashMap::new();
+            map.insert(1, 10);
+            map.insert(2, 20);
+            let probe = mix64(7u64);
+            if map.len() == 2usize && probe != 0 { 0 } else { 1 }
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn slice_iter_supports_manual_consecutive_next_calls() {
+    let source = r#"
+        use crate::std::option::Option;
+        use crate::std::vector::Vector;
+
+        fun main() -> i32 {
+            let mut v: Vector<i32> = Vector::new();
+            v.push(10);
+            v.push(20);
+            v.push(30);
+            // Manual `next` calls on an `Item = &T` iterator: the returned
+            // element references borrow the stored buffer loan, not the
+            // iterator, so consecutive calls are fine.
+            let mut it = v.iter();
+            let a = it.next();
+            let b = it.next();
+            let c = it.next();
+            let done = it.next();
+            let av = match a { Option::Some(x) => *x, _ => -1 };
+            let bv = match b { Option::Some(x) => *x, _ => -1 };
+            let cv = match c { Option::Some(x) => *x, _ => -1 };
+            let dn = match done { Option::Some(_) => 1, _ => 0 };
+            if av == 10 && bv == 20 && cv == 30 && dn == 0 { 0 } else { 1 }
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source, true);
+    assert_eq!(code, 0, "stdout: {stdout}");
+}
+
+#[test]
+fn tree_map_iter_supports_manual_consecutive_next_calls() {
+    let source = r#"
+        use crate::std::collections::TreeMap;
+        use crate::std::option::Option;
+        use crate::std::iter::Iterator;
+
+        fun main() -> i32 {
+            let mut tree: TreeMap<i32, i32> = TreeMap::new();
+            tree.insert(10i32, 1);
+            tree.insert(20i32, 2);
+            tree.insert(30i32, 3);
+            // Tree iterators reach their elements through `Vector::get`,
+            // whose provenance is trackable again after the raw-pointer
+            // detour was replaced by the slice accessor.
+            let mut iter = tree.iter();
+            let a = iter.next();
+            let b = iter.next();
+            let c = iter.next();
+            let done = iter.next();
+            let av = match a { Option::Some((k, _)) => *k, _ => -1 };
+            let bv = match b { Option::Some((k, _)) => *k, _ => -1 };
+            let cv = match c { Option::Some((k, _)) => *k, _ => -1 };
+            let dn = match done { Option::Some(_) => 1, _ => 0 };
+            if av == 10 && bv == 20 && cv == 30 && dn == 0 { 0 } else { 1 }
         }
     "#;
     let (code, stdout) = compile_and_run(source, true);

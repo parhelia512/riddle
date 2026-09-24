@@ -1,9 +1,13 @@
-use crate::std::iter::{IntoIterator, Iterator};
+use crate::std::iter::{
+    IntoIterator,
+    Iterator
+};
 use crate::std::option::Option;
 
 pub struct SliceIter<T> {
     values: &[T],
     index: usize,
+    back: usize,
 }
 
 pub struct SliceIterMut<T> {
@@ -11,8 +15,7 @@ pub struct SliceIterMut<T> {
     index: usize,
 }
 
-impl<T> crate::std::fmt::Debug for [T]
-where T: crate::std::fmt::Debug {
+impl<T> crate::std::fmt::Debug for [T] where T: crate::std::fmt::Debug {
     fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
         formatter.write_str("[")?;
         let mut index = 0usize;
@@ -27,8 +30,7 @@ where T: crate::std::fmt::Debug {
     }
 }
 
-impl<T> crate::std::fmt::Debug for &[T]
-where T: crate::std::fmt::Debug {
+impl<T> crate::std::fmt::Debug for &[T] where T: crate::std::fmt::Debug {
     fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
         let values = *self;
         formatter.write_str("[")?;
@@ -44,10 +46,12 @@ where T: crate::std::fmt::Debug {
     }
 }
 
-impl<T> [T] {
+impl<T>[T] {
     pub fun len(&self) -> usize {
         // SAFETY: `&[T]` is laid out as a `(pointer, length)` pair.
-        let (_, len) = unsafe { self as (*const T, usize) };
+        let (_, len) = unsafe {
+            self as (*const T, usize)
+        };
         len
     }
 
@@ -57,8 +61,10 @@ impl<T> [T] {
 
     pub fun get(&self, index: usize) -> Option<&T> {
         if index < self.len() {
-            // SAFETY: index is in bounds, so the element is initialized.
-            Option::Some(unsafe { &self.as_ptr()[index] })
+            // The bound was just checked, so direct indexing cannot panic;
+            // it keeps the element borrow trackable by the move checker
+            // (unlike a raw-pointer detour, which is exempt from tracking).
+            Option::Some(&self[index])
         } else {
             Option::None
         }
@@ -66,8 +72,7 @@ impl<T> [T] {
 
     pub fun get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index < self.len() {
-            // SAFETY: index is in bounds, so the element is initialized.
-            Option::Some(unsafe { &mut self.as_mut_ptr()[index] })
+            Option::Some(&mut self[index])
         } else {
             Option::None
         }
@@ -75,13 +80,17 @@ impl<T> [T] {
 
     pub fun as_ptr(&self) -> *const T {
         // SAFETY: `&[T]` is laid out as a `(pointer, length)` pair.
-        let (ptr, _) = unsafe { self as (*const T, usize) };
+        let (ptr, _) = unsafe {
+            self as (*const T, usize)
+        };
         ptr
     }
 
     pub fun as_mut_ptr(&mut self) -> *mut T {
         // SAFETY: `&mut [T]` is laid out as a `(pointer, length)` pair.
-        let (ptr, _) = unsafe { self as (*mut T, usize) };
+        let (ptr, _) = unsafe {
+            self as (*mut T, usize)
+        };
         ptr
     }
 
@@ -89,6 +98,7 @@ impl<T> [T] {
         SliceIter {
             values: &*self,
             index: 0usize,
+            back: self.len(),
         }
     }
 
@@ -104,7 +114,7 @@ impl<T> Iterator for SliceIter<T> {
     type Item = &T;
 
     fun next(&mut self) -> Option<Self::Item> {
-        if self.index < self.values.len() {
+        if self.index < self.back {
             let index = self.index;
             self.index += 1usize;
             self.values.get(index)
@@ -116,9 +126,9 @@ impl<T> Iterator for SliceIter<T> {
 
 impl<T> crate::std::iter::DoubleEndedIterator for SliceIter<T> {
     fun next_back(&mut self) -> Option<Self::Item> {
-        if self.index < self.values.len() {
-            let last = self.values.len() - 1usize;
-            self.values.get(last)
+        if self.back > self.index {
+            self.back -= 1usize;
+            self.values.get(self.back)
         } else {
             Option::None
         }
@@ -133,6 +143,7 @@ impl<T> IntoIterator for &[T] {
         SliceIter {
             values: &*self,
             index: 0usize,
+            back: self.len(),
         }
     }
 }

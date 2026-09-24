@@ -1,9 +1,18 @@
-use crate::std::iter::{IntoIterator, Iterator};
+use crate::std::iter::{
+    IntoIterator,
+    Iterator
+};
 use crate::std::mem::size_of;
 use crate::std::option::Option;
-use crate::std::ops::{Index, IndexMut};
+use crate::std::ops::{
+    Index,
+    IndexMut
+};
 use crate::std::panic::panic;
-use crate::std::slice::{SliceIter, SliceIterMut};
+use crate::std::slice::{
+    SliceIter,
+    SliceIterMut
+};
 
 // The buffer lives in the GC heap so stored references to escaping values are
 // traced; Drop still releases it deterministically via rgc_free.
@@ -18,8 +27,7 @@ pub struct Vector<T> {
     capacity: usize,
 }
 
-impl<T> crate::std::fmt::Debug for Vector<T>
-where T: crate::std::fmt::Debug {
+impl<T> crate::std::fmt::Debug for Vector<T> where T: crate::std::fmt::Debug {
     fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
         formatter.write_str("[")?;
         let mut index = 0usize;
@@ -27,7 +35,9 @@ where T: crate::std::fmt::Debug {
             if index > 0usize {
                 formatter.write_str(", ")?;
             }
-            crate::std::fmt::write_debug(unsafe { &self.data[index] }, &mut *formatter)?;
+            crate::std::fmt::write_debug(unsafe {
+                &self.data[index]
+            }, &mut *formatter)?;
             index += 1usize;
         }
         formatter.write_str("]")
@@ -50,21 +60,23 @@ impl<T> Vector<T> {
     }
 
     // Collects every remaining item of `iterator` into a new vector.
-    pub fun from_iterator<I>(iterator: &mut I) -> Vector<T>
-    where I: Iterator<Item = T> {
+    pub fun from_iterator<I>(iterator: &mut I) -> Vector<T> where I: Iterator<Item = T> {
         let mut out = Vector::new();
         loop {
             match iterator.next() {
-                Option::Some(value) => { out.push(value); },
-                Option::None => { break; },
+                Option::Some(value) => {
+                    out.push(value);
+                },
+                Option::None => {
+                    break;
+                },
             }
         }
         out
     }
 
     // Builds a vector holding `count` clones of `value`.
-    pub fun from_elem(value: T, count: usize) -> Vector<T>
-    where T: crate::std::clone::Clone {
+    pub fun from_elem(value: T, count: usize) -> Vector<T> where T: crate::std::clone::Clone {
         let mut out = Vector::new();
         let mut index = 0usize;
         while index < count {
@@ -93,7 +105,11 @@ impl<T> Vector<T> {
             // an element is never dereferenced (ZST reads/writes touch no
             // memory), so only distinct slot counts matter.
             let raw_size = size_of::<T>();
-            let item_size = if raw_size == 0usize { 1usize } else { raw_size };
+            let item_size = if raw_size == 0usize {
+                1usize
+            } else {
+                raw_size
+            };
             let next_capacity = if self.capacity == 0usize {
                 4usize
             } else {
@@ -109,7 +125,9 @@ impl<T> Vector<T> {
             self.data = rgc_realloc(self.data as *mut u8, bytes) as *mut T;
             self.capacity = next_capacity;
         }
-        unsafe { self.data[self.len] = value; }
+        unsafe {
+            self.data[self.len] = value;
+        }
         self.len += 1usize;
     }
 
@@ -118,13 +136,18 @@ impl<T> Vector<T> {
             Option::None
         } else {
             self.len -= 1usize;
-            Option::Some(unsafe { self.data[self.len] })
+            Option::Some(unsafe {
+                self.data[self.len]
+            })
         }
     }
 
     pub fun get(&self, index: usize) -> Option<&T> {
         if index < self.len {
-            Option::Some(unsafe { &self.data[index] })
+            // Delegate to the slice accessor after the bounds check: it
+            // keeps the element borrow trackable by the move checker (a
+            // raw-pointer detour is exempt from tracking).
+            self.as_slice().get(index)
         } else {
             Option::None
         }
@@ -132,7 +155,10 @@ impl<T> Vector<T> {
 
     pub fun get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index < self.len {
-            Option::Some(unsafe { &mut self.data[index] })
+            let values: &mut [T] = unsafe {
+                (self.data, self.len) as &mut [T]
+            };
+            values.get_mut(index)
         } else {
             Option::None
         }
@@ -140,9 +166,15 @@ impl<T> Vector<T> {
 
     pub fun swap(&mut self, left: usize, right: usize) {
         if left < self.len && right < self.len && left != right {
-            let value = unsafe { self.data[left] };
-            unsafe { self.data[left] = self.data[right]; }
-            unsafe { self.data[right] = value; }
+            let value = unsafe {
+                self.data[left]
+            };
+            unsafe {
+                self.data[left] = self.data[right];
+            }
+            unsafe {
+                self.data[right] = value;
+            }
         }
     }
 
@@ -153,7 +185,11 @@ impl<T> Vector<T> {
         if self.len == self.capacity {
             // Same zero-sized-element handling as `push`: one-byte slots.
             let raw_size = size_of::<T>();
-            let item_size = if raw_size == 0usize { 1usize } else { raw_size };
+            let item_size = if raw_size == 0usize {
+                1usize
+            } else {
+                raw_size
+            };
             let next_capacity = if self.capacity == 0usize {
                 4usize
             } else {
@@ -171,11 +207,17 @@ impl<T> Vector<T> {
         }
         let mut position = self.len;
         while position > index {
-            let moved = unsafe { self.data[position - 1usize] };
-            unsafe { self.data[position] = moved; }
+            let moved = unsafe {
+                self.data[position - 1usize]
+            };
+            unsafe {
+                self.data[position] = moved;
+            }
             position -= 1usize;
         }
-        unsafe { self.data[index] = value; }
+        unsafe {
+            self.data[index] = value;
+        }
         self.len += 1usize;
     }
 
@@ -183,22 +225,29 @@ impl<T> Vector<T> {
         if index >= self.len {
             panic("Vector remove index out of bounds");
         }
-        let value = unsafe { self.data[index] };
+        let value = unsafe {
+            self.data[index]
+        };
         self.len -= 1usize;
         let mut position = index;
         while position < self.len {
-            let moved = unsafe { self.data[position + 1usize] };
-            unsafe { self.data[position] = moved; }
+            let moved = unsafe {
+                self.data[position + 1usize]
+            };
+            unsafe {
+                self.data[position] = moved;
+            }
             position += 1usize;
         }
         value
     }
 
-    pub fun contains(&self, value: &T) -> bool
-    where T: crate::std::cmp::PartialEq {
+    pub fun contains(&self, value: &T) -> bool where T: crate::std::cmp::PartialEq {
         let mut index = 0usize;
         while index < self.len {
-            let candidate = unsafe { &self.data[index] };
+            let candidate = unsafe {
+                &self.data[index]
+            };
             let matches = candidate.eq(value);
             if matches {
                 return true;
@@ -208,22 +257,111 @@ impl<T> Vector<T> {
         false
     }
 
-    pub fun sort(&mut self)
-    where T: crate::std::cmp::PartialOrd {
-        let mut index = 1usize;
-        while index < self.len {
-            let mut position = index;
-            while position > 0usize {
-                let current = unsafe { &self.data[position] };
-                let previous = unsafe { &self.data[position - 1usize] };
-                let is_smaller = current.lt(previous);
-                if !is_smaller {
+    /// Sorts in ascending order. Bottom-up merge sort: stable and
+    /// O(n log n) moves — the left run parks in a scratch buffer while the
+    /// right run merges in place, so every output slot is written at most
+    /// once per level and `out` never passes the right-run cursor.
+    pub fun sort(&mut self) where T: crate::std::cmp::PartialOrd {
+        let len = self.len;
+        if len < 2usize {
+            return;
+        }
+        let raw_size = size_of::<T>();
+        let item_size = if raw_size == 0usize {
+            1usize
+        } else {
+            raw_size
+        };
+        let scratch = rgc_realloc(0usize as *mut u8, len * item_size) as *mut T;
+        let mut width = 1usize;
+        while width < len {
+            let mut start = 0usize;
+            while start < len {
+                let mid = if start + width < len {
+                    start + width
+                } else {
+                    len
+                };
+                let end = if start + width * 2usize < len {
+                    start + width * 2usize
+                } else {
+                    len
+                };
+                if mid == end {
+                    // A trailing run with no right partner is already sorted
+                    // in place, and every later `start` is past the end.
                     break;
                 }
-                self.swap(position, position - 1usize);
-                position -= 1usize;
+                self.merge_runs(scratch, start, mid, end);
+                start += width * 2usize;
+            }
+            width *= 2usize;
+        }
+        rgc_free(scratch as *mut u8);
+    }
+
+    /// Merges the sorted runs `data[start..mid]` and `data[mid..end]` back
+    /// into `data[start..end]`, staging the left run in `scratch`.
+    fun merge_runs(&mut self, scratch: *mut T, start: usize, mid: usize, end: usize) where T: crate::std::cmp::PartialOrd {
+        let mut index = start;
+        while index < mid {
+            unsafe {
+                scratch[index] = unsafe {
+                    self.data[index]
+                };
             }
             index += 1usize;
+        }
+        let mut left = start;
+        let mut right = mid;
+        let mut out = start;
+        while left < mid && right < end {
+            let left_value = unsafe {
+                &scratch[left]
+            };
+            let right_value = unsafe {
+                &self.data[right]
+            };
+            // Strictly smaller takes from the right run; ties keep the left
+            // run's element first, which makes the sort stable.
+            if right_value.lt(left_value) {
+                if out != right {
+                    unsafe {
+                        self.data[out] = unsafe {
+                            self.data[right]
+                        };
+                    }
+                }
+                right += 1usize;
+            } else {
+                unsafe {
+                    self.data[out] = unsafe {
+                        scratch[left]
+                    };
+                }
+                left += 1usize;
+            }
+            out += 1usize;
+        }
+        while left < mid {
+            unsafe {
+                self.data[out] = unsafe {
+                    scratch[left]
+                };
+            }
+            left += 1usize;
+            out += 1usize;
+        }
+        while right < end {
+            if out != right {
+                unsafe {
+                    self.data[out] = unsafe {
+                        self.data[right]
+                    };
+                }
+            }
+            right += 1usize;
+            out += 1usize;
         }
     }
 
@@ -231,16 +369,24 @@ impl<T> Vector<T> {
         let mut write = 0usize;
         let mut read = 0usize;
         while read < self.len {
-            let candidate = unsafe { &self.data[read] };
+            let candidate = unsafe {
+                &self.data[read]
+            };
             let keep = predicate(candidate);
             if keep {
                 if write != read {
-                    let moved = unsafe { self.data[read] };
-                    unsafe { self.data[write] = moved; }
+                    let moved = unsafe {
+                        self.data[read]
+                    };
+                    unsafe {
+                        self.data[write] = moved;
+                    }
                 }
                 write += 1usize;
             } else {
-                let dropped = unsafe { self.data[read] };
+                let dropped = unsafe {
+                    self.data[read]
+                };
             }
             read += 1usize;
         }
@@ -250,7 +396,9 @@ impl<T> Vector<T> {
     pub fun clear(&mut self) {
         let mut index = 0usize;
         while index < self.len {
-            let value = unsafe { self.data[index] };
+            let value = unsafe {
+                self.data[index]
+            };
             index += 1usize;
         }
         self.len = 0usize;
@@ -267,7 +415,9 @@ impl<T> Vector<T> {
         } else {
             // SAFETY: data points to self.len initialized elements and remains
             // live while self is borrowed.
-            unsafe { (self.data, self.len) as &[T] }
+            unsafe {
+                (self.data, self.len) as &[T]
+            }
         }
     }
 
@@ -276,7 +426,9 @@ impl<T> Vector<T> {
     }
 
     pub fun iter_mut(&mut self) -> SliceIterMut<T> {
-        let values: &mut [T] = unsafe { (self.data, self.len) as &mut [T] };
+        let values: &mut [T] = unsafe {
+            (self.data, self.len) as &mut [T]
+        };
         values.iter_mut()
     }
 }
@@ -285,7 +437,9 @@ impl<T> Drop for Vector<T> {
     fun drop(&mut self) {
         let mut index = 0usize;
         while index < self.len {
-            let value = unsafe { self.data[index] };
+            let value = unsafe {
+                self.data[index]
+            };
             index += 1usize;
         }
         rgc_free(self.data as *mut u8);
@@ -317,7 +471,9 @@ impl<T> Iterator for VectorIntoIter<T> {
 
     fun next(&mut self) -> Option<Self::Item> {
         if self.index < self.len {
-            let value = unsafe { self.data[self.index] };
+            let value = unsafe {
+                self.data[self.index]
+            };
             self.index += 1usize;
             Option::Some(value)
         } else {
@@ -340,7 +496,9 @@ impl<T> IntoIterator for &mut Vector<T> {
     type IntoIter = SliceIterMut<T>;
 
     fun into_iter(self) -> Self::IntoIter {
-        let values: &mut [T] = unsafe { (self.data, self.len) as &mut [T] };
+        let values: &mut [T] = unsafe {
+            (self.data, self.len) as &mut [T]
+        };
         values.iter_mut()
     }
 }
@@ -348,7 +506,9 @@ impl<T> IntoIterator for &mut Vector<T> {
 impl<T> Drop for VectorIntoIter<T> {
     fun drop(&mut self) {
         while self.index < self.len {
-            let value = unsafe { self.data[self.index] };
+            let value = unsafe {
+                self.data[self.index]
+            };
             self.index += 1usize;
         }
         rgc_free(self.data as *mut u8);

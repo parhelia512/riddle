@@ -1,5 +1,11 @@
-use crate::std::iter::{IntoIterator, Iterator};
-use crate::std::cmp::{Eq, PartialEq};
+use crate::std::iter::{
+    IntoIterator,
+    Iterator
+};
+use crate::std::cmp::{
+    Eq,
+    PartialEq
+};
 use crate::std::hash::Hash;
 use crate::std::option::Option;
 use crate::std::vector::Vector;
@@ -7,7 +13,9 @@ use crate::std::vector::Vector;
 // SAFETY: the caller must guarantee that value contains valid UTF-8.
 unsafe fun from_utf8_unchecked(value: &[u8]) -> &str {
     // SAFETY: &[u8] and &str use the same pointer and length metadata.
-    unsafe { value as &str }
+    unsafe {
+        value as &str
+    }
 }
 
 // SAFETY: the caller must guarantee that value is a valid Unicode scalar value.
@@ -15,7 +23,9 @@ unsafe fun char_from_u32_unchecked(value: u32) -> char {
     // SAFETY: char and u32 have the same runtime representation.
     let values = [value];
     let slice: &[u32] = &values;
-    unsafe { *(slice.as_ptr() as *const char) }
+    unsafe {
+        *(slice.as_ptr() as *const char)
+    }
 }
 
 unsafe extern "C" {
@@ -56,7 +66,9 @@ impl String {
         let mut output = String::new();
         let mut index = 0usize;
         while index < length {
-            output.bytes.push(unsafe { pointer[index] });
+            output.bytes.push(unsafe {
+                pointer[index]
+            });
             index += 1usize;
         }
         output
@@ -75,7 +87,9 @@ impl String {
 
     // SAFETY: pointer must reference length readable bytes.
     pub unsafe fun from_utf8_raw(pointer: *const u8, length: usize) -> Option<String> {
-        let output = unsafe { String::from_raw_bytes(pointer, length) };
+        let output = unsafe {
+            String::from_raw_bytes(pointer, length)
+        };
         if is_valid_utf8(output.as_bytes()) {
             Option::Some(output)
         } else {
@@ -85,7 +99,9 @@ impl String {
 
     pub fun as_str(&self) -> &str {
         // SAFETY: String only stores bytes copied from valid string slices.
-        unsafe { from_utf8_unchecked(self.bytes.as_slice()) }
+        unsafe {
+            from_utf8_unchecked(self.bytes.as_slice())
+        }
     }
 
     pub fun as_bytes(&self) -> &[u8] {
@@ -235,9 +251,7 @@ impl str {
         let mut start = 0usize;
         while start <= last {
             let mut index = 0usize;
-            while index < needle.len()
-                && self.as_bytes()[start + index] == needle.as_bytes()[index]
-            {
+            while index < needle.len() && self.as_bytes()[start + index] == needle.as_bytes()[index] {
                 index += 1usize;
             }
             if index == needle.len() {
@@ -249,15 +263,18 @@ impl str {
     }
 
     pub fun slice(&self, start: usize, end: usize) -> Option<&str> {
-        if start > end || end > self.len()
-            || !is_utf8_boundary(self.as_bytes(), start)
-            || !is_utf8_boundary(self.as_bytes(), end)
-        {
+        if start > end || end > self.len() || !is_utf8_boundary(self.as_bytes(), start) || !is_utf8_boundary(self.as_bytes(), end) {
             return Option::None;
         }
-        let pointer = unsafe { riddle_str_slice_ptr(self.as_bytes().as_ptr(), start) };
-        let bytes: &[u8] = unsafe { (pointer, end - start) as &[u8] };
-        Option::Some(unsafe { bytes as &str })
+        let pointer = unsafe {
+            riddle_str_slice_ptr(self.as_bytes().as_ptr(), start)
+        };
+        let bytes: &[u8] = unsafe {
+            (pointer, end - start) as &[u8]
+        };
+        Option::Some(unsafe {
+            bytes as &str
+        })
     }
 
     pub fun trim(&self) -> &str {
@@ -367,8 +384,7 @@ fun is_ascii_whitespace_byte(value: u8) -> bool {
 }
 
 fun is_utf8_boundary(value: &[u8], index: usize) -> bool {
-    index == 0usize || index == value.len()
-        || (value[index] & 192u8) != 128u8
+    index == 0usize || index == value.len() || (value[index] & 192u8) != 128u8
 }
 
 fun is_utf8_continuation(value: u8) -> bool {
@@ -414,8 +430,7 @@ pub fun is_valid_utf8(value: &[u8]) -> bool {
             } else {
                 is_utf8_continuation(second)
             };
-            if !valid_second || !is_utf8_continuation(value[index + 2usize])
-                || !is_utf8_continuation(value[index + 3usize]) {
+            if !valid_second || !is_utf8_continuation(value[index + 2usize]) || !is_utf8_continuation(value[index + 3usize]) {
                 return false;
             }
             index += 4usize;
@@ -456,46 +471,57 @@ impl Iterator for StrIter {
     fun next(&mut self) -> Option<Self::Item> {
         let first = match self.bytes.get(self.index) {
             Option::Some(value) => *value,
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
 
         if first < 128u8 {
             self.index += 1usize;
-            return Option::Some(unsafe { char_from_u32_unchecked(first as u32) });
+            return Option::Some(unsafe {
+                char_from_u32_unchecked(first as u32)
+            });
         }
 
         let second = match self.bytes.get(self.index + 1usize) {
             Option::Some(value) => *value,
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
         if first < 224u8 {
             self.index += 2usize;
             let value = (((first & 31u8) as u32) << 6u32) | ((second & 63u8) as u32);
-            return Option::Some(unsafe { char_from_u32_unchecked(value) });
+            return Option::Some(unsafe {
+                char_from_u32_unchecked(value)
+            });
         }
 
         let third = match self.bytes.get(self.index + 2usize) {
             Option::Some(value) => *value,
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
         if first < 240u8 {
             self.index += 3usize;
-            let value = (((first & 15u8) as u32) << 12u32)
-                | (((second & 63u8) as u32) << 6u32)
-                | ((third & 63u8) as u32);
-            return Option::Some(unsafe { char_from_u32_unchecked(value) });
+            let value = (((first & 15u8) as u32) << 12u32) | (((second & 63u8) as u32) << 6u32) | ((third & 63u8) as u32);
+            return Option::Some(unsafe {
+                char_from_u32_unchecked(value)
+            });
         }
 
         let fourth = match self.bytes.get(self.index + 3usize) {
             Option::Some(value) => *value,
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
         self.index += 4usize;
-        let value = (((first & 7u8) as u32) << 18u32)
-            | (((second & 63u8) as u32) << 12u32)
-            | (((third & 63u8) as u32) << 6u32)
-            | ((fourth & 63u8) as u32);
-        Option::Some(unsafe { char_from_u32_unchecked(value) })
+        let value = (((first & 7u8) as u32) << 18u32) | (((second & 63u8) as u32) << 12u32) | (((third & 63u8) as u32) << 6u32) | ((fourth & 63u8) as u32);
+        Option::Some(unsafe {
+            char_from_u32_unchecked(value)
+        })
     }
 }
 

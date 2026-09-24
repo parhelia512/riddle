@@ -789,6 +789,9 @@ impl<'a> TypeChecker<'a> {
         let function_bounds = self.current_generic_bounds(&ctx);
         self.active_trait_assumptions =
             self.lower_trait_env_bounds(&function_bounds, &ctx.generic_params);
+        self.result
+            .body_bounds
+            .insert(body_id, self.active_trait_assumptions.clone());
         self.check_type_bounds_inner(
             &ctx,
             &return_ty,
@@ -1147,23 +1150,29 @@ impl<'a> TypeChecker<'a> {
                     &bound_params,
                     Some(constraint.range),
                 );
-                // Seeded entries hold fresh inference variables and
-                // `collect_subst` never overwrites occupied entries, so bind
-                // every constraint param whose slot is still unresolved by
-                // overwriting it with the concrete associated type.
+                // The constraint value is a pattern (`&T`, `(T, i32)`,
+                // `Vector<T>`), so each param must be matched against the
+                // associated type at its own position instead of binding the
+                // whole associated type to every param the pattern mentions.
+                // Seeded slots hold fresh inference variables and
+                // `collect_subst` never overwrites occupied entries, so drop
+                // those first and commit the result only when the pattern
+                // matches the associated type structurally.
+                let mut matched = subst.clone();
                 for name in bound_params.keys() {
                     if !crate::body::type_has_param_where(&pattern, &|candidate| {
                         candidate == name.as_str()
                     }) {
                         continue;
                     }
-                    if let Some(existing) = subst.get(name)
-                        && !existing.is_unknown_like()
-                        && !matches!(existing, Type::InferVar(_))
-                    {
-                        continue;
+                    if matched.get(name).is_none_or(|existing| {
+                        existing.is_unknown_like() || matches!(existing, Type::InferVar(_))
+                    }) {
+                        matched.remove(name);
                     }
-                    subst.insert(name.clone(), actual.clone());
+                }
+                if crate::lowering::collect_subst(&pattern, &actual, &mut matched) {
+                    *subst = matched;
                 }
             }
         }

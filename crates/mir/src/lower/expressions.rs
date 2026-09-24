@@ -444,13 +444,37 @@ impl LowerCtx<'_> {
         let params = &self.hir.item_tree.functions[function].params;
         let receiver_ty = params.first().map(|param| param.ty.clone());
         let rhs_ty = params.get(1).map(|param| param.ty.clone());
+        let lhs_tc_ty = self
+            .current_body
+            .and_then(|body| self.type_result.expr_types.get(&(body, lhs)));
+        let rhs_tc_ty = self
+            .current_body
+            .and_then(|body| self.type_result.expr_types.get(&(body, rhs)));
         let lhs_value = if let Some(receiver_ty) = &receiver_ty {
-            self.lower_receiver_arg(builder, input.param_values, input.body, lhs, receiver_ty)
+            self.lower_receiver_arg(
+                builder,
+                input.param_values,
+                input.body,
+                lhs,
+                receiver_ty,
+                lhs_tc_ty
+                    .and_then(|ty| self.mono_method_param_type(function, 0, ty, rhs_tc_ty))
+                    .as_ref(),
+            )
         } else {
             self.lower_expr(builder, input.param_values, input.body, lhs)
         };
         let rhs_value = if let Some(rhs_ty) = rhs_ty {
-            self.lower_receiver_arg(builder, input.param_values, input.body, rhs, &rhs_ty)
+            self.lower_receiver_arg(
+                builder,
+                input.param_values,
+                input.body,
+                rhs,
+                &rhs_ty,
+                lhs_tc_ty
+                    .and_then(|ty| self.mono_method_param_type(function, 1, ty, rhs_tc_ty))
+                    .as_ref(),
+            )
         } else {
             self.lower_expr(builder, input.param_values, input.body, rhs)
         };
@@ -573,6 +597,9 @@ impl LowerCtx<'_> {
                 .params
                 .first()
                 .map(|param| param.ty.clone());
+            let operand_tc_ty = self
+                .current_body
+                .and_then(|body| self.type_result.expr_types.get(&(body, operand)));
             let value = if let Some(receiver_ty) = receiver_ty {
                 self.lower_receiver_arg(
                     builder,
@@ -580,6 +607,9 @@ impl LowerCtx<'_> {
                     input.body,
                     operand,
                     &receiver_ty,
+                    operand_tc_ty
+                        .and_then(|ty| self.mono_method_param_type(function, 0, ty, None))
+                        .as_ref(),
                 )
             } else {
                 self.lower_expr(builder, input.param_values, input.body, operand)
@@ -1411,6 +1441,7 @@ impl LowerCtx<'_> {
             input.body,
             callee,
             &receiver_param,
+            None,
         );
         let args = self.lower_expr_sequence(
             builder,
@@ -1545,28 +1576,65 @@ impl LowerCtx<'_> {
             self.mono_function_name(target, callee)
                 .unwrap_or_else(|| self.function_name(target))
         };
-        let receiver = if let Some((function, base)) = method_target
+        let method_dispatch_types = method_target.map(|(function, base)| {
+            let base_tc_ty = self
+                .current_body
+                .and_then(|body| self.type_result.expr_types.get(&(body, base)));
+            let rhs_tc_ty = args.first().and_then(|arg| {
+                self.current_body
+                    .and_then(|body| self.type_result.expr_types.get(&(body, *arg)))
+            });
+            (function, base, base_tc_ty, rhs_tc_ty)
+        });
+        let receiver = if let Some((function, base, base_tc_ty, rhs_tc_ty)) = method_dispatch_types
             && let Some(receiver) = self.hir.item_tree.functions[function].params.first()
         {
             let receiver_ty = receiver.ty.clone();
-            Some(self.lower_receiver_arg(
-                builder,
-                input.param_values,
-                input.body,
-                base,
-                &receiver_ty,
-            ))
+            Some(
+                self.lower_receiver_arg(
+                    builder,
+                    input.param_values,
+                    input.body,
+                    base,
+                    &receiver_ty,
+                    base_tc_ty
+                        .and_then(|ty| self.mono_method_param_type(function, 0, ty, rhs_tc_ty))
+                        .as_ref(),
+                ),
+            )
         } else {
             None
         };
-        let args = self.lower_expr_sequence(
-            builder,
-            input.param_values,
-            input.body,
-            input.expr_id,
-            1,
-            args,
-        );
+        let args = if let Some((function, _, base_tc_ty, rhs_tc_ty)) = method_dispatch_types {
+            let body_id = self.current_body;
+            let mut values = Vec::with_capacity(args.len());
+            for (index, arg) in args.iter().enumerate() {
+                let raw = self.lower_expr(builder, input.param_values, input.body, *arg);
+                let expected = base_tc_ty
+                    .and_then(|ty| self.mono_method_param_type(function, index + 1, ty, rhs_tc_ty));
+                let adjusted =
+                    match body_id.and_then(|bid| self.type_result.expr_types.get(&(bid, *arg))) {
+                        Some(arg_ty) => self.adjust_arg_for_reference_self_impl(
+                            builder,
+                            raw,
+                            arg_ty,
+                            expected.as_ref(),
+                        ),
+                        None => raw,
+                    };
+                values.push(adjusted);
+            }
+            values
+        } else {
+            self.lower_expr_sequence(
+                builder,
+                input.param_values,
+                input.body,
+                input.expr_id,
+                1,
+                args,
+            )
+        };
         let mut values = Vec::with_capacity(args.len() + usize::from(receiver.is_some()));
         if let Some(receiver) = receiver {
             values.push(receiver);
@@ -1579,7 +1647,11 @@ impl LowerCtx<'_> {
         } else {
             FuncRef::Local(name)
         };
-        let value = builder.call(function, values, input.mir_type.clone());
+        let call_ty = match &function {
+            FuncRef::Local(name) => self.instance_result_type(name, input.mir_type.clone()),
+            _ => input.mir_type.clone(),
+        };
+        let value = builder.call(function, values, call_ty);
         self.finish_expr(builder, input, value)
     }
 

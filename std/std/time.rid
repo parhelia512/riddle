@@ -34,5 +34,7 @@ impl Duration {
 }
 
 pub fun sleep(duration: Duration) {
-    unsafe { riddle_sleep_ms(duration.as_millis()); }
+    unsafe {
+        riddle_sleep_ms(duration.as_millis());
+    }
 }

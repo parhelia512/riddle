@@ -270,6 +270,12 @@ pub enum Pattern {
         path: HirPath,
         fields: Vec<FieldPat>,
     },
+    /// `A | B | C` — top-level or-pattern of a match arm. Alternatives must
+    /// not bind variables (enforced by the type checker), so matching is a
+    /// disjunction of the alternative tests.
+    Or {
+        alternatives: Vec<PatId>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -948,6 +954,11 @@ impl BodyPrinter<'_> {
                     .join(", ");
                 format!("{} {{ {} }}", path.display(), inner)
             }
+            Pattern::Or { alternatives } => alternatives
+                .iter()
+                .map(|p| self.print_pat(*p))
+                .collect::<Vec<_>>()
+                .join(" | "),
         }
     }
 

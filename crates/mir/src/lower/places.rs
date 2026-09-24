@@ -637,7 +637,8 @@ impl LowerCtx<'_> {
             Pattern::Wildcard
             | Pattern::Literal(_)
             | Pattern::Path { .. }
-            | Pattern::TupleStruct { .. } => {}
+            | Pattern::TupleStruct { .. }
+            | Pattern::Or { .. } => {}
         }
     }
 

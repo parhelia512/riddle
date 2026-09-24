@@ -175,6 +175,21 @@ impl LowerCtx<'_> {
             Pattern::Tuple { elements } => {
                 self.lower_tuple_pattern_condition(builder, body, value, value_ty, elements)
             }
+            Pattern::Or { alternatives } => {
+                let mut condition = builder.bconst(false);
+                for alternative in alternatives {
+                    let alternative_ty = value_ty.clone();
+                    let alt_condition = self.lower_pattern_condition(
+                        builder,
+                        body,
+                        alternative,
+                        value,
+                        &alternative_ty,
+                    )?;
+                    condition = builder.binop(BinOp::BitOr, condition, alt_condition, Type::Bool);
+                }
+                Some(condition)
+            }
         }
     }
 
@@ -487,7 +502,8 @@ impl LowerCtx<'_> {
             Pattern::Struct { path, fields } => {
                 self.collect_struct_pattern_bindings(builder, body, &input, &path, fields, scope);
             }
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {
+            }
         }
     }
 

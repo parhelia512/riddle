@@ -815,6 +815,7 @@ impl TypeChecker<'_> {
                 continue;
             }
             subst.insert("Self".into(), receiver_self_ty.clone());
+            self.seed_trait_generic_defaults(trait_id, &mut subst);
             let fid = imp
                 .methods
                 .iter()

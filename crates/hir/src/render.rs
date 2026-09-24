@@ -43,9 +43,10 @@ fn generics_with_bounds(function: &HirFunction) -> String {
         .generics
         .iter()
         .map(|name| {
-            let bound = function.generic_bounds.iter().find(|bound| {
-                bound.param == *name && is_bare_parameter_bound(bound)
-            });
+            let bound = function
+                .generic_bounds
+                .iter()
+                .find(|bound| bound.param == *name && is_bare_parameter_bound(bound));
             match bound {
                 Some(bound) => format!("{}: {}", name.0, bound.trait_ty.display()),
                 None => name.0.clone(),
@@ -66,7 +67,7 @@ fn where_clause(bounds: &[HirGenericBound], generics: &[Name], hidden: &[Name]) 
     let rendered = bounds
         .iter()
         .filter(|bound| {
-            !hidden.iter().any(|name| *name == bound.param)
+            !hidden.contains(&bound.param)
                 && !(is_bare_parameter_bound(bound) && generics.contains(&bound.param))
         })
         .map(|bound| format!("{}: {}", bound.param.0, bound.trait_ty.display()))

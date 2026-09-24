@@ -1,5 +1,8 @@
 use crate::std::clone::Clone;
-use crate::std::cmp::{Eq, PartialEq};
+use crate::std::cmp::{
+    Eq,
+    PartialEq
+};
 use crate::std::result::Result;
 use crate::std::string::String;
 use crate::std::vector::Vector;
@@ -57,7 +60,9 @@ impl OsString {
 
 impl Clone for OsString {
     fun clone(&self) -> Self {
-        unsafe { OsString::from_encoded_bytes_unchecked(self.as_encoded_bytes()) }
+        unsafe {
+            OsString::from_encoded_bytes_unchecked(self.as_encoded_bytes())
+        }
     }
 }
 

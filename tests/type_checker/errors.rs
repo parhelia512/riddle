@@ -1468,3 +1468,90 @@ fn pointer_null_comparison_type_checks() {
 
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
 }
+
+#[test]
+fn or_pattern_arm_covers_all_alternatives_exhaustively() {
+    let result = check(
+        r"
+        enum Color { Red, Green, Blue }
+
+        fun code(color: Color) -> i32 {
+            match color {
+                Color::Red | Color::Green => 1,
+                Color::Blue => 2,
+            }
+        }
+        ",
+    );
+
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}
+
+#[test]
+fn or_pattern_alternatives_may_not_bind() {
+    let result = check(
+        r"
+        enum Value { A(i32), B }
+
+        fun probe(value: Value) -> i32 {
+            match value {
+                Value::A(x) | Value::B => x,
+            }
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code == "E0010" && diag.message.contains("cannot bind variables") }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn or_pattern_alternative_rejects_struct_shorthand_binding() {
+    // Shorthand field patterns bind, so the same E0010 must fire even though
+    // no identifier appears as a standalone pattern.
+    let result = check(
+        r"
+        struct Point { px: i32, py: i32 }
+
+        fun probe(point: Point) -> i32 {
+            match point {
+                Point { px } | Point { px: 0, py: 0 } => 1,
+                _ => 2,
+            }
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code == "E0010" && diag.message.contains("cannot bind variables") }),
+        "{:#?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn leading_pipe_arm_behaves_like_the_plain_pattern() {
+    // A leading `|` is cosmetic Rust parity: a single alternative after it is
+    // still an ordinary pattern, so binding there stays legal.
+    let result = check(
+        r"
+        fun probe(value: i32) -> i32 {
+            match value {
+                | 1 => 2,
+                | rest => rest,
+            }
+        }
+        ",
+    );
+
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+}

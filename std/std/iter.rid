@@ -4,14 +4,22 @@ use crate::std::vector::Vector;
 pub trait Iterator {
     type Item;
 
+    // The returned references alias regions behind references stored in the
+    // receiver (its buffer/element pointers), never the iterator's own
+    // storage — verified by the move checker against every impl.
+    #[flow = "behind_reference"]
     fun next(&mut self) -> Option<Self::Item>;
 
     fun count(&mut self) -> usize {
         let mut total = 0usize;
         loop {
             match self.next() {
-                Option::Some(_) => { total += 1usize; },
-                Option::None => { break; },
+                Option::Some(_) => {
+                    total += 1usize;
+                },
+                Option::None => {
+                    break;
+                },
             }
         }
         total
@@ -24,8 +32,12 @@ pub trait Iterator {
                 break;
             }
             match self.next() {
-                Option::Some(_) => { remaining -= 1usize; },
-                Option::None => { return Option::None; },
+                Option::Some(_) => {
+                    remaining -= 1usize;
+                },
+                Option::None => {
+                    return Option::None;
+                },
             }
         }
         self.next()
@@ -36,8 +48,12 @@ pub trait Iterator {
         let mut runner = self;
         loop {
             match runner.next() {
-                Option::Some(value) => { acc = f(acc, value); },
-                Option::None => { break; },
+                Option::Some(value) => {
+                    acc = f(acc, value);
+                },
+                Option::None => {
+                    break;
+                },
             }
         }
         acc
@@ -46,8 +62,12 @@ pub trait Iterator {
     fun for_each(&mut self, mut f: impl FnMut(Self::Item) -> ()) {
         loop {
             match self.next() {
-                Option::Some(value) => { f(value); },
-                Option::None => { break; },
+                Option::Some(value) => {
+                    f(value);
+                },
+                Option::None => {
+                    break;
+                },
             }
         }
     }
@@ -61,7 +81,9 @@ pub trait Iterator {
                         return false;
                     }
                 },
-                Option::None => { return true; },
+                Option::None => {
+                    return true;
+                },
             }
         }
     }
@@ -75,7 +97,9 @@ pub trait Iterator {
                         return true;
                     }
                 },
-                Option::None => { return false; },
+                Option::None => {
+                    return false;
+                },
             }
         }
     }
@@ -89,7 +113,9 @@ pub trait Iterator {
                         return Option::Some(value);
                     }
                 },
-                Option::None => { return Option::None; },
+                Option::None => {
+                    return Option::None;
+                },
             }
         }
     }
@@ -105,25 +131,30 @@ pub trait Iterator {
                     }
                     index += 1usize;
                 },
-                Option::None => { return Option::None; },
+                Option::None => {
+                    return Option::None;
+                },
             }
         }
     }
 
-    fun map<U, F>(self, f: F) -> Map<Self, F, Self::Item, U>
-    where F: FnMut(Self::Item) -> U {
-        let adapter: Map<Self, F, Self::Item, U> = Map { iter: self, f };
+    fun map<U, F>(self, f: F) -> Map<Self, F, Self::Item, U> where F: FnMut(Self::Item) -> U {
+        let adapter: Map<Self, F, Self::Item, U> = Map {
+            iter: self,
+            f
+        };
         adapter
     }
 
-    fun filter<F>(self, predicate: F) -> Filter<Self, F, Self::Item>
-    where F: FnMut(&Self::Item) -> bool {
-        let adapter: Filter<Self, F, Self::Item> = Filter { iter: self, predicate };
+    fun filter<F>(self, predicate: F) -> Filter<Self, F, Self::Item> where F: FnMut(&Self::Item) -> bool {
+        let adapter: Filter<Self, F, Self::Item> = Filter {
+            iter: self,
+            predicate
+        };
         adapter
     }
 
-    fun chain<J>(self, other: J) -> Chain<Self, J, Self::Item>
-    where J: Iterator<Item = Self::Item> {
+    fun chain<J>(self, other: J) -> Chain<Self, J, Self::Item> where J: Iterator<Item = Self::Item> {
         let adapter: Chain<Self, J, Self::Item> = Chain {
             first: self,
             second: other,
@@ -132,8 +163,7 @@ pub trait Iterator {
         adapter
     }
 
-    fun take_while<F>(self, predicate: F) -> TakeWhile<Self, F, Self::Item>
-    where F: FnMut(&Self::Item) -> bool {
+    fun take_while<F>(self, predicate: F) -> TakeWhile<Self, F, Self::Item> where F: FnMut(&Self::Item) -> bool {
         let adapter: TakeWhile<Self, F, Self::Item> = TakeWhile {
             iter: self,
             predicate,
@@ -142,8 +172,7 @@ pub trait Iterator {
         adapter
     }
 
-    fun skip_while<F>(self, predicate: F) -> SkipWhile<Self, F, Self::Item>
-    where F: FnMut(&Self::Item) -> bool {
+    fun skip_while<F>(self, predicate: F) -> SkipWhile<Self, F, Self::Item> where F: FnMut(&Self::Item) -> bool {
         let adapter: SkipWhile<Self, F, Self::Item> = SkipWhile {
             iter: self,
             predicate,
@@ -152,9 +181,11 @@ pub trait Iterator {
         adapter
     }
 
-    fun inspect<F>(self, f: F) -> Inspect<Self, F, Self::Item>
-    where F: FnMut(&Self::Item) -> () {
-        let adapter: Inspect<Self, F, Self::Item> = Inspect { iter: self, f };
+    fun inspect<F>(self, f: F) -> Inspect<Self, F, Self::Item> where F: FnMut(&Self::Item) -> () {
+        let adapter: Inspect<Self, F, Self::Item> = Inspect {
+            iter: self,
+            f
+        };
         adapter
     }
 
@@ -163,8 +194,12 @@ pub trait Iterator {
         let mut runner = self;
         loop {
             match runner.next() {
-                Option::Some(value) => { out.push(value); },
-                Option::None => { break; },
+                Option::Some(value) => {
+                    out.push(value);
+                },
+                Option::None => {
+                    break;
+                },
             }
         }
         out
@@ -172,6 +207,7 @@ pub trait Iterator {
 }
 
 pub trait DoubleEndedIterator: Iterator {
+    #[flow = "behind_reference"]
     fun next_back(&mut self) -> Option<Self::Item>;
 }
 
@@ -189,8 +225,7 @@ pub struct Enumerate<I, T> {
     index: usize,
 }
 
-impl<I, T> Iterator for Enumerate<I, T>
-where I: Iterator<Item = T> {
+impl<I, T> Iterator for Enumerate<I, T> where I: Iterator<Item = T> {
     type Item = (usize, T);
 
     fun next(&mut self) -> Option<(usize, T)> {
@@ -205,8 +240,7 @@ where I: Iterator<Item = T> {
     }
 }
 
-impl<I, T> IntoIterator for Enumerate<I, T>
-where I: Iterator<Item = T> {
+impl<I, T> IntoIterator for Enumerate<I, T> where I: Iterator<Item = T> {
     type Item = (usize, T);
     type IntoIter = Enumerate<I, T>;
 
@@ -220,8 +254,7 @@ pub struct Take<I, T> {
     remaining: usize,
 }
 
-impl<I, T> Iterator for Take<I, T>
-where I: Iterator<Item = T> {
+impl<I, T> Iterator for Take<I, T> where I: Iterator<Item = T> {
     type Item = T;
 
     fun next(&mut self) -> Option<T> {
@@ -237,8 +270,7 @@ where I: Iterator<Item = T> {
     }
 }
 
-impl<I, T> IntoIterator for Take<I, T>
-where I: Iterator<Item = T> {
+impl<I, T> IntoIterator for Take<I, T> where I: Iterator<Item = T> {
     type Item = T;
     type IntoIter = Take<I, T>;
 
@@ -252,29 +284,29 @@ pub struct Zip<A, B, TA, TB> {
     b: B,
 }
 
-impl<A, B, TA, TB> Iterator for Zip<A, B, TA, TB>
-where A: Iterator<Item = TA>,
-      B: Iterator<Item = TB> {
+impl<A, B, TA, TB> Iterator for Zip<A, B, TA, TB> where A: Iterator<Item = TA>, B: Iterator<Item = TB> {
     type Item = (TA, TB);
 
     fun next(&mut self) -> Option<(TA, TB)> {
         let first = self.a.next();
         let first = match first {
             Option::Some(value) => value,
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
         let second = self.b.next();
         let second = match second {
             Option::Some(value) => value,
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
         Option::Some((first, second))
     }
 }
 
-impl<A, B, TA, TB> IntoIterator for Zip<A, B, TA, TB>
-where A: Iterator<Item = TA>,
-      B: Iterator<Item = TB> {
+impl<A, B, TA, TB> IntoIterator for Zip<A, B, TA, TB> where A: Iterator<Item = TA>, B: Iterator<Item = TB> {
     type Item = (TA, TB);
     type IntoIter = Zip<A, B, TA, TB>;
 
@@ -290,9 +322,7 @@ pub struct Map<I, F, T, U> {
     f: F,
 }
 
-impl<I, F, T, U> Iterator for Map<I, F, T, U>
-where I: Iterator<Item = T>,
-      F: FnMut(T) -> U {
+impl<I, F, T, U> Iterator for Map<I, F, T, U> where I: Iterator<Item = T>, F: FnMut(T) -> U {
     type Item = U;
 
     fun next(&mut self) -> Option<U> {
@@ -303,9 +333,7 @@ where I: Iterator<Item = T>,
     }
 }
 
-impl<I, F, T, U> IntoIterator for Map<I, F, T, U>
-where I: Iterator<Item = T>,
-      F: FnMut(T) -> U {
+impl<I, F, T, U> IntoIterator for Map<I, F, T, U> where I: Iterator<Item = T>, F: FnMut(T) -> U {
     type Item = U;
     type IntoIter = Map<I, F, T, U>;
 
@@ -319,9 +347,7 @@ pub struct Filter<I, F, T> {
     predicate: F,
 }
 
-impl<I, F, T> Iterator for Filter<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> bool {
+impl<I, F, T> Iterator for Filter<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> bool {
     type Item = T;
 
     fun next(&mut self) -> Option<T> {
@@ -333,15 +359,15 @@ where I: Iterator<Item = T>,
                         return Option::Some(value);
                     }
                 },
-                Option::None => { return Option::None; },
+                Option::None => {
+                    return Option::None;
+                },
             }
         }
     }
 }
 
-impl<I, F, T> IntoIterator for Filter<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> bool {
+impl<I, F, T> IntoIterator for Filter<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> bool {
     type Item = T;
     type IntoIter = Filter<I, F, T>;
 
@@ -356,25 +382,25 @@ pub struct Chain<I, J, T> {
     first_done: bool,
 }
 
-impl<I, J, T> Iterator for Chain<I, J, T>
-where I: Iterator<Item = T>,
-      J: Iterator<Item = T> {
+impl<I, J, T> Iterator for Chain<I, J, T> where I: Iterator<Item = T>, J: Iterator<Item = T> {
     type Item = T;
 
     fun next(&mut self) -> Option<T> {
         if !self.first_done {
             match self.first.next() {
-                Option::Some(value) => { return Option::Some(value); },
-                Option::None => { self.first_done = true; },
+                Option::Some(value) => {
+                    return Option::Some(value);
+                },
+                Option::None => {
+                    self.first_done = true;
+                },
             }
         }
         self.second.next()
     }
 }
 
-impl<I, J, T> IntoIterator for Chain<I, J, T>
-where I: Iterator<Item = T>,
-      J: Iterator<Item = T> {
+impl<I, J, T> IntoIterator for Chain<I, J, T> where I: Iterator<Item = T>, J: Iterator<Item = T> {
     type Item = T;
     type IntoIter = Chain<I, J, T>;
 
@@ -389,9 +415,7 @@ pub struct TakeWhile<I, F, T> {
     done: bool,
 }
 
-impl<I, F, T> Iterator for TakeWhile<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> bool {
+impl<I, F, T> Iterator for TakeWhile<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> bool {
     type Item = T;
 
     fun next(&mut self) -> Option<T> {
@@ -415,9 +439,7 @@ where I: Iterator<Item = T>,
     }
 }
 
-impl<I, F, T> IntoIterator for TakeWhile<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> bool {
+impl<I, F, T> IntoIterator for TakeWhile<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> bool {
     type Item = T;
     type IntoIter = TakeWhile<I, F, T>;
 
@@ -432,9 +454,7 @@ pub struct SkipWhile<I, F, T> {
     skipping: bool,
 }
 
-impl<I, F, T> Iterator for SkipWhile<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> bool {
+impl<I, F, T> Iterator for SkipWhile<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> bool {
     type Item = T;
 
     fun next(&mut self) -> Option<T> {
@@ -458,9 +478,7 @@ where I: Iterator<Item = T>,
     }
 }
 
-impl<I, F, T> IntoIterator for SkipWhile<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> bool {
+impl<I, F, T> IntoIterator for SkipWhile<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> bool {
     type Item = T;
     type IntoIter = SkipWhile<I, F, T>;
 
@@ -474,9 +492,7 @@ pub struct Inspect<I, F, T> {
     f: F,
 }
 
-impl<I, F, T> Iterator for Inspect<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> () {
+impl<I, F, T> Iterator for Inspect<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> () {
     type Item = T;
 
     fun next(&mut self) -> Option<T> {
@@ -490,9 +506,7 @@ where I: Iterator<Item = T>,
     }
 }
 
-impl<I, F, T> IntoIterator for Inspect<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> () {
+impl<I, F, T> IntoIterator for Inspect<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> () {
     type Item = T;
     type IntoIter = Inspect<I, F, T>;
 
@@ -503,8 +517,7 @@ where I: Iterator<Item = T>,
 
 // Adapter constructors --------------------------------------------------------
 
-pub fun enumerate<I, T>(iterator: I) -> Enumerate<I, T>
-where I: Iterator<Item = T> {
+pub fun enumerate<I, T>(iterator: I) -> Enumerate<I, T> where I: Iterator<Item = T> {
     let adapter: Enumerate<I, T> = Enumerate {
         iter: iterator,
         index: 0usize,
@@ -512,8 +525,7 @@ where I: Iterator<Item = T> {
     adapter
 }
 
-pub fun take<I, T>(iterator: I, n: usize) -> Take<I, T>
-where I: Iterator<Item = T> {
+pub fun take<I, T>(iterator: I, n: usize) -> Take<I, T> where I: Iterator<Item = T> {
     let adapter: Take<I, T> = Take {
         iter: iterator,
         remaining: n,
@@ -521,16 +533,15 @@ where I: Iterator<Item = T> {
     adapter
 }
 
-pub fun zip<A, B, TA, TB>(a: A, b: B) -> Zip<A, B, TA, TB>
-where A: Iterator<Item = TA>,
-      B: Iterator<Item = TB> {
-    let adapter: Zip<A, B, TA, TB> = Zip { a, b };
+pub fun zip<A, B, TA, TB>(a: A, b: B) -> Zip<A, B, TA, TB> where A: Iterator<Item = TA>, B: Iterator<Item = TB> {
+    let adapter: Zip<A, B, TA, TB> = Zip {
+        a,
+        b
+    };
     adapter
 }
 
-pub fun chain<I, J, T>(first: I, second: J) -> Chain<I, J, T>
-where I: Iterator<Item = T>,
-      J: Iterator<Item = T> {
+pub fun chain<I, J, T>(first: I, second: J) -> Chain<I, J, T> where I: Iterator<Item = T>, J: Iterator<Item = T> {
     let adapter: Chain<I, J, T> = Chain {
         first,
         second,
@@ -539,9 +550,7 @@ where I: Iterator<Item = T>,
     adapter
 }
 
-pub fun take_while<I, F, T>(iterator: I, predicate: F) -> TakeWhile<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> bool {
+pub fun take_while<I, F, T>(iterator: I, predicate: F) -> TakeWhile<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> bool {
     let adapter: TakeWhile<I, F, T> = TakeWhile {
         iter: iterator,
         predicate,
@@ -550,9 +559,7 @@ where I: Iterator<Item = T>,
     adapter
 }
 
-pub fun skip_while<I, F, T>(iterator: I, predicate: F) -> SkipWhile<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> bool {
+pub fun skip_while<I, F, T>(iterator: I, predicate: F) -> SkipWhile<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> bool {
     let adapter: SkipWhile<I, F, T> = SkipWhile {
         iter: iterator,
         predicate,
@@ -561,10 +568,11 @@ where I: Iterator<Item = T>,
     adapter
 }
 
-pub fun inspect<I, F, T>(iterator: I, f: F) -> Inspect<I, F, T>
-where I: Iterator<Item = T>,
-      F: FnMut(&T) -> () {
-    let adapter: Inspect<I, F, T> = Inspect { iter: iterator, f };
+pub fun inspect<I, F, T>(iterator: I, f: F) -> Inspect<I, F, T> where I: Iterator<Item = T>, F: FnMut(&T) -> () {
+    let adapter: Inspect<I, F, T> = Inspect {
+        iter: iterator,
+        f
+    };
     adapter
 }
 
@@ -572,20 +580,22 @@ where I: Iterator<Item = T>,
 
 // Builds a vector by mapping every remaining item eagerly. The lazy
 // `Iterator::map` stores the callable in a struct field.
-pub fun map_into<I, T, U>(iterator: &mut I, mut f: impl FnMut(T) -> U) -> Vector<U>
-where I: Iterator<Item = T> {
+pub fun map_into<I, T, U>(iterator: &mut I, mut f: impl FnMut(T) -> U) -> Vector<U> where I: Iterator<Item = T> {
     let mut out = Vector::new();
     loop {
         match iterator.next() {
-            Option::Some(value) => { out.push(f(value)); },
-            Option::None => { break; },
+            Option::Some(value) => {
+                out.push(f(value));
+            },
+            Option::None => {
+                break;
+            },
         }
     }
     out
 }
 
-pub fun filter_into<I, T>(iterator: &mut I, mut predicate: impl FnMut(&T) -> bool) -> Vector<T>
-where I: Iterator<Item = T> {
+pub fun filter_into<I, T>(iterator: &mut I, mut predicate: impl FnMut(&T) -> bool) -> Vector<T> where I: Iterator<Item = T> {
     let mut out = Vector::new();
     loop {
         match iterator.next() {
@@ -595,7 +605,9 @@ where I: Iterator<Item = T> {
                     out.push(value);
                 }
             },
-            Option::None => { break; },
+            Option::None => {
+                break;
+            },
         }
     }
     out
@@ -606,8 +618,7 @@ pub struct Skip<I, T> {
     remaining: usize,
 }
 
-impl<I, T> Iterator for Skip<I, T>
-where I: Iterator<Item = T> {
+impl<I, T> Iterator for Skip<I, T> where I: Iterator<Item = T> {
     type Item = T;
 
     fun next(&mut self) -> Option<T> {
@@ -615,15 +626,16 @@ where I: Iterator<Item = T> {
             self.remaining -= 1usize;
             match self.iter.next() {
                 Option::Some(_) => {},
-                Option::None => { return Option::None; },
+                Option::None => {
+                    return Option::None;
+                },
             }
         }
         self.iter.next()
     }
 }
 
-impl<I, T> IntoIterator for Skip<I, T>
-where I: Iterator<Item = T> {
+impl<I, T> IntoIterator for Skip<I, T> where I: Iterator<Item = T> {
     type Item = T;
     type IntoIter = Skip<I, T>;
 
@@ -632,8 +644,7 @@ where I: Iterator<Item = T> {
     }
 }
 
-pub fun skip<I, T>(iterator: I, n: usize) -> Skip<I, T>
-where I: Iterator<Item = T> {
+pub fun skip<I, T>(iterator: I, n: usize) -> Skip<I, T> where I: Iterator<Item = T> {
     let adapter: Skip<I, T> = Skip {
         iter: iterator,
         remaining: n,
@@ -641,10 +652,7 @@ where I: Iterator<Item = T> {
     adapter
 }
 
-
-pub fun min<I, T>(mut iterator: I) -> Option<T>
-where I: Iterator<Item = T>,
-      T: crate::std::cmp::PartialOrd {
+pub fun min<I, T>(mut iterator: I) -> Option<T> where I: Iterator<Item = T>, T: crate::std::cmp::PartialOrd {
     let mut best: Option<T> = Option::None;
     loop {
         match iterator.next() {
@@ -656,18 +664,20 @@ where I: Iterator<Item = T>,
                             best = Option::Some(value);
                         }
                     },
-                    Option::None => { best = Option::Some(value); },
+                    Option::None => {
+                        best = Option::Some(value);
+                    },
                 }
             },
-            Option::None => { break; },
+            Option::None => {
+                break;
+            },
         }
     }
     best
 }
 
-pub fun max<I, T>(mut iterator: I) -> Option<T>
-where I: Iterator<Item = T>,
-      T: crate::std::cmp::PartialOrd {
+pub fun max<I, T>(mut iterator: I) -> Option<T> where I: Iterator<Item = T>, T: crate::std::cmp::PartialOrd {
     let mut best: Option<T> = Option::None;
     loop {
         match iterator.next() {
@@ -679,10 +689,14 @@ where I: Iterator<Item = T>,
                             best = Option::Some(value);
                         }
                     },
-                    Option::None => { best = Option::Some(value); },
+                    Option::None => {
+                        best = Option::Some(value);
+                    },
                 }
             },
-            Option::None => { break; },
+            Option::None => {
+                break;
+            },
         }
     }
     best

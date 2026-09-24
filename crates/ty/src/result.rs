@@ -7,7 +7,7 @@ use hir::{
 use rowan::TextRange;
 
 use crate::{
-    TraitEnv,
+    TraitBound, TraitEnv,
     types::{CallableSignature, ClosureKind, OpaqueCallableId, Type},
 };
 
@@ -65,6 +65,11 @@ pub struct TypeCheckResult {
     /// Trait implementation environment, built during type checking.
     /// Available for downstream passes like move checking.
     pub trait_env: TraitEnv,
+    /// Generic bounds in scope for each function body (`T: Copy` and the
+    /// enclosing impl's bounds), lowered during type checking. Downstream
+    /// passes like move checking consult them because the global environment
+    /// has no impl for a bare generic parameter.
+    pub body_bounds: HashMap<BodyId, Vec<TraitBound>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

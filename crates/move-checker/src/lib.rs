@@ -13,14 +13,16 @@ use hir::{
 };
 use ty::{
     CaptureMode, CapturePlace, CaptureSource, ClosureKind, Diagnostic, LabelStyle, LambdaInfo,
-    PatternBindingMode, Severity, SourceLabel, TraitEnv, Type, TypeCheckResult, ValueUse,
+    PatternBindingMode, Severity, SourceLabel, TraitBound, TraitEnv, Type, TypeCheckResult,
+    ValueUse,
 };
 
 mod initialization;
 mod reference_flow;
 
 use reference_flow::{
-    FlowKind, FunctionSummary, ReferenceFlow, SummaryOrigin, type_may_carry_reference,
+    FlowKind, FlowProjection, FunctionSummary, ReferenceFlow, SummaryOrigin,
+    type_may_carry_reference,
 };
 
 type LoanId = usize;
@@ -253,7 +255,12 @@ impl Analyzer<'_> {
 
     fn analyze_body(&mut self, function_id: FunctionId, body_id: BodyId) {
         let body = &self.hir.bodies[body_id];
-        let mut ctx = BodyCtx::new(function_id, body_id, body);
+        let bounds = self
+            .type_result
+            .body_bounds
+            .get(&body_id)
+            .map_or(&[][..], Vec::as_slice);
+        let mut ctx = BodyCtx::new(function_id, body_id, body, bounds);
         ctx.seed_params(
             self.hir.item_tree.functions[function_id]
                 .params
@@ -499,6 +506,25 @@ impl Analyzer<'_> {
                     span,
                     "E0303",
                 );
+            }
+            // Writing through a reference (`*m = v`, `m.field = v` with
+            // `m: &mut _`) writes the referent: loans derived from the same
+            // underlying place — a shared element reference still held by a
+            // closure, say — conflict even though the assignment's own place
+            // is rooted at the reference binding. The reference's own loan
+            // family (the incoming parameter seed included) stays excluded,
+            // matching the method-call path.
+            if self.place_has_explicit_reference_deref(ctx, lhs) {
+                for target in self.reference_write_targets(ctx, lhs) {
+                    self.borrow_conflicts(
+                        ctx,
+                        &target.place,
+                        BorrowKind::Mutable,
+                        &target.parents,
+                        span,
+                        lhs,
+                    );
+                }
             }
             if let Some((binding, direct)) = Self::local_assignment(ctx, lhs) {
                 let mut value = ctx.expr_origin_value(rhs);
@@ -965,8 +991,8 @@ impl Analyzer<'_> {
                 }
             }
         }
-        let (inputs, modes, fid) = self.call_signature(ctx, callee, &args);
-        let value = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, span);
+        let (inputs, modes, fid, trait_call) = self.call_signature(ctx, callee, &args);
+        let value = self.check_call_borrows(ctx, expr_id, &inputs, &modes, fid, trait_call, span);
         if fid.is_none()
             && self
                 .type_result
@@ -1182,13 +1208,28 @@ impl Analyzer<'_> {
         }
     }
 
+    /// `Copy` for a body: a generic parameter bound by `T: Copy` is
+    /// copyable even though the global environment holds no impl for the bare
+    /// parameter, so bound assumptions are checked alongside the impls.
+    fn type_is_copy(&self, ctx: &BodyCtx<'_>, ty: &Type) -> bool {
+        match self.trait_env.copy_trait_id {
+            Some(copy_trait_id) => self.trait_env.type_implements_with_args_assuming(
+                ty,
+                copy_trait_id,
+                &[],
+                ctx.bounds,
+            ),
+            None => self.trait_env.type_is_copy(ty),
+        }
+    }
+
     fn consume_if_local(&mut self, ctx: &mut BodyCtx<'_>, expr_id: ExprId) {
         if let Expr::Path { path, resolved } = &ctx.body.exprs[expr_id]
             && let Some(name) = path.as_single_name()
             && ctx.bindings.contains(&name.0)
         {
             let (ty, closure_kind) = self.expr_move_properties(ctx, expr_id);
-            if !self.trait_env.type_is_copy(&ty)
+            if !self.type_is_copy(ctx, &ty)
                 || matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
             {
                 if ctx.in_match_guard
@@ -1257,7 +1298,7 @@ impl Analyzer<'_> {
         }
 
         let (ty, closure_kind) = self.expr_move_properties(ctx, expr_id);
-        if self.trait_env.type_is_copy(&ty)
+        if self.type_is_copy(ctx, &ty)
             && !matches!(closure_kind, Some(ClosureKind::FnMut | ClosureKind::FnOnce))
         {
             return;
@@ -1484,6 +1525,28 @@ impl Analyzer<'_> {
                 capture_origins.insert(origin);
             }
         }
+        // A captured value keeps its outstanding loans alive for as long as
+        // the lambda value itself lives. The captured binding's last textual
+        // use sits inside the lambda body, so without this the loan expired
+        // right after the lambda expression — leaving `v.push(..)` between
+        // the closure's creation and its call unchecked while the captured
+        // reference still pointed into the container.
+        for capture in &info.captures {
+            let CaptureSource::Pattern(id) = capture.place.source else {
+                // Reference parameters carry permanent seed loans; lambda
+                // parameters have no trackable place here.
+                continue;
+            };
+            let mut value = ctx.local_origin_value(id);
+            for projection in &capture.place.projections {
+                value = match projection {
+                    hir::place::Projection::Field(index)
+                    | hir::place::Projection::Index(Some(index)) => value.project(*index),
+                    hir::place::Projection::Index(None) => value.iterated(),
+                };
+            }
+            capture_origins.extend(value.flattened().origins);
+        }
         if !capture_origins.is_empty() {
             // The lambda's value carries its captured references: attach the
             // capture loans as the expression's origins so they flow into the
@@ -1552,7 +1615,7 @@ impl Analyzer<'_> {
                 }
             }
             CaptureMode::Value => {
-                if self.trait_env.type_is_copy(&capture.ty) {
+                if self.type_is_copy(ctx, &capture.ty) {
                     return None;
                 }
                 if ctx.in_match_guard
@@ -1610,7 +1673,7 @@ impl Analyzer<'_> {
         body: ExprId,
         info: &LambdaInfo,
     ) {
-        let mut ctx = BodyCtx::new(outer.function_id, outer.body_id, outer.body);
+        let mut ctx = BodyCtx::new(outer.function_id, outer.body_id, outer.body, outer.bounds);
         ctx.seed_params(
             params
                 .iter()
@@ -1624,6 +1687,82 @@ impl Analyzer<'_> {
         {
             self.check_returned_drop_borrow(&ctx, *tail);
         }
+    }
+
+    /// Write targets for an assignment whose left-hand side goes through a
+    /// reference: the reference root's current origins (the local binding's
+    /// or the parameter's), projected by the field/index chain written
+    /// through. Unlike `access_targets`, this does not rely on the
+    /// left-hand side having been visited as an expression — assignments
+    /// never read their LHS, so its path expression carries no recorded
+    /// origins.
+    fn reference_write_targets(&self, ctx: &BodyCtx<'_>, lhs: ExprId) -> Vec<AccessTarget> {
+        let mut projections: Vec<AccessProjection> = Vec::new();
+        let mut cursor = lhs;
+        loop {
+            match &ctx.body.exprs[cursor] {
+                Expr::Unary {
+                    operand,
+                    op: UnaryOp::Deref,
+                } => {
+                    if !self.expr_is_reference(ctx, *operand) {
+                        return Vec::new();
+                    }
+                    cursor = *operand;
+                    break;
+                }
+                Expr::FieldAccess { base, field } => {
+                    if let Some(index) = self.resolve_field_index(ctx.body_id, *base, field) {
+                        projections.push(AccessProjection::Field(index));
+                    }
+                    cursor = *base;
+                    if self.expr_is_reference(ctx, cursor) {
+                        break;
+                    }
+                }
+                Expr::IndexAccess { base, index } => {
+                    let index = match &ctx.body.exprs[*index] {
+                        Expr::IntLiteral { value, .. } => usize::try_from(*value).ok(),
+                        _ => None,
+                    };
+                    projections.push(AccessProjection::Index(index));
+                    cursor = *base;
+                    if self.expr_is_reference(ctx, cursor) {
+                        break;
+                    }
+                }
+                _ => return Vec::new(),
+            }
+        }
+        let origins = match &ctx.body.exprs[cursor] {
+            Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                ..
+            } => ctx.local_origins.get(id).cloned().unwrap_or_default(),
+            Expr::Path {
+                resolved: Some(ResolvedName::Param(index)),
+                ..
+            } => ctx.param_origins.get(index).cloned().unwrap_or_default(),
+            _ => ctx.expr_origins.get(&cursor).cloned().unwrap_or_default(),
+        };
+        let mut targets: HashMap<AccessPlace, HashSet<LoanId>> = HashMap::new();
+        for origin in origins {
+            let mut place = origin.place;
+            for projection in projections.iter().rev() {
+                place = match projection {
+                    AccessProjection::Field(index) => place.field(*index),
+                    AccessProjection::Index(index) => place.index(*index),
+                };
+            }
+            targets
+                .entry(place)
+                .or_default()
+                .extend(ctx.loan_family(origin.loan));
+        }
+        targets
+            .into_iter()
+            .map(|(place, parents)| AccessTarget { place, parents })
+            .collect()
     }
 
     fn place_from_expr(&self, ctx: &BodyCtx<'_>, expr_id: ExprId) -> Option<Place> {
@@ -1882,34 +2021,23 @@ impl Analyzer<'_> {
         )
     }
 
+    #[allow(clippy::type_complexity)]
     fn call_signature(
         &self,
         ctx: &BodyCtx<'_>,
         callee: ExprId,
         args: &[ExprId],
-    ) -> (Vec<ExprId>, Vec<Option<BorrowKind>>, Option<FunctionId>) {
-        if let Some(call) = self
-            .type_result
-            .trait_method_calls
-            .get(&(ctx.body_id, callee))
-            && let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee]
-            && let Some(function) = self.hir.item_tree.traits[call.trait_id]
-                .methods
-                .iter()
-                .find(|method| method.name.0 == call.method)
-        {
-            let inputs = std::iter::once(*base)
-                .chain(args.iter().copied())
-                .collect::<Vec<_>>();
-            let modes = function
-                .params
-                .iter()
-                .take(inputs.len())
-                .map(|param| hir_ref_kind(&param.ty))
-                .collect();
-            return (inputs, modes, None);
-        }
-
+    ) -> (
+        Vec<ExprId>,
+        Vec<Option<BorrowKind>>,
+        Option<FunctionId>,
+        Option<(hir::item_tree::TraitId, String)>,
+    ) {
+        // A resolved concrete callee (an impl method or a trait default
+        // method) is authoritative: it supplies the actual parameter modes
+        // and — via the reference-flow summary — where the return value's
+        // borrows really come from, instead of the trait-branch fallback
+        // that ties an elided return reference to every reference input.
         let fid = match self.type_result.expr_types.get(&(ctx.body_id, callee)) {
             Some(Type::FunctionItem { function: fid, .. }) => Some(*fid),
             _ => None,
@@ -1929,7 +2057,36 @@ impl Analyzer<'_> {
                 .take(inputs.len())
                 .map(|param| hir_ref_kind(&param.ty))
                 .collect();
-            return (inputs, modes, Some(fid));
+            return (inputs, modes, Some(fid), None);
+        }
+
+        if let Some(call) = self
+            .type_result
+            .trait_method_calls
+            .get(&(ctx.body_id, callee))
+            && let Expr::FieldAccess { base, .. } = &ctx.body.exprs[callee]
+            && let Some(function) = self.hir.item_tree.traits[call.trait_id]
+                .methods
+                .iter()
+                .find(|method| method.name.0 == call.method)
+        {
+            let inputs = std::iter::once(*base)
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>();
+            let modes = function
+                .params
+                .iter()
+                .take(inputs.len())
+                .map(|param| hir_ref_kind(&param.ty))
+                .collect();
+            // No concrete callee (generic-bound or dynamic dispatch): the
+            // joined summaries of every impl of this trait method stand in.
+            let trait_call = if call.dynamic {
+                None
+            } else {
+                Some((call.trait_id, call.method.clone()))
+            };
+            return (inputs, modes, None, trait_call);
         }
 
         let inputs = args.to_vec();
@@ -1939,9 +2096,10 @@ impl Analyzer<'_> {
             .get(&(ctx.body_id, callee))
             .and_then(callable_parameter_modes)
             .unwrap_or_else(|| vec![None; inputs.len()]);
-        (inputs, modes, None)
+        (inputs, modes, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_call_borrows(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -1949,6 +2107,7 @@ impl Analyzer<'_> {
         inputs: &[ExprId],
         modes: &[Option<BorrowKind>],
         fid: Option<FunctionId>,
+        trait_call: Option<(hir::item_tree::TraitId, String)>,
         span: Option<TextRange>,
     ) -> OriginValue {
         let mut prepared = Vec::with_capacity(inputs.len());
@@ -1986,7 +2145,14 @@ impl Analyzer<'_> {
 
         let may_carry_reference = self.expr_may_carry_reference(ctx, call);
         let summary = may_carry_reference
-            .then(|| fid.and_then(|fid| self.reference_flow.summary(fid)))
+            .then(|| {
+                fid.and_then(|fid| self.reference_flow.summary(fid))
+                    .or_else(|| {
+                        trait_call.as_ref().and_then(|(trait_id, method)| {
+                            self.reference_flow.trait_method_summary(*trait_id, method)
+                        })
+                    })
+            })
             .flatten();
         let result = summary.map_or_else(
             || {
@@ -2054,7 +2220,31 @@ impl Analyzer<'_> {
             let Some(input) = inputs.get(source.param) else {
                 continue;
             };
-            result.merge(self.map_summary_input(ctx, input, *source, input_exprs, span, mapped));
+            let refined = self.refine_summary_input(ctx, source, input_exprs);
+            let (effective, excluded) = match refined {
+                Some(refined) => {
+                    // A refined mapping routes through the receiver's stored
+                    // loans while the call's own receiver loan exists
+                    // alongside it: exclude that loan family too, or the two
+                    // would flag each other within the same call.
+                    let excluded = input
+                        .origins
+                        .iter()
+                        .flat_map(|origin| ctx.loan_family(origin.loan))
+                        .collect::<HashSet<_>>();
+                    (refined, excluded)
+                }
+                None => (input.clone(), HashSet::new()),
+            };
+            result.merge(self.map_summary_input(
+                ctx,
+                &effective,
+                source.clone(),
+                input_exprs,
+                span,
+                mapped,
+                &excluded,
+            ));
         }
         if !summary.fields.is_empty() {
             result.fields = summary
@@ -2080,6 +2270,51 @@ impl Analyzer<'_> {
         result
     }
 
+    /// Refines a path-carrying summary origin ("the return aliases the
+    /// receiver's `values` field") through the input expression's stored
+    /// per-field origins — an iterator's `next` borrows the reference stored
+    /// inside the iterator, not the iterator itself, so the returned element
+    /// reference carries that stored loan and the call's own `&mut self`
+    /// receiver loan can expire. Returns `None` when the input's stored value
+    /// has no structure for the path (an owned receiver, say): the return
+    /// then flows through the call's own receiver borrow, the historical
+    /// whole-input mapping.
+    fn refine_summary_input(
+        &self,
+        ctx: &BodyCtx<'_>,
+        source: &SummaryOrigin,
+        input_exprs: &[ExprId],
+    ) -> Option<OriginValue> {
+        if source.path.is_empty() {
+            return None;
+        }
+        let expr = *input_exprs.get(source.param)?;
+        let stored = match &ctx.body.exprs[expr] {
+            Expr::Path {
+                resolved: Some(ResolvedName::PatternBinding(id)),
+                ..
+            } => ctx.local_origin_value(*id),
+            _ => ctx.expr_origin_value(expr),
+        };
+        if stored.origins.is_empty() && stored.fields.is_empty() {
+            return None;
+        }
+        let mut projected = stored;
+        for projection in &source.path {
+            projected = match projection {
+                FlowProjection::Field(index) | FlowProjection::Index(Some(index)) => {
+                    projected.project(*index)
+                }
+                FlowProjection::Index(None) => projected.iterated(),
+            };
+        }
+        if projected.origins.is_empty() && projected.fields.is_empty() {
+            return None;
+        }
+        Some(projected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn map_summary_input(
         &mut self,
         ctx: &mut BodyCtx<'_>,
@@ -2088,6 +2323,7 @@ impl Analyzer<'_> {
         input_exprs: &[ExprId],
         span: Option<TextRange>,
         mapped: &mut HashMap<(SummaryOrigin, LoanId), Option<Origin>>,
+        excluded: &HashSet<LoanId>,
     ) -> OriginValue {
         let origins = input
             .origins
@@ -2096,7 +2332,7 @@ impl Analyzer<'_> {
                 if source.kind == FlowKind::Inherit {
                     return Some(origin.clone());
                 }
-                let key = (source, origin.loan);
+                let key = (source.clone(), origin.loan);
                 if let Some(mapped) = mapped.get(&key) {
                     return mapped.clone();
                 }
@@ -2105,19 +2341,28 @@ impl Analyzer<'_> {
                     mapped.insert(key, Some(origin.clone()));
                     return Some(origin.clone());
                 }
-                let parents = ctx.loan_family(origin.loan);
-                let mapped_origin = if self.borrow_conflicts(
+                let mut parents = ctx.loan_family(origin.loan);
+                parents.extend(excluded.iter().copied());
+                let name = Self::expr_name(ctx, input_exprs[source.param]);
+                let mapped_origin = if self.borrow_conflicts_named_ext(
                     ctx,
                     &origin.place,
                     kind,
                     &parents,
                     span,
-                    input_exprs[source.param],
+                    &name,
+                    source.behind_reference,
                 ) {
                     None
                 } else {
-                    let loan =
-                        ctx.new_loan_with_parents(origin.place.clone(), kind, span, false, parents);
+                    let loan = ctx.new_loan_ext(
+                        origin.place.clone(),
+                        kind,
+                        span,
+                        false,
+                        parents,
+                        source.behind_reference,
+                    );
                     Some(Origin {
                         place: origin.place.clone(),
                         kind,
@@ -2131,7 +2376,17 @@ impl Analyzer<'_> {
         let fields = input
             .fields
             .iter()
-            .map(|field| self.map_summary_input(ctx, field, source, input_exprs, span, mapped))
+            .map(|field| {
+                self.map_summary_input(
+                    ctx,
+                    field,
+                    source.clone(),
+                    input_exprs,
+                    span,
+                    mapped,
+                    excluded,
+                )
+            })
             .collect();
         OriginValue { origins, fields }
     }
@@ -2191,7 +2446,7 @@ impl Analyzer<'_> {
         expr_id: ExprId,
     ) -> bool {
         let name = Self::expr_name(ctx, expr_id);
-        self.borrow_conflicts_named(ctx, place, kind, parents, span, &name)
+        self.borrow_conflicts_named_ext(ctx, place, kind, parents, span, &name, false)
     }
 
     fn borrow_conflicts_named(
@@ -2203,9 +2458,29 @@ impl Analyzer<'_> {
         span: Option<TextRange>,
         name: &str,
     ) -> bool {
+        self.borrow_conflicts_named_ext(ctx, place, kind, parents, span, name, false)
+    }
+
+    /// `attempted_behind_reference` marks borrows whose region lives behind
+    /// a reference (a summary origin that crossed a reference-typed field).
+    /// Such a region is disjoint from the receiver's own storage, and vice
+    /// versa, so a conflict where exactly one side is behind a reference can
+    /// never materialize and is skipped.
+    #[allow(clippy::too_many_arguments)]
+    fn borrow_conflicts_named_ext(
+        &mut self,
+        ctx: &BodyCtx<'_>,
+        place: &AccessPlace,
+        kind: BorrowKind,
+        parents: &HashSet<LoanId>,
+        span: Option<TextRange>,
+        name: &str,
+        attempted_behind_reference: bool,
+    ) -> bool {
         let conflict = ctx.loans.iter().find_map(|(id, loan)| {
             (loan.active
                 && !parents.contains(id)
+                && loan.behind_reference == attempted_behind_reference
                 && access_places_overlap(&loan.place, place)
                 && !(loan.kind == BorrowKind::Shared && kind == BorrowKind::Shared))
                 .then(|| loan.clone())
@@ -2408,7 +2683,8 @@ impl Analyzer<'_> {
                     }
                 }
             }
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {
+            }
         }
     }
 
@@ -2486,7 +2762,7 @@ impl Analyzer<'_> {
                     .type_result
                     .pattern_binding_types
                     .get(&(ctx.body_id, id))
-                    .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
+                    .is_some_and(|ty| !self.type_is_copy(ctx, ty))
         };
         match &ctx.body.pats[pat] {
             Pattern::Binding { .. } => {
@@ -2526,7 +2802,8 @@ impl Analyzer<'_> {
             Pattern::Reference { .. }
             | Pattern::Wildcard
             | Pattern::Literal(_)
-            | Pattern::Path { .. } => {}
+            | Pattern::Path { .. }
+            | Pattern::Or { .. } => {}
         }
     }
 
@@ -2602,7 +2879,7 @@ impl Analyzer<'_> {
                     .type_result
                     .pattern_binding_types
                     .get(&(ctx.body_id, id))
-                    .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
+                    .is_some_and(|ty| !self.type_is_copy(ctx, ty))
         };
         match &ctx.body.pats[pat] {
             Pattern::Binding { .. } => binding_moves(PatternBindingId {
@@ -2625,7 +2902,8 @@ impl Analyzer<'_> {
             Pattern::Reference { .. }
             | Pattern::Wildcard
             | Pattern::Literal(_)
-            | Pattern::Path { .. } => false,
+            | Pattern::Path { .. }
+            | Pattern::Or { .. } => false,
         }
     }
 
@@ -2655,7 +2933,7 @@ impl Analyzer<'_> {
                     .type_result
                     .pattern_binding_types
                     .get(&(ctx.body_id, id))
-                    .is_some_and(|ty| !self.trait_env.type_is_copy(ty))
+                    .is_some_and(|ty| !self.type_is_copy(ctx, ty))
         };
         match &ctx.body.pats[pat] {
             Pattern::Binding { .. }
@@ -2699,7 +2977,8 @@ impl Analyzer<'_> {
             Pattern::Binding { .. }
             | Pattern::Wildcard
             | Pattern::Literal(_)
-            | Pattern::Path { .. } => None,
+            | Pattern::Path { .. }
+            | Pattern::Or { .. } => None,
         }
     }
 
@@ -2775,14 +3054,20 @@ impl Analyzer<'_> {
                 style: *style,
             });
         }
-        self.result.diagnostics.push(Diagnostic {
+        let diagnostic = Diagnostic {
             code,
             severity: Severity::Error,
             message,
             labels,
             help: None,
             notes,
-        });
+        };
+        // The root block's tail is visited by both the body walk and the block
+        // walk, and recovery paths re-enter the same place: an identical
+        // diagnostic adds nothing, so drop the repeat.
+        if !self.result.diagnostics.contains(&diagnostic) {
+            self.result.diagnostics.push(diagnostic);
+        }
     }
 }
 
@@ -2798,6 +3083,10 @@ struct BorrowRecord {
     issued_at: Option<TextRange>,
     active: bool,
     permanent: bool,
+    /// The loan's real region lives behind a reference (a summary origin
+    /// whose path crossed a reference-typed field): it can never conflict
+    /// with borrows of the receiver's own storage.
+    behind_reference: bool,
     holders: HashSet<PatternBindingId>,
     parents: HashSet<LoanId>,
 }
@@ -2836,10 +3125,18 @@ struct BodyCtx<'a> {
     /// scrutinee). Moves out of them must be rejected in guards: the guard
     /// may fail and the next arm still needs the value.
     guard_scrutinee: Vec<Place>,
+    /// Generic bounds in scope for this body (`T: Copy`, plus the enclosing
+    /// impl's bounds), so a parameter type is copyable when its bound says so.
+    bounds: &'a [TraitBound],
 }
 
 impl<'a> BodyCtx<'a> {
-    fn new(function_id: FunctionId, body_id: BodyId, body: &'a Body) -> Self {
+    fn new(
+        function_id: FunctionId,
+        body_id: BodyId,
+        body: &'a Body,
+        bounds: &'a [TraitBound],
+    ) -> Self {
         Self {
             function_id,
             body_id,
@@ -2861,6 +3158,7 @@ impl<'a> BodyCtx<'a> {
             scope_depth: 0,
             in_match_guard: false,
             guard_scrutinee: Vec::new(),
+            bounds,
         }
     }
 
@@ -3065,11 +3363,24 @@ impl<'a> BodyCtx<'a> {
         permanent: bool,
         parents: HashSet<LoanId>,
     ) -> LoanId {
+        self.new_loan_ext(place, kind, issued_at, permanent, parents, false)
+    }
+
+    fn new_loan_ext(
+        &mut self,
+        place: AccessPlace,
+        kind: BorrowKind,
+        issued_at: Option<TextRange>,
+        permanent: bool,
+        parents: HashSet<LoanId>,
+        behind_reference: bool,
+    ) -> LoanId {
         if let Some((id, record)) = self.loans.iter_mut().find(|(_, record)| {
             record.place == place
                 && record.kind == kind
                 && record.issued_at == issued_at
                 && record.permanent == permanent
+                && record.behind_reference == behind_reference
         }) {
             record.active = true;
             record.scope_depth = self.scope_depth;
@@ -3087,6 +3398,7 @@ impl<'a> BodyCtx<'a> {
                 issued_at,
                 active: true,
                 permanent,
+                behind_reference,
                 holders: HashSet::new(),
                 parents,
             },
@@ -3456,6 +3768,39 @@ fn callable_parameter_modes(ty: &Type) -> Option<Vec<Option<BorrowKind>>> {
 fn collect_local_uses(body: &Body) -> HashMap<PatternBindingId, usize> {
     let mut uses = HashMap::new();
     collect_expr_local_uses(body, body.root_block, &mut uses);
+    // A binding with no recorded use never expires, so loans it holds would
+    // outlive the scope forever. Seed those with their own binding site:
+    // they expire as soon as checking moves past the pattern, like a
+    // binding whose last use is at its initializer.
+    for (pat, pattern) in body.pats.iter() {
+        let bindings: Vec<PatternBindingId> = match pattern {
+            Pattern::Binding { .. } => vec![PatternBindingId {
+                pattern: pat,
+                field: None,
+            }],
+            Pattern::Struct { fields, .. } => fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| field.pat.is_none())
+                .map(|(index, _)| PatternBindingId {
+                    pattern: pat,
+                    field: Some(index),
+                })
+                .collect(),
+            _ => continue,
+        };
+        let Some(end) = body
+            .source_map
+            .pat_ranges
+            .get(&pat)
+            .map(|range| usize::from(range.end()))
+        else {
+            continue;
+        };
+        for binding in bindings {
+            uses.entry(binding).or_insert(end);
+        }
+    }
     uses
 }
 

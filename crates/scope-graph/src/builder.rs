@@ -1563,7 +1563,8 @@ impl<'a> ScopeGraphBuilder<'a> {
             Pattern::Reference { pattern, .. } => {
                 self.emit_pat_bindings(body, *pattern, current, nodes, edges);
             }
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {
+            }
             Pattern::Tuple { elements } | Pattern::TupleStruct { elements, .. } => {
                 for e in elements {
                     self.emit_pat_bindings(body, *e, current, nodes, edges);

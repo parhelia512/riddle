@@ -11,6 +11,9 @@
 /target
 **/.clue/
 
+# Generated when clue checks the bundled std package
+/std/Clue.lock
+
 # C
 *.c
 !crates/gc/src/runtime.c

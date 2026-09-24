@@ -582,6 +582,6 @@ pub fn collect_pattern_bindings(
                 }
             }
         }
-        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+        Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {}
     }
 }

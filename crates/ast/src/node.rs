@@ -109,6 +109,7 @@ ast_node!(CallableTraitArgs, CallableTraitArgs);
 ast_node!(WildcardPat, WildcardPattern);
 ast_node!(LiteralPat, LiteralPattern);
 ast_node!(TuplePat, TuplePattern);
+ast_node!(OrPat, OrPattern);
 ast_node!(BindingPat, BindingPattern);
 ast_node!(ReferencePat, ReferencePattern);
 ast_node!(StructPattern, StructPattern);
@@ -1663,6 +1664,12 @@ impl TuplePat {
     }
 }
 
+impl OrPat {
+    pub fn alternatives(&self) -> impl Iterator<Item = Pattern> + '_ {
+        support::children(&self.syntax)
+    }
+}
+
 impl StructPattern {
     #[must_use]
     pub fn path(&self) -> Option<Path> {
@@ -1805,6 +1812,7 @@ pub enum Pattern {
     Enum(EnumPattern),
     Binding(BindingPat),
     Reference(ReferencePat),
+    Or(OrPat),
 }
 
 impl AstNode for Pattern {
@@ -1817,6 +1825,7 @@ impl AstNode for Pattern {
             SyntaxKind::EnumPattern => Some(Self::Enum(EnumPattern { syntax: node })),
             SyntaxKind::BindingPattern => Some(Self::Binding(BindingPat { syntax: node })),
             SyntaxKind::ReferencePattern => Some(Self::Reference(ReferencePat { syntax: node })),
+            SyntaxKind::OrPattern => Some(Self::Or(OrPat { syntax: node })),
             _ => None,
         }
     }
@@ -1830,6 +1839,7 @@ impl AstNode for Pattern {
             Self::Enum(it) => it.syntax(),
             Self::Binding(it) => it.syntax(),
             Self::Reference(it) => it.syntax(),
+            Self::Or(it) => it.syntax(),
         }
     }
 }

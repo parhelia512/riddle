@@ -1,7 +1,7 @@
 // File access built on the C stdio facade. The runtime provides thin
 // `riddle_fs_*` wrappers around `<stdio.h>` so the extern signatures here
 // never clash with the platform's own `FILE` typedef. The handle travels as
-// `usize` because pointer null-comparison is not available yet.
+// `usize`; a null stream compares equal to `0usize`.
 use crate::std::result::Result;
 use crate::std::string::String;
 use crate::std::vector::Vector;
@@ -40,11 +40,15 @@ impl FsFile {
     }
 
     fun with_mode(path: &str, mode: &str) -> Result<FsFile, FsError> {
-        let stream = unsafe { riddle_fs_fopen(path, mode) };
+        let stream = unsafe {
+            riddle_fs_fopen(path, mode)
+        };
         if stream == 0usize {
             Result::Err(FsError::OpenFailed)
         } else {
-            Result::Ok(FsFile { stream })
+            Result::Ok(FsFile {
+                stream
+            })
         }
     }
 
@@ -54,7 +58,9 @@ impl FsFile {
             return Result::Ok(0usize);
         }
         let ptr = buffer.as_mut_ptr();
-        let count = unsafe { riddle_fs_fread(ptr, 1usize, buffer.len(), self.stream) };
+        let count = unsafe {
+            riddle_fs_fread(ptr, 1usize, buffer.len(), self.stream)
+        };
         Result::Ok(count)
     }
 
@@ -63,7 +69,9 @@ impl FsFile {
             return Result::Ok(0usize);
         }
         let ptr = buffer.as_ptr();
-        let count = unsafe { riddle_fs_fwrite(ptr, 1usize, buffer.len(), self.stream) };
+        let count = unsafe {
+            riddle_fs_fwrite(ptr, 1usize, buffer.len(), self.stream)
+        };
         if count == 0usize {
             Result::Err(FsError::WriteFailed)
         } else {
@@ -72,7 +80,9 @@ impl FsFile {
     }
 
     pub fun flush(&mut self) -> Result<(), FsError> {
-        let code = unsafe { riddle_fs_fflush(self.stream) };
+        let code = unsafe {
+            riddle_fs_fflush(self.stream)
+        };
         if code == 0i32 {
             Result::Ok(())
         } else {
@@ -86,7 +96,9 @@ impl FsFile {
         loop {
             let count = match self.read(&mut chunk) {
                 Result::Ok(count) => count,
-                Result::Err(err) => { return Result::Err(err); },
+                Result::Err(err) => {
+                    return Result::Err(err);
+                },
             };
             if count == 0usize {
                 break;
@@ -105,7 +117,9 @@ impl FsFile {
         }
         // SAFETY: `&[u8]` and `&str` share layout; the bytes were just
         // validated as UTF-8.
-        let text: &str = unsafe { bytes.as_slice() as &str };
+        let text: &str = unsafe {
+            bytes.as_slice() as &str
+        };
         Result::Ok(String::from_str(text))
     }
 }
@@ -113,7 +127,9 @@ impl FsFile {
 impl Drop for FsFile {
     fun drop(&mut self) {
         if self.stream != 0usize {
-            unsafe { riddle_fs_fclose(self.stream) };
+            unsafe {
+                riddle_fs_fclose(self.stream)
+            };
             self.stream = 0usize;
         }
     }
@@ -123,7 +139,9 @@ pub fun read_to_string(path: &str) -> Result<String, FsError> {
     let opened = FsFile::open(path);
     let mut file = match opened {
         Result::Ok(value) => value,
-        Result::Err(err) => { return Result::Err(err); },
+        Result::Err(err) => {
+            return Result::Err(err);
+        },
     };
     file.read_to_string()
 }
@@ -132,12 +150,16 @@ pub fun write(path: &str, contents: &str) -> Result<(), FsError> {
     let opened = FsFile::create(path);
     let mut file = match opened {
         Result::Ok(value) => value,
-        Result::Err(err) => { return Result::Err(err); },
+        Result::Err(err) => {
+            return Result::Err(err);
+        },
     };
     let written = file.write(contents.as_bytes());
     match written {
         Result::Ok(_) => {},
-        Result::Err(err) => { return Result::Err(err); },
+        Result::Err(err) => {
+            return Result::Err(err);
+        },
     }
     file.flush()
 }
@@ -149,12 +171,7 @@ unsafe extern "C" {
     safe fun riddle_fs_size(path: &str) -> u64;
     safe fun riddle_fs_is_file(path: &str) -> i32;
     safe fun riddle_fs_is_dir(path: &str) -> i32;
-    safe fun riddle_fs_read_dir(
-        path: &str,
-        names_out: *mut *const u8,
-        lens_out: *mut usize,
-        capacity: usize,
-    ) -> usize;
+    safe fun riddle_fs_read_dir(path: &str, names_out: *mut *const u8, lens_out: *mut usize, capacity: usize,) -> usize;
 }
 
 #[derive(Debug)]
@@ -165,7 +182,9 @@ pub struct FileMetadata {
 }
 
 pub fun exists(path: &str) -> bool {
-    let found = unsafe { riddle_fs_exists(path) };
+    let found = unsafe {
+        riddle_fs_exists(path)
+    };
     found != 0i32
 }
 
@@ -173,7 +192,9 @@ pub fun exists(path: &str) -> bool {
 /// directory reports `FsError::OpenFailed` (the C facade has no distinct
 /// directory-removal error).
 pub fun remove(path: &str) -> Result<(), FsError> {
-    let code = unsafe { riddle_fs_remove(path) };
+    let code = unsafe {
+        riddle_fs_remove(path)
+    };
     if code == 0i32 {
         Result::Ok(())
     } else {
@@ -183,7 +204,9 @@ pub fun remove(path: &str) -> Result<(), FsError> {
 
 /// Renames (or moves) the file at `from` to `to`.
 pub fun rename(from: &str, to: &str) -> Result<(), FsError> {
-    let code = unsafe { riddle_fs_rename(from, to) };
+    let code = unsafe {
+        riddle_fs_rename(from, to)
+    };
     if code == 0i32 {
         Result::Ok(())
     } else {
@@ -197,12 +220,16 @@ pub fun copy(from: &str, to: &str) -> Result<usize, FsError> {
     let opened_source = FsFile::open(from);
     let mut source = match opened_source {
         Result::Ok(value) => value,
-        Result::Err(err) => { return Result::Err(err); },
+        Result::Err(err) => {
+            return Result::Err(err);
+        },
     };
     let opened_target = FsFile::create(to);
     let mut target = match opened_target {
         Result::Ok(value) => value,
-        Result::Err(err) => { return Result::Err(err); },
+        Result::Err(err) => {
+            return Result::Err(err);
+        },
     };
     let mut total = 0usize;
     let mut chunk = [0u8; 4096];
@@ -210,7 +237,9 @@ pub fun copy(from: &str, to: &str) -> Result<usize, FsError> {
     loop {
         let count = match source.read(&mut chunk) {
             Result::Ok(count) => count,
-            Result::Err(err) => { return Result::Err(err); },
+            Result::Err(err) => {
+                return Result::Err(err);
+            },
         };
         if count == 0usize {
             break;
@@ -236,9 +265,15 @@ pub fun metadata(path: &str) -> Option<FileMetadata> {
     if !exists(path) {
         return Option::None;
     }
-    let size = unsafe { riddle_fs_size(path) };
-    let file_flag = unsafe { riddle_fs_is_file(path) };
-    let dir_flag = unsafe { riddle_fs_is_dir(path) };
+    let size = unsafe {
+        riddle_fs_size(path)
+    };
+    let file_flag = unsafe {
+        riddle_fs_is_file(path)
+    };
+    let dir_flag = unsafe {
+        riddle_fs_is_dir(path)
+    };
     Option::Some(FileMetadata {
         size,
         is_file: file_flag != 0i32,
@@ -258,12 +293,7 @@ pub fun read_dir(path: &str) -> Vector<String> {
             slot += 1usize;
         }
         let count = unsafe {
-            riddle_fs_read_dir(
-                path,
-                names.as_ptr() as *mut *const u8,
-                lens.as_ptr() as *mut usize,
-                capacity,
-            )
+            riddle_fs_read_dir(path, names.as_ptr() as *mut *const u8, lens.as_ptr() as *mut usize, capacity,)
         };
         if count > capacity {
             capacity = count + 8usize;
@@ -274,9 +304,16 @@ pub fun read_dir(path: &str) -> Vector<String> {
         let length_base = lens.as_ptr();
         let mut index = 0usize;
         while index < count {
-            let pointer: *const u8 = unsafe { name_base[index] } as *const u8;
-            let length: usize = unsafe { length_base[index] };
-            let bytes: &[u8] = unsafe { (pointer, length) as &[u8] };
+            let pointer: *const u8 = unsafe {
+                name_base[index]
+            }
+            as *const u8;
+            let length: usize = unsafe {
+                length_base[index]
+            };
+            let bytes: &[u8] = unsafe {
+                (pointer, length) as &[u8]
+            };
             entries.push(String::from_utf8(bytes).unwrap_or(String::new()));
             index += 1usize;
         }

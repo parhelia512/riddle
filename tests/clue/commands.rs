@@ -5100,8 +5100,81 @@ fn automatic_example_test_and_bench_targets_are_buildable() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Whether this environment can run git's local transport. Sandboxes that
+/// forbid the helper processes and pipes git spawns for a local clone block
+/// `git_lock_keeps_revision_until_update` for reasons unrelated to clue.
+fn git_local_transport_available() -> bool {
+    let root = temp_root("git-probe");
+    let source = root.join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("file.txt"), "probe").unwrap();
+    let run = |args: &[&str], directory: &Path| {
+        Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    let available = run(&["init", "-q"], &source)
+        && run(&["add", "."], &source)
+        && run(
+            &[
+                "-c",
+                "user.name=Clue",
+                "-c",
+                "user.email=clue@example.invalid",
+                "commit",
+                "-qm",
+                "probe",
+            ],
+            &source,
+        )
+        && run(
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                root.join("clone").to_str().unwrap(),
+            ],
+            &root,
+        );
+    let _ = fs::remove_dir_all(&root);
+    available
+}
+
+#[test]
+fn git_dependency_failure_reports_git_output() {
+    let root = temp_root("git-missing");
+    let clue_home = root.join("clue-home");
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(root.join("app/src/main.rid"), "fun main() -> i32 { 0 }\n").unwrap();
+    let missing = root
+        .join("missing-dep")
+        .to_string_lossy()
+        .replace('\\', "/");
+    fs::write(
+        root.join("app/Clue.toml"),
+        format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[[bin]]\npath = \"src/main.rid\"\n\n[dependencies]\ngit_dep = {{ package = \"git-dep\", git = \"{missing}\" }}\n"),
+    )
+    .unwrap();
+    let output = clue_with_home(&["check", "app"], &root, &clue_home);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("git command failed with"), "{stderr}");
+    // The exit code alone is not actionable; the captured git output has to
+    // reach the message.
+    assert!(!stderr.contains("no diagnostic output"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn git_lock_keeps_revision_until_update() {
+    if !git_local_transport_available() {
+        eprintln!(
+            "skipping git_lock_keeps_revision_until_update: git cannot clone a local repository in this environment"
+        );
+        return;
+    }
     let root = temp_root("git-lock");
     let clue_home = root.join("clue-home");
     let repo = root.join("git-dep");

@@ -10,13 +10,11 @@ enum HashBucket {
 
 impl crate::std::marker::Copy for HashBucket {}
 
-fun occupy_hash_bucket(
-    mut buckets: &mut Vector<HashBucket>,
-    bucket_index: usize,
-    entry_index: usize
-) {
+fun occupy_hash_bucket(mut buckets: &mut Vector<HashBucket>, bucket_index: usize, entry_index: usize) {
     match buckets.get_mut(bucket_index) {
-        Option::Some(mut bucket) => { *bucket = HashBucket::Occupied(entry_index); },
+        Option::Some(mut bucket) => {
+            *bucket = HashBucket::Occupied(entry_index);
+        },
         Option::None => {},
     }
 }
@@ -27,19 +25,22 @@ pub struct HashMap<K, V> {
     values: Vector<V>,
 }
 
-impl<K, V> crate::std::fmt::Debug for HashMap<K, V>
-where K: crate::std::fmt::Debug, V: crate::std::fmt::Debug {
+impl<K, V> crate::std::fmt::Debug for HashMap<K, V> where K: crate::std::fmt::Debug, V: crate::std::fmt::Debug {
     fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
         formatter.write_str("{")?;
         let mut index = 0usize;
         while index < self.keys.len() {
             let key = match self.keys.get(index) {
                 Option::Some(key) => key,
-                Option::None => { break; },
+                Option::None => {
+                    break;
+                },
             };
             let value = match self.values.get(index) {
                 Option::Some(value) => value,
-                Option::None => { break; },
+                Option::None => {
+                    break;
+                },
             };
             if index > 0usize {
                 formatter.write_str(", ")?;
@@ -84,11 +85,9 @@ impl<K, V> HashMap<K, V> {
         self.keys.is_empty()
     }
 
-    pub fun insert(&mut self, key: K, value: V)
-    where K: Hash + Eq {
+    pub fun insert(&mut self, key: K, value: V) where K: Hash + Eq {
         let existing = self.find_entry(&key);
-        if existing.is_none()
-            && (self.keys.len() + 1usize) * 4usize >= self.buckets.len() * 3usize {
+        if existing.is_none() && (self.keys.len() + 1usize) * 4usize >= self.buckets.len() * 3usize {
             self.grow();
         }
 
@@ -111,24 +110,21 @@ impl<K, V> HashMap<K, V> {
         }
     }
 
-    pub fun get(&self, key: &K) -> Option<&V>
-    where K: Hash + Eq {
+    pub fun get(&self, key: &K) -> Option<&V> where K: Hash + Eq {
         match self.find_entry(key) {
             Option::Some(entry_index) => self.values.get(entry_index),
             Option::None => Option::None,
         }
     }
 
-    pub fun get_mut(&mut self, key: &K) -> Option<&mut V>
-    where K: Hash + Eq {
+    pub fun get_mut(&mut self, key: &K) -> Option<&mut V> where K: Hash + Eq {
         match self.find_entry(key) {
             Option::Some(entry_index) => self.values.get_mut(entry_index),
             Option::None => Option::None,
         }
     }
 
-    pub fun remove(&mut self, key: &K) -> Option<V>
-    where K: Hash + Eq {
+    pub fun remove(&mut self, key: &K) -> Option<V> where K: Hash + Eq {
         let capacity = self.buckets.len();
         if capacity == 0usize {
             return Option::None;
@@ -140,7 +136,9 @@ impl<K, V> HashMap<K, V> {
                 self.backward_shift(bucket, capacity);
                 entry
             },
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
 
         // Remove the parallel entries, then relocate the formerly last entry's
@@ -171,7 +169,9 @@ impl<K, V> HashMap<K, V> {
                 };
                 if matches_last {
                     match self.buckets.get_mut(probe) {
-                        Option::Some(mut slot) => { *slot = HashBucket::Occupied(entry_index); },
+                        Option::Some(mut slot) => {
+                            *slot = HashBucket::Occupied(entry_index);
+                        },
                         Option::None => {},
                     }
                     scanning = false;
@@ -186,8 +186,7 @@ impl<K, V> HashMap<K, V> {
         value
     }
 
-    fun find_entry_bucket(&self, key: &K) -> Option<(usize, usize)>
-    where K: Hash + Eq {
+    fun find_entry_bucket(&self, key: &K) -> Option<(usize, usize)> where K: Hash + Eq {
         let capacity = self.buckets.len();
         if capacity == 0usize {
             return Option::None;
@@ -197,7 +196,9 @@ impl<K, V> HashMap<K, V> {
         while scanned < capacity {
             let bucket = self.bucket_at(bucket_index);
             match bucket {
-                HashBucket::Empty => { return Option::None; },
+                HashBucket::Empty => {
+                    return Option::None;
+                },
                 HashBucket::Occupied(entry_index) => {
                     match self.keys.get(entry_index) {
                         Option::Some(stored) => {
@@ -205,7 +206,9 @@ impl<K, V> HashMap<K, V> {
                                 return Option::Some((entry_index, bucket_index));
                             }
                         },
-                        Option::None => { return Option::None; },
+                        Option::None => {
+                            return Option::None;
+                        },
                     }
                 },
             }
@@ -224,7 +227,9 @@ impl<K, V> HashMap<K, V> {
 
     fun set_bucket(&mut self, index: usize, bucket: HashBucket) {
         match self.buckets.get_mut(index) {
-            Option::Some(mut slot) => { *slot = bucket; },
+            Option::Some(mut slot) => {
+                *slot = bucket;
+            },
             Option::None => {},
         }
     }
@@ -232,8 +237,7 @@ impl<K, V> HashMap<K, V> {
     // Backward-shift deletion for linear probing: entries after the emptied
     // bucket move into it whenever their home position lies before the empty
     // slot on their probe path, keeping every lookup chain intact.
-    fun backward_shift(&mut self, removed_bucket: usize, capacity: usize)
-    where K: Hash {
+    fun backward_shift(&mut self, removed_bucket: usize, capacity: usize) where K: Hash {
         if capacity == 0usize {
             return;
         }
@@ -277,8 +281,12 @@ impl<K, V> HashMap<K, V> {
         }
     }
 
-    /// Iterates the keys in insertion order (probe-table order is an
-    /// implementation detail and must not be relied upon).
+    /// Iterates the keys in the order they were inserted. `remove` shifts the
+    /// last key into the vacated slot (a `swap_remove`, needed to keep the
+    /// parallel value vector aligned), so every removal reorders the key it
+    /// displaces — treat the order as insertion order only while nothing has
+    /// been removed. Probe-table order is an implementation detail and must
+    /// not be relied upon.
     pub fun keys(&self) -> HashMapKeys<K, V> {
         HashMapKeys {
             inner: self.iter(),
@@ -292,46 +300,54 @@ impl<K, V> HashMap<K, V> {
         }
     }
 
-    pub fun contains_key(&self, key: &K) -> bool
-    where K: Hash + Eq {
+    pub fun contains_key(&self, key: &K) -> bool where K: Hash + Eq {
         self.find_entry(key).is_some()
     }
 
-
     /// Returns the stored value for `key`, inserting `default` first when the
     /// key is absent. The key is consumed because `insert` stores it by value.
-    pub fun get_or_insert(&mut self, key: K, default: V) -> &mut V
-    where K: Hash + Eq {
+    pub fun get_or_insert(&mut self, key: K, default: V) -> &mut V where K: Hash + Eq {
         if self.contains_key(&key) {
             match self.get_mut(&key) {
-                Option::Some(value) => { return value; },
-                Option::None => { crate::std::panic::panic("get_or_insert: entry missing") },
+                Option::Some(value) => {
+                    return value;
+                },
+                Option::None => {
+                    crate::std::panic::panic("get_or_insert: entry missing")
+                },
             }
         }
         self.insert(key, default);
         let last = self.values.len() - 1usize;
         match self.values.get_mut(last) {
             Option::Some(value) => value,
-            Option::None => { crate::std::panic::panic("get_or_insert: entry missing after insert") },
+            Option::None => {
+                crate::std::panic::panic("get_or_insert: entry missing after insert")
+            },
         }
     }
 
     /// Gets the given key's corresponding entry for in-place manipulation,
     /// mirroring Rust's `HashMap::entry`: `map.entry(key).or_insert(0)`
     /// inserts only when the key is absent and returns the slot either way.
-    pub fun entry(&mut self, key: K) -> Entry<K, V>
-    where K: Hash + Eq {
+    pub fun entry(&mut self, key: K) -> Entry<K, V> where K: Hash + Eq {
         match self.find_entry(&key) {
             Option::Some(entry_index) => match self.values.get_mut(entry_index) {
-                Option::Some(value) => Entry::Occupied { value },
-                Option::None => { crate::std::panic::panic("entry: index out of sync") },
+                Option::Some(value) => Entry::Occupied {
+                    value
+                },
+                Option::None => {
+                    crate::std::panic::panic("entry: index out of sync")
+                },
             },
-            Option::None => Entry::Vacant { key, map: self },
+            Option::None => Entry::Vacant {
+                key,
+                map: self
+            },
         }
     }
 
-    fun find_entry(&self, key: &K) -> Option<usize>
-    where K: Hash + Eq {
+    fun find_entry(&self, key: &K) -> Option<usize> where K: Hash + Eq {
         let capacity = self.buckets.len();
         if capacity == 0usize {
             return Option::None;
@@ -341,7 +357,9 @@ impl<K, V> HashMap<K, V> {
         while scanned < capacity {
             match self.buckets.get(bucket_index) {
                 Option::Some(bucket) => match *bucket {
-                    HashBucket::Empty => { return Option::None; },
+                    HashBucket::Empty => {
+                        return Option::None;
+                    },
                     HashBucket::Occupied(entry_index) => {
                         match self.keys.get(entry_index) {
                             Option::Some(stored) => {
@@ -353,7 +371,9 @@ impl<K, V> HashMap<K, V> {
                         }
                     },
                 },
-                Option::None => { return Option::None; },
+                Option::None => {
+                    return Option::None;
+                },
             }
             bucket_index = (bucket_index + 1usize) % capacity;
             scanned += 1usize;
@@ -361,8 +381,7 @@ impl<K, V> HashMap<K, V> {
         Option::None
     }
 
-    fun find_empty_bucket(&self, key: &K) -> Option<usize>
-    where K: Hash {
+    fun find_empty_bucket(&self, key: &K) -> Option<usize> where K: Hash {
         let capacity = self.buckets.len();
         if capacity == 0usize {
             return Option::None;
@@ -372,10 +391,14 @@ impl<K, V> HashMap<K, V> {
         while scanned < capacity {
             match self.buckets.get(bucket_index) {
                 Option::Some(bucket) => match *bucket {
-                    HashBucket::Empty => { return Option::Some(bucket_index); },
+                    HashBucket::Empty => {
+                        return Option::Some(bucket_index);
+                    },
                     HashBucket::Occupied(_) => {},
                 },
-                Option::None => { return Option::None; },
+                Option::None => {
+                    return Option::None;
+                },
             }
             bucket_index = (bucket_index + 1usize) % capacity;
             scanned += 1usize;
@@ -383,8 +406,7 @@ impl<K, V> HashMap<K, V> {
         Option::None
     }
 
-    fun grow(&mut self)
-    where K: Hash {
+    fun grow(&mut self) where K: Hash {
         let capacity = self.buckets.len() * 2usize;
         let mut buckets: Vector<HashBucket> = Vector::new();
         let mut bucket_count = 0usize;
@@ -479,22 +501,35 @@ impl<K, V> crate::std::iter::Iterator for HashMapValues<K, V> {
 /// Constructed through [`HashMap::entry`]; the `or_insert*` methods insert
 /// on the vacant variant only and return the slot either way.
 pub enum Entry<K, V> {
-    Occupied { value: &mut V },
-    Vacant { key: K, map: &mut HashMap<K, V> },
+    Occupied {
+        value: &mut V
+    },
+    Vacant {
+        key: K,
+        map: &mut HashMap<K, V>
+    },
 }
 
-impl<K, V> Entry<K, V>
-where K: Hash + Eq {
+impl<K, V> Entry<K, V> where K: Hash + Eq {
     /// Inserts `default` when the entry is vacant, then returns the slot.
     pub fun or_insert(self, default: V) -> &mut V {
         match self {
-            Entry::Occupied { value } => value,
-            Entry::Vacant { key, map: mut map } => {
+            Entry::Occupied {
+                value
+            }
+            => value,
+            Entry::Vacant {
+                key,
+                map: mut map
+            }
+            => {
                 map.insert(key, default);
                 let last = map.values.len() - 1usize;
                 match map.values.get_mut(last) {
                     Option::Some(value) => value,
-                    Option::None => { crate::std::panic::panic("entry: missing slot after insert") },
+                    Option::None => {
+                        crate::std::panic::panic("entry: missing slot after insert")
+                    },
                 }
             },
         }
@@ -504,21 +539,29 @@ where K: Hash + Eq {
     /// `make_default` only when the entry is vacant.
     pub fun or_insert_with(self, mut make_default: impl FnOnce() -> V) -> &mut V {
         match self {
-            Entry::Occupied { value } => value,
-            Entry::Vacant { key, map: mut map } => {
+            Entry::Occupied {
+                value
+            }
+            => value,
+            Entry::Vacant {
+                key,
+                map: mut map
+            }
+            => {
                 map.insert(key, make_default());
                 let last = map.values.len() - 1usize;
                 match map.values.get_mut(last) {
                     Option::Some(value) => value,
-                    Option::None => { crate::std::panic::panic("entry: missing slot after insert") },
+                    Option::None => {
+                        crate::std::panic::panic("entry: missing slot after insert")
+                    },
                 }
             },
         }
     }
 
     /// Like [`Entry::or_insert`], using `Default::default()`.
-    pub fun or_default(self) -> &mut V
-    where V: crate::std::default::Default {
+    pub fun or_default(self) -> &mut V where V: crate::std::default::Default {
         let produced: V = crate::std::default::Default::default();
         self.or_insert(produced)
     }

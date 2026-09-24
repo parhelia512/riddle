@@ -166,6 +166,7 @@ pub struct Parser<'s> {
     current_non_trivia_pos: usize,
     pending_split_greater: usize,
     nesting_depth: usize,
+    nesting_exhausted: bool,
 }
 
 thread_local! {
@@ -199,11 +200,7 @@ impl<'s> Parser<'s> {
         // Postfix-call chains (`f(a)(b)`, `((((1))))`) recurse without ever
         // nesting a syntactic block, so the call depth is the real bound.
         if self.nesting_depth > MAX_NESTING_DEPTH || riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
-            let span = self.current_span();
-            self.errors.push(ParseError {
-                message: "expression nesting is too deep".into(),
-                span,
-            });
+            self.bail_out_nesting(false);
             self.nesting_depth -= 1;
             return false;
         }
@@ -212,6 +209,26 @@ impl<'s> Parser<'s> {
 
     fn exit_nesting(&mut self) {
         self.nesting_depth = self.nesting_depth.saturating_sub(1);
+    }
+
+    /// Reports the nesting diagnostic once per parse and, when `consume` is
+    /// set, skips the offending token so the caller's loop cannot retry the
+    /// same position. Recovery keeps re-entering the exhausted depth, so an
+    /// undeduplicated report emits one identical diagnostic per retry.
+    fn bail_out_nesting(&mut self, consume: bool) {
+        if !self.nesting_exhausted {
+            self.nesting_exhausted = true;
+            let span = self.current_span();
+            self.errors.push(ParseError {
+                message: "expression nesting is too deep".into(),
+                span,
+            });
+        }
+        if consume && !self.at(SyntaxKind::Eof) {
+            let m = self.start();
+            self.bump();
+            m.complete(self, SyntaxKind::ErrorNode);
+        }
     }
 
     #[must_use]
@@ -226,6 +243,7 @@ impl<'s> Parser<'s> {
             current_non_trivia_pos: 0,
             pending_split_greater: 0,
             nesting_depth: 0,
+            nesting_exhausted: false,
         };
         p.recompute_current();
         p
@@ -451,7 +469,18 @@ impl<'s> Parser<'s> {
         let m = self.start();
 
         while !self.at(SyntaxKind::Eof) {
+            if self.nesting_exhausted {
+                // The nesting diagnostic already explains the failure; swallow
+                // the rest of the file so recovery does not report one cascade
+                // error per remaining delimiter.
+                while !self.at(SyntaxKind::Eof) {
+                    self.bump();
+                }
+                break;
+            }
+            let pos_before_statement = self.current_non_trivia_pos;
             self.statement();
+            self.force_progress(pos_before_statement);
         }
         self.eat_trivia();
         m.complete(&mut self, SyntaxKind::Root);
@@ -844,6 +873,18 @@ impl<'s> Parser<'s> {
         // `mut x`, and `let mut (a, b)` is therefore a syntax error.
         self.pattern();
 
+        // `A | B` is a match-arm form only. Without this the stray `|` falls
+        // into the recovery below, which assumes the pattern already errored
+        // and would silently drop `| B = init` with no diagnostic at all.
+        if self.at(SyntaxKind::Pipe) {
+            self.error_no_bump(
+                "or-patterns `A | B` are only allowed on match arms; a `let` pattern is a single pattern".into(),
+            );
+            self.sync_to_statement_boundary();
+            m.complete(self, SyntaxKind::VarDecl);
+            return;
+        }
+
         // A malformed pattern leaves tokens the type/init grammar cannot
         // consume; sync to the statement boundary so one mistake stays one
         // diagnostic and later statements still parse.
@@ -1215,6 +1256,7 @@ impl<'s> Parser<'s> {
 
     fn block_inner(&mut self, m: Marker) -> CompletedMarker {
         while !self.at(SyntaxKind::RBrace) && !self.at(SyntaxKind::Eof) {
+            let pos_before_statement = self.current_non_trivia_pos;
             if self.at_stmt_start() {
                 self.statement();
                 continue;
@@ -1231,6 +1273,7 @@ impl<'s> Parser<'s> {
             }
 
             let Some(expr) = self.statement_expression() else {
+                self.force_progress(pos_before_statement);
                 continue;
             };
 
@@ -1497,7 +1540,7 @@ impl<'s> Parser<'s> {
         self.attrs();
         let m = self.start();
 
-        self.pattern();
+        self.arm_pattern();
 
         if self.at(SyntaxKind::If) {
             self.bump();
@@ -1525,7 +1568,7 @@ impl<'s> Parser<'s> {
         self.attrs();
         let _rdg = RiddleDepthGuard::enter();
         if riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
-            self.error_no_bump("expression nesting is too deep".into());
+            self.bail_out_nesting(false);
             return None;
         }
         self.attrs();
@@ -1670,10 +1713,23 @@ impl<'s> Parser<'s> {
         self.current_non_trivia_pos != pos_before
     }
 
+    /// Consumes one token when an iteration consumed nothing, so a bailout
+    /// that returns without advancing cannot spin the enclosing loop on the
+    /// same position. The nesting guards push one diagnostic per attempt, so
+    /// a stalled loop would also grow `errors` without bound.
+    fn force_progress(&mut self, pos_before: usize) {
+        if self.iteration_made_progress(pos_before) {
+            return;
+        }
+        let m = self.start();
+        self.bump();
+        m.complete(self, SyntaxKind::ErrorNode);
+    }
+
     fn postfix_expr(&mut self, lhs: CompletedMarker, op: SyntaxKind) -> CompletedMarker {
         let _rdg = RiddleDepthGuard::enter();
         if riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
-            self.error_no_bump("expression nesting is too deep".into());
+            self.bail_out_nesting(false);
             // Consume the offending delimiter so the caller's loop makes
             // progress instead of retrying the same token forever.
             self.bump();
@@ -1803,8 +1859,7 @@ impl<'s> Parser<'s> {
     fn arg_list(&mut self) {
         let _rdg = RiddleDepthGuard::enter();
         if riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
-            self.error_no_bump("expression nesting is too deep".into());
-            self.error("expression nesting is too deep".into());
+            self.bail_out_nesting(true);
             return;
         }
         let m = self.start();
@@ -1990,7 +2045,7 @@ impl<'s> Parser<'s> {
     fn paren_expr(&mut self, restrictions: ExprRestrictions) -> CompletedMarker {
         let _rdg = RiddleDepthGuard::enter();
         if riddle_call_depth() > MAX_NESTING_DEPTH * 12 {
-            self.error("expression nesting is too deep".into());
+            self.bail_out_nesting(true);
             let m = self.start();
             let done = m.complete(self, SyntaxKind::ParenExpr);
             return done;
@@ -2662,6 +2717,28 @@ impl<'s> Parser<'s> {
     }
 
     // == patterns ==
+
+    /// A match-arm pattern: one or more `|`-separated patterns. A lone
+    /// pattern keeps its own node; two or more wrap in an `OrPattern`. Rust
+    /// also allows a leading `|`, which is consumed before the marker so a
+    /// single alternative still lowers as the plain pattern it is equivalent
+    /// to (and does not inherit the alternatives' no-binding rule).
+    fn arm_pattern(&mut self) {
+        if self.at(SyntaxKind::Pipe) {
+            self.bump();
+        }
+        let m = self.start();
+        self.pattern();
+        if !self.at(SyntaxKind::Pipe) {
+            m.abandon(self);
+            return;
+        }
+        while self.at(SyntaxKind::Pipe) {
+            self.bump();
+            self.pattern();
+        }
+        m.complete(self, SyntaxKind::OrPattern);
+    }
 
     fn pattern(&mut self) {
         let _rdg = RiddleDepthGuard::enter();

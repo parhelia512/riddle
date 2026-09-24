@@ -6,8 +6,7 @@ pub struct TreeSet<T> {
     values: TreeMap<T, ()>,
 }
 
-impl<T> crate::std::fmt::Debug for TreeSet<T>
-where T: crate::std::fmt::Debug {
+impl<T> crate::std::fmt::Debug for TreeSet<T> where T: crate::std::fmt::Debug {
     fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
         formatter.write_str("{")?;
         let mut iter = self.values.iter();
@@ -22,7 +21,9 @@ where T: crate::std::fmt::Debug {
                     }
                     crate::std::fmt::write_debug(value, &mut *formatter)?;
                 },
-                Option::None => { break; },
+                Option::None => {
+                    break;
+                },
             }
         }
         formatter.write_str("}")
@@ -31,7 +32,9 @@ where T: crate::std::fmt::Debug {
 
 impl<T> TreeSet<T> {
     pub fun new() -> TreeSet<T> {
-        TreeSet { values: TreeMap::new() }
+        TreeSet {
+            values: TreeMap::new()
+        }
     }
 
     pub fun len(&self) -> usize {
@@ -42,18 +45,55 @@ impl<T> TreeSet<T> {
         self.values.is_empty()
     }
 
-    pub fun insert(&mut self, value: T)
-    where T: Ord {
+    pub fun insert(&mut self, value: T) where T: Ord {
         self.values.insert(value, ());
     }
 
-    pub fun contains(&self, value: &T) -> bool
-    where T: Ord {
+    pub fun contains(&self, value: &T) -> bool where T: Ord {
         self.values.contains_key(value)
     }
 
-    pub fun remove(&mut self, value: &T) -> bool
-    where T: Ord {
+    pub fun remove(&mut self, value: &T) -> bool where T: Ord {
         self.values.remove(value).is_some()
+    }
+
+    /// Iterates the elements in sorted order.
+    pub fun iter(&self) -> TreeSetIter<T> {
+        TreeSetIter {
+            inner: self.values.iter(),
+        }
+    }
+}
+
+pub struct TreeSetIter<T> {
+    inner: crate::std::collections::tree_map::TreeMapIter<T, ()>,
+}
+
+impl<T> crate::std::iter::Iterator for TreeSetIter<T> {
+    type Item = &T;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Option::Some((value, _)) => Option::Some(value),
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<T> crate::std::iter::IntoIterator for TreeSetIter<T> {
+    type Item = &T;
+    type IntoIter = TreeSetIter<T>;
+
+    fun into_iter(self) -> TreeSetIter<T> {
+        self
+    }
+}
+
+impl<T> crate::std::iter::IntoIterator for &TreeSet<T> {
+    type Item = &T;
+    type IntoIter = TreeSetIter<T>;
+
+    fun into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }

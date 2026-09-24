@@ -103,10 +103,8 @@ fn run_file(args: RunArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = riddlec::pipeline::compile_for_interpretation(
-        &source,
-        &args.file.display().to_string(),
-    );
+    let result =
+        riddlec::pipeline::compile_for_interpretation(&source, &args.file.display().to_string());
     if !result.success() {
         let errors =
             riddlec::diagnostics::report(&result, Some(&source), &args.file.display().to_string());

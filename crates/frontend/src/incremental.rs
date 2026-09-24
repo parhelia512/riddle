@@ -219,9 +219,11 @@ pub fn parse_fragment(source: &str, entry: ReparseEntry) -> Option<Parse> {
 
 #[must_use]
 pub fn parse_tokens(source: &str, tokens: Vec<lexer::Token>) -> Parse {
+    let mut lex_errors = lexer_error_diagnostics(source, &tokens);
     let parser = Parser::new(source, tokens);
-    let (events, tokens, errors, source) = parser.parse();
-    tree_builder::build_tree(&events, &tokens, source, errors)
+    let (events, tokens, mut errors, source) = parser.parse();
+    lex_errors.append(&mut errors);
+    tree_builder::build_tree(&events, &tokens, source, lex_errors)
 }
 
 #[must_use]
@@ -237,18 +239,35 @@ pub fn parse_token_fragment(
         .then(|| tree_builder::build_tree(&events, &tokens, source, errors))
 }
 
-/// Emit diagnostics for tokens the lexer couldn't recognise.
+/// Emit diagnostics for tokens the lexer couldn't recognise, and for a block
+/// comment that never terminates.
 fn lexer_error_diagnostics(source: &str, tokens: &[lexer::Token]) -> Vec<ParseError> {
     use syntax::SyntaxKind;
     tokens
         .iter()
-        .filter(|t| t.kind == SyntaxKind::ErrorNode)
+        .filter(|t| {
+            matches!(
+                t.kind,
+                SyntaxKind::ErrorNode | SyntaxKind::BlockComment | SyntaxKind::DocBlockComment
+            )
+        })
+        .filter(|t| match t.kind {
+            SyntaxKind::BlockComment | SyntaxKind::DocBlockComment => {
+                !source[t.span.start..t.span.end].ends_with("*/")
+            }
+            _ => true,
+        })
         .map(|t| {
             let text = &source[t.span.start..t.span.end];
-            let msg = if text.is_empty() {
-                "unrecognized token".into()
-            } else {
-                format!("unrecognized character: `{text}`")
+            let msg = match t.kind {
+                // `block_comment` consumes to end-of-input when the terminator
+                // never arrives, so every item after a stray `/*` disappears
+                // without a trace unless this says otherwise.
+                SyntaxKind::BlockComment | SyntaxKind::DocBlockComment => {
+                    "unterminated block comment".into()
+                }
+                _ if text.is_empty() => "unrecognized token".into(),
+                _ => format!("unrecognized character: `{text}`"),
             };
             ParseError {
                 message: msg,
@@ -359,7 +378,17 @@ fn reparse_candidate(
         return None;
     }
 
+    // The replacement is spliced in with `SyntaxNode::replace_with`, which
+    // asserts the kinds match. A kind change means the edit altered the
+    // grammar shape of the node itself (typing inside `for v` glues the
+    // tokens into one identifier, say) — the fragment's reading of the slice
+    // may then differ from the full parser's, so give up on this node and
+    // let a wider ancestor (or a full reparse) produce the canonical tree.
     let new_kind = fragment_root.kind();
+    if new_kind != old_node.kind() {
+        return None;
+    }
+
     let new_green = old_node.replace_with(fragment_parse.green);
 
     Some((

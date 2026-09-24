@@ -125,11 +125,9 @@ fn walk(
         |visibility: &hir::item_tree::Visibility| document_private || visibility.is_public();
 
     let mut entries: Vec<DocEntry> = Vec::new();
-    let mut impls: Vec<(
-        String,
-        Option<String>,
-        Vec<(String, Option<String>)>,
-    )> = Vec::new();
+    // rustfmt collapses this type to one line, which trips type_complexity.
+    #[allow(clippy::type_complexity)]
+    let mut impls: Vec<(String, Option<String>, Vec<(String, Option<String>)>)> = Vec::new();
     for item in items {
         match item {
             TopLevelItem::Function(id) => {

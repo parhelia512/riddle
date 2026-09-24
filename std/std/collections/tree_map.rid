@@ -1,4 +1,7 @@
-use crate::std::cmp::{Ord, Ordering};
+use crate::std::cmp::{
+    Ord,
+    Ordering
+};
 use crate::std::option::Option;
 use crate::std::vector::Vector;
 
@@ -41,8 +44,7 @@ impl<K, V> TreeMap<K, V> {
         self.size == 0usize
     }
 
-    pub fun insert(&mut self, key: K, value: V)
-    where K: Ord {
+    pub fun insert(&mut self, key: K, value: V) where K: Ord {
         let mut parent: Option<usize> = Option::None;
         let mut current = self.root;
         let mut insert_left = false;
@@ -74,7 +76,9 @@ impl<K, V> TreeMap<K, V> {
         if existing.is_some() {
             let existing = existing.unwrap_or(0usize);
             match self.nodes.get_mut(existing) {
-                Option::Some(mut node) => { node.value = value; },
+                Option::Some(mut node) => {
+                    node.value = value;
+                },
                 Option::None => {},
             }
         } else {
@@ -97,14 +101,15 @@ impl<K, V> TreeMap<K, V> {
                         self.set_right(parent, Option::Some(index));
                     }
                 },
-                Option::None => { self.root = Option::Some(index); },
+                Option::None => {
+                    self.root = Option::Some(index);
+                },
             }
             self.fix_insert(index);
         }
     }
 
-    pub fun get(&self, key: &K) -> Option<&V>
-    where K: Ord {
+    pub fun get(&self, key: &K) -> Option<&V> where K: Ord {
         let index = self.find_index(key);
         match index {
             Option::Some(index) => match self.nodes.get(index) {
@@ -115,23 +120,29 @@ impl<K, V> TreeMap<K, V> {
         }
     }
 
-    pub fun contains_key(&self, key: &K) -> bool
-    where K: Ord {
+    pub fun contains_key(&self, key: &K) -> bool where K: Ord {
         self.find_index(key).is_some()
     }
 
-    fun find_index(&self, key: &K) -> Option<usize>
-    where K: Ord {
+    fun find_index(&self, key: &K) -> Option<usize> where K: Ord {
         let mut current = self.root;
         while current.is_some() {
             let index = current.unwrap_or(0usize);
             match self.nodes.get(index) {
                 Option::Some(node) => match key.cmp(&node.key) {
-                    Ordering::Less => { current = node.left; },
-                    Ordering::Greater => { current = node.right; },
-                    Ordering::Equal => { return Option::Some(index); },
+                    Ordering::Less => {
+                        current = node.left;
+                    },
+                    Ordering::Greater => {
+                        current = node.right;
+                    },
+                    Ordering::Equal => {
+                        return Option::Some(index);
+                    },
                 },
-                Option::None => { return Option::None; },
+                Option::None => {
+                    return Option::None;
+                },
             }
         }
         Option::None
@@ -149,7 +160,9 @@ impl<K, V> TreeMap<K, V> {
                 if self.is_red(uncle) {
                     self.set_red(parent, false);
                     match uncle {
-                        Option::Some(uncle) => { self.set_red(uncle, false); },
+                        Option::Some(uncle) => {
+                            self.set_red(uncle, false);
+                        },
                         Option::None => {},
                     }
                     self.set_red(grand, true);
@@ -170,7 +183,9 @@ impl<K, V> TreeMap<K, V> {
                 if self.is_red(uncle) {
                     self.set_red(parent, false);
                     match uncle {
-                        Option::Some(uncle) => { self.set_red(uncle, false); },
+                        Option::Some(uncle) => {
+                            self.set_red(uncle, false);
+                        },
                         Option::None => {},
                     }
                     self.set_red(grand, true);
@@ -189,7 +204,9 @@ impl<K, V> TreeMap<K, V> {
             }
         }
         match self.root {
-            Option::Some(root) => { self.set_red(root, false); },
+            Option::Some(root) => {
+                self.set_red(root, false);
+            },
             Option::None => {},
         }
     }
@@ -197,12 +214,16 @@ impl<K, V> TreeMap<K, V> {
     fun rotate_left(&mut self, root: usize) {
         let right = match self.right(root) {
             Option::Some(right) => right,
-            Option::None => { return; },
+            Option::None => {
+                return;
+            },
         };
         let right_left = self.left(right);
         self.set_right(root, right_left);
         match right_left {
-            Option::Some(child) => { self.set_parent(child, Option::Some(root)); },
+            Option::Some(child) => {
+                self.set_parent(child, Option::Some(root));
+            },
             Option::None => {},
         }
 
@@ -216,7 +237,9 @@ impl<K, V> TreeMap<K, V> {
                     self.set_right(parent, Option::Some(right));
                 }
             },
-            Option::None => { self.root = Option::Some(right); },
+            Option::None => {
+                self.root = Option::Some(right);
+            },
         }
         self.set_left(right, Option::Some(root));
         self.set_parent(root, Option::Some(right));
@@ -225,12 +248,16 @@ impl<K, V> TreeMap<K, V> {
     fun rotate_right(&mut self, root: usize) {
         let left = match self.left(root) {
             Option::Some(left) => left,
-            Option::None => { return; },
+            Option::None => {
+                return;
+            },
         };
         let left_right = self.right(left);
         self.set_left(root, left_right);
         match left_right {
-            Option::Some(child) => { self.set_parent(child, Option::Some(root)); },
+            Option::Some(child) => {
+                self.set_parent(child, Option::Some(root));
+            },
             Option::None => {},
         }
 
@@ -244,7 +271,9 @@ impl<K, V> TreeMap<K, V> {
                     self.set_right(parent, Option::Some(left));
                 }
             },
-            Option::None => { self.root = Option::Some(left); },
+            Option::None => {
+                self.root = Option::Some(left);
+            },
         }
         self.set_right(left, Option::Some(root));
         self.set_parent(root, Option::Some(left));
@@ -290,30 +319,37 @@ impl<K, V> TreeMap<K, V> {
 
     fun set_parent(&mut self, index: usize, parent: Option<usize>) {
         match self.nodes.get_mut(index) {
-            Option::Some(mut node) => { node.parent = parent; },
+            Option::Some(mut node) => {
+                node.parent = parent;
+            },
             Option::None => {},
         }
     }
 
     fun set_left(&mut self, index: usize, child: Option<usize>) {
         match self.nodes.get_mut(index) {
-            Option::Some(mut node) => { node.left = child; },
+            Option::Some(mut node) => {
+                node.left = child;
+            },
             Option::None => {},
         }
     }
 
     fun set_right(&mut self, index: usize, child: Option<usize>) {
         match self.nodes.get_mut(index) {
-            Option::Some(mut node) => { node.right = child; },
+            Option::Some(mut node) => {
+                node.right = child;
+            },
             Option::None => {},
         }
     }
 
-    pub fun remove(&mut self, key: &K) -> Option<V>
-    where K: Ord {
+    pub fun remove(&mut self, key: &K) -> Option<V> where K: Ord {
         let z = match self.find_index(key) {
             Option::Some(index) => index,
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
         self.delete_node(z);
         self.size -= 1usize;
@@ -365,7 +401,9 @@ impl<K, V> TreeMap<K, V> {
                 self.transplant(y, x);
                 self.set_right(y, z_right);
                 match z_right {
-                    Option::Some(child) => { self.set_parent(child, Option::Some(y)); },
+                    Option::Some(child) => {
+                        self.set_parent(child, Option::Some(y));
+                    },
                     Option::None => {},
                 }
                 y_parent
@@ -373,7 +411,9 @@ impl<K, V> TreeMap<K, V> {
             self.transplant(z, Option::Some(y));
             self.set_left(y, z_left);
             match z_left {
-                Option::Some(child) => { self.set_parent(child, Option::Some(y)); },
+                Option::Some(child) => {
+                    self.set_parent(child, Option::Some(y));
+                },
                 Option::None => {},
             }
             self.set_red(y, z_red);
@@ -406,7 +446,9 @@ impl<K, V> TreeMap<K, V> {
             if self.holds_left_child(x, parent) {
                 let mut sibling = self.right(parent);
                 match sibling {
-                    Option::None => { walking = false; },
+                    Option::None => {
+                        walking = false;
+                    },
                     Option::Some(index) => {
                         if self.is_red(Option::Some(index)) {
                             self.set_red(index, false);
@@ -414,19 +456,15 @@ impl<K, V> TreeMap<K, V> {
                             self.rotate_left(parent);
                             sibling = self.right(parent);
                         }
-                        self.delete_fixup_dark_sibling(
-                            &mut x,
-                            &mut parent,
-                            &mut walking,
-                            sibling,
-                            true,
-                        );
+                        self.delete_fixup_dark_sibling(&mut x, &mut parent, &mut walking, sibling, true,);
                     },
                 }
             } else {
                 let mut sibling = self.left(parent);
                 match sibling {
-                    Option::None => { walking = false; },
+                    Option::None => {
+                        walking = false;
+                    },
                     Option::Some(index) => {
                         if self.is_red(Option::Some(index)) {
                             self.set_red(index, false);
@@ -434,31 +472,20 @@ impl<K, V> TreeMap<K, V> {
                             self.rotate_right(parent);
                             sibling = self.left(parent);
                         }
-                        self.delete_fixup_dark_sibling(
-                            &mut x,
-                            &mut parent,
-                            &mut walking,
-                            sibling,
-                            false,
-                        );
+                        self.delete_fixup_dark_sibling(&mut x, &mut parent, &mut walking, sibling, false,);
                     },
                 }
             }
         }
         match self.root {
-            Option::Some(root) => { self.set_red(root, false); },
+            Option::Some(root) => {
+                self.set_red(root, false);
+            },
             Option::None => {},
         }
     }
 
-    fun delete_fixup_dark_sibling(
-        &mut self,
-        x: &mut Option<usize>,
-        parent: &mut usize,
-        walking: &mut bool,
-        sibling: Option<usize>,
-        left_side: bool,
-    ) {
+    fun delete_fixup_dark_sibling(&mut self, x: &mut Option<usize>, parent: &mut usize, walking: &mut bool, sibling: Option<usize>, left_side: bool,) {
         let sibling_index = match sibling {
             Option::Some(index) => index,
             Option::None => {
@@ -492,7 +519,9 @@ impl<K, V> TreeMap<K, V> {
         }
         if !self.is_red(far_child) {
             match near_child {
-                Option::Some(near) => { self.set_red(near, false); },
+                Option::Some(near) => {
+                    self.set_red(near, false);
+                },
                 Option::None => {},
             }
             self.set_red(sibling_index, true);
@@ -521,7 +550,9 @@ impl<K, V> TreeMap<K, V> {
             self.left(sibling_index)
         };
         match far_child {
-            Option::Some(far) => { self.set_red(far, false); },
+            Option::Some(far) => {
+                self.set_red(far, false);
+            },
             Option::None => {},
         }
         if left_side {
@@ -529,7 +560,7 @@ impl<K, V> TreeMap<K, V> {
         } else {
             self.rotate_right(*parent);
         }
-        *x = self.root;
+        * x = self.root;
         *walking = false;
     }
 
@@ -563,8 +594,12 @@ impl<K, V> TreeMap<K, V> {
         let mut walking = true;
         while walking {
             match self.left(current) {
-                Option::Some(next) => { current = next; },
-                Option::None => { walking = false; },
+                Option::Some(next) => {
+                    current = next;
+                },
+                Option::None => {
+                    walking = false;
+                },
             }
         }
         current
@@ -580,10 +615,14 @@ impl<K, V> TreeMap<K, V> {
                     self.set_right(p, v);
                 }
             },
-            Option::None => { self.root = v; },
+            Option::None => {
+                self.root = v;
+            },
         }
         match v {
-            Option::Some(child) => { self.set_parent(child, u_parent); },
+            Option::Some(child) => {
+                self.set_parent(child, u_parent);
+            },
             Option::None => {},
         }
     }
@@ -646,7 +685,9 @@ impl<K, V> TreeMap<K, V> {
 
     fun set_red(&mut self, index: usize, red: bool) {
         match self.nodes.get_mut(index) {
-            Option::Some(mut node) => { node.red = red; },
+            Option::Some(mut node) => {
+                node.red = red;
+            },
             Option::None => {},
         }
     }
@@ -665,11 +706,85 @@ impl<K, V> TreeMap<K, V> {
         Option::None
     }
 
+    // In-order successor: the leftmost node of the right subtree, or the
+    // nearest ancestor whose left subtree we have not finished.
+    fun successor(&self, index: usize) -> Option<usize> {
+        let right = self.right(index);
+        if right.is_some() {
+            return self.first_index(right);
+        }
+        let mut candidate = index;
+        loop {
+            let parent = match self.parent(candidate) {
+                Option::Some(parent) => parent,
+                Option::None => {
+                    return Option::None;
+                },
+            };
+            if self.is_left_child(candidate, parent) {
+                return Option::Some(parent);
+            }
+            candidate = parent;
+        }
+    }
+
+    // First node whose key is not less than `key` (a lower bound).
+    fun lower_bound_index(&self, key: &K) -> Option<usize> where K: Ord {
+        let mut current = self.root;
+        let mut result: Option<usize> = Option::None;
+        while current.is_some() {
+            let index = current.unwrap_or(0usize);
+            match self.nodes.get(index) {
+                Option::Some(node) => match key.cmp(&node.key) {
+                    Ordering::Less => {
+                        result = Option::Some(index);
+                        current = node.left;
+                    },
+                    Ordering::Equal => {
+                        result = Option::Some(index);
+                        current = node.left;
+                    },
+                    Ordering::Greater => {
+                        current = node.right;
+                    },
+                },
+                Option::None => {
+                    current = Option::None;
+                },
+            }
+        }
+        result
+    }
+
     pub fun iter(&self) -> TreeMapIter<K, V> {
         TreeMapIter {
             tree: self,
             current: self.first_index(self.root),
             remaining: self.size,
+        }
+    }
+
+    /// Iterates the keys in sorted order.
+    pub fun keys(&self) -> TreeMapKeys<K, V> {
+        TreeMapKeys {
+            inner: self.iter(),
+        }
+    }
+
+    /// Iterates the values in the same order as [`TreeMap::keys`].
+    pub fun values(&self) -> TreeMapValues<K, V> {
+        TreeMapValues {
+            inner: self.iter(),
+        }
+    }
+
+    /// Iterates entries with `start <= key < end` in sorted order. The start
+    /// bound is inclusive, the end bound exclusive.
+    pub fun range(&self, start: &K, end: &K) -> TreeMapRangeIter<K, V> where K: Ord {
+        TreeMapRangeIter {
+            tree: self,
+            current: self.lower_bound_index(start),
+            end,
         }
     }
 }
@@ -683,38 +798,107 @@ impl<K, V> crate::std::iter::Iterator for TreeMapIter<K, V> {
         }
         let index = match self.current {
             Option::Some(index) => index,
-            Option::None => { return Option::None; },
+            Option::None => {
+                return Option::None;
+            },
         };
         self.remaining -= 1usize;
-        let node = self.tree.nodes.get(index);
-        // In-order successor: the leftmost node of the right subtree, or the
-        // nearest ancestor whose left subtree we have not finished.
-        if self.tree.right(index).is_some() {
-            self.current = self.tree.first_index(self.tree.right(index));
-        } else {
-            let mut candidate = index;
-            let mut climbing = true;
-            while climbing {
-                let parent = match self.tree.parent(candidate) {
-                    Option::Some(parent) => parent,
-                    Option::None => {
-                        self.current = Option::None;
-                        climbing = false;
-                        break;
-                    },
-                };
-                if self.tree.is_left_child(candidate, parent) {
-                    self.current = Option::Some(parent);
-                    climbing = false;
-                } else {
-                    candidate = parent;
-                }
-            }
-        }
-        match node {
+        self.current = self.tree.successor(index);
+        match self.tree.nodes.get(index) {
             Option::Some(node) => Option::Some((&node.key, &node.value)),
             Option::None => Option::None,
         }
+    }
+}
+
+pub struct TreeMapKeys<K, V> {
+    inner: TreeMapIter<K, V>,
+}
+
+impl<K, V> crate::std::iter::Iterator for TreeMapKeys<K, V> {
+    type Item = &K;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Option::Some((key, _)) => Option::Some(key),
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<K, V> crate::std::iter::IntoIterator for TreeMapKeys<K, V> {
+    type Item = &K;
+    type IntoIter = TreeMapKeys<K, V>;
+
+    fun into_iter(self) -> TreeMapKeys<K, V> {
+        self
+    }
+}
+
+pub struct TreeMapValues<K, V> {
+    inner: TreeMapIter<K, V>,
+}
+
+impl<K, V> crate::std::iter::Iterator for TreeMapValues<K, V> {
+    type Item = &V;
+
+    fun next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Option::Some((_, value)) => Option::Some(value),
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<K, V> crate::std::iter::IntoIterator for TreeMapValues<K, V> {
+    type Item = &V;
+    type IntoIter = TreeMapValues<K, V>;
+
+    fun into_iter(self) -> TreeMapValues<K, V> {
+        self
+    }
+}
+
+pub struct TreeMapRangeIter<K, V> {
+    tree: &TreeMap<K, V>,
+    current: Option<usize>,
+    end: &K,
+}
+
+impl<K, V> crate::std::iter::Iterator for TreeMapRangeIter<K, V> where K: Ord {
+    type Item = (&K, &V);
+
+    fun next(&mut self) -> Option<Self::Item> {
+        let index = match self.current {
+            Option::Some(index) => index,
+            Option::None => {
+                return Option::None;
+            },
+        };
+        let node = match self.tree.nodes.get(index) {
+            Option::Some(node) => node,
+            Option::None => {
+                return Option::None;
+            },
+        };
+        let past_end = match node.key.cmp(self.end) {
+            Ordering::Less => false,
+            _ => true,
+        };
+        if past_end {
+            return Option::None;
+        }
+        self.current = self.tree.successor(index);
+        Option::Some((&node.key, &node.value))
+    }
+}
+
+impl<K, V> crate::std::iter::IntoIterator for TreeMapRangeIter<K, V> where K: Ord {
+    type Item = (&K, &V);
+    type IntoIter = TreeMapRangeIter<K, V>;
+
+    fun into_iter(self) -> TreeMapRangeIter<K, V> {
+        self
     }
 }
 
@@ -727,8 +911,7 @@ impl<K, V> crate::std::iter::IntoIterator for &TreeMap<K, V> {
     }
 }
 
-impl<K, V> crate::std::fmt::Debug for TreeMap<K, V>
-where K: crate::std::fmt::Debug, V: crate::std::fmt::Debug {
+impl<K, V> crate::std::fmt::Debug for TreeMap<K, V> where K: crate::std::fmt::Debug, V: crate::std::fmt::Debug {
     fun fmt(&self, formatter: &mut crate::std::fmt::Formatter) -> crate::std::fmt::Result {
         formatter.write_str("{")?;
         let mut iter = self.iter();
@@ -745,7 +928,9 @@ where K: crate::std::fmt::Debug, V: crate::std::fmt::Debug {
                     formatter.write_str(": ")?;
                     crate::std::fmt::write_debug(value, &mut *formatter)?;
                 },
-                Option::None => { break; },
+                Option::None => {
+                    break;
+                },
             }
         }
         formatter.write_str("}")

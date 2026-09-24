@@ -220,6 +220,54 @@ fn interpreter_index_out_of_bounds_aborts() {
 }
 
 #[test]
+fn interpreter_indexes_through_array_references() {
+    // Indexing a `&[T; N]` must stride by the element size, not the whole
+    // array's size, and keep the bounds check on the array's length.
+    assert_ok(
+        r#"
+        struct Pair { a: [i32; 2] }
+
+        fun main() -> i32 {
+            let values = [5i32, 6i32, 7i32];
+            let view = &values;
+            let mut total = 0i32;
+            let mut index = 0usize;
+            while index < 3usize {
+                total += view[index];
+                index += 1usize;
+            }
+            if total != 18i32 { return 1; }
+            if view[2usize] != 7i32 { return 2; }
+
+            let pair = Pair { a: [1i32, 2i32] };
+            let inner = &pair.a;
+            if inner[0usize] + inner[1usize] != 3i32 { return 3; }
+            0
+        }
+        "#,
+        "",
+    );
+
+    let out_of_bounds = r#"
+        fun main() -> i32 {
+            let values = [1i32, 2i32];
+            let view = &values;
+            println!("{}", view[2usize]);
+            0
+        }
+        "#;
+    let (code, _stdout, stderr) = run(out_of_bounds);
+    assert!(
+        code.as_ref().unwrap_err().contains("index out of bounds"),
+        "code: {code:?}"
+    );
+    assert!(
+        stderr.contains("riddle: index out of bounds"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn interpreter_float_to_int_cast_saturates() {
     assert_ok(
         r#"
@@ -708,6 +756,37 @@ fn interpreter_unknown_extern_is_reported() {
 }
 
 #[test]
+fn interpreter_bool_bitwise_ops_are_eager() {
+    // `match` lowering folds pattern tests and guards into eager
+    // `BitAnd`/`BitOr`/`BitXor` on `bool`, so the interpreter must evaluate
+    // them; `&&`/`||` stay short-circuit control flow and must not.
+    assert_ok(
+        r#"
+        fun main() -> i32 {
+            let mut calls = 0i32;
+            let mut bump = [ -> { calls += 1i32; true }];
+            let t = true;
+            let f = false;
+
+            if t & f { return 1; }
+            if !(t | f) { return 2; }
+            if !(t ^ f) { return 3; }
+            if t && f { return 4; }
+            if !(t || f) { return 5; }
+
+            if f && bump() { return 6; }
+            if calls != 0i32 { return 7; }
+
+            if f & bump() { return 8; }
+            if calls != 1i32 { return 9; }
+            0
+        }
+        "#,
+        "",
+    );
+}
+
+#[test]
 fn interpreter_prints_uints_and_chars() {
     assert_ok(
         r#"
@@ -721,4 +800,614 @@ fn interpreter_prints_uints_and_chars() {
         "#,
         "42\n-1\nr\ntrue\n",
     );
+}
+
+#[test]
+fn interpreter_hash_set_iterates_in_insertion_order() {
+    assert_ok(
+        r#"
+        use std::collections::HashSet;
+
+        fun main() -> i32 {
+            let mut set: HashSet<i32> = HashSet::new();
+            set.insert(3);
+            set.insert(1);
+            set.insert(4);
+            set.insert(1);
+            let mut out = 0usize;
+            for value in &set {
+                out = out * 10usize + (*value as usize);
+            }
+            println!("{}", out);
+            0
+        }
+        "#,
+        "314\n",
+    );
+}
+
+#[test]
+fn interpreter_tree_set_iterates_sorted() {
+    assert_ok(
+        r#"
+        use std::collections::TreeSet;
+
+        fun main() -> i32 {
+            let mut set: TreeSet<i32> = TreeSet::new();
+            set.insert(5);
+            set.insert(1);
+            set.insert(9);
+            set.insert(3);
+            let mut out = 0usize;
+            for value in &set {
+                out = out * 10usize + (*value as usize);
+            }
+            println!("{}", out);
+            0
+        }
+        "#,
+        "1359\n",
+    );
+}
+
+#[test]
+fn interpreter_tree_map_keys_values_and_range() {
+    assert_ok(
+        r#"
+        use std::collections::TreeMap;
+
+        fun main() -> i32 {
+            let mut map: TreeMap<i32, i32> = TreeMap::new();
+            map.insert(10, 1);
+            map.insert(20, 2);
+            map.insert(30, 3);
+            map.insert(40, 4);
+            map.insert(50, 5);
+
+            let mut keys = 0usize;
+            for key in map.keys() {
+                keys = keys * 100usize + (*key as usize);
+            }
+            println!("keys={}", keys);
+
+            let mut values = 0usize;
+            for value in map.values() {
+                values = values * 10usize + (*value as usize);
+            }
+            println!("values={}", values);
+
+            let mut range_keys = 0usize;
+            for (key, value) in map.range(&20, &50) {
+                range_keys = range_keys * 100usize + (*key as usize);
+                if *value != *key / 10 { return 1; }
+            }
+            println!("range={}", range_keys);
+
+            let mut empty = 0usize;
+            for (key, _) in map.range(&35, &40) {
+                empty = empty * 100usize + (*key as usize);
+            }
+            println!("empty={}", empty);
+            0
+        }
+        "#,
+        "keys=1020304050\nvalues=12345\nrange=203040\nempty=0\n",
+    );
+}
+
+#[test]
+fn interpreter_vector_sorts_merge_sorted_and_stable() {
+    assert_ok(
+        r#"
+        use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
+        use std::option::Option;
+
+        struct Pair { key: i32, tag: i32 }
+
+        impl PartialEq for Pair {
+            fun eq(&self, other: &Self) -> bool {
+                self.key == other.key && self.tag == other.tag
+            }
+        }
+
+        impl PartialOrd for Pair {
+            fun partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                if self.key < other.key {
+                    Option::Some(Ordering::Less)
+                } else if self.key > other.key {
+                    Option::Some(Ordering::Greater)
+                } else {
+                    Option::Some(Ordering::Equal)
+                }
+            }
+        }
+
+        fun main() -> i32 {
+            let mut v: Vector<i32> = Vector::new();
+            let mut seed = 7i32;
+            let mut i = 0usize;
+            while i < 100usize {
+                // Deterministic LCG spread over positive and negative keys.
+                seed = seed * 1103515245i32 + 12345i32;
+                v.push(seed / 65536i32);
+                i += 1usize;
+            }
+            v.sort();
+            let mut j: usize = 1usize;
+            while j < v.len() {
+                if v[j - 1usize] > v[j] { return 1; }
+                j += 1usize;
+            }
+
+            // Stability: equal keys keep insertion order (tags ascending
+            // within equal keys in the order pushed).
+            let mut pairs: Vector<Pair> = Vector::new();
+            pairs.push(Pair { key: 1, tag: 1 });
+            pairs.push(Pair { key: 0, tag: 2 });
+            pairs.push(Pair { key: 1, tag: 3 });
+            pairs.push(Pair { key: 0, tag: 4 });
+            pairs.sort();
+            if pairs[0].key != 0 || pairs[0].tag != 2 { return 2; }
+            if pairs[1].key != 0 || pairs[1].tag != 4 { return 3; }
+            if pairs[2].key != 1 || pairs[2].tag != 1 { return 4; }
+            if pairs[3].key != 1 || pairs[3].tag != 3 { return 5; }
+            println!("sorted");
+            0
+        }
+        "#,
+        "sorted\n",
+    );
+}
+
+#[test]
+fn interpreter_tuple_comparison_and_hash_dispatch() {
+    assert_ok(
+        r#"
+        use std::collections::{HashMap, HashSet};
+
+        fun main() -> i32 {
+            // Direct method calls through the std tuple impls.
+            let a = (1, 2);
+            let b = (0, 9);
+            if !b.lt(&a) { return 1; }
+            if a.ge(&a) != true { return 2; }
+            if a.eq(&b) { return 3; }
+            match a.partial_cmp(&b) {
+                Option::Some(std::cmp::Ordering::Greater) => {},
+                _ => { return 4; },
+            }
+            match a.cmp(&a) {
+                std::cmp::Ordering::Equal => {},
+                _ => { return 5; },
+            }
+
+            // Operators still agree with the impls.
+            let same = (1, 2);
+            if !(a > b && a == same && a != b) { return 6; }
+
+            // Generic dispatch: sort vectors of tuples and pairs-of-tuples.
+            let mut v: Vector<(i32, i32)> = Vector::new();
+            v.push((3, 1));
+            v.push((1, 2));
+            v.push((1, 1));
+            v.sort();
+            if v[0].0 != 1 || v[0].1 != 1 { return 7; }
+            if v[1].0 != 1 || v[1].1 != 2 { return 8; }
+            if v[2].0 != 3 { return 9; }
+
+            // Tuples as map keys (Hash + Eq) and ordered keys (Ord).
+            let mut counts: HashMap<(i32, i32), i32> = HashMap::new();
+            counts.insert((1, 2), 10);
+            counts.insert((1, 2), 20);
+            counts.insert((2, 1), 30);
+            match counts.get(&(1, 2)) {
+                Option::Some(value) => { if *value != 20 { return 10; } },
+                Option::None => { return 11; },
+            }
+            let mut ordered: std::collections::TreeMap<(i32, i32), i32> = std::collections::TreeMap::new();
+            ordered.insert((2, 0), 1);
+            ordered.insert((1, 9), 2);
+            let mut first_key = (9, 9);
+            let low = (0, 0);
+            let high = (2, 0);
+            for (key, _) in ordered.range(&low, &high) {
+                first_key = *key;
+                break;
+            }
+            let want = (1, 9);
+            if first_key != want { return 12; }
+            0
+        }
+        "#,
+        "",
+    );
+}
+
+#[test]
+fn interpreter_match_or_patterns_dispatch() {
+    assert_ok(
+        r#"
+        enum Color { Red, Green, Blue, Custom(i32) }
+
+        fun band(x: i32) -> &str {
+            match x {
+                1 | 2 | 3 => "low",
+                10 => "ten",
+                _ => "other",
+            }
+        }
+
+        fun name(color: Color) -> &str {
+            match color {
+                Color::Red | Color::Green => "warm",
+                Color::Custom(_) | Color::Blue => "cool",
+            }
+        }
+
+        fun guarded(x: i32) -> &str {
+            match x {
+                1 | 2 | 3 if x > 2 => "big-small",
+                1 | 2 | 3 => "small",
+                y if y > 100 => "huge",
+                _ => "rest",
+            }
+        }
+
+        fun main() -> i32 {
+            println!("{}{}{}", band(2), band(10), band(99));
+            println!("{}{}", name(Color::Red), name(Color::Blue));
+            println!("{}{}", name(Color::Custom(7)), name(Color::Green));
+            // `1 | 2 | 3 if x > 2` matches 3; `1 | 2 | 3` catches 1; the
+            // binding arm `y if y > 100` still sees its `y`.
+            println!("{}{}{}{}", guarded(3), guarded(1), guarded(200), guarded(50));
+            0
+        }
+        "#,
+        "lowtenother\nwarmcool\ncoolwarm\nbig-smallsmallhugerest\n",
+    );
+}
+
+#[test]
+fn interpreter_tuple_dispatch_through_nested_and_generic_paths() {
+    assert_ok(
+        r#"
+        fun main() -> i32 {
+            // 3-tuples sort through the element-wise PartialOrd impl.
+            let mut v: Vector<(i32, i32, i32)> = Vector::new();
+            v.push((1, 2, 3));
+            v.push((1, 2, 1));
+            v.push((0, 9, 9));
+            v.sort();
+            if v[0].2 != 9 { return 1; }
+            if v[2].2 != 3 { return 2; }
+
+            // Nested tuples: the outer impl dispatches `.lt` into the inner
+            // tuple impl — recursion through the same generic machinery.
+            let mut nested: Vector<((i32, i32), i32)> = Vector::new();
+            nested.push(((1, 0), 5));
+            nested.push(((0, 9), 5));
+            nested.push(((1, 0), 2));
+            nested.sort();
+            if (nested[0].0).0 != 0 { return 3; }
+            if nested[1].1 != 2 { return 4; }
+            if nested[2].1 != 5 { return 5; }
+            0
+        }
+        "#,
+        "",
+    );
+}
+
+#[test]
+fn interpreter_tuple_arities_four_to_six_sort_and_compare() {
+    // The std tuple impls cover arities 2..=6; the other tuple tests only
+    // exercise 2 and 3, so the long forms stay unproven without this.
+    assert_ok(
+        r#"
+        use std::cmp::Ordering;
+
+        fun main() -> i32 {
+            let mut four: Vector<(i32, i32, i32, i32)> = Vector::new();
+            four.push((0, 0, 1, 0));
+            four.push((0, 0, 0, 9));
+            four.push((0, 0, 0, 1));
+            four.sort();
+            if !four[0].eq(&(0, 0, 0, 1)) { return 1; }
+            if !four[2].eq(&(0, 0, 1, 0)) { return 2; }
+
+            let mut five: Vector<(i32, i32, i32, i32, i32)> = Vector::new();
+            five.push((1, 0, 0, 0, 0));
+            five.push((0, 9, 9, 9, 9));
+            five.sort();
+            if five[0].0 != 0 || five[1].0 != 1 { return 3; }
+
+            let mut six: Vector<(i32, i32, i32, i32, i32, i32)> = Vector::new();
+            six.push((0, 0, 0, 0, 0, 5));
+            six.push((0, 0, 0, 0, 0, 2));
+            six.push((0, 0, 0, 0, 1, 0));
+            six.sort();
+            if !six[0].eq(&(0, 0, 0, 0, 0, 2)) { return 4; }
+            if !six[2].eq(&(0, 0, 0, 0, 1, 0)) { return 5; }
+
+            // Lexicographic tie-breaking reaches the last element of a 6-tuple.
+            if (0, 0, 0, 0, 0, 2).lt(&(0, 0, 0, 0, 0, 5)) != true { return 6; }
+            // `Ordering` has no `PartialEq`, so `cmp` results match by variant.
+            match (1, 2, 3, 4, 5, 6).cmp(&(1, 2, 3, 4, 5, 6)) {
+                Ordering::Equal => {},
+                _ => { return 7; },
+            }
+            if (0, 0, 0, 0, 0, 9).gt(&(9, 0, 0, 0, 0, 0)) { return 8; }
+            0
+        }
+        "#,
+        "",
+    );
+}
+
+#[test]
+fn interpreter_tuple_display_and_debug_render_parenthesized() {
+    // `std::fmt` ships Display/Debug for arities 2..=6; elements format
+    // through their own impls, and nested tuples recurse.
+    assert_ok(
+        r#"
+        fun main() -> i32 {
+            println!("{}", (1, 2));
+            println!("{:?}", (1, true));
+            println!("{}", ('a', 2u8, 3.5f64, "s"));
+            println!("{}", (1, 2, 3, 4, 5, 6));
+            println!("{}", ((1, 2), 3));
+            println!("{:?}", ((1, 2), 3));
+            0
+        }
+        "#,
+        "(1, 2)\n(1, true)\n(a, 2, 3.500000, s)\n(1, 2, 3, 4, 5, 6)\n((1, 2), 3)\n((1, 2), 3)\n",
+    );
+}
+
+#[test]
+fn interpreter_float_hashes_distinguish_values_by_bit_pattern() {
+    // Port of the C-backend scenario: the interpreter has to agree that
+    // fractions below 1.0 no longer collapse onto one hash.
+    assert_ok(
+        r#"
+        use crate::std::hash::Hash;
+
+        fun main() -> i32 {
+            let small = 0.1f64;
+            let large = 0.9f64;
+            let half = 0.5f64;
+            if small.hash() == large.hash() { return 1; }
+            if half.hash() == small.hash() { return 2; }
+            let one = 1.5f64;
+            let two = 2.5f64;
+            if one.hash() == two.hash() { return 3; }
+            let quarter = 0.25f64;
+            let quarter_again = 0.25f64;
+            if quarter.hash() != quarter_again.hash() { return 4; }
+            let fsmall = 0.1f32;
+            let flarge = 0.9f32;
+            if fsmall.hash() == flarge.hash() { return 5; }
+            0
+        }
+        "#,
+        "",
+    );
+}
+
+#[test]
+fn interpreter_float_hashes_fold_the_exact_bit_pattern() {
+    // Port of the C-backend pin: the interpreter walks the same `&[u8]` view, so
+    // it must produce the identical bit-exact fold.
+    assert_ok(
+        r#"
+        use crate::std::hash::Hash;
+
+        fun main() -> i32 {
+            let one = 1.5f64;
+            let two = 2.25f64;
+            if one.hash() != 9826234843501278960usize { return 1; }
+            if two.hash() != 2653818900198545032usize { return 2; }
+            let zero = 0.0f64;
+            let neg_zero = -0.0f64;
+            if zero != neg_zero { return 3; }
+            if zero.hash() == neg_zero.hash() { return 4; }
+            0
+        }
+        "#,
+        "",
+    );
+}
+
+#[test]
+fn interpreter_float_display_handles_nan_infinity_and_negative_zero() {
+    // Port of the C-backend scenario: both backends must render the same
+    // non-finite and exact-big-value forms.
+    let expected = format!(
+        "nan=NaN dbg=NaN pos=inf neg=-inf\nzero=-0.000000 f32=0.250000\n\
+         big=100000000000000000000.000000\ndmax={:.0}.000000\n",
+        f64::MAX
+    );
+    assert_ok(
+        r#"
+        fun main() -> i32 {
+            let nan = 0.0f64 / 0.0f64;
+            let positive_infinity = 1.0f64 / 0.0f64;
+            let negative_infinity = -1.0f64 / 0.0f64;
+            let negative_zero = -0.0f64;
+            let quarter = 0.25f32;
+            let big = 1.0e20f64;
+            let dmax = 1.7976931348623157e308f64;
+            println!("nan={nan} dbg={nan:?} pos={positive_infinity} neg={negative_infinity}");
+            println!("zero={negative_zero} f32={quarter}");
+            println!("big={big}");
+            println!("dmax={dmax}");
+            0
+        }
+        "#,
+        &expected,
+    );
+}
+
+#[test]
+fn interpreter_path_rejects_unterminated_block_comment() {
+    // `riddle run` compiles through the macro-expansion pipeline, which builds
+    // its green tree from a token stream instead of a fresh lex. A stray `/*`
+    // must still stop the program there — silently dropping every item after
+    // it makes the run path disagree with `riddlec` and `clue check`.
+    let source = "fun main() { println!(\"hi\"); }\n/* stray\n";
+    let result = pipeline::compile(source);
+    assert!(!result.success(), "parse: {:#?}", result.parse_errors);
+    let reported = result
+        .parse_errors
+        .iter()
+        .filter(|error| error.message.contains("unterminated block comment"))
+        .count();
+    assert_eq!(
+        reported, 1,
+        "expected exactly one diagnostic, got: {:#?}",
+        result.parse_errors
+    );
+}
+
+#[test]
+fn interpreter_compares_ordering_values() {
+    // Port of the C-backend scenario: `Ordering` used to carry only `Copy`,
+    // so `x.cmp(&y) == Ordering::Equal` — the ordinary way to test a
+    // comparison — had no `PartialEq` to dispatch through.
+    let source = r#"
+        use crate::std::cmp::Ordering;
+
+        fun main() -> i32 {
+            let a = 1i32;
+            let b = 2i32;
+            if a.cmp(&a) != Ordering::Equal { return 1; }
+            if a.cmp(&b) != Ordering::Less { return 2; }
+            if b.cmp(&a) != Ordering::Greater { return 3; }
+            if a.cmp(&b) == Ordering::Equal { return 4; }
+            if !(Ordering::Less < Ordering::Equal) { return 5; }
+            if !(Ordering::Equal < Ordering::Greater) { return 6; }
+            if !(Ordering::Greater > Ordering::Less) { return 7; }
+            let mut results = vec![Ordering::Greater, Ordering::Less, Ordering::Equal];
+            results.sort();
+            if results[0] != Ordering::Less { return 8; }
+            if results[1] != Ordering::Equal { return 9; }
+            if results[2] != Ordering::Greater { return 10; }
+            0
+        }
+        "#;
+    assert_ok(source, "");
+}
+
+#[test]
+fn references_compare_through_blanket_impls() {
+    let source = r#"
+        use crate::std::cmp::Ordering;
+
+        fun ref_eq<T: crate::std::cmp::PartialEq>(a: &T, b: &T) -> bool {
+            a == b
+        }
+
+        fun main() -> i32 {
+            let p = 10;
+            let q = 10;
+            let a = &p;
+            let b = &q;
+            if !(a == b) { return 1; }
+            if a != b { return 2; }
+            let small = 3;
+            let big = 9;
+            if !(&small < &big) { return 3; }
+            if !(&big > &small) { return 4; }
+            if &small >= &big { return 5; }
+            if !a.eq(b) { return 6; }
+            if a.cmp(b) != Ordering::Equal { return 7; }
+            if small.cmp(&big) != Ordering::Less { return 8; }
+            if !ref_eq(&p, &q) { return 9; }
+            if ref_eq(&small, &big) { return 10; }
+            0
+        }
+        "#;
+    assert_ok(source, "");
+}
+
+#[test]
+fn debug_formats_ordering_and_nested_options() {
+    let source = r#"
+        use crate::std::cmp::Ordering;
+        use crate::std::option::Option;
+        use crate::std::vector::Vector;
+
+        fun main() -> i32 {
+            let mut v: Vector<i32> = Vector::new();
+            v.push(1);
+            v.push(2);
+            let none: Option<i32> = Option::None;
+            println!("{:?}|{:?}|{:?}|{:?}", Option::Some(v), none, Ordering::Greater, Option::Some(Ordering::Less));
+            0
+        }
+        "#;
+    assert_ok(source, "Some([1, 2])|None|Greater|Some(Less)\n");
+}
+
+#[test]
+fn slice_iter_supports_manual_consecutive_next_calls() {
+    let source = r#"
+        use crate::std::option::Option;
+        use crate::std::vector::Vector;
+
+        fun main() -> i32 {
+            let mut v: Vector<i32> = Vector::new();
+            v.push(10);
+            v.push(20);
+            v.push(30);
+            let mut it = v.iter();
+            let a = it.next();
+            let b = it.next();
+            let c = it.next();
+            let done = it.next();
+            let av = match a { Option::Some(x) => *x, _ => -1 };
+            let bv = match b { Option::Some(x) => *x, _ => -1 };
+            let cv = match c { Option::Some(x) => *x, _ => -1 };
+            let dn = match done { Option::Some(_) => 1, _ => 0 };
+            if av == 10 && bv == 20 && cv == 30 && dn == 0 { 0 } else { 1 }
+        }
+        "#;
+    assert_ok(source, "");
+}
+
+#[test]
+fn generic_iterator_consumption_and_tree_next_calls() {
+    let source = r#"
+        use crate::std::collections::TreeMap;
+        use crate::std::iter::Iterator;
+        use crate::std::option::Option;
+
+        fun count_all<I: Iterator>(it: &mut I) -> usize {
+            let mut n = 0usize;
+            loop {
+                match it.next() {
+                    Option::Some(_) => { n += 1usize; },
+                    Option::None => { break; },
+                }
+            }
+            n
+        }
+
+        fun main() -> i32 {
+            let mut tree: TreeMap<i32, i32> = TreeMap::new();
+            tree.insert(10i32, 1);
+            tree.insert(20i32, 2);
+            // Generic-bound consumption (dead results) plus manual
+            // consecutive `next` on the tree iterator (live results).
+            let mut iter = tree.iter();
+            let n = count_all(&mut iter);
+            let mut iter2 = tree.iter();
+            let a = iter2.next();
+            let b = iter2.next();
+            let av = match a { Option::Some((k, _)) => *k, _ => -1 };
+            let bv = match b { Option::Some((k, _)) => *k, _ => -1 };
+            if n == 2usize && av == 10 && bv == 20 { 0 } else { 1 }
+        }
+        "#;
+    assert_ok(source, "");
 }

@@ -6,5 +6,7 @@ unsafe extern "C" {
 /// Terminates the process with the given exit code.
 /// Like C `exit`, this does not run Riddle stack destructors.
 pub fun exit(code: i32) -> ! {
-    unsafe { riddle_process_exit(code) }
+    unsafe {
+        riddle_process_exit(code)
+    }
 }

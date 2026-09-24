@@ -245,14 +245,36 @@ impl LowerCtx<'_> {
                 ));
             }
             let receiver_param = self.hir.item_tree.functions[fid].params.first()?.ty.clone();
-            let receiver =
-                self.lower_receiver_arg(builder, param_values, body, *base, &receiver_param);
-            let mut values =
-                self.lower_expr_sequence(builder, param_values, body, expr_id, 1, args);
+            let receiver = self.lower_receiver_arg(
+                builder,
+                param_values,
+                body,
+                *base,
+                &receiver_param,
+                self.mono_method_param_type(fid, 0, dispatch_ty, dispatch_rhs)
+                    .as_ref(),
+            );
+            let mut values = Vec::with_capacity(args.len() + 1);
+            for (index, arg) in args.iter().enumerate() {
+                let raw = self.lower_expr(builder, param_values, body, *arg);
+                let expected =
+                    self.mono_method_param_type(fid, index + 1, dispatch_ty, dispatch_rhs);
+                let adjusted = match self.type_result.expr_types.get(&(body_id, *arg)) {
+                    Some(arg_ty) => self.adjust_arg_for_reference_self_impl(
+                        builder,
+                        raw,
+                        arg_ty,
+                        expected.as_ref(),
+                    ),
+                    None => raw,
+                };
+                values.push(adjusted);
+            }
             values.insert(0, receiver);
             let name = self
                 .mono_method_name_for_receiver(fid, dispatch_ty, dispatch_rhs)
                 .unwrap_or_else(|| self.function_name(fid));
+            let result_ty = self.instance_result_type(&name, result_ty);
             return Some(builder.call(FuncRef::Local(name), values, result_ty));
         }
         if !matches!(
@@ -275,6 +297,7 @@ impl LowerCtx<'_> {
             .mono_method_name_for_receiver(fid, receiver_ty, None)
             .unwrap_or_else(|| self.function_name(fid));
         let values = self.lower_expr_sequence(builder, param_values, body, expr_id, 0, args);
+        let result_ty = self.instance_result_type(&name, result_ty);
         Some(builder.call(FuncRef::Local(name), values, result_ty))
     }
 
@@ -290,7 +313,22 @@ impl LowerCtx<'_> {
         let name = self
             .mono_method_name(fid, lhs, rhs)
             .unwrap_or_else(|| self.function_name(fid));
+        let ret_ty = self.instance_result_type(&name, ret_ty);
         builder.call(FuncRef::Local(name), args, ret_ty)
+    }
+
+    /// Result type for a call to a locally generated function instance. A
+    /// generic caller's recorded expression type can lose an associated type
+    /// (`Option<Self::Item>` in a generic body lowers to a Unit placeholder),
+    /// while the instance's own signature — whose associated types were
+    /// seeded concretely at monomorphization — is the ABI truth.
+    pub(super) fn instance_result_type(&self, name: &str, fallback: Type) -> Type {
+        self.module
+            .function_order
+            .iter()
+            .map(|fid| &self.module.functions[*fid])
+            .find(|function| function.name == name)
+            .map_or(fallback, |function| function.ret_type.clone())
     }
 
     pub(super) fn lower_comparison(
@@ -489,8 +527,24 @@ impl LowerCtx<'_> {
             else {
                 return builder.cmp(convert_cmp_op(op), lhs, rhs);
             };
-            let lhs_arg = self.lower_comparison_arg(builder, lhs, lhs_ty, &receiver_ty);
-            let rhs_arg = self.lower_comparison_arg(builder, rhs, rhs_ty, &rhs_param_ty);
+            // Both parameters belong to the instance keyed by the receiver,
+            // so the rhs parameter is substituted through `lhs_ty` too.
+            let lhs_arg = self.lower_comparison_arg(
+                builder,
+                lhs,
+                lhs_ty,
+                &receiver_ty,
+                self.mono_method_param_type(fid, 0, lhs_ty, Some(rhs_ty))
+                    .as_ref(),
+            );
+            let rhs_arg = self.lower_comparison_arg(
+                builder,
+                rhs,
+                rhs_ty,
+                &rhs_param_ty,
+                self.mono_method_param_type(fid, 1, lhs_ty, Some(rhs_ty))
+                    .as_ref(),
+            );
             let name = self
                 .mono_method_name_for_receiver(fid, lhs_ty, Some(rhs_ty))
                 .unwrap_or_else(|| self.function_name(fid));
@@ -506,8 +560,25 @@ impl LowerCtx<'_> {
         value: Value,
         actual_ty: &type_checker::Type,
         expected: &hir::item_tree::HirTypeRef,
+        expected_substituted: Option<&Type>,
     ) -> Value {
         let actual_mir_ty = self.convert_type(actual_ty);
+        // An impl whose self type is itself a reference (`impl PartialEq for
+        // &T`) takes `&&T` parameters: when the operand carries exactly the
+        // inner reference, materialize the extra level. Every other shape
+        // keeps the historical declared-type behavior below.
+        if let Some(Type::Ref(inner, mutable)) = expected_substituted
+            && matches!(**inner, Type::Ref(_, _))
+            && **inner == actual_mir_ty
+        {
+            let place = builder.alloca(actual_mir_ty.clone());
+            builder.store(value, place);
+            return builder.unop(
+                if *mutable { UnOp::MutRef } else { UnOp::Ref },
+                place,
+                Type::Ref(inner.clone(), *mutable),
+            );
+        }
         match expected {
             hir::item_tree::HirTypeRef::Ref(_, _) if matches!(actual_mir_ty, Type::Ref(_, _)) => {
                 value
@@ -523,6 +594,35 @@ impl LowerCtx<'_> {
             }
             _ => value,
         }
+    }
+
+    /// Adjusts a plain call argument for an impl whose self type is itself a
+    /// reference (`impl PartialEq for &T` taking `&&T` parameters): when the
+    /// substituted parameter is reference-of-reference and the argument
+    /// carries exactly the inner reference, materialize the extra level.
+    /// Every other argument passes through untouched, matching the
+    /// historical behavior.
+    pub(super) fn adjust_arg_for_reference_self_impl(
+        &self,
+        builder: &mut Builder,
+        raw: Value,
+        arg_ty: &type_checker::Type,
+        expected: Option<&Type>,
+    ) -> Value {
+        let actual = self.convert_type(arg_ty);
+        if let Some(Type::Ref(inner, mutable)) = expected
+            && matches!(**inner, Type::Ref(_, _))
+            && **inner == actual
+        {
+            let place = builder.alloca(actual.clone());
+            builder.store(raw, place);
+            return builder.unop(
+                if *mutable { UnOp::MutRef } else { UnOp::Ref },
+                place,
+                Type::Ref(inner.clone(), *mutable),
+            );
+        }
+        raw
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -687,11 +787,41 @@ impl LowerCtx<'_> {
         body: &Body,
         base: ExprId,
         expected: &hir::item_tree::HirTypeRef,
+        expected_substituted: Option<&Type>,
     ) -> Value {
         let base_ty = self
             .current_body
             .and_then(|bid| self.type_result.expr_types.get(&(bid, base)))
             .map_or(Type::Unit, |t| self.convert_expr_type(body, base, t));
+
+        // An impl whose self type is itself a reference (`impl PartialEq for
+        // &T`) takes a `&&T` receiver: when the operand carries exactly the
+        // inner reference, materialize the extra level. Every other shape
+        // keeps the historical declared-type behavior below.
+        if let Some(Type::Ref(inner, mutable)) = expected_substituted
+            && matches!(**inner, Type::Ref(_, _))
+            && **inner == base_ty
+        {
+            if *mutable {
+                let place = self.lower_lvalue(builder, param_values, body, base);
+                return builder.unop(
+                    convert_unop(HirUnOp::MutRef),
+                    place,
+                    Type::Ref(inner.clone(), *mutable),
+                );
+            }
+            // Shared borrows of a value-typed operand (a parameter, say) need
+            // their own slot: `Ref` of a placeless value would point at the
+            // pointee instead of at storage holding the reference.
+            let value = self.lower_expr(builder, param_values, body, base);
+            let slot = builder.alloca(base_ty.clone());
+            builder.store(value, slot);
+            return builder.unop(
+                convert_unop(HirUnOp::Ref),
+                slot,
+                Type::Ref(inner.clone(), *mutable),
+            );
+        }
 
         match expected {
             hir::item_tree::HirTypeRef::Ref(_, _) if matches!(base_ty, Type::Ref(_, _)) => {
@@ -760,8 +890,9 @@ impl LowerCtx<'_> {
         let name = self
             .mono_method_name_for_receiver(fid, &receiver_ty, Some(&index_ty))
             .unwrap_or_else(|| self.function_name(fid));
-        let receiver = self.lower_receiver_arg(builder, param_values, body, base, &receiver_param);
-        let index = self.lower_receiver_arg(builder, param_values, body, index, &index_param);
+        let receiver =
+            self.lower_receiver_arg(builder, param_values, body, base, &receiver_param, None);
+        let index = self.lower_receiver_arg(builder, param_values, body, index, &index_param, None);
         let output = self
             .type_result
             .expr_types

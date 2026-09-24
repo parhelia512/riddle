@@ -4,20 +4,48 @@
 use crate::std::option::Option;
 
 impl char {
-    pub fun is_ascii(self) -> bool { is_ascii(self) }
-    pub fun is_ascii_alphabetic(self) -> bool { is_ascii_alphabetic(self) }
-    pub fun is_ascii_alphanumeric(self) -> bool { is_ascii_alphanumeric(self) }
-    pub fun is_ascii_digit(self) -> bool { is_ascii_digit(self) }
-    pub fun is_ascii_hexdigit(self) -> bool { is_ascii_hexdigit(self) }
-    pub fun is_ascii_lowercase(self) -> bool { is_ascii_lowercase(self) }
-    pub fun is_ascii_uppercase(self) -> bool { is_ascii_uppercase(self) }
-    pub fun is_ascii_whitespace(self) -> bool { is_ascii_whitespace(self) }
-    pub fun is_ascii_punctuation(self) -> bool { is_ascii_punctuation(self) }
-    pub fun is_ascii_graphic(self) -> bool { is_ascii_graphic(self) }
-    pub fun is_ascii_control(self) -> bool { is_ascii_control(self) }
-    pub fun to_ascii_uppercase(self) -> char { to_ascii_uppercase(self) }
-    pub fun to_ascii_lowercase(self) -> char { to_ascii_lowercase(self) }
-    pub fun to_digit(self, radix: u32) -> Option<u32> { to_digit(self, radix) }
+    pub fun is_ascii(self) -> bool {
+        is_ascii(self)
+    }
+    pub fun is_ascii_alphabetic(self) -> bool {
+        is_ascii_alphabetic(self)
+    }
+    pub fun is_ascii_alphanumeric(self) -> bool {
+        is_ascii_alphanumeric(self)
+    }
+    pub fun is_ascii_digit(self) -> bool {
+        is_ascii_digit(self)
+    }
+    pub fun is_ascii_hexdigit(self) -> bool {
+        is_ascii_hexdigit(self)
+    }
+    pub fun is_ascii_lowercase(self) -> bool {
+        is_ascii_lowercase(self)
+    }
+    pub fun is_ascii_uppercase(self) -> bool {
+        is_ascii_uppercase(self)
+    }
+    pub fun is_ascii_whitespace(self) -> bool {
+        is_ascii_whitespace(self)
+    }
+    pub fun is_ascii_punctuation(self) -> bool {
+        is_ascii_punctuation(self)
+    }
+    pub fun is_ascii_graphic(self) -> bool {
+        is_ascii_graphic(self)
+    }
+    pub fun is_ascii_control(self) -> bool {
+        is_ascii_control(self)
+    }
+    pub fun to_ascii_uppercase(self) -> char {
+        to_ascii_uppercase(self)
+    }
+    pub fun to_ascii_lowercase(self) -> char {
+        to_ascii_lowercase(self)
+    }
+    pub fun to_digit(self, radix: u32) -> Option<u32> {
+        to_digit(self, radix)
+    }
 }
 
 /// ASCII digit radix ceiling (`to_digit` supports 2..=36).

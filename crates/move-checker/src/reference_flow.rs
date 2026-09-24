@@ -19,10 +19,27 @@ pub enum FlowKind {
     Mutable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// One step of a field/index path recorded on a summary origin: how the
+/// borrowed place was reached from the parameter root (`&self.values[i]`
+/// records `[Field(0), Index(None)]` against param 0).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum FlowProjection {
+    Field(usize),
+    Index(Option<usize>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SummaryOrigin {
     pub(crate) param: usize,
+    pub(crate) path: Vec<FlowProjection>,
     pub(crate) kind: FlowKind,
+    /// The path crosses through a reference-typed prefix (a reference stored
+    /// in a field, or the pointee of the receiver's own reference): the
+    /// aliased region lives outside the receiver's own storage, so a loan
+    /// mapped from this origin can never conflict with borrows of the
+    /// receiver itself. Computed after the fixpoint by walking the path
+    /// against the impl's self type.
+    pub(crate) behind_reference: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -35,38 +52,311 @@ pub struct FunctionSummary {
 #[derive(Debug, Default)]
 pub struct ReferenceFlow {
     summaries: HashMap<FunctionId, FunctionSummary>,
+    /// Per trait method, the join of every impl's (and default method's)
+    /// summary. Generic-bound dispatch has no concrete callee to summarize;
+    /// the join is what those calls may assume — sound because the
+    /// compilation sees every impl.
+    trait_method_joins: HashMap<(hir::item_tree::TraitId, String), FunctionSummary>,
 }
 
 impl ReferenceFlow {
     pub(crate) fn build(hir: &HirFile, type_result: &TypeCheckResult) -> Self {
-        let mut summaries = hir
-            .function_bodies
-            .keys()
-            .copied()
-            .filter(|fid| !is_std_builtin(hir, *fid))
-            .map(|fid| (fid, FunctionSummary::default()))
-            .collect::<HashMap<_, _>>();
-
+        // Contracted trait methods license adapters' summaries to carry the
+        // behind-reference marker for generic inner calls. The contract is
+        // verified against every impl after the fixpoint; a failure disables
+        // the contract and the analysis reruns without it (at most one extra
+        // round — disabling is monotone).
+        let mut disabled_contracts = HashSet::new();
+        let mut summaries;
         loop {
-            let previous = summaries.clone();
-            for (fid, body_id) in &hir.function_bodies {
-                if is_std_builtin(hir, *fid) {
-                    continue;
-                }
-                let summary = SummaryAnalyzer::new(hir, type_result, &previous, *body_id)
+            let fresh = hir
+                .function_bodies
+                .keys()
+                .copied()
+                .filter(|fid| !is_std_builtin(hir, *fid))
+                .map(|fid| (fid, FunctionSummary::default()))
+                .collect::<HashMap<_, _>>();
+            summaries = fresh;
+            loop {
+                let previous = summaries.clone();
+                for (fid, body_id) in &hir.function_bodies {
+                    if is_std_builtin(hir, *fid) {
+                        continue;
+                    }
+                    let summary = SummaryAnalyzer::new(
+                        hir,
+                        type_result,
+                        &previous,
+                        &disabled_contracts,
+                        *body_id,
+                    )
                     .analyze_function(*fid);
-                summaries.insert(*fid, summary);
+                    summaries.insert(*fid, summary);
+                }
+                if summaries == previous {
+                    break;
+                }
             }
-            if summaries == previous {
+            annotate_behind_reference(hir, &mut summaries);
+            let failed = verify_contracts(hir, &summaries);
+            let newly_failed = failed
+                .iter()
+                .filter(|contract| !disabled_contracts.contains(*contract))
+                .cloned()
+                .collect::<HashSet<_>>();
+            if newly_failed.is_empty() {
                 break;
             }
+            disabled_contracts.extend(newly_failed);
         }
 
-        Self { summaries }
+        let trait_method_joins = build_trait_method_joins(hir, &summaries, &disabled_contracts);
+
+        Self {
+            summaries,
+            trait_method_joins,
+        }
     }
 
     pub(crate) fn summary(&self, fid: FunctionId) -> Option<&FunctionSummary> {
         self.summaries.get(&fid)
+    }
+
+    pub(crate) fn trait_method_summary(
+        &self,
+        trait_id: hir::item_tree::TraitId,
+        method: &str,
+    ) -> Option<&FunctionSummary> {
+        self.trait_method_joins.get(&(trait_id, method.to_string()))
+    }
+}
+
+/// A trait method declared `#[flow = "behind_reference"]` promises that every
+/// impl's returned references alias regions behind references stored in the
+/// receiver, never the receiver's own storage. The promise is verified
+/// against each impl's summary (all origins empty or walk-verified as
+/// behind-reference, nothing opaque); if any impl fails the check the
+/// contract is demoted and generic dispatch stays conservative.
+pub(crate) fn trait_method_contracted(
+    hir: &HirFile,
+    trait_id: hir::item_tree::TraitId,
+    method: &str,
+) -> bool {
+    let tr = &hir.item_tree.traits[trait_id];
+    if !tr
+        .attrs
+        .iter()
+        .any(|attr| attr.name.0 == "flow" && attr.value.as_deref() == Some("behind_reference"))
+        && !tr.methods.iter().any(|m| {
+            m.name.0 == method
+                && m.attrs.iter().any(|attr| {
+                    attr.name.0 == "flow" && attr.value.as_deref() == Some("behind_reference")
+                })
+        })
+    {
+        return false;
+    }
+    true
+}
+
+fn summary_conforms_to_contract(summary: &FunctionSummary) -> bool {
+    if summary.opaque {
+        return false;
+    }
+    summary.origins.iter().all(|origin| origin.behind_reference)
+        && summary.fields.iter().all(summary_conforms_to_contract)
+}
+
+/// Checks every contracted trait method against its impls' summaries and
+/// returns the contracts that failed (a non-conforming or opaque member).
+fn verify_contracts(
+    hir: &HirFile,
+    summaries: &HashMap<FunctionId, FunctionSummary>,
+) -> HashSet<(hir::item_tree::TraitId, String)> {
+    let mut failed = HashSet::new();
+    for (trait_id, tr) in hir.item_tree.traits.iter() {
+        for method in &tr.methods {
+            if !trait_method_contracted(hir, trait_id, &method.name.0) {
+                continue;
+            }
+            let conforms =
+                |fid: &FunctionId| summaries.get(fid).is_none_or(summary_conforms_to_contract);
+            let all_impls_conform = hir.item_tree.impls.values().all(|imp| {
+                let Some(trait_range) = imp.trait_ty_range else {
+                    return true;
+                };
+                let Some(ResolvedName::Trait(id)) = hir.type_resolutions.get(&trait_range) else {
+                    return true;
+                };
+                if *id != trait_id {
+                    return true;
+                }
+                imp.methods.iter().all(|impl_method| {
+                    hir.item_tree.functions[*impl_method].name.0 != method.name.0
+                        || conforms(impl_method)
+                })
+            });
+            if !all_impls_conform {
+                failed.insert((trait_id, method.name.0.clone()));
+            }
+        }
+    }
+    failed
+}
+
+fn build_trait_method_joins(
+    hir: &HirFile,
+    summaries: &HashMap<FunctionId, FunctionSummary>,
+    disabled_contracts: &HashSet<(hir::item_tree::TraitId, String)>,
+) -> HashMap<(hir::item_tree::TraitId, String), FunctionSummary> {
+    let mut joins = HashMap::new();
+    for imp in hir.item_tree.impls.values() {
+        let Some(trait_range) = imp.trait_ty_range else {
+            continue;
+        };
+        let Some(ResolvedName::Trait(trait_id)) = hir.type_resolutions.get(&trait_range) else {
+            continue;
+        };
+        for &method in &imp.methods {
+            let name = hir.item_tree.functions[method].name.0.clone();
+            if disabled_contracts.contains(&(*trait_id, name.clone())) {
+                continue;
+            }
+            join_trait_method(summaries, &mut joins, *trait_id, &name, method);
+        }
+    }
+    for (trait_id, tr) in hir.item_tree.traits.iter() {
+        for &method in &tr.default_methods {
+            join_trait_method(
+                summaries,
+                &mut joins,
+                trait_id,
+                &hir.item_tree.functions[method].name.0,
+                method,
+            );
+        }
+    }
+    joins
+}
+
+fn join_trait_method(
+    summaries: &HashMap<FunctionId, FunctionSummary>,
+    joins: &mut HashMap<(hir::item_tree::TraitId, String), FunctionSummary>,
+    trait_id: hir::item_tree::TraitId,
+    method_name: &str,
+    method: FunctionId,
+) {
+    let Some(summary) = summaries.get(&method) else {
+        return;
+    };
+    joins
+        .entry((trait_id, method_name.to_string()))
+        .or_default()
+        .merge(summary.clone());
+}
+
+/// Marks every impl-method summary origin whose path crosses through a
+/// reference-typed prefix of the impl's self type. `HashSet` keys hash on
+/// every field, so origins are taken out and reinserted.
+fn annotate_behind_reference(hir: &HirFile, summaries: &mut HashMap<FunctionId, FunctionSummary>) {
+    let impl_self_types = hir
+        .item_tree
+        .impls
+        .values()
+        .flat_map(|imp| {
+            imp.methods
+                .iter()
+                .map(|method| (*method, imp.self_ty.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    for (fid, summary) in summaries.iter_mut() {
+        let Some(self_ty) = impl_self_types.get(fid) else {
+            continue;
+        };
+        annotate_summary_origins(hir, self_ty, summary);
+    }
+}
+
+fn annotate_summary_origins(
+    hir: &HirFile,
+    self_ty: &hir::item_tree::HirTypeRef,
+    summary: &mut FunctionSummary,
+) {
+    let origins = std::mem::take(&mut summary.origins);
+    summary.origins = origins
+        .into_iter()
+        .map(|mut origin| {
+            // Only strengthen: the walk verifies structurally-crossed paths,
+            // while contracted-trait fallbacks license their own marker —
+            // neither source may clear the other's claim.
+            origin.behind_reference |= path_crosses_reference(hir, self_ty, &origin.path);
+            origin
+        })
+        .collect();
+    for field in &mut summary.fields {
+        annotate_summary_origins(hir, self_ty, field);
+    }
+}
+
+/// Walks a summary origin's path against the impl's self type. Any step that
+/// applies after a reference-typed prefix crosses into the reference's
+/// pointee, which lives outside the receiver's own storage. Steps that
+/// cannot be walked stop the walk conservatively.
+fn path_crosses_reference(
+    hir: &HirFile,
+    self_ty: &hir::item_tree::HirTypeRef,
+    path: &[FlowProjection],
+) -> bool {
+    let mut ty = self_ty;
+    let mut crossed = false;
+    for step in path {
+        // Reference and raw-pointer prefixes both reach outside the
+        // receiver's own storage (a stored borrow's pointee, or the heap
+        // behind a `*mut T` field like Vector's buffer).
+        while let hir::item_tree::HirTypeRef::Ref(inner, _)
+        | hir::item_tree::HirTypeRef::Ptr { inner, .. } = ty
+        {
+            crossed = true;
+            ty = inner;
+        }
+        ty = match step {
+            FlowProjection::Field(index) => match field_type_at(hir, ty, *index) {
+                Some(field) => field,
+                None => return crossed,
+            },
+            FlowProjection::Index(_) => match element_type_at(ty) {
+                Some(element) => element,
+                None => return crossed,
+            },
+        };
+    }
+    crossed
+}
+
+fn field_type_at<'a>(
+    hir: &'a HirFile,
+    ty: &'a hir::item_tree::HirTypeRef,
+    index: usize,
+) -> Option<&'a hir::item_tree::HirTypeRef> {
+    match ty {
+        hir::item_tree::HirTypeRef::Named(path) => match hir.type_resolutions.get(&path.range) {
+            Some(ResolvedName::Struct(id)) => hir.item_tree.structs[*id]
+                .fields
+                .get(index)
+                .map(|field| &field.ty),
+            _ => None,
+        },
+        hir::item_tree::HirTypeRef::Tuple(elements) => elements.get(index),
+        _ => None,
+    }
+}
+
+fn element_type_at(ty: &hir::item_tree::HirTypeRef) -> Option<&hir::item_tree::HirTypeRef> {
+    match ty {
+        hir::item_tree::HirTypeRef::Slice(inner) | hir::item_tree::HirTypeRef::Array(inner, _) => {
+            Some(inner)
+        }
+        _ => None,
     }
 }
 
@@ -88,7 +378,9 @@ impl FunctionSummary {
         Self {
             origins: std::iter::once(SummaryOrigin {
                 param,
+                path: Vec::new(),
                 kind: FlowKind::Inherit,
+                behind_reference: false,
             })
             .collect(),
             opaque: false,
@@ -122,7 +414,9 @@ impl FunctionSummary {
             .into_iter()
             .map(|origin| SummaryOrigin {
                 param: origin.param,
+                path: origin.path,
                 kind,
+                behind_reference: origin.behind_reference,
             })
             .collect();
         self.fields = self
@@ -133,10 +427,31 @@ impl FunctionSummary {
         self
     }
 
+    /// Marks every origin (recursively through fields) as living behind a
+    /// reference — used by the contracted-trait-call fallback, where the
+    /// contract guarantees the callee's returns never alias the receiver's
+    /// own storage.
+    fn with_behind_reference(mut self) -> Self {
+        self.origins = self
+            .origins
+            .iter()
+            .map(|origin| SummaryOrigin {
+                behind_reference: true,
+                ..origin.clone()
+            })
+            .collect();
+        self.fields = self
+            .fields
+            .iter()
+            .map(|field| field.clone().with_behind_reference())
+            .collect();
+        self
+    }
+
     fn from_fields(fields: Vec<Self>) -> Self {
         let mut value = Self::default();
         for field in &fields {
-            value.origins.extend(field.origins.iter().copied());
+            value.origins.extend(field.origins.iter().cloned());
             value.opaque |= field.opaque;
         }
         value.fields = fields;
@@ -148,6 +463,49 @@ impl FunctionSummary {
             .get(index)
             .cloned()
             .unwrap_or_else(|| self.flattened())
+    }
+
+    /// Narrows a flow value by one place step. Structured values (tuple,
+    /// array, struct literals) narrow to the element's own flow; param-rooted
+    /// values instead record the step on the origin's path, so a summary can
+    /// say "the return aliases param 0's field 0" instead of flattening to
+    /// the whole parameter. Paths are capped: join feedback composes adapter
+    /// chains onto themselves, and without a cap the composition would grow
+    /// every fixpoint round; truncating loses precision (a shorter path
+    /// claims less), never soundness, and guarantees convergence.
+    fn project_path(&self, projection: FlowProjection) -> Self {
+        const MAX_PATH_LEN: usize = 8;
+        match &projection {
+            FlowProjection::Field(index) | FlowProjection::Index(Some(index)) => {
+                if let Some(field) = self.fields.get(*index) {
+                    return field.clone();
+                }
+            }
+            FlowProjection::Index(None) => {
+                if !self.fields.is_empty() {
+                    return self.iterated();
+                }
+            }
+        }
+        Self {
+            origins: self
+                .origins
+                .iter()
+                .map(|origin| SummaryOrigin {
+                    param: origin.param,
+                    path: origin
+                        .path
+                        .iter()
+                        .cloned()
+                        .chain((origin.path.len() < MAX_PATH_LEN).then_some(projection.clone()))
+                        .collect(),
+                    kind: origin.kind,
+                    behind_reference: origin.behind_reference,
+                })
+                .collect(),
+            opaque: self.opaque,
+            fields: Vec::new(),
+        }
     }
 
     fn iterated(&self) -> Self {
@@ -181,6 +539,9 @@ struct SummaryAnalyzer<'a> {
     hir: &'a HirFile,
     type_result: &'a TypeCheckResult,
     summaries: &'a HashMap<FunctionId, FunctionSummary>,
+    /// Contracts that failed verification in an earlier build round: calls
+    /// to them fall back to the conservative opaque merge.
+    disabled_contracts: &'a HashSet<(hir::item_tree::TraitId, String)>,
     body_id: BodyId,
     body: &'a Body,
     /// Provenance per binding. `let`, `match` arms and `for` all land here —
@@ -196,12 +557,14 @@ impl<'a> SummaryAnalyzer<'a> {
         hir: &'a HirFile,
         type_result: &'a TypeCheckResult,
         summaries: &'a HashMap<FunctionId, FunctionSummary>,
+        disabled_contracts: &'a HashSet<(hir::item_tree::TraitId, String)>,
         body_id: BodyId,
     ) -> Self {
         Self {
             hir,
             type_result,
             summaries,
+            disabled_contracts,
             body_id,
             body: &hir.bodies[body_id],
             locals: HashMap::new(),
@@ -240,21 +603,60 @@ impl<'a> SummaryAnalyzer<'a> {
             Expr::Unary { operand, op } => {
                 let operand_value = self.analyze_expr(*operand);
                 match op {
-                    UnaryOp::Ref => self
-                        .place_value(*operand)
-                        .with_kind(FlowKind::Shared)
-                        .or_opaque_reference(),
-                    UnaryOp::MutRef => self
-                        .place_value(*operand)
-                        .with_kind(FlowKind::Mutable)
-                        .or_opaque_reference(),
+                    UnaryOp::Ref | UnaryOp::MutRef => {
+                        // Borrowing an empty array literal (`&[]` in
+                        // `Vector::as_slice`'s empty branch) aliases no data:
+                        // an empty flow, not an opaque one, so the branch
+                        // does not poison the merged summary.
+                        if matches!(
+                            &self.body.exprs[*operand],
+                            Expr::Array { elements } if elements.is_empty()
+                        ) {
+                            FlowValue::default()
+                        } else {
+                            let kind = if matches!(op, UnaryOp::Ref) {
+                                FlowKind::Shared
+                            } else {
+                                FlowKind::Mutable
+                            };
+                            self.place_value(*operand)
+                                .with_kind(kind)
+                                .or_opaque_reference()
+                        }
+                    }
                     UnaryOp::Deref => operand_value,
                     _ => FlowValue::default(),
                 }
             }
 
             Expr::Struct { fields, .. } => {
-                merge_values(fields.iter().map(|field| self.analyze_expr(field.value)))
+                let mut analyzed = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let value = self.analyze_expr(field.value);
+                    analyzed.push((field.name.clone(), value));
+                }
+                // Struct literals keep per-field flow (mapped to the declared
+                // field order), so a returned struct's reference-typed fields
+                // stay projectable at the call site — an iterator's `values`
+                // field keeps the borrow it was constructed from.
+                let struct_id = match self.type_result.expr_types.get(&(self.body_id, expr_id)) {
+                    Some(Type::Struct(id, _)) => Some(*id),
+                    _ => None,
+                };
+                match struct_id {
+                    None => merge_values(analyzed.into_iter().map(|(_, value)| value)),
+                    Some(id) => {
+                        let declared = &self.hir.item_tree.structs[id].fields;
+                        let mut slots = vec![FlowValue::default(); declared.len()];
+                        for (name, value) in analyzed {
+                            if let Some(slot) = declared.iter().position(|field| field.name == name)
+                            {
+                                slots[slot] = value;
+                            }
+                        }
+                        FlowValue::from_fields(slots)
+                    }
+                }
             }
 
             Expr::Array { elements } | Expr::Tuple { elements } => FlowValue::from_fields(
@@ -312,23 +714,30 @@ impl<'a> SummaryAnalyzer<'a> {
 
             Expr::FieldAccess { base, field } => {
                 let value = self.analyze_expr(*base);
-                self.field_index(*base, field)
-                    .map_or_else(|| value.flattened(), |index| value.project(index))
+                self.field_index(*base, field).map_or_else(
+                    || value.flattened(),
+                    |index| value.project_path(FlowProjection::Field(index)),
+                )
             }
 
             Expr::IndexAccess { base, index } => {
                 let value = self.analyze_expr(*base);
                 self.analyze_expr(*index);
-                match &self.body.exprs[*index] {
-                    Expr::IntLiteral { value: index, .. } => usize::try_from(*index)
-                        .ok()
-                        .map_or_else(|| value.iterated(), |index| value.project(index)),
-                    _ => value.iterated(),
-                }
+                let projection = match &self.body.exprs[*index] {
+                    Expr::IntLiteral { value, .. } => usize::try_from(*value)
+                        .map(|index| FlowProjection::Index(Some(index)))
+                        .unwrap_or(FlowProjection::Index(None)),
+                    _ => FlowProjection::Index(None),
+                };
+                value.project_path(projection)
             }
 
             Expr::Unsafe { body } => self.analyze_expr(*body),
-            Expr::Cast { base, .. } => self.analyze_expr(*base),
+            // A cast produces a fresh value: the operand's origins flow
+            // through, but its per-field structure does not project — the
+            // `(ptr, len) as &[T]` idiom must not leave the pair's two
+            // slots behind for a later index step to "iterate" over.
+            Expr::Cast { base, .. } => self.analyze_expr(*base).flattened(),
             Expr::Try { operand } => self.analyze_expr(*operand),
         };
 
@@ -485,8 +894,31 @@ impl<'a> SummaryAnalyzer<'a> {
 
     fn analyze_call(&mut self, callee: ExprId, args: &[ExprId], call: ExprId) -> FlowValue {
         let callee_value = self.analyze_expr(callee);
+        // A value-shaped callee (`self.f(value)` — a closure or callable
+        // parameter stored in a field) is invoked as a value, not as a method
+        // of the receiver: the receiver base is not an input, and the result
+        // can only derive from the callee's captures (its own flow) and the
+        // arguments — a dyn-trait call is the one value-shaped callee whose
+        // target may borrow the object itself, so it keeps the opaque merge.
+        let resolves_to_function = self.resolve_callee(callee).is_some();
+        let trait_call_info = self
+            .type_result
+            .trait_method_calls
+            .get(&(self.body_id, callee))
+            .map(|call| (call.dynamic, call.trait_id, call.method.clone()));
+        let value_shaped_callee = !resolves_to_function
+            && !matches!(
+                self.body.exprs[callee],
+                Expr::Path {
+                    resolved: Some(ResolvedName::EnumVariant(..)),
+                    ..
+                }
+            );
+        let dyn_call = matches!(trait_call_info, Some((true, ..)));
         let mut inputs = Vec::new();
-        if let Expr::FieldAccess { base, .. } = &self.body.exprs[callee] {
+        if let Expr::FieldAccess { base, .. } = &self.body.exprs[callee]
+            && (!value_shaped_callee || dyn_call)
+        {
             inputs.push(self.analyze_expr(*base));
         }
         inputs.extend(args.iter().map(|arg| self.analyze_expr(*arg)));
@@ -507,12 +939,43 @@ impl<'a> SummaryAnalyzer<'a> {
             return instantiate_summary(summary, &inputs);
         }
 
+        // Generic-bound trait dispatch on a `#[flow = "behind_reference"]`
+        // contracted method: the returned references provably live behind
+        // the receiver's stored references (verified against every impl
+        // after the fixpoint), so the input flows carry the marker instead
+        // of going opaque — adapters composing such calls keep their
+        // provenance.
+        if let Some(trait_call) = self
+            .type_result
+            .trait_method_calls
+            .get(&(self.body_id, callee))
+            && !trait_call.dynamic
+            && !self
+                .disabled_contracts
+                .contains(&(trait_call.trait_id, trait_call.method.clone()))
+            && trait_method_contracted(self.hir, trait_call.trait_id, &trait_call.method)
+            && self.expr_may_carry_provenance(call)
+        {
+            let mut result = callee_value;
+            result.merge(merge_values(inputs));
+            return result.with_behind_reference();
+        }
+
         if !self.expr_may_carry_provenance(call) {
             return FlowValue::default();
         }
-        let mut result = callee_value;
+        // The callee value's own reachable references (a closure's captures,
+        // a callable parameter's innards) were constructed outside the
+        // current receiver, so they alias regions behind it.
+        let mut result = if value_shaped_callee {
+            callee_value.with_behind_reference()
+        } else {
+            callee_value
+        };
         result.merge(merge_values(inputs));
-        result.opaque = true;
+        if dyn_call {
+            result.opaque = true;
+        }
         result
     }
 
@@ -528,6 +991,14 @@ impl<'a> SummaryAnalyzer<'a> {
     }
 
     fn place_value(&self, expr_id: ExprId) -> FlowValue {
+        // Raw pointers stay outside borrow tracking (the documented `unsafe`
+        // escape hatch): borrows taken through them are opaque.
+        if matches!(
+            self.type_result.expr_types.get(&(self.body_id, expr_id)),
+            Some(Type::Ptr { .. })
+        ) {
+            return FlowValue::default();
+        }
         match &self.body.exprs[expr_id] {
             Expr::Path {
                 resolved: Some(ResolvedName::Param(index)),
@@ -537,13 +1008,43 @@ impl<'a> SummaryAnalyzer<'a> {
                 resolved: Some(ResolvedName::PatternBinding(id)),
                 ..
             } => self.locals.get(id).cloned().unwrap_or_default(),
-            Expr::FieldAccess { base, .. } | Expr::IndexAccess { base, .. } => {
-                self.place_value(*base)
+            Expr::FieldAccess { base, field } => {
+                let value = self.place_value(*base);
+                self.field_index(*base, field).map_or_else(
+                    || value.flattened(),
+                    |index| value.project_path(FlowProjection::Field(index)),
+                )
+            }
+            Expr::IndexAccess { base, index } => {
+                // Indexing through a raw pointer (`self.data[index]` in
+                // Vector internals) reads the pointee, which is untracked.
+                if matches!(
+                    self.type_result.expr_types.get(&(self.body_id, *base)),
+                    Some(Type::Ptr { .. })
+                ) {
+                    return FlowValue::default();
+                }
+                let value = self.place_value(*base);
+                let projection = match &self.body.exprs[*index] {
+                    Expr::IntLiteral { value, .. } => usize::try_from(*value)
+                        .map(|index| FlowProjection::Index(Some(index)))
+                        .unwrap_or(FlowProjection::Index(None)),
+                    _ => FlowProjection::Index(None),
+                };
+                value.project_path(projection)
             }
             Expr::Unary {
                 operand,
                 op: UnaryOp::Deref,
-            } => self.place_value(*operand),
+            } => {
+                if matches!(
+                    self.type_result.expr_types.get(&(self.body_id, *operand)),
+                    Some(Type::Ptr { .. })
+                ) {
+                    return FlowValue::default();
+                }
+                self.place_value(*operand)
+            }
             _ => FlowValue::default(),
         }
     }
@@ -604,7 +1105,8 @@ impl<'a> SummaryAnalyzer<'a> {
                     }
                 }
             }
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } => {}
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Path { .. } | Pattern::Or { .. } => {
+            }
         }
     }
 
@@ -711,9 +1213,16 @@ fn instantiate_summary(summary: &FunctionSummary, inputs: &[FlowValue]) -> FlowV
         let Some(input) = inputs.get(origin.param) else {
             continue;
         };
+        // Compose the callee's field path onto the caller's input: a
+        // structured input narrows per field; a param-rooted input records
+        // the steps on its own origin path.
+        let mut projected = input.clone();
+        for projection in &origin.path {
+            projected = projected.project_path(projection.clone());
+        }
         result.merge(match origin.kind {
-            FlowKind::Inherit => input.clone(),
-            kind => input.clone().with_kind(kind),
+            FlowKind::Inherit => projected,
+            kind => projected.with_kind(kind),
         });
     }
     if !summary.fields.is_empty() {

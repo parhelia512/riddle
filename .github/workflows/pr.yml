@@ -35,6 +35,16 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 
+      - name: Check Riddle source formatting
+        shell: bash
+        run: |
+          files=$(git ls-files 'std/**/*.rid')
+          if [ -z "$files" ]; then
+            echo "no Riddle sources to check"
+            exit 0
+          fi
+          cargo run --quiet -p riddle --features install-bins --bin riddle -- fmt --check $files
+
       - name: Check installable binaries
         run: cargo check -p riddle --features install-bins --bins
 

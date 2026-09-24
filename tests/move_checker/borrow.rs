@@ -948,3 +948,492 @@ fn borrow_conflict_reports_the_original_borrow_as_secondary() {
         label.style == type_checker::LabelStyle::Secondary && label.message.contains("first borrow")
     }));
 }
+
+#[test]
+fn reference_held_by_closure_blocks_assignment_until_last_call() {
+    // A copy of `&value` captured into the closure keeps the shared loan of
+    // `value` alive for the closure's lifetime: assigning between creation
+    // and call would leave the captured reference dangling.
+    let result = analyze(
+        r"
+        fun f() {
+            let mut value = 1;
+            let r = &value;
+            let closure = [ -> { *r } ];
+            value = 2;
+            closure();
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("cannot assign") && d.message.contains("value")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn shared_capture_of_borrowed_binding_blocks_assignment() {
+    let result = analyze(
+        r"
+        fun inspect(holder: &(&i32, i32)) -> i32 { *holder.0 }
+
+        fun f() {
+            let mut value = 1;
+            let r = &value;
+            let holder = (r, 10);
+            let closure = [ -> { inspect(&holder) } ];
+            value = 2;
+            closure();
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("cannot assign") && d.message.contains("value")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn mutation_after_closure_last_use_is_allowed() {
+    let result = analyze(
+        r"
+        fun f() {
+            let mut value = 1;
+            let r = &value;
+            let closure = [ -> { *r } ];
+            let out = closure();
+            value = 2;
+        }
+        ",
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn mutable_capture_conflicts_with_outstanding_borrow_held_by_closure() {
+    // The closure captures `value` mutably while the shared loan captured
+    // from `r` is still outstanding — rejected at the capture site.
+    let result = analyze(
+        r"
+        fun f() {
+            let mut value = 1;
+            let r = &value;
+            let mut closure = [ -> { value = 2; } ];
+            closure();
+            let out = *r;
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("cannot capture") && d.message.contains("mutably")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn immediately_invoked_closure_releases_its_captured_borrows() {
+    let result = analyze(
+        r"
+        fun f() {
+            let mut value = 1;
+            let r = &value;
+            [ -> { *r } ]();
+            value = 2;
+        }
+        ",
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn container_loan_held_by_closure_blocks_structural_mutation() {
+    // The CHANGELOG's headline shape: a borrow of the container's interior
+    // captured into a closure keeps its loan alive, so the `&mut self` call
+    // in between is E0300. Without the fix the loan expired at the lambda's
+    // closing bracket and `bag.set(2)` compiled against a stale interior
+    // pointer.
+    let result = analyze(
+        r"
+        struct Bag { value: i32 }
+
+        impl Bag {
+            fun borrow(&self) -> &i32 { &self.value }
+            fun set(&mut self, next: i32) { self.value = next; }
+        }
+
+        fun f() {
+            let mut bag = Bag { value: 1 };
+            let r = bag.borrow();
+            let closure = [ -> { *r } ];
+            bag.set(2);
+            let out = closure();
+        }
+        ",
+    );
+
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0300"),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn container_loan_released_after_closures_last_call() {
+    let result = analyze(
+        r"
+        struct Bag { value: i32 }
+
+        impl Bag {
+            fun borrow(&self) -> &i32 { &self.value }
+            fun set(&mut self, next: i32) { self.value = next; }
+        }
+
+        fun f() {
+            let mut bag = Bag { value: 1 };
+            let r = bag.borrow();
+            let closure = [ -> { *r } ];
+            let out = closure();
+            bag.set(2);
+        }
+        ",
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn derived_read_blocks_write_through_reference() {
+    // Writing through a `&mut` (`m.value = 2`) writes the referent: the
+    // shared loan derived from `&m.value` conflicts, even though the
+    // assignment's own place is rooted at the reference binding.
+    let result = analyze(
+        r"
+        struct Bag { value: i32 }
+
+        fun f() {
+            let mut bag = Bag { value: 1 };
+            let mut m = &mut bag;
+            let r = &m.value;
+            m.value = 2;
+            let out = *r;
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0300" && d.message.contains("as mutable")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn closure_held_derived_read_blocks_write_through_reference() {
+    // Same shape with the derived read kept alive by a closure capture:
+    // the write between creation and last call must be rejected.
+    let result = analyze(
+        r"
+        struct Bag { value: i32 }
+
+        fun f() {
+            let mut bag = Bag { value: 1 };
+            let mut m = &mut bag;
+            let r = &m.value;
+            let closure = [ -> { *r } ];
+            m.value = 2;
+            closure();
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0300" && d.message.contains("as mutable")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn write_through_reference_after_last_derived_use_is_allowed() {
+    // Once the derived reference's last use has passed, writing through the
+    // `&mut` is fine — the loan is no longer held.
+    let result = analyze(
+        r"
+        struct Bag { value: i32 }
+
+        fun f() {
+            let mut bag = Bag { value: 1 };
+            let mut m = &mut bag;
+            let r = &m.value;
+            let closure = [ -> { *r } ];
+            let out = closure();
+            m.value = 2;
+        }
+        ",
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn whole_deref_assignment_conflicts_with_derived_loan() {
+    // `*m = v` writes the whole referent, conflicting with a loan on any
+    // part of it.
+    let result = analyze(
+        r"
+        struct Bag { value: i32 }
+
+        fun f() {
+            let mut bag = Bag { value: 1 };
+            let mut m = &mut bag;
+            let r = &m.value;
+            *m = Bag { value: 2 };
+            let out = *r;
+        }
+        ",
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0300" && d.message.contains("as mutable")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn consecutive_next_on_stored_reference_iterator_is_allowed() {
+    // `next` borrows the reference stored in the iterator's `values` field,
+    // not the iterator itself: the returned element reference carries that
+    // stored loan, the `&mut self` receiver loan expires at each call, and
+    // two consecutive `next` calls no longer report E0302.
+    let result = analyze(
+        r#"
+        enum Step {
+            Item(&i32),
+            Done,
+        }
+
+        struct Iter {
+            values: &[i32; 2],
+            index: usize,
+        }
+
+        trait StepIter {
+            fun next(&mut self) -> Step;
+        }
+
+        impl StepIter for Iter {
+            fun next(&mut self) -> Step {
+                if self.index < 2usize {
+                    let index = self.index;
+                    self.index += 1usize;
+                    Step::Item(&self.values[index])
+                } else {
+                    Step::Done
+                }
+            }
+        }
+
+        fun f() -> i32 {
+            let data = [7, 9];
+            let mut iter = Iter { values: &data, index: 0usize };
+            let a = iter.next();
+            let b = iter.next();
+            match a { Step::Item(first) => *first, _ => 0 }
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn next_element_reference_blocks_underlying_mutation() {
+    // The element reference carries the loan stored in the iterator's
+    // `values` field, so mutably aliasing what that loan covers while the
+    // element is alive is still a conflict.
+    let result = analyze(
+        r#"
+        enum Step {
+            Item(&i32),
+            Done,
+        }
+
+        struct Iter {
+            values: &[i32; 2],
+            index: usize,
+        }
+
+        trait StepIter {
+            fun next(&mut self) -> Step;
+        }
+
+        impl StepIter for Iter {
+            fun next(&mut self) -> Step {
+                if self.index < 2usize {
+                    let index = self.index;
+                    self.index += 1usize;
+                    Step::Item(&self.values[index])
+                } else {
+                    Step::Done
+                }
+            }
+        }
+
+        fun f() -> i32 {
+            let mut data = [7, 9];
+            let mut iter = Iter { values: &data, index: 0usize };
+            let a = iter.next();
+            let m = &mut data;
+            match a { Step::Item(first) => *first, _ => 0 }
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0300" && d.message.contains("data")),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn generic_bound_consecutive_next_with_contract_is_allowed() {
+    // Generic-bound dispatch has no concrete impl to summarize; the trait
+    // method's `#[flow = "behind_reference"]` contract — verified against
+    // every impl — licenses the returned references to live behind the
+    // receiver's stored references, so consecutive `next` calls with live
+    // results no longer report E0302.
+    let result = analyze(
+        r#"
+        enum Step {
+            Item(&i32),
+            Done,
+        }
+
+        struct Iter {
+            values: &[i32; 2],
+            index: usize,
+        }
+
+        trait StepIter {
+            #[flow = "behind_reference"]
+            fun next(&mut self) -> Step;
+        }
+
+        impl StepIter for Iter {
+            fun next(&mut self) -> Step {
+                if self.index < 2usize {
+                    let index = self.index;
+                    self.index += 1usize;
+                    Step::Item(&self.values[index])
+                } else {
+                    Step::Done
+                }
+            }
+        }
+
+        fun take_two<It: StepIter>(it: &mut It) -> i32 {
+            let a = it.next();
+            let b = it.next();
+            match a { Step::Item(first) => *first, _ => 0 }
+        }
+
+        fun f() -> i32 {
+            let data = [7, 9];
+            let mut iter = Iter { values: &data, index: 0usize };
+            take_two(&mut iter)
+        }
+        "#,
+    );
+
+    assert_eq!(result.diagnostics, vec![]);
+}
+
+#[test]
+fn broken_contract_falls_back_to_conservative() {
+    // An impl whose `next` borrows its own storage (the buffer field) fails
+    // the contract verification; generic dispatch on that trait falls back
+    // to the conservative whole-receiver mapping and consecutive calls
+    // report again.
+    let result = analyze(
+        r#"
+        enum Step {
+            Item(&i32),
+            Done,
+        }
+
+        struct OwnBuffer {
+            buffer: [i32; 2],
+            index: usize,
+        }
+
+        trait StepIter {
+            #[flow = "behind_reference"]
+            fun next(&mut self) -> Step;
+        }
+
+        impl StepIter for OwnBuffer {
+            fun next(&mut self) -> Step {
+                if self.index < 2usize {
+                    let index = self.index;
+                    self.index += 1usize;
+                    Step::Item(&self.buffer[index])
+                } else {
+                    Step::Done
+                }
+            }
+        }
+
+        fun take_two<It: StepIter>(it: &mut It) -> i32 {
+            let a = it.next();
+            let b = it.next();
+            match a { Step::Item(first) => *first, _ => 0 }
+        }
+
+        fun f() -> i32 {
+            let mut iter = OwnBuffer { buffer: [7, 9], index: 0usize };
+            take_two(&mut iter)
+        }
+        "#,
+    );
+
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0300" || d.code == "E0301" || d.code == "E0302"),
+        "{:?}",
+        result.diagnostics
+    );
+}

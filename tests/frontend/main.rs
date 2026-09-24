@@ -3,6 +3,8 @@
 //! recovery for malformed input.
 
 use frontend::incremental::IncrementalParser;
+
+mod fuzz;
 use syntax::SyntaxKind;
 
 fn parse(source: &str) -> frontend::tree_builder::Parse {
@@ -32,6 +34,42 @@ fn parses_inclusive_range_expression() {
     let parse = parse("fun main() { let r = 0..=5; }");
     assert!(tree_has(&parse, SyntaxKind::RangeExpr));
     assert!(tree_has(&parse, SyntaxKind::DotDotEq));
+}
+
+#[test]
+fn parses_or_pattern_in_match_arm() {
+    let parse = parse("fun main() { match x { A | B => 1, _ => 2 } }");
+    assert!(tree_has(&parse, SyntaxKind::OrPattern));
+    assert!(tree_has(&parse, SyntaxKind::MatchArm));
+}
+
+#[test]
+fn parses_leading_pipe_before_match_arm_alternatives() {
+    let parse = parse("fun main() { match x { | A | B => 1, _ => 2 } }");
+    assert!(tree_has(&parse, SyntaxKind::OrPattern));
+}
+
+#[test]
+fn let_or_pattern_reports_one_error_and_keeps_later_statements() {
+    // Or-patterns belong to match arms only. The parser used to sync past the
+    // stray `|` without any diagnostic, silently discarding `| 2 = x`.
+    let parse = parse_unchecked("fun main() { let 1 | 2 = x; let y = 3; }");
+    assert_eq!(parse.errors.len(), 1, "{:?}", parse.errors);
+    assert!(
+        parse.errors[0]
+            .message
+            .contains("only allowed on match arms"),
+        "{:?}",
+        parse.errors
+    );
+    assert_eq!(
+        parse
+            .syntax()
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::VarDecl)
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -91,6 +129,28 @@ fn unterminated_string_recovers() {
     let mut parser = IncrementalParser::new();
     let parse = parser.set_source("fun main() { let s = \"open; }");
     assert!(!parse.errors.is_empty());
+}
+
+#[test]
+fn unterminated_block_comment_reports_one_error() {
+    // The lexer runs a stray `/*` to end of input, so every item after it
+    // vanishes; without a diagnostic the file compiles as if truncated.
+    let mut parser = IncrementalParser::new();
+    let parse = parser.set_source("fun main() { }\n/* oops\nfun after() { }");
+    assert_eq!(parse.errors.len(), 1, "{:?}", parse.errors);
+    assert!(
+        parse.errors[0]
+            .message
+            .contains("unterminated block comment"),
+        "{:?}",
+        parse.errors[0]
+    );
+}
+
+#[test]
+fn terminated_block_comments_stay_error_free() {
+    let parse = parse("/* plain */ /** doc */ /*! inner */ fun main() { }");
+    assert!(tree_has(&parse, SyntaxKind::FuncDecl));
 }
 
 #[test]
@@ -364,4 +424,38 @@ fn stray_closing_braces_each_report_once() {
     let parse = parse_unchecked("fun main() { let a = 1; } } } fun other() { let b = 2; }");
     assert_eq!(parse.errors.len(), 2, "{:?}", parse.errors);
     assert!(tree_has(&parse, SyntaxKind::FuncDecl));
+}
+
+#[test]
+fn deeply_nested_blocks_report_one_nesting_diagnostic() {
+    // Debug-build recovery frames are large, matching the deep-nesting test in
+    // tests/riddlec: run the parse on an explicitly sized stack thread.
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(deeply_nested_blocks_report_one_nesting_diagnostic_inner)
+        .unwrap();
+    handle.join().unwrap();
+}
+
+fn deeply_nested_blocks_report_one_nesting_diagnostic_inner() {
+    // The depth bailout inside `lhs` returns without consuming a token, so the
+    // enclosing block loop retried the same position forever, pushing one
+    // diagnostic per attempt until the allocator aborted the process.
+    let depth = 96;
+    let source = format!(
+        "fun main() -> i32 {{ {}0{} }}\n",
+        "{".repeat(depth),
+        "}".repeat(depth)
+    );
+    let parse = parse_unchecked(&source);
+    assert_eq!(
+        parse
+            .errors
+            .iter()
+            .filter(|error| error.message.contains("nesting is too deep"))
+            .count(),
+        1,
+        "{:?}",
+        parse.errors
+    );
 }
