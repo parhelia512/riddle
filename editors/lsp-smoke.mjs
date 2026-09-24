@@ -264,7 +264,7 @@ try {
         uri: fixUri,
         languageId: 'riddle',
         version: 1,
-        text: 'fun main() { let mut total = 0; let add = fun() { total += 1; }; add(); }',
+        text: 'fun main() { let mut total = 0; let add = [ -> { total += 1; }]; add(); }',
       },
     },
   });
