@@ -10,7 +10,7 @@ project tooling (`clue`), a language server (`riddle-lsp`), and the
 `riddle fmt` formatter.
 
 Riddle is an experimental programming language inspired by Rust and Go. As of
-`v0.2.3`, it provides type checking, a move checker, borrow and escape
+`v0.3.0`, it provides type checking, a move checker, borrow and escape
 analysis, unsafe semantics, a bundled standard library, a C backend, project
 tooling, and an LSP. This is a technology preview: the language and toolchain
 may still change without compatibility guarantees.
